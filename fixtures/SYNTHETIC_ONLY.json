@@ -1,0 +1,22 @@
+[
+  {
+    "kind": "explicit_open",
+    "text": "BUY ABC @ 100 STOP 95 TARGET 110",
+    "expected_action": "OPEN"
+  },
+  {
+    "kind": "explicit_short",
+    "text": "SHORT XYZ @ 50 STOP 55 TARGET 40",
+    "expected_action": "OPEN"
+  },
+  {
+    "kind": "market_commentary",
+    "text": "We remain bullish on ABC, with support near 95 and a target of 110.",
+    "expected_action": "NO_TRADE"
+  },
+  {
+    "kind": "conditional_forecast",
+    "text": "If the index breaks resistance, a move toward the next level is possible.",
+    "expected_action": "NO_TRADE"
+  }
+]
