@@ -269,14 +269,17 @@ def test_complete_post_cannot_be_downgraded_or_rehydrated(tmp_path):
 def test_hydration_does_not_bypass_edit_or_revision_protection(tmp_path):
     e = PaperEventReplay(tmp_path / "p.sqlite3")
     e.process(_source("x", complete=False), ParsedPost(actions=[_open_action()]), _tlt(), now=NOW)
-    e.process(_source("x", complete=True, revision=2), ParsedPost(actions=[_open_action()]), _tlt(), now=NOW)
-    late_v1 = e.process(_source("x", complete=True), ParsedPost(actions=[_open_action()]), _tlt(), now=NOW)
+    e.process(_source("x", complete=True, revision=2), ParsedPost(actions=[_open_action()]),
+              _tlt(), now=NOW)
+    late_v1 = e.process(_source("x", complete=True), ParsedPost(actions=[_open_action()]),
+                        _tlt(), now=NOW)
     assert late_v1.hydrated and late_v1.outcomes[0].reasons == ["SOURCE_EDIT_REQUIRES_REVIEW"]
     v2 = e.process(_source("y", complete=False, revision=2), ParsedPost(actions=[_open_action()]),
                    _tlt(), now=NOW)
     v2_full = e.process(_source("y", complete=True, revision=2), ParsedPost(actions=[_open_action()]),
                         _tlt(), now=NOW)
-    assert v2.outcomes[0].reasons == v2_full.outcomes[0].reasons == ["SOURCE_EDIT_REQUIRES_REVIEW"]
+    assert v2.outcomes[0].reasons == ["SOURCE_EDIT_REQUIRES_REVIEW"]
+    assert v2_full.outcomes[0].reasons == ["SOURCE_EDIT_REQUIRES_REVIEW"]
     assert e.ideas() == []
 
 
@@ -325,7 +328,8 @@ def test_replay_and_journal_close_every_connection(tmp_path, monkeypatch):
     counts = _track_connections(monkeypatch)
     e = PaperEventReplay(tmp_path / "p.sqlite3")
     e.process(_source("a"), ParsedPost(actions=[_open_action()]), _tlt(), now=NOW)
-    e.process(_source("a"), ParsedPost(actions=[_open_action()]), _tlt(), now=NOW)   # duplicate path
+    # second call takes the duplicate path
+    e.process(_source("a"), ParsedPost(actions=[_open_action()]), _tlt(), now=NOW)
     for _ in range(5):
         e.ideas()
         e.outcomes("a")
