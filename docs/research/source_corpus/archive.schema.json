@@ -35,7 +35,7 @@
     "text": {"type": "string", "minLength": 1},
     "text_field": {"enum": ["note", "text"]},
     "text_sha256": {"$ref": "#/$defs/digest"},
-    "text_completeness": {"enum": ["api_body", "repost_wrapper", "uncertain_trailing_ellipsis"]},
+    "text_completeness": {"enum": ["api_body", "repost_wrapper", "truncated_api_text"]},
     "media": {"type": "array", "items": {
       "type": "object", "required": ["media_key", "type", "local_status", "download"],
       "properties": {

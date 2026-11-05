@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import json
 import os
 import re
@@ -88,6 +89,8 @@ def normalize(row: dict, target: dict, digest: str, line: int, media_root: Path)
     body = row["text"]
     if not isinstance(body, str) or not body.strip():
         raise ValueError("authoritative text missing")
+    if not isinstance(row["short_text"], str):
+        raise TypeError("missing API short field")
     if any(type(row[k]) is not bool for k in ("has_note", "is_quote", "is_reply")):
         raise ValueError("invalid source metadata flags")
     refs = row["referenced"]
@@ -101,8 +104,8 @@ def normalize(row: dict, target: dict, digest: str, line: int, media_root: Path)
     repost = "retweeted" in types
     if repost:
         completeness = "repost_wrapper"
-    elif not row["has_note"] and re.search(r"(?:…|\.\.\.)(?:\s+https?://\S+)*\s*$", body):
-        completeness = "uncertain_trailing_ellipsis"
+    elif not row["has_note"] and row["short_text"].rstrip().endswith("…"):
+        completeness = "truncated_api_text"
     else:
         completeness = "api_body"
     return {
@@ -227,12 +230,19 @@ def export(rows: list[dict], dest: Path, repo: Path) -> None:
             tmp.unlink(missing_ok=True)
 
 
-def read_history(path: Path, *, through: datetime | None = None):
+def read_history(path: Path, *, through: datetime | None = None, expected_sha256: str | None = None):
     """Read a chronological export up to and including an optional aware publication time."""
     if through is not None and through.utcoffset() is None:
         raise ValueError("through needs an offset")
     previous = None
-    with path.open(encoding="utf-8") as file:
+    if expected_sha256 is not None:
+        raw = path.read_bytes()
+        if sha256(raw) != expected_sha256:
+            raise ValueError("archive digest mismatch")
+        source = io.BytesIO(raw)
+    else:
+        source = path.open("rb")
+    with source as file:
         for line in file:
             row = json.loads(line)
             if row["schema_version"] != ARCHIVE_VERSION:
@@ -269,6 +279,7 @@ def main() -> None:
         selected = development_rows(rows, args.split_manifest) if args.split_manifest else rows
         export(selected, args.out, Path(__file__).resolve().parents[3])
         summary["exported_records"] = len(selected)
+        summary["export_sha256"] = sha256(args.out.read_bytes())
     print(json.dumps(summary, indent=2))
 
 

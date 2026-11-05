@@ -23,7 +23,7 @@ Use a new output filename for each immutable export. The CLI validates the full 
 | Records / distinct IDs / target authors | 3,189 / 3,189 / 1 |
 | Publication window (UTC) | 2024-06-17 to 2026-11-04 |
 | Long-form API bodies / edited records | 1,367 / 61 |
-| Ordinary or note bodies / possible trailing truncation / repost wrappers | 2,882 / 16 / 291 |
+| Complete author bodies / flagged author truncations / repost wrappers | 2,898 / 0 / 291 |
 | Photo references / locally verified files / recorded 404s | 993 / 991 / 2 |
 | Quote / reply references | 1,601 / 144 |
 | Absent quote / reply / repost targets | 421 / 133 / 287 |
@@ -36,6 +36,6 @@ The full archive is for the corpus curator. The private split assigns 120 develo
 ## Limits
 
 - An authorized backfill records the captured revision's publication time and a historical page-request timestamp. The latter cannot measure live delivery. Live polling and matched app-only authorization use a separate G0 log and the aggregate-only auditor.
-- Earlier text versions of the 61 edited records are unavailable. Reposts can contain only wrapper excerpts. The 16 trailing-ellipsis flags are conservative and include potentially intentional punctuation.
+- Earlier text versions of the 61 edited records are unavailable. Reposts can contain only wrapper excerpts. The core handoff defines a note-less short field ending with a literal Unicode ellipsis as potentially truncated. None of the original-author posts in this capture meets that condition.
 - An absent parent, quote or media file remains absent. A protected-author timeline establishes the timeline identity at collection; it carries no independent community-membership assertion.
 - The golden sequences express source intent as of publication. The holdout has a single annotation pass independent of interpreter output. Broker fills, strategy performance and parser accuracy require separate evidence.

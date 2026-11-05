@@ -5,13 +5,20 @@ import hashlib
 import json
 import subprocess
 import sys
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "docs/research/source_corpus"))
-from archive import development_rows, export, read_history, rows_from_capture, statistics
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "docs/research"))
+from source_corpus.archive import (
+    development_rows,
+    export,
+    read_history,
+    rows_from_capture,
+    statistics,
+)
+from source_corpus.source_reader import historical_inputs
 
 OPEN = "2030-01-01T12:00:00Z"
 LATER = "2030-01-01T12:01:00Z"
@@ -69,13 +76,13 @@ def test_export_round_trip_and_chronological_boundary(store, tmp_path):
 def test_source_completeness_is_separate_from_references_and_media(store):
     repost = record("102", has_note=False, text="RT @example: shortened…",
                     referenced=[{"type": "retweeted", "id": "99"}])
-    uncertain = record("103", has_note=False, text="An ellipsis… https://invalid.example/x")
+    uncertain = record("103", has_note=False, text="Truncated…", short_text="Truncated…")
     unavailable = record("104", is_reply=True, referenced=[{"type": "replied_to", "id": "99"}],
                          media=[{"media_key": "3_100", "type": "photo"}],
                          media_files=[{"status": 404}])
     rows = store(repost, uncertain, unavailable)
     assert [r["text_completeness"] for r in rows] == [
-        "repost_wrapper", "uncertain_trailing_ellipsis", "api_body"]
+        "repost_wrapper", "truncated_api_text", "api_body"]
     assert rows[2]["media"][0]["local_status"] == "unavailable"
 
 
@@ -157,3 +164,50 @@ def test_reader_split_requires_exact_partition_and_positive_dev_clearance(store,
         write(broken)
         with pytest.raises(ValueError):
             development_rows(rows, manifest)
+
+
+def test_interpreter_mapping_eligibility_and_as_of_revision(store, tmp_path):
+    def snowflake(when):
+        millis = int(datetime.fromisoformat(when).timestamp()) * 1000
+        return str((millis - 1288834974657) << 22)
+
+    root, edited_id = snowflake(OPEN), snowflake(LATER)
+    rows = store(record(root), record(edited_id, created_at=LATER,
+                                      edit_history_ids=[root, edited_id]))
+    path = tmp_path / "data" / "test.jsonl"
+    export(rows, path, tmp_path)
+    args = {"expected_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "expected_author_id": "42", "simulated_lag": timedelta(seconds=2)}
+    before_edit = list(historical_inputs(path, through=datetime.fromisoformat(LATER), **args))
+    assert len(before_edit) == 1
+    a, b = list(historical_inputs(path, **args))
+    assert a.as_source_event().source_id == root
+    assert a.as_source_event().text == rows[0]["text"]
+    assert a.as_source_event().source_type == "protected_feed"
+    assert a.replay_source.published_at == b.replay_source.published_at == datetime.fromisoformat(OPEN)
+    assert b.replay_source.source_id == root and b.replay_source.revision == 2
+    assert b.revised_at == datetime.fromisoformat(LATER)
+    assert b.replay_source.received_at == b.revised_at + timedelta(seconds=2)
+    with pytest.raises(ValueError, match="legacy"):
+        b.as_source_event()
+    for overrides, reason in (({"expected_author_id": "666"}, "author"),
+                              ({"expected_sha256": "f" * 64}, "digest"),
+                              ({"simulated_lag": timedelta(seconds=-1)}, "nonnegative")):
+        with pytest.raises(ValueError, match=reason):
+            list(historical_inputs(path, **(args | overrides)))
+
+
+def test_reposts_and_truncation_never_exposed_to_legacy_event(store, tmp_path):
+    rows = store(record("102", referenced=[{"id": "99", "type": "retweeted"}]),
+                 record("103", has_note=False, short_text="Cut…", text="Cut…"),
+                 record("104", has_note=False, short_text="A full thought... https://example.invalid",
+                        text="A full thought... https://example.invalid"))
+    path = tmp_path / "data" / "inputs.jsonl"
+    export(rows, path, tmp_path)
+    events = list(historical_inputs(path, expected_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+                                    simulated_lag=timedelta(0), expected_author_id="42"))
+    for e in events[:2]:
+        assert not e.replay_source.complete_text
+        with pytest.raises(ValueError, match="legacy"):
+            e.as_source_event()
+    assert events[2].as_source_event().source_id == "104"
