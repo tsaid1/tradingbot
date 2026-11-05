@@ -257,7 +257,8 @@ def test_truncated_post_holds_then_completes_exactly_once(tmp_path):
     tampered = e.process(_source("t", complete=True, post_hash="c" * 64),
                          ParsedPost(actions=[_open_action()]),
                          _tlt(), now=NOW)
-    assert tampered.duplicate and tampered.outcomes[0].reasons == ["SOURCE_HASH_CHANGED_WITHOUT_REVISION"]
+    assert tampered.duplicate
+    assert tampered.outcomes[0].reasons == ["SOURCE_HASH_CHANGED_WITHOUT_REVISION"]
     assert e.ideas()[0]["quantity"] == 1
 
 
