@@ -7,13 +7,12 @@ from the ingest adapter, never from model output. Paid post text is NOT stored h
 from __future__ import annotations
 
 from datetime import datetime
-from decimal import Decimal
 from enum import Enum
 from typing import Literal
 
 from pydantic import Field, model_validator
 
-from tradingbot.models import Action, Instrument, PositionSide, StrictModel
+from tradingbot.models import Action, Instrument, MockPolicy, PositionSide, StrictModel
 
 
 class Timing(str, Enum):
@@ -82,19 +81,9 @@ class ReplaySource(StrictModel):
     post_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
-class ReplayPolicy(StrictModel):
-    """Fictional paper-only limits, never a substitute for broker policy."""
-    paper_only: Literal[True] = True
-    allowed_symbols: set[str] = Field(default_factory=lambda: {"TLT"})
-    quantity_per_open: int = Field(default=2, ge=1, le=100)
-    quantity_per_add: int = Field(default=1, ge=1, le=100)
-    max_notional_usd: Decimal = Field(default=Decimal("20000"), gt=0)
-    max_deviation_pct: Decimal = Field(default=Decimal("1.0"), ge=0, le=20)
-    max_spread_pct: Decimal = Field(default=Decimal("1.0"), ge=0, le=20)
-    max_source_age_seconds: int = Field(default=90, ge=1)
-    max_quote_age_seconds: int = Field(default=30, ge=1)
-    require_stop_on_open: bool = True
-    allow_stop_widening: Literal[False] = False
+# One policy contract for every engine. The Sprint 1.1 name is kept so existing callers
+# and tests keep working; risk parameters and defaults are defined once, in models.MockPolicy.
+ReplayPolicy = MockPolicy
 
 
 class PaperOrder(StrictModel):
@@ -120,4 +109,6 @@ class ReplayResult(StrictModel):
     source_id: str
     revision: int
     duplicate: bool = False
+    # True when this pass evaluated the complete text of a post first received truncated.
+    hydrated: bool = False
     outcomes: list[ActionOutcome] = Field(default_factory=list)

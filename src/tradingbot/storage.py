@@ -4,8 +4,8 @@ This is purposely NOT a production order router. All fills are fictional.
 """
 from __future__ import annotations
 
+from contextlib import closing
 from datetime import datetime, timezone
-from decimal import Decimal
 from pathlib import Path
 import sqlite3
 
@@ -13,14 +13,14 @@ from tradingbot.models import (
     Action, Decision, MockOrder, MockPolicy, Position, PositionSide,
     ProcessResult, Quote, SignalCandidate, SourceEvent,
 )
-from tradingbot.validator import validate
+from tradingbot.validator import fill_quantity, validate
 
 
 class Journal:
     def __init__(self, path: str | Path):
         self.path = str(path)
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-        with self.connect() as c:
+        with closing(self.connect()) as c, c:
             c.executescript("""
                 PRAGMA journal_mode=WAL;
                 CREATE TABLE IF NOT EXISTS events (
@@ -45,13 +45,14 @@ class Journal:
             """)
 
     def connect(self) -> sqlite3.Connection:
+        """Open a connection. Callers close it (see `closing(...)` below); nothing is left to GC."""
         c = sqlite3.connect(self.path, timeout=10.0)
         c.row_factory = sqlite3.Row
         c.execute("PRAGMA busy_timeout=10000")
         return c
 
     def reserve(self, event: SourceEvent) -> bool:
-        with self.connect() as c:
+        with closing(self.connect()) as c, c:
             c.execute("BEGIN IMMEDIATE")
             cur = c.execute(
                 """INSERT OR IGNORE INTO events
@@ -67,7 +68,7 @@ class Journal:
     def position(self, idea_id: str | None) -> Position | None:
         if not idea_id:
             return None
-        with self.connect() as c:
+        with closing(self.connect()) as c, c:
             row = c.execute("SELECT * FROM positions WHERE idea_id = ?", (idea_id,)).fetchone()
         return Position.model_validate(dict(row)) if row else None
 
@@ -79,7 +80,7 @@ class Journal:
         policy: MockPolicy,
     ) -> ProcessResult:
         """Re-check preflight under a SQLite writer lock; then apply fictional fill atomically."""
-        with self.connect() as c:
+        with closing(self.connect()) as c, c:
             c.execute("BEGIN IMMEDIATE")
             row = c.execute("SELECT status FROM events WHERE source_id=?", (source.source_id,)).fetchone()
             if row is None or row["status"] != "RECEIVED":
@@ -96,7 +97,7 @@ class Journal:
                 assert candidate.instrument is not None and quote is not None
                 if candidate.action == Action.OPEN:
                     assert candidate.side is not None
-                    qty = policy.quantity
+                    qty = fill_quantity(Action.OPEN, policy, None)
                     side = "BUY" if candidate.side == PositionSide.LONG else "SELL"
                     idea_id = source.source_id
                     c.execute(
@@ -108,9 +109,7 @@ class Journal:
                     assert position is not None
                     idea_id = position.idea_id
                     side = "SELL" if position.side == PositionSide.LONG else "BUY"
-                    qty = position.quantity
-                    if candidate.action == Action.REDUCE:
-                        qty = int(Decimal(position.quantity) * Decimal(candidate.close_fraction or "0"))
+                    qty = fill_quantity(candidate.action, policy, position, candidate.close_fraction)
                     remaining = position.quantity - qty
                     if remaining == 0:
                         c.execute("DELETE FROM positions WHERE idea_id=?", (idea_id,))
@@ -138,7 +137,7 @@ class Journal:
         return ProcessResult(source_id=source.source_id, candidate=candidate, decision=decision, order=order)
 
     def mark_error(self, source_id: str, message: str):
-        with self.connect() as c:
+        with closing(self.connect()) as c, c:
             c.execute(
                 "UPDATE events SET status='ERROR',decision_json=? WHERE source_id=? AND status='RECEIVED'",
                 (Decision(status="BLOCK", reasons=["INTERPRETER_ERROR", message[:300]]).model_dump_json(),
@@ -146,7 +145,7 @@ class Journal:
             )
 
     def recent_events(self, limit: int = 50) -> list[dict]:
-        with self.connect() as c:
+        with closing(self.connect()) as c, c:
             rows = c.execute(
                 """SELECT source_id,provider,status,source_text,published_at,decision_json,order_json
                 FROM events ORDER BY created_at DESC LIMIT ?""", (limit,)
@@ -154,6 +153,6 @@ class Journal:
         return [dict(r) for r in rows]
 
     def positions(self) -> list[dict]:
-        with self.connect() as c:
+        with closing(self.connect()) as c, c:
             rows = c.execute("SELECT * FROM positions ORDER BY idea_id").fetchall()
         return [dict(r) for r in rows]

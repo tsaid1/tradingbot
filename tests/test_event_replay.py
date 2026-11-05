@@ -54,6 +54,8 @@ def open_tlt(aid="open", *, side=PositionSide.LONG):
 
 
 def replay(tmp_path, **kw):
+    # These scenarios were written for a 2-unit opening size; the shared MockPolicy default is 1.
+    kw.setdefault("quantity_per_open", 2)
     return PaperEventReplay(tmp_path / "paper.sqlite3", ReplayPolicy(**kw))
 
 

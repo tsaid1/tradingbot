@@ -44,3 +44,16 @@ failures MUST automatically block unsafe new submissions (not discretionary stra
 Eventual target: ordinary publication-to-broker acknowledgement ~10–15 seconds.
 Source delay is not controllable; measure publication, receipt, parse, preflight,
 submission, ack, first fill and protection confirmation independently.
+
+## ADR-009 — One authorization gateway, one policy contract
+
+`src/tradingbot/validator.py` is the sole deterministic authorization gateway.
+`gate_source()` applies provenance rules to a whole post and `gate_action()` applies
+per-action preflight to the Sprint 1.1 `TradeAction` schema; `validate()` is a
+compatibility wrapper that lifts a Sprint 1 `SignalCandidate` into that schema and
+translates the canonical result (APPROVE / HOLD / BLOCK / NO_TRADE / RECONCILE) to the
+legacy `Decision` vocabulary. Engines (`storage.Journal`, `event_replay.PaperEventReplay`)
+are coordinators: they sequence calls, keep linked actions atomic, enforce once-only
+processing and apply fictional fills sized by `fill_quantity()`. Risk parameters and
+defaults live only in `models.MockPolicy`; `ReplayPolicy` is the same class. No LLM-facing
+schema carries a quantity, venue or account. Equivalence of both paths is a regression test.
