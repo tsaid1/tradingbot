@@ -55,6 +55,12 @@ The two price-role defects are real interpreter bugs found by the evaluation. Th
 
 All four misses are lexicon gaps that a handful of deterministic patterns close at zero cost and with no new failure surface, and no miss is a context or reasoning failure. The verdict stands until the development-set baseline shows misses that are not phrasing gaps (for instance, instructions whose meaning depends on the quoted post or on a chart). The decision rule proposed for that baseline: an LLM second pass is justified only if, after the measured phrasing gaps are added to the lexicon, the remaining executable-instruction recall is below 90% **and** the residual misses are semantic rather than lexical. A second pass would also have to send paid text to an external model, which remains blocked until the publisher's permission is recorded (spec D-07).
 
+## 2b. Price convention and the private baseline
+
+**Price convention (product decision, 5 November 2026).** A quoted current market price in a post is a REFERENCE by default. Only explicit execution language ("at", "entry", "buying at", a level line labelled entry) establishes an entry reference. An indicative quote is never treated as a publisher fill, so an entry instruction that quotes only the market price has no entry reference and fails closed at the gateway (`OPEN_ENTRY_PRICE_MISSING`).
+
+**Real development baseline.** The unmodified interpreter was run over the Source Agent's verified 120-post development export as a label-free census (the bundle carries one smoke label, so precision and recall are not yet computable). Headline, aggregates only: 0 executable candidates and 0 opening instructions recognised in 120 posts. The per-post census, the failure analysis and the publisher-specific phrasing patterns are kept in the private bundle, not in this repository; only generic parsing improvements are published (draft PR stacked on this branch), and publisher-specific phrasings can be supplied at runtime through `LexiconExtension` from a private file. Scored precision/recall follows once the 120 development labels and the four golden specs arrive.
+
 ## 3. Intake contract for the development export
 
 The Source Agent delivers the 120-post development split as a JSONL export (lines are `SourcePost` dicts, schema 1.2, or raw G0 records) plus a manifest sidecar:
