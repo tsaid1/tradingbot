@@ -1,0 +1,210 @@
+{
+ "name": "Staged partial exits (shape of April 2025)",
+ "policy": {
+  "quantity": 8,
+  "max_notional_usd": "5000"
+ },
+ "quotes": {
+  "s1": {
+   "GLD": "280.00"
+  },
+  "s2": {
+   "GLD": "292.00"
+  },
+  "s3": {
+   "GLD": "298.00"
+  },
+  "s4": {
+   "GLD": "301.00"
+  },
+  "s5": {
+   "GLD": "305.00"
+  },
+  "s6": {
+   "GLD": "305.00"
+  }
+ },
+ "lag_seconds": 0.0,
+ "posts": [
+  {
+   "schema_version": "1.2",
+   "source_id": "s1",
+   "post_id": "s1",
+   "revision": 1,
+   "author_id": "SYNTH",
+   "verified_author": true,
+   "text": "We are now long $GLD at $280.00 with a stop at $270.00 and a target of $310.00.",
+   "text_complete": true,
+   "is_repost": false,
+   "published_at": "2026-10-01T14:30:00Z",
+   "revised_at": null,
+   "received_at": "2026-10-01T14:30:00Z",
+   "provenance": "SYNTHETIC",
+   "conversation_id": null,
+   "links": [],
+   "media": []
+  },
+  {
+   "schema_version": "1.2",
+   "source_id": "s2",
+   "post_id": "s2",
+   "revision": 1,
+   "author_id": "SYNTH",
+   "verified_author": true,
+   "text": "Taking profits on a quarter of our $GLD long at $292.00.",
+   "text_complete": true,
+   "is_repost": false,
+   "published_at": "2026-10-04T14:30:00Z",
+   "revised_at": null,
+   "received_at": "2026-10-04T14:30:00Z",
+   "provenance": "SYNTHETIC",
+   "conversation_id": null,
+   "links": [],
+   "media": []
+  },
+  {
+   "schema_version": "1.2",
+   "source_id": "s3",
+   "post_id": "s3",
+   "revision": 1,
+   "author_id": "SYNTH",
+   "verified_author": true,
+   "text": "Selling half of our remaining $GLD long at $298.00.",
+   "text_complete": true,
+   "is_repost": false,
+   "published_at": "2026-10-06T14:30:00Z",
+   "revised_at": null,
+   "received_at": "2026-10-06T14:30:00Z",
+   "provenance": "SYNTHETIC",
+   "conversation_id": null,
+   "links": [],
+   "media": []
+  },
+  {
+   "schema_version": "1.2",
+   "source_id": "s4",
+   "post_id": "s4",
+   "revision": 1,
+   "author_id": "SYNTH",
+   "verified_author": true,
+   "text": "Taking profits on a third of our $GLD long at $301.00.",
+   "text_complete": true,
+   "is_repost": false,
+   "published_at": "2026-10-08T14:30:00Z",
+   "revised_at": null,
+   "received_at": "2026-10-08T14:30:00Z",
+   "provenance": "SYNTHETIC",
+   "conversation_id": null,
+   "links": [],
+   "media": []
+  },
+  {
+   "schema_version": "1.2",
+   "source_id": "s5",
+   "post_id": "s5",
+   "revision": 1,
+   "author_id": "SYNTH",
+   "verified_author": true,
+   "text": "Closing the rest of our $GLD long at $305.00.",
+   "text_complete": true,
+   "is_repost": false,
+   "published_at": "2026-10-11T14:30:00Z",
+   "revised_at": null,
+   "received_at": "2026-10-11T14:30:00Z",
+   "provenance": "SYNTHETIC",
+   "conversation_id": null,
+   "links": [],
+   "media": []
+  },
+  {
+   "schema_version": "1.2",
+   "source_id": "s6",
+   "post_id": "s6",
+   "revision": 1,
+   "author_id": "SYNTH",
+   "verified_author": true,
+   "text": "We took profits on $GLD three times in April for an average gain of +8%.",
+   "text_complete": true,
+   "is_repost": false,
+   "published_at": "2026-10-14T02:30:00Z",
+   "revised_at": null,
+   "received_at": "2026-10-14T02:30:00Z",
+   "provenance": "SYNTHETIC",
+   "conversation_id": null,
+   "links": [],
+   "media": []
+  }
+ ],
+ "steps": [
+  {
+   "source_id": "s1",
+   "statuses": [
+    "SIMULATED"
+   ],
+   "orders": [
+    {
+     "side": "BUY",
+     "quantity": 8
+    }
+   ],
+   "classes": null
+  },
+  {
+   "source_id": "s2",
+   "statuses": [
+    "SIMULATED"
+   ],
+   "orders": [
+    {
+     "side": "SELL",
+     "quantity": 2
+    }
+   ],
+   "classes": null
+  },
+  {
+   "source_id": "s3",
+   "statuses": [
+    "SIMULATED"
+   ],
+   "orders": [
+    {
+     "side": "SELL",
+     "quantity": 3
+    }
+   ],
+   "classes": null
+  },
+  {
+   "source_id": "s4",
+   "statuses": [
+    "HOLD"
+   ],
+   "orders": [],
+   "classes": null
+  },
+  {
+   "source_id": "s5",
+   "statuses": [
+    "SIMULATED"
+   ],
+   "orders": [
+    {
+     "side": "SELL",
+     "quantity": 3
+    }
+   ],
+   "classes": null
+  },
+  {
+   "source_id": "s6",
+   "statuses": [
+    "RECONCILE"
+   ],
+   "orders": [],
+   "classes": [
+    "RETROSPECTIVE"
+   ]
+  }
+ ]
+}
