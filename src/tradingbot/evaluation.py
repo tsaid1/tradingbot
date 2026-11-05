@@ -8,15 +8,17 @@ text; reports carry aggregates, IDs and failure codes only.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 from collections import Counter, defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+from typing import Literal
 
-from pydantic import Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from tradingbot.event_models import TradeAction, Timing
 from tradingbot.event_replay import PaperEventReplay
@@ -75,9 +77,94 @@ def load_labels(path: Path) -> dict[str, LabeledPost]:
 
 
 def load_posts(path: Path, *, expected_author_id: str | None = None) -> list[SourcePost]:
-    """JSONL of SourcePost dicts (schema 1.2) or raw G0 records."""
+    """JSONL of SourcePost dicts (schema 1.2) or raw G0 records. Unverified; for synthetic data."""
     items = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
     return coerce_source_posts(items, expected_author_id=expected_author_id)
+
+
+# ----------------------------------------------------------------------------- development export intake
+
+class ExportManifest(BaseModel):
+    """Sidecar the Source Agent ships with an export. Unknown keys are ignored so the agent may add
+    its own metadata; the keys below are what the consumer checks."""
+    model_config = ConfigDict(extra="ignore")
+    split: Literal["development", "holdout", "synthetic"]
+    post_count: int | None = None
+    sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    labels_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    source: str = ""
+
+
+def sha256_of(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def verify_sha256(path: Path, expected: str | None) -> str:
+    actual = sha256_of(path)
+    if expected is not None and actual != expected.lower():
+        raise ValueError(f"Checksum mismatch for {path.name}: expected {expected[:12]}…, got {actual[:12]}…")
+    return actual
+
+
+def load_export(export: Path, *, manifest: Path | None = None, sha256: str | None = None,
+                expected_author_id: str | None = None, allow_holdout: bool = False,
+                require_checksum: bool = True) -> tuple[list[SourcePost], dict]:
+    """Read a Source Agent export (JSONL of SourcePost dicts or G0 records) with integrity and
+    split checks: the file digest must match the manifest and/or the given value, the manifest
+    split must not be the holdout (unless explicitly allowed, final evaluation only), and the
+    declared post count must match the file."""
+    info: dict = {"export": export.name}
+    declared: ExportManifest | None = None
+    if manifest is not None:
+        declared = ExportManifest.model_validate_json(manifest.read_text())
+        info.update({"split": declared.split, "manifest": manifest.name, "source": declared.source})
+        if declared.split == "holdout" and not allow_holdout:
+            raise ValueError("Refusing the holdout split: it is reserved for the final evaluation")
+        if sha256 is not None and declared.sha256 is not None and sha256.lower() != declared.sha256:
+            raise ValueError("The given checksum disagrees with the manifest")
+    expected = sha256.lower() if sha256 else (declared.sha256 if declared else None)
+    if expected is None and require_checksum:
+        raise ValueError("A checksum is required for a real export (manifest sha256 or --sha256)")
+    info["sha256"] = verify_sha256(export, expected)
+    lines = [line for line in export.read_text().splitlines() if line.strip()]
+    if declared is not None and declared.post_count is not None and declared.post_count != len(lines):
+        raise ValueError(f"Manifest declares {declared.post_count} posts, export has {len(lines)}")
+    posts = coerce_source_posts([json.loads(line) for line in lines], expected_author_id=expected_author_id)
+    info["posts"] = len(posts)
+    return posts, info
+
+
+def coerce_reader_arg(value: str):
+    """Reader arguments arrive as strings on the command line; ISO-8601 timestamps and integers
+    are converted so `historical_inputs(start=..., limit=...)` receives typed values."""
+    if value.isdigit():
+        return int(value)
+    if "T" in value and value[:4].isdigit():
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+        except ValueError:
+            return value
+    return value
+
+
+def parse_reader_args(pairs: Iterable[str]) -> dict:
+    out: dict = {}
+    for pair in pairs:
+        if "=" not in pair:
+            raise ValueError(f"Reader argument must be key=value, got {pair!r}")
+        key, value = pair.split("=", 1)
+        out[key.strip()] = coerce_reader_arg(value.strip())
+    return out
+
+
+def posts_from_adapter(historical_inputs, reader_args: dict, *, expected_author_id: str | None = None) -> list[SourcePost]:
+    """Call the Source Agent's adapter with its own reader arguments and normalise the result."""
+    return coerce_source_posts(historical_inputs(**reader_args), expected_author_id=expected_author_id)
 
 
 # ----------------------------------------------------------------------------- scoring primitives
@@ -278,7 +365,7 @@ def evaluate(posts: Iterable[SourcePost], labels: dict[str, LabeledPost], *, dat
     advance the context. Posts without a label are interpreted (they shape the context) but not
     scored."""
     it = interpreter or TklInterpreter()
-    ordered = sorted(posts, key=lambda p: (p.published_at, p.revision, p.post_id))
+    ordered = sorted(posts, key=lambda p: (p.available_at, p.revision, p.post_id))
     post_exec, post_instr, action_pr = PR(), PR(), PR()
     by_type: dict[str, PR] = defaultdict(PR)
     class_hits = tense_hits = matched = 0
@@ -482,9 +569,9 @@ def run_golden(spec: GoldenReplay, posts_by_id: dict[str, SourcePost], db_path: 
     it = TklInterpreter()
     mismatches: list[str] = []
     results = {}
-    for post in sorted(posts, key=lambda p: (p.published_at, p.revision, p.post_id)):
+    for post in sorted(posts, key=lambda p: (p.available_at, p.revision, p.post_id)):
         interpreted = it.interpret(post)
-        now = post.received_at if post.is_live else post.published_at + timedelta(seconds=spec.lag_seconds)
+        now = post.received_at if post.is_live else post.available_at + timedelta(seconds=spec.lag_seconds)
         quotes = {sym: Quote(symbol=sym, bid=Decimal(mid) - Decimal("0.05"), ask=Decimal(mid) + Decimal("0.05"), observed_at=now)
                   for sym, mid in spec.quotes.get(post.source_id, {}).items()}
         result = coordinator.process(post.to_replay_source(), group_linked_actions(interpreted), quotes, now=now)
