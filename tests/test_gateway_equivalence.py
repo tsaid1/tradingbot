@@ -239,19 +239,23 @@ def _tlt(bid="99.95", ask="100.05", at=NOW):
 
 def test_truncated_post_holds_then_completes_exactly_once(tmp_path):
     e = PaperEventReplay(tmp_path / "p.sqlite3")
-    held = e.process(_source("t", complete=False), ParsedPost(actions=[_open_action()]), _tlt(), now=NOW)
+    held = e.process(_source("t", complete=False),
+                     ParsedPost(actions=[_open_action()]), _tlt(), now=NOW)
     assert held.outcomes[0].status == "HOLD" and held.outcomes[0].reasons == ["SOURCE_TEXT_TRUNCATED"]
     assert not held.hydrated and e.ideas() == []
     # Same source_id and revision, complete text (different hash): evaluated once as hydration
-    done = e.process(_source("t", complete=True), ParsedPost(actions=[_open_action()]), _tlt(), now=NOW)
+    done = e.process(_source("t", complete=True),
+                     ParsedPost(actions=[_open_action()]), _tlt(), now=NOW)
     assert done.hydrated and not done.duplicate and done.outcomes[0].status == "SIMULATED"
     assert e.ideas()[0]["quantity"] == 1
     # Replaying the complete post is a duplicate that returns the hydrated outcomes, no second fill
-    again = e.process(_source("t", complete=True), ParsedPost(actions=[_open_action()]), _tlt(), now=NOW)
+    again = e.process(_source("t", complete=True),
+                      ParsedPost(actions=[_open_action()]), _tlt(), now=NOW)
     assert again.duplicate and again.outcomes[0].status == "SIMULATED" and e.ideas()[0]["quantity"] == 1
     assert [o.status for o in e.outcomes("t")] == ["SIMULATED"]
     # Any further content change under the same revision is blocked: the row is sealed
-    tampered = e.process(_source("t", complete=True, post_hash="c" * 64), ParsedPost(actions=[_open_action()]),
+    tampered = e.process(_source("t", complete=True, post_hash="c" * 64),
+                         ParsedPost(actions=[_open_action()]),
                          _tlt(), now=NOW)
     assert tampered.duplicate and tampered.outcomes[0].reasons == ["SOURCE_HASH_CHANGED_WITHOUT_REVISION"]
     assert e.ideas()[0]["quantity"] == 1
@@ -276,7 +280,8 @@ def test_hydration_does_not_bypass_edit_or_revision_protection(tmp_path):
     assert late_v1.hydrated and late_v1.outcomes[0].reasons == ["SOURCE_EDIT_REQUIRES_REVIEW"]
     v2 = e.process(_source("y", complete=False, revision=2), ParsedPost(actions=[_open_action()]),
                    _tlt(), now=NOW)
-    v2_full = e.process(_source("y", complete=True, revision=2), ParsedPost(actions=[_open_action()]),
+    v2_full = e.process(_source("y", complete=True, revision=2),
+                        ParsedPost(actions=[_open_action()]),
                         _tlt(), now=NOW)
     assert v2.outcomes[0].reasons == ["SOURCE_EDIT_REQUIRES_REVIEW"]
     assert v2_full.outcomes[0].reasons == ["SOURCE_EDIT_REQUIRES_REVIEW"]
