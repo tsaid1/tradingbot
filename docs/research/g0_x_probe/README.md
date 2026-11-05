@@ -55,7 +55,23 @@ Long posts: most publisher posts exceed 280 characters, so the probe requests th
 
 A 401 or 403 on the user-token timeline is a **FAIL** for route B (official X API) and means the publisher-feed path (route A in the spec) is the only remaining option. Also watch whether the subscriber's follow is revoked during or after the run; that is a contractual signal, not a technical one.
 
-## 5. Record the result
+## 5. Build the evaluation corpus (backfill)
+
+The same endpoint pages backwards through the account's most recent 3,200 posts, 100 per call, so one session yields years of history with full text, timestamps, media URLs, quote links and edit history:
+
+```bash
+python docs/research/g0_x_probe/x_probe.py backfill --start-time 2025-01-01T00:00:00Z --download-media
+python docs/research/g0_x_probe/x_probe.py corpus data/g0/corpus/posts_<timestamp>.jsonl
+```
+
+- Output: `data/g0/corpus/posts_<timestamp>.jsonl`, one full post per line, plus chart images under `data/g0/corpus/media/` when `--download-media` is set. **This is paid publisher content stored locally for personal evaluation only. It is git-ignored; never commit or share it.**
+- Cost: about $0.005 per post read, so the full 3,200-post window is roughly $16. 32 pages at the default one-second pause takes under a minute.
+- Interrupted or capped runs resume with `--resume`; `--max-posts` and `--until-id` bound a run; `--start-time` / `--end-time` take ISO-8601 UTC.
+- The `corpus` summary reports posts per month, how many carried media, long bodies, quotes, replies and edits, and the author IDs seen (expect exactly one: the target).
+
+Run `backfill` after `lookup` and before or after `poll`; it is the quickest confirmation that protected posts come through at all.
+
+## 6. Record the result
 
 Write the `report` output and the key observations into `docs/research/G0_RESULTS.md`. Do not commit anything from `data/g0/`.
 

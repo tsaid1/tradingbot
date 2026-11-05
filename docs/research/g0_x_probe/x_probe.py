@@ -11,11 +11,15 @@ What it does
   controls  Bearer-token timeline call and user-token recent search (both expected to fail
             or return nothing for a protected account).
   report    Summarise a poll log against the G0 pass/fail criteria.
+  backfill  Page backwards through the target's timeline (up to X's 3,200-post window) and
+            store FULL posts locally for corpus building. Resumable. Optional chart download.
+  corpus    Summarise a backfill corpus: posts per month, media, long bodies, quotes, replies.
 
 What it stores
-  By default NO post text: only a SHA-256 of the text and its length, plus IDs, timestamps,
-  lag, media presence and edit-history counts. Pass --keep-text only for a short manual
-  inspection and never commit the output. Everything lands under data/g0/ (git-ignored).
+  poll stores NO post text by default: only a SHA-256 of the text and its length, plus IDs,
+  timestamps, lag, media presence and edit-history counts. backfill is the exception: its
+  purpose is a local evaluation corpus, so it stores full text and media under data/g0/corpus/.
+  Everything lands under data/g0/ (git-ignored). Never commit any of it; it is paid content.
 """
 from __future__ import annotations
 
@@ -343,6 +347,22 @@ def timeline_params(since_id: str | None, max_results: int, naming: str = "tweet
     return params
 
 
+def timeline_get(user_id: str, params_for: "callable", token: str, naming: str) -> tuple[int, dict, dict, float, str]:
+    """GET the user timeline; on a 400 about field naming, retry once with the other scheme."""
+    status, headers, body, elapsed = api_get(f"/users/{user_id}/tweets", params_for(naming), token)
+    if status == 400 and naming == "tweet" and looks_like_field_naming_error(body):
+        naming = "post"
+        print("400 on tweet.fields naming; retrying with post.fields naming")
+        status, headers, body, elapsed = api_get(f"/users/{user_id}/tweets", params_for(naming), token)
+    return status, headers, body, elapsed, naming
+
+
+def sleep_for_rate_limit(reset: int | None) -> None:
+    wait = max(1.0, (reset or time.time() + 60) - time.time() + 1)
+    print(f"Rate limited; sleeping {wait:.0f}s until reset")
+    time.sleep(min(wait, 900))
+
+
 def cmd_poll(args: argparse.Namespace) -> None:
     target = load_target()
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -356,13 +376,8 @@ def cmd_poll(args: argparse.Namespace) -> None:
                               "keep_text": args.keep_text, "started": datetime.now(timezone.utc).isoformat()}) + "\n")
         while time.monotonic() < deadline:
             observed = datetime.now(timezone.utc)
-            status, headers, body, elapsed = api_get(f"/users/{target['id']}/tweets",
-                                                     timeline_params(since_id, args.max_results, naming), user_token())
-            if status == 400 and naming == "tweet" and looks_like_field_naming_error(body):
-                naming = "post"
-                print("400 on tweet.fields naming; retrying with post.fields naming")
-                status, headers, body, elapsed = api_get(f"/users/{target['id']}/tweets",
-                                                         timeline_params(since_id, args.max_results, naming), user_token())
+            status, headers, body, elapsed, naming = timeline_get(
+                target["id"], lambda nm: timeline_params(since_id, args.max_results, nm), user_token(), naming)
             remaining, reset = rate_info(headers)
             media_by_key = {m.get("media_key"): m for m in (body.get("includes") or {}).get("media", [])}
             posts = [redact_post(p, media_by_key, observed, args.keep_text) for p in body.get("data", [])]
@@ -384,16 +399,148 @@ def cmd_poll(args: argparse.Namespace) -> None:
             since_id = newest_id(since_id, [p["id"] for p in posts if p.get("id")])
             print(f"{observed.strftime('%H:%M:%S')} status={status} posts={len(posts)} remaining={remaining} "
                   f"lag_med={statistics.median([p['lag_s'] for p in posts]) if posts else '-'}")
-            if status == 429 and reset:
-                wait = max(1.0, reset - time.time() + 1)
-                print(f"Rate limited; sleeping {wait:.0f}s until reset")
-                time.sleep(min(wait, 900))
+            if status == 429:
+                sleep_for_rate_limit(reset)
             elif status in (401, 403):
                 print("Auth or permission failure; stopping. This is a G0 FAIL signal if the token is the subscriber's.")
                 break
             else:
                 time.sleep(args.interval)
     print(f"Done. Summarise with: x_probe.py report {log_path}")
+
+
+MEDIA_EXT = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp", "image/gif": ".gif"}
+
+
+def corpus_record(post: dict, media_by_key: dict[str, dict], observed_at: datetime) -> dict:
+    """Full local record for corpus building (paid content: local only)."""
+    note = post.get("note_tweet") or post.get("note_post") or {}
+    media_keys = (post.get("attachments") or {}).get("media_keys", []) or []
+    refs = post.get("referenced_tweets") or []
+    return {
+        "id": post.get("id"), "author_id": post.get("author_id"), "created_at": post.get("created_at"),
+        "conversation_id": post.get("conversation_id"),
+        "text": note.get("text") or post.get("text", ""), "has_note": bool(note.get("text")),
+        "short_text": post.get("text", ""),
+        "referenced": [{"type": r.get("type"), "id": r.get("id")} for r in refs],
+        "is_reply": bool(post.get("in_reply_to_user_id")) or any(r.get("type") == "replied_to" for r in refs),
+        "is_quote": any(r.get("type") == "quoted" for r in refs),
+        "edit_history_ids": post.get("edit_history_tweet_ids") or [],
+        "media": [media_by_key.get(k, {"media_key": k}) for k in media_keys],
+        "observed_at": observed_at.isoformat(),
+    }
+
+
+def corpus_summary(records: list[dict]) -> dict:
+    by_month: dict[str, int] = {}
+    for r in records:
+        month = (r.get("created_at") or "")[:7] or "unknown"
+        by_month[month] = by_month.get(month, 0) + 1
+    ids = {r.get("id") for r in records if r.get("id")}
+    created = sorted(r["created_at"] for r in records if r.get("created_at"))
+    return {
+        "posts": len(records), "unique_ids": len(ids),
+        "oldest": created[0] if created else None, "newest": created[-1] if created else None,
+        "by_month": dict(sorted(by_month.items())),
+        "with_media": sum(1 for r in records if r.get("media")),
+        "with_long_body": sum(1 for r in records if r.get("has_note")),
+        "quotes": sum(1 for r in records if r.get("is_quote")),
+        "replies": sum(1 for r in records if r.get("is_reply")),
+        "edited": sum(1 for r in records if len(r.get("edit_history_ids") or []) > 1),
+        "authors": sorted({r.get("author_id") for r in records if r.get("author_id")}),
+    }
+
+
+def download_media(media: dict, dest_dir: Path, token: str) -> dict:
+    url = media.get("url") or media.get("preview_image_url")
+    if not url:
+        return {"skipped": "no_url"}
+    key = media.get("media_key", "media")
+    existing = next(dest_dir.glob(f"{key}.*"), None)
+    if existing:
+        return {"file": existing.name, "cached": True}
+    status, headers, raw, _ = http("GET", url, headers={"Authorization": f"Bearer {token}"})
+    if status != 200:
+        status, headers, raw, _ = http("GET", url)  # media host may not want the API token
+    if status != 200:
+        return {"status": status}
+    ext = MEDIA_EXT.get((headers.get("content-type") or "").split(";")[0].strip(), ".bin")
+    path = dest_dir / f"{key}{ext}"
+    path.write_bytes(raw)
+    return {"file": path.name, "bytes": len(raw), "status": status}
+
+
+def cmd_backfill(args: argparse.Namespace) -> None:
+    target = load_target()
+    corpus_dir = DATA_DIR / "corpus"
+    media_dir = corpus_dir / "media"
+    corpus_dir.mkdir(parents=True, exist_ok=True)
+    state_path = corpus_dir / "backfill_state.json"
+    state = json.loads(state_path.read_text()) if (args.resume and state_path.exists()) else {}
+    next_token = args.pagination_token or state.get("next_token")
+    out_path = Path(state["out"]) if state.get("out") else corpus_dir / f"posts_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.jsonl"
+    fetched = state.get("fetched", 0)
+    naming = state.get("naming", "tweet")
+    print(f"Backfilling @{target.get('username')} (id {target['id']}) -> {out_path}"
+          + (f" resuming at token {next_token[:12]}..." if next_token else "")
+          + f"; window start={args.start_time or '-'} end={args.end_time or '-'} max_posts={args.max_posts}")
+    print("NOTE: this stores full post text (paid content) locally under data/g0/. Never commit it.")
+
+    def params_for(nm: str) -> dict:
+        params = timeline_params(None, 100, nm)
+        if args.start_time:
+            params["start_time"] = args.start_time
+        if args.end_time:
+            params["end_time"] = args.end_time
+        if args.until_id:
+            params["until_id"] = args.until_id
+        if next_token:
+            params["pagination_token"] = next_token
+        return params
+
+    pages = 0
+    with out_path.open("a") as out:
+        while True:
+            observed = datetime.now(timezone.utc)
+            status, headers, body, elapsed, naming = timeline_get(target["id"], params_for, user_token(), naming)
+            remaining, reset = rate_info(headers)
+            if status == 429:
+                sleep_for_rate_limit(reset)
+                continue
+            if status != 200:
+                print(f"Stopped: HTTP {status} {json.dumps(body)[:300]}")
+                break
+            media_by_key = {m.get("media_key"): m for m in (body.get("includes") or {}).get("media", [])}
+            posts = body.get("data", [])
+            for post in posts:
+                rec = corpus_record(post, media_by_key, observed)
+                if args.download_media and rec["media"]:
+                    media_dir.mkdir(parents=True, exist_ok=True)
+                    rec["media_files"] = [download_media(m, media_dir, user_token()) for m in rec["media"]]
+                out.write(json.dumps(rec) + "\n")
+            out.flush()
+            fetched += len(posts)
+            pages += 1
+            next_token = (body.get("meta") or {}).get("next_token")
+            state_path.write_text(json.dumps({"next_token": next_token, "fetched": fetched, "out": str(out_path),
+                                              "naming": naming, "updated": observed.isoformat()}))
+            oldest = min((p.get("created_at", "") for p in posts), default="-")
+            print(f"page {pages}: {len(posts)} posts (oldest {oldest}) total {fetched} remaining={remaining} naming={naming}")
+            if not next_token:
+                print("Reached the end of the available timeline window.")
+                break
+            if fetched >= args.max_posts:
+                print(f"Reached --max-posts {args.max_posts}; rerun with --resume to continue.")
+                break
+            time.sleep(args.pause)
+    records = [json.loads(line) for line in out_path.read_text().splitlines() if line.strip()]
+    print(json.dumps(corpus_summary(records), indent=2))
+    print(f"Corpus: {out_path}. Summarise again with: x_probe.py corpus {out_path}")
+
+
+def cmd_corpus(args: argparse.Namespace) -> None:
+    records = [json.loads(line) for line in Path(args.corpus).read_text().splitlines() if line.strip()]
+    print(json.dumps(corpus_summary(records), indent=2))
 
 
 def cmd_controls(args: argparse.Namespace) -> None:
@@ -448,6 +595,19 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--keep-text", action="store_true", help="store post text (manual inspection only; never commit)")
     p.set_defaults(fn=cmd_poll)
     sub.add_parser("controls", help="Bearer timeline and user search controls").set_defaults(fn=cmd_controls)
+    p = sub.add_parser("backfill", help="Page backwards through the timeline and store full posts locally")
+    p.add_argument("--start-time", help="ISO-8601 UTC lower bound, e.g. 2025-01-01T00:00:00Z")
+    p.add_argument("--end-time", help="ISO-8601 UTC upper bound")
+    p.add_argument("--until-id", help="only posts older than this post ID")
+    p.add_argument("--max-posts", type=int, default=3200, help="stop after this many (API window is 3,200)")
+    p.add_argument("--pause", type=float, default=1.0, help="seconds between pages (default 1)")
+    p.add_argument("--pagination-token", help="start from this token (from a previous run)")
+    p.add_argument("--resume", action="store_true", help="continue from data/g0/corpus/backfill_state.json")
+    p.add_argument("--download-media", action="store_true", help="save chart images under data/g0/corpus/media/")
+    p.set_defaults(fn=cmd_backfill)
+    p = sub.add_parser("corpus", help="Summarise a backfill corpus file")
+    p.add_argument("corpus")
+    p.set_defaults(fn=cmd_corpus)
     p = sub.add_parser("report", help="Summarise a poll log")
     p.add_argument("log")
     p.set_defaults(fn=cmd_report)
