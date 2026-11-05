@@ -147,7 +147,7 @@ CANCEL_RE = _r(r"\b(?:cancel(?:l)?(?:ing|ed)?|no longer (?:looking|planning|inte
 VERBS: list[tuple[re.Pattern[str], MessageClass, Tense]] = [
     (_r(r"\bwe (?:have |had )?(?:raised|moved|lowered|tightened|trailed|adjusted) (?:our |the )?(?:stop|target)"),
      MessageClass.MODIFY, Tense.PAST),
-    (_r(r"\b(?:raising|moving|lowering|tightening|trailing|adjusting|lifting) (?:our |the )?"
+    (_r(r"\b(?:raising|moving|lowering|tightening|trailing|adjusting|lifting) (?:our |the )?(?:\$?(?-i:[A-Z]{1,5}) )?"
         r"(?:stop|target|stop[- ]loss|take[- ]profit)|"
         r"\b(?:stop|target|stop[- ]loss)(?: is| has been)? (?:now )?(?:raised|moved|lowered|tightened|set|adjusted|trailed)"
         r"(?: up| down)? to\b|\bnew (?:stop|target)\b|\b(?:stop|target) (?:is )?now (?:at )?\$?\d"),
@@ -165,10 +165,12 @@ VERBS: list[tuple[re.Pattern[str], MessageClass, Tense]] = [
         r"adding (?:a |an )?(?:second|third|new) tranche)\b"), MessageClass.ADD, Tense.PRESENT),
     (_r(r"\b(?:(?:have |has |had |were |was |got )?(?:closed(?: out)?|exited|stopped out|covered)|"
         r"took full profits|we are out of)\b"), MessageClass.CLOSE, Tense.PAST),
-    (_r(r"\b(?:closing(?: out)?|exiting|covering|taking full profits|cutting (?:our |the )?(?:position|losses)|"
-        r"closing the (?:rest|remaining|remainder|entire|full))\b"), MessageClass.CLOSE, Tense.PRESENT),
+    (_r(rf"\b(?:closing(?: out)?|exiting|covering|taking full profits|cutting (?:our |the )?(?:position|losses)|"
+        rf"closing the (?:rest|remaining|remainder|entire|full)|out of {ASSET_TOKEN}|"
+        rf"cutting (?:our |the )?(?:{ASSET_TOKEN} )?(?:long|short|position)(?: loose)?)\b"), MessageClass.CLOSE, Tense.PRESENT),
     (_r(r"\b(?:we (?:went|got) (?:long|short)|we entered|we bought|we shorted|entered (?:a |an )?(?:new )?(?:long|short)|"
-        r"opened (?:a |an )?(?:new )?(?:long|short)|we are (?:long|short) [^.]{0,40}?\bfrom\b)"),
+        r"opened (?:a |an )?(?:new )?(?:long|short)|initiated (?:a |an )?(?:new )?(?:long|short)|we initiated|"
+        r"we are (?:long|short) [^.]{0,40}?\bfrom\b)"),
      MessageClass.OPEN, Tense.PAST),
     (_r(r"\b(?:we are now (?:long|short)|now (?:long|short)|going (?:long|short)|"
         r"entering (?:a |an )?(?:new )?(?:long|short)|opening (?:a |an )?(?:new )?(?:long|short)|"
@@ -216,7 +218,9 @@ CONJUNCTION = re.compile(r",?\s+and\s+|,\s+then\s+|,\s+")
 PNL_RE = re.compile(r"(?<![\d.])([+-]?\d+(?:\.\d+)?)\s?%(?!\s+of\b)", re.IGNORECASE)
 DATE_RE = _r(r"\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?\s+\d{1,2}(?:st|nd|rd|th)?,?\s*(?:\d{4})?|"
              r"\b(?:in|since|of|by|during|late|early|mid|this|last) (?:19|20)\d{2}\b")
-PRICE_RE = re.compile(r"(?<![\w.$])\$?\s?(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)(?!\s*%)(?![\d,])")
+# Trailing lookaheads: not a percentage, not inside a longer number, not a thousands group. The old
+# `(?![\d,])` also rejected a comma after a decimal ("$31.20, stop"), which made the regex backtrack to "31".
+PRICE_RE = re.compile(r"(?<![\w.$])\$?\s?(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)(?!\s*%)(?!\d)(?!,\d)")
 STOP_WORD_RE = _r(r"\b(?:stop|stop[- ]loss|sl)\b")
 TARGET_WORD_RE = _r(r"\b(?:target|take[- ]profit|tp|objective)\b")
 TRIGGER_WORD_RE = _r(r"\b(?:below|above|under|over|breaks?|breaking|break of|through|closes?|cross(?:es|ing)?)\b")
@@ -724,12 +728,9 @@ def _prices(text: str, underlying: Action | None, *, conditional: bool) -> list[
     for m in PRICE_RE.finditer(work):
         value = m.group(1).replace(",", "")
         window = work[max(0, m.start() - WINDOW):m.start()].lower()
-        if STOP_WORD_RE.search(window):
-            role = PriceRole.STOP
-        elif TARGET_WORD_RE.search(window):
-            role = PriceRole.TARGET
-        elif conditional and TRIGGER_WORD_RE.search(window):
-            role = PriceRole.TRIGGER
+        keyword_role = _nearest_role(window, conditional)
+        if keyword_role is not None:
+            role = keyword_role
         elif AT_WORD_RE.search(window):
             if conditional:
                 role = PriceRole.TRIGGER
@@ -743,6 +744,20 @@ def _prices(text: str, underlying: Action | None, *, conditional: bool) -> list[
             role = PriceRole.REFERENCE
         mentions.append(PriceMention(role=role, value=value))
     return mentions
+
+
+def _nearest_role(window: str, conditional: bool) -> PriceRole | None:
+    """The role keyword closest to the number, provided no other number sits between them (that
+    keyword belongs to the earlier number). "stop $29.50, target $36" therefore tags 36 as TARGET."""
+    candidates: list[tuple[int, PriceRole]] = []
+    for rx, role in ((STOP_WORD_RE, PriceRole.STOP), (TARGET_WORD_RE, PriceRole.TARGET),
+                     (TRIGGER_WORD_RE, PriceRole.TRIGGER)):
+        if role == PriceRole.TRIGGER and not conditional:
+            continue
+        for m in rx.finditer(window):
+            if not re.search(r"\d", window[m.end():]):
+                candidates.append((m.start(), role))
+    return max(candidates)[1] if candidates else None
 
 
 def _price(c: Classification, role: PriceRole) -> str | None:
