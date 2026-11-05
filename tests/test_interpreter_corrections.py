@@ -71,3 +71,71 @@ def test_past_tense_entry_announcement_registers_the_position_but_does_not_execu
     assert "e05:a1" in it.context.ideas and it.context.ideas["e05:a1"].stop_price == "212"
     c, a = one(it.interpret(post("e31", "Cutting our $IWM long loose at $214.", minutes=5)))
     assert c.message_class == MessageClass.CLOSE and a.idea_reference == "e05:a1"
+
+
+# ----------------------------------------------------------------------------- generic parsing improvements (synthetic wording only)
+
+from tradingbot.tkl_interpreter import LexiconExtension  # noqa: E402
+
+
+def test_html_entities_are_unescaped_before_asset_recognition():
+    c, a = one(TklInterpreter().interpret(post("h", "S&amp;P 500: We are now short at 6,850 with a stop at 6,950.")))
+    assert c.message_class == MessageClass.OPEN and c.asset == "SPX" and c.side == PositionSide.SHORT
+    assert roles(c) == {PriceRole.ENTRY: "6850", PriceRole.STOP: "6950"}
+
+
+def test_plural_sides_and_position_noun_entries():
+    for text, side in [("We are taking a long position in $TLT at $88.50 with a stop at $86.", PositionSide.LONG),
+                       ("Opening shorts in $SPY at $685 with a stop at $695.", PositionSide.SHORT),
+                       ("Taking some longs in $GLD here at $280 with a $270 stop.", PositionSide.LONG)]:
+        c, a = one(TklInterpreter().interpret(post("p", text)))
+        assert c.message_class == MessageClass.OPEN and c.side == side, text
+        assert "HEADLINE_POSITION_LINE_WITHOUT_ENTRY_VERB" not in a.ambiguities and "SIDE_UNCLEAR" not in a.ambiguities, text
+
+
+def test_multiline_levels_attach_across_intervening_commentary_and_quotes_stay_references():
+    text = ("We are now long $TLT at $88.50.\n\nThe bond market has been weak for months and sentiment is washed out.\n\n"
+            "Targeting $95.00 with an $86.00 stop-loss.\n\n$88.40 now.")
+    ip = TklInterpreter().interpret(post("m", text))
+    assert [c.message_class for c in ip.classifications] == [MessageClass.OPEN, MessageClass.COMMENTARY]
+    c, a = ip.classifications[0], ip.parsed.actions[0]
+    assert roles(c) == {PriceRole.ENTRY: "88.50", PriceRole.TARGET: "95.00", PriceRole.STOP: "86.00", PriceRole.REFERENCE: "88.40"}
+    assert (a.entry_reference, a.stop_price, a.target_price) == ("88.50", "86.00", "95.00")
+    # a quoted market price alone never becomes an entry: the open stays without an entry reference (fails closed)
+    text2 = "We are taking a long position in $TLT here.\n\nTargeting $95.00 with an $86.00 stop-loss.\n\n$88.40 now."
+    c, a = one(TklInterpreter().interpret(post("q", text2)))
+    assert roles(c) == {PriceRole.TARGET: "95.00", PriceRole.STOP: "86.00", PriceRole.REFERENCE: "88.40"}
+    assert a.entry_reference is None and a.stop_price == "86.00"
+    text3 = "We are taking a long position in $TLT.\n\nEntry: $88.40. Stop: $86.00. Target: $95.00."
+    c, a = one(TklInterpreter().interpret(post("r", text3)))
+    assert a.entry_reference == "88.40" and a.stop_price == "86.00" and a.target_price == "95.00"
+
+
+def test_role_keywords_after_the_number():
+    c, _ = one(TklInterpreter().interpret(post("k", "We are now long $TLT: 95 target, 86 stop, 88.50 entry.")))
+    assert roles(c) == {PriceRole.TARGET: "95", PriceRole.STOP: "86", PriceRole.ENTRY: "88.50"}
+    c, _ = one(TklInterpreter().interpret(post("k2", "Current positions:\nLong $TLT: 95 target, 86 stop, 88.50 entry\nShort $SPY: 650 target, 700 stop, 685 entry")))
+    assert c.message_class == MessageClass.POSITION_SUMMARY
+
+
+def test_negated_stop_change_is_commentary_and_shifting_is_a_modify():
+    it = TklInterpreter()
+    it.ingest(post("o", "We are now long $TLT at $88.50. Stop: $86.00. Target: $95.00."))
+    c, a = one(it.interpret(post("n", "We are not moving our stop from $86.00 for now.", minutes=1)))
+    assert c.message_class == MessageClass.COMMENTARY and a.action == Action.NO_TRADE
+    c, a = one(it.interpret(post("y", "Shifting our stop up to $90.00 on $TLT.", minutes=2)))
+    assert c.message_class == MessageClass.MODIFY and a.stop_price == "90.00" and a.idea_reference == "o:a1"
+
+
+def test_lexicon_extension_adds_private_phrasings_at_runtime(tmp_path):
+    ext_file = tmp_path / "lexicon.json"
+    ext_file.write_text('{"open_present": ["\\\\bwe are piling into (?:long|short)s?\\\\b"], "summary_headers": ["^\\\\s*book snapshot\\\\b"]}')
+    ext = LexiconExtension.from_json(ext_file)
+    plain, extended = TklInterpreter(), TklInterpreter(lexicon=ext)
+    text = "We are piling into longs on $TLT at $88.50 with a stop at $86."
+    assert one(plain.interpret(post("e", text)))[0].message_class == MessageClass.COMMENTARY
+    c, a = one(extended.interpret(post("e", text)))
+    assert c.message_class == MessageClass.OPEN and c.side == PositionSide.LONG and a.entry_reference == "88.50"
+    assert "HEADLINE_POSITION_LINE_WITHOUT_ENTRY_VERB" not in a.ambiguities
+    summary = "Book snapshot:\nLong $TLT: 95 target, 86 stop\nShort $SPY: 650 target, 700 stop"
+    assert one(extended.interpret(post("s", summary)))[0].message_class == MessageClass.POSITION_SUMMARY
