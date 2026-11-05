@@ -40,6 +40,8 @@ Add `--keep-text` only for a short manual look at parsing-relevant content, and 
 Per call: UTC time, HTTP status, elapsed, `x-rate-limit-remaining` and reset, `since_id`, result count, any API errors.
 Per post: ID, author ID, `created_at`, lag in seconds (receive time minus `created_at`), SHA-256 and length of text, reply flag, referenced-post types, media count and types, whether each media item carries a URL, number of edit-history IDs, edits remaining. With `--fetch-media`, the status and byte count of one media download per call.
 
+Long posts: most publisher posts exceed 280 characters, so the probe requests the long-post field (`note_tweet`, falling back to `post.fields` / `note_post` if the API rejects the older naming) and hashes the full body. The report shows how many posts carried a long body and which parameter naming the API accepted. A G0 run where long bodies never appear is a fail for signal completeness.
+
 ## 4. Pass / fail (printed by `report`)
 
 | Criterion | Pass |
