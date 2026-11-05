@@ -1,6 +1,6 @@
 # Sprint 1.2C — Real-corpus evaluation of the TKL interpreter
 
-**Status:** evaluation tooling complete and exercised on synthetic fixtures; the baseline on the 120-post development dataset is **pending the Source Agent's adapter**, which is not in the repository yet (`research/sprint1.2-source-corpus` is identical to `main`). Mock-only: the runner adds no validator and no journal; it replays through the Sprint 1.1 coordinator. Reports contain aggregates, IDs and failure codes only. No subscriber text is ever written, printed or committed.
+**Status:** evaluation tooling complete and exercised on synthetic fixtures, and integrated with the Source Agent's real exporter and reader (`docs/research/source_corpus/`, merged into this branch). The baseline on the 120-post development dataset is **pending two private artifacts** that are not in the repository or on this machine: the split manifest that defines the development IDs (the exporter needs it to write the development file) and the development labels in the `LabeledPost` schema. Mock-only: the runner adds no validator and no journal; it replays through the Sprint 1.1 coordinator. Reports contain aggregates, IDs and failure codes only. No subscriber text is ever written, printed or committed.
 
 ## 1. Tooling
 
@@ -66,7 +66,19 @@ The Source Agent delivers the 120-post development split as a JSONL export (line
 
 Unknown manifest keys are ignored. `load_export()` refuses the file when the digest does not match (manifest and/or `--sha256`), when the split is `holdout` (unless `--allow-holdout`, final evaluation only), when the declared count differs from the file, or when no checksum is available at all. The labels file is checked against `labels_sha256` or `--labels-sha256`. The report's `input` block records the verified digests and split.
 
-Alternatively the CLI calls the adapter directly: `--adapter package.module:historical_inputs` with any number of `--reader-arg key=value` (ISO timestamps and integers are typed before the call), so the adapter's own reader signature is honoured without a shim; `split=holdout` is refused there too. `tests/test_source_agent_compat.py::check_historical_inputs` remains the consumer-side contract check.
+**The Source Agent's actual interface.** `docs/research/source_corpus/archive.py` validates the G0 capture and writes an immutable archive export (schema `g0.archive.v1`); with `--split-manifest` it writes only the DEVELOPMENT records. `docs/research/source_corpus/source_reader.py::historical_inputs(path, *, expected_sha256, expected_author_id, simulated_lag, through=None)` reads such an export, pins its digest, and yields `HistoricalInput` objects whose `as_source_post()` returns a schema-1.2 `SourcePost` (edits at the root's snowflake publication time with their own `revised_at`; `received_at` is the archive clock). `coerce_source_posts` accepts those objects directly, and `--reader-arg` typing matches that signature: `path` becomes a `Path`, `simulated_lag` a timedelta in seconds, `through` an aware datetime, digests and IDs stay strings. `tests/test_source_agent_compat.py` drives the real exporter and reader end to end on a synthetic capture (including an edited revision and a retweet) and through the interpreter, gateway and coordinator.
+
+The real baseline command, once the private files exist:
+
+```bash
+python scripts/evaluate_corpus.py --adapter docs.research.source_corpus.source_reader:historical_inputs \
+    --reader-arg path=private_samples/sprint12/development.jsonl --reader-arg expected_sha256=<export digest> \
+    --reader-arg expected_author_id=<account id> --reader-arg simulated_lag=12.4 \
+    --labels private_samples/sprint12/dev_labels.jsonl --labels-sha256 <hex> --expected-author <account id> \
+    --golden private_samples/sprint12/golden --out data/eval/results_dev --dataset-name dev-120
+```
+
+`simulated_lag=12.4` is the measured median publication-to-receipt lag from the G0 freshness run, so archive replay is clocked the way live delivery would be. The exporter was run in audit mode against the real capture on 5 November 2026 (no file written): it validated all 3,189 records with the same counts the Source Agent reports.
 
 ## 4. Running the development-set baseline (when the adapter lands)
 
@@ -83,7 +95,7 @@ python scripts/evaluate_corpus.py --adapter <package.module>:historical_inputs \
 ```
 
 - Interpreter untouched for the first run; the report is the baseline.
-- The four chronological golden replays against real posts are JSON specs in the private `data/eval/golden/` that reference `source_id`s (no inline text); expected statuses and orders come from the product owner's reading of each episode. The synthetic specs show the format.
+- The four chronological golden replays against real posts are JSON specs in the private `private_samples/sprint12/golden/` that reference `source_id`s (no inline text); the Source Agent reports four golden sequences covering 38 captured revisions, so the expected statuses and orders per step still have to be written down in the `GoldenReplay` format. The synthetic specs show it.
 - The 365-post holdout is never read: the CLI refuses any path containing `holdout`, and `--allow-holdout` is for the final evaluation only.
 - Everything under `data/` is git-ignored; only `report.md` aggregates (IDs and codes) may be shared.
 

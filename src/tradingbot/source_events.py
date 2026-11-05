@@ -190,6 +190,7 @@ def coerce_source_posts(items, *, expected_author_id: str | None = None,
 
     Accepted item shapes, in order of preference:
       * a SourcePost instance;
+      * an object exposing ``as_source_post()`` (the Source Agent's ``HistoricalInput``);
       * a SourcePost-shaped mapping (has ``schema_version`` or both ``source_id`` and ``post_id``);
       * a G0 archive/poll record (has ``id`` and ``created_at``), mapped with ``from_g0_record``,
         which needs ``expected_author_id``.
@@ -199,6 +200,11 @@ def coerce_source_posts(items, *, expected_author_id: str | None = None,
     for item in items:
         if isinstance(item, SourcePost):
             out.append(item)
+        elif hasattr(item, "as_source_post") and callable(item.as_source_post):
+            converted = item.as_source_post()
+            if not isinstance(converted, SourcePost):
+                raise TypeError("as_source_post() must return a SourcePost")
+            out.append(converted)
         elif isinstance(item, dict) and ("schema_version" in item or ("source_id" in item and "post_id" in item)):
             out.append(SourcePost.model_validate(item))
         elif isinstance(item, dict) and "id" in item and "created_at" in item:

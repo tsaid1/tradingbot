@@ -138,9 +138,20 @@ def load_export(export: Path, *, manifest: Path | None = None, sha256: str | Non
     return posts, info
 
 
-def coerce_reader_arg(value: str):
-    """Reader arguments arrive as strings on the command line; ISO-8601 timestamps and integers
-    are converted so `historical_inputs(start=..., limit=...)` receives typed values."""
+def coerce_reader_arg(value: str, key: str | None = None):
+    """Reader arguments arrive as strings on the command line. They are typed by name and shape so
+    the Source Agent's ``historical_inputs(path=..., expected_sha256=..., expected_author_id=...,
+    simulated_lag=..., through=...)`` receives what it declares: ``path``/``*_path``/``*_file``
+    become Path, ``*lag*`` becomes a timedelta in seconds, ISO-8601 timestamps become aware
+    datetimes, integers become int; everything else (digests, IDs) stays a string."""
+    if key is not None:
+        name = key.lower()
+        if name in ("path", "manifest") or name.endswith(("_path", "_file")):
+            return Path(value)
+        if "lag" in name:
+            return timedelta(seconds=float(value))
+        if name.endswith(("_id", "sha256", "digest")):
+            return value
     if value.isdigit():
         return int(value)
     if "T" in value and value[:4].isdigit():
@@ -158,7 +169,7 @@ def parse_reader_args(pairs: Iterable[str]) -> dict:
         if "=" not in pair:
             raise ValueError(f"Reader argument must be key=value, got {pair!r}")
         key, value = pair.split("=", 1)
-        out[key.strip()] = coerce_reader_arg(value.strip())
+        out[key.strip()] = coerce_reader_arg(value.strip(), key.strip())
     return out
 
 
