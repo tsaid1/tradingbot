@@ -57,3 +57,14 @@ are coordinators: they sequence calls, keep linked actions atomic, enforce once-
 processing and apply fictional fills sized by `fill_quantity()`. Risk parameters and
 defaults live only in `models.MockPolicy`; `ReplayPolicy` is the same class. No LLM-facing
 schema carries a quantity, venue or account. Equivalence of both paths is a regression test.
+
+## ADR-010 — The interpreter advises; time is point-in-time; paid text stays local
+
+The TKL interpreter (`tkl_interpreter.py`) emits classifications and `TradeAction`
+candidates only; the gateway and the Sprint 1.1 coordinator decide, size and journal.
+Position references are resolved against a context filtered by the post's own publication
+time, so no later post can influence an earlier decision. Source events arrive through the
+versioned `SourcePost` (schema 1.2) produced by the Source Integration Agent; the engine
+never reads the feed directly. Paid feed text is processed deterministically on the local
+machine; sending it to an external model requires an explicit, recorded permission flag.
+
