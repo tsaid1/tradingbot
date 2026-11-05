@@ -37,8 +37,9 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from itertools import pairwise
 from pathlib import Path
 
 API = "https://api.x.com/2"
@@ -76,7 +77,7 @@ def pkce_pair() -> tuple[str, str]:
 
 def parse_x_time(value: str) -> datetime:
     """X returns ISO-8601 UTC like 2026-11-05T14:03:11.000Z."""
-    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return datetime.fromisoformat(value)
 
 
 def lag_seconds(created_at: str, observed_at: datetime) -> float:
@@ -130,6 +131,69 @@ def percentile(values: list[float], pct: float) -> float:
     return round(ordered[max(0, index)], 1)
 
 
+RATE_HEADER_PREFIXES = ("x-rate-limit-", "x-app-limit-", "x-user-limit-")
+POST_READ_USD = 0.005  # pay-per-use list price per post read, deduplicated per UTC day
+
+
+def rate_headers(headers: dict) -> dict:
+    """Every X quota header (15-minute bucket plus 24-hour app/user caps), as ints where possible."""
+    out: dict = {}
+    for k, v in headers.items():
+        if k.startswith(RATE_HEADER_PREFIXES):
+            try:
+                out[k] = int(v)
+            except (TypeError, ValueError):
+                out[k] = v
+    return out
+
+
+def parse_phases(spec: str) -> list[tuple[float, float]]:
+    """'15:3600,5:1800' -> [(15.0, 3600.0), (5.0, 1800.0)]: poll interval seconds : phase duration seconds."""
+    phases: list[tuple[float, float]] = []
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        interval, duration = part.split(":")
+        phases.append((float(interval), float(duration)))
+    if not phases:
+        raise ValueError("empty phase spec")
+    return phases
+
+
+def effective_interval(requested: float, limit_per_15min: int | None, headroom: float = 0.8) -> float:
+    """The requested interval, or the slowest cadence the 15-minute quota allows with headroom if faster."""
+    if not limit_per_15min or limit_per_15min <= 0:
+        return requested
+    floor = 900.0 / (headroom * limit_per_15min)
+    return requested if requested >= floor else math.ceil(floor * 10) / 10
+
+
+def enrich_lag(record: dict, created_at: str | None, received_at: datetime, prev_sent_at: datetime | None) -> dict:
+    """Split publication-to-receipt lag into what the polling cadence can explain and what X itself took.
+
+    lag_s            created_at -> response received: end-to-end, what a trading bot would see
+    poll_window_s    previous call's send -> this call's receipt: the most the polling wait can account for
+    x_delay_floor_s  the post existed this long before the previous call was sent yet was not returned then,
+                     so X took at least this long to expose it (lower bound; 0 means nothing is provable)
+    """
+    if not created_at:
+        return record
+    created = parse_x_time(created_at)
+    record["lag_s"] = round((received_at - created).total_seconds(), 3)
+    if prev_sent_at is not None:
+        record["poll_window_s"] = round((received_at - prev_sent_at).total_seconds(), 3)
+        record["x_delay_floor_s"] = round(max(0.0, (prev_sent_at - created).total_seconds()), 3)
+    return record
+
+
+def pct_block(values: list[float]) -> dict | None:
+    if not values:
+        return None
+    return {"n": len(values), "p50": percentile(values, 50), "p95": percentile(values, 95),
+            "p99": percentile(values, 99), "max": round(max(values), 1), "min": round(min(values), 1)}
+
+
 def looks_like_field_naming_error(body: dict) -> bool:
     """True when a 400 body complains about the tweet.fields parameter or the note_tweet field."""
     blob = json.dumps(body).lower()
@@ -139,7 +203,8 @@ def looks_like_field_naming_error(body: dict) -> bool:
 def summarize(records: list[dict], target_author_id: str | None = None) -> dict:
     """Aggregate a poll log (list of per-call dicts) into G0 metrics."""
     calls = [r for r in records if r.get("kind") == "call"]
-    posts = [p for r in calls for p in r.get("posts", [])]
+    all_posts = [p for r in calls for p in r.get("posts", [])]
+    posts = [p for p in all_posts if not p.get("duplicate")]
     statuses: dict[str, int] = {}
     for c in calls:
         statuses[str(c.get("status"))] = statuses.get(str(c.get("status")), 0) + 1
@@ -149,21 +214,100 @@ def summarize(records: list[dict], target_author_id: str | None = None) -> dict:
     author_match = sum(1 for p in posts if target_author_id and p.get("author_id") == target_author_id)
     remaining = [c["rate_remaining"] for c in calls if isinstance(c.get("rate_remaining"), int)]
     unique_ids = {p["id"] for p in posts if p.get("id")}
+
+    sent = sorted(parse_x_time(c["sent_at"]) for c in calls if c.get("sent_at"))
+    gaps = [(b - a).total_seconds() for a, b in pairwise(sent)]
+    elapsed = [c["elapsed_s"] for c in calls if isinstance(c.get("elapsed_s"), (int, float))]
+    span = (sent[-1] - sent[0]).total_seconds() if len(sent) > 1 else 0.0
+
+    by_interval: dict[str, dict] = {}
+    for interval in sorted({c.get("interval_s") for c in calls if c.get("interval_s") is not None}):
+        cs = [c for c in calls if c.get("interval_s") == interval]
+        ps = [p for c in cs for p in c.get("posts", []) if not p.get("duplicate")]
+        s = sorted(parse_x_time(c["sent_at"]) for c in cs if c.get("sent_at"))
+        rem = [c["rate_remaining"] for c in cs if isinstance(c.get("rate_remaining"), int)]
+        by_interval[str(interval)] = {
+            "calls": len(cs), "new_posts": len(ps),
+            "lag": pct_block([p["lag_s"] for p in ps if p.get("lag_s") is not None]),
+            "gap": pct_block([(b - a).total_seconds() for a, b in pairwise(s)]),
+            "elapsed": pct_block([c["elapsed_s"] for c in cs if isinstance(c.get("elapsed_s"), (int, float))]),
+            "errors_4xx_5xx": sum(1 for c in cs if isinstance(c.get("status"), int) and c["status"] >= 400),
+            "network_errors": sum(1 for c in cs if c.get("status") is None),
+            "min_rate_remaining": min(rem) if rem else None,
+        }
+
+    rate_series: dict[str, list[int]] = {}
+    for c in calls:
+        for k, v in (c.get("rate") or {}).items():
+            if isinstance(v, int):
+                rate_series.setdefault(k, []).append(v)
+    rate_summary = {k: {"min": min(v), "max": max(v)} for k, v in sorted(rate_series.items())}
+
+    fetched = [m for p in posts for m in (p.get("media_fetch") or []) if isinstance(m, dict) and "status" in m]
+    media_status: dict[str, int] = {}
+    for m in fetched:
+        media_status[str(m["status"])] = media_status.get(str(m["status"]), 0) + 1
+    media = {"fetched": len(fetched), "status_counts": media_status,
+             "elapsed": pct_block([m["elapsed_s"] for m in fetched if "elapsed_s" in m]),
+             "media_lag": pct_block([m["media_lag_s"] for m in fetched if "media_lag_s" in m]),
+             "bytes_total": sum(m.get("bytes", 0) for m in fetched)}
+
+    bc = [c["bearer_control"] for c in calls if isinstance(c.get("bearer_control"), dict)]
+    bc_status: dict[str, int] = {}
+    for b in bc:
+        bc_status[str(b.get("status"))] = bc_status.get(str(b.get("status")), 0) + 1
+    bearer = {"calls": len(bc), "posts_returned": sum(b.get("n_posts", 0) for b in bc), "status_counts": bc_status,
+              "error_types": sorted({t for b in bc for t in b.get("error_types", [])})}
+
+    recon = next((r for r in records if r.get("kind") == "reconcile"), None)
+    reconcile = None
+    if recon:
+        reconcile = {"status": recon.get("status"), "reported": recon.get("reported"), "polled": recon.get("polled"),
+                     "missed": len(recon.get("missed_ids", [])), "vanished": len(recon.get("vanished_ids", [])),
+                     "missed_ids": recon.get("missed_ids", []), "vanished_ids": recon.get("vanished_ids", [])}
+
+    usage = [r for r in records if r.get("kind") == "usage"]
+    before = next((u for u in usage if u.get("when") == "before"), None)
+    after = next((u for u in usage if u.get("when") == "after"), None)
+    cost = None
+    if before and after and "project_usage" in before and "project_usage" in after:
+        delta = after["project_usage"] - before["project_usage"]
+        cost = {"reads_before": before["project_usage"], "reads_after": after["project_usage"],
+                "delta_reads": delta, "usd_at_list_price": round(delta * POST_READ_USD, 4)}
+
     return {
         "calls": len(calls),
         "status_counts": statuses,
         "unique_posts": len(unique_ids),
+        "duplicate_deliveries": len(all_posts) - len(posts),
+        "edits_of_seen_posts": sum(1 for p in posts if p.get("edit_of_seen")),
         "posts_author_match": author_match,
         "lag_median_s": round(statistics.median(lags), 1) if lags else None,
         "lag_p95_s": percentile(lags, 95) if lags else None,
+        "lag_p99_s": percentile(lags, 99) if lags else None,
+        "lag_max_s": round(max(lags), 1) if lags else None,
+        "lag_samples": len(lags),
+        "poll_window": pct_block([p["poll_window_s"] for p in posts if p.get("poll_window_s") is not None]),
+        "x_delay_floor": pct_block([p["x_delay_floor_s"] for p in posts if p.get("x_delay_floor_s") is not None]),
         "posts_with_media": len(with_media),
         "posts_with_media_url": media_ok,
         "posts_with_edit_history": sum(1 for p in posts if p.get("n_edit_ids", 0) > 1),
         "replies": sum(1 for p in posts if p.get("is_reply")),
         "min_rate_remaining": min(remaining) if remaining else None,
         "errors_4xx_5xx": sum(1 for c in calls if isinstance(c.get("status"), int) and c["status"] >= 400),
+        "network_errors": sum(1 for c in calls if c.get("status") is None),
         "posts_with_long_body": sum(1 for p in posts if p.get("has_note")),
         "field_naming_used": sorted({c.get("field_naming") for c in calls if c.get("field_naming")}),
+        "request_frequency": {"span_s": round(span, 1), "calls_per_min": round(60 * len(sent) / span, 2) if span else None,
+                              "gap": pct_block(gaps), "elapsed": pct_block(elapsed)},
+        "by_interval": by_interval,
+        "rate_headers": rate_summary,
+        "media_fetch": media,
+        "bearer_control": bearer,
+        "reconcile": reconcile,
+        "cost": cost,
+        "phases": [{k: r.get(k) for k in ("label", "requested_interval_s", "interval_s", "duration_s", "rate_limit_15min")}
+                   for r in records if r.get("kind") == "phase"],
     }
 
 
@@ -178,10 +322,31 @@ def verdict(summary: dict, controls: dict | None) -> list[tuple[str, bool | None
                 f"{summary['posts_with_media_url']}/{summary['posts_with_media']}"))
     out.append(("Median publication-to-receipt lag under 30 s",
                 (summary["lag_median_s"] is not None and summary["lag_median_s"] < 30) if summary["lag_median_s"] is not None else None,
-                f"median {summary['lag_median_s']} s, p95 {summary['lag_p95_s']} s"))
+                (f"median {summary['lag_median_s']} s, p95 {summary['lag_p95_s']} s, p99 {summary.get('lag_p99_s')} s "
+                 f"over {summary.get('lag_samples', 0)} posts")))
+    xd = summary.get("x_delay_floor")
+    out.append(("X-side exposure delay (lower bound, informational)", None,
+                f"p50 {xd['p50']} s, p95 {xd['p95']} s, max {xd['max']} s" if xd else "no samples"))
     out.append(("No 4xx/5xx on timeline calls",
                 summary["errors_4xx_5xx"] == 0 if summary["calls"] else None,
                 f"{summary['errors_4xx_5xx']} errors in {summary['calls']} calls"))
+    out.append(("No duplicate deliveries", summary.get("duplicate_deliveries", 0) == 0 if summary["unique_posts"] else None,
+                f"{summary.get('duplicate_deliveries', 0)} duplicates, {summary.get('edits_of_seen_posts', 0)} edits of seen posts"))
+    recon = summary.get("reconcile")
+    if recon:
+        out.append(("No posts missed by polling (end-of-run reconciliation)", recon["missed"] == 0,
+                    (f"X reports {recon['reported']} posts since baseline; polling delivered {recon['polled']}; "
+                     f"missed {recon['missed']}, vanished {recon['vanished']}")))
+    bc = summary.get("bearer_control") or {}
+    if bc.get("calls"):
+        out.append(("In-run bearer-token control returns no protected posts", bc["posts_returned"] == 0,
+                    (f"{bc['calls']} control calls, statuses {bc['status_counts']}, posts {bc['posts_returned']}, "
+                     f"errors {bc['error_types']}")))
+    cost = summary.get("cost")
+    if cost:
+        out.append(("Metered reads consistent with the per-day dedup rule (informational)", None,
+                    (f"{cost['delta_reads']} billable reads during the run (${cost['usd_at_list_price']}) for "
+                     f"{summary['unique_posts']} new posts")))
     if controls:
         bearer = controls.get("bearer_timeline", {})
         out.append(("Bearer-token control returns no protected posts",
@@ -347,7 +512,7 @@ def timeline_params(since_id: str | None, max_results: int, naming: str = "tweet
     return params
 
 
-def timeline_get(user_id: str, params_for: "callable", token: str, naming: str) -> tuple[int, dict, dict, float, str]:
+def timeline_get(user_id: str, params_for: callable, token: str, naming: str) -> tuple[int, dict, dict, float, str]:
     """GET the user timeline; on a 400 about field naming, retry once with the other scheme."""
     status, headers, body, elapsed = api_get(f"/users/{user_id}/tweets", params_for(naming), token)
     if status == 400 and naming == "tweet" and looks_like_field_naming_error(body):
@@ -363,50 +528,259 @@ def sleep_for_rate_limit(reset: int | None) -> None:
     time.sleep(min(wait, 900))
 
 
+def usage_snapshot(bearer: str | None) -> dict | None:
+    """GET /2/usage/tweets with the app-only bearer: X's own running count of billable post reads."""
+    if not bearer:
+        return None
+    status, _, body, _ = api_get("/usage/tweets", {}, bearer)
+    data = body.get("data") or {}
+    snap: dict = {"at": datetime.now(UTC).isoformat(), "status": status}
+    if status == 200 and data:
+        snap.update({"project_usage": int(data.get("project_usage", 0)), "project_cap": int(data.get("project_cap", 0)),
+                     "cap_reset_day": data.get("cap_reset_day")})
+    else:
+        snap["errors"] = body.get("errors") or body.get("detail")
+    return snap
+
+
+def bearer_control_call(user_id: str, since_id: str | None, bearer: str, naming: str) -> dict:
+    """Ask for the same new posts with the app-only token. Expected: no data, not-authorized-for-resource."""
+    status, headers, body, elapsed = api_get(f"/users/{user_id}/tweets", timeline_params(since_id, 10, naming), bearer)
+    errs = body.get("errors") or []
+    return {"status": status, "n_posts": len(body.get("data") or []), "elapsed_s": round(elapsed, 3),
+            "error_types": sorted({e.get("type", "") for e in errs if isinstance(e, dict)}), "rate": rate_headers(headers)}
+
+
+def fetch_media_timed(media_items: list[dict], token: str, created_at: str | None) -> list[dict]:
+    """GET every media URL of a post (bytes discarded); record status, size, elapsed and media lag."""
+    out: list[dict] = []
+    for m in media_items:
+        url = m.get("url") or m.get("preview_image_url")
+        if not url:
+            out.append({"media_key": m.get("media_key"), "skipped": "no_url"})
+            continue
+        status, headers, raw, elapsed = http("GET", url, headers={"Authorization": f"Bearer {token}"})
+        if status != 200:
+            status, headers, raw, elapsed2 = http("GET", url)
+            elapsed += elapsed2
+        done = datetime.now(UTC)
+        item = {"media_key": m.get("media_key"), "type": m.get("type"), "status": status, "bytes": len(raw),
+                "elapsed_s": round(elapsed, 3), "content_type": (headers.get("content-type") or "").split(";")[0]}
+        if created_at:
+            item["media_lag_s"] = round((done - parse_x_time(created_at)).total_seconds(), 3)
+        out.append(item)
+    return out
+
+
+def safe_user_token(attempts: int = 5) -> str | None:
+    """user_token() exits on a failed refresh; during a long poll we retry instead of dying."""
+    for i in range(attempts):
+        try:
+            return user_token()
+        except SystemExit as exc:
+            print(f"Token refresh problem ({exc}); retry {i + 1}/{attempts}")
+            time.sleep(min(60, 5 * (i + 1)))
+    return None
+
+
+def wait_until(start_at: str | None) -> None:
+    if not start_at:
+        return
+    target = parse_x_time(start_at)
+    delay = (target - datetime.now(UTC)).total_seconds()
+    if delay > 0:
+        print(f"Waiting {delay:.0f}s until {target.isoformat()}", flush=True)
+        time.sleep(delay)
+
+
+def reconcile(user_id: str, baseline_since_id: str | None, naming: str, seen: dict) -> dict:
+    """Re-read everything X now reports since the baseline and diff it against what polling delivered."""
+    token = safe_user_token()
+    reported: dict[str, str | None] = {}
+    pagination: str | None = None
+    pages = 0
+    status: int | None = None
+    if token is not None:
+        while True:
+            def params_for(nm: str, _tok: str | None = pagination) -> dict:
+                p = timeline_params(baseline_since_id, 100, nm)
+                if _tok:
+                    p["pagination_token"] = _tok
+                return p
+            status, _, body, _, naming = timeline_get(user_id, params_for, token, naming)
+            pages += 1
+            for p in body.get("data", []):
+                reported[p["id"]] = p.get("created_at")
+            pagination = (body.get("meta") or {}).get("next_token")
+            if status != 200 or not pagination or pages >= 10:
+                break
+    polled = {i for i in seen if baseline_since_id is None or (i.isdigit() and int(i) > int(baseline_since_id))}
+    return {"status": status, "pages": pages, "reported": len(reported), "polled": len(polled),
+            "missed_ids": sorted(set(reported) - polled), "vanished_ids": sorted(polled - set(reported)),
+            "at": datetime.now(UTC).isoformat()}
+
+
 def cmd_poll(args: argparse.Namespace) -> None:
     target = load_target()
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    log_path = DATA_DIR / f"poll_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.jsonl"
-    print(f"Polling @{target.get('username')} (id {target['id']}) every {args.interval}s for {args.duration}s -> {log_path}")
-    since_id: str | None = None
+    phases = parse_phases(args.phases) if args.phases else [(args.interval, args.duration)]
+    bearer = os.environ.get("X_BEARER_TOKEN")  # read from the environment only; never written to disk or logs
+    wait_until(args.start_at)
+    log_path = DATA_DIR / f"poll_{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}.jsonl"
+    print(f"Polling @{target.get('username')} (id {target['id']}) phases={phases} -> {log_path}", flush=True)
     naming = "tweet"
-    deadline = time.monotonic() + args.duration
-    with log_path.open("a") as log:
-        log.write(json.dumps({"kind": "meta", "target": target, "interval_s": args.interval,
-                              "keep_text": args.keep_text, "started": datetime.now(timezone.utc).isoformat()}) + "\n")
+    seen: dict[str, str] = {}  # post id -> first receipt time
+    new_target_posts = 0
+    prev_sent: datetime | None = None
+    since_id: str | None = None
+    last_limit: int | None = None
+    log = log_path.open("a")
+
+    def write(rec: dict) -> None:
+        log.write(json.dumps(rec) + "\n")
+        log.flush()
+
+    def run_phase(requested: float, duration: float, label: str, stop_when_posts: int | None = None) -> str:
+        nonlocal naming, since_id, prev_sent, last_limit, new_target_posts
+        interval = effective_interval(requested, last_limit)
+        write({"kind": "phase", "label": label, "requested_interval_s": requested, "interval_s": interval,
+               "duration_s": duration, "rate_limit_15min": last_limit, "started": datetime.now(UTC).isoformat()})
+        if interval != requested:
+            print(f"Phase {label}: {requested}s requested; the 15-minute quota ({last_limit}) only supports {interval}s "
+                  f"with 20% headroom", flush=True)
+        print(f"Phase {label}: interval {interval}s for {duration:.0f}s", flush=True)
+        deadline = time.monotonic() + duration
+        next_send = time.monotonic()
+        calls = 0
+        failures = 0
         while time.monotonic() < deadline:
-            observed = datetime.now(timezone.utc)
-            status, headers, body, elapsed, naming = timeline_get(
-                target["id"], lambda nm: timeline_params(since_id, args.max_results, nm), user_token(), naming)
-            remaining, reset = rate_info(headers)
+            if stop_when_posts and new_target_posts >= stop_when_posts:
+                return "enough"
+            token = safe_user_token()
+            if token is None:
+                write({"kind": "call", "phase": label, "interval_s": interval, "status": None, "error": "no_token",
+                       "sent_at": datetime.now(UTC).isoformat(), "n_posts": 0, "posts": []})
+                return "no_token"
+            sent = datetime.now(UTC)
+            try:
+                status, headers, body, elapsed, naming = timeline_get(
+                    target["id"], lambda nm, _s=since_id: timeline_params(_s, args.max_results, nm), token, naming)
+            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                received = datetime.now(UTC)
+                write({"kind": "call", "phase": label, "interval_s": interval, "sent_at": sent.isoformat(),
+                       "received_at": received.isoformat(), "status": None, "error": f"{type(exc).__name__}: {exc}",
+                       "since_id": since_id, "n_posts": 0, "posts": []})
+                failures += 1
+                print(f"{sent.strftime('%H:%M:%S')} network error: {type(exc).__name__}", flush=True)
+                if failures >= 10:
+                    print("Ten consecutive network failures; ending phase", flush=True)
+                    return "network"
+                next_send = max(next_send + interval, time.monotonic())
+                time.sleep(max(0.0, next_send - time.monotonic()))
+                continue
+            failures = 0
+            received = datetime.now(UTC)
+            rh = rate_headers(headers)
+            last_limit = rh.get("x-rate-limit-limit", last_limit)
             media_by_key = {m.get("media_key"): m for m in (body.get("includes") or {}).get("media", [])}
-            posts = [redact_post(p, media_by_key, observed, args.keep_text) for p in body.get("data", [])]
-            if args.fetch_media and posts and media_by_key:
-                first = next((m for m in media_by_key.values() if m.get("url") or m.get("preview_image_url")), None)
-                if first:
-                    murl = first.get("url") or first.get("preview_image_url")
-                    mstatus, mheaders, mraw, _ = http("GET", murl, headers={"Authorization": f"Bearer {user_token()}"})
-                    posts[0]["media_fetch"] = {"status": mstatus, "bytes": len(mraw), "type": mheaders.get("content-type")}
+            posts: list[dict] = []
+            n_new = 0
+            for raw_post in body.get("data", []):
+                rec = redact_post(raw_post, media_by_key, received, args.keep_text)
+                enrich_lag(rec, raw_post.get("created_at"), received, prev_sent)
+                pid = rec.get("id")
+                rec["duplicate"] = pid in seen
+                rec["edit_of_seen"] = any(e in seen for e in (raw_post.get("edit_history_tweet_ids") or []) if e != pid)
+                if not rec["duplicate"]:
+                    seen[pid] = received.isoformat()
+                    n_new += 1
+                    if rec.get("author_id") == target["id"]:
+                        new_target_posts += 1
+                    if args.fetch_media and rec.get("n_media_keys"):
+                        keys = (raw_post.get("attachments") or {}).get("media_keys", []) or []
+                        rec["media_fetch"] = fetch_media_timed([media_by_key.get(k, {}) for k in keys], token,
+                                                               raw_post.get("created_at"))
+                posts.append(rec)
             record = {
-                "kind": "call", "observed_at": observed.isoformat(), "status": status, "elapsed_s": round(elapsed, 3),
-                "field_naming": naming,
-                "rate_remaining": remaining, "rate_reset": reset, "since_id": since_id,
-                "n_posts": len(posts), "posts": posts, "errors": body.get("errors"),
+                "kind": "call", "phase": label, "interval_s": interval, "sent_at": sent.isoformat(),
+                "received_at": received.isoformat(), "observed_at": sent.isoformat(), "status": status,
+                "elapsed_s": round(elapsed, 3), "field_naming": naming, "rate": rh,
+                "rate_remaining": rh.get("x-rate-limit-remaining"), "rate_reset": rh.get("x-rate-limit-reset"),
+                "since_id": since_id, "n_posts": len(posts), "n_new": n_new, "posts": posts, "errors": body.get("errors"),
                 "result_count": (body.get("meta") or {}).get("result_count"),
             }
-            log.write(json.dumps(record) + "\n")
-            log.flush()
+            if n_new and bearer:
+                record["bearer_control"] = bearer_control_call(target["id"], since_id, bearer, naming)
+            write(record)
+            prev_sent = sent
             since_id = newest_id(since_id, [p["id"] for p in posts if p.get("id")])
-            print(f"{observed.strftime('%H:%M:%S')} status={status} posts={len(posts)} remaining={remaining} "
-                  f"lag_med={statistics.median([p['lag_s'] for p in posts]) if posts else '-'}")
+            calls += 1
+            if posts or calls % max(1, int(300 / max(interval, 1))) == 1:
+                lags = [p["lag_s"] for p in posts if p.get("lag_s") is not None and not p.get("duplicate")]
+                print(f"{received.strftime('%H:%M:%S')} [{label} {interval}s] status={status} posts={len(posts)} new={n_new} "
+                      f"remaining={rh.get('x-rate-limit-remaining')} lag={','.join(str(round(v, 1)) for v in lags) or '-'}",
+                      flush=True)
             if status == 429:
-                sleep_for_rate_limit(reset)
+                sleep_for_rate_limit(rh.get("x-rate-limit-reset"))
+                next_send = time.monotonic()
             elif status in (401, 403):
-                print("Auth or permission failure; stopping. This is a G0 FAIL signal if the token is the subscriber's.")
-                break
+                print("Auth or permission failure; stopping. This is a G0 FAIL signal if the token is the subscriber's.", flush=True)
+                return "denied"
             else:
-                time.sleep(args.interval)
-    print(f"Done. Summarise with: x_probe.py report {log_path}")
+                next_send = max(next_send + interval, time.monotonic() - interval)
+                time.sleep(max(0.0, next_send - time.monotonic()))
+        return "done"
+
+    try:
+        write({"kind": "meta", "target": target, "phases": phases, "interval_s": phases[0][0], "keep_text": args.keep_text,
+               "fetch_media": args.fetch_media, "bearer_control": bool(bearer), "max_results": args.max_results,
+               "started": datetime.now(UTC).isoformat()})
+        usage0 = usage_snapshot(bearer)
+        if usage0:
+            write({"kind": "usage", "when": "before", **usage0})
+        # Baseline: learn the newest existing post ID so every later call asks only for newer posts.
+        # Baseline posts are not lag samples (they are old) and are read again free under the daily dedup.
+        token = safe_user_token()
+        if token is None:
+            sys.exit("Could not obtain a user token")
+        sent = datetime.now(UTC)
+        status, headers, body, elapsed, naming = timeline_get(target["id"], lambda nm: timeline_params(None, 5, nm), token, naming)
+        received = datetime.now(UTC)
+        base_posts = body.get("data", [])
+        since_id = newest_id(None, [p["id"] for p in base_posts if p.get("id")])
+        baseline_since_id = since_id
+        last_limit = rate_headers(headers).get("x-rate-limit-limit")
+        for p in base_posts:
+            seen[p["id"]] = received.isoformat()
+        write({"kind": "baseline", "sent_at": sent.isoformat(), "received_at": received.isoformat(), "status": status,
+               "elapsed_s": round(elapsed, 3), "field_naming": naming, "rate": rate_headers(headers), "since_id": since_id,
+               "posts": [{"id": p.get("id"), "created_at": p.get("created_at")} for p in base_posts], "errors": body.get("errors")})
+        print(f"Baseline: status={status} newest_id={since_id} rate_limit_15min={last_limit}", flush=True)
+        if status in (401, 403):
+            sys.exit("Baseline call denied; check the subscriber token")
+        prev_sent = sent
+
+        outcome = "done"
+        for i, (interval, duration) in enumerate(phases, 1):
+            outcome = run_phase(interval, duration, f"p{i}")
+            if outcome in ("denied", "no_token"):
+                break
+        if outcome not in ("denied", "no_token") and args.extend_until and new_target_posts < args.min_posts:
+            remaining = (parse_x_time(args.extend_until) - datetime.now(UTC)).total_seconds()
+            if remaining > 0:
+                print(f"Only {new_target_posts} new target posts after the schedule; extending at {args.extend_interval}s "
+                      f"until {args.extend_until} or {args.min_posts} posts", flush=True)
+                outcome = run_phase(args.extend_interval, remaining, "extend", stop_when_posts=args.min_posts)
+        if outcome not in ("denied", "no_token"):
+            write({"kind": "reconcile", **reconcile(target["id"], baseline_since_id, naming, seen)})
+        usage1 = usage_snapshot(bearer)
+        if usage1:
+            write({"kind": "usage", "when": "after", **usage1})
+        write({"kind": "end", "outcome": outcome, "new_target_posts": new_target_posts,
+               "finished": datetime.now(UTC).isoformat()})
+    finally:
+        log.close()
+    print(f"Done ({outcome}). Summarise with: x_probe.py report {log_path}", flush=True)
 
 
 MEDIA_EXT = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp", "image/gif": ".gif"}
@@ -478,7 +852,7 @@ def cmd_backfill(args: argparse.Namespace) -> None:
     state_path = corpus_dir / "backfill_state.json"
     state = json.loads(state_path.read_text()) if (args.resume and state_path.exists()) else {}
     next_token = args.pagination_token or state.get("next_token")
-    out_path = Path(state["out"]) if state.get("out") else corpus_dir / f"posts_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.jsonl"
+    out_path = Path(state["out"]) if state.get("out") else corpus_dir / f"posts_{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}.jsonl"
     fetched = state.get("fetched", 0)
     naming = state.get("naming", "tweet")
     print(f"Backfilling @{target.get('username')} (id {target['id']}) -> {out_path}"
@@ -501,8 +875,8 @@ def cmd_backfill(args: argparse.Namespace) -> None:
     pages = 0
     with out_path.open("a") as out:
         while True:
-            observed = datetime.now(timezone.utc)
-            status, headers, body, elapsed, naming = timeline_get(target["id"], params_for, user_token(), naming)
+            observed = datetime.now(UTC)
+            status, headers, body, _elapsed, naming = timeline_get(target["id"], params_for, user_token(), naming)
             remaining, reset = rate_info(headers)
             if status == 429:
                 sleep_for_rate_limit(reset)
@@ -575,9 +949,23 @@ def cmd_report(args: argparse.Namespace) -> None:
     for name, ok, detail in verdict(summary, controls):
         flag = "PASS" if ok else ("FAIL" if ok is False else "n/a ")
         print(f"  [{flag}] {name}: {detail}")
+    if summary["by_interval"]:
+        print("\nBy polling interval")
+        print(f"  {'interval':>8} {'calls':>6} {'posts':>6} {'lag p50':>8} {'p95':>6} {'p99':>6} {'gap p50':>8} {'gap p95':>8} "
+              f"{'req p50':>8} {'req p95':>8} {'min rem':>8}")
+        for interval, b in summary["by_interval"].items():
+            lag = b["lag"] or {}
+            gap = b["gap"] or {}
+            el = b["elapsed"] or {}
+            print(f"  {interval:>8} {b['calls']:>6} {b['new_posts']:>6} {lag.get('p50', '-')!s:>8} {lag.get('p95', '-')!s:>6} "
+                  f"{lag.get('p99', '-')!s:>6} {gap.get('p50', '-')!s:>8} {gap.get('p95', '-')!s:>8} "
+                  f"{el.get('p50', '-')!s:>8} {el.get('p95', '-')!s:>8} {b['min_rate_remaining']!s:>8}")
     print(f"\nLong posts (over 280 chars) with full body present: {summary['posts_with_long_body']}; "
           f"field naming accepted by the API: {summary['field_naming_used'] or 'n/a'}")
     print("Also check manually: edits (n_edit_ids > 1), replies and threads, and whether the subscriber's follow was revoked.")
+    if args.json:
+        Path(args.json).write_text(json.dumps(summary, indent=2))
+        print(f"Summary written to {args.json}")
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -593,6 +981,11 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--max-results", type=int, default=100)
     p.add_argument("--fetch-media", action="store_true", help="GET the first media URL per call and record status/bytes")
     p.add_argument("--keep-text", action="store_true", help="store post text (manual inspection only; never commit)")
+    p.add_argument("--phases", help="interval:duration pairs, e.g. 15:3600,5:1800,3:1800 (overrides --interval/--duration)")
+    p.add_argument("--start-at", help="ISO-8601 UTC time to begin, e.g. 2026-11-05T14:30:00Z (sleeps until then)")
+    p.add_argument("--extend-until", help="if fewer than --min-posts new target posts arrived, keep polling until this UTC time")
+    p.add_argument("--extend-interval", type=float, default=15.0, help="interval for the extension phase (default 15)")
+    p.add_argument("--min-posts", type=int, default=3, help="new target posts that make the extension unnecessary (default 3)")
     p.set_defaults(fn=cmd_poll)
     sub.add_parser("controls", help="Bearer timeline and user search controls").set_defaults(fn=cmd_controls)
     p = sub.add_parser("backfill", help="Page backwards through the timeline and store full posts locally")
@@ -610,6 +1003,7 @@ def main(argv: list[str] | None = None) -> None:
     p.set_defaults(fn=cmd_corpus)
     p = sub.add_parser("report", help="Summarise a poll log")
     p.add_argument("log")
+    p.add_argument("--json", help="also write the summary dict to this path")
     p.set_defaults(fn=cmd_report)
     args = parser.parse_args(argv)
     args.fn(args)
