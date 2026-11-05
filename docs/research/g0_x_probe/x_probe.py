@@ -43,8 +43,15 @@ TOKEN_URL = "https://api.x.com/2/oauth2/token"
 SCOPES = ["tweet.read", "users.read", "offline.access"]
 TWEET_FIELDS = (
     "created_at,edit_controls,edit_history_tweet_ids,referenced_tweets,attachments,"
-    "conversation_id,in_reply_to_user_id,author_id"
+    "conversation_id,in_reply_to_user_id,author_id,note_tweet"
 )
+# X is renaming tweet.* to post.* in its docs (2026). The live API has historically accepted
+# tweet.fields; the endpoint reference now lists post.fields with note_post. The probe tries
+# "tweet" naming first and falls back to "post" naming on a 400, recording which one worked.
+FIELD_NAMING = {
+    "tweet": {"param": "tweet.fields", "fields": TWEET_FIELDS},
+    "post": {"param": "post.fields", "fields": TWEET_FIELDS.replace("note_tweet", "note_post")},
+}
 EXPANSIONS = "attachments.media_keys,referenced_tweets.id"
 MEDIA_FIELDS = "media_key,type,url,preview_image_url,variants"
 USER_FIELDS = "id,username,protected,created_at"
@@ -83,7 +90,9 @@ def newest_id(current: str | None, ids: list[str]) -> str | None:
 def redact_post(post: dict, media_by_key: dict[str, dict], observed_at: datetime,
                 keep_text: bool = False) -> dict:
     """Reduce a post to metrics. Text is hashed unless keep_text is set."""
-    text = post.get("text", "")
+    short_text = post.get("text", "")
+    note = post.get("note_tweet") or post.get("note_post") or {}
+    text = note.get("text") or short_text
     media_keys = (post.get("attachments") or {}).get("media_keys", []) or []
     media = [media_by_key.get(k, {}) for k in media_keys]
     refs = post.get("referenced_tweets") or []
@@ -94,6 +103,8 @@ def redact_post(post: dict, media_by_key: dict[str, dict], observed_at: datetime
         "lag_s": round(lag_seconds(post["created_at"], observed_at), 3) if post.get("created_at") else None,
         "text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
         "text_len": len(text),
+        "has_note": bool(note.get("text")),
+        "short_text_len": len(short_text),
         "is_reply": bool(post.get("in_reply_to_user_id")) or any(r.get("type") == "replied_to" for r in refs),
         "ref_types": sorted({r.get("type", "") for r in refs}),
         "conversation_id": post.get("conversation_id"),
@@ -113,6 +124,12 @@ def percentile(values: list[float], pct: float) -> float:
     ordered = sorted(values)
     index = min(len(ordered) - 1, math.ceil(pct / 100 * len(ordered)) - 1)
     return round(ordered[max(0, index)], 1)
+
+
+def looks_like_field_naming_error(body: dict) -> bool:
+    """True when a 400 body complains about the tweet.fields parameter or the note_tweet field."""
+    blob = json.dumps(body).lower()
+    return any(k in blob for k in ("tweet.fields", "note_tweet", "tweet_fields"))
 
 
 def summarize(records: list[dict], target_author_id: str | None = None) -> dict:
@@ -141,6 +158,8 @@ def summarize(records: list[dict], target_author_id: str | None = None) -> dict:
         "replies": sum(1 for p in posts if p.get("is_reply")),
         "min_rate_remaining": min(remaining) if remaining else None,
         "errors_4xx_5xx": sum(1 for c in calls if isinstance(c.get("status"), int) and c["status"] >= 400),
+        "posts_with_long_body": sum(1 for p in posts if p.get("has_note")),
+        "field_naming_used": sorted({c.get("field_naming") for c in calls if c.get("field_naming")}),
     }
 
 
@@ -313,10 +332,11 @@ def load_target() -> dict:
     return json.loads(path.read_text())
 
 
-def timeline_params(since_id: str | None, max_results: int) -> dict:
+def timeline_params(since_id: str | None, max_results: int, naming: str = "tweet") -> dict:
+    scheme = FIELD_NAMING[naming]
     params = {
         "max_results": str(max(5, min(100, max_results))),
-        "tweet.fields": TWEET_FIELDS, "expansions": EXPANSIONS, "media.fields": MEDIA_FIELDS,
+        scheme["param"]: scheme["fields"], "expansions": EXPANSIONS, "media.fields": MEDIA_FIELDS,
     }
     if since_id:
         params["since_id"] = since_id
@@ -329,6 +349,7 @@ def cmd_poll(args: argparse.Namespace) -> None:
     log_path = DATA_DIR / f"poll_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.jsonl"
     print(f"Polling @{target.get('username')} (id {target['id']}) every {args.interval}s for {args.duration}s -> {log_path}")
     since_id: str | None = None
+    naming = "tweet"
     deadline = time.monotonic() + args.duration
     with log_path.open("a") as log:
         log.write(json.dumps({"kind": "meta", "target": target, "interval_s": args.interval,
@@ -336,7 +357,12 @@ def cmd_poll(args: argparse.Namespace) -> None:
         while time.monotonic() < deadline:
             observed = datetime.now(timezone.utc)
             status, headers, body, elapsed = api_get(f"/users/{target['id']}/tweets",
-                                                     timeline_params(since_id, args.max_results), user_token())
+                                                     timeline_params(since_id, args.max_results, naming), user_token())
+            if status == 400 and naming == "tweet" and looks_like_field_naming_error(body):
+                naming = "post"
+                print("400 on tweet.fields naming; retrying with post.fields naming")
+                status, headers, body, elapsed = api_get(f"/users/{target['id']}/tweets",
+                                                         timeline_params(since_id, args.max_results, naming), user_token())
             remaining, reset = rate_info(headers)
             media_by_key = {m.get("media_key"): m for m in (body.get("includes") or {}).get("media", [])}
             posts = [redact_post(p, media_by_key, observed, args.keep_text) for p in body.get("data", [])]
@@ -348,6 +374,7 @@ def cmd_poll(args: argparse.Namespace) -> None:
                     posts[0]["media_fetch"] = {"status": mstatus, "bytes": len(mraw), "type": mheaders.get("content-type")}
             record = {
                 "kind": "call", "observed_at": observed.isoformat(), "status": status, "elapsed_s": round(elapsed, 3),
+                "field_naming": naming,
                 "rate_remaining": remaining, "rate_reset": reset, "since_id": since_id,
                 "n_posts": len(posts), "posts": posts, "errors": body.get("errors"),
                 "result_count": (body.get("meta") or {}).get("result_count"),
@@ -401,7 +428,9 @@ def cmd_report(args: argparse.Namespace) -> None:
     for name, ok, detail in verdict(summary, controls):
         flag = "PASS" if ok else ("FAIL" if ok is False else "n/a ")
         print(f"  [{flag}] {name}: {detail}")
-    print("\nAlso check manually: edits (n_edit_ids > 1), replies and threads, and whether the subscriber's follow was revoked.")
+    print(f"\nLong posts (over 280 chars) with full body present: {summary['posts_with_long_body']}; "
+          f"field naming accepted by the API: {summary['field_naming_used'] or 'n/a'}")
+    print("Also check manually: edits (n_edit_ids > 1), replies and threads, and whether the subscriber's follow was revoked.")
 
 
 def main(argv: list[str] | None = None) -> None:

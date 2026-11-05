@@ -103,3 +103,24 @@ def test_timeline_params_clamps_and_sets_since_id():
     assert p["max_results"] == "100" and p["since_id"] == "42"
     assert "since_id" not in x_probe.timeline_params(None, 1)
     assert x_probe.timeline_params(None, 1)["max_results"] == "5"
+
+
+def test_long_post_body_is_used_when_present():
+    observed = datetime(2026, 11, 5, 14, 0, 30, tzinfo=timezone.utc)
+    long_body = "x" * 600
+    post = {"id": "5", "author_id": "T", "created_at": "2026-11-05T14:00:00.000Z",
+            "text": "x" * 280, "note_tweet": {"text": long_body}}
+    rec = x_probe.redact_post(post, {}, observed)
+    assert rec["has_note"] is True and rec["text_len"] == 600 and rec["short_text_len"] == 280
+    assert rec["text_sha256"] == hashlib.sha256(long_body.encode()).hexdigest()
+    post_new_naming = dict(post); del post_new_naming["note_tweet"]; post_new_naming["note_post"] = {"text": long_body}
+    assert x_probe.redact_post(post_new_naming, {}, observed)["has_note"] is True
+
+
+def test_field_naming_schemes_and_error_detection():
+    old = x_probe.timeline_params(None, 10, "tweet")
+    new = x_probe.timeline_params(None, 10, "post")
+    assert "note_tweet" in old["tweet.fields"] and "post.fields" not in old
+    assert "note_post" in new["post.fields"] and "tweet.fields" not in new
+    assert x_probe.looks_like_field_naming_error({"errors": [{"message": "The query parameter [tweet.fields] is not one of [post.fields]"}]})
+    assert not x_probe.looks_like_field_naming_error({"errors": [{"message": "Rate limit exceeded"}]})
