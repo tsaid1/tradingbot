@@ -1,6 +1,6 @@
 # Source to interpreter handoff
 
-The producer owns the historical private archive. The core team owns the interpreter input and any mapping to trusted replay metadata. The archive CLI and reader have no core imports. The [core handoff](https://github.com/tsaid1/tradingbot/blob/84b93c8956e4c4106aa2e7caacc1fc906a98efb3/docs/research/G0_EVENT_SCHEMA.md) specifies the existing Sprint 1.1 consumer mappings.
+The producer owns the historical private archive. The core team owns the interpreter input and any mapping to trusted replay metadata. The exporter is independent of core. The reader maps its verified result to the core models. The [core handoff](https://github.com/tsaid1/tradingbot/blob/84b93c8956e4c4106aa2e7caacc1fc906a98efb3/docs/research/G0_EVENT_SCHEMA.md) specifies the existing Sprint 1.1 consumer mappings.
 
 ## Historical input for core
 
@@ -23,9 +23,9 @@ from docs.research.source_corpus.source_reader import historical_inputs
 for item in historical_inputs(dev_path, expected_sha256=dev_digest,
                               expected_author_id=target_id, simulated_lag=timedelta(0)):
     text = item.text                 # full API body; apply source gates before interpretation
-    metadata = item.replay_source    # tradingbot.event_models.ReplaySource
+    post = item.as_source_post()     # tradingbot.source_events.SourcePost (schema 1.2)
 ```
 
-The example uses zero lag only as a deterministic simulation parameter. The revision's API timestamp controls availability, and the root's original publication controls freshness. For eligible revision-1 originals, `item.as_source_event()` returns `tradingbot.models.SourceEvent`. It refuses edits, uncertain bodies and reposts that the legacy shape cannot safely represent. The richer replay metadata and original archive row remain available on every item.
+Use the explicitly converted posts with the core interpreter. Preserve the reader’s revision-availability order. When a batch contains edits, pass one available post at a time to the existing mock replay coordinator and keep the same interpreter instance; the core batch helper sorts by original publication. On the core archive model, received_at carries the historical capture clock. The wrapper’s replay_source.received_at is instead a simulated receipt. The example uses zero lag only as a deterministic simulation parameter. The revision's API timestamp controls availability, and the root's original publication controls freshness. For eligible revision-1 originals, `item.as_source_event()` returns `tradingbot.models.SourceEvent`. It refuses edits, uncertain bodies and reposts that the legacy shape cannot safely represent. The richer replay metadata and original archive row remain available on every item.
 
-`post_hash` matches the UTF-8 text digest. A pinned archive checksum also covers identity, references, provenance and media metadata. A time cutoff on the interpreter reader includes simulated receipt lag. Never use the curator's full archive to tune or retrieve context; use the development file. The original, unedited publication time inferred from an edit chain uses the X snowflake epoch, truncated to whole seconds.
+`post_hash` matches the UTF-8 text digest. A pinned archive checksum also covers identity, references, provenance and media metadata. A time cutoff on the interpreter reader includes simulated receipt lag. Never use the curator's full archive to tune or retrieve context; use the development file. For an edit, the core SourcePost uses the root snowflake time with millisecond precision, and the revision API time determines when its body becomes available.

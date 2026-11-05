@@ -211,3 +211,73 @@ def test_reposts_and_truncation_never_exposed_to_legacy_event(store, tmp_path):
         with pytest.raises(ValueError, match="legacy"):
             e.as_source_event()
     assert events[2].as_source_event().source_id == "104"
+
+
+def test_historical_source_posts_through_core_and_mock_coordinator(store, tmp_path):
+    from decimal import Decimal
+
+    from tradingbot.event_replay import PaperEventReplay
+    from tradingbot.models import MockPolicy, Quote
+    from tradingbot.source_events import Provenance, coerce_source_posts
+    from tradingbot.tkl_interpreter import TklInterpreter, replay_posts
+
+    start = datetime.fromisoformat(OPEN)
+
+    def at(seconds):
+        return start + timedelta(seconds=seconds)
+
+    def post(seconds, text, **metadata):
+        millis = int(at(seconds).timestamp()) * 1000
+        post_id = str((millis - 1288834974657) << 22)
+        return record(post_id, text=text, created_at=at(seconds).isoformat(), **metadata)
+
+    first = post(0, "We are now long $TLT at $88.50. Stop: $86.00. Target: $95.00.")
+    parent = first["id"]
+    media_file = tmp_path / "media" / "3_12.png"
+    media_file.write_bytes(b"synthetic image bytes")
+    first.update(media=[{"media_key": "3_12", "type": "photo", "url": "https://example.invalid/a"}],
+                 media_files=[{"file": media_file.name, "bytes": media_file.stat().st_size,
+                               "status": 200}])
+    mixed = post(30, "Adding to our $TLT long at $89.20 and raising our stop to $87.00.",
+                 referenced=[{"type": "quoted", "id": parent}], is_quote=True)
+    edited = post(60, "Closing the remaining $TLT long here at $89.20.")
+    edited["edit_history_ids"] = [parent, edited["id"]]
+    repost = post(90, first["text"], referenced=[{"type": "retweeted", "id": parent}])
+    short = post(120, "We are now long $TLT at $89.20…", has_note=False, short_text="Cut…")
+    records = store(short, mixed, repost, edited, first)
+    dest = tmp_path / "data" / "corpus.jsonl"
+    export(records, dest, tmp_path)
+    options = {"expected_sha256": hashlib.sha256(dest.read_bytes()).hexdigest(),
+               "expected_author_id": "42", "simulated_lag": timedelta(seconds=1)}
+    reader = historical_inputs(dest, **options)
+    posts = [p.as_source_post() for p in reader]
+    assert [p.post_id for p in posts] == [r["id"] for r in [first, mixed, edited, repost, short]]
+    assert [p.post_id for p in posts[:2]] == [
+        p.as_source_post().post_id for p in historical_inputs(dest, through=at(60), **options)
+    ]
+    assert all(p.provenance == Provenance.ARCHIVE_API_USER_CONTEXT for p in posts)
+    assert posts[0].text == first["text"] and posts[0].received_at.year == 2031
+    assert posts[0].media[0].sha256 == hashlib.sha256(media_file.read_bytes()).hexdigest()
+    assert posts[0].media[0].local_file == media_file.name
+    assert posts[1].links[0].post_id == parent and not posts[1].links[0].text_available
+    assert posts[2].source_id == parent and posts[2].revised_at == at(60)
+
+    def quotes(p, now):
+        midpoint = Decimal("88.50" if p.post_id == parent else "89.20")
+        return {"TLT": Quote(symbol="TLT", bid=midpoint, ask=midpoint, observed_at=now)}
+
+    engine = PaperEventReplay(tmp_path / "mock.sqlite3", MockPolicy(quantity=2))
+    interpreter = TklInterpreter()
+    steps = []
+    for available_post in posts:
+        # Feed availability order. The core batch helper sorts by original publication.
+        accepted = coerce_source_posts([available_post])
+        steps.extend(replay_posts(accepted, engine, interpreter, quotes, lag_seconds=1))
+    assert [a.status for a in steps[0].result.outcomes] == ["SIMULATED"]
+    assert [a.status for a in steps[1].result.outcomes] == ["SIMULATED", "SIMULATED"]
+    assert [a.action.value for a in steps[1].interpreted.parsed.actions] == ["ADD", "MODIFY"]
+    assert steps[2].result.outcomes[0].reasons == ["SOURCE_EDIT_REQUIRES_REVIEW"]
+    assert all(a.status == "NO_TRADE" for a in steps[3].result.outcomes)
+    assert steps[4].result.outcomes[0].reasons == ["SOURCE_TEXT_TRUNCATED"]
+    assert all(a.order is None for step in steps[2:] for a in step.result.outcomes)
+    assert [(i["quantity"], i["stop_price"]) for i in engine.ideas()] == [(3, "87.00")]

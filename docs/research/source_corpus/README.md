@@ -10,7 +10,6 @@ Run from the repository root with Python 3.11 or later. Set `CAPTURE` to the loc
 python docs/research/source_corpus/archive.py "$CAPTURE" --target "$TARGET" --media "$MEDIA" --expected-count 3189
 python docs/research/source_corpus/archive.py "$CAPTURE" --target "$TARGET" --media "$MEDIA" --expected-count 3189 --full-archive --out private_samples/sprint12/archive.jsonl
 python docs/research/source_corpus/archive.py "$CAPTURE" --target "$TARGET" --media "$MEDIA" --split-manifest private_samples/sprint12/holdout/split_manifest.jsonl --out private_samples/sprint12/development.jsonl
-python docs/research/source_corpus/g0_audit.py --help
 python -m pytest
 ```
 
@@ -35,7 +34,7 @@ The full archive is for the corpus curator. The private split assigns 120 develo
 
 ## Limits
 
-- An authorized backfill records the captured revision's publication time and a historical page-request timestamp. The latter cannot measure live delivery. Live polling and matched app-only authorization use a separate G0 log and the aggregate-only auditor.
+- An authorized backfill records the captured revision's publication time and a historical page-request timestamp. The latter cannot measure live delivery. The G0 probe separately measures live delivery and app-only authorization.
 - Earlier text versions of the 61 edited records are unavailable. Reposts can contain only wrapper excerpts. The core handoff defines a note-less short field ending with a literal Unicode ellipsis as potentially truncated. None of the original-author posts in this capture meets that condition.
 - An absent parent, quote or media file remains absent. A protected-author timeline establishes the timeline identity at collection; it carries no independent community-membership assertion.
 - The golden sequences express source intent as of publication. The holdout has a single annotation pass independent of interpreter output. Broker fills, strategy performance and parser accuracy require separate evidence.

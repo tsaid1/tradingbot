@@ -8,6 +8,7 @@ from pathlib import Path
 
 from tradingbot.event_models import ReplaySource
 from tradingbot.models import SourceEvent
+from tradingbot.source_events import MediaRef, PostLink, Provenance, SourcePost, snowflake_time
 
 from .archive import identifier, instant, read_history
 
@@ -23,6 +24,22 @@ class HistoricalInput:
     @property
     def text(self) -> str:
         return self.archive_record["text"]
+
+    def as_source_post(self) -> SourcePost:
+        """Project the validated revision into the core archive model, without resolving links."""
+        row, src = self.archive_record, self.replay_source
+        return SourcePost(
+            source_id=src.source_id, post_id=row["post_id"], revision=src.revision,
+            author_id=row["author"]["id"], verified_author=src.verified_author,
+            text=self.text, text_complete=src.complete_text, is_repost=src.is_repost,
+            published_at=snowflake_time(src.source_id) if self.revised_at else src.published_at,
+            revised_at=self.revised_at, received_at=instant(row["observed_at"]),
+            provenance=Provenance.ARCHIVE_API_USER_CONTEXT, conversation_id=row["conversation_id"],
+            links=[PostLink(relation=r["type"], post_id=r["id"]) for r in row["references"]],
+            media=[MediaRef(media_key=m["media_key"], type=m["type"], url=m.get("url"),
+                            local_file=m["download"].get("file"), sha256=m.get("sha256"))
+                   for m in row["media"]],
+        )
 
     def as_source_event(self) -> SourceEvent:
         """The legacy input lacks revision, repost and completeness fields."""
