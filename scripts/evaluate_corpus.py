@@ -7,10 +7,12 @@ Real development export from the Source Agent (private, git-ignored; never the h
     python scripts/evaluate_corpus.py --export data/eval/dev_export.jsonl --manifest data/eval/dev_export.manifest.json \\
         --labels data/eval/dev_labels.jsonl --labels-sha256 <hex> --expected-author <account id> \\
         --golden data/eval/golden --out data/eval/results_dev
-    # or straight from the adapter, passing its own reader arguments:
-    python scripts/evaluate_corpus.py --adapter source_agent.adapter:historical_inputs \\
-        --reader-arg split=development --reader-arg start=2025-01-01T00:00:00Z --reader-arg end=2026-11-01T00:00:00Z \\
-        --labels data/eval/dev_labels.jsonl --expected-author <account id>
+    # or straight from the Source Agent's reader (docs/research/source_corpus/source_reader.py):
+    python scripts/evaluate_corpus.py --adapter docs.research.source_corpus.source_reader:historical_inputs \\
+        --reader-arg path=private_samples/sprint12/development.jsonl --reader-arg expected_sha256=<export digest> \\
+        --reader-arg expected_author_id=<account id> --reader-arg simulated_lag=12.4 \\
+        --labels private_samples/sprint12/dev_labels.jsonl --labels-sha256 <hex> --expected-author <account id> \\
+        --golden private_samples/sprint12/golden --out data/eval/results_dev --dataset-name dev-120
 
 Integrity: an export needs a checksum (manifest `sha256` or --sha256) and the manifest split must be
 "development"; the holdout is refused unless --allow-holdout (final evaluation only). Reports hold
@@ -78,6 +80,7 @@ def main(argv: list[str] | None = None) -> int:
                     reader_args[key] = parse_reader_args([f"{key}={getattr(args, key)}"])[key]
             if str(reader_args.get("split", "")).lower() == "holdout" and not args.allow_holdout:
                 sys.exit("Refusing split=holdout: the holdout is reserved for the final evaluation.")
+            _guard_holdout([v for v in reader_args.values() if isinstance(v, Path)], args.allow_holdout)
             posts = posts_from_adapter(historical_inputs, reader_args, expected_author_id=args.expected_author)
             info = {"adapter": args.adapter, "reader_args": {k: str(v) for k, v in reader_args.items()}}
         elif args.export:
@@ -104,7 +107,7 @@ def main(argv: list[str] | None = None) -> int:
     report = evaluate(posts, labels, dataset=name)
     goldens: list[GoldenResult] = []
     if args.golden:
-        by_id = {p.source_id: p for p in posts}
+        by_id = {p.post_id: p for p in posts}
         args.out.mkdir(parents=True, exist_ok=True)
         for spec_path in sorted(args.golden.glob("golden_*.json")):
             spec = load_golden(spec_path)
