@@ -193,3 +193,34 @@ def test_backfill_pages_until_no_token_and_is_resumable(tmp_path, monkeypatch, c
     x_probe.cmd_backfill(args3)
     state = json.loads((tmp_path / "corpus" / "backfill_state.json").read_text())
     assert state["fetched"] == 3 and state["next_token"] is None and seen[-1] == "p2"
+
+
+def test_auth_flow_exchanges_code_without_a_real_browser(tmp_path, monkeypatch, capsys):
+    """Drives cmd_auth end to end with a fake browser that hits the local callback."""
+    import argparse, json, threading, urllib.request
+    monkeypatch.setattr(x_probe, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(x_probe, "TOKEN_FILE", tmp_path / "tokens.json")
+    monkeypatch.setenv("X_CLIENT_ID", "cid")
+    monkeypatch.setenv("X_REDIRECT_URI", "http://127.0.0.1:8799/callback")
+    monkeypatch.delenv("X_CLIENT_SECRET", raising=False)
+
+    def fake_open(url):
+        state = dict(p.split("=") for p in url.split("?", 1)[1].split("&"))["state"]
+        def hit():
+            urllib.request.urlopen(f"http://127.0.0.1:8799/callback?code=abc&state={state}", timeout=5).read()
+        threading.Timer(0.2, hit).start()
+        return True
+
+    monkeypatch.setattr(x_probe.webbrowser, "open", fake_open)
+    posted = {}
+
+    def fake_http(method, url, *, headers=None, data=None, timeout=20.0):
+        posted.update({"url": url, "body": data.decode()})
+        return 200, {}, json.dumps({"access_token": "A", "refresh_token": "R", "expires_in": 7200, "scope": "tweet.read"}).encode(), 0.1
+
+    monkeypatch.setattr(x_probe, "http", fake_http)
+    x_probe.cmd_auth(argparse.Namespace())
+    assert posted["url"] == x_probe.TOKEN_URL and "code=abc" in posted["body"] and "code_verifier=" in posted["body"]
+    saved = json.loads((tmp_path / "tokens.json").read_text())
+    assert saved["refresh_token"] == "R" and saved["expires_at"] > 0
+    assert "Refresh token present: True" in capsys.readouterr().out

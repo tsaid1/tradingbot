@@ -26,7 +26,6 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
-import http.server
 import json
 import math
 import os
@@ -39,6 +38,7 @@ import urllib.parse
 import urllib.request
 import webbrowser
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 API = "https://api.x.com/2"
@@ -266,7 +266,7 @@ def cmd_auth(_: argparse.Namespace) -> None:
     parsed = urllib.parse.urlparse(redirect_uri)
     captured: dict = {}
 
-    class Handler(http.server.BaseHTTPRequestHandler):
+    class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             captured.update({k: v[0] for k, v in qs.items()})
@@ -277,7 +277,7 @@ def cmd_auth(_: argparse.Namespace) -> None:
         def log_message(self, *args):  # silence
             return
 
-    server = http.server.HTTPServer((parsed.hostname or "127.0.0.1", parsed.port or 80), Handler)
+    server = HTTPServer((parsed.hostname or "127.0.0.1", parsed.port or 80), Handler)
     print("Opening browser for X authorization. Log in as the SUBSCRIBER account that follows the target.")
     print(url)
     webbrowser.open(url)
