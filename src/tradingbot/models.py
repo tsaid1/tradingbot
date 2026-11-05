@@ -10,7 +10,7 @@ from decimal import Decimal
 from enum import Enum
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 
 class StrictModel(BaseModel):
@@ -81,14 +81,45 @@ class Quote(StrictModel):
 
 
 class MockPolicy(StrictModel):
-    # All values are illustrative DEMO limits, NOT real trading settings.
-    quantity: int = Field(default=1, ge=1, le=100)
-    max_price_deviation_pct: Decimal = Field(default=Decimal("1.0"), ge=0, le=100)
+    """The ONE mock risk-parameter contract, shared by every engine.
+
+    Both the Sprint 1 journal (storage.py) and the Sprint 1.1 replay coordinator
+    (event_replay.py) read their limits from here through validator.py, so no engine
+    carries its own defaults. All values are illustrative DEMO limits, NOT real trading
+    settings. Sizing lives here and in deterministic code only; the LLM-facing schemas
+    (SignalCandidate, ParsedPost/TradeAction) carry no quantity, venue or account field.
+    The Sprint 1.1 spellings are accepted as validation aliases for existing callers.
+    """
+    quantity: int = Field(
+        default=1, ge=1, le=100, validation_alias=AliasChoices("quantity", "quantity_per_open"),
+    )
+    quantity_per_add: int = Field(default=1, ge=1, le=100)
+    max_price_deviation_pct: Decimal = Field(
+        default=Decimal("1.0"), ge=0, le=100,
+        validation_alias=AliasChoices("max_price_deviation_pct", "max_deviation_pct"),
+    )
     max_spread_pct: Decimal = Field(default=Decimal("1.0"), ge=0, le=100)
     max_notional_usd: Decimal = Field(default=Decimal("2000"), gt=0)
-    max_signal_age_seconds: int = Field(default=90, gt=0)
+    max_signal_age_seconds: int = Field(
+        default=90, gt=0, validation_alias=AliasChoices("max_signal_age_seconds", "max_source_age_seconds"),
+    )
     max_quote_age_seconds: int = Field(default=30, gt=0)
+    require_stop_on_open: bool = True
+    # None = no symbol allowlist (the demo grammar accepts any well-formed symbol);
+    # a set restricts fictional fills to those symbols.
+    allowed_symbols: frozenset[str] | None = None
     paper_only: Literal[True] = True
+    allow_stop_widening: Literal[False] = False
+
+
+class GateDecision(StrictModel):
+    """Canonical output of the deterministic authorization gateway (validator.py).
+
+    APPROVE never means an order exists; an engine must still apply a fictional fill.
+    The Sprint 1 pipeline sees this translated to the legacy Decision vocabulary.
+    """
+    status: Literal["APPROVE", "HOLD", "BLOCK", "NO_TRADE", "RECONCILE"]
+    reasons: list[str] = Field(default_factory=list)
 
 
 class Decision(StrictModel):
@@ -102,6 +133,9 @@ class Position(StrictModel):
     asset_class: AssetClass
     side: PositionSide
     quantity: int = Field(gt=0)
+    # Protection levels known to the ledger (Sprint 1.1 ideas); None when the ledger does not track them.
+    stop_price: str | None = None
+    target_price: str | None = None
 
 
 class MockOrder(StrictModel):
