@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 from collections import Counter, defaultdict
 from collections.abc import Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -248,8 +248,8 @@ class EvaluationReport(StrictModel):
                   f"{v['precision']} | {v['recall']} |" for r, v in sorted(self.price_roles.items())]
         lk = self.linkage
         lines += ["", "## Position linkage", "",
-                  f"Evaluated {lk['evaluated']}, correct {lk['correct']}, missing {lk['missing']}, wrong {lk['wrong']}, "
-                  f"accuracy {lk['accuracy']}.", "",
+                  (f"Evaluated {lk['evaluated']}, correct {lk['correct']}, missing {lk['missing']}, wrong {lk['wrong']}, "
+                   f"accuracy {lk['accuracy']}."), "",
                   f"## False executable candidates: {len(self.false_executable)}", ""]
         lines += [f"- {f['source_id']} {f['action_id']} predicted {f['predicted']} ({f['reason']})" for f in self.false_executable] or ["- none"]
         lines += ["", f"## Missed instructions: {len(self.missed_instructions)}", ""]
