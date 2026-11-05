@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Read-only historical timeline record",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "post_id", "post_family_id", "revision", "edit_history_ids", "author", "published_at", "observed_at", "conversation_id", "references", "is_quote", "is_reply", "is_repost", "text", "text_field", "text_sha256", "text_completeness", "media", "provenance"],
+  "$defs": {
+    "id": {"type": "string", "pattern": "^[0-9]+$"},
+    "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "clock": {"type": "string", "format": "date-time"}
+  },
+  "properties": {
+    "schema_version": {"const": "g0.archive.v1"},
+    "post_id": {"$ref": "#/$defs/id"},
+    "post_family_id": {"$ref": "#/$defs/id"},
+    "revision": {"type": "integer", "minimum": 1},
+    "edit_history_ids": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/id"}},
+    "author": {
+      "type": "object", "additionalProperties": false, "required": ["id", "username", "protected_at_lookup"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"}, "username": {"type": "string", "minLength": 1},
+        "protected_at_lookup": {"const": true}
+      }
+    },
+    "published_at": {"$ref": "#/$defs/clock"},
+    "observed_at": {"$ref": "#/$defs/clock"},
+    "conversation_id": {"$ref": "#/$defs/id"},
+    "references": {"type": "array", "items": {
+      "type": "object", "additionalProperties": false, "required": ["type", "id"],
+      "properties": {"type": {"enum": ["quoted", "replied_to", "retweeted"]}, "id": {"$ref": "#/$defs/id"}}
+    }},
+    "is_quote": {"type": "boolean"},
+    "is_reply": {"type": "boolean"},
+    "is_repost": {"type": "boolean"},
+    "text": {"type": "string", "minLength": 1},
+    "text_field": {"enum": ["note", "text"]},
+    "text_sha256": {"$ref": "#/$defs/digest"},
+    "text_completeness": {"enum": ["api_body", "repost_wrapper", "uncertain_trailing_ellipsis"]},
+    "media": {"type": "array", "items": {
+      "type": "object", "required": ["media_key", "type", "local_status", "download"],
+      "properties": {
+        "media_key": {"type": "string", "pattern": "^[0-9]+_[0-9]+$"},
+        "type": {"type": "string", "minLength": 1},
+        "url": {"type": "string"}, "preview_image_url": {"type": "string"},
+        "download": {"type": "object"},
+        "local_status": {"enum": ["verified", "unavailable", "not_requested"]},
+        "sha256": {"$ref": "#/$defs/digest"}, "bytes": {"type": "integer", "minimum": 1}
+      },
+      "if": {"properties": {"local_status": {"const": "verified"}}},
+      "then": {"required": ["bytes", "sha256"]}
+    }},
+    "provenance": {
+      "type": "object", "additionalProperties": false,
+      "required": ["platform", "method", "capture_sha256", "capture_line", "observation_clock"],
+      "properties": {
+        "platform": {"const": "x"},
+        "method": {"const": "authenticated_user_timeline_backfill"},
+        "capture_sha256": {"$ref": "#/$defs/digest"},
+        "capture_line": {"type": "integer", "minimum": 1},
+        "observation_clock": {"const": "page_request_start"}
+      }
+    }
+  }
+}
