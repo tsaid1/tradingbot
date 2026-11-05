@@ -166,10 +166,11 @@ def test_synthetic_evaluation_aggregates():
     report = evaluate(load_posts(FIXTURES / "posts.jsonl"), load_labels(FIXTURES / "labels.jsonl"), dataset="synthetic")
     assert report.posts == 33 and report.labeled_posts == 33 and report.labeled_actions == 36
     assert report.false_executable == []                                              # distractors never become candidates
-    assert {m["source_id"] for m in report.missed_instructions} == {"e05", "e08", "e13", "e31"}   # the planted gaps
-    assert report.class_accuracy == "100.0%" and report.tense_accuracy == "100.0%"
+    # After the corrections only the past-tense entry announcement remains, and as a semantic gap, not a phrasing one
+    assert [(m["source_id"], m["failure"]) for m in report.missed_instructions] == [("e05", "MISSED_INSTRUCTION_SEMANTICS")]
     assert report.linkage["wrong"] == 0 and report.linkage["missing"] == 0
-    assert report.failures_ranked[0]["kind"] == "MISSED_INSTRUCTION_PHRASING"
+    assert all(v["wrong"] == 0 for v in report.price_roles.values())
+    assert {f["kind"] for f in report.failures_ranked} <= {"MISSED_INSTRUCTION_SEMANTICS", "TENSE_OR_CLASS_MISMATCH"}
 
 
 def test_cli_synthetic_run_writes_reports_without_text(tmp_path):

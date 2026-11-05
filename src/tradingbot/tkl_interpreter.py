@@ -19,10 +19,13 @@ Rules
 """
 from __future__ import annotations
 
+import html
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
+from pathlib import Path
+import json
 from typing import Callable, Literal, Protocol
 
 from pydantic import Field
@@ -104,6 +107,34 @@ class StructuredBackend(Protocol):
     def parse(self, text: str, image: bytes | None = None) -> ParsedPost: ...
 
 
+class LexiconExtension(StrictModel):
+    """Extra verb and header patterns supplied at runtime, for example from a private, git-ignored
+    file that holds a publisher's house phrasings so they never enter the public code. Each entry is
+    a regular expression compiled case-insensitively; extension verbs take precedence over the built-in
+    verbs of the same class and tense, and extension entry verbs count as explicit entry language."""
+    open_present: list[str] = Field(default_factory=list)
+    open_past: list[str] = Field(default_factory=list)
+    add_present: list[str] = Field(default_factory=list)
+    reduce_present: list[str] = Field(default_factory=list)
+    close_present: list[str] = Field(default_factory=list)
+    close_past: list[str] = Field(default_factory=list)
+    modify_present: list[str] = Field(default_factory=list)
+    summary_headers: list[str] = Field(default_factory=list)
+
+    @classmethod
+    def from_json(cls, path) -> LexiconExtension:
+        return cls.model_validate(json.loads(Path(path).read_text(encoding="utf-8")))
+
+    def verb_entries(self) -> list[tuple[re.Pattern[str], MessageClass, Tense]]:
+        table = [
+            ("open_present", MessageClass.OPEN, Tense.PRESENT), ("open_past", MessageClass.OPEN, Tense.PAST),
+            ("add_present", MessageClass.ADD, Tense.PRESENT), ("reduce_present", MessageClass.REDUCE, Tense.PRESENT),
+            ("close_present", MessageClass.CLOSE, Tense.PRESENT), ("close_past", MessageClass.CLOSE, Tense.PAST),
+            ("modify_present", MessageClass.MODIFY, Tense.PRESENT),
+        ]
+        return [(_r(pattern), cls, tense) for name, cls, tense in table for pattern in getattr(self, name)]
+
+
 # ----------------------------------------------------------------------------- lexicon
 
 def _r(pattern: str) -> re.Pattern[str]:
@@ -142,12 +173,13 @@ PCT_OF_RE = _r(r"(\d{1,3})\s?%\s+of\b")
 PARTIAL_RE = _r(r"\b(?:partial|some|part of|portion)\b")
 
 # Verb lexicon: first match decides the base class and tense. Order matters.
+NEGATED_MODIFY_RE = _r(r"\b(?:not|never|no longer) (?:shifting|moving|raising|lowering|changing|adjusting|trailing|touching)\b")
 CANCEL_RE = _r(r"\b(?:cancel(?:l)?(?:ing|ed)?|no longer (?:looking|planning|intending) to|scrapping|scrapped|"
                r"withdrawing|withdrawn|calling off|called off|abandon(?:ing|ed)|shelving)\b")
 VERBS: list[tuple[re.Pattern[str], MessageClass, Tense]] = [
     (_r(r"\bwe (?:have |had )?(?:raised|moved|lowered|tightened|trailed|adjusted) (?:our |the )?(?:stop|target)"),
      MessageClass.MODIFY, Tense.PAST),
-    (_r(r"\b(?:raising|moving|lowering|tightening|trailing|adjusting|lifting) (?:our |the )?"
+    (_r(r"\b(?:raising|moving|lowering|tightening|trailing|adjusting|lifting|shifting) (?:our |the )?(?:\$?(?-i:[A-Z]{1,5}) )?"
         r"(?:stop|target|stop[- ]loss|take[- ]profit)|"
         r"\b(?:stop|target|stop[- ]loss)(?: is| has been)? (?:now )?(?:raised|moved|lowered|tightened|set|adjusted|trailed)"
         r"(?: up| down)? to\b|\bnew (?:stop|target)\b|\b(?:stop|target) (?:is )?now (?:at )?\$?\d"),
@@ -165,15 +197,18 @@ VERBS: list[tuple[re.Pattern[str], MessageClass, Tense]] = [
         r"adding (?:a |an )?(?:second|third|new) tranche)\b"), MessageClass.ADD, Tense.PRESENT),
     (_r(r"\b(?:(?:have |has |had |were |was |got )?(?:closed(?: out)?|exited|stopped out|covered)|"
         r"took full profits|we are out of)\b"), MessageClass.CLOSE, Tense.PAST),
-    (_r(r"\b(?:closing(?: out)?|exiting|covering|taking full profits|cutting (?:our |the )?(?:position|losses)|"
-        r"closing the (?:rest|remaining|remainder|entire|full))\b"), MessageClass.CLOSE, Tense.PRESENT),
+    (_r(rf"\b(?:closing(?: out)?|exiting|covering|taking full profits|cutting (?:our |the )?(?:position|losses)|"
+        rf"closing the (?:rest|remaining|remainder|entire|full)|out of {ASSET_TOKEN}|"
+        rf"cutting (?:our |the )?(?:{ASSET_TOKEN} )?(?:long|short|position)(?: loose)?)\b"), MessageClass.CLOSE, Tense.PRESENT),
     (_r(r"\b(?:we (?:went|got) (?:long|short)|we entered|we bought|we shorted|entered (?:a |an )?(?:new )?(?:long|short)|"
-        r"opened (?:a |an )?(?:new )?(?:long|short)|we are (?:long|short) [^.]{0,40}?\bfrom\b)"),
+        r"opened (?:a |an )?(?:new )?(?:long|short)|initiated (?:a |an )?(?:new )?(?:long|short)|we initiated|"
+        r"we are (?:long|short) [^.]{0,40}?\bfrom\b)"),
      MessageClass.OPEN, Tense.PAST),
     (_r(r"\b(?:we are now (?:long|short)|now (?:long|short)|going (?:long|short)|"
         r"entering (?:a |an )?(?:new )?(?:long|short)|opening (?:a |an )?(?:new )?(?:long|short)|"
         r"initiating (?:a |an )?(?:new )?(?:long|short)|we are buying|we are shorting|"
         rf"buying {ASSET_TOKEN}|shorting {ASSET_TOKEN}|new (?:long|short)(?: position)?\b|"
+        r"(?:taking|opening|starting|initiating|entering) (?:a |an |some )?(?:small |new |partial )?(?:long|short)s?(?: positions?)?\b|"
         rf"(?:long|short) {ASSET_TOKEN}[^.]{{0,30}}?\b(?:at|@)\b)"),
      MessageClass.OPEN, Tense.PRESENT),
 ]
@@ -193,6 +228,7 @@ SUMMARY_RE = _r(r"^\s*(?:current|open|our|active) positions?\b|\bposition (?:sum
                 r"\bportfolio (?:update|summary)\b|^\s*positions?\s*:")
 SUMMARY_LINE_RE = _r(r"^\s*(?:\d+[.)]\s*|[-•*]\s*)?(?:long|short)\s+\$?[A-Za-z&0-9 .]{1,30}?\s*(?:\(|-|–|:|from|entry|@|at)\s*\$?\d")
 STRONG_OPEN_RE = _r(r"\b(?:we are now (?:long|short)|now (?:long|short)|going (?:long|short)|"
+                    r"(?:taking|opening|starting|initiating|entering) (?:a |an |some )?(?:small |new |partial )?(?:long|short)s?\b|"
                     r"entering (?:a |an )?(?:new )?(?:long|short)|opening (?:a |an )?(?:new )?(?:long|short)|"
                     r"initiating (?:a |an )?(?:new )?(?:long|short)|we are buying|we are shorting|"
                     rf"buying {ASSET_TOKEN}|shorting {ASSET_TOKEN}|new (?:long|short)(?: position)?\b)")
@@ -208,21 +244,27 @@ RECAP_RE = _r(r"\b(?:yesterday|last (?:week|month|year|session|night)|earlier (?
 _close_past_index = next(i for i, (_rx, cls, tense) in enumerate(VERBS)
                          if cls == MessageClass.CLOSE and tense == Tense.PAST)
 VERBS.insert(_close_past_index, (STOP_TRIGGERED_RE, MessageClass.CLOSE, Tense.PAST))
-SIDE_LONG_RE = _r(r"\b(?:long|buy|buying|bought)\b")
-SIDE_SHORT_RE = _r(r"\b(?:short|shorting|shorted|covering|covered|cover)\b")
+SIDE_LONG_RE = _r(r"\b(?:longs?|buy|buying|bought)\b")
+SIDE_SHORT_RE = _r(r"\b(?:shorts?|shorting|shorted|covering|covered|cover)\b")
 
 SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+(?=[A-Z$\"'(])|\n+|;\s*")
 CONJUNCTION = re.compile(r",?\s+and\s+|,\s+then\s+|,\s+")
 PNL_RE = re.compile(r"(?<![\d.])([+-]?\d+(?:\.\d+)?)\s?%(?!\s+of\b)", re.IGNORECASE)
 DATE_RE = _r(r"\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?\s+\d{1,2}(?:st|nd|rd|th)?,?\s*(?:\d{4})?|"
              r"\b(?:in|since|of|by|during|late|early|mid|this|last) (?:19|20)\d{2}\b")
-PRICE_RE = re.compile(r"(?<![\w.$])\$?\s?(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)(?!\s*%)(?![\d,])")
+# Trailing lookaheads: not a percentage, not inside a longer number, not a thousands group. The old
+# `(?![\d,])` also rejected a comma after a decimal ("$31.20, stop"), which made the regex backtrack to "31".
+PRICE_RE = re.compile(r"(?<![\w.$])\$?\s?(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)(?!\s*%)(?!\d)(?!,\d)")
 STOP_WORD_RE = _r(r"\b(?:stop|stop[- ]loss|sl)\b")
-TARGET_WORD_RE = _r(r"\b(?:target|take[- ]profit|tp|objective)\b")
+TARGET_WORD_RE = _r(r"\b(?:target(?:ing)?|take[- ]profit|tp|objective)\b")
+# A role word may follow the number ("95 target, 86 stop, 88 entry"). A trailing "now" marks a quoted
+# market price: a reference by default, never an entry (only explicit execution language sets ENTRY).
+AFTER_ROLE_RE = _r(r"^\s*(?:(?P<stop>stop(?:[- ]loss)?|sl)|(?P<target>target|tp)|(?P<entry>entry|ent)|(?P<now>now))\b")
 TRIGGER_WORD_RE = _r(r"\b(?:below|above|under|over|breaks?|breaking|break of|through|closes?|cross(?:es|ing)?)\b")
 AT_WORD_RE = _r(r"(?:\b(?:at|here at|near|around|from|entry(?: at| of)?|entered at|price of|to)\b|@|:)\s*\$?\s*$")
 WINDOW = 28
-LEVEL_LINE_RE = _r(r"^\s*(?:stop(?:[- ]loss)?|target|take[- ]profit|tp|sl)\b[^a-z0-9$]{0,6}\$?\s?\d")
+LEVEL_LINE_RE = _r(r"^\s*(?:stop(?:[- ]loss)?|target(?:ing)?|take[- ]profit|tp|sl|entry)\b[^a-z0-9$]{0,6}\$?\s?\d|"
+                   r"^\s*~?\$?\d[\d,.]*\s+now\b")
 _LEVEL_HOSTS = {MessageClass.OPEN, MessageClass.ADD, MessageClass.MODIFY, MessageClass.CONDITIONAL}
 
 
@@ -292,10 +334,14 @@ class _Clause:
 
 class TklInterpreter:
     def __init__(self, context: PointInTimeContext | None = None, backend: StructuredBackend | None = None,
-                 *, external_processing_permitted: bool = False):
+                 *, external_processing_permitted: bool = False, lexicon: LexiconExtension | None = None):
         self.context = context or PointInTimeContext()
         self.backend = backend
         self.external_processing_permitted = external_processing_permitted
+        self.lexicon = lexicon or LexiconExtension()
+        self._verbs = _merge_verbs(VERBS, self.lexicon.verb_entries())
+        self._strong_open = [STRONG_OPEN_RE] + [_r(x) for x in self.lexicon.open_present]
+        self._summary_headers = [SUMMARY_RE] + [_r(x) for x in self.lexicon.summary_headers]
 
     # ------------------------------------------------------------------ public API
 
@@ -402,10 +448,14 @@ class TklInterpreter:
             if summary_mode and _is_summary_clause(clause.text):
                 summary_parts.append(clause.text)
                 continue
-            if out and LEVEL_LINE_RE.match(clause.text) and out[-1].message_class in _LEVEL_HOSTS:
-                # "Stop: $86. Target: $95." belong to the instruction before them, not to a new clause.
-                roles = {PriceRole.STOP, PriceRole.TARGET}
-                out[-1].prices.extend(m for m in _prices(clause.text, None, conditional=False) if m.role in roles)
+            host = next((c for c in reversed(out) if c.message_class in _LEVEL_HOSTS), None) if LEVEL_LINE_RE.match(clause.text) else None
+            if host is not None:
+                # Level lines ("Stop: 86.", "Target: 95.", "Entry: 88.", "88.40 now.") belong to the most recent
+                # instruction in the post, even when commentary sits between them.
+                roles = {PriceRole.STOP, PriceRole.TARGET, PriceRole.ENTRY, PriceRole.REFERENCE}
+                host_roles = {m.role for m in host.prices}
+                host.prices.extend(m for m in _prices(clause.text, host.underlying, conditional=False)
+                                   if m.role in roles and m.role not in host_roles)
                 continue
             c = self._classify_clause(clause, post, len(out) + 1, carried_asset, eligible)
             if c is None:
@@ -423,18 +473,16 @@ class TklInterpreter:
                                       prices=_prices(joined, None, conditional=False)))
         return out
 
-    @staticmethod
-    def _is_summary(text: str) -> bool:
+    def _is_summary(self, text: str) -> bool:
         lines = [ln for ln in text.splitlines() if ln.strip()]
-        if SUMMARY_RE.search(text):
+        if any(rx.search(text) for rx in self._summary_headers):
             return True
         return sum(1 for ln in lines if SUMMARY_LINE_RE.search(ln)) >= 2
 
-    @staticmethod
-    def _clauses(text: str) -> list[_Clause]:
+    def _clauses(self, text: str) -> list[_Clause]:
         clauses: list[_Clause] = []
         for s_index, sentence in enumerate(p for p in SENTENCE_SPLIT.split(text) if p and p.strip()):
-            for part in _split_conjunctions(sentence.strip()):
+            for part in _split_conjunctions(sentence.strip(), self._verbs):
                 if part.strip():
                     clauses.append(_Clause(part.strip(), s_index))
         return clauses
@@ -450,7 +498,9 @@ class TklInterpreter:
         if asset_ambiguity:
             ambiguities.append(asset_ambiguity)
 
-        verb = next(((cls, tense, m) for rx, cls, tense in VERBS if (m := rx.search(text))), None)
+        verb = next(((cls, tense, m) for rx, cls, tense in self._verbs if (m := rx.search(text))), None)
+        if verb is not None and verb[0] == MessageClass.MODIFY and NEGATED_MODIFY_RE.search(text):
+            verb = None   # "we are not moving our stop" changes nothing
         cancel = CANCEL_RE.search(text) is not None
         conditional = CONDITIONAL_RE.search(text) is not None
         infinitive = INFINITIVE_RE.search(text)
@@ -525,7 +575,7 @@ class TklInterpreter:
             ambiguities.append("EXISTING_OPEN_IDEA_SAME_SIDE_IN_CONTEXT")
         if message_class == MessageClass.OPEN and side is None:
             ambiguities.append("SIDE_UNCLEAR")
-        if message_class == MessageClass.OPEN and STRONG_OPEN_RE.search(text) is None:
+        if message_class == MessageClass.OPEN and not any(rx.search(text) for rx in self._strong_open):
             ambiguities.append("HEADLINE_POSITION_LINE_WITHOUT_ENTRY_VERB")   # "Long $TLT at 88" alone: entry or summary?
         if message_class == MessageClass.OPEN and verb is not None and re.search(r"\bwe are (?:long|short)\b", text, re.IGNORECASE) \
                 and not re.search(r"\bnow\b", text, re.IGNORECASE):
@@ -645,13 +695,24 @@ def _tense_from_timing(timing: Timing) -> Tense:
 
 
 def _normalise(text: str) -> str:
+    text = html.unescape(text)   # API text may carry HTML entities
     return (text.replace("’", "'").replace("“", '"').replace("”", '"')
             .replace("—", " - ").replace("–", "-").replace(" ", " "))
 
 
-def _split_conjunctions(sentence: str) -> list[str]:
+def _merge_verbs(base, extra):
+    """Extension verbs go in front of the built-in entries of the same class and tense."""
+    merged = list(base)
+    for rx, cls, tense in extra:
+        index = next((i for i, (_r2, c, t2) in enumerate(merged) if c == cls and t2 == tense), len(merged))
+        merged.insert(index, (rx, cls, tense))
+    return merged
+
+
+def _split_conjunctions(sentence: str, verbs=None) -> list[str]:
     """Cut a sentence before a second action verb so each clause carries one instruction."""
-    positions = sorted({m.start() for rx, _, _ in VERBS for m in rx.finditer(sentence)}
+    verbs = VERBS if verbs is None else verbs
+    positions = sorted({m.start() for rx, _, _ in verbs for m in rx.finditer(sentence)}
                        | {m.start() for m in INFINITIVE_RE.finditer(sentence)}
                        | {m.start() for m in CANCEL_RE.finditer(sentence)})
     if len(positions) < 2:
@@ -663,7 +724,7 @@ def _split_conjunctions(sentence: str) -> list[str]:
     if cut is None or cut.start() <= first:
         return [sentence]
     head, tail = sentence[:cut.start()].strip(), sentence[cut.end():].strip()
-    return [head, *_split_conjunctions(tail)] if head and tail else [sentence]
+    return [head, *_split_conjunctions(tail, verbs)] if head and tail else [sentence]
 
 
 def _asset(text: str) -> tuple[str | None, str | None, str | None]:
@@ -724,12 +785,18 @@ def _prices(text: str, underlying: Action | None, *, conditional: bool) -> list[
     for m in PRICE_RE.finditer(work):
         value = m.group(1).replace(",", "")
         window = work[max(0, m.start() - WINDOW):m.start()].lower()
-        if STOP_WORD_RE.search(window):
+        keyword_role = _nearest_role(window, conditional)
+        after = AFTER_ROLE_RE.match(work[m.end():m.end() + 12])
+        if after is not None and after.group("stop"):
             role = PriceRole.STOP
-        elif TARGET_WORD_RE.search(window):
+        elif after is not None and after.group("target"):
             role = PriceRole.TARGET
-        elif conditional and TRIGGER_WORD_RE.search(window):
-            role = PriceRole.TRIGGER
+        elif after is not None and after.group("entry"):
+            role = PriceRole.ENTRY if underlying in (Action.OPEN, Action.ADD) else PriceRole.REFERENCE
+        elif after is not None and after.group("now") and keyword_role is None:
+            role = PriceRole.REFERENCE
+        elif keyword_role is not None:
+            role = keyword_role
         elif AT_WORD_RE.search(window):
             if conditional:
                 role = PriceRole.TRIGGER
@@ -743,6 +810,20 @@ def _prices(text: str, underlying: Action | None, *, conditional: bool) -> list[
             role = PriceRole.REFERENCE
         mentions.append(PriceMention(role=role, value=value))
     return mentions
+
+
+def _nearest_role(window: str, conditional: bool) -> PriceRole | None:
+    """The role keyword closest to the number, provided no other number sits between them (that
+    keyword belongs to the earlier number). "stop $29.50, target $36" therefore tags 36 as TARGET."""
+    candidates: list[tuple[int, PriceRole]] = []
+    for rx, role in ((STOP_WORD_RE, PriceRole.STOP), (TARGET_WORD_RE, PriceRole.TARGET),
+                     (TRIGGER_WORD_RE, PriceRole.TRIGGER)):
+        if role == PriceRole.TRIGGER and not conditional:
+            continue
+        for m in rx.finditer(window):
+            if not re.search(r"\d", window[m.end():]):
+                candidates.append((m.start(), role))
+    return max(candidates)[1] if candidates else None
 
 
 def _price(c: Classification, role: PriceRole) -> str | None:
