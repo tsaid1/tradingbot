@@ -75,7 +75,7 @@ def test_past_tense_entry_announcement_registers_the_position_but_does_not_execu
 
 # ----------------------------------------------------------------------------- generic parsing improvements (synthetic wording only)
 
-from tradingbot.tkl_interpreter import LexiconExtension  # noqa: E402
+from tradingbot.tkl_interpreter import LexiconExtension
 
 
 def test_html_entities_are_unescaped_before_asset_recognition():
