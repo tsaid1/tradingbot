@@ -107,7 +107,7 @@ def main(argv: list[str] | None = None) -> int:
     report = evaluate(posts, labels, dataset=name)
     goldens: list[GoldenResult] = []
     if args.golden:
-        by_id = {p.source_id: p for p in posts}
+        by_id = {p.post_id: p for p in posts}
         args.out.mkdir(parents=True, exist_ok=True)
         for spec_path in sorted(args.golden.glob("golden_*.json")):
             spec = load_golden(spec_path)

@@ -145,6 +145,23 @@ def test_all_four_synthetic_goldens_pass(tmp_path):
         assert result.passed, (path.name, result.mismatches)
 
 
+def test_golden_resolves_exact_revision_and_refuses_an_absent_original(tmp_path):
+    template = load_golden(FIXTURES / "golden_tlt_lifecycle.json")
+    first = template.posts[0]
+    edit = first.model_copy(update={"revision": 2, "post_id": "later-version",
+                                    "revised_at": first.published_at + timedelta(hours=1)})
+    later = GoldenStep(source_id=first.source_id, post_id=edit.post_id, statuses=["HOLD"])
+    both = template.model_copy(update={"posts": [], "steps": [template.steps[0], later]})
+    versions = {p.post_id: p for p in [edit, first]}
+    assert run_golden(both, versions, tmp_path / "both.db").passed
+    missing = tmp_path / "missing.db"
+    result = run_golden(both, {edit.post_id: edit}, missing)
+    assert not result.passed and "requested revision unavailable" in result.mismatches[0]
+    assert not missing.exists()
+    final_only = both.model_copy(update={"steps": [later]})
+    assert run_golden(final_only, {edit.post_id: edit}, tmp_path / "edit.db").passed
+
+
 def test_synthetic_evaluation_aggregates():
     report = evaluate(load_posts(FIXTURES / "posts.jsonl"), load_labels(FIXTURES / "labels.jsonl"), dataset="synthetic")
     assert report.posts == 33 and report.labeled_posts == 33 and report.labeled_actions == 36

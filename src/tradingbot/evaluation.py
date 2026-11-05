@@ -282,6 +282,7 @@ def match_actions(labels: list[LabeledAction], preds: list[Predicted]) -> list[t
 
 class GoldenStep(StrictModel):
     source_id: str
+    post_id: str | None = None  # omit only when requesting the family's original post
     statuses: list[str]
     orders: list[dict] = Field(default_factory=list)     # [{"side": "SELL", "quantity": 3}]
     classes: list[MessageClass] | None = None
@@ -292,7 +293,7 @@ class GoldenReplay(StrictModel):
     (synthetic) or resolved from the evaluated dataset by source_id (private)."""
     name: str
     policy: dict = Field(default_factory=dict)
-    quotes: dict[str, dict[str, str]] = Field(default_factory=dict)   # source_id -> symbol -> mid
+    quotes: dict[str, dict[str, str]] = Field(default_factory=dict)   # captured post_id -> symbol -> mid
     lag_seconds: float = 0.0
     posts: list[SourcePost] = Field(default_factory=list)
     steps: list[GoldenStep]
@@ -575,7 +576,18 @@ def _recommend(ranked: list[dict], failures: list[Failure]) -> list[str]:
 # ----------------------------------------------------------------------------- golden replays
 
 def run_golden(spec: GoldenReplay, posts_by_id: dict[str, SourcePost], db_path: Path) -> GoldenResult:
-    posts = spec.posts or [posts_by_id[s.source_id] for s in spec.steps]
+    available = spec.posts or posts_by_id.values()
+    originals = {p.source_id: p for p in available if p.revision == 1}
+    versions = {p.post_id: p for p in available}
+    requested = []
+    for step in spec.steps:
+        post_id = step.post_id or step.source_id
+        post = versions.get(step.post_id) if step.post_id else originals.get(step.source_id)
+        if post is None or post.source_id != step.source_id:
+            return GoldenResult(name=spec.name, passed=False, steps=len(spec.steps),
+                                mismatches=[f"{post_id}: requested revision unavailable"])
+        requested.append(post)
+    posts = spec.posts or requested
     coordinator = PaperEventReplay(db_path, MockPolicy(**spec.policy))
     it = TklInterpreter()
     mismatches: list[str] = []
@@ -583,16 +595,16 @@ def run_golden(spec: GoldenReplay, posts_by_id: dict[str, SourcePost], db_path: 
     for post in sorted(posts, key=lambda p: (p.available_at, p.revision, p.post_id)):
         interpreted = it.interpret(post)
         now = post.received_at if post.is_live else post.available_at + timedelta(seconds=spec.lag_seconds)
+        quote_values = spec.quotes.get(post.post_id, {})
+        if post.revision == 1 and post.post_id not in spec.quotes:
+            quote_values = spec.quotes.get(post.source_id, {})
         quotes = {sym: Quote(symbol=sym, bid=Decimal(mid) - Decimal("0.05"), ask=Decimal(mid) + Decimal("0.05"), observed_at=now)
-                  for sym, mid in spec.quotes.get(post.source_id, {}).items()}
+                  for sym, mid in quote_values.items()}
         result = coordinator.process(post.to_replay_source(), group_linked_actions(interpreted), quotes, now=now)
         it.observe(post, interpreted)
-        results[post.source_id] = (interpreted, result)
-    for step in spec.steps:
-        if step.source_id not in results:
-            mismatches.append(f"{step.source_id}: not replayed")
-            continue
-        interpreted, result = results[step.source_id]
+        results[post.post_id] = (interpreted, result)
+    for step, post in zip(spec.steps, requested, strict=True):
+        interpreted, result = results[post.post_id]
         statuses = [o.status for o in result.outcomes]
         if statuses != step.statuses:
             mismatches.append(f"{step.source_id}: statuses {statuses} != {step.statuses}")
