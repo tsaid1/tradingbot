@@ -1,6 +1,6 @@
 # G0 results: official X API read access to `@TKLSubscribers`
 
-**Date run:** 2026-11-05 · **Run by:** Agent B with the product owner's subscriber account · **Status:** ACCESS PROVEN; freshness not yet measured
+**Date run:** 2026-11-05 · **Run by:** Agent B with the product owner's subscriber account · **Status:** ACCESS PROVEN, controls passed; freshness not yet measured
 **Tooling:** `g0_x_probe/x_probe.py` (auth, lookup, controls, backfill). Raw output lives in git-ignored `data/g0/` and is paid content; nothing from it is reproduced here beyond counts.
 
 ## Outcome against the G0 criteria
@@ -13,7 +13,7 @@
 | Thread and quote linkage | **PASS** | 1,601 posts reference a quoted post and 144 are replies, via `referenced_tweets`. 61 posts carry edit history. |
 | Reliability | **PASS** | 33 pages, zero 4xx/5xx, zero rate-limit pauses. |
 | Recent search under user token | As expected | `from:TKLSubscribers` recent search returned 0 posts: search does not expose protected content. |
-| Bearer-token (app-only) control | NOT RUN | Bearer variable was missing from the local env file at run time. Low priority; rerun with `controls`. |
+| Bearer-token (app-only) control | **PASS** | App-only token returns zero posts and an explicit `not-authorized-for-resource` error for the protected user ID. Protected content is gated to the approved follower's user context, as the Developer Policy requires. |
 | Freshness (median lag under 30 s at a 15 s poll) | NOT MEASURED | Requires `poll` during a US market session. |
 
 ## Corpus obtained
