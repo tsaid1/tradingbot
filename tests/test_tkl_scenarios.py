@@ -79,8 +79,9 @@ def test_tlt_lifecycle_open_add_modify_reduce_close_confirm_summary(tmp_path):
     assert statuses(s["p4"]) == ["SIMULATED"] and orders(s["p4"])[0].quantity == 3
     assert coord.ideas()[0]["status"] == "CLOSED" and coord.ideas()[0]["quantity"] == 0
     assert statuses(s["p5"]) == ["RECONCILE"] and orders(s["p5"]) == []  # past-tense confirmation: no order
-    assert statuses(s["p6"]) == ["NO_TRADE"] and orders(s["p6"]) == []    # position summary: no order
-    assert s["p6"].interpreted.classifications[0].message_class == MessageClass.POSITION_SUMMARY
+    # position summary with a recap sentence: the recap reconciles, the summary is a no-trade, no order
+    assert statuses(s["p6"]) == ["RECONCILE", "NO_TRADE"] and orders(s["p6"]) == []
+    assert {c.message_class for c in s["p6"].interpreted.classifications} == {MessageClass.RETROSPECTIVE, MessageClass.POSITION_SUMMARY}
     assert sum(len(orders(step)) for step in s.values()) == 5
     # Replaying an executed post is a duplicate and never fills again
     again = coord.process(TLT_POSTS[3].to_replay_source(), s["p4"].interpreted.parsed, {}, now=TLT_POSTS[3].published_at)
@@ -91,7 +92,7 @@ def test_tlt_lifecycle_is_order_independent_and_never_leaks_the_future(tmp_path)
     shuffled = [TLT_POSTS[3], TLT_POSTS[0], TLT_POSTS[5], TLT_POSTS[2], TLT_POSTS[1], TLT_POSTS[4]]
     coord, s = run(tmp_path, shuffled, TLT_MIDS, quantity=4, quantity_per_add=2)
     assert [statuses(s[k]) for k in ("p1", "p2", "p3", "p4", "p5", "p6")] == [
-        ["SIMULATED"], ["SIMULATED", "SIMULATED"], ["SIMULATED"], ["SIMULATED"], ["RECONCILE"], ["NO_TRADE"]]
+        ["SIMULATED"], ["SIMULATED", "SIMULATED"], ["SIMULATED"], ["SIMULATED"], ["RECONCILE"], ["RECONCILE", "NO_TRADE"]]
     assert coord.ideas()[0]["status"] == "CLOSED"
 
 

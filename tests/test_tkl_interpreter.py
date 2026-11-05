@@ -94,9 +94,14 @@ def test_partial_exit_fractions():
 def test_past_tense_reports_are_retrospective_and_historical():
     it = TklInterpreter()
     it.ingest(post("p1", OPEN_TLT))
+    # A fresh exit announcement against the open position is a CURRENT close candidate (review item 1)...
     c, a = one(it.interpret(post("p5", "We have closed our $TLT long at $94.10 for a +6.3% gain.", minutes=10)))
-    assert (c.message_class, c.tense, c.underlying) == (MessageClass.RETROSPECTIVE, Tense.PAST, Action.CLOSE)
+    assert (c.message_class, c.tense, c.underlying, c.exit_kind) == (MessageClass.EXIT_ANNOUNCEMENT, Tense.PAST, Action.CLOSE, "announcement")
     assert roles(c) == {PriceRole.PNL_PERCENT: "+6.3", PriceRole.EXIT: "94.10"} and c.idea_reference == "p1:a1"
+    assert a.action == Action.CLOSE and a.timing == Timing.CURRENT
+    # ...while a recap of the same exit is historical and reconciles
+    c, a = one(it.interpret(post("p5r", "We closed our $TLT long yesterday at $94.10 for a +6.3% gain.", minutes=10)))
+    assert (c.message_class, c.tense, c.underlying, c.exit_kind) == (MessageClass.RETROSPECTIVE, Tense.PAST, Action.CLOSE, "recap")
     assert a.action == Action.CLOSE and a.timing == Timing.HISTORICAL
     c2, a2 = one(it.interpret(post("p6", "We have raised our stop to $90 on our $TLT long.", minutes=11)))
     assert c2.tense == Tense.PAST and c2.message_class == MessageClass.RETROSPECTIVE and a2.action == Action.MODIFY and a2.timing == Timing.HISTORICAL
@@ -106,12 +111,16 @@ def test_past_tense_reports_are_retrospective_and_historical():
 
 
 def test_position_summary_is_a_single_no_trade():
-    for text in ("Current positions: none. We closed $TLT for a +6.3% gain earlier this week.",
-                 "Position update:\n1. Long $TLT (entry $88.50)\n2. Short $SPY (entry $685)",
-                 "Long $TLT from $88.50\nShort $SPY from $685"):
+    for text in ("Position update:\n1. Long $TLT (entry $88.50)\n2. Short $SPY (entry $685)",
+                 "Long $TLT from $88.50\nShort $SPY from $685",
+                 "Current positions: none."):
         c, a = one(TklInterpreter().interpret(post("s", text)))
         assert c.message_class == MessageClass.POSITION_SUMMARY, text
         assert a.action == Action.NO_TRADE and a.timing == Timing.COMMENTARY and not a.explicit_instruction
+    # A recap sentence inside a summary post is reported separately but still cannot trade
+    ip = TklInterpreter().interpret(post("s", "Current positions: none. We closed $TLT for a +6.3% gain earlier this week."))
+    assert {c.message_class for c in ip.classifications} == {MessageClass.RETROSPECTIVE, MessageClass.POSITION_SUMMARY}
+    assert all(a.timing in (Timing.HISTORICAL, Timing.COMMENTARY) for a in ip.parsed.actions)
 
 
 def test_commentary_never_trades():

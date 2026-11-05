@@ -20,7 +20,9 @@
 | `conversation_id`, `links` | Thread root and quoted / replied-to / retweeted post IDs with a `text_available` flag | Quoted text is **not** in the archive; fetch it or leave the flag false |
 | `media` | Media keys, type, URL, local file, optional hash | Charts may carry the instruction; `text_complete` says nothing about them |
 
-Helpers: `to_replay_source()` (trusted metadata, `post_hash` = SHA-256 of the exact text), `to_legacy_source_event()` (Sprint 1 demo pipeline, revision 1 only), `from_g0_record()` (the archive mapping, tested on synthetic records). The model forbids extra fields, so no sizing or routing can ride on a source event.
+Helpers: `to_replay_source()` (trusted metadata, `post_hash` = SHA-256 of the exact text), `to_legacy_source_event()` (Sprint 1 demo pipeline; refuses unverified authors, incomplete text, reposts and edits, because that pipeline has no provenance fields of its own), `from_g0_record()` (the archive mapping, tested on synthetic records), `coerce_source_posts()` (normalises adapter output). The model forbids extra fields, so no sizing or routing can ride on a source event.
+
+**Source Agent adapter contract.** `historical_inputs(start, end)` yields, for posts published in `[start, end)`, items that are `SourcePost` instances, schema-1.2 dicts, or raw G0 archive records, in any order; the consumer runs them through `coerce_source_posts()` (which sorts by publication time) and `tests/test_source_agent_compat.py::check_historical_inputs` states the exact requirements (schema version, paid provenance, aware timestamps, revision/`revised_at` consistency, author verification, hash of the exact text). The adapter is not in this repository yet; the test uses a synthetic stand-in with every accepted shape, and the Source Agent can run the same check against the real adapter without sharing paid text.
 
 ## 2. Interpreter (`src/tradingbot/tkl_interpreter.py`)
 
@@ -34,18 +36,23 @@ Helpers: `to_replay_source()` (trusted metadata, `post_hash` = SHA-256 of the ex
 |---|---|---|---|
 | OPEN, ADD, REDUCE, CLOSE, MODIFY | present | same action, `CURRENT` | preflight, may APPROVE |
 | CONDITIONAL ("if", "should", "once", "on a break of", "will exit if") | future | underlying action, `CONDITIONAL` | HOLD |
-| RETROSPECTIVE ("we have closed", "stopped out", "we took profits", "we are long X from Y") | past | reported action, `HISTORICAL` | RECONCILE, no order |
+| EXIT_ANNOUNCEMENT (fresh "we have closed / taken profits on ..." from a source-eligible post, uniquely matching an open follower position, no recap or stop-triggered wording) | past | CLOSE or REDUCE, `CURRENT`, reduce-only | preflight (freshness, quote, position), may APPROVE |
+| RETROSPECTIVE (recaps: "yesterday", "earlier this week", "in April", "average", "times"; stop-triggered: "stopped out", "our stop was hit"; position statements "we are long X from Y"; any past-tense exit with no unique open follower position) | past | reported action, `HISTORICAL` | RECONCILE, no order |
 | CANCEL ("no longer looking to", "cancelling") | present | `NO_TRADE` | NO_TRADE; pending intent withdrawn in context |
 | COMMENTARY ("we remain", "could", "expect", forecasts without an instruction) | present | `NO_TRADE`, `COMMENTARY` | NO_TRADE |
 | POSITION_SUMMARY ("Current positions:", listed positions) | present | single `NO_TRADE`, `COMMENTARY` | NO_TRADE |
 
 Tense is decided per clause from the verb form. A bare participle in the publisher's headline style ("Stop raised to 90") is a current instruction; "we have raised our stop" is a report.
 
+**Exit announcements.** The publisher announces most exits after the fact ("We have closed our $TLT long at $94.10 for a +6.3% gain"). Such a clause becomes an `EXIT_ANNOUNCEMENT`, a `CURRENT` reduce-only CLOSE or REDUCE candidate, only when all of these hold: the post is source-eligible (verified author, revision 1, complete, not a repost: exactly the gateway's `gate_source` rule), the clause contains no recap marker (dates, "yesterday", "earlier this week", "average", "times", "recap", ...) and no stop-triggered wording, and the context resolves the asset to at least one open follower position. Exactly one match gives a clean candidate; several keep the ambiguity, which the gateway holds. The canonical validator then applies freshness, quote and position checks and the coordinator fills reduce-only. Recaps and stop-triggered reports ("stopped out", "our stop was hit") stay `RETROSPECTIVE` and reconcile: a broker-side protective stop may already have fired, so the follower's book must be checked against the broker, never assumed. A bare headline line ("Long $TLT at 88.50") without an entry verb is flagged ambiguous because it could equally be a summary line.
+
 **Price roles.** ENTRY, STOP, TARGET, EXIT, TRIGGER, REFERENCE, PNL_PERCENT, assigned from the words before each number. Only ENTRY, STOP, TARGET and the reduction fraction reach the `TradeAction`; the rest are evaluation detail.
 
 **Instruments.** An explicitly named ticker (`$TLT`, or a known ETF symbol) becomes an `Instrument` with `TRADED_CONTRACT` price basis. Index, spot and futures names (S&P 500, gold, natural gas, oil, Bitcoin, ...) become a source series (`SPX`, `GOLD`, `NATGAS`, `WTI`, `BTC`, ...) with **no** instrument, so the gateway holds them. The interpreter never maps a series to an ETF. A clause naming both a series and a ticker is ambiguous.
 
-**Point-in-time context.** `PointInTimeContext` is the interpreter's view of the publisher's book, keyed by idea IDs that match the coordinator's (`source_id:action_id`). Every lookup is filtered by `as_of = post.published_at`: an idea opened later, or closed later, is invisible, so a post is always interpreted against the state that existed when it was published, whatever has been ingested since. Only first revisions of complete, original posts change the context. References resolve to exactly one open idea; none or several is an ambiguity. A second open on the same side of an asset already open is flagged.
+**Point-in-time context.** `PointInTimeContext` is the interpreter's view of the publisher's book, keyed by idea IDs that match the coordinator's (`source_id:action_id`). Every lookup is filtered by `as_of = post.published_at`: an idea opened later, or closed later, is invisible, so a post is always interpreted against the state that existed when it was published, whatever has been ingested since. Only **source-eligible** posts advance the context, and eligibility is decided by the gateway's own `gate_source` (`TklInterpreter.is_source_eligible`): unverified authors, edits (including an original whose edit was seen earlier), reposts, truncated text and timestamp faults are interpreted but never remembered, whether or not execution was attempted. References resolve to exactly one open idea; none or several is an ambiguity. A second open on the same side of an asset already open is flagged.
+
+**Mixed summary posts.** Clauses are classified individually first. Summary headers ("Current positions:") and listed-position lines ("Long $TLT (entry 88.50)") are collected into one `POSITION_SUMMARY`; an explicit OPEN, CLOSE, REDUCE or MODIFY in the same post is still emitted and still reaches the gateway.
 
 **Linked actions.** Actions from the same sentence on the same asset form one atomic group (ADD + MODIFY, CLOSE + OPEN reversal), so the coordinator applies all or none.
 
@@ -63,7 +70,7 @@ Tense is decided per clause from the verb form. A bare participle in the publish
 
 ## 4. Unresolved risks
 
-1. **Publisher exits are usually announced in the past tense.** Under the tense rule they reconcile rather than execute, so a follower would never close on "we have closed". A product decision is needed: treat same-session past-tense exit confirmations as current closes, or operate exits from reconciliation alerts.
+1. **Exit announcements rely on wording and context, not on a timestamp.** A fresh "we have closed" becomes a reduce-only candidate; a recap marker or stop-triggered wording keeps it a report. Phrasings outside both lexicons fall back to RETROSPECTIVE (no order), so recall on real announcements is unmeasured until the holdout is labelled. The gateway's 90-second source-age rule is the only time bound.
 2. **Most instructions are quoted at index or spot level.** They hold by design until the product owner approves a source-to-contract mapping policy.
 3. **The grammar is synthetic-validated only.** Accuracy on the real archive needs the Sprint 1.2 holdout labelled independently; a phrasing outside the lexicon degrades to COMMENTARY (fail closed), never to a wrong order, but recall is unknown.
 4. **Quoted posts, threads and charts** are context the interpreter does not see; the Source Agent must resolve quoted text or flag it, and chart-only instructions remain invisible.

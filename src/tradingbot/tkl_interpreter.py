@@ -31,6 +31,7 @@ from tradingbot.event_models import ParsedPost, PriceBasis, ReplayResult, Timing
 from tradingbot.event_replay import PaperEventReplay
 from tradingbot.models import Action, AssetClass, Instrument, PositionSide, Quote, StrictModel
 from tradingbot.source_events import SourcePost
+from tradingbot.validator import gate_source
 
 
 # ----------------------------------------------------------------------------- vocabulary
@@ -46,6 +47,10 @@ class MessageClass(str, Enum):
     COMMENTARY = "COMMENTARY"
     RETROSPECTIVE = "RETROSPECTIVE"
     POSITION_SUMMARY = "POSITION_SUMMARY"
+    # A fresh, past-tense announcement that the publisher has just exited a position the follower
+    # still holds. Becomes a CURRENT reduce-only CLOSE/REDUCE candidate for the gateway. Recaps and
+    # stop-triggered reports stay RETROSPECTIVE and only reconcile.
+    EXIT_ANNOUNCEMENT = "EXIT_ANNOUNCEMENT"
 
 
 class Tense(str, Enum):
@@ -79,6 +84,7 @@ class Classification(StrictModel):
     prices: list[PriceMention] = Field(default_factory=list)
     close_fraction: str | None = None
     idea_reference: str | None = None
+    exit_kind: Literal["announcement", "recap", "stop_triggered"] | None = None
     clause: str
     sentence: int = 0                             # index of the sentence the clause came from
     ambiguities: list[str] = Field(default_factory=list)
@@ -146,7 +152,7 @@ VERBS: list[tuple[re.Pattern[str], MessageClass, Tense]] = [
         r"\b(?:stop|target|stop[- ]loss)(?: is| has been)? (?:now )?(?:raised|moved|lowered|tightened|set|adjusted|trailed)"
         r"(?: up| down)? to\b|\bnew (?:stop|target)\b|\b(?:stop|target) (?:is )?now (?:at )?\$?\d"),
      MessageClass.MODIFY, Tense.PRESENT),
-    (_r(r"\b(?:took|booked|locked in) (?:partial |some )?profits?\b|\btrimmed\b|"
+    (_r(r"\b(?:took|taken|booked|locked in) (?:partial |some )?profits?\b|\btrimmed\b|"
         r"\bsold (?:half|a third|one third|a quarter|two thirds|\d+%)|\breduced (?:our|the)\b"),
      MessageClass.REDUCE, Tense.PAST),
     (_r(r"\b(?:taking (?:partial |some )?profits?|booking (?:partial |some )?profits?|trimming|reducing|"
@@ -186,6 +192,22 @@ COMMENTARY_RE = _r(r"\b(?:remain|remains|remaining (?:long|short)|still (?:long|
 SUMMARY_RE = _r(r"^\s*(?:current|open|our|active) positions?\b|\bposition (?:summary|update)\b|"
                 r"\bportfolio (?:update|summary)\b|^\s*positions?\s*:")
 SUMMARY_LINE_RE = _r(r"^\s*(?:\d+[.)]\s*|[-•*]\s*)?(?:long|short)\s+\$?[A-Za-z&0-9 .]{1,30}?\s*(?:\(|-|–|:|from|entry|@|at)\s*\$?\d")
+STRONG_OPEN_RE = _r(r"\b(?:we are now (?:long|short)|now (?:long|short)|going (?:long|short)|"
+                    r"entering (?:a |an )?(?:new )?(?:long|short)|opening (?:a |an )?(?:new )?(?:long|short)|"
+                    r"initiating (?:a |an )?(?:new )?(?:long|short)|we are buying|we are shorting|"
+                    rf"buying {ASSET_TOKEN}|shorting {ASSET_TOKEN}|new (?:long|short)(?: position)?\b)")
+STOP_TRIGGERED_RE = _r(r"\b(?:stopped out|stop(?:[- ]loss)? (?:was|got|has been|is|were) (?:hit|triggered|taken out|run|elected)|"
+                       r"hit our stop|our stop (?:was )?(?:hit|triggered)|got stopped|triggered our stop|stop triggered|"
+                       r"stopped us out|took us out)\b")
+RECAP_RE = _r(r"\b(?:yesterday|last (?:week|month|year|session|night)|earlier (?:today|this (?:week|month|year))|"
+              r"this (?:week|month|year)|on (?:monday|tuesday|wednesday|thursday|friday)|"
+              r"in (?:january|february|march|april|may|june|july|august|september|october|november|december)|"
+              r"\d+ (?:days?|weeks?|months?) ago|recap|review|summary|times|average|so far|year[- ]to[- ]date|ytd|"
+              r"track record|results?|performance)\b")
+# A stop reported as triggered is a past exit too; it must never read as commentary.
+_close_past_index = next(i for i, (_rx, cls, tense) in enumerate(VERBS)
+                         if cls == MessageClass.CLOSE and tense == Tense.PAST)
+VERBS.insert(_close_past_index, (STOP_TRIGGERED_RE, MessageClass.CLOSE, Tense.PAST))
 SIDE_LONG_RE = _r(r"\b(?:long|buy|buying|bought)\b")
 SIDE_SHORT_RE = _r(r"\b(?:short|shorting|shorted|covering|covered|cover)\b")
 
@@ -242,7 +264,11 @@ class PointInTimeContext:
     has been ingested since."""
     ideas: dict[str, IdeaView] = field(default_factory=dict)
     intents: dict[str, PendingIntent] = field(default_factory=dict)
-    observed_posts: set[tuple[str, int]] = field(default_factory=set)
+    observed_posts: set[tuple[str, int]] = field(default_factory=set)   # eligible posts that advanced the book
+    seen_posts: set[tuple[str, int]] = field(default_factory=set)       # every post shown to observe()
+
+    def has_other_revision(self, source_id: str, revision: int) -> bool:
+        return any(sid == source_id and rev != revision for sid, rev in self.seen_posts)
 
     def open_ideas(self, asset: str, as_of: datetime, side: PositionSide | None = None) -> list[IdeaView]:
         return sorted(
@@ -283,13 +309,21 @@ class TklInterpreter:
                                published_at=post.published_at, parsed=ParsedPost(actions=actions),
                                classifications=classifications)
 
+    def is_source_eligible(self, post: SourcePost) -> bool:
+        """The canonical provenance rule, reused from the gateway: a post that `gate_source` would
+        hold or block (edit, unverified author, repost, truncated text, timestamp faults) can neither
+        advance the publisher-book context nor turn a past-tense exit into an order candidate."""
+        is_edit = self.context.has_other_revision(post.source_id, post.revision)
+        return gate_source(post.to_replay_source(), post.received_at, is_edit=is_edit) is None
+
     def observe(self, post: SourcePost, interpreted: InterpretedPost) -> None:
-        """Advance the publisher-book view. Only first revisions of complete, original posts count;
-        edits, reposts and truncated posts are interpreted but never change the context."""
+        """Advance the publisher-book view. Only source-eligible first revisions count; edits,
+        reposts, truncated and unverified posts are interpreted but never change the context."""
         key = (post.source_id, post.revision)
-        if key in self.observed_posts or post.revision != 1 or post.is_repost or not post.text_complete:
+        self.context.seen_posts.add(key)
+        if key in self.context.observed_posts or not self.is_source_eligible(post):
             return
-        self.observed_posts.add(key)
+        self.context.observed_posts.add(key)
         when = post.published_at
         for c in interpreted.classifications:
             if not c.asset:
@@ -303,7 +337,8 @@ class TklInterpreter:
                 self.context.ideas[idea_id] = IdeaView(
                     idea_id=idea_id, source_id=post.source_id, asset=c.asset, side=c.side, opened_at=when,
                     stop_price=_price(c, PriceRole.STOP), target_price=_price(c, PriceRole.TARGET))
-            elif c.message_class in (MessageClass.CLOSE, MessageClass.RETROSPECTIVE) and c.idea_reference:
+            elif c.message_class in (MessageClass.CLOSE, MessageClass.RETROSPECTIVE, MessageClass.EXIT_ANNOUNCEMENT) \
+                    and c.idea_reference:
                 idea = self.context.ideas.get(c.idea_reference)
                 if idea is not None and c.underlying == Action.CLOSE and idea.closed_at is None:
                     idea.closed_at = when
@@ -358,23 +393,34 @@ class TklInterpreter:
         text = _normalise(post.text)
         if not text.strip():
             return []
-        if self._is_summary(text):
-            return [Classification(action_id="a1", message_class=MessageClass.POSITION_SUMMARY, tense=Tense.PRESENT,
-                                   clause=text[:200], prices=_prices(text, None, conditional=False))]
+        eligible = self.is_source_eligible(post)
+        summary_mode = self._is_summary(text)
         out: list[Classification] = []
+        summary_parts: list[str] = []
         carried_asset: str | None = None
         for clause in self._clauses(text):
+            if summary_mode and _is_summary_clause(clause.text):
+                summary_parts.append(clause.text)
+                continue
             if out and LEVEL_LINE_RE.match(clause.text) and out[-1].message_class in _LEVEL_HOSTS:
                 # "Stop: $86. Target: $95." belong to the instruction before them, not to a new clause.
                 roles = {PriceRole.STOP, PriceRole.TARGET}
                 out[-1].prices.extend(m for m in _prices(clause.text, None, conditional=False) if m.role in roles)
                 continue
-            c = self._classify_clause(clause, post, len(out) + 1, carried_asset)
+            c = self._classify_clause(clause, post, len(out) + 1, carried_asset, eligible)
             if c is None:
+                continue
+            if summary_mode and c.message_class == MessageClass.COMMENTARY:
+                summary_parts.append(clause.text)   # descriptive lines of a summary post
                 continue
             if c.asset:
                 carried_asset = c.asset
             out.append(c)
+        if summary_parts:
+            joined = " ".join(summary_parts)
+            out.append(Classification(action_id=f"a{len(out) + 1}", message_class=MessageClass.POSITION_SUMMARY,
+                                      tense=Tense.PRESENT, clause=joined[:200],
+                                      prices=_prices(joined, None, conditional=False)))
         return out
 
     @staticmethod
@@ -394,7 +440,7 @@ class TklInterpreter:
         return clauses
 
     def _classify_clause(self, clause: _Clause, post: SourcePost, index: int,
-                         carried: str | None) -> Classification | None:
+                         carried: str | None, eligible: bool) -> Classification | None:
         text = clause.text
         action_id = f"a{index}"
         ambiguities: list[str] = []
@@ -420,7 +466,8 @@ class TklInterpreter:
                 underlying = _ACTION_FOR_CLASS.get(verb[0], Action.NO_TRADE)
         elif verb is None or (verb[0] == MessageClass.OPEN and commentary_words):
             if verb is None and infinitive is not None and not commentary_words:
-                message_class, tense, underlying = MessageClass.CONDITIONAL, Tense.FUTURE, INFINITIVE_ACTION[infinitive.group("verb").lower()]
+                message_class, tense = MessageClass.CONDITIONAL, Tense.FUTURE
+                underlying = INFINITIVE_ACTION[infinitive.group("verb").lower()]
                 ambiguities.append("FUTURE_INTENT_WITHOUT_EXPLICIT_CONDITION")
             else:
                 message_class, tense, underlying = MessageClass.COMMENTARY, Tense.PRESENT, Action.NO_TRADE
@@ -430,9 +477,9 @@ class TklInterpreter:
             message_class = MessageClass.RETROSPECTIVE if tense == Tense.PAST else base
 
         fraction = _fraction(text)
-        if underlying == Action.REDUCE and fraction is None and not PARTIAL_RE.search(text) and message_class != MessageClass.CONDITIONAL:
-            # "took profits on X" with no partial marker reads as a full exit
-            underlying = Action.CLOSE
+        if underlying == Action.REDUCE and fraction is None and not PARTIAL_RE.search(text) \
+                and message_class != MessageClass.CONDITIONAL:
+            underlying = Action.CLOSE          # "took profits on X" with no partial marker reads as a full exit
             if message_class == MessageClass.REDUCE:
                 message_class = MessageClass.CLOSE
         if underlying == Action.CLOSE and fraction is not None:
@@ -448,6 +495,7 @@ class TklInterpreter:
             ambiguities.append("ASSET_UNRESOLVED")
 
         idea_reference = None
+        matches: list[IdeaView] = []
         if asset is not None and underlying in (Action.ADD, Action.REDUCE, Action.CLOSE, Action.MODIFY) \
                 and message_class != MessageClass.CONDITIONAL:
             matches = self.context.open_ideas(asset, post.published_at, side)
@@ -459,19 +507,34 @@ class TklInterpreter:
                     ambiguities.append("NO_OPEN_IDEA_IN_CONTEXT")
             else:
                 ambiguities.append("MULTIPLE_OPEN_IDEAS_IN_CONTEXT")
+
+        exit_kind = None
+        if message_class == MessageClass.RETROSPECTIVE and underlying in (Action.CLOSE, Action.REDUCE):
+            if STOP_TRIGGERED_RE.search(text):
+                exit_kind = "stop_triggered"          # broker-side stop may already have fired: reconcile
+            elif RECAP_RE.search(text):
+                exit_kind = "recap"
+            elif eligible and matches:
+                # Fresh announcement of a completed publisher exit against a position the follower
+                # still holds: a reduce-only candidate for the canonical gateway. Several candidate
+                # positions keep the ambiguity, which the gateway turns into HOLD.
+                message_class, exit_kind = MessageClass.EXIT_ANNOUNCEMENT, "announcement"
+                ambiguities = [a for a in ambiguities if a != "NO_OPEN_IDEA_IN_CONTEXT"]
         if asset is not None and message_class == MessageClass.OPEN and side is not None \
                 and self.context.open_ideas(asset, post.published_at, side):
             ambiguities.append("EXISTING_OPEN_IDEA_SAME_SIDE_IN_CONTEXT")
         if message_class == MessageClass.OPEN and side is None:
             ambiguities.append("SIDE_UNCLEAR")
+        if message_class == MessageClass.OPEN and STRONG_OPEN_RE.search(text) is None:
+            ambiguities.append("HEADLINE_POSITION_LINE_WITHOUT_ENTRY_VERB")   # "Long $TLT at 88" alone: entry or summary?
         if message_class == MessageClass.OPEN and verb is not None and re.search(r"\bwe are (?:long|short)\b", text, re.IGNORECASE) \
                 and not re.search(r"\bnow\b", text, re.IGNORECASE):
             ambiguities.append("POSITION_STATEMENT_OR_ENTRY")
 
         return Classification(action_id=action_id, message_class=message_class, tense=tense, underlying=underlying,
                               asset=asset, side=side, prices=prices, close_fraction=fraction,
-                              idea_reference=idea_reference, clause=text[:200], sentence=clause.sentence,
-                              ambiguities=[a for a in dict.fromkeys(ambiguities) if a])
+                              idea_reference=idea_reference, exit_kind=exit_kind, clause=text[:200],
+                              sentence=clause.sentence, ambiguities=[a for a in dict.fromkeys(ambiguities) if a])
 
     def _to_trade_action(self, c: Classification) -> TradeAction:
         ticker = c.asset if c.asset and c.asset not in _SERIES_CODES else None
@@ -485,13 +548,14 @@ class TklInterpreter:
         timing = {
             MessageClass.CONDITIONAL: Timing.CONDITIONAL, MessageClass.RETROSPECTIVE: Timing.HISTORICAL,
             MessageClass.COMMENTARY: Timing.COMMENTARY, MessageClass.POSITION_SUMMARY: Timing.COMMENTARY,
-        }.get(c.message_class, Timing.CURRENT)
+        }.get(c.message_class, Timing.CURRENT)   # EXIT_ANNOUNCEMENT is CURRENT: the gateway decides
         action = c.underlying if c.message_class not in (MessageClass.COMMENTARY, MessageClass.POSITION_SUMMARY,
                                                          MessageClass.CANCEL) else Action.NO_TRADE
         explicit = c.message_class in (MessageClass.OPEN, MessageClass.ADD, MessageClass.REDUCE, MessageClass.CLOSE,
-                                       MessageClass.MODIFY, MessageClass.CONDITIONAL, MessageClass.RETROSPECTIVE) \
-            and c.asset is not None
+                                       MessageClass.MODIFY, MessageClass.CONDITIONAL, MessageClass.RETROSPECTIVE,
+                                       MessageClass.EXIT_ANNOUNCEMENT) and c.asset is not None
         entry = _price(c, PriceRole.ENTRY) if action in (Action.OPEN, Action.ADD) else None
+        reason = f"{c.message_class.value}/{c.tense.value}" + (f"/{c.exit_kind}" if c.exit_kind else "")
         return TradeAction(
             action_id=c.action_id, action=action, timing=timing, instrument=instrument, position_side=c.side,
             idea_reference=c.idea_reference if action != Action.OPEN else None,
@@ -500,8 +564,14 @@ class TklInterpreter:
             target_price=_price(c, PriceRole.TARGET) if action in (Action.OPEN, Action.MODIFY) else None,
             close_fraction=c.close_fraction if action == Action.REDUCE else None,
             explicit_instruction=explicit, evidence=[c.clause] if explicit else [],
-            ambiguities=list(c.ambiguities), reason=f"{c.message_class.value}/{c.tense.value}",
+            ambiguities=list(c.ambiguities), reason=reason,
         )
+
+
+def _is_summary_clause(text: str) -> bool:
+    """Header or listed-position line of a summary post. An explicit instruction ("We are now short
+    $SPY at 685", "Closing our $TLT long") never matches, so it survives inside a summary post."""
+    return SUMMARY_RE.search(text) is not None or SUMMARY_LINE_RE.match(text) is not None
 
 
 # ----------------------------------------------------------------------------- replay runner
@@ -534,13 +604,15 @@ def replay_posts(posts: list[SourcePost], coordinator: PaperEventReplay, interpr
 
 
 def group_linked_actions(interpreted: InterpretedPost) -> ParsedPost:
-    """Actions from the same sentence on the same asset form one atomic group (ADD + MODIFY,
-    CLOSE + OPEN reversal). Different assets stay independent."""
+    """Fill-capable actions (CURRENT timing) from the same sentence on the same asset form one
+    atomic group (ADD + MODIFY, CLOSE + OPEN reversal). Different assets stay independent, and
+    historical, conditional or commentary clauses never join a group: they cannot fill, so
+    grouping them would only turn their RECONCILE / HOLD into an atomic rejection of the rest."""
     by_key: dict[tuple[int, str], list[str]] = {}
     actions = []
     for a in interpreted.parsed.actions:
         c = next(x for x in interpreted.classifications if x.action_id == a.action_id)
-        if a.action != Action.NO_TRADE and c.asset:
+        if a.action != Action.NO_TRADE and a.timing == Timing.CURRENT and c.asset:
             by_key.setdefault((c.sentence, c.asset), []).append(a.action_id)
     groups = {aid: f"s{k[0]}-{k[1]}" for k, ids in by_key.items() if len(ids) > 1 for aid in ids}
     for a in interpreted.parsed.actions:

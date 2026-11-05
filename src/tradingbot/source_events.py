@@ -105,12 +105,21 @@ class SourcePost(StrictModel):
         )
 
     def to_legacy_source_event(self) -> SourceEvent:
-        """Sprint 1 shape for the demo pipeline. That journal has no revision concept, so only
-        revision 1 may be lifted."""
+        """Sprint 1 shape for the demo pipeline, which has no provenance fields of its own.
+
+        Everything the Sprint 1.1 gateway would hold or block on provenance is therefore refused
+        here, before the text can reach that pipeline: unverified authors, incomplete text,
+        reposts and edits (the Sprint 1 journal has no revision concept)."""
+        if not self.verified_author:
+            raise ValueError("Refusing legacy conversion: author not verified")
+        if not self.text_complete:
+            raise ValueError("Refusing legacy conversion: text incomplete")
+        if self.is_repost:
+            raise ValueError("Refusing legacy conversion: repost is not the author's instruction")
         if self.revision != 1:
-            raise ValueError("The Sprint 1 pipeline cannot represent edited posts")
+            raise ValueError("Refusing legacy conversion: edited post (the Sprint 1 journal has no revisions)")
         if not self.text:
-            raise ValueError("The Sprint 1 pipeline needs text")
+            raise ValueError("Refusing legacy conversion: empty text")
         paid = self.is_paid_content
         return SourceEvent(
             source_id=self.source_id,
@@ -161,6 +170,32 @@ class SourcePost(StrictModel):
             received_at=received, provenance=provenance, conversation_id=record.get("conversation_id"),
             links=links, media=media,
         )
+
+
+def coerce_source_posts(items, *, expected_author_id: str | None = None,
+                        provenance: Provenance = Provenance.ARCHIVE_API_USER_CONTEXT) -> list[SourcePost]:
+    """Normalise what a Source Agent adapter yields into SourcePost objects.
+
+    Accepted item shapes, in order of preference:
+      * a SourcePost instance;
+      * a SourcePost-shaped mapping (has ``schema_version`` or both ``source_id`` and ``post_id``);
+      * a G0 archive/poll record (has ``id`` and ``created_at``), mapped with ``from_g0_record``,
+        which needs ``expected_author_id``.
+    Anything else raises TypeError. Output is sorted by (published_at, revision, post_id).
+    """
+    out: list[SourcePost] = []
+    for item in items:
+        if isinstance(item, SourcePost):
+            out.append(item)
+        elif isinstance(item, dict) and ("schema_version" in item or ("source_id" in item and "post_id" in item)):
+            out.append(SourcePost.model_validate(item))
+        elif isinstance(item, dict) and "id" in item and "created_at" in item:
+            if expected_author_id is None:
+                raise TypeError("G0 records need expected_author_id to verify the author")
+            out.append(SourcePost.from_g0_record(item, expected_author_id=expected_author_id, provenance=provenance))
+        else:
+            raise TypeError(f"Unsupported source item: {type(item).__name__}")
+    return sorted(out, key=lambda p: (p.published_at, p.revision, p.post_id))
 
 
 def _parse_time(value: str) -> datetime:
