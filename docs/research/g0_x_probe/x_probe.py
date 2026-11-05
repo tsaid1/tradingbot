@@ -19,24 +19,29 @@ What it stores
   poll stores NO post text by default: only a SHA-256 of the text and its length, plus IDs,
   timestamps, lag, media presence and edit-history counts. backfill is the exception: its
   purpose is a local evaluation corpus, so it stores full text and media under data/g0/corpus/.
-  Everything lands under data/g0/ (git-ignored). Never commit any of it; it is paid content.
+  Research output lands under data/g0/ (git-ignored). OAuth tokens live in a separate local store.
 """
 from __future__ import annotations
 
 import argparse
 import base64
+import fcntl
 import hashlib
 import json
 import math
 import os
+import pwd
 import secrets
+import stat
 import statistics
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from itertools import pairwise
@@ -62,7 +67,9 @@ MEDIA_FIELDS = "media_key,type,url,preview_image_url,variants"
 USER_FIELDS = "id,username,protected,created_at"
 
 DATA_DIR = Path(os.environ.get("G0_DATA_DIR", "data/g0"))
-TOKEN_FILE = DATA_DIR / "tokens.json"
+# The account home comes from the OS. G0_DATA_DIR and shell environment overrides
+# must never relocate credentials into a synced checkout.
+TOKEN_FILE = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve() / ".config/tradingbot/g0/tokens.json"
 
 
 # ----------------------------------------------------------------------------- pure helpers
@@ -360,12 +367,19 @@ def verdict(summary: dict, controls: dict | None) -> list[tuple[str, bool | None
 
 # ----------------------------------------------------------------------------- HTTP and auth
 
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None  # API credentials and token-exchange bodies stay at the original endpoint.
+
+
 def http(method: str, url: str, *, headers: dict | None = None, data: bytes | None = None,
          timeout: float = 20.0) -> tuple[int, dict, bytes, float]:
+    if (headers or data) and urllib.parse.urlsplit(url)[:2] != ("https", "api.x.com"):
+        raise ValueError("Credentialed requests require the X API origin")
     req = urllib.request.Request(url, method=method, headers=headers or {}, data=data)
     t0 = time.monotonic()
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with urllib.request.build_opener(NoRedirect).open(req, timeout=timeout) as resp:
             return resp.status, {k.lower(): v for k, v in resp.headers.items()}, resp.read(), time.monotonic() - t0
     except urllib.error.HTTPError as exc:
         return exc.code, {k.lower(): v for k, v in exc.headers.items()}, exc.read(), time.monotonic() - t0
@@ -386,40 +400,90 @@ def token_headers(client_id: str, client_secret: str | None) -> dict:
     return headers
 
 
-def save_tokens(payload: dict) -> None:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    payload["expires_at"] = time.time() + float(payload.get("expires_in", 7200)) - 60
-    TOKEN_FILE.write_text(json.dumps(payload, indent=2))
-    os.chmod(TOKEN_FILE, 0o600)
+@contextmanager
+def credential_store():
+    """Serialize auth/refresh and refuse an absent, redirected or shared local store."""
+    directory = TOKEN_FILE.parent
+    if (directory.resolve() != directory or directory.is_relative_to(DATA_DIR.resolve())
+            or directory.is_relative_to(Path(__file__).resolve().parents[3])
+            or any(part.lower().startswith("dropbox") or part.lower() == "cloudstorage"
+                   for part in directory.parts)):
+        sys.exit("OAuth storage must be outside the project and cloud storage, without symlinks.")
+    try:
+        fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        sys.exit("OAuth directory unavailable. Set up the private directory before running auth.")
+    try:
+        info = os.fstat(fd)
+        if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
+            sys.exit("OAuth directory must belong to the current user with mode 0700.")
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            info = TOKEN_FILE.lstat()
+        except FileNotFoundError:
+            pass  # A new authorization can create the file in this verified directory.
+        else:
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                    or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600):
+                sys.exit("OAuth token file must be a private, single-link regular file with mode 0600.")
+        yield
+    finally:
+        os.close(fd)
 
 
-def load_tokens() -> dict:
-    if not TOKEN_FILE.exists():
-        sys.exit("No tokens. Run: x_probe.py auth")
-    return json.loads(TOKEN_FILE.read_text())
+def _save_tokens(payload: dict) -> None:
+    """Called under the credential store lock after a successful token exchange."""
+    if not isinstance(payload.get("access_token"), str) or not payload["access_token"]:
+        sys.exit("Token endpoint omitted the access token.")
+    try:
+        expires_at = time.time() + float(payload.get("expires_in", 7200)) - 60
+    except (ValueError, TypeError, OverflowError):
+        sys.exit("Invalid token lifetime.")
+    with tempfile.NamedTemporaryFile(dir=TOKEN_FILE.parent, mode="w", delete=False) as tmp:
+        try:
+            json.dump({**payload, "expires_at": expires_at}, tmp)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+            tmp.close()
+            os.replace(tmp.name, TOKEN_FILE)
+        finally:
+            Path(tmp.name).unlink(missing_ok=True)
 
 
-def refresh_tokens(tokens: dict) -> dict:
+def _refresh_tokens(tokens: dict) -> dict:
     client_id, client_secret, _ = client_config()
     body = {"grant_type": "refresh_token", "refresh_token": tokens["refresh_token"], "client_id": client_id}
     status, _, raw, _ = http("POST", TOKEN_URL, headers=token_headers(client_id, client_secret),
                              data=urllib.parse.urlencode(body).encode())
     if status != 200:
-        sys.exit(f"Refresh failed {status}: {raw[:300]!r}")
+        sys.exit(f"Refresh failed (HTTP {status}).")
     new = json.loads(raw)
     new.setdefault("refresh_token", tokens["refresh_token"])
-    save_tokens(new)
+    _save_tokens(new)
     return new
 
 
 def user_token() -> str:
-    tokens = load_tokens()
-    if time.time() >= tokens.get("expires_at", 0):
-        tokens = refresh_tokens(tokens)
-    return tokens["access_token"]
+    with credential_store():
+        try:
+            fd = os.open(TOKEN_FILE, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(fd) as f:
+                tokens = json.load(f)
+        except FileNotFoundError:
+            sys.exit("No OAuth tokens in the private store. Run x_probe.py auth.")
+        if time.time() >= tokens.get("expires_at", 0):
+            if not tokens.get("refresh_token"):
+                sys.exit("Refresh token missing. Run x_probe.py auth.")
+            tokens = _refresh_tokens(tokens)
+        return tokens["access_token"]
 
 
 def cmd_auth(_: argparse.Namespace) -> None:
+    with credential_store():
+        _authorize()
+
+
+def _authorize() -> None:
     client_id, client_secret, redirect_uri = client_config()
     verifier, challenge = pkce_pair()
     state = secrets.token_urlsafe(16)
@@ -429,11 +493,17 @@ def cmd_auth(_: argparse.Namespace) -> None:
     }
     url = f"{AUTH_URL}?{urllib.parse.urlencode(params)}"
     parsed = urllib.parse.urlparse(redirect_uri)
+    if parsed.scheme != "http" or parsed.hostname != "127.0.0.1" or parsed.path != "/callback" or parsed.username:
+        sys.exit("Configure the OAuth redirect as http://127.0.0.1:<port>/callback.")
     captured: dict = {}
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
-            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            callback = urllib.parse.urlsplit(self.path)
+            if callback.path != parsed.path:
+                self.send_error(404)
+                return
+            qs = urllib.parse.parse_qs(callback.query)
             captured.update({k: v[0] for k, v in qs.items()})
             self.send_response(200)
             self.end_headers()
@@ -443,13 +513,16 @@ def cmd_auth(_: argparse.Namespace) -> None:
             return
 
     server = HTTPServer((parsed.hostname or "127.0.0.1", parsed.port or 80), Handler)
-    print("Opening browser for X authorization. Log in as the SUBSCRIBER account that follows the target.")
-    print(url)
-    webbrowser.open(url)
-    server.handle_request()
-    server.server_close()
+    try:
+        server.timeout = 180
+        print("Opening browser for X authorization. Log in as the SUBSCRIBER account that follows the target.")
+        if not webbrowser.open(url):
+            sys.exit("Could not open the OAuth authorization browser.")
+        server.handle_request()
+    finally:
+        server.server_close()
     if captured.get("state") != state or "code" not in captured:
-        sys.exit(f"Authorization failed or state mismatch: {captured}")
+        sys.exit("Authorization failed or callback state mismatch.")
     body = {
         "grant_type": "authorization_code", "code": captured["code"], "client_id": client_id,
         "redirect_uri": redirect_uri, "code_verifier": verifier,
@@ -457,10 +530,10 @@ def cmd_auth(_: argparse.Namespace) -> None:
     status, _, raw, _ = http("POST", TOKEN_URL, headers=token_headers(client_id, client_secret),
                              data=urllib.parse.urlencode(body).encode())
     if status != 200:
-        sys.exit(f"Token exchange failed {status}: {raw[:300]!r}")
+        sys.exit(f"Token exchange failed (HTTP {status}).")
     tokens = json.loads(raw)
-    save_tokens(tokens)
-    print(f"Tokens stored in {TOKEN_FILE} (mode 600). Scopes: {tokens.get('scope')}. "
+    _save_tokens(tokens)
+    print(f"Tokens stored in {TOKEN_FILE} (mode 600). "
           f"Refresh token present: {'refresh_token' in tokens}")
 
 
@@ -472,8 +545,25 @@ def api_get(path: str, params: dict, token: str) -> tuple[int, dict, dict, float
     try:
         body = json.loads(raw) if raw else {}
     except json.JSONDecodeError:
-        body = {"raw": raw[:500].decode("utf-8", "replace")}
+        body = {}
     return status, headers, body, elapsed
+
+
+def log_errors(body: dict) -> list[dict]:
+    """Keep the control evidence while discarding server-supplied descriptions and request echoes."""
+    errors = []
+    for error in body.get("errors") or []:
+        safe = {"type": "unspecified"}
+        if isinstance(error, dict):
+            kind = error.get("type")
+            if kind in ("https://api.x.com/2/problems/not-authorized-for-resource",
+                        "https://api.twitter.com/2/problems/not-authorized-for-resource"):
+                safe["type"] = kind
+            resource = error.get("resource_id")
+            if isinstance(resource, str) and resource.isascii() and resource.isdigit() and len(resource) <= 20:
+                safe["resource_id"] = resource
+        errors.append(safe)
+    return errors
 
 
 def rate_info(headers: dict) -> tuple[int | None, int | None]:
@@ -487,7 +577,7 @@ def rate_info(headers: dict) -> tuple[int | None, int | None]:
 
 def cmd_lookup(args: argparse.Namespace) -> None:
     status, headers, body, _ = api_get(f"/users/by/username/{args.username}", {"user.fields": USER_FIELDS}, user_token())
-    print(json.dumps({"status": status, "rate": rate_info(headers), "data": body.get("data"), "errors": body.get("errors")}, indent=2))
+    print(json.dumps({"status": status, "rate": rate_info(headers), "data": body.get("data"), "errors": log_errors(body)}, indent=2))
     if status == 200 and body.get("data"):
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         (DATA_DIR / "target.json").write_text(json.dumps(body["data"], indent=2))
@@ -539,30 +629,34 @@ def usage_snapshot(bearer: str | None) -> dict | None:
         snap.update({"project_usage": int(data.get("project_usage", 0)), "project_cap": int(data.get("project_cap", 0)),
                      "cap_reset_day": data.get("cap_reset_day")})
     else:
-        snap["errors"] = body.get("errors") or body.get("detail")
+        snap["errors"] = log_errors(body)
     return snap
 
 
 def bearer_control_call(user_id: str, since_id: str | None, bearer: str, naming: str) -> dict:
     """Ask for the same new posts with the app-only token. Expected: no data, not-authorized-for-resource."""
     status, headers, body, elapsed = api_get(f"/users/{user_id}/tweets", timeline_params(since_id, 10, naming), bearer)
-    errs = body.get("errors") or []
+    errs = log_errors(body)
     return {"status": status, "n_posts": len(body.get("data") or []), "elapsed_s": round(elapsed, 3),
             "error_types": sorted({e.get("type", "") for e in errs if isinstance(e, dict)}), "rate": rate_headers(headers)}
 
 
-def fetch_media_timed(media_items: list[dict], token: str, created_at: str | None) -> list[dict]:
+def media_url(media: dict) -> str | None:
+    url = media.get("url") or media.get("preview_image_url")
+    if url and urllib.parse.urlsplit(url)[:2] in (("https", "pbs.twimg.com"), ("https", "video.twimg.com")):
+        return url
+    return None
+
+
+def fetch_media_timed(media_items: list[dict], created_at: str | None) -> list[dict]:
     """GET every media URL of a post (bytes discarded); record status, size, elapsed and media lag."""
     out: list[dict] = []
     for m in media_items:
-        url = m.get("url") or m.get("preview_image_url")
+        url = media_url(m)
         if not url:
-            out.append({"media_key": m.get("media_key"), "skipped": "no_url"})
+            out.append({"media_key": m.get("media_key"), "skipped": "no_trusted_url"})
             continue
-        status, headers, raw, elapsed = http("GET", url, headers={"Authorization": f"Bearer {token}"})
-        if status != 200:
-            status, headers, raw, elapsed2 = http("GET", url)
-            elapsed += elapsed2
+        status, headers, raw, elapsed = http("GET", url)
         done = datetime.now(UTC)
         item = {"media_key": m.get("media_key"), "type": m.get("type"), "status": status, "bytes": len(raw),
                 "elapsed_s": round(elapsed, 3), "content_type": (headers.get("content-type") or "").split(";")[0]}
@@ -668,7 +762,7 @@ def cmd_poll(args: argparse.Namespace) -> None:
             except (urllib.error.URLError, TimeoutError, OSError) as exc:
                 received = datetime.now(UTC)
                 write({"kind": "call", "phase": label, "interval_s": interval, "sent_at": sent.isoformat(),
-                       "received_at": received.isoformat(), "status": None, "error": f"{type(exc).__name__}: {exc}",
+                       "received_at": received.isoformat(), "status": None, "error": type(exc).__name__,
                        "since_id": since_id, "n_posts": 0, "posts": []})
                 failures += 1
                 print(f"{sent.strftime('%H:%M:%S')} network error: {type(exc).__name__}", flush=True)
@@ -698,7 +792,7 @@ def cmd_poll(args: argparse.Namespace) -> None:
                         new_target_posts += 1
                     if args.fetch_media and rec.get("n_media_keys"):
                         keys = (raw_post.get("attachments") or {}).get("media_keys", []) or []
-                        rec["media_fetch"] = fetch_media_timed([media_by_key.get(k, {}) for k in keys], token,
+                        rec["media_fetch"] = fetch_media_timed([media_by_key.get(k, {}) for k in keys],
                                                                raw_post.get("created_at"))
                 posts.append(rec)
             record = {
@@ -706,7 +800,7 @@ def cmd_poll(args: argparse.Namespace) -> None:
                 "received_at": received.isoformat(), "observed_at": sent.isoformat(), "status": status,
                 "elapsed_s": round(elapsed, 3), "field_naming": naming, "rate": rh,
                 "rate_remaining": rh.get("x-rate-limit-remaining"), "rate_reset": rh.get("x-rate-limit-reset"),
-                "since_id": since_id, "n_posts": len(posts), "n_new": n_new, "posts": posts, "errors": body.get("errors"),
+                "since_id": since_id, "n_posts": len(posts), "n_new": n_new, "posts": posts, "errors": log_errors(body),
                 "result_count": (body.get("meta") or {}).get("result_count"),
             }
             if n_new and bearer:
@@ -754,7 +848,7 @@ def cmd_poll(args: argparse.Namespace) -> None:
             seen[p["id"]] = received.isoformat()
         write({"kind": "baseline", "sent_at": sent.isoformat(), "received_at": received.isoformat(), "status": status,
                "elapsed_s": round(elapsed, 3), "field_naming": naming, "rate": rate_headers(headers), "since_id": since_id,
-               "posts": [{"id": p.get("id"), "created_at": p.get("created_at")} for p in base_posts], "errors": body.get("errors")})
+               "posts": [{"id": p.get("id"), "created_at": p.get("created_at")} for p in base_posts], "errors": log_errors(body)})
         print(f"Baseline: status={status} newest_id={since_id} rate_limit_15min={last_limit}", flush=True)
         if status in (401, 403):
             sys.exit("Baseline call denied; check the subscriber token")
@@ -825,17 +919,15 @@ def corpus_summary(records: list[dict]) -> dict:
     }
 
 
-def download_media(media: dict, dest_dir: Path, token: str) -> dict:
-    url = media.get("url") or media.get("preview_image_url")
+def download_media(media: dict, dest_dir: Path) -> dict:
+    url = media_url(media)
     if not url:
-        return {"skipped": "no_url"}
+        return {"skipped": "no_trusted_url"}
     key = media.get("media_key", "media")
     existing = next(dest_dir.glob(f"{key}.*"), None)
     if existing:
         return {"file": existing.name, "cached": True}
-    status, headers, raw, _ = http("GET", url, headers={"Authorization": f"Bearer {token}"})
-    if status != 200:
-        status, headers, raw, _ = http("GET", url)  # media host may not want the API token
+    status, headers, raw, _ = http("GET", url)
     if status != 200:
         return {"status": status}
     ext = MEDIA_EXT.get((headers.get("content-type") or "").split(";")[0].strip(), ".bin")
@@ -856,7 +948,7 @@ def cmd_backfill(args: argparse.Namespace) -> None:
     fetched = state.get("fetched", 0)
     naming = state.get("naming", "tweet")
     print(f"Backfilling @{target.get('username')} (id {target['id']}) -> {out_path}"
-          + (f" resuming at token {next_token[:12]}..." if next_token else "")
+          + (" resuming from saved cursor" if next_token else "")
           + f"; window start={args.start_time or '-'} end={args.end_time or '-'} max_posts={args.max_posts}")
     print("NOTE: this stores full post text (paid content) locally under data/g0/. Never commit it.")
 
@@ -882,7 +974,7 @@ def cmd_backfill(args: argparse.Namespace) -> None:
                 sleep_for_rate_limit(reset)
                 continue
             if status != 200:
-                print(f"Stopped: HTTP {status} {json.dumps(body)[:300]}")
+                print(f"Stopped: HTTP {status}")
                 break
             media_by_key = {m.get("media_key"): m for m in (body.get("includes") or {}).get("media", [])}
             posts = body.get("data", [])
@@ -890,7 +982,7 @@ def cmd_backfill(args: argparse.Namespace) -> None:
                 rec = corpus_record(post, media_by_key, observed)
                 if args.download_media and rec["media"]:
                     media_dir.mkdir(parents=True, exist_ok=True)
-                    rec["media_files"] = [download_media(m, media_dir, user_token()) for m in rec["media"]]
+                    rec["media_files"] = [download_media(m, media_dir) for m in rec["media"]]
                 out.write(json.dumps(rec) + "\n")
             out.flush()
             fetched += len(posts)
@@ -923,14 +1015,14 @@ def cmd_controls(args: argparse.Namespace) -> None:
     bearer = os.environ.get("X_BEARER_TOKEN")
     if bearer:
         status, headers, body, _ = api_get(f"/users/{target['id']}/tweets", timeline_params(None, 10), bearer)
-        results["bearer_timeline"] = {"status": status, "n_posts": len(body.get("data", [])), "errors": body.get("errors"),
+        results["bearer_timeline"] = {"status": status, "n_posts": len(body.get("data", [])), "errors": log_errors(body),
                                       "rate": rate_info(headers)}
     else:
         print("X_BEARER_TOKEN not set; skipping bearer control (set it from the app's Keys and Tokens page).")
     status, headers, body, _ = api_get("/tweets/search/recent",
                                        {"query": f"from:{target['username']}", "max_results": "10", "tweet.fields": "created_at,author_id"},
                                        user_token())
-    results["user_search"] = {"status": status, "n_posts": len(body.get("data", [])), "errors": body.get("errors"),
+    results["user_search"] = {"status": status, "n_posts": len(body.get("data", [])), "errors": log_errors(body),
                               "rate": rate_info(headers)}
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     (DATA_DIR / "controls.json").write_text(json.dumps(results, indent=2))

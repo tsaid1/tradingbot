@@ -4,13 +4,114 @@
 """
 import base64
 import hashlib
+import json
+import os
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent))
 
 import x_probe
+
+
+@pytest.fixture
+def private_store(tmp_path, monkeypatch):
+    cache = tmp_path.resolve() / "private"
+    cache.mkdir(mode=0o700)
+    monkeypatch.setattr(x_probe, "TOKEN_FILE", cache / "tokens.json")
+    monkeypatch.setattr(x_probe, "DATA_DIR", tmp_path / "research")
+    return cache / "tokens.json"
+
+
+@pytest.mark.parametrize("unsafe", ["absent", "shared", "symlink-dir", "symlink-file",
+                                    "public-file", "hardlink", "output-dir", "synced"])
+def test_unsafe_oauth_store_fails_before_browser_or_refresh(unsafe, private_store, monkeypatch):
+    token = private_store
+    directory = token.parent
+    if unsafe == "absent":
+        directory.rmdir()
+    elif unsafe == "shared":
+        directory.chmod(0o755)
+    elif unsafe in ("symlink-dir", "synced"):
+        alternate = directory.with_name("CloudStorage" if unsafe == "synced" else "linked")
+        if unsafe == "synced":
+            directory.rename(alternate)
+        else:
+            alternate.symlink_to(directory, target_is_directory=True)
+        monkeypatch.setattr(x_probe, "TOKEN_FILE", alternate / token.name)
+    elif unsafe == "symlink-file":
+        token.symlink_to(directory / "missing")
+    elif unsafe == "public-file":
+        token.touch(mode=0o600)
+        token.chmod(0o644)
+    elif unsafe == "hardlink":
+        token.touch(mode=0o600)
+        os.link(token, directory / "second-name")
+    else:
+        monkeypatch.setattr(x_probe, "DATA_DIR", directory)
+    monkeypatch.setattr(x_probe, "_authorize", lambda: pytest.fail("unsafe authorization"))
+    monkeypatch.setattr(x_probe, "http", lambda *a, **kw: pytest.fail("unsafe refresh"))
+    with pytest.raises(SystemExit, match="OAuth"):
+        x_probe.cmd_auth(None)
+    with pytest.raises(SystemExit, match="OAuth"):
+        x_probe.user_token()
+
+
+def test_refresh_is_private_atomic_and_ignores_legacy_file(private_store, monkeypatch, capsys):
+    legacy = x_probe.DATA_DIR / "tokens.json"
+    legacy.parent.mkdir()
+    legacy.write_text("legacy file must never be read or written")
+    with pytest.raises(SystemExit, match="No OAuth tokens"):
+        x_probe.user_token()
+    old = {"access_token": "expired-test-value", "refresh_token": "test-refresh", "expires_at": 0}
+    private_store.touch(mode=0o600)
+    private_store.write_text(json.dumps(old))
+    inode = private_store.stat().st_ino
+    monkeypatch.setenv("X_CLIENT_ID", "test-app")
+    monkeypatch.setattr(x_probe, "http", lambda *a, **kw: (401, {}, b"test-sensitive-error", 0))
+    with pytest.raises(SystemExit) as failed:
+        x_probe.user_token()
+    assert "test-sensitive-error" not in str(failed.value)
+    assert json.loads(private_store.read_text()) == old
+    monkeypatch.setattr(x_probe, "http", lambda *a, **kw: (200, {}, b'{"access_token":"test-renewed"}', 0))
+    assert x_probe.user_token() == "test-renewed"
+    assert private_store.stat().st_ino != inode and private_store.stat().st_mode & 0o777 == 0o600
+    assert json.loads(private_store.read_text())["refresh_token"] == old["refresh_token"]
+    assert legacy.read_text() == "legacy file must never be read or written"
+    assert list(private_store.parent.iterdir()) == [private_store]
+    assert not capsys.readouterr().out
+
+
+def test_failed_atomic_replace_keeps_old_tokens(private_store, monkeypatch):
+    private_store.touch(mode=0o600)
+    private_store.write_text("original bytes")
+    def fail_replace(*args):
+        raise OSError("simulated failure")
+    monkeypatch.setattr(os, "replace", fail_replace)
+    with x_probe.credential_store(), pytest.raises(OSError):
+        x_probe._save_tokens({"access_token": "synthetic"})
+    assert private_store.read_text() == "original bytes"
+    assert list(private_store.parent.iterdir()) == [private_store]
+
+
+def test_media_and_redirects_cannot_export_credentials(tmp_path, monkeypatch):
+    with pytest.raises(ValueError):
+        x_probe.http("GET", "https://outside.example", headers={"Authorization": "Bearer synthetic"})
+    assert x_probe.NoRedirect().redirect_request(None, None, 302, "", {}, "https://outside.example") is None
+    requests = []
+    def anonymous_get(method, url):
+        requests.append((method, url))
+        return 200, {}, b"test", 0
+    monkeypatch.setattr(x_probe, "http", anonymous_get)
+    media = {"media_key": "3_1", "url": "https://pbs.twimg.com/test"}
+    untrusted = {"url": "https://pbs.twimg.com.outside.example/test"}
+    assert x_probe.fetch_media_timed([media, untrusted], None)[1]["skipped"]
+    assert x_probe.download_media(media, tmp_path)["status"] == 200
+    assert x_probe.download_media(untrusted, tmp_path)["skipped"]
+    assert requests == [("GET", media["url"])] * 2
 
 
 def test_pkce_pair_is_s256_of_verifier():
@@ -196,17 +297,22 @@ def test_backfill_pages_until_no_token_and_is_resumable(tmp_path, monkeypatch, c
     assert state["fetched"] == 3 and state["next_token"] is None and seen[-1] == "p2"
 
 
-def test_auth_flow_exchanges_code_without_a_real_browser(tmp_path, monkeypatch, capsys):
+def test_auth_flow_exchanges_code_without_a_real_browser(private_store, monkeypatch, capsys):
     """Drives cmd_auth end to end with a fake browser that hits the local callback."""
     import argparse
     import json
     import threading
     import urllib.request
-    monkeypatch.setattr(x_probe, "DATA_DIR", tmp_path)
-    monkeypatch.setattr(x_probe, "TOKEN_FILE", tmp_path / "tokens.json")
     monkeypatch.setenv("X_CLIENT_ID", "cid")
     monkeypatch.setenv("X_REDIRECT_URI", "http://127.0.0.1:8799/callback")
     monkeypatch.delenv("X_CLIENT_SECRET", raising=False)
+    server_type = x_probe.HTTPServer
+    def loopback(*args):
+        try:
+            return server_type(*args)
+        except PermissionError:
+            pytest.skip("Loopback listener prohibited by the host sandbox")
+    monkeypatch.setattr(x_probe, "HTTPServer", loopback)
 
     def fake_open(url):
         state = dict(p.split("=") for p in url.split("?", 1)[1].split("&"))["state"]
@@ -225,9 +331,65 @@ def test_auth_flow_exchanges_code_without_a_real_browser(tmp_path, monkeypatch, 
     monkeypatch.setattr(x_probe, "http", fake_http)
     x_probe.cmd_auth(argparse.Namespace())
     assert posted["url"] == x_probe.TOKEN_URL and "code=abc" in posted["body"] and "code_verifier=" in posted["body"]
-    saved = json.loads((tmp_path / "tokens.json").read_text())
+    saved = json.loads(private_store.read_text())
     assert saved["refresh_token"] == "R" and saved["expires_at"] > 0
-    assert "Refresh token present: True" in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert "Refresh token present: True" in output and "code_challenge" not in output
+    assert private_store.stat().st_mode & 0o777 == 0o600
+    assert not x_probe.DATA_DIR.exists()
+
+
+@pytest.mark.parametrize("outcome", ["ok", "wrong-state", "exchange-denied"])
+def test_auth_callback_and_storage_without_listening(private_store, monkeypatch, capsys, outcome):
+    """Drive the real callback handler with in-memory streams, including failure paths."""
+    import io
+    from types import SimpleNamespace
+    from urllib.parse import parse_qs, urlsplit
+
+    callback = {}
+    def browser(url):
+        callback["state"] = parse_qs(urlsplit(url).query)["state"][0]
+        return True
+
+    class CallbackServer:
+        def __init__(self, address, handler):
+            assert address[0] == "127.0.0.1"
+            self.handler = handler
+
+        def handle_request(self):
+            state = "mismatch" if outcome == "wrong-state" else callback["state"]
+            request = SimpleNamespace(path=f"/callback?code=sensitive-test-code&state={state}",
+                                      send_response=lambda status: None, end_headers=lambda: None,
+                                      wfile=io.BytesIO())
+            self.handler.do_GET(request)
+
+        def server_close(self):
+            pass
+
+    def exchange(*args, **kwargs):
+        assert outcome != "wrong-state"
+        if outcome == "exchange-denied":
+            return 400, {}, b"sensitive-test-response", 0
+        return 200, {}, b'{"access_token":"sensitive-test-access","expires_in":7200}', 0
+
+    monkeypatch.setattr(x_probe, "HTTPServer", CallbackServer)
+    monkeypatch.setattr(x_probe.webbrowser, "open", browser)
+    monkeypatch.setattr(x_probe, "http", exchange)
+    monkeypatch.setenv("X_CLIENT_ID", "test-app")
+    monkeypatch.delenv("X_REDIRECT_URI", raising=False)
+    if outcome == "ok":
+        x_probe.cmd_auth(None)
+        assert x_probe.user_token() == "sensitive-test-access"
+        assert private_store.stat().st_mode & 0o777 == 0o600
+        error = ""
+    else:
+        with pytest.raises(SystemExit) as failure:
+            x_probe.cmd_auth(None)
+        error = str(failure.value)
+        assert not private_store.exists()
+    streams = capsys.readouterr()
+    assert "sensitive-test" not in streams.out + streams.err + error
+    assert not x_probe.DATA_DIR.exists()
 
 
 def test_parse_phases_and_effective_interval():
@@ -324,7 +486,7 @@ def test_poll_end_to_end_with_fake_clock(tmp_path, monkeypatch, capsys):
             return 200, headers, {"data": [], "meta": {"result_count": 0}}, 0.3, naming
         post = {"id": "101", "author_id": "T", "created_at": fresh, "text": "BUY", "attachments": {"media_keys": ["3_1"]},
                 "edit_history_tweet_ids": ["101"]}
-        body = {"data": [post], "includes": {"media": [{"media_key": "3_1", "type": "photo", "url": "https://pbs/x.png"}]},
+        body = {"data": [post], "includes": {"media": [{"media_key": "3_1", "type": "photo", "url": "https://pbs.twimg.com/x.png"}]},
                 "meta": {"result_count": 1}}
         return 200, headers, body, 0.3, naming                 # call 3: new post; call 4: same post again (duplicate)
 
@@ -335,7 +497,10 @@ def test_poll_end_to_end_with_fake_clock(tmp_path, monkeypatch, capsys):
         api_calls.append((path, token))
         if path == "/usage/tweets":
             return 200, {}, {"data": {"project_usage": str(3189 + len(api_calls)), "project_cap": "3000000", "cap_reset_day": 5}}, 0.1
-        return 200, {"x-rate-limit-remaining": "9998"}, {"errors": [{"type": "x/not-authorized-for-resource"}]}, 0.1
+        return 200, {"x-rate-limit-remaining": "9998"}, {"errors": [{
+            "type": "https://api.x.com/2/problems/not-authorized-for-resource",
+            "detail": "sensitive-test-error-echo"
+        }]}, 0.1
 
     monkeypatch.setattr(x_probe, "api_get", fake_api_get)
     monkeypatch.setattr(x_probe, "http", lambda m, url, **kw: (200, {"content-type": "image/png"}, b"\x89PNG" * 10, 0.05))
@@ -353,7 +518,8 @@ def test_poll_end_to_end_with_fake_clock(tmp_path, monkeypatch, capsys):
     # wall clock does not advance in this test, so the post "existed" before the previous call: floor == lag minus epsilon
     assert 2.5 <= new_post["lag_s"] < 10 and 0 <= new_post["x_delay_floor_s"] <= new_post["lag_s"] and "poll_window_s" in new_post
     assert new_post["media_fetch"][0]["status"] == 200 and new_post["media_fetch"][0]["bytes"] == 40
-    assert calls[1]["bearer_control"]["error_types"] == ["x/not-authorized-for-resource"]
+    assert calls[1]["bearer_control"]["error_types"] == ["https://api.x.com/2/problems/not-authorized-for-resource"]
+    assert "sensitive-test-error-echo" not in log.read_text()
     assert "bearer_control" not in calls[2]                       # duplicates do not trigger a control call
     assert all(t == "app-only" for _, t in api_calls) and "tok" not in json.dumps(recs) and "app-only" not in json.dumps(recs)
     recon = recs[-3]

@@ -11,7 +11,11 @@ Runs the feasibility experiment described in `../X_PROTECTED_ACCOUNT_API_FEASIBI
 2. In the App's **User authentication settings**: enable OAuth 2.0, type **Web App** (or Native App), callback URI `http://127.0.0.1:8765/callback`, website URL anything. Save the **Client ID** (and Client Secret if one is issued).
 3. Under **Keys and Tokens**, also copy the app **Bearer Token** (used only as a negative control).
 4. Add a small pay-per-use credit balance.
-5. Export the values in your shell. Never write them into the repo or `.env.example`:
+5. On macOS or Linux, provision the owner-only credential directory once with
+   `install -d -m 700 ~/.config/tradingbot/g0`. Keep it on local storage under your
+   OS account home. Export the app values from a local secret manager or a mode-0600
+   file there. Avoid pasting real values into shell history, logs or a project file.
+   The environment names below are placeholders:
 
 ```bash
 export X_CLIENT_ID=...
@@ -19,7 +23,17 @@ export X_CLIENT_SECRET=...      # omit if the console did not issue one
 export X_BEARER_TOKEN=...       # control only
 ```
 
-All output goes to `data/g0/` which is git-ignored.
+Research output goes to `data/g0/` or `G0_DATA_DIR`. Auth and refresh use only
+`~/.config/tradingbot/g0/tokens.json`. An absent credential directory, a symlink
+in the credential path, a shared directory or a non-private token file stops the
+operation. A new authorization creates a mode-0600 token file in the prepared
+directory. Refresh replaces it atomically. Concurrent probe processes serialize
+access. The probe ignores any old `data/g0/tokens.json`.
+
+If a real secret previously lived in a synced directory, revoke and reissue those
+credentials at the provider before the next live run. Removing the local copy does
+not invalidate historical copies. Media downloads use anonymous HTTPS requests to
+the X image/video CDN. Credentialed API requests never follow redirects.
 
 ## 2. Run (from the repo root)
 
@@ -91,4 +105,5 @@ Write the `report` output and the key observations into `docs/research/G0_RESULT
 python -m pytest docs/research/g0_x_probe -q
 ```
 
-These cover PKCE, lag and its decomposition, `since_id` handling, redaction, phase parsing and quota-aware intervals, summary and verdict logic, backfill paging, the auth flow and an end-to-end poll against a fake clock and fake API. They are not in the CI `testpaths` (that is Agent A's `pyproject.toml`); run them locally.
+CI runs these tests alongside the core suite. They cover the local OAuth store,
+credential boundaries, PKCE, polling and offline backfill.
