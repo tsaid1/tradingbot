@@ -1,0 +1,214 @@
+{
+ "name": "TLT lifecycle (shape of October 2026)",
+ "policy": {
+  "quantity": 4,
+  "quantity_per_add": 2
+ },
+ "quotes": {
+  "g1": {
+   "TLT": "88.50"
+  },
+  "g2": {
+   "TLT": "89.20"
+  },
+  "g3": {
+   "TLT": "92.00"
+  },
+  "g4": {
+   "TLT": "94.10"
+  },
+  "g5": {
+   "TLT": "94.10"
+  }
+ },
+ "lag_seconds": 0.0,
+ "posts": [
+  {
+   "schema_version": "1.2",
+   "source_id": "g1",
+   "post_id": "g1",
+   "revision": 1,
+   "author_id": "SYNTH",
+   "verified_author": true,
+   "text": "We are now long $TLT at $88.50. Stop: $86.00. Target: $95.00.",
+   "text_complete": true,
+   "is_repost": false,
+   "published_at": "2026-10-01T14:30:00Z",
+   "revised_at": null,
+   "received_at": "2026-10-01T14:30:00Z",
+   "provenance": "SYNTHETIC",
+   "conversation_id": null,
+   "links": [],
+   "media": []
+  },
+  {
+   "schema_version": "1.2",
+   "source_id": "g2",
+   "post_id": "g2",
+   "revision": 1,
+   "author_id": "SYNTH",
+   "verified_author": true,
+   "text": "Adding to our $TLT long at $89.20 and raising our stop to $87.00.",
+   "text_complete": true,
+   "is_repost": false,
+   "published_at": "2026-10-02T14:30:00Z",
+   "revised_at": null,
+   "received_at": "2026-10-02T14:30:00Z",
+   "provenance": "SYNTHETIC",
+   "conversation_id": null,
+   "links": [],
+   "media": []
+  },
+  {
+   "schema_version": "1.2",
+   "source_id": "g3",
+   "post_id": "g3",
+   "revision": 1,
+   "author_id": "SYNTH",
+   "verified_author": true,
+   "text": "Taking profits on half of our $TLT long at $92.00.",
+   "text_complete": true,
+   "is_repost": false,
+   "published_at": "2026-10-06T14:30:00Z",
+   "revised_at": null,
+   "received_at": "2026-10-06T14:30:00Z",
+   "provenance": "SYNTHETIC",
+   "conversation_id": null,
+   "links": [],
+   "media": []
+  },
+  {
+   "schema_version": "1.2",
+   "source_id": "g4",
+   "post_id": "g4",
+   "revision": 1,
+   "author_id": "SYNTH",
+   "verified_author": true,
+   "text": "Closing the remaining $TLT long here at $94.10.",
+   "text_complete": true,
+   "is_repost": false,
+   "published_at": "2026-10-10T14:30:00Z",
+   "revised_at": null,
+   "received_at": "2026-10-10T14:30:00Z",
+   "provenance": "SYNTHETIC",
+   "conversation_id": null,
+   "links": [],
+   "media": []
+  },
+  {
+   "schema_version": "1.2",
+   "source_id": "g5",
+   "post_id": "g5",
+   "revision": 1,
+   "author_id": "SYNTH",
+   "verified_author": true,
+   "text": "We have closed our $TLT long at $94.10 for a +6.3% gain.",
+   "text_complete": true,
+   "is_repost": false,
+   "published_at": "2026-10-10T15:30:00Z",
+   "revised_at": null,
+   "received_at": "2026-10-10T15:30:00Z",
+   "provenance": "SYNTHETIC",
+   "conversation_id": null,
+   "links": [],
+   "media": []
+  },
+  {
+   "schema_version": "1.2",
+   "source_id": "g6",
+   "post_id": "g6",
+   "revision": 1,
+   "author_id": "SYNTH",
+   "verified_author": true,
+   "text": "Current positions: none.",
+   "text_complete": true,
+   "is_repost": false,
+   "published_at": "2026-10-11T14:30:00Z",
+   "revised_at": null,
+   "received_at": "2026-10-11T14:30:00Z",
+   "provenance": "SYNTHETIC",
+   "conversation_id": null,
+   "links": [],
+   "media": []
+  }
+ ],
+ "steps": [
+  {
+   "source_id": "g1",
+   "statuses": [
+    "SIMULATED"
+   ],
+   "orders": [
+    {
+     "side": "BUY",
+     "quantity": 4
+    }
+   ],
+   "classes": null
+  },
+  {
+   "source_id": "g2",
+   "statuses": [
+    "SIMULATED",
+    "SIMULATED"
+   ],
+   "orders": [
+    {
+     "side": "BUY",
+     "quantity": 2
+    },
+    {
+     "side": "NONE",
+     "quantity": 0
+    }
+   ],
+   "classes": null
+  },
+  {
+   "source_id": "g3",
+   "statuses": [
+    "SIMULATED"
+   ],
+   "orders": [
+    {
+     "side": "SELL",
+     "quantity": 3
+    }
+   ],
+   "classes": null
+  },
+  {
+   "source_id": "g4",
+   "statuses": [
+    "SIMULATED"
+   ],
+   "orders": [
+    {
+     "side": "SELL",
+     "quantity": 3
+    }
+   ],
+   "classes": null
+  },
+  {
+   "source_id": "g5",
+   "statuses": [
+    "RECONCILE"
+   ],
+   "orders": [],
+   "classes": [
+    "RETROSPECTIVE"
+   ]
+  },
+  {
+   "source_id": "g6",
+   "statuses": [
+    "NO_TRADE"
+   ],
+   "orders": [],
+   "classes": [
+    "POSITION_SUMMARY"
+   ]
+  }
+ ]
+}

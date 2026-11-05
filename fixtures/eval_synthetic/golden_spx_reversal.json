@@ -1,0 +1,147 @@
+{
+ "name": "S&P reversal (shape of November 2025)",
+ "policy": {
+  "quantity": 2
+ },
+ "quotes": {
+  "r1": {
+   "SPY": "685.00"
+  },
+  "r2": {
+   "SPY": "670.00"
+  }
+ },
+ "lag_seconds": 0.0,
+ "posts": [
+  {
+   "schema_version": "1.2",
+   "source_id": "q1",
+   "post_id": "q1",
+   "revision": 1,
+   "author_id": "SYNTH",
+   "verified_author": true,
+   "text": "We are now short the S&P 500 at 6,850 with a stop at 6,950.",
+   "text_complete": true,
+   "is_repost": false,
+   "published_at": "2026-10-01T14:30:00Z",
+   "revised_at": null,
+   "received_at": "2026-10-01T14:30:00Z",
+   "provenance": "SYNTHETIC",
+   "conversation_id": null,
+   "links": [],
+   "media": []
+  },
+  {
+   "schema_version": "1.2",
+   "source_id": "q2",
+   "post_id": "q2",
+   "revision": 1,
+   "author_id": "SYNTH",
+   "verified_author": true,
+   "text": "Closing our S&P 500 short at 6,700 and going long at 6,700 with a stop at 6,600.",
+   "text_complete": true,
+   "is_repost": false,
+   "published_at": "2026-10-03T14:30:00Z",
+   "revised_at": null,
+   "received_at": "2026-10-03T14:30:00Z",
+   "provenance": "SYNTHETIC",
+   "conversation_id": null,
+   "links": [],
+   "media": []
+  },
+  {
+   "schema_version": "1.2",
+   "source_id": "r1",
+   "post_id": "r1",
+   "revision": 1,
+   "author_id": "SYNTH",
+   "verified_author": true,
+   "text": "We are now short $SPY at $685.00 with a stop at $695.00.",
+   "text_complete": true,
+   "is_repost": false,
+   "published_at": "2026-10-04T14:30:00Z",
+   "revised_at": null,
+   "received_at": "2026-10-04T14:30:00Z",
+   "provenance": "SYNTHETIC",
+   "conversation_id": null,
+   "links": [],
+   "media": []
+  },
+  {
+   "schema_version": "1.2",
+   "source_id": "r2",
+   "post_id": "r2",
+   "revision": 1,
+   "author_id": "SYNTH",
+   "verified_author": true,
+   "text": "Covering our $SPY short at $670.00 and going long $SPY at $670.00 with a stop at $660.00.",
+   "text_complete": true,
+   "is_repost": false,
+   "published_at": "2026-10-06T14:30:00Z",
+   "revised_at": null,
+   "received_at": "2026-10-06T14:30:00Z",
+   "provenance": "SYNTHETIC",
+   "conversation_id": null,
+   "links": [],
+   "media": []
+  }
+ ],
+ "steps": [
+  {
+   "source_id": "q1",
+   "statuses": [
+    "HOLD"
+   ],
+   "orders": [],
+   "classes": [
+    "OPEN"
+   ]
+  },
+  {
+   "source_id": "q2",
+   "statuses": [
+    "HOLD",
+    "HOLD"
+   ],
+   "orders": [],
+   "classes": [
+    "CLOSE",
+    "OPEN"
+   ]
+  },
+  {
+   "source_id": "r1",
+   "statuses": [
+    "SIMULATED"
+   ],
+   "orders": [
+    {
+     "side": "SELL",
+     "quantity": 2
+    }
+   ],
+   "classes": null
+  },
+  {
+   "source_id": "r2",
+   "statuses": [
+    "SIMULATED",
+    "SIMULATED"
+   ],
+   "orders": [
+    {
+     "side": "BUY",
+     "quantity": 2
+    },
+    {
+     "side": "BUY",
+     "quantity": 2
+    }
+   ],
+   "classes": [
+    "CLOSE",
+    "OPEN"
+   ]
+  }
+ ]
+}

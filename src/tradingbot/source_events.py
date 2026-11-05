@@ -96,6 +96,18 @@ class SourcePost(StrictModel):
     def is_live(self) -> bool:
         return self.provenance == Provenance.LIVE_API_USER_CONTEXT
 
+    @property
+    def available_at(self) -> datetime:
+        """When this version could first have been acted on: the receipt time for live posts, the
+        edit time for a later revision, otherwise the original publication. Chronological replay
+        orders and clocks posts by this, never by `published_at`, so an edit is processed after
+        everything that happened between the original and the edit."""
+        if self.is_live:
+            return self.received_at
+        if self.revision > 1 and self.revised_at is not None:
+            return self.revised_at
+        return self.published_at
+
     def to_replay_source(self) -> ReplaySource:
         """Trusted metadata for the replay coordinator. The hash covers the exact text bytes."""
         return ReplaySource(
@@ -178,15 +190,21 @@ def coerce_source_posts(items, *, expected_author_id: str | None = None,
 
     Accepted item shapes, in order of preference:
       * a SourcePost instance;
+      * an object exposing ``as_source_post()`` (the Source Agent's ``HistoricalInput``);
       * a SourcePost-shaped mapping (has ``schema_version`` or both ``source_id`` and ``post_id``);
       * a G0 archive/poll record (has ``id`` and ``created_at``), mapped with ``from_g0_record``,
         which needs ``expected_author_id``.
-    Anything else raises TypeError. Output is sorted by (published_at, revision, post_id).
+    Anything else raises TypeError. Output is sorted by (available_at, revision, post_id).
     """
     out: list[SourcePost] = []
     for item in items:
         if isinstance(item, SourcePost):
             out.append(item)
+        elif hasattr(item, "as_source_post") and callable(item.as_source_post):
+            converted = item.as_source_post()
+            if not isinstance(converted, SourcePost):
+                raise TypeError("as_source_post() must return a SourcePost")
+            out.append(converted)
         elif isinstance(item, dict) and ("schema_version" in item or ("source_id" in item and "post_id" in item)):
             out.append(SourcePost.model_validate(item))
         elif isinstance(item, dict) and "id" in item and "created_at" in item:
@@ -195,7 +213,7 @@ def coerce_source_posts(items, *, expected_author_id: str | None = None,
             out.append(SourcePost.from_g0_record(item, expected_author_id=expected_author_id, provenance=provenance))
         else:
             raise TypeError(f"Unsupported source item: {type(item).__name__}")
-    return sorted(out, key=lambda p: (p.published_at, p.revision, p.post_id))
+    return sorted(out, key=lambda p: (p.available_at, p.revision, p.post_id))
 
 
 def _parse_time(value: str) -> datetime:

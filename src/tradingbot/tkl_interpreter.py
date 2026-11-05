@@ -588,14 +588,15 @@ QuoteProvider = Callable[[SourcePost, datetime], dict[str, Quote]]
 
 def replay_posts(posts: list[SourcePost], coordinator: PaperEventReplay, interpreter: TklInterpreter,
                  quotes_for: QuoteProvider, *, lag_seconds: float = 0.0) -> list[ReplayStep]:
-    """Point-in-time replay: publication order, interpret, authorize and fill through the Sprint 1.1
+    """Point-in-time replay in availability order (receipt for live posts, edit time for later
+    revisions, publication otherwise): interpret, authorize and fill through the Sprint 1.1
     coordinator, then advance the context. `now` is the real receipt time for live posts and
-    `published_at + lag_seconds` for archive or synthetic posts (archive receipt times are not
+    `available_at + lag_seconds` for archive or synthetic posts (archive receipt times are not
     latencies, see docs/research/G0_EVENT_SCHEMA.md)."""
     steps: list[ReplayStep] = []
-    for post in sorted(posts, key=lambda p: (p.published_at, p.revision, p.post_id)):
+    for post in sorted(posts, key=lambda p: (p.available_at, p.revision, p.post_id)):
         interpreted = interpreter.interpret(post)
-        now = post.received_at if post.is_live else post.published_at + timedelta(seconds=lag_seconds)
+        now = post.received_at if post.is_live else post.available_at + timedelta(seconds=lag_seconds)
         parsed = group_linked_actions(interpreted)
         result = coordinator.process(post.to_replay_source(), parsed, quotes_for(post, now), now=now)
         interpreter.observe(post, interpreted)

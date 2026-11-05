@@ -1,0 +1,126 @@
+{
+ "name": "Natural-gas conditional exit (shape of October 2026)",
+ "policy": {},
+ "quotes": {},
+ "lag_seconds": 0.0,
+ "posts": [
+  {
+   "schema_version": "1.2",
+   "source_id": "n1",
+   "post_id": "n1",
+   "revision": 1,
+   "author_id": "SYNTH",
+   "verified_author": true,
+   "text": "We are long natural gas from $2.90. If natural gas closes below $2.75 we will exit the position.",
+   "text_complete": true,
+   "is_repost": false,
+   "published_at": "2026-10-01T14:30:00Z",
+   "revised_at": null,
+   "received_at": "2026-10-01T14:30:00Z",
+   "provenance": "SYNTHETIC",
+   "conversation_id": null,
+   "links": [],
+   "media": []
+  },
+  {
+   "schema_version": "1.2",
+   "source_id": "n2",
+   "post_id": "n2",
+   "revision": 1,
+   "author_id": "SYNTH",
+   "verified_author": true,
+   "text": "We are no longer looking to exit natural gas on a break below $2.75. Stop now at $2.60.",
+   "text_complete": true,
+   "is_repost": false,
+   "published_at": "2026-10-02T14:30:00Z",
+   "revised_at": null,
+   "received_at": "2026-10-02T14:30:00Z",
+   "provenance": "SYNTHETIC",
+   "conversation_id": null,
+   "links": [],
+   "media": []
+  },
+  {
+   "schema_version": "1.2",
+   "source_id": "n4",
+   "post_id": "n4",
+   "revision": 1,
+   "author_id": "SYNTH",
+   "verified_author": true,
+   "text": "Exiting our natural gas long now at $2.80.",
+   "text_complete": true,
+   "is_repost": false,
+   "published_at": "2026-10-03T14:30:00Z",
+   "revised_at": null,
+   "received_at": "2026-10-03T14:30:00Z",
+   "provenance": "SYNTHETIC",
+   "conversation_id": null,
+   "links": [],
+   "media": []
+  },
+  {
+   "schema_version": "1.2",
+   "source_id": "n3",
+   "post_id": "n3",
+   "revision": 1,
+   "author_id": "SYNTH",
+   "verified_author": true,
+   "text": "Natural gas has broken below $2.60 and we have exited our long at $2.58.",
+   "text_complete": true,
+   "is_repost": false,
+   "published_at": "2026-10-04T14:30:00Z",
+   "revised_at": null,
+   "received_at": "2026-10-04T14:30:00Z",
+   "provenance": "SYNTHETIC",
+   "conversation_id": null,
+   "links": [],
+   "media": []
+  }
+ ],
+ "steps": [
+  {
+   "source_id": "n1",
+   "statuses": [
+    "RECONCILE",
+    "HOLD"
+   ],
+   "orders": [],
+   "classes": [
+    "RETROSPECTIVE",
+    "CONDITIONAL"
+   ]
+  },
+  {
+   "source_id": "n2",
+   "statuses": [
+    "NO_TRADE",
+    "HOLD"
+   ],
+   "orders": [],
+   "classes": [
+    "CANCEL",
+    "MODIFY"
+   ]
+  },
+  {
+   "source_id": "n4",
+   "statuses": [
+    "HOLD"
+   ],
+   "orders": [],
+   "classes": [
+    "CLOSE"
+   ]
+  },
+  {
+   "source_id": "n3",
+   "statuses": [
+    "RECONCILE"
+   ],
+   "orders": [],
+   "classes": [
+    "RETROSPECTIVE"
+   ]
+  }
+ ]
+}
