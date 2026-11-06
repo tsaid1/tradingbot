@@ -1,0 +1,96 @@
+"""Environment and account attestation gate: runs BEFORE any read is dispatched (issue #16).
+
+The gate reads only the operator's explicit ``ReadinessExpectation`` and the transport's
+``SessionAttestation``. It refuses, with every applicable reason, when the environment is not
+explicitly PAPER, when the expected synthetic account is not the single managed account, when the
+Read-Only API setting is not attested, when the session is not connected or has lost connectivity.
+A socket port is never evidence of anything: the documented defaults are user-configurable.
+"""
+from __future__ import annotations
+
+from pydantic import Field
+
+from tradingbot.models import StrictModel
+from tradingbot.paper_readiness.diagnostics import Finding, FindingKind, Stage
+from tradingbot.paper_readiness.observations import (
+    SYNTHETIC_ACCOUNT_RE,
+    ReadinessExpectation,
+    SessionAttestation,
+)
+
+__all__ = ["CONNECTIVITY_LOST", "CONNECTIVITY_RESTORED", "PreflightDecision", "preflight"]
+
+CONNECTIVITY_LOST = 1100       # "Connectivity between IB and the TWS has been lost."
+CONNECTIVITY_RESTORED = frozenset({1101, 1102})  # restored, data lost / data maintained
+
+
+class PreflightDecision(StrictModel):
+    refused: bool
+    refusals: list[Finding] = Field(default_factory=list)
+    notes: list[Finding] = Field(default_factory=list)
+
+
+def _refusal(code: str, detail: str) -> Finding:
+    return Finding(code=code, kind=FindingKind.REFUSED, stage=Stage.PREFLIGHT, detail=detail)
+
+
+def connectivity_is_lost(messages) -> bool:
+    """True when the most recent connectivity message is a loss (1100) with no later restoration."""
+    state = False
+    for m in messages:
+        if m.code == CONNECTIVITY_LOST:
+            state = True
+        elif m.code in CONNECTIVITY_RESTORED:
+            state = False
+    return state
+
+
+def preflight(expectation: ReadinessExpectation, session: SessionAttestation) -> PreflightDecision:
+    """Collect every refusal; the caller dispatches reads only when the list is empty."""
+    refusals: list[Finding] = []
+    notes: list[Finding] = []
+
+    if not session.connected:
+        refusals.append(_refusal("SESSION_NOT_CONNECTED", "The session attestation says the transport is "
+                                 "not connected; nothing can be observed."))
+    if connectivity_is_lost(session.messages):
+        refusals.append(_refusal("SESSION_CONNECTIVITY_LOST", "Message code 1100 (connectivity between IB and "
+                                 "TWS lost) was reported without a later 1101/1102 restoration."))
+
+    claim = session.environment_claim
+    if claim == "UNKNOWN":
+        refusals.append(_refusal("ENVIRONMENT_UNKNOWN", "The session does not state whether it is PAPER or "
+                                 "LIVE. Nothing is inferred from the socket port or anything else."))
+    elif claim == "LIVE":
+        refusals.append(_refusal("ENVIRONMENT_LIVE_REFUSED", "The session states a LIVE environment; this "
+                                 "scaffold admits PAPER only."))
+    elif claim != expectation.environment:
+        refusals.append(_refusal("ENVIRONMENT_MISMATCH", f"The session states {claim} but the expectation is "
+                                 f"{expectation.environment}."))
+
+    accounts = session.managed_accounts
+    if not accounts:
+        refusals.append(_refusal("ACCOUNT_EVIDENCE_ABSENT", "No managed account was attested (empty "
+                                 "managedAccounts list); account identity cannot be established."))
+    else:
+        if any(not SYNTHETIC_ACCOUNT_RE.fullmatch(a) for a in accounts):
+            refusals.append(_refusal("ACCOUNT_ID_NOT_SYNTHETIC", "A managed account identifier does not carry the "
+                                     "explicit synthetic marker; this offline scaffold refuses it unseen."))
+        if expectation.account_id not in accounts:
+            refusals.append(_refusal("ACCOUNT_NOT_IN_MANAGED_LIST", "The expected synthetic account is not among "
+                                     "the attested managed accounts."))
+        if len(accounts) != 1:
+            refusals.append(_refusal("MANAGED_ACCOUNTS_NOT_SINGULAR", f"{len(accounts)} managed accounts were "
+                                     "attested; the approved paper scope is a single isolated account."))
+
+    if session.read_only_api_attested is not True:
+        refusals.append(_refusal("READ_ONLY_API_NOT_ATTESTED", "The TWS/IB Gateway Read-Only API setting is not "
+                                 "attested as enabled. It is not queryable through the API, so an explicit "
+                                 "operator attestation is required."))
+
+    if session.socket_port is not None:
+        notes.append(Finding(code="SOCKET_PORT_NOT_EVIDENCE", kind=FindingKind.INFO, stage=Stage.PREFLIGHT,
+                             detail="A socket port was attested. It is recorded for diagnostics only; the "
+                                    "documented default ports are configurable and prove nothing about PAPER "
+                                    "versus LIVE."))
+    return PreflightDecision(refused=bool(refusals), refusals=refusals, notes=notes)
