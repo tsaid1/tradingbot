@@ -90,6 +90,8 @@ Identity and basis
 | `INSTRUMENT_MISSING` / `SOURCE_SERIES_MISSING` | MISSING | a side of the comparison is absent |
 | `PRICE_BASIS_UNKNOWN` | AMBIGUOUS | `price_basis` is `UNKNOWN`; no basis is assumed |
 | `SOURCE_SERIES_KIND_UNKNOWN` | AMBIGUOUS | `source.kind` is `UNKNOWN` |
+| `BLANK_FIELDS_TREATED_AS_ABSENT` | INFO | whitespace-only optional strings were present; they are reported as not stated (see below) |
+| `INSTRUMENT_SYMBOL_BLANK` | MISSING | the instrument symbol is whitespace |
 | `DIRECT_IDENTITY_CONTROL` | INFO | same label, orderable source kind matching the asset class, `TRADED_CONTRACT` basis |
 | `SOURCE_IS_STATED_UNDERLYING` | INFO | the source label equals the derivative's stated underlying |
 | `SOURCE_KIND_NOT_ORDERABLE` | MISMATCH | same label but the source is an index/spot/continuous/CFD series |
@@ -110,7 +112,7 @@ Currency, unit and economics
 | `SOURCE_CURRENCY_MISSING`, `SOURCE_UNIT_MISSING`, `TRADED_CURRENCY_MISSING`, `TRADED_UNIT_MISSING`, `CONTRACT_SPEC_MISSING` | MISSING | the named field or the whole contract block is absent |
 | `CURRENCY_CODE_INVALID` | INVALID | not three upper-case letters |
 | `CURRENCY_MISMATCH` / `UNIT_MISMATCH` | MISMATCH | both sides stated and different; nothing is converted |
-| `SOURCE_LEVEL_INVALID`, `MULTIPLIER_INVALID`, `TICK_SIZE_INVALID`, `TICK_VALUE_INVALID` | INVALID | not a positive finite decimal |
+| `SOURCE_LEVEL_INVALID`, `MULTIPLIER_INVALID`, `TICK_SIZE_INVALID`, `TICK_VALUE_INVALID` | INVALID | not a positive finite decimal, or outside the supported numeric range (see below) |
 | `MULTIPLIER_MISSING` (derivatives), `TICK_SIZE_MISSING` (futures) | MISSING | required economics absent |
 | `TICK_VALUE_INCONSISTENT` | MISMATCH | stated tick value is not multiplier x tick size |
 | `QUOTED_LEVEL_OFF_TICK_GRID` | AMBIGUOUS | a level claimed as the contract's own price is not a multiple of the stated tick |
@@ -125,7 +127,7 @@ Contract specificity
 | `DERIVATIVE_FIELDS_ON_CASH_INSTRUMENT` / `OPTION_FIELDS_ON_FUTURE` | MISMATCH | identifiers contradict the asset class |
 | `UNDERLYING_MISSING` | MISSING | derivative without an underlying |
 | `OPTION_EXPIRY_MISSING`, `OPTION_STRIKE_MISSING`, `OPTION_RIGHT_MISSING`, `OPTION_EXERCISE_STYLE_MISSING`, `OPTION_SETTLEMENT_MISSING` | MISSING | single-leg option identifiers absent |
-| `OPTION_STRIKE_INVALID`, `EXPIRY_FORMAT_INVALID`, `AS_OF_DATE_INVALID` | INVALID | malformed values |
+| `OPTION_STRIKE_INVALID`, `EXPIRY_FORMAT_INVALID`, `AS_OF_DATE_INVALID` | INVALID | malformed values; a strike is also subject to the numeric range |
 | `OPTION_SETTLEMENT_TIME_UNSPECIFIED` | AMBIGUOUS | cash-settled option without AM/PM; those are distinct series |
 | `CONTRACT_EXPIRED_AT_AS_OF` | INVALID | expiry precedes the record's `as_of` |
 | `FUTURES_VENUE_MISSING`, `FUTURES_EXPIRY_MISSING`, `FUTURES_CONTRACT_CODE_MISSING`, `FUTURES_CONTRACT_MONTH_MISSING`, `FUTURES_SETTLEMENT_MISSING` | MISSING | dated-contract identifiers absent; a product root alone is not a contract |
@@ -140,6 +142,24 @@ Runtime
 |---|---|---|
 | `RUNTIME_ASSET_CLASS_UNSUPPORTED` | UNSUPPORTED | the instrument is an option or future; the gateway holds it as `ASSET_CLASS_PAPER_ADAPTER_UNSUPPORTED` however complete the metadata |
 
+## Numeric bounds and blank values
+
+**Numbers.** `quoted_level`, `multiplier`, `tick_size`, `tick_value` and `strike` must be positive finite
+decimals with at most 28 significant digits and a magnitude from 1e-12 up to but excluding 1e16. Anything
+else is reported as INVALID for its own field *before* any arithmetic, so one extreme record (for example a
+level of `1e30` against a `0.01` tick, or a `1e999999` multiplier) becomes a finding and never an
+exception that would abort the batch. The only arithmetic the module performs (multiplier x tick for
+`TICK_VALUE_INCONSISTENT`, level mod tick for `QUOTED_LEVEL_OFF_TICK_GRID`) runs inside an explicit
+64-digit `decimal` local context in which every in-range operation is exact; the host process's ambient
+decimal context is never changed. No price is computed, converted or sized.
+
+**Blank strings.** A whitespace-only optional string (unit, currency, venue, underlying, expiry, strike,
+contract code, contract month, level, as_of) is treated as *not stated* within the diagnostic: the
+corresponding MISSING / AMBIGUOUS finding fires exactly as if the field were absent, and an INFO
+`BLANK_FIELDS_TREATED_AS_ABSENT` lists the fields concerned. A whitespace-only instrument symbol is
+`INSTRUMENT_SYMBOL_BLANK`. The shared `Instrument` contract is not changed and still accepts such values;
+only this tool's reading of them is defined.
+
 ## Relation to the gateway
 
 The diagnostic mirrors, and never replaces, the identity rules the gateway already enforces:
@@ -153,7 +173,8 @@ is an INFO finding here while only the gateway produces its own decision from it
 
 Records are reported in input order, findings in rule order, JSON keys sorted; no timestamps, paths or
 environment values appear. `fixtures/instrument_mapping_synthetic/expected_report.json` is the committed
-report for `records.json` and the suite asserts byte equality, in-process and through the CLI. After a
+report for `records.json` and the suite asserts byte equality, in-process and through the CLI. Current
+`RULES_VERSION` is 2 (1 -> 2 added the numeric bounds and blank-string handling after review). After a
 deliberate rule change, bump `RULES_VERSION`, regenerate with
 
 ```bash

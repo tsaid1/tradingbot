@@ -12,7 +12,7 @@ import re
 import subprocess
 import sys
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, getcontext
 from pathlib import Path
 
 import pytest
@@ -301,6 +301,94 @@ def test_invalid_numeric_metadata_is_reported_not_repaired():
     assert "AS_OF_DATE_INVALID" in codes(diagnose_record(record(as_of="yesterday")))
 
 
+def test_extreme_numeric_inputs_become_findings_and_never_abort_the_batch():
+    """Review finding 1: the ambient decimal context raised on in-bounds-looking but extreme values."""
+    range_text = "outside the supported numeric range"
+    # The reviewer's static example: a finite level whose integer quotient over the tick exceeds 28 digits.
+    d = diagnose_record(record(source=source(quoted_level="1e30")))
+    assert codes(d) == ["DIRECT_IDENTITY_CONTROL", "SOURCE_LEVEL_INVALID"] and range_text in d.findings[1].detail
+    # Extreme finite multiplier and tick that overflow the default context when multiplied or divided.
+    d = diagnose_record(record(contract=ContractSpec(currency="USD", unit="USD_PER_SHARE", multiplier="1e999999",
+                                                     tick_size="1e999999", tick_value="5")))
+    assert codes(d) == ["DIRECT_IDENTITY_CONTROL", "MULTIPLIER_INVALID", "TICK_SIZE_INVALID"]
+    assert all(range_text in f.detail for f in d.findings[1:])
+    # Tiny tick, over-long coefficient, huge tick value and huge strike are each reported for their own field.
+    d = diagnose_record(record(source=source(quoted_level="1234567890123456789012345678.9"),
+                               contract=ContractSpec(currency="USD", unit="USD_PER_SHARE", multiplier="1",
+                                                     tick_size="1e-30", tick_value="1e40")))
+    assert codes(d) == ["DIRECT_IDENTITY_CONTROL", "SOURCE_LEVEL_INVALID", "TICK_SIZE_INVALID", "TICK_VALUE_INVALID"]
+    huge_strike = diagnose_record(record(as_of="2026-11-06", source=SPX, price_basis=PriceBasis.SOURCE_SERIES,
+                                         instrument=OPTION.model_copy(update={"strike": "1e20"}), contract=OPTION_SPEC))
+    assert "OPTION_STRIKE_INVALID" in codes(huge_strike)
+    # The whole fixture batch plus the extreme records still renders, deterministically, with the fixture
+    # records unchanged relative to the committed golden.
+    fixture = load_records(FIXTURES / "records.json")
+    extremes = [record(record_id="x1", source=source(quoted_level="1e30")),
+                record(record_id="x2", contract=ContractSpec(multiplier="1e999999", tick_size="1e999999", tick_value="5"))]
+    first, second = render_json(diagnose_records(fixture + extremes)), render_json(diagnose_records(fixture + extremes))
+    assert first == second
+    golden = json.loads((FIXTURES / "expected_report.json").read_text(encoding="utf-8"))
+    assert json.loads(first)["records"][:len(fixture)] == golden["records"]
+    assert [r["headline"] for r in json.loads(first)["records"][len(fixture):]] == ["INVALID", "INVALID"]
+    # Positive normal control is unchanged.
+    assert codes(diagnose_record(record())) == ["DIRECT_IDENTITY_CONTROL"]
+
+
+def test_in_range_extremes_are_computed_exactly_without_touching_the_ambient_context():
+    before = (getcontext().prec, getcontext().rounding)
+    biggest = "9999999999999999.999999999999"  # 28 digits, magnitude just below 1e16
+    smallest = "0.000000000001"               # 1e-12
+    d = diagnose_record(record(source=source(quoted_level=biggest),
+                               contract=ContractSpec(currency="USD", unit="USD_PER_SHARE", multiplier=biggest,
+                                                     tick_size=smallest, tick_value="1")))
+    assert codes(d) == ["DIRECT_IDENTITY_CONTROL", "TICK_VALUE_INCONSISTENT"]
+    assert "9999.999999999999999999999999" in d.findings[1].detail  # exact product, not a rounded one
+    on_grid = diagnose_record(record(source=source(quoted_level=biggest),
+                                     contract=ContractSpec(currency="USD", unit="USD_PER_SHARE", multiplier="1",
+                                                           tick_size=smallest)))
+    assert codes(on_grid) == ["DIRECT_IDENTITY_CONTROL"]
+    off_grid = diagnose_record(record(source=source(quoted_level=biggest),
+                                      contract=ContractSpec(currency="USD", unit="USD_PER_SHARE", multiplier="1",
+                                                            tick_size="0.000000000007")))
+    assert codes(off_grid) == ["DIRECT_IDENTITY_CONTROL", "QUOTED_LEVEL_OFF_TICK_GRID"]
+    assert (getcontext().prec, getcontext().rounding) == before == (28, "ROUND_HALF_EVEN")
+
+
+def test_blank_strings_are_diagnosed_as_not_stated_without_changing_the_shared_contract():
+    """Review finding 2: '' and whitespace evaded every presence check."""
+    for blank in ("", " ", "\t\n"):
+        d = diagnose_record(record(source=source(unit=blank),
+                                   instrument=Instrument(asset_class=AssetClass.EQUITY, symbol="ABC", exchange=blank),
+                                   contract=ContractSpec(currency="USD", unit=blank, multiplier="1", tick_size="0.01")))
+        assert codes(d) == ["BLANK_FIELDS_TREATED_AS_ABSENT", "DIRECT_IDENTITY_CONTROL", "SOURCE_UNIT_MISSING",
+                            "TRADED_UNIT_MISSING", "LISTING_VENUE_UNSPECIFIED"], repr(blank)
+        assert d.findings[0].detail.endswith("source.unit, instrument.exchange, contract.unit.")
+        assert d.headline == FindingKind.MISSING
+    # Blank currency on either side is missing, and no comparison is made against a blank.
+    d = diagnose_record(record(source=source(currency=" "), contract=ContractSpec(currency="", unit="USD_PER_SHARE")))
+    assert {"SOURCE_CURRENCY_MISSING", "TRADED_CURRENCY_MISSING"} <= set(codes(d)) and "CURRENCY_MISMATCH" not in codes(d)
+    # A derivative's blank underlying, expiry, strike, contract code and contract month are missing, not supplied.
+    opt = diagnose_record(record(source=SPX, price_basis=PriceBasis.SOURCE_SERIES,
+                                 instrument=OPTION.model_copy(update={"underlying": "", "expiry": " ", "strike": ""}),
+                                 contract=OPTION_SPEC))
+    assert {"UNDERLYING_MISSING", "OPTION_EXPIRY_MISSING", "OPTION_STRIKE_MISSING"} <= set(codes(opt))
+    assert opt.identity == Identity.DIFFERENT and "SOURCE_UNDERLYING_UNCOMPARABLE" in codes(opt)
+    fut = diagnose_record(record(as_of=" ", source=SPX, price_basis=PriceBasis.SOURCE_SERIES,
+                                 instrument=FUTURE.model_copy(update={"futures_contract": "  ", "exchange": ""}),
+                                 contract=FUTURE_SPEC.model_copy(update={"contract_month": ""})))
+    assert {"FUTURES_CONTRACT_CODE_MISSING", "FUTURES_CONTRACT_MONTH_MISSING", "FUTURES_VENUE_MISSING"} <= set(codes(fut))
+    assert "AS_OF_DATE_INVALID" not in codes(fut) and "as_of" in fut.findings[0].detail
+    # Blank labels on either side leave identity undetermined.
+    d = diagnose_record(record(instrument=Instrument(asset_class=AssetClass.EQUITY, symbol="  ", exchange="SYNTH-X")))
+    assert codes(d) == ["INSTRUMENT_SYMBOL_BLANK"] and d.identity == Identity.UNDETERMINED
+    d = diagnose_record(record(source=source(symbol="   ")))
+    assert codes(d) == ["BLANK_FIELDS_TREATED_AS_ABSENT", "SOURCE_SERIES_MISSING"] and d.identity == Identity.UNDETERMINED
+    # Populated controls are unchanged, and the shared Instrument contract still accepts blanks untouched.
+    assert codes(diagnose_record(record())) == ["DIRECT_IDENTITY_CONTROL"]
+    assert Instrument(asset_class=AssetClass.EQUITY, symbol="ABC", exchange="").exchange == ""
+    assert Instrument.model_fields["exchange"].annotation == (str | None)
+
+
 def test_expiry_is_compared_only_to_the_record_as_of_never_to_the_clock():
     past = OPTION.model_copy(update={"expiry": "2001-01-19"})
     without = diagnose_record(record(source=SPX, price_basis=PriceBasis.SOURCE_SERIES, instrument=past, contract=OPTION_SPEC))
@@ -350,7 +438,7 @@ def test_fixture_report_is_deterministic_and_matches_the_committed_golden():
     assert first == (FIXTURES / "expected_report.json").read_text(encoding="utf-8")
     report = json.loads(first)
     assert [r["record_id"] for r in report["records"]] == [r.record_id for r in records]
-    assert report["record_count"] == len(records) == 24
+    assert report["record_count"] == len(records) == 26
     assert report["rules_version"] == diag.RULES_VERSION
     assert sum(report["headlines"].values()) == len(records)
     assert sum(report["totals"].values()) == sum(len(r["findings"]) for r in report["records"])
@@ -372,6 +460,8 @@ def test_fixture_covers_every_required_boundary():
         "fut_gold_month_conflict": (FindingKind.MISMATCH, "FUTURES_CONTRACT_MONTH_CONFLICT"),
         "fut_natgas_invalid_economics": (FindingKind.INVALID, "MULTIPLIER_INVALID"),
         "fut_incomplete": (FindingKind.MISSING, "FUTURES_CONTRACT_CODE_MISSING"),
+        "fut_numeric_range_unsupported": (FindingKind.INVALID, "SOURCE_LEVEL_INVALID"),
+        "eq_blank_metadata": (FindingKind.MISSING, "TRADED_UNIT_MISSING"),
         "no_instrument": (FindingKind.MISSING, "INSTRUMENT_MISSING"),
     }
     for record_id, (headline, code) in expected.items():
@@ -461,7 +551,7 @@ def test_cli_text_summary_json_and_out(tmp_path):
     text = _cli("--examples")
     assert text.returncode == 0 and text.stdout.startswith("INSTRUMENT MAPPING DIAGNOSTIC") and "NON_AUTHORITATIVE" in text.stdout
     summary = _cli("--examples", "--summary")
-    assert summary.returncode == 0 and sum(line.startswith("[") for line in summary.stdout.splitlines()) == 24
+    assert summary.returncode == 0 and sum(line.startswith("[") for line in summary.stdout.splitlines()) == 26
     as_json = _cli("--examples", "--json")
     assert as_json.returncode == 0
     assert as_json.stdout == (FIXTURES / "expected_report.json").read_text(encoding="utf-8")

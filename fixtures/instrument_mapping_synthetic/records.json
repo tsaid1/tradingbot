@@ -73,6 +73,15 @@
       "contract": {"currency": "USD", "unit": "USD_PER_SHARE", "multiplier": "1", "tick_size": "0.01"}
     },
     {
+      "record_id": "eq_blank_metadata",
+      "synthetic": true,
+      "description": "Whitespace-only currency, unit and venue fields: blanks are reported as not stated, never as supplied.",
+      "source": {"symbol": "ABC", "kind": "TRADED_SECURITY", "currency": " ", "unit": "", "quoted_level": "100.00"},
+      "instrument": {"asset_class": "EQUITY", "symbol": "ABC", "exchange": ""},
+      "price_basis": "TRADED_CONTRACT",
+      "contract": {"currency": "USD", "unit": "  ", "multiplier": "1", "tick_size": "0.01"}
+    },
+    {
       "record_id": "etf_spx_index_proxy",
       "synthetic": true,
       "description": "An index level quoted against an ETF: proxy relationship, index points versus per-share.",
@@ -206,6 +215,16 @@
       "instrument": {"asset_class": "FUTURE", "symbol": "NGSH27", "underlying": "HENRY_HUB", "expiry": "2027-02-24", "futures_contract": "NGSH27", "exchange": "SYNTH-NRG"},
       "price_basis": "TRADED_CONTRACT",
       "contract": {"currency": "USD", "unit": "USD_PER_MMBTU", "multiplier": "2500", "tick_size": "0.005", "tick_value": "20", "settlement": "PHYSICAL", "contract_month": "2027-03"}
+    },
+    {
+      "record_id": "fut_numeric_range_unsupported",
+      "synthetic": true,
+      "description": "A dated contract quoted on itself with a level, multiplier and tick far outside any market's numeric range; each is diagnosed, nothing is computed from them.",
+      "as_of": "2026-11-06",
+      "source": {"symbol": "IDXFZ26", "kind": "DATED_CONTRACT", "currency": "USD", "unit": "INDEX_POINT", "quoted_level": "1e30"},
+      "instrument": {"asset_class": "FUTURE", "symbol": "IDXFZ26", "underlying": "SPX", "expiry": "2026-12-18", "futures_contract": "IDXFZ26", "exchange": "SYNTH-FUT"},
+      "price_basis": "TRADED_CONTRACT",
+      "contract": {"currency": "USD", "unit": "INDEX_POINT", "multiplier": "1e999999", "tick_size": "1e-30", "tick_value": "5", "settlement": "CASH", "contract_month": "2026-12"}
     },
     {
       "record_id": "fut_incomplete",

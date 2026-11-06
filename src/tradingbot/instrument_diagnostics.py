@@ -22,7 +22,7 @@ from __future__ import annotations
 import json
 import re
 from datetime import date
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_HALF_EVEN, Context, Decimal, InvalidOperation, localcontext
 from enum import Enum
 from pathlib import Path
 from typing import Literal
@@ -33,7 +33,7 @@ from tradingbot.event_models import PriceBasis
 from tradingbot.models import AssetClass, Instrument, StrictModel
 from tradingbot.validator import SYMBOL_RE
 
-RULES_VERSION = 1
+RULES_VERSION = 2
 AUTHORITY = "NON_AUTHORITATIVE"
 NOTICE = (
     "Non-authoritative offline diagnostic over synthetic mapping records. It reports metadata gaps, "
@@ -43,6 +43,18 @@ NOTICE = (
 )
 
 CURRENCY_RE = re.compile(r"^[A-Z]{3}$")
+# Numeric inputs are bounded BEFORE any arithmetic so that one extreme record becomes a finding instead
+# of an exception that would abort the whole batch: at most NUMERIC_MAX_DIGITS significant digits and a
+# magnitude from 1e-12 up to but excluding 1e16. No market quote, multiplier, tick or strike lies outside.
+NUMERIC_MAX_DIGITS = 28
+NUMERIC_MIN_ADJUSTED_EXPONENT = -12
+NUMERIC_MAX_ADJUSTED_EXPONENT = 15
+NUMERIC_RANGE_TEXT = (f"at most {NUMERIC_MAX_DIGITS} significant digits and a magnitude from "
+                      f"1e{NUMERIC_MIN_ADJUSTED_EXPONENT} up to but excluding 1e{NUMERIC_MAX_ADJUSTED_EXPONENT + 1}")
+# Exact for every product and remainder of two in-range numbers (a product has at most 56 coefficient
+# digits; a remainder's integer quotient stays below 1e28). Applied only through localcontext(), so the
+# ambient decimal context of the host process is never modified.
+ARITHMETIC_CONTEXT = Context(prec=64, rounding=ROUND_HALF_EVEN)
 CONTRACT_MONTH_RE = re.compile(r"^(\d{4})-(0[1-9]|1[0-2])$")
 # Root, delivery-month letter and one- or two-digit year, e.g. ABCZ6 / ABCZ26. A widely used
 # convention, not a venue catalog: codes that do not match are reported as unrecognised, not rejected.
@@ -175,9 +187,19 @@ def _decimal(value: str | None) -> Decimal | None:
     return result if result.is_finite() else None
 
 
-def _positive(value: str | None) -> Decimal | None:
+def _positive(value: str | None) -> tuple[Decimal | None, str | None]:
+    """(number, None) for a positive finite decimal inside the supported range; otherwise (None, why).
+
+    The range check happens before any arithmetic, so an extreme but finite value is reported as INVALID
+    for its own field and can never raise out of the rule set.
+    """
     result = _decimal(value)
-    return result if result is not None and result > 0 else None
+    if result is None or result <= 0:
+        return None, "not a positive finite decimal"
+    if len(result.as_tuple().digits) > NUMERIC_MAX_DIGITS or \
+            not NUMERIC_MIN_ADJUSTED_EXPONENT <= result.adjusted() <= NUMERIC_MAX_ADJUSTED_EXPONENT:
+        return None, f"outside the supported numeric range ({NUMERIC_RANGE_TEXT})"
+    return result, None
 
 
 def _iso_date(value: str | None) -> date | None:
@@ -198,6 +220,36 @@ def _label(value: str | None) -> str | None:
     return text or None
 
 
+def _blank(value: object) -> bool:
+    return type(value) is str and not value.strip()
+
+
+def _without_blanks(model):
+    """Copy of a record component in which whitespace-only optional strings are None, plus the field names
+    affected. Diagnostic-local: the shared Instrument contract itself is not changed and still accepts them."""
+    if model is None:
+        return None, []
+    fields = type(model).model_fields
+    names = [name for name, value in model if _blank(value) and not fields[name].is_required()]
+    if not names:
+        return model, []
+    return model.model_copy(update={name: None for name in names}), names
+
+
+def _normalise(record: MappingRecord) -> tuple[MappingRecord, list[str]]:
+    """Blank strings are 'not stated'. Returns the normalised record and the dotted paths that were blank."""
+    source, source_names = _without_blanks(record.source)
+    instrument, instrument_names = _without_blanks(record.instrument)
+    contract, contract_names = _without_blanks(record.contract)
+    blanks = ([f"source.{n}" for n in source_names] + [f"instrument.{n}" for n in instrument_names]
+              + [f"contract.{n}" for n in contract_names])
+    update: dict = {"source": source, "instrument": instrument, "contract": contract}
+    if _blank(record.as_of):
+        update["as_of"] = None
+        blanks.append("as_of")
+    return record.model_copy(update=update), blanks
+
+
 class _Collector:
     def __init__(self) -> None:
         self.findings: list[Finding] = []
@@ -216,6 +268,9 @@ def _identity_rules(r: MappingRecord, c: _Collector) -> Identity:
     if inst is None:
         c.add("INSTRUMENT_MISSING", FindingKind.MISSING, "No traded instrument is stated; nothing to map to.",
               "instrument")
+    inst_label = _label(inst.symbol) if inst is not None else None
+    if inst is not None and inst_label is None:
+        c.add("INSTRUMENT_SYMBOL_BLANK", FindingKind.MISSING, "The instrument symbol is blank.", "instrument.symbol")
     src_label = _label(src.symbol) if src is not None else None
     if src_label is None:
         c.add("SOURCE_SERIES_MISSING", FindingKind.MISSING,
@@ -228,10 +283,9 @@ def _identity_rules(r: MappingRecord, c: _Collector) -> Identity:
         c.add("SOURCE_SERIES_KIND_UNKNOWN", FindingKind.AMBIGUOUS,
               "The source series is not classified (index, spot, continuous, listed security...); its "
               "orderability cannot be assessed.", "source.kind")
-    if inst is None or src is None or src_label is None:
+    if inst is None or inst_label is None or src is None or src_label is None:
         return Identity.UNDETERMINED
 
-    inst_label = _label(inst.symbol)
     underlying = _label(inst.underlying)
     if src_label == inst_label:
         identity = Identity.DIRECT
@@ -355,44 +409,49 @@ def _economics_rules(r: MappingRecord, c: _Collector) -> None:
     cls = inst.asset_class if inst is not None else None
     level = None
     if src is not None and src.quoted_level is not None:
-        level = _positive(src.quoted_level)
-        if level is None:
+        level, problem = _positive(src.quoted_level)
+        if problem:
             c.add("SOURCE_LEVEL_INVALID", FindingKind.INVALID,
-                  f"Quoted level '{src.quoted_level}' is not a positive finite decimal.", "source.quoted_level")
+                  f"Quoted level '{src.quoted_level}' is {problem}.", "source.quoted_level")
     if spec is None:
         return
-    multiplier = tick = None
+    multiplier = tick = tick_value = None
     if spec.multiplier is not None:
-        multiplier = _positive(spec.multiplier)
-        if multiplier is None:
+        multiplier, problem = _positive(spec.multiplier)
+        if problem:
             c.add("MULTIPLIER_INVALID", FindingKind.INVALID,
-                  f"Multiplier '{spec.multiplier}' is not a positive finite decimal.", "contract.multiplier")
+                  f"Multiplier '{spec.multiplier}' is {problem}.", "contract.multiplier")
     elif cls in DERIVATIVES:
         c.add("MULTIPLIER_MISSING", FindingKind.MISSING,
               "A derivative without a stated multiplier has undefined notional per contract.",
               "contract.multiplier")
     if spec.tick_size is not None:
-        tick = _positive(spec.tick_size)
-        if tick is None:
+        tick, problem = _positive(spec.tick_size)
+        if problem:
             c.add("TICK_SIZE_INVALID", FindingKind.INVALID,
-                  f"Tick size '{spec.tick_size}' is not a positive finite decimal.", "contract.tick_size")
+                  f"Tick size '{spec.tick_size}' is {problem}.", "contract.tick_size")
     elif cls == AssetClass.FUTURE:
         c.add("TICK_SIZE_MISSING", FindingKind.MISSING, "The future states no minimum price increment.",
               "contract.tick_size")
     if spec.tick_value is not None:
-        tick_value = _positive(spec.tick_value)
-        if tick_value is None:
+        tick_value, problem = _positive(spec.tick_value)
+        if problem:
             c.add("TICK_VALUE_INVALID", FindingKind.INVALID,
-                  f"Tick value '{spec.tick_value}' is not a positive finite decimal.", "contract.tick_value")
-        elif multiplier is not None and tick is not None and tick_value != multiplier * tick:
-            c.add("TICK_VALUE_INCONSISTENT", FindingKind.MISMATCH,
-                  f"Stated tick value {tick_value} is not multiplier {multiplier} x tick size {tick} = "
-                  f"{multiplier * tick}.", "contract.tick_value")
-    if level is not None and tick is not None and r.price_basis == PriceBasis.TRADED_CONTRACT \
-            and level % tick != 0:
-        c.add("QUOTED_LEVEL_OFF_TICK_GRID", FindingKind.AMBIGUOUS,
-              f"Quoted level {level} is not a multiple of the stated tick size {tick}, which is unusual for a "
-              "level said to be the contract's own price.", "source.quoted_level")
+                  f"Tick value '{spec.tick_value}' is {problem}.", "contract.tick_value")
+    # Every operand passed the range check, so both operations below are exact in this context and cannot
+    # signal; the context is local to this block and the host process's decimal settings are untouched.
+    with localcontext(ARITHMETIC_CONTEXT):
+        if tick_value is not None and multiplier is not None and tick is not None:
+            expected = multiplier * tick
+            if tick_value != expected:
+                c.add("TICK_VALUE_INCONSISTENT", FindingKind.MISMATCH,
+                      f"Stated tick value {tick_value} is not multiplier {multiplier} x tick size {tick} = "
+                      f"{expected}.", "contract.tick_value")
+        if level is not None and tick is not None and r.price_basis == PriceBasis.TRADED_CONTRACT \
+                and level % tick != 0:
+            c.add("QUOTED_LEVEL_OFF_TICK_GRID", FindingKind.AMBIGUOUS,
+                  f"Quoted level {level} is not a multiple of the stated tick size {tick}, which is unusual for a "
+                  "level said to be the contract's own price.", "source.quoted_level")
 
 
 def _contract_rules(r: MappingRecord, c: _Collector) -> None:
@@ -405,7 +464,7 @@ def _contract_rules(r: MappingRecord, c: _Collector) -> None:
         c.add("AS_OF_DATE_INVALID", FindingKind.INVALID, f"as_of '{r.as_of}' is not an ISO date.", "as_of")
 
     if cls in CASH_INSTRUMENTS:
-        if not SYMBOL_RE.fullmatch(inst.symbol):
+        if inst.symbol.strip() and not SYMBOL_RE.fullmatch(inst.symbol):
             c.add("SYMBOL_FORMAT_INVALID", FindingKind.INVALID,
                   f"Symbol '{inst.symbol}' does not match the gateway symbol pattern (the gateway blocks it as "
                   "INVALID_SYMBOL).", "instrument.symbol")
@@ -447,9 +506,11 @@ def _contract_rules(r: MappingRecord, c: _Collector) -> None:
     if cls == AssetClass.OPTION:
         if inst.strike is None:
             c.add("OPTION_STRIKE_MISSING", FindingKind.MISSING, "The option states no strike.", "instrument.strike")
-        elif _positive(inst.strike) is None:
-            c.add("OPTION_STRIKE_INVALID", FindingKind.INVALID,
-                  f"Strike '{inst.strike}' is not a positive finite decimal.", "instrument.strike")
+        else:
+            _, problem = _positive(inst.strike)
+            if problem:
+                c.add("OPTION_STRIKE_INVALID", FindingKind.INVALID, f"Strike '{inst.strike}' is {problem}.",
+                      "instrument.strike")
         if inst.option_right is None:
             c.add("OPTION_RIGHT_MISSING", FindingKind.MISSING, "The option states neither CALL nor PUT.",
                   "instrument.option_right")
@@ -536,8 +597,16 @@ def _runtime_rules(r: MappingRecord, c: _Collector) -> RuntimeScope:
 # ----------------------------------------------------------------------------- entry points
 
 def diagnose_record(record: MappingRecord) -> RecordDiagnostic:
-    """Evaluate every rule against one record. Pure: same record, same findings, same order."""
+    """Evaluate every rule against one record. Pure: same record, same findings, same order.
+
+    Whitespace-only strings are treated as not stated (and said so) before the rules run, and every
+    numeric field is range-checked before arithmetic, so a single record can neither hide a gap nor
+    abort the batch."""
+    record, blanks = _normalise(record)
     c = _Collector()
+    if blanks:
+        c.add("BLANK_FIELDS_TREATED_AS_ABSENT", FindingKind.INFO,
+              f"Whitespace-only values were treated as not stated: {', '.join(blanks)}.")
     identity = _identity_rules(record, c)
     _unit_currency_rules(record, c)
     _economics_rules(record, c)

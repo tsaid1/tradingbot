@@ -3,13 +3,13 @@
   "headlines": {
     "AMBIGUOUS": 3,
     "INFO": 2,
-    "INVALID": 2,
+    "INVALID": 3,
     "MISMATCH": 11,
-    "MISSING": 4,
+    "MISSING": 5,
     "UNSUPPORTED": 2
   },
   "notice": "Non-authoritative offline diagnostic over synthetic mapping records. It reports metadata gaps, ambiguities, mismatches and invalid economics only. It performs no price conversion, roll choice, source-to-contract selection, sizing, order construction or authorization. INFO findings are not trading permission; the deterministic gateway is unchanged and still decides every action.",
-  "record_count": 24,
+  "record_count": 26,
   "records": [
     {
       "asset_class": "EQUITY",
@@ -255,6 +255,60 @@
       "headline": "MISMATCH",
       "identity": "DIRECT",
       "record_id": "eq_derivative_fields",
+      "runtime_scope": "EQUITY_ETF_GATEWAY_CHECKS_STILL_APPLY"
+    },
+    {
+      "asset_class": "EQUITY",
+      "authority": "NON_AUTHORITATIVE",
+      "counts": {
+        "AMBIGUOUS": 1,
+        "INFO": 2,
+        "INVALID": 0,
+        "MISMATCH": 0,
+        "MISSING": 3,
+        "UNSUPPORTED": 0
+      },
+      "findings": [
+        {
+          "code": "BLANK_FIELDS_TREATED_AS_ABSENT",
+          "detail": "Whitespace-only values were treated as not stated: source.currency, source.unit, instrument.exchange, contract.unit.",
+          "field": null,
+          "kind": "INFO"
+        },
+        {
+          "code": "DIRECT_IDENTITY_CONTROL",
+          "detail": "Source label ABC equals instrument label ABC and the quoted level is stated as the traded contract's own price. Informational control only: this is not trading permission and the gateway still applies every provenance, freshness, quote and policy rule.",
+          "field": null,
+          "kind": "INFO"
+        },
+        {
+          "code": "SOURCE_CURRENCY_MISSING",
+          "detail": "The source series states no currency.",
+          "field": "source.currency",
+          "kind": "MISSING"
+        },
+        {
+          "code": "SOURCE_UNIT_MISSING",
+          "detail": "The source series states no unit (per share, index point, per barrel...).",
+          "field": "source.unit",
+          "kind": "MISSING"
+        },
+        {
+          "code": "TRADED_UNIT_MISSING",
+          "detail": "The instrument states no price unit.",
+          "field": "contract.unit",
+          "kind": "MISSING"
+        },
+        {
+          "code": "LISTING_VENUE_UNSPECIFIED",
+          "detail": "A bare ticker without a listing venue can denote different securities on different markets; no venue is chosen.",
+          "field": "instrument.exchange",
+          "kind": "AMBIGUOUS"
+        }
+      ],
+      "headline": "MISSING",
+      "identity": "DIRECT",
+      "record_id": "eq_blank_metadata",
       "runtime_scope": "EQUITY_ETF_GATEWAY_CHECKS_STILL_APPLY"
     },
     {
@@ -861,6 +915,54 @@
       "asset_class": "FUTURE",
       "authority": "NON_AUTHORITATIVE",
       "counts": {
+        "AMBIGUOUS": 0,
+        "INFO": 1,
+        "INVALID": 3,
+        "MISMATCH": 0,
+        "MISSING": 0,
+        "UNSUPPORTED": 1
+      },
+      "findings": [
+        {
+          "code": "DIRECT_IDENTITY_CONTROL",
+          "detail": "Source label IDXFZ26 equals instrument label IDXFZ26 and the quoted level is stated as the traded contract's own price. Informational control only: this is not trading permission and the gateway still applies every provenance, freshness, quote and policy rule.",
+          "field": null,
+          "kind": "INFO"
+        },
+        {
+          "code": "SOURCE_LEVEL_INVALID",
+          "detail": "Quoted level '1e30' is outside the supported numeric range (at most 28 significant digits and a magnitude from 1e-12 up to but excluding 1e16).",
+          "field": "source.quoted_level",
+          "kind": "INVALID"
+        },
+        {
+          "code": "MULTIPLIER_INVALID",
+          "detail": "Multiplier '1e999999' is outside the supported numeric range (at most 28 significant digits and a magnitude from 1e-12 up to but excluding 1e16).",
+          "field": "contract.multiplier",
+          "kind": "INVALID"
+        },
+        {
+          "code": "TICK_SIZE_INVALID",
+          "detail": "Tick size '1e-30' is outside the supported numeric range (at most 28 significant digits and a magnitude from 1e-12 up to but excluding 1e16).",
+          "field": "contract.tick_size",
+          "kind": "INVALID"
+        },
+        {
+          "code": "RUNTIME_ASSET_CLASS_UNSUPPORTED",
+          "detail": "FUTURE cannot be acted on by the current paper adapter: the gateway holds it as ASSET_CLASS_PAPER_ADAPTER_UNSUPPORTED however complete the contract metadata is.",
+          "field": "instrument.asset_class",
+          "kind": "UNSUPPORTED"
+        }
+      ],
+      "headline": "INVALID",
+      "identity": "DIRECT",
+      "record_id": "fut_numeric_range_unsupported",
+      "runtime_scope": "ASSET_CLASS_UNSUPPORTED_IN_CURRENT_RUNTIME"
+    },
+    {
+      "asset_class": "FUTURE",
+      "authority": "NON_AUTHORITATIVE",
+      "counts": {
         "AMBIGUOUS": 2,
         "INFO": 0,
         "INVALID": 0,
@@ -961,13 +1063,13 @@
     }
   ],
   "report_kind": "INSTRUMENT_MAPPING_DIAGNOSTIC",
-  "rules_version": 1,
+  "rules_version": 2,
   "totals": {
-    "AMBIGUOUS": 13,
-    "INFO": 15,
-    "INVALID": 6,
+    "AMBIGUOUS": 14,
+    "INFO": 18,
+    "INVALID": 9,
     "MISMATCH": 24,
-    "MISSING": 17,
-    "UNSUPPORTED": 11
+    "MISSING": 20,
+    "UNSUPPORTED": 12
   }
 }
