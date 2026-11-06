@@ -10,8 +10,9 @@ import ast
 import re
 import sqlite3
 import tempfile
-from contextlib import closing
+from contextlib import closing, contextmanager
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -328,16 +329,21 @@ def test_view_connections_are_read_only_by_construction(populated):
     assert len(connects) == 1 and {k.arg for k in connects[0].keywords} >= {"uri", "timeout"}
     assert "mode=ro" in ast.get_source_segment(source, connects[0])
     assert "executescript" not in source and "executemany" not in source
-    # Every SQL statement the module executes is a SELECT; nothing else is ever sent to a ledger.
+    # Every statement the module executes is a SELECT, apart from the one BEGIN that opens the read
+    # transaction pinning a single snapshot per ledger (nothing else is ever sent to a ledger).
     statements = [
         n.args[0]
         for n in ast.walk(tree)
         if isinstance(n, ast.Call) and getattr(n.func, "attr", None) == "execute"
     ]
-    assert len(statements) == 7  # 4 journal reads, 3 replay reads
+    sql = []
     for stmt in statements:
         assert isinstance(stmt, ast.Constant) and isinstance(stmt.value, str), ast.dump(stmt)[:80]
-        assert re.match(r"\s*SELECT\b", stmt.value), stmt.value[:60]
+        sql.append(stmt.value)
+    assert sql.count("BEGIN") == 1
+    selects = [q for q in sql if q != "BEGIN"]
+    assert len(selects) == 6, selects  # 3 journal reads, 3 replay reads
+    assert all(re.match(r"\s*SELECT\b", q) for q in selects), selects
 
 
 def test_build_snapshot_never_mutates_or_adds_ledger_content(populated):
@@ -457,3 +463,220 @@ def test_page_uses_supplied_ledgers_and_shows_drift_as_errors(tmp_path, monkeypa
     assert any(e.startswith("SERIOUS JOURNAL_POSITION_QUANTITY_MISMATCH") for e in errors)
     assert "No discrepancies were detected" not in texts(at)
     assert {m.label: m.value for m in at.metric}["Discrepancies"] == "3"
+
+
+# ----------------------------------------------------------------------------- review round 1
+
+
+class _Interposed:
+    """Test-only connection wrapper: runs a callback with each statement before it executes."""
+
+    def __init__(self, conn, before):
+        self._conn, self._before = conn, before
+
+    def execute(self, sql, *args):
+        self._before(sql)
+        return self._conn.execute(sql, *args)
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+def _interpose(monkeypatch, before):
+    real = ov.read_only_connection
+
+    @contextmanager
+    def hooked(path):
+        with real(path) as conn:
+            yield _Interposed(conn, before)
+
+    monkeypatch.setattr(ov, "read_only_connection", hooked)
+    return real
+
+
+def test_journal_commit_between_reads_does_not_cause_false_drift(populated, monkeypatch):
+    """One read transaction per ledger: a WAL writer committing after the fills were read and before
+    the positions are read leaves the snapshot internally consistent (no fills/positions mismatch)."""
+    from tradingbot.interpreters import DemoInterpreter
+    from tradingbot.models import MockPolicy, Quote, SourceEvent
+    from tradingbot.pipeline import SignalPipeline
+    from tradingbot.storage import Journal
+
+    pipe = SignalPipeline(
+        Journal(populated.journal_path), DemoInterpreter(), MockPolicy(quantity=2)
+    )
+    committed: list[str] = []
+
+    def race_writer(sql: str) -> None:
+        if "FROM positions" in sql:
+            now = datetime.now(timezone.utc)
+            result = pipe.process(
+                SourceEvent(
+                    source_id="race-open", text="BUY MOCKX @ 10 STOP 9 TARGET 12", published_at=now
+                ),
+                Quote(symbol="MOCKX", bid=Decimal("9.99"), ask=Decimal("10.01"), observed_at=now),
+            )
+            committed.append(result.decision.status)
+
+    real = _interpose(monkeypatch, race_writer)
+    racy = ov.build_snapshot(populated)
+    monkeypatch.setattr(ov, "read_only_connection", real)
+
+    assert committed == ["EXECUTE_MOCK"]  # the engine really committed while the view was reading
+    assert not [d for d in racy.discrepancies if d.severity == "SERIOUS"]
+    seen = (
+        {p.idea_id for p in racy.positions}
+        | {f.idea_id for f in racy.fills}
+        | {v.source_id for v in racy.validations}
+    )
+    assert "race-open" not in seen  # the whole snapshot predates the commit
+    after = ov.build_snapshot(populated)
+    assert "race-open" in {p.idea_id for p in after.open_positions}
+    assert "race-open" in {f.idea_id for f in after.fills}
+    assert not [d for d in after.discrepancies if d.severity == "SERIOUS"]
+
+
+def test_replay_writer_cannot_tear_the_view_snapshot(populated, monkeypatch):
+    """The replay ledger uses a rollback journal: a commit attempted between the view's reads waits for
+    the view's read lock instead of being interleaved, so no false drift is possible there either."""
+    attempts: list[str] = []
+
+    def contending_writer(sql: str) -> None:
+        if "FROM replay_ideas" in sql:
+            with closing(sqlite3.connect(str(populated.replay_path), timeout=0.2)) as w:
+                try:
+                    w.execute("UPDATE replay_ideas SET quantity=99 WHERE idea_id='syn-r-1:open'")
+                    w.commit()
+                    attempts.append("committed")
+                except sqlite3.OperationalError as exc:
+                    attempts.append(str(exc))
+                    w.rollback()
+
+    real = _interpose(monkeypatch, contending_writer)
+    racy = ov.build_snapshot(populated)
+    monkeypatch.setattr(ov, "read_only_connection", real)
+
+    assert len(attempts) == 1 and "locked" in attempts[0]
+    assert not [d for d in racy.discrepancies if d.severity == "SERIOUS"]
+    assert next(p for p in racy.open_positions if p.idea_id == "syn-r-1:open").quantity == 2
+    # Once the view released its read transaction the same write succeeds, and the next snapshot sees it.
+    with closing(sqlite3.connect(str(populated.replay_path))) as w, w:
+        w.execute("UPDATE replay_ideas SET quantity=99 WHERE idea_id='syn-r-1:open'")
+    assert "REPLAY_IDEA_QUANTITY_MISMATCH" in {
+        d.code for d in ov.build_snapshot(populated).discrepancies
+    }
+
+
+def test_corrupt_ledger_files_and_undecodable_records_are_reported_not_fatal(
+    tmp_path, monkeypatch, populated
+):
+    not_a_db = tmp_path / "not-a-database.sqlite3"
+    not_a_db.write_text("plain text, not SQLite\n" * 40)
+    s = ov.build_snapshot(MockLedgers(journal_path=not_a_db, replay_path=populated.replay_path))
+    assert {(d.engine, d.code) for d in s.discrepancies if d.severity == "SERIOUS"} == {
+        ("journal", "LEDGER_UNREADABLE")
+    }
+    assert not s.reconciliation_complete
+    assert {p.idea_id for p in s.open_positions} == {
+        "syn-r-1:open"
+    }  # the healthy ledger still renders
+    s = ov.build_snapshot(MockLedgers(journal_path=populated.journal_path, replay_path=not_a_db))
+    assert {(d.engine, d.code) for d in s.discrepancies if d.severity == "SERIOUS"} == {
+        ("replay", "LEDGER_UNREADABLE")
+    }
+    assert {p.idea_id for p in s.open_positions} == {"syn-j-open-1"}
+
+    with closing(sqlite3.connect(str(populated.journal_path))) as c, c:
+        c.execute(
+            "UPDATE events SET order_json='{\"garbage\": \"PAYLOAD-MARKER\"}' WHERE source_id='syn-j-open-1'"
+        )
+        c.execute(
+            "UPDATE events SET decision_json='not json PAYLOAD-MARKER' WHERE source_id='syn-j-commentary'"
+        )
+    with closing(sqlite3.connect(str(populated.replay_path))) as c, c:
+        c.execute(
+            "UPDATE replay_actions SET result_json='not json PAYLOAD-MARKER' WHERE source_id='syn-r-1'"
+        )
+    s = ov.build_snapshot(populated)
+    serious = {(d.engine, d.code, d.subject) for d in s.discrepancies if d.severity == "SERIOUS"}
+    assert serious == {
+        ("journal", "JOURNAL_RECORD_UNDECODABLE", "syn-j-open-1"),
+        ("journal", "JOURNAL_RECORD_UNDECODABLE", "syn-j-commentary"),
+        ("replay", "REPLAY_RECORD_UNDECODABLE", "syn-r-1 r1 / open"),
+    }
+    assert "PAYLOAD-MARKER" not in s.model_dump_json()  # diagnostics never carry the raw payload
+    assert not s.reconciliation_complete
+    assert {a.engine: a.undecodable_rows for a in s.activity} == {"journal": 2, "replay": 1}
+    quantity_codes = {
+        "JOURNAL_POSITION_QUANTITY_MISMATCH",
+        "JOURNAL_FILL_WITHOUT_POSITION",
+        "JOURNAL_POSITION_WITHOUT_FILL",
+        "REPLAY_IDEA_QUANTITY_MISMATCH",
+        "REPLAY_FILL_WITHOUT_IDEA",
+        "REPLAY_IDEA_WITHOUT_FILL",
+    }
+    assert (
+        not {d.code for d in s.discrepancies} & quantity_codes
+    )  # partial history is not reconciled as complete
+    rows = {(v.engine, v.source_id, v.action_id): v for v in s.validations}
+    assert rows[("journal", "syn-j-open-1", None)].needs_review
+    assert "RECORD_UNDECODABLE" in rows[("journal", "syn-j-open-1", None)].reasons
+    assert rows[("journal", "syn-j-commentary", None)].reasons == ["RECORD_UNDECODABLE"]
+    assert (
+        rows[("replay", "syn-r-1", "open")].status == "UNDECODABLE"
+        and rows[("replay", "syn-r-1", "open")].needs_review
+    )
+    assert "paper-syn-r-1-1-open" not in {f.order_id for f in s.fills}
+
+    at = page(tmp_path, monkeypatch)
+    at.session_state["mock_ops_scenario"] = "populated"
+    at.session_state["mock_ops_ledgers"] = populated.model_dump(mode="json")
+    at.run()
+    assert not at.exception
+    errors = [e.value for e in at.error]
+    assert any(e.startswith("SERIOUS JOURNAL_RECORD_UNDECODABLE") for e in errors)
+    assert any(e.startswith("SERIOUS REPLAY_RECORD_UNDECODABLE") for e in errors)
+    assert any("Reconciliation is INCOMPLETE" in e for e in errors)
+    assert "PAYLOAD-MARKER" not in texts(at)
+
+
+def test_untimed_ledger_activity_is_unknown_in_read_model_and_page(
+    tmp_path, monkeypatch, populated
+):
+    with closing(sqlite3.connect(str(populated.journal_path))) as c, c:
+        c.execute(
+            "UPDATE events SET created_at='2099-01-01T00:00:00' WHERE source_id='syn-j-inflight'"
+        )  # naive, newest
+    with closing(sqlite3.connect(str(populated.replay_path))) as c, c:
+        c.execute(
+            "UPDATE replay_posts SET processed_at='2026-11-06T15:00:00' WHERE source_id='syn-r-5'"
+        )  # mixed
+    s = ov.build_snapshot(populated)  # must not raise on aware/naive comparison
+    act = {a.engine: a for a in s.activity}
+    for engine in ("journal", "replay"):
+        assert act[engine].readable and act[engine].last_write_at is None
+        assert act[engine].seconds_before_as_of is None and act[engine].untimed_rows == 1
+    assert s.reconciliation_complete and len(s.open_positions) == 2
+    assert ov._last_write([]) == (None, 0)
+    assert ov._last_write([None, datetime(2026, 1, 1)]) == (None, 2)
+    aware = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    assert ov._last_write([aware, aware + timedelta(seconds=5)]) == (
+        aware + timedelta(seconds=5),
+        0,
+    )
+
+    at = page(tmp_path, monkeypatch)
+    at.session_state["mock_ops_scenario"] = "populated"
+    at.session_state["mock_ops_ledgers"] = populated.model_dump(mode="json")
+    at.run()
+    assert not at.exception
+    assert [h.value for h in at.subheader] == [
+        "As-of",
+        "Mock positions",
+        "Fictional orders and fills",
+        "Validation outcomes",
+        "Reconciliation",
+    ]
+    unknown = [w.value for w in at.warning if "last ledger write UNKNOWN" in w.value]
+    assert len(unknown) == 2 and all("without a timezone" in w for w in unknown)
+    assert {m.label: m.value for m in at.metric}["Open mock positions"] == "2"

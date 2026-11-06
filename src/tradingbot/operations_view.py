@@ -27,13 +27,15 @@ from __future__ import annotations
 
 import sqlite3
 import tempfile
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from hashlib import sha256
 from pathlib import Path
 from typing import Literal
+
+from pydantic import ValidationError
 
 from tradingbot.event_models import (
     ActionOutcome,
@@ -79,10 +81,16 @@ PROTECTION_NOTES: dict[str, str] = {
     ),
 }
 # Outcomes that an operator must look at: nothing was filled and nothing was finally rejected.
-NEEDS_REVIEW_STATUSES = frozenset({"RECEIVED", "ERROR", "REVIEW", "HOLD", "RECONCILE"})
+NEEDS_REVIEW_STATUSES = frozenset(
+    {"RECEIVED", "ERROR", "REVIEW", "HOLD", "RECONCILE", "UNDECODABLE"}
+)
 
 RECONCILIATION_CHECKS = [
     "LEDGER_FILE_MISSING / LEDGER_UNREADABLE: each configured ledger file opens read-only and has the engine's tables",
+    (
+        "JOURNAL_RECORD_UNDECODABLE / REPLAY_RECORD_UNDECODABLE: every stored decision, order and outcome "
+        "record decodes with the engines' contracts; otherwise that ledger's fills are not reconciled"
+    ),
     "JOURNAL_RESERVATION_INCOMPLETE: no event is still RECEIVED (reserved but never completed)",
     "JOURNAL_HISTORY_TRUNCATED: every journal event was read, so fill totals are complete",
     (
@@ -179,9 +187,12 @@ class LedgerActivity(StrictModel):
     rows_on_record: int
     rows_read: int
     history_truncated: bool
+    # None means UNKNOWN: no row on record, or at least one row's write timestamp lacks a timezone.
     last_write_at: datetime | None = None
     last_write_basis: str
     seconds_before_as_of: float | None = None
+    untimed_rows: int = 0  # rows whose write timestamp is missing or has no timezone
+    undecodable_rows: int = 0  # stored records that did not decode with the engine's contract
 
 
 class OperationsSnapshot(StrictModel):
@@ -226,12 +237,21 @@ class OperationsSnapshot(StrictModel):
 
 @contextmanager
 def read_only_connection(path: str | Path) -> Iterator[sqlite3.Connection]:
-    """A connection that SQLite itself refuses to write through (``mode=ro``). Always closed."""
+    """A connection that SQLite itself refuses to write through (``mode=ro``). Always closed.
+
+    One deferred read transaction is opened up front and held until the connection closes, so every
+    SELECT issued through it sees the same ledger snapshot: a concurrent engine commit between two reads
+    cannot produce fills from one state and positions from another. In WAL mode (the journal) the
+    writer proceeds and the view keeps its snapshot; in rollback-journal mode (the replay ledger) the
+    writer's commit waits for the view's milliseconds-long read to finish.
+    """
     conn = sqlite3.connect(f"{Path(path).resolve().as_uri()}?mode=ro", uri=True, timeout=10.0)
     try:
         conn.row_factory = sqlite3.Row
+        conn.execute("BEGIN")  # read transaction; the first SELECT pins the snapshot
         yield conn
     finally:
+        conn.rollback()
         conn.close()
 
 
@@ -280,6 +300,7 @@ def _validation(
     *,
     revision: int | None = None,
     action_id: str | None = None,
+    force_review: bool = False,
 ) -> ValidationRow:
     age = _age_seconds(published_at, now)
     return ValidationRow(
@@ -292,8 +313,38 @@ def _validation(
         published_at=published_at,
         source_age_seconds=age,
         source_freshness=freshness(age, policy.max_signal_age_seconds),
-        needs_review=status in NEEDS_REVIEW_STATUSES,
+        needs_review=force_review or status in NEEDS_REVIEW_STATUSES,
     )
+
+
+def _last_write(stamps: Iterable[datetime | None]) -> tuple[datetime | None, int]:
+    """Latest timezone-aware write time, or None (UNKNOWN) when any row's stamp is missing or naive."""
+    stamps = list(stamps)
+    aware = [t for t in stamps if t is not None and t.tzinfo is not None]
+    untimed = len(stamps) - len(aware)
+    return (max(aware) if aware and not untimed else None), untimed
+
+
+def _decode(
+    model, payload: str, engine: Engine, subject: str, column: str, found: list[Discrepancy]
+):
+    """Decode a stored record with the engine's contract; on failure report it without the payload."""
+    try:
+        return model.model_validate_json(payload)
+    except ValidationError as exc:
+        kinds = sorted({str(e.get("type", "unknown")) for e in exc.errors()})
+        found.append(
+            Discrepancy(
+                engine=engine,
+                code=f"{engine.upper()}_RECORD_UNDECODABLE",
+                severity="SERIOUS",
+                subject=subject,
+                detail=f"{column} did not decode as {model.__name__} ({len(exc.errors())} validation "
+                f"error(s): {', '.join(kinds)}); the record was skipped and this ledger's fills were "
+                "not reconciled.",
+            )
+        )
+        return None
 
 
 def _signed_units(action: str, quantity: int) -> int:
@@ -365,7 +416,6 @@ def _read_journal(
     try:
         with read_only_connection(path) as c:
             total = c.execute("SELECT COUNT(*) FROM events").fetchone()[0]
-            last_write = _parse_ts(c.execute("SELECT MAX(created_at) FROM events").fetchone()[0])
             # Same shape as Journal.recent_events(), minus source_text: the view never shows post text.
             events = c.execute(
                 """SELECT source_id, status, published_at, created_at, decision_json, order_json
@@ -375,7 +425,8 @@ def _read_journal(
             position_rows = c.execute(
                 "SELECT idea_id, symbol, asset_class, side, quantity FROM positions ORDER BY idea_id"
             ).fetchall()
-    except sqlite3.OperationalError as exc:
+    # DatabaseError covers a missing file, a non-SQLite or malformed file, and a missing table.
+    except sqlite3.DatabaseError as exc:
         code = "LEDGER_FILE_MISSING" if not path.exists() else "LEDGER_UNREADABLE"
         found.append(
             Discrepancy(
@@ -383,7 +434,7 @@ def _read_journal(
                 code=code,
                 severity="SERIOUS",
                 subject=str(path),
-                detail=f"Journal ledger could not be read: {exc}",
+                detail=f"Journal ledger could not be read: {type(exc).__name__}: {exc}",
             )
         )
         activity = LedgerActivity(
@@ -399,32 +450,37 @@ def _read_journal(
 
     events = list(reversed(events))  # chronological for display
     truncated = total > len(events)
-    activity = LedgerActivity(
-        engine="journal",
-        path=str(path),
-        readable=True,
-        rows_on_record=total,
-        rows_read=len(events),
-        history_truncated=truncated,
-        last_write_at=last_write,
-        last_write_basis="events.created_at (ledger write time)",
-        seconds_before_as_of=_age_seconds(last_write, now),
-    )
+    # The newest rows are always among those read, so the latest write is computed from them.
+    last_write, untimed = _last_write(_parse_ts(r["created_at"]) for r in events)
     expected: dict[str, int] = {}
     opened: set[str] = set()
     for r in events:
-        decision = Decision.model_validate_json(r["decision_json"]) if r["decision_json"] else None
-        order = MockOrder.model_validate_json(r["order_json"]) if r["order_json"] else None
+        sid = r["source_id"]
+        decision = (
+            _decode(Decision, r["decision_json"], "journal", sid, "decision_json", found)
+            if r["decision_json"]
+            else None
+        )
+        order = (
+            _decode(MockOrder, r["order_json"], "journal", sid, "order_json", found)
+            if r["order_json"]
+            else None
+        )
+        undecodable = bool(
+            (r["decision_json"] and decision is None) or (r["order_json"] and order is None)
+        )
         published_at = _parse_ts(r["published_at"])
         validations.append(
             _validation(
                 "journal",
-                r["source_id"],
+                sid,
                 r["status"],
-                list(decision.reasons) if decision else [],
+                (list(decision.reasons) if decision else [])
+                + (["RECORD_UNDECODABLE"] if undecodable else []),
                 published_at,
                 now,
                 policy,
+                force_review=undecodable,
             )
         )
         if r["status"] == "RECEIVED":
@@ -474,6 +530,20 @@ def _read_journal(
                 protection_note=PROTECTION_NOTES["UNKNOWN"],
             )
         )
+    undecodable_rows = sum(d.code == "JOURNAL_RECORD_UNDECODABLE" for d in found)
+    activity = LedgerActivity(
+        engine="journal",
+        path=str(path),
+        readable=True,
+        rows_on_record=total,
+        rows_read=len(events),
+        history_truncated=truncated,
+        last_write_at=last_write,
+        last_write_basis="events.created_at (ledger write time)",
+        seconds_before_as_of=_age_seconds(last_write, now),
+        untimed_rows=untimed,
+        undecodable_rows=undecodable_rows,
+    )
     if truncated:
         found.append(
             Discrepancy(
@@ -484,7 +554,7 @@ def _read_journal(
                 detail=f"Only the latest {len(events)} of {total} events were read; fill totals were not reconciled.",
             )
         )
-    else:
+    elif not undecodable_rows:  # a partially decoded history is never reconciled as if complete
         found.extend(
             _reconcile_quantities(
                 "journal",
@@ -528,7 +598,8 @@ def _read_replay(
                 """SELECT idea_id, symbol, asset_class, position_side, quantity, stop_price, target_price, status
                 FROM replay_ideas ORDER BY idea_id"""
             ).fetchall()
-    except sqlite3.OperationalError as exc:
+    # DatabaseError covers a missing file, a non-SQLite or malformed file, and a missing table.
+    except sqlite3.DatabaseError as exc:
         code = "LEDGER_FILE_MISSING" if not path.exists() else "LEDGER_UNREADABLE"
         found.append(
             Discrepancy(
@@ -536,7 +607,7 @@ def _read_replay(
                 code=code,
                 severity="SERIOUS",
                 subject=str(path),
-                detail=f"Replay ledger could not be read: {exc}",
+                detail=f"Replay ledger could not be read: {type(exc).__name__}: {exc}",
             )
         )
         activity = LedgerActivity(
@@ -550,9 +621,26 @@ def _read_replay(
         )
         return activity, positions, fills, validations, found
 
-    last_write = max(
-        (t for t in (_parse_ts(p["processed_at"]) for p in posts) if t is not None), default=None
-    )
+    last_write, untimed = _last_write(_parse_ts(p["processed_at"]) for p in posts)
+    # Latest evaluation attempt per post revision, exactly as PaperEventReplay.outcomes() reports it.
+    latest_attempt: dict[tuple[str, int], int] = {}
+    for r in action_rows:
+        key = (r["source_id"], r["revision"])
+        latest_attempt[key] = max(latest_attempt.get(key, 0), r["attempt"])
+    outcomes: dict[tuple[str, int], list[ActionOutcome]] = {}
+    undecodable_actions: dict[tuple[str, int], list[str]] = {}
+    for r in action_rows:
+        key = (r["source_id"], r["revision"])
+        if r["attempt"] == latest_attempt[key]:
+            subject = f"{r['source_id']} r{r['revision']} / {r['action_id']}"
+            outcome = _decode(
+                ActionOutcome, r["result_json"], "replay", subject, "result_json", found
+            )
+            if outcome is None:
+                undecodable_actions.setdefault(key, []).append(r["action_id"])
+            else:
+                outcomes.setdefault(key, []).append(outcome)
+    undecodable_rows = sum(len(v) for v in undecodable_actions.values())
     activity = LedgerActivity(
         engine="replay",
         path=str(path),
@@ -563,17 +651,9 @@ def _read_replay(
         last_write_at=last_write,
         last_write_basis=basis,
         seconds_before_as_of=_age_seconds(last_write, now),
+        untimed_rows=untimed,
+        undecodable_rows=undecodable_rows,
     )
-    # Latest evaluation attempt per post revision, exactly as PaperEventReplay.outcomes() reports it.
-    latest_attempt: dict[tuple[str, int], int] = {}
-    for r in action_rows:
-        key = (r["source_id"], r["revision"])
-        latest_attempt[key] = max(latest_attempt.get(key, 0), r["attempt"])
-    outcomes: dict[tuple[str, int], list[ActionOutcome]] = {}
-    for r in action_rows:
-        key = (r["source_id"], r["revision"])
-        if r["attempt"] == latest_attempt[key]:
-            outcomes.setdefault(key, []).append(ActionOutcome.model_validate_json(r["result_json"]))
 
     expected: dict[str, int] = {}
     opened: set[str] = set()
@@ -581,6 +661,20 @@ def _read_replay(
         key = (p["source_id"], p["revision"])
         published_at = _parse_ts(p["published_at"])
         processed_at = _parse_ts(p["processed_at"])
+        for action_id in undecodable_actions.get(key, []):
+            validations.append(
+                _validation(
+                    "replay",
+                    p["source_id"],
+                    "UNDECODABLE",
+                    ["RECORD_UNDECODABLE"],
+                    published_at,
+                    now,
+                    policy,
+                    revision=p["revision"],
+                    action_id=action_id,
+                )
+            )
         for o in outcomes.get(key, []):
             validations.append(
                 _validation(
@@ -658,19 +752,20 @@ def _read_replay(
                     detail=f"Idea status is {i['status']} while quantity is {i['quantity']}.",
                 )
             )
-    found.extend(
-        _reconcile_quantities(
-            "replay",
-            expected,
-            {i["idea_id"]: i["quantity"] for i in idea_rows},
-            opened,
-            (
-                "REPLAY_IDEA_QUANTITY_MISMATCH",
-                "REPLAY_FILL_WITHOUT_IDEA",
-                "REPLAY_IDEA_WITHOUT_FILL",
-            ),
+    if not undecodable_rows:  # a partially decoded history is never reconciled as if complete
+        found.extend(
+            _reconcile_quantities(
+                "replay",
+                expected,
+                {i["idea_id"]: i["quantity"] for i in idea_rows},
+                opened,
+                (
+                    "REPLAY_IDEA_QUANTITY_MISMATCH",
+                    "REPLAY_FILL_WITHOUT_IDEA",
+                    "REPLAY_IDEA_WITHOUT_FILL",
+                ),
+            )
         )
-    )
     return activity, positions, fills, validations, found
 
 
@@ -708,7 +803,9 @@ def build_snapshot(
         fills += fil
         validations += val
         discrepancies += dis
-    complete = all(a.readable and not a.history_truncated for a in activity)
+    complete = all(
+        a.readable and not a.history_truncated and not a.undecodable_rows for a in activity
+    )
     return OperationsSnapshot(
         as_of=now,
         ledgers=ledgers,

@@ -96,14 +96,29 @@ for act in snapshot.activity:
             f"{name}: UNREADABLE — `{act.path}` could not be opened read-only. See reconciliation."
         )
         continue
-    if act.last_write_at is None:
+    if act.untimed_rows:
+        st.warning(
+            f"{name}: {act.rows_on_record} rows on record; last ledger write UNKNOWN because "
+            f"{act.untimed_rows} row(s) carry a write timestamp without a timezone (basis: {act.last_write_basis})."
+        )
+    elif act.last_write_at is None:
         st.markdown(
             f"**{name}:** {act.rows_on_record} rows on record; **no ledger write recorded** (nothing to observe)."
         )
     else:
+        age_text = (
+            f"{act.seconds_before_as_of:.0f} s before as-of"
+            if act.seconds_before_as_of is not None
+            else "age UNKNOWN"
+        )
         st.markdown(
             f"**{name}:** {act.rows_on_record} rows on record; last ledger write {_fmt(act.last_write_at)} "
-            f"({act.seconds_before_as_of:.0f} s before as-of; basis: {act.last_write_basis})."
+            f"({age_text}; basis: {act.last_write_basis})."
+        )
+    if act.undecodable_rows:
+        st.error(
+            f"{name}: {act.undecodable_rows} stored record(s) did not decode; fills were not reconciled. "
+            "See reconciliation."
         )
     if act.history_truncated:
         st.warning(

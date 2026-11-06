@@ -19,7 +19,9 @@ validator, policy, journal, contract migration or trading control. Issue: `tsaid
 
 Every timestamp is explicit: the **snapshot as-of** (when the ledgers were read), each ledger's **last write**
 with its basis column, and each outcome's **source timestamp age** against the shared `MockPolicy`
-signal window. Source text is never selected from the ledgers, so paid post text cannot reach the page.
+signal window. A last write is reported as **UNKNOWN** (never compared or aged) when any row's write
+timestamp is missing or has no timezone; the page says how many rows are untimed. Source text is never
+selected from the ledgers, so paid post text cannot reach the page.
 
 ## Read-only by construction
 
@@ -27,6 +29,16 @@ signal window. Source text is never selected from the ledgers, so paid post text
   itself refuses writes through it (`attempt to write a readonly database`), and the module contains no
   write statement and no engine construction on the read path. The page constructs no `Journal` or
   `PaperEventReplay`; it only reads the paths held in `st.session_state`.
+* Each ledger is read inside **one deferred read transaction** (`BEGIN` … rollback on close), so every
+  SELECT of a snapshot sees the same state. An engine committing between the fills read and the positions
+  read cannot make the view compare old fills with new quantities: in WAL mode (the journal) the writer
+  proceeds and the view keeps its snapshot; in rollback-journal mode (the replay ledger) the writer's commit
+  waits for the view's milliseconds-long read. Tests drive both cases with a second connection.
+* A corrupt ledger never aborts the view. A non-SQLite or malformed file is reported as `LEDGER_UNREADABLE`
+  and the other ledger still renders. A stored decision, order or outcome record that does not decode with
+  the engine's contract is reported as `JOURNAL_RECORD_UNDECODABLE` / `REPLAY_RECORD_UNDECODABLE` (error
+  types only, never the payload), the affected row is marked `RECORD_UNDECODABLE` / `UNDECODABLE` for
+  review, that ledger's fills are **not** reconciled, and reconciliation is marked incomplete.
 * A missing or foreign ledger file is reported as a `SERIOUS` discrepancy (`LEDGER_FILE_MISSING`,
   `LEDGER_UNREADABLE`); the view never creates a database.
 * The only control is **Refresh view (read-only)**, which re-reads the same files. There are no trade
@@ -84,7 +96,8 @@ filled and nothing was finally rejected, so an operator must look.
 
 | Code | Check |
 |---|---|
-| `LEDGER_FILE_MISSING`, `LEDGER_UNREADABLE` | A configured ledger did not open read-only or lacks the engine's tables. |
+| `LEDGER_FILE_MISSING`, `LEDGER_UNREADABLE` | A configured ledger is missing, is not a SQLite database, is malformed, or lacks the engine's tables. |
+| `JOURNAL_RECORD_UNDECODABLE`, `REPLAY_RECORD_UNDECODABLE` | A stored decision/order/outcome record did not decode with the engine's contract; that ledger's fills are not reconciled. |
 | `JOURNAL_RESERVATION_INCOMPLETE` | An event is still `RECEIVED`: reserved, never completed, and the duplicate guard will refuse a retry. |
 | `JOURNAL_HISTORY_TRUNCATED` | More events exist than were read (`journal_event_limit`); fill totals were not reconciled. |
 | `JOURNAL_POSITION_QUANTITY_MISMATCH`, `JOURNAL_FILL_WITHOUT_POSITION`, `JOURNAL_POSITION_WITHOUT_FILL` | Journal positions versus the signed sum of recorded fictional fills per idea. |
@@ -115,7 +128,10 @@ checkout's code and not another editable install.
 * Replay outcomes are read from the latest evaluation attempt of each post revision, matching
   `PaperEventReplay.outcomes()`; earlier attempts of a truncated post only ever recorded `HOLD`.
 * The journal read is capped at `JOURNAL_EVENT_LIMIT` (1000) events; beyond that the page reports
-  `JOURNAL_HISTORY_TRUNCATED` instead of guessing.
+  `JOURNAL_HISTORY_TRUNCATED` instead of guessing. The journal's last write is computed from the rows read,
+  which always include the newest ones.
+* While the view holds its read transaction (milliseconds), a replay-ledger writer's commit waits; the
+  engines' 10 s busy timeout covers this comfortably.
 * The browser does not auto-refresh. The as-of timestamp is the truth; press **Refresh view (read-only)**.
 * Synthetic fixtures are illustrative, not a corpus; they prove rendering and read-only behaviour, not
   interpreter accuracy.
