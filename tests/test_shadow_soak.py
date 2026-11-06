@@ -364,6 +364,9 @@ def test_fast_profile_passes_with_fresh_processes_pauses_and_both_crash_windows(
     assert sum(s.processed for s in chain) == 51 + after_commit
     assert sum(s.duplicate_returns + s.hash_mismatch_blocks for s in chain) == 3 * 6 + after_commit
     assert report.wall.total_s > 0 and report.wall.total_s >= report.wall.reference_s + report.wall.chain_s - 0.01
+    assert report.wall.total_s <= report.wall.total_budget_s == CI.max_total_wall_seconds
+    assert report.segments[0].wall_budget_s == min(CI.max_wall_seconds_per_process, CI.max_total_wall_seconds) == 120.0
+    assert all(0 < s.wall_budget_s <= CI.max_wall_seconds_per_process for s in report.segments)
     assert (report.feed.deliveries, report.feed.posts, report.feed.virtual_span_s) == (51, 33, 2 * PERIOD + 700 * 60)
     assert (report.feed.duplicate_deliveries, report.feed.tampered_deliveries) == (15, 3)
     assert report.feed.base_feed_digest == BASE.digest() and report.feed.feed_digest == FEED3.digest()
@@ -430,6 +433,7 @@ def test_wall_budget_pauses_are_reported_incomplete_never_pass(tmp_path):
     report = run_soak(tiny, tmp_path / "per-process")
     assert report.verdict == "INCOMPLETE" and report.processes_launched == 1
     assert report.segments[0].status == "WALL_BUDGET_EXHAUSTED" and report.segments[0].exit_code == EXIT_PAUSED
+    assert report.segments[0].wall_budget_s == 1e-9
     assert report.findings == [("INCOMPLETE: reference paused on its wall budget at cursor "
                                 f"{report.segments[0].cursor} (bounded pause, not a PASS)")]
     assert report.actual_reference is None and not report.digests_converge and report.restarts_executed == 0
@@ -443,6 +447,50 @@ def test_wall_budget_pauses_are_reported_incomplete_never_pass(tmp_path):
     assert report.verdict == "INCOMPLETE" and report.processes_launched == 1
     assert report.segments[0].status == "COMPLETE"
     assert report.findings == ["INCOMPLETE: total wall budget exhausted before chain segment 1"]
+    assert report.wall.total_s == 10_000.0 > report.wall.total_budget_s
+
+
+def test_total_wall_budget_caps_every_launch_and_a_late_final_segment_is_incomplete(tmp_path):
+    """Review correction on PR #23: an invented clock makes every process take 120 s against a 300 s
+    total budget (per-process bound 600 s). Each child's budget must be the per-process bound capped
+    by the remaining total; the final segment starts inside the budget (t=240) and finishes past it
+    (t=360), which is INCOMPLETE with the work preserved, never PASS."""
+    clock = {"now": 0.0}
+    launches = []
+
+    def slow(request):
+        launches.append((request.spec.planned, request.spec.max_wall_seconds, clock["now"]))
+        outcome = launch_subprocess(request)
+        clock["now"] += 120.0
+        return outcome
+
+    profile = SoakProfile(name="late", cycles=1, restarts=1, seed=3, max_wall_seconds_per_process=600,
+                          max_total_wall_seconds=300)
+    step = make_plan(profile, SPEC_DELIVERIES).steps[0].planned
+    report = run_soak(profile, tmp_path / "root", launcher=slow, wall_clock=lambda: clock["now"])
+    assert launches == [("complete", 300.0, 0.0), (step, 180.0, 120.0), ("complete", 60.0, 240.0)]
+    assert [s.wall_budget_s for s in report.segments] == [300.0, 180.0, 60.0]       # the clamp is in the report
+    assert [s.status for s in report.segments] == ["COMPLETE", "DELIVERY_CAP_REACHED" if step == "pause" else "INTERRUPTED",
+                                                   "COMPLETE"]
+    assert report.processes_launched == 3 and report.restarts_executed == 1
+    assert report.digests_converge and report.ledgers_equal and report.actual_chain == report.expected   # the work is fine
+    assert report.verdict == "INCOMPLETE"
+    assert report.findings == [("INCOMPLETE: total wall budget exceeded: 360.000s measured against 300s; "
+                                "a late finish is not a PASS")]
+    assert report.wall.total_s == 360.0 > report.wall.total_budget_s == 300.0
+    # paused evidence preserved: both ledgers with their checkpoints, the per-process reports and the soak report
+    root = tmp_path / "root"
+    assert sorted(p.name for p in root.iterdir()) == ["chain", "reference", "segments", SOAK_REPORT_FILE]
+    assert ShadowCheckpoint.model_validate_json((root / "chain" / CHECKPOINT_FILE).read_text()).cursor == SPEC_DELIVERIES
+    assert SoakReport.model_validate_json((root / SOAK_REPORT_FILE).read_text()).verdict == "INCOMPLETE"
+    # the remaining-total clamp really reaches the child: a tiny total budget pauses the reference itself
+    tiny_total = SoakProfile(name="tinytotal", cycles=1, restarts=0, seed=1, max_wall_seconds_per_process=600,
+                             max_total_wall_seconds=1e-9)
+    report = run_soak(tiny_total, tmp_path / "tiny")
+    assert report.segments[0].wall_budget_s == 1e-9 and report.segments[0].status == "WALL_BUDGET_EXHAUSTED"
+    assert report.verdict == "INCOMPLETE" and report.processes_launched == 1 and report.restarts_executed == 0
+    assert report.findings[0].startswith("INCOMPLETE: reference paused on its wall budget")
+    assert report.findings[1].startswith("INCOMPLETE: total wall budget exceeded:") and len(report.findings) == 2
 
 
 def test_tampered_chain_ledger_fails_even_though_the_runner_digests_agree(tmp_path):
@@ -493,6 +541,7 @@ def test_segment_process_refuses_a_wrong_import_origin_or_feed_digest_before_tou
     code, outcome = child(good)
     assert (code, outcome.status, outcome.cursor, outcome.hash_seed_confirmed, outcome.network_guard) == \
         (0, "COMPLETE", 17, True, True)
+    assert outcome.wall_budget_s == 30.0
     assert ShadowRunReport.model_validate_json((tmp_path / "c.json").read_text()).convergence_digest == outcome.convergence_digest
 
 

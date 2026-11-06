@@ -20,8 +20,11 @@ Everything that decides is reused unchanged: ``ShadowRunner`` (delivery loop, vi
 checkpoint), ``TklInterpreter``, ``validator`` gates inside ``PaperEventReplay`` and ``MockPolicy``.
 No interpreter, validator, policy, journal, adapter or parsing rule is added here.
 
-Bounds are explicit: cycles, restarts, a per-process wall budget and a total wall budget. A run
-stopped by a wall budget is reported as ``INCOMPLETE``, never ``PASS``. Wall time is measured and
+Bounds are explicit: cycles, restarts, a per-process wall budget and a total wall budget. Every
+process launch is capped by the per-process bound AND by what remains of the total budget, nothing
+is launched once the total is exhausted, and the total deadline is re-checked after the final
+segment and the measurement: a run stopped or finished late by a wall budget is reported as
+``INCOMPLETE``, never ``PASS``. Wall time is measured and
 reported separately from virtual time; nothing here is an uptime or throughput claim. Only fresh
 (absent or empty) directories are used; nothing on the host is scanned for ledgers. No network
 socket may be opened while a soak runs (``no_network``). The evidence is synthetic and offline:
@@ -473,6 +476,7 @@ class SegmentOutcome(StrictModel):
     duplicate_returns: int = 0
     hash_mismatch_blocks: int = 0
     convergence_digest: str | None = None
+    wall_budget_s: float = Field(gt=0)      # the bound handed to this process: per-process cap AND remaining total
     wall_seconds: float
     window_verified: bool | None = None
     error: str | None = None
@@ -505,7 +509,7 @@ def run_segment(request: SegmentRequest) -> SegmentOutcome:
     common = {"segment": spec.segment, "role": spec.role, "planned": spec.planned, "hash_seed": spec.hash_seed,
               "hash_seed_confirmed": os.environ.get("PYTHONHASHSEED") == str(spec.hash_seed),
               "import_origin_verified": import_origin() == request.import_origin.resolve(),
-              "network_guard": network_guard_active()}
+              "network_guard": network_guard_active(), "wall_budget_s": spec.max_wall_seconds}
 
     def refused(message: str) -> SegmentOutcome:
         return SegmentOutcome(**common, exit_code=EXIT_REFUSED, status="REFUSED", error=message,
@@ -595,7 +599,8 @@ def _errored(request: SegmentRequest, message: str, exit_code: int, wall: float)
     spec = request.spec
     return SegmentOutcome(segment=spec.segment, role=spec.role, planned=spec.planned, hash_seed=spec.hash_seed,
                           hash_seed_confirmed=False, import_origin_verified=False, network_guard=False,
-                          exit_code=exit_code, status="ERROR", error=message, wall_seconds=wall)
+                          exit_code=exit_code, status="ERROR", error=message, wall_budget_s=spec.max_wall_seconds,
+                          wall_seconds=wall)
 
 
 def segment_main(argv: list[str] | None = None) -> int:
@@ -776,16 +781,24 @@ def run_soak(profile: SoakProfile, root: str | Path, *, launcher: Launcher = lau
             ok = False
         return ok
 
-    def within_total_budget(label: str) -> bool:
-        if wall_clock() - started > profile.max_total_wall_seconds:
+    exhausted = False
+
+    def launch_budget(label: str) -> float | None:
+        """Wall budget for the next launch: the per-process bound, further capped by what is left of
+        the total budget. Nothing is launched once the total budget is exhausted."""
+        nonlocal exhausted
+        remaining = profile.max_total_wall_seconds - (wall_clock() - started)
+        if remaining <= 0:
+            exhausted = True
             findings.incomplete.append(f"total wall budget exhausted before {label}")
-            return False
-        return True
+            return None
+        return min(profile.max_wall_seconds_per_process, remaining)
 
     # 1. uninterrupted reference process
     reference = launch(SegmentSpec(segment=0, role="reference", planned="complete", resume=False,
-                                   hash_seed=plan.reference_hash_seed,
-                                   max_wall_seconds=profile.max_wall_seconds_per_process), reference_dir)
+                                   hash_seed=plan.reference_hash_seed,      # nothing has elapsed yet by construction
+                                   max_wall_seconds=min(profile.max_wall_seconds_per_process,
+                                                        profile.max_total_wall_seconds)), reference_dir)
     if generic_checks(reference, "reference") and (reference.status != "COMPLETE" or reference.cursor != total):
         findings.fail.append(f"reference ended {reference.status} at cursor {reference.cursor}, expected COMPLETE at {total}")
     notify()
@@ -797,14 +810,15 @@ def run_soak(profile: SoakProfile, root: str | Path, *, launcher: Launcher = lau
     proceed = reference.status == "COMPLETE"
     previous_cut = 0
     for step in plan.steps:
-        if not proceed or not within_total_budget(f"chain segment {step.segment}"):
+        budget = launch_budget(f"chain segment {step.segment}") if proceed else None
+        if budget is None:
             proceed = False
             break
         pause = step.planned == "pause"
         spec = SegmentSpec(segment=step.segment, role="chain", planned=step.planned, resume=step.segment > 1,
                            max_deliveries=step.cut_index - previous_cut if pause else None,
                            interrupt_index=None if pause else step.cut_index, interrupt_phase=step.phase,
-                           hash_seed=step.hash_seed, max_wall_seconds=profile.max_wall_seconds_per_process)
+                           hash_seed=step.hash_seed, max_wall_seconds=budget)
         outcome = launch(spec, chain_dir)
         if not generic_checks(outcome, f"chain segment {step.segment}"):
             notify()
@@ -826,10 +840,11 @@ def run_soak(profile: SoakProfile, root: str | Path, *, launcher: Launcher = lau
             proceed = False
             break
         previous_cut = step.cut_index
-    if proceed and within_total_budget("the final chain segment"):
+    final_budget = launch_budget("the final chain segment") if proceed else None
+    if final_budget is not None:
         chain_final = launch(SegmentSpec(segment=len(plan.steps) + 1, role="chain", planned="complete",
                                          resume=bool(plan.steps), hash_seed=plan.final_hash_seed,
-                                         max_wall_seconds=profile.max_wall_seconds_per_process), chain_dir)
+                                         max_wall_seconds=final_budget), chain_dir)
         if generic_checks(chain_final, "final chain segment") and \
                 (chain_final.status != "COMPLETE" or chain_final.cursor != total or chain_final.resumed_from != previous_cut):
             findings.fail.append(f"final chain segment ended {chain_final.status} at cursor {chain_final.cursor} "
@@ -869,6 +884,13 @@ def run_soak(profile: SoakProfile, root: str | Path, *, launcher: Launcher = lau
     if findings.verdict == "PASS" and executed != profile.restarts:
         findings.fail.append(f"{executed} of {profile.restarts} planned restarts verified")
 
+    # 4. the total deadline is re-checked after the final segment and the measurement: finishing late
+    #    is a bounded pause in disguise and can never be a PASS
+    elapsed = wall_clock() - started
+    if elapsed > profile.max_total_wall_seconds and not exhausted:
+        findings.incomplete.append(f"total wall budget exceeded: {elapsed:.3f}s measured against "
+                                   f"{profile.max_total_wall_seconds:g}s; a late finish is not a PASS")
+
     report = SoakReport(
         profile=profile, feed=identity, plan=plan, segments=segments, processes_launched=len(segments),
         restarts_planned=profile.restarts, restarts_executed=executed, distinct_hash_seeds=len(seeds),
@@ -876,7 +898,7 @@ def run_soak(profile: SoakProfile, root: str | Path, *, launcher: Launcher = lau
         digests_converge=digests_converge, ledgers_equal=ledgers_equal, expected=expected,
         actual_reference=actual_reference, actual_chain=actual_chain, cycle_mismatches=mismatches,
         wall=WallTime(reference_s=round(reference_wall, 3), chain_s=round(chain_wall, 3),
-                      total_s=round(wall_clock() - started, 3),
+                      total_s=round(elapsed, 3),
                       per_process_budget_s=profile.max_wall_seconds_per_process,
                       total_budget_s=profile.max_total_wall_seconds),
         verdict=findings.verdict, findings=findings.all,

@@ -85,7 +85,7 @@ def trace(outcome: SegmentOutcome) -> None:
     print(f"  [{outcome.segment:02d}] {outcome.role:<9} {outcome.planned:<23} PYTHONHASHSEED={outcome.hash_seed:<10} "
           f"{outcome.status:<20} exit {outcome.exit_code}  cursor {outcome.resumed_from}->{outcome.cursor}  "
           f"processed={outcome.processed} fresh={outcome.fresh_results} duplicate={outcome.duplicate_returns} "
-          f"tampered={outcome.hash_mismatch_blocks}  wall {outcome.wall_seconds:.2f}s"
+          f"tampered={outcome.hash_mismatch_blocks}  wall {outcome.wall_seconds:.2f}s of {outcome.wall_budget_s:g}s budget"
           f"{verified}{'  ' + outcome.error if outcome.error else ''}")
 
 
@@ -115,7 +115,8 @@ def print_report(report: SoakReport) -> None:
             print(f"  - {item}")
     w = report.wall
     print(f"wall time (measured, includes process start-up): reference {w.reference_s:.2f}s, chain {w.chain_s:.2f}s, "
-          f"total {w.total_s:.2f}s; budgets {w.per_process_budget_s:g}s per process, {w.total_budget_s:g}s total")
+          f"total {w.total_s:.2f}s; budgets {w.per_process_budget_s:g}s per process, {w.total_budget_s:g}s total "
+          f"(each launch is capped by the remaining total; a late finish is INCOMPLETE)")
     print(f"virtual time (deterministic input, not elapsed time): {report.feed.virtual_epoch.isoformat()} -> "
           f"{report.feed.virtual_end.isoformat()} = {virtual_span(report.feed.virtual_span_s)}")
     print(f"verdict: {report.verdict}")
