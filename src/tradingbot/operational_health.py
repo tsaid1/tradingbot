@@ -39,6 +39,7 @@ import sqlite3
 import tempfile
 from collections import Counter
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal
@@ -178,7 +179,12 @@ class ShadowRunArtifacts(StrictModel):
 
 
 class FileObservation(StrictModel):
-    """What the filesystem showed about one artifact, without interpreting its content."""
+    """What the filesystem showed about one artifact, without interpreting its content.
+
+    ``present`` is True only when the path was observed as a regular file. ``read_error`` names the
+    exception type (never its message, which may carry a path) when the file could not be examined or
+    read; a file that vanished between observation and reading is simply reported as absent.
+    """
 
     role: FileRole
     path: str
@@ -187,6 +193,7 @@ class FileObservation(StrictModel):
     # Timezone-aware wall-clock write time from the filesystem; None means UNKNOWN (never guessed).
     written_at: datetime | None = None
     written_at_basis: str = WRITE_TIME_BASIS
+    read_error: str | None = None
 
 
 class ShadowRunEvidence(StrictModel):
@@ -295,6 +302,10 @@ class LedgerView(StrictModel):
     discrepancies: list[Discrepancy]
     reconciliation_complete: bool
     checks_performed: list[str]
+    # Posts with a ledger row but no latest-attempt outcome record, and posts whose latest-attempt
+    # outcome record does not decode: both matter to the runner's resume validation.
+    posts_without_recorded_outcomes: int = 0
+    posts_with_undecodable_outcomes: int = 0
     flatness_note: str = FLATNESS_NOTE
 
 
@@ -333,9 +344,19 @@ class ShadowRunHealth(StrictModel):
 
 
 def _observe_file(role: FileRole, path: Path) -> FileObservation:
-    if not path.is_file():
+    """Stat one artifact. A path that does not exist is absent; any other OSError (for example a
+    permission problem on the file or its directory) is recorded by exception type only, so the view
+    can report it instead of aborting."""
+    try:
+        if not path.is_file():
+            return FileObservation(role=role, path=str(path), present=False)
+        stat = path.stat()
+    except FileNotFoundError:
         return FileObservation(role=role, path=str(path), present=False)
-    stat = path.stat()
+    except OSError as exc:
+        return FileObservation(
+            role=role, path=str(path), present=False, read_error=type(exc).__name__
+        )
     return FileObservation(
         role=role,
         path=str(path),
@@ -345,20 +366,33 @@ def _observe_file(role: FileRole, path: Path) -> FileObservation:
     )
 
 
-def _read_text(observation: FileObservation) -> str | None:
-    if not observation.present:
-        return None
-    return Path(observation.path).read_bytes().decode("utf-8", errors="replace")
+def _read_text(observation: FileObservation) -> tuple[FileObservation, str | None]:
+    """Read an observed artifact as bytes. A file removed since it was observed becomes absent (the
+    observation is corrected); any other OSError is recorded by exception type only."""
+    if not observation.present or observation.read_error is not None:
+        return observation, None
+    try:
+        text = Path(observation.path).read_bytes().decode("utf-8", errors="replace")
+    except FileNotFoundError:
+        gone = {"present": False, "size_bytes": None, "written_at": None}
+        return observation.model_copy(update=gone), None
+    except OSError as exc:
+        return observation.model_copy(update={"read_error": type(exc).__name__}), None
+    return observation, text
 
 
 def collect_evidence(
     artifacts: ShadowRunArtifacts, *, collected_at: datetime | None = None
 ) -> ShadowRunEvidence:
-    """Stat and read the artifacts once. Reads bytes only; nothing is opened for writing."""
+    """Stat and read the artifacts once. Reads bytes only; nothing is opened for writing, and a
+    file that cannot be examined or read is recorded as such rather than raising."""
     workdir = Path(artifacts.workdir)
-    checkpoint = _observe_file("checkpoint", workdir / CHECKPOINT_FILE)
+    checkpoint, checkpoint_text = _read_text(_observe_file("checkpoint", workdir / CHECKPOINT_FILE))
     ledger = _observe_file("ledger", workdir / LEDGER_FILE)
-    report = _observe_file("report", Path(artifacts.report_path)) if artifacts.report_path else None
+    report: FileObservation | None = None
+    report_text: str | None = None
+    if artifacts.report_path:
+        report, report_text = _read_text(_observe_file("report", Path(artifacts.report_path)))
     return ShadowRunEvidence(
         label=artifacts.label,
         workdir=str(workdir),
@@ -366,8 +400,8 @@ def collect_evidence(
         checkpoint=checkpoint,
         ledger=ledger,
         report=report,
-        checkpoint_text=_read_text(checkpoint),
-        report_text=_read_text(report) if report else None,
+        checkpoint_text=checkpoint_text,
+        report_text=report_text,
     )
 
 
@@ -434,12 +468,29 @@ def _prefix_identities(feed: ShadowFeed, cursor: int) -> set[tuple[str, int]]:
     return out
 
 
-def _ledger_view(path: Path, virtual_as_of: datetime, basis: str, policy: MockPolicy) -> LedgerView:
+@dataclass(frozen=True)
+class _LedgerRead:
+    """The OPS-01 view plus the per-post outcome evidence the resume check needs (internal)."""
+
+    view: LedgerView
+    identities: set[tuple[str, int]] | None  # replay_posts rows; None when the ledger is unreadable
+    with_decodable_outcomes: set[tuple[str, int]]
+    with_undecodable_outcomes: set[tuple[str, int]]
+
+
+def _read_ledger(path: Path, virtual_as_of: datetime, basis: str, policy: MockPolicy) -> _LedgerRead:
+    """One OPS-01 read of the ledger. The snapshot's validation rows are the latest-attempt outcome
+    records decoded with the engine's contract (``UNDECODABLE`` marks a record that did not decode),
+    which is exactly what the runner's resume validation reads through ``PaperEventReplay.outcomes``."""
     snapshot = build_snapshot(
         MockLedgers(replay_path=path, label="shadow ledger"), now=virtual_as_of, policy=policy
     )
     activity = snapshot.activity[0]
-    return LedgerView(
+    identities = _ledger_identities(path) if activity.readable else None
+    decodable = {(v.source_id, v.revision) for v in snapshot.validations if v.status != "UNDECODABLE"}
+    undecodable = {(v.source_id, v.revision) for v in snapshot.validations if v.status == "UNDECODABLE"}
+    without = (identities - decodable - undecodable) if identities is not None else set()
+    view = LedgerView(
         path=str(path),
         readable=activity.readable,
         virtual_as_of=virtual_as_of,
@@ -452,7 +503,10 @@ def _ledger_view(path: Path, virtual_as_of: datetime, basis: str, policy: MockPo
         discrepancies=snapshot.discrepancies,
         reconciliation_complete=snapshot.reconciliation_complete,
         checks_performed=snapshot.checks_performed,
+        posts_without_recorded_outcomes=len(without),
+        posts_with_undecodable_outcomes=len(undecodable),
     )
+    return _LedgerRead(view, identities, decodable, undecodable)
 
 
 def _report_matches_ledger(report: ShadowRunReport, ledger: LedgerView) -> list[str]:
@@ -516,7 +570,13 @@ def assess_shadow_run(
 
     # --- parse the artifacts with the runner's own strict contracts -------------------------------
     checkpoint: ShadowCheckpoint | None = None
-    if not evidence.checkpoint.present:
+    if evidence.checkpoint.read_error is not None:
+        finding("SERIOUS", "CHECKPOINT_UNREADABLE", CHECKPOINT_FILE,
+                f"The checkpoint could not be examined or read ({evidence.checkpoint.read_error}); its "
+                "content is unknown and no run state can be read from it.")
+        check("CHECKPOINT_VALID", "checkpoint.json exists and parses as ShadowCheckpoint", "FAIL",
+              f"unreadable ({evidence.checkpoint.read_error})")
+    elif not evidence.checkpoint.present:
         finding("SERIOUS", "CHECKPOINT_MISSING", CHECKPOINT_FILE, "No checkpoint file was found.")
         check("CHECKPOINT_VALID", "checkpoint.json exists and parses as ShadowCheckpoint", "FAIL",
               "missing")
@@ -534,10 +594,16 @@ def assess_shadow_run(
                   f"schema {checkpoint.schema_version}, cursor {checkpoint.cursor}")
 
     report: ShadowRunReport | None = None
-    if evidence.report is None or not evidence.report.present:
+    if evidence.report is None or (
+        not evidence.report.present and evidence.report.read_error is None
+    ):
         finding("INFO", "NO_REPORT", REPORT_FILE,
                 "No run report was supplied or found. A pause and an interruption cannot be told "
                 "apart from the checkpoint alone.")
+    elif evidence.report.read_error is not None:
+        finding("WARNING", "REPORT_UNREADABLE", REPORT_FILE,
+                f"The report could not be examined or read ({evidence.report.read_error}); the run "
+                "state is taken from the checkpoint alone, so a pause cannot be shown.")
     else:
         parsed, error = _parse(ShadowRunReport, evidence.report_text)
         if parsed is None:
@@ -547,7 +613,13 @@ def assess_shadow_run(
         else:
             report = parsed
 
-    if not evidence.ledger.present:
+    if evidence.ledger.read_error is not None:
+        finding("SERIOUS", "LEDGER_INACCESSIBLE", LEDGER_FILE,
+                f"The ledger file could not be examined ({evidence.ledger.read_error}); nothing was "
+                "read or reconciled.")
+        check("LEDGER_PRESENT", "shadow_ledger.sqlite3 exists", "FAIL",
+              f"inaccessible ({evidence.ledger.read_error})")
+    elif not evidence.ledger.present:
         finding("SERIOUS", "LEDGER_MISSING", LEDGER_FILE, "No ledger file was found.")
         check("LEDGER_PRESENT", "shadow_ledger.sqlite3 exists", "FAIL", "missing")
     else:
@@ -618,39 +690,63 @@ def assess_shadow_run(
             check(code, description, "SKIPPED", "no valid checkpoint")
 
     # --- ledger view (virtual clock) and prefix consistency --------------------------------------
+    ledger_read: _LedgerRead | None = None
     ledger_view: LedgerView | None = None
-    ledger_identities: set[tuple[str, int]] | None = None
     if evidence.ledger.present:
         if cp is not None and cp.virtual_now is not None:
             virtual_as_of, basis = cp.virtual_now, "checkpoint virtual_now (last committed delivery)"
         else:
             virtual_as_of, basis = feed.epoch, "feed epoch (no committed delivery or no checkpoint)"
-        ledger_view = _ledger_view(Path(evidence.ledger.path), virtual_as_of, basis, policy)
-        ledger_identities = _ledger_identities(Path(evidence.ledger.path))
+        ledger_read = _read_ledger(Path(evidence.ledger.path), virtual_as_of, basis, policy)
+        ledger_view = ledger_read.view
 
     ledger_ahead_by_one = False
-    prefix_description = "every post committed before the cursor has a ledger row (read-only proxy " \
-                         "for the runner's recorded-outcome check)"
+    prefix_description = (
+        "every post committed before the cursor has a ledger row and decodable latest-attempt "
+        "outcome records (read-only mirror of the runner's recorded-outcome check)"
+    )
     if cp is None or not (feed_identity_ok and cursor_ok):
         check("LEDGER_NOT_BEHIND_CHECKPOINT", prefix_description, "SKIPPED",
               "cursor cannot be read against the feed in use")
-    elif ledger_identities is None:
+    elif ledger_read is None or ledger_read.identities is None or not ledger_read.view.readable:
         check("LEDGER_NOT_BEHIND_CHECKPOINT", prefix_description, "SKIPPED",
               "ledger missing or unreadable")
     else:
+        ledger_identities = ledger_read.identities
         expected_prefix = _prefix_identities(feed, cp.cursor)
         missing = expected_prefix - ledger_identities
         extra = ledger_identities - expected_prefix
+        undecodable = expected_prefix & ledger_read.with_undecodable_outcomes
+        unproven = expected_prefix - missing - undecodable - ledger_read.with_decodable_outcomes
         if missing:
             finding("SERIOUS", "CHECKPOINT_AHEAD_OF_LEDGER", LEDGER_FILE,
                     f"The checkpoint cursor {cp.cursor} covers {len(expected_prefix)} unique post(s) but "
                     f"{len(missing)} of them have no ledger row; the ledger is behind the checkpoint "
                     "(for example replaced) and the runner refuses to resume rather than skip events.")
+        if undecodable:
+            finding("SERIOUS", "LEDGER_OUTCOMES_UNDECODABLE", LEDGER_FILE,
+                    f"{len(undecodable)} committed post(s) have a latest-attempt outcome record that does "
+                    "not decode with the engine's contract. The runner reads these records on resume and "
+                    "fails; the ledger section reports them by error type only.")
+        if unproven:
+            finding("WARNING", "LEDGER_OUTCOMES_NOT_RECORDED", LEDGER_FILE,
+                    f"{len(unproven)} committed post(s) have a ledger row but no recorded outcome. The "
+                    "runner refuses to resume if such a post produced actions, which cannot be established "
+                    "read-only without interpreting the post; resumability is therefore UNKNOWN.")
+        if missing or undecodable:
+            parts = ([f"{len(missing)} without a ledger row"] if missing else []) + (
+                [f"{len(undecodable)} with undecodable outcome records"] if undecodable else []
+            )
             check("LEDGER_NOT_BEHIND_CHECKPOINT", prefix_description, "FAIL",
-                  f"{len(missing)} committed post(s) without a ledger row")
+                  f"committed post(s): {', '.join(parts)}")
+        elif unproven:
+            check("LEDGER_NOT_BEHIND_CHECKPOINT", prefix_description, "SKIPPED",
+                  f"{len(unproven)} committed post(s) without a recorded outcome; outcomes cannot be "
+                  "established read-only")
         else:
             check("LEDGER_NOT_BEHIND_CHECKPOINT", prefix_description, "PASS",
-                  f"{len(expected_prefix)} committed post(s) all on record")
+                  f"{len(expected_prefix)} committed post(s) on record, each with decodable recorded "
+                  "outcomes")
         if extra:
             next_identity = None
             if cp.cursor < total:
@@ -712,7 +808,10 @@ def assess_shadow_run(
                                     "ledger or the ledger changed after it was written.")
     # --- run state -------------------------------------------------------------------------------
     serious = {f.code for f in findings if f.severity == "SERIOUS"}
-    invalid_codes = {"CHECKPOINT_MISSING", "CHECKPOINT_MALFORMED", "LEDGER_MISSING"}
+    invalid_codes = {
+        "CHECKPOINT_MISSING", "CHECKPOINT_MALFORMED", "CHECKPOINT_UNREADABLE",
+        "LEDGER_MISSING", "LEDGER_INACCESSIBLE",
+    }
     ledger_unreadable = ledger_view is not None and not ledger_view.readable
     if serious & invalid_codes or ledger_unreadable:
         run_state: RunState = "INVALID"

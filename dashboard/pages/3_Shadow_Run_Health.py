@@ -127,12 +127,18 @@ st.dataframe(
             "present": f.present,
             "size_bytes": f.size_bytes,
             "written_at (wall clock)": _fmt(f.written_at),
+            "read_error": f.read_error or "—",
             "basis": f.written_at_basis,
         }
         for f in health.files
     ],
     hide_index=True,
 )
+if any(f.read_error for f in health.files):
+    st.warning(
+        "At least one artifact could not be examined or read (exception type shown above, never its "
+        "content). The sections below use only the evidence that could be read."
+    )
 freshness_text = (
     f"**Progress freshness:** {obs.progress_freshness} — last checkpoint write "
     f"{_fmt(obs.checkpoint_written_at)}, age {_fmt_age(obs.checkpoint_age_seconds)} at as-of "
@@ -267,6 +273,12 @@ else:
     for d in ledger.discrepancies:
         message = f"{d.severity} {d.code} [{d.engine}] {d.subject}: {d.detail}"
         (st.error if d.severity == "SERIOUS" else st.warning)(message)
+    if ledger.posts_without_recorded_outcomes or ledger.posts_with_undecodable_outcomes:
+        st.warning(
+            f"{ledger.posts_without_recorded_outcomes} post(s) have no recorded outcome and "
+            f"{ledger.posts_with_undecodable_outcomes} post(s) have an undecodable outcome record; "
+            "see the findings and the resumability checks for the effect on resumability."
+        )
     if not ledger.reconciliation_complete:
         st.error("Reconciliation is INCOMPLETE: the ledger was unreadable or only partly decoded.")
     elif not ledger.discrepancies:

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import pathlib
 import re
 import shutil
 import sqlite3
@@ -20,11 +21,13 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 from streamlit.testing.v1 import AppTest
 
 import tradingbot
 from tradingbot import operational_health as oh
 from tradingbot.shadow_runner import (
+    CHECKPOINT_FILE,
     LEDGER_FILE,
     NON_PRODUCTION_LABEL,
     ShadowRunner,
@@ -675,3 +678,202 @@ def test_page_uses_supplied_artifacts_and_shows_drift_and_contradictions_as_erro
     assert "No run state can be trusted" in shown and "No discrepancies were detected" not in shown
     for marker in ("SYNTHETIC-CHECKPOINT-MARKER", "SYNTHETIC-REPORT-MARKER", *SYNTHETIC_TEXTS):
         assert marker not in shown
+
+
+# ----------------------------------------------------------------------------- review round 1
+
+
+def _resume_check(h: oh.ShadowRunHealth) -> oh.ResumabilityCheck:
+    return next(c for c in h.resumability_checks if c.check == "LEDGER_NOT_BEHIND_CHECKPOINT")
+
+
+def _damaged_copy(base: oh.ShadowRunArtifacts, destination: Path, sql: str) -> oh.ShadowRunArtifacts:
+    """A copy of a scenario (run directory and report) whose ledger the TEST damages with ``sql``."""
+    copy_of(base, destination / "run")
+    report = None
+    if base.report_path is not None:
+        report = destination / oh.REPORT_FILE
+        shutil.copyfile(base.report_path, report)
+    artifacts = oh.ShadowRunArtifacts(label=destination.name, workdir=destination / "run", report_path=report)
+    with closing(sqlite3.connect(str(artifacts.workdir / LEDGER_FILE))) as c, c:
+        c.execute(sql)
+    return artifacts
+
+
+def test_resume_check_requires_decodable_prefix_outcomes_and_matches_the_runner(tmp_path):
+    """The runner's resume validation reads the latest-attempt outcome records of every committed post
+    (PaperEventReplay.outcomes). A post row alone must never pass the read-only mirror of that check."""
+    base = oh.build_scenario(tmp_path / "paused", "paused_by_delivery_cap")
+    control = assess(base)
+    assert control.resumability == "RESUMABLE_BY_CONTRACT" and _resume_check(control).result == "PASS"
+    assert "decodable recorded outcomes" in _resume_check(control).detail
+    assert control.ledger.posts_without_recorded_outcomes == 0
+    assert control.ledger.posts_with_undecodable_outcomes == 0
+    resumed = ShadowRunner(copy_of(base, tmp_path / "control-runner"), FEED, POLICY, resume=True).run()
+    assert resumed.status == "COMPLETE"  # the positive control still holds
+
+    # Action rows deleted while the post row survives: the runner refuses; the view cannot prove the
+    # precondition read-only (the post might have produced no actions), so it is UNKNOWN, never PASS.
+    deleted = _damaged_copy(base, tmp_path / "deleted", "DELETE FROM replay_actions WHERE source_id='e01'")
+    h = assess(deleted)
+    assert h.resumability == "UNKNOWN" and _resume_check(h).result == "SKIPPED"
+    assert "cannot be established read-only" in _resume_check(h).detail
+    findings = {f.code: f for f in h.findings}
+    assert findings["LEDGER_OUTCOMES_NOT_RECORDED"].severity == "WARNING"
+    assert "1 committed post(s)" in findings["LEDGER_OUTCOMES_NOT_RECORDED"].detail
+    assert "REPORT_LEDGER_MISMATCH" in findings and h.run_state == "CONTRADICTORY"
+    assert h.ledger.posts_without_recorded_outcomes == 1
+    assert "REPLAY_IDEA_WITHOUT_FILL" in {d.code for d in h.ledger.discrepancies}
+    with pytest.raises(ShadowStateError, match="has no recorded outcome"):
+        ShadowRunner(copy_of(deleted, tmp_path / "deleted-runner"), FEED, POLICY, resume=True)
+
+    # The latest outcome record does not decode: the runner fails while reading it; the view fails the
+    # check and reports the record by error type only.
+    malformed = _damaged_copy(
+        base, tmp_path / "malformed",
+        "UPDATE replay_actions SET result_json='not json SYNTHETIC-OUTCOME-MARKER' WHERE source_id='e01'",
+    )
+    h = assess(malformed)
+    assert h.resumability == "NOT_RESUMABLE" and _resume_check(h).result == "FAIL"
+    assert "1 with undecodable outcome records" in _resume_check(h).detail
+    findings = {f.code: f for f in h.findings}
+    assert findings["LEDGER_OUTCOMES_UNDECODABLE"].severity == "SERIOUS" and h.run_state == "CONTRADICTORY"
+    assert h.ledger.posts_with_undecodable_outcomes == 1 and not h.ledger.reconciliation_complete
+    assert "REPLAY_RECORD_UNDECODABLE" in {d.code for d in h.ledger.discrepancies}
+    assert "SYNTHETIC-OUTCOME-MARKER" not in h.model_dump_json()
+    with pytest.raises(ValidationError):
+        ShadowRunner(copy_of(malformed, tmp_path / "malformed-runner"), FEED, POLICY, resume=True)
+
+    # Without a report to contradict, UNKNOWN stands on its own (not masked by CONTRADICTORY).
+    interrupted = oh.build_scenario(tmp_path / "interrupted", "interrupted_before_commit")
+    with closing(sqlite3.connect(str(interrupted.workdir / LEDGER_FILE))) as c, c:  # the TEST damages its fixture
+        c.execute("DELETE FROM replay_actions WHERE source_id='e02'")
+    h = assess(interrupted)
+    assert (h.run_state, h.resumability) == ("INCOMPLETE", "UNKNOWN")
+    assert "Resumability: UNKNOWN" in h.headline and h.attention_required
+    assert {f.code for f in h.findings} >= {"LEDGER_OUTCOMES_NOT_RECORDED", "NO_REPORT"}
+    with pytest.raises(ShadowStateError, match="has no recorded outcome"):
+        ShadowRunner(copy_of(interrupted, tmp_path / "interrupted-runner"), FEED, POLICY, resume=True)
+
+
+def _deny(monkeypatch: pytest.MonkeyPatch, filename: str, exc: Exception, method: str = "read_bytes") -> None:
+    """Make ``pathlib.Path.<method>`` raise ``exc`` for one file name; every other path is untouched.
+    No permission bits are changed anywhere."""
+    original = getattr(pathlib.Path, method)
+
+    def guarded(self, *args, **kwargs):
+        if self.name == filename:
+            raise exc
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(pathlib.Path, method, guarded)
+
+
+def test_collector_reports_unreadable_or_vanishing_artifacts_instead_of_aborting(tmp_path, monkeypatch):
+    base = oh.build_scenario(tmp_path / "paused", "paused_by_delivery_cap")
+    before = file_state(base)
+    secret = "REDACTED-PATH-MARKER"
+
+    # Unreadable optional report: the checkpoint and ledger stay visible; the pause can no longer be shown.
+    _deny(monkeypatch, oh.REPORT_FILE, PermissionError(13, "Permission denied", secret))
+    evidence = oh.collect_evidence(base)
+    assert evidence.report.present and evidence.report.read_error == "PermissionError"
+    assert evidence.report_text is None and evidence.checkpoint_text is not None
+    h = oh.assess_shadow_run(evidence, now=evidence.collected_at)
+    assert (h.run_state, h.resumability) == ("INCOMPLETE", "RESUMABLE_BY_CONTRACT")
+    assert h.progress.cursor == 5 and h.progress.report_status is None and h.ledger.readable
+    findings = {f.code: f for f in h.findings}
+    assert findings["REPORT_UNREADABLE"].severity == "WARNING" and "PermissionError" in findings["REPORT_UNREADABLE"].detail
+    assert "NO_REPORT" not in findings
+    dump = h.model_dump_json()
+    assert secret not in dump and "Permission denied" not in dump
+    monkeypatch.undo()
+    _deny(monkeypatch, oh.REPORT_FILE, OSError(5, "Input/output error", secret))
+    assert oh.collect_evidence(base).report.read_error == "OSError"
+    monkeypatch.undo()
+
+    # Unreadable checkpoint: truthful INVALID, the ledger is still read and the report still parsed.
+    _deny(monkeypatch, CHECKPOINT_FILE, PermissionError(13, "Permission denied", secret))
+    evidence = oh.collect_evidence(base)
+    assert evidence.checkpoint.present and evidence.checkpoint.read_error == "PermissionError"
+    assert evidence.checkpoint_text is None
+    h = oh.assess_shadow_run(evidence, now=evidence.collected_at)
+    assert (h.run_state, h.resumability) == ("INVALID", "NOT_RESUMABLE")
+    findings = {f.code: f for f in h.findings}
+    assert findings["CHECKPOINT_UNREADABLE"].severity == "SERIOUS" and "CHECKPOINT_MISSING" not in findings
+    assert "CHECKPOINT_UNREADABLE" in h.headline and h.progress.cursor is None
+    assert h.progress.report_status == "DELIVERY_CAP_REACHED" and h.ledger is not None and h.ledger.readable
+    checks = {c.check: c for c in h.resumability_checks}
+    assert checks["CHECKPOINT_VALID"].result == "FAIL" and "PermissionError" in checks["CHECKPOINT_VALID"].detail
+    assert checks["LEDGER_NOT_BEHIND_CHECKPOINT"].result == "SKIPPED"
+    assert h.observation.progress_freshness == "FRESH"  # the stat succeeded; only the read was refused
+    assert secret not in h.model_dump_json()
+    monkeypatch.undo()
+
+    # Checkpoint stat denied (is_file propagates EACCES): existence unknown, reported as unreadable.
+    _deny(monkeypatch, CHECKPOINT_FILE, PermissionError(13, "Permission denied", secret), method="stat")
+    evidence = oh.collect_evidence(base)
+    assert not evidence.checkpoint.present and evidence.checkpoint.read_error == "PermissionError"
+    assert evidence.checkpoint.written_at is None
+    h = oh.assess_shadow_run(evidence, now=evidence.collected_at)
+    assert h.run_state == "INVALID" and "CHECKPOINT_UNREADABLE" in {f.code for f in h.findings}
+    assert h.observation.progress_freshness == "UNKNOWN"
+    monkeypatch.undo()
+
+    # Ledger stat denied: nothing is read or reconciled, and the view says so.
+    _deny(monkeypatch, LEDGER_FILE, PermissionError(13, "Permission denied", secret), method="stat")
+    evidence = oh.collect_evidence(base)
+    assert not evidence.ledger.present and evidence.ledger.read_error == "PermissionError"
+    h = oh.assess_shadow_run(evidence, now=evidence.collected_at)
+    assert (h.run_state, h.resumability) == ("INVALID", "NOT_RESUMABLE") and h.ledger is None
+    findings = {f.code: f for f in h.findings}
+    assert findings["LEDGER_INACCESSIBLE"].severity == "SERIOUS" and "LEDGER_MISSING" not in findings
+    assert {c.check: c.result for c in h.resumability_checks}["LEDGER_PRESENT"] == "FAIL"
+    monkeypatch.undo()
+
+    assert file_state(base) == before  # nothing above touched the fixture
+
+    # Checkpoint removed between observation and read: the observation is corrected to absent.
+    vanishing = oh.ShadowRunArtifacts(
+        label="vanish", workdir=copy_of(base, tmp_path / "vanish" / "run"), report_path=base.report_path
+    )
+    original = pathlib.Path.read_bytes
+
+    def vanish(self):
+        if self.name == CHECKPOINT_FILE:
+            self.unlink()
+        return original(self)
+
+    monkeypatch.setattr(pathlib.Path, "read_bytes", vanish)
+    evidence = oh.collect_evidence(vanishing)
+    monkeypatch.undo()
+    assert not evidence.checkpoint.present and evidence.checkpoint.read_error is None
+    assert evidence.checkpoint.written_at is None and evidence.checkpoint_text is None
+    assert not (vanishing.workdir / CHECKPOINT_FILE).exists()
+    h = oh.assess_shadow_run(evidence, now=evidence.collected_at)
+    assert h.run_state == "INVALID" and "CHECKPOINT_MISSING" in {f.code for f in h.findings}
+    assert h.observation.progress_freshness == "UNKNOWN"
+
+
+def test_page_survives_an_unreadable_optional_report(tmp_path, monkeypatch):
+    supplied = oh.build_scenario(tmp_path / "supplied", "completed")
+    before = file_state(supplied)
+    _deny(monkeypatch, oh.REPORT_FILE, PermissionError(13, "Permission denied", "REDACTED-PATH-MARKER"))
+    at = page(tmp_path, monkeypatch)
+    at.session_state["srh_scenario"] = "completed"
+    at.session_state["srh_artifacts"] = supplied.model_dump(mode="json")
+    at.run()
+    assert not at.exception
+    metrics = {m.label: m.value for m in at.metric}
+    assert metrics["Run state"] == "COMPLETE" and metrics["Checkpoint cursor"] == f"{TOTAL} / {TOTAL}"
+    assert metrics["Resumability"] == "NOTHING_TO_RESUME" and metrics["Ideas"] == "2"
+    warnings = [w.value for w in at.warning]
+    assert any(w.startswith("WARNING REPORT_UNREADABLE") and "PermissionError" in w for w in warnings)
+    assert any(w.startswith("At least one artifact could not be examined or read") for w in warnings)
+    files = at.dataframe[0].value
+    assert list(files["read_error"]) == ["—", "—", "PermissionError"]
+    shown = texts(at)
+    assert "Report:** none readable" in shown and "REDACTED-PATH-MARKER" not in shown
+    assert "Permission denied" not in shown
+    monkeypatch.undo()  # the denial served its purpose; the fixture itself must be untouched
+    assert page_artifacts(at) == supplied and file_state(supplied) == before

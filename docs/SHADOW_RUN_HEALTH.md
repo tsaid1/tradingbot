@@ -67,26 +67,34 @@ changes the run state and is not a runner setting or trading policy.
 | `UNKNOWN` | a precondition could not be evaluated (no valid checkpoint, unreadable ledger). |
 
 Preconditions: `CHECKPOINT_VALID`, `LEDGER_PRESENT`, `FEED_IDENTITY`, `POLICY_IDENTITY`,
-`LEDGER_FILE_NAME`, `CURSOR_WITHIN_FEED`, `LEDGER_NOT_BEHIND_CHECKPOINT`. The last is a read-only proxy
-for the runner's recorded-outcome check: every unique post committed before the cursor must have a
-`replay_posts` row. `tests/test_operational_health.py` proves the prediction against the runner on
-copies of every scenario (refusal with `ShadowStateError` where `NOT_RESUMABLE`, convergence to
-`COMPLETE` otherwise).
+`LEDGER_FILE_NAME`, `CURSOR_WITHIN_FEED`, `LEDGER_NOT_BEHIND_CHECKPOINT`. The last mirrors the runner's
+recorded-outcome check read-only, using the OPS-01 snapshot's validation rows (the latest-attempt
+outcome records decoded with the engine's contract, exactly what `PaperEventReplay.outcomes` reads):
+every unique post committed before the cursor must have a `replay_posts` row **and** decodable
+latest-attempt outcome records. A missing row or an undecodable record fails the check; a post row with
+no outcome record at all cannot be judged read-only (the runner accepts it only if the post produced no
+actions, which would need the interpreter), so the check is `SKIPPED` and the verdict is `UNKNOWN`,
+never a pass. `tests/test_operational_health.py` proves the prediction against the runner on copies:
+refusal (`ShadowStateError`, or a pydantic `ValidationError` for an undecodable record) wherever the
+view says `NOT_RESUMABLE` or `UNKNOWN` for the damaged copies, convergence to `COMPLETE` for the valid
+positive controls.
 
 **Findings** (`SERIOUS` rendered as errors, `WARNING` as warnings, `INFO` as info):
 
 | Code | Severity | Meaning |
 |---|---|---|
-| `CHECKPOINT_MISSING`, `CHECKPOINT_MALFORMED` | SERIOUS | no checkpoint, or one that does not parse with the runner's contract (error types only; content never shown) |
-| `LEDGER_MISSING` | SERIOUS | no ledger file |
+| `CHECKPOINT_MISSING`, `CHECKPOINT_MALFORMED`, `CHECKPOINT_UNREADABLE` | SERIOUS | no checkpoint; one that does not parse with the runner's contract (error types only; content never shown); or one that could not be examined or read (exception type only) |
+| `LEDGER_MISSING`, `LEDGER_INACCESSIBLE` | SERIOUS | no ledger file, or a ledger file that could not be examined |
 | `FEED_IDENTITY_MISMATCH`, `POLICY_IDENTITY_MISMATCH`, `LEDGER_FILE_NAME_UNEXPECTED` | SERIOUS | the checkpoint belongs to another feed, policy or ledger file; the cursor is not read against this feed |
 | `CURSOR_BEYOND_FEED` | SERIOUS | cursor larger than the feed's delivery count |
 | `CHECKPOINT_AHEAD_OF_LEDGER` | SERIOUS | a committed post has no ledger row (ledger replaced or lost); the runner refuses rather than skip events |
 | `LEDGER_CONTAINS_UNEXPECTED_POSTS` | SERIOUS | ledger rows the committed prefix does not explain (another run's ledger) |
+| `LEDGER_OUTCOMES_UNDECODABLE` | SERIOUS | a committed post's latest-attempt outcome record does not decode; the runner reads it on resume and fails |
+| `LEDGER_OUTCOMES_NOT_RECORDED` | WARNING | a committed post has a ledger row but no outcome record; the runner refuses if the post produced actions, which cannot be established read-only, so resumability is `UNKNOWN` |
 | `LEDGER_ONE_AHEAD_OF_CHECKPOINT` | WARNING | exactly the next delivery is in the ledger but not covered by the checkpoint: the post-commit, pre-checkpoint crash window. On resume the coordinator records a duplicate; nothing fills twice. |
 | `REPORT_IDENTITY_MISMATCH`, `REPORT_CONTRADICTS_CHECKPOINT`, `REPORT_LEDGER_MISMATCH` | SERIOUS | the report describes another run, claims a cursor or completion the checkpoint does not support, or its ledger summary (orders, ideas, outcome counts) differs from the read-only ledger view |
 | `REPORT_SUPERSEDED` | WARNING | the report ends before the checkpoint cursor: an earlier invocation's report; not compared with the ledger |
-| `REPORT_MALFORMED`, `REPORT_LABEL_UNEXPECTED` | WARNING | the optional report does not parse, or lacks the runner's non-production label |
+| `REPORT_MALFORMED`, `REPORT_UNREADABLE`, `REPORT_LABEL_UNEXPECTED` | WARNING | the optional report does not parse, could not be examined or read (exception type only), or lacks the runner's non-production label; the run state is then taken from the checkpoint alone |
 | `CHECKPOINT_WRITE_TIME_UNKNOWN`, `CHECKPOINT_WRITE_IN_FUTURE` | WARNING | no write time available; or a write time beyond the as-of clock (clock skew or altered metadata) |
 | `NO_RECENT_PROGRESS` | WARNING on `INCOMPLETE`, INFO on `PAUSED` | no checkpoint write within the display threshold |
 | `RECENT_WRITE_OBSERVED` | INFO | a recent write on an incomplete run; liveness still UNKNOWN |
@@ -115,6 +123,13 @@ reports a past exit that the ledger never executed.
 * A malformed checkpoint or report is reported by validation error type and count only; the tests plant
   markers in the malformed files and assert they reach neither the health model nor the page. Source text
   is never selected or rendered: the health model carries no `text`, `post_hash` or raw artifact field.
+* The collector never raises on a file it cannot examine or read. A `PermissionError` or other `OSError`
+  from `stat` or `read_bytes` is recorded on the file observation by exception type only (never the
+  message, which may carry a path), and a file removed between observation and reading is reported as
+  absent. An unreadable optional report leaves the checkpoint and ledger sections intact
+  (`REPORT_UNREADABLE`); an unreadable checkpoint or ledger yields the truthful `INVALID` state
+  (`CHECKPOINT_UNREADABLE`, `LEDGER_INACCESSIBLE`). The tests reproduce these with a monkeypatched
+  `pathlib.Path` method for one file name, without changing any permission bits.
 
 ## Synthetic scenarios
 
@@ -179,8 +194,9 @@ print(health.run_state, health.resumability, health.headline)
   heartbeat would be a producer change requiring its own review.
 * File write times are filesystem metadata. Copying, restoring or touching a file changes them; they are
   shown with their basis and never upgraded into a runner timestamp.
-* The ledger-prefix check compares post identities, a proxy for the runner's recorded-outcome check; the
-  runner's own validation remains authoritative on resume.
+* The ledger-prefix check establishes decodable latest-attempt outcome records per committed post from
+  the OPS-01 snapshot; it cannot tell a deleted outcome from a post that produced no actions without the
+  interpreter, so that case is `UNKNOWN`. The runner's own validation remains authoritative on resume.
 * The report-versus-ledger comparison uses the OPS-01 snapshot (orders, ideas, latest-attempt outcome
   counts); it does not recompute the runner's convergence digest.
 * The view describes one run directory at a time against the shipped synthetic feed and mock policy;
