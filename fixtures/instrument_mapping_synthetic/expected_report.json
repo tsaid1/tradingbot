@@ -1,0 +1,1075 @@
+{
+  "authority": "NON_AUTHORITATIVE",
+  "headlines": {
+    "AMBIGUOUS": 3,
+    "INFO": 2,
+    "INVALID": 3,
+    "MISMATCH": 11,
+    "MISSING": 5,
+    "UNSUPPORTED": 2
+  },
+  "notice": "Non-authoritative offline diagnostic over synthetic mapping records. It reports metadata gaps, ambiguities, mismatches and invalid economics only. It performs no price conversion, roll choice, source-to-contract selection, sizing, order construction or authorization. INFO findings are not trading permission; the deterministic gateway is unchanged and still decides every action.",
+  "record_count": 26,
+  "records": [
+    {
+      "asset_class": "EQUITY",
+      "authority": "NON_AUTHORITATIVE",
+      "counts": {
+        "AMBIGUOUS": 0,
+        "INFO": 1,
+        "INVALID": 0,
+        "MISMATCH": 0,
+        "MISSING": 0,
+        "UNSUPPORTED": 0
+      },
+      "findings": [
+        {
+          "code": "DIRECT_IDENTITY_CONTROL",
+          "detail": "Source label ABC equals instrument label ABC and the quoted level is stated as the traded contract's own price. Informational control only: this is not trading permission and the gateway still applies every provenance, freshness, quote and policy rule.",
+          "field": null,
+          "kind": "INFO"
+        }
+      ],
+      "headline": "INFO",
+      "identity": "DIRECT",
+      "record_id": "eq_direct_control",
+      "runtime_scope": "EQUITY_ETF_GATEWAY_CHECKS_STILL_APPLY"
+    },
+    {
+      "asset_class": "ETF",
+      "authority": "NON_AUTHORITATIVE",
+      "counts": {
+        "AMBIGUOUS": 0,
+        "INFO": 1,
+        "INVALID": 0,
+        "MISMATCH": 0,
+        "MISSING": 0,
+        "UNSUPPORTED": 0
+      },
+      "findings": [
+        {
+          "code": "DIRECT_IDENTITY_CONTROL",
+          "detail": "Source label TLT equals instrument label TLT and the quoted level is stated as the traded contract's own price. Informational control only: this is not trading permission and the gateway still applies every provenance, freshness, quote and policy rule.",
+          "field": null,
+          "kind": "INFO"
+        }
+      ],
+      "headline": "INFO",
+      "identity": "DIRECT",
+      "record_id": "etf_direct_control",
+      "runtime_scope": "EQUITY_ETF_GATEWAY_CHECKS_STILL_APPLY"
+    },
+    {
+      "asset_class": "EQUITY",
+      "authority": "NON_AUTHORITATIVE",
+      "counts": {
+        "AMBIGUOUS": 1,
+        "INFO": 1,
+        "INVALID": 0,
+        "MISMATCH": 0,
+        "MISSING": 3,
+        "UNSUPPORTED": 0
+      },
+      "findings": [
+        {
+          "code": "DIRECT_IDENTITY_CONTROL",
+          "detail": "Source label ABC equals instrument label ABC and the quoted level is stated as the traded contract's own price. Informational control only: this is not trading permission and the gateway still applies every provenance, freshness, quote and policy rule.",
+          "field": null,
+          "kind": "INFO"
+        },
+        {
+          "code": "SOURCE_CURRENCY_MISSING",
+          "detail": "The source series states no currency.",
+          "field": "source.currency",
+          "kind": "MISSING"
+        },
+        {
+          "code": "SOURCE_UNIT_MISSING",
+          "detail": "The source series states no unit (per share, index point, per barrel...).",
+          "field": "source.unit",
+          "kind": "MISSING"
+        },
+        {
+          "code": "CONTRACT_SPEC_MISSING",
+          "detail": "No contract economics (currency, unit, multiplier, tick) are stated for the instrument.",
+          "field": "contract",
+          "kind": "MISSING"
+        },
+        {
+          "code": "LISTING_VENUE_UNSPECIFIED",
+          "detail": "A bare ticker without a listing venue can denote different securities on different markets; no venue is chosen.",
+          "field": "instrument.exchange",
+          "kind": "AMBIGUOUS"
+        }
+      ],
+      "headline": "MISSING",
+      "identity": "DIRECT",
+      "record_id": "eq_bare_ticker",
+      "runtime_scope": "EQUITY_ETF_GATEWAY_CHECKS_STILL_APPLY"
+    },
+    {
+      "asset_class": "EQUITY",
+      "authority": "NON_AUTHORITATIVE",
+      "counts": {
+        "AMBIGUOUS": 1,
+        "INFO": 0,
+        "INVALID": 0,
+        "MISMATCH": 0,
+        "MISSING": 0,
+        "UNSUPPORTED": 0
+      },
+      "findings": [
+        {
+          "code": "PRICE_BASIS_UNKNOWN",
+          "detail": "The record does not say whether the quoted level is the traded contract's price or a source-series level; no basis is assumed.",
+          "field": "price_basis",
+          "kind": "AMBIGUOUS"
+        }
+      ],
+      "headline": "AMBIGUOUS",
+      "identity": "DIRECT",
+      "record_id": "eq_basis_unknown",
+      "runtime_scope": "EQUITY_ETF_GATEWAY_CHECKS_STILL_APPLY"
+    },
+    {
+      "asset_class": "EQUITY",
+      "authority": "NON_AUTHORITATIVE",
+      "counts": {
+        "AMBIGUOUS": 1,
+        "INFO": 0,
+        "INVALID": 0,
+        "MISMATCH": 0,
+        "MISSING": 0,
+        "UNSUPPORTED": 0
+      },
+      "findings": [
+        {
+          "code": "SOURCE_SERIES_KIND_UNKNOWN",
+          "detail": "The source series is not classified (index, spot, continuous, listed security...); its orderability cannot be assessed.",
+          "field": "source.kind",
+          "kind": "AMBIGUOUS"
+        }
+      ],
+      "headline": "AMBIGUOUS",
+      "identity": "DIRECT",
+      "record_id": "eq_source_kind_unknown",
+      "runtime_scope": "EQUITY_ETF_GATEWAY_CHECKS_STILL_APPLY"
+    },
+    {
+      "asset_class": "EQUITY",
+      "authority": "NON_AUTHORITATIVE",
+      "counts": {
+        "AMBIGUOUS": 1,
+        "INFO": 1,
+        "INVALID": 0,
+        "MISMATCH": 0,
+        "MISSING": 0,
+        "UNSUPPORTED": 0
+      },
+      "findings": [
+        {
+          "code": "DIRECT_IDENTITY_CONTROL",
+          "detail": "Source label ABC equals instrument label ABC and the quoted level is stated as the traded contract's own price. Informational control only: this is not trading permission and the gateway still applies every provenance, freshness, quote and policy rule.",
+          "field": null,
+          "kind": "INFO"
+        },
+        {
+          "code": "QUOTED_LEVEL_OFF_TICK_GRID",
+          "detail": "Quoted level 100.005 is not a multiple of the stated tick size 0.01, which is unusual for a level said to be the contract's own price.",
+          "field": "source.quoted_level",
+          "kind": "AMBIGUOUS"
+        }
+      ],
+      "headline": "AMBIGUOUS",
+      "identity": "DIRECT",
+      "record_id": "eq_off_tick_grid",
+      "runtime_scope": "EQUITY_ETF_GATEWAY_CHECKS_STILL_APPLY"
+    },
+    {
+      "asset_class": "EQUITY",
+      "authority": "NON_AUTHORITATIVE",
+      "counts": {
+        "AMBIGUOUS": 1,
+        "INFO": 1,
+        "INVALID": 0,
+        "MISMATCH": 2,
+        "MISSING": 0,
+        "UNSUPPORTED": 0
+      },
+      "findings": [
+        {
+          "code": "DIRECT_IDENTITY_CONTROL",
+          "detail": "Source label ABC.A equals instrument label ABC.A and the quoted level is stated as the traded contract's own price. Informational control only: this is not trading permission and the gateway still applies every provenance, freshness, quote and policy rule.",
+          "field": null,
+          "kind": "INFO"
+        },
+        {
+          "code": "CURRENCY_MISMATCH",
+          "detail": "Source currency CAD differs from instrument currency USD; no FX conversion is performed.",
+          "field": "contract.currency",
+          "kind": "MISMATCH"
+        },
+        {
+          "code": "UNIT_MISMATCH",
+          "detail": "Source unit CAD_PER_SHARE differs from instrument unit USD_PER_SHARE; no unit conversion is performed.",
+          "field": "contract.unit",
+          "kind": "MISMATCH"
+        },
+        {
+          "code": "SYMBOL_SUFFIX_CONVENTION_AMBIGUOUS",
+          "detail": "Symbol 'ABC.A' carries a share-class or suffix separator whose spelling differs between venues and vendors.",
+          "field": "instrument.symbol",
+          "kind": "AMBIGUOUS"
+        }
+      ],
+      "headline": "MISMATCH",
+      "identity": "DIRECT",
+      "record_id": "eq_suffix_and_currency",
+      "runtime_scope": "EQUITY_ETF_GATEWAY_CHECKS_STILL_APPLY"
+    },
+    {
+      "asset_class": "EQUITY",
+      "authority": "NON_AUTHORITATIVE",
+      "counts": {
+        "AMBIGUOUS": 0,
+        "INFO": 1,
+        "INVALID": 0,
+        "MISMATCH": 1,
+        "MISSING": 0,
+        "UNSUPPORTED": 0
+      },
+      "findings": [
+        {
+          "code": "DIRECT_IDENTITY_CONTROL",
+          "detail": "Source label ABC equals instrument label ABC and the quoted level is stated as the traded contract's own price. Informational control only: this is not trading permission and the gateway still applies every provenance, freshness, quote and policy rule.",
+          "field": null,
+          "kind": "INFO"
+        },
+        {
+          "code": "DERIVATIVE_FIELDS_ON_CASH_INSTRUMENT",
+          "detail": "EQUITY carries derivative fields expiry, strike, option_right; the identifiers contradict the asset class.",
+          "field": "instrument",
+          "kind": "MISMATCH"
+        }
+      ],
+      "headline": "MISMATCH",
+      "identity": "DIRECT",
+      "record_id": "eq_derivative_fields",
+      "runtime_scope": "EQUITY_ETF_GATEWAY_CHECKS_STILL_APPLY"
+    },
+    {
+      "asset_class": "EQUITY",
+      "authority": "NON_AUTHORITATIVE",
+      "counts": {
+        "AMBIGUOUS": 1,
+        "INFO": 2,
+        "INVALID": 0,
+        "MISMATCH": 0,
+        "MISSING": 3,
+        "UNSUPPORTED": 0
+      },
+      "findings": [
+        {
+          "code": "BLANK_FIELDS_TREATED_AS_ABSENT",
+          "detail": "Whitespace-only values were treated as not stated: source.currency, source.unit, instrument.exchange, contract.unit.",
+          "field": null,
+          "kind": "INFO"
+        },
+        {
+          "code": "DIRECT_IDENTITY_CONTROL",
+          "detail": "Source label ABC equals instrument label ABC and the quoted level is stated as the traded contract's own price. Informational control only: this is not trading permission and the gateway still applies every provenance, freshness, quote and policy rule.",
+          "field": null,
+          "kind": "INFO"
+        },
+        {
+          "code": "SOURCE_CURRENCY_MISSING",
+          "detail": "The source series states no currency.",
+          "field": "source.currency",
+          "kind": "MISSING"
+        },
+        {
+          "code": "SOURCE_UNIT_MISSING",
+          "detail": "The source series states no unit (per share, index point, per barrel...).",
+          "field": "source.unit",
+          "kind": "MISSING"
+        },
+        {
+          "code": "TRADED_UNIT_MISSING",
+          "detail": "The instrument states no price unit.",
+          "field": "contract.unit",
+          "kind": "MISSING"
+        },
+        {
+          "code": "LISTING_VENUE_UNSPECIFIED",
+          "detail": "A bare ticker without a listing venue can denote different securities on different markets; no venue is chosen.",
+          "field": "instrument.exchange",
+          "kind": "AMBIGUOUS"
+        }
+      ],
+      "headline": "MISSING",
+      "identity": "DIRECT",
+      "record_id": "eq_blank_metadata",
+      "runtime_scope": "EQUITY_ETF_GATEWAY_CHECKS_STILL_APPLY"
+    },
+    {
+      "asset_class": "ETF",
+      "authority": "NON_AUTHORITATIVE",
+      "counts": {
+        "AMBIGUOUS": 0,
+        "INFO": 0,
+        "INVALID": 0,
+        "MISMATCH": 3,
+        "MISSING": 0,
+        "UNSUPPORTED": 0
+      },
+      "findings": [
+        {
+          "code": "PRICE_BASIS_NOT_TRADED_CONTRACT",
+          "detail": "The quoted level is a source-series level, not the instrument's own price. No conversion is performed; the gateway holds such actions as SOURCE_TO_BROKER_PRICE_BASIS_UNRESOLVED.",
+          "field": "price_basis",
+          "kind": "MISMATCH"
+        },
+        {
+          "code": "SOURCE_SERIES_PROXY_MISMATCH",
+          "detail": "The quoted INDEX series SPX is not the ETF SPY; using one as a proxy for the other is a mapping decision this diagnostic does not make.",
+          "field": "source.symbol",
+          "kind": "MISMATCH"
+        },
+        {
+          "code": "UNIT_MISMATCH",
+          "detail": "Source unit INDEX_POINT differs from instrument unit USD_PER_SHARE; no unit conversion is performed.",
+          "field": "contract.unit",
+          "kind": "MISMATCH"
+        }
+      ],
+      "headline": "MISMATCH",
+      "identity": "DIFFERENT",
+      "record_id": "etf_spx_index_proxy",
+      "runtime_scope": "EQUITY_ETF_GATEWAY_CHECKS_STILL_APPLY"
+    },
+    {
+      "asset_class": "ETF",
+      "authority": "NON_AUTHORITATIVE",
+      "counts": {
+        "AMBIGUOUS": 0,
+        "INFO": 0,
+        "INVALID": 0,
+        "MISMATCH": 3,
+        "MISSING": 0,
+        "UNSUPPORTED": 0
+      },
+      "findings": [
+        {
+          "code": "PRICE_BASIS_CLAIM_CONFLICT",
+          "detail": "price_basis claims TRADED_CONTRACT but the source series kind is INDEX, which cannot be the price of an orderable contract.",
+          "field": "price_basis",
+          "kind": "MISMATCH"
+        },
+        {
+          "code": "SOURCE_SERIES_PROXY_MISMATCH",
+          "detail": "The quoted INDEX series SPX is not the ETF SPY; using one as a proxy for the other is a mapping decision this diagnostic does not make.",
+          "field": "source.symbol",
+          "kind": "MISMATCH"
+        },
+        {
+          "code": "UNIT_MISMATCH",
+          "detail": "Source unit INDEX_POINT differs from instrument unit USD_PER_SHARE; no unit conversion is performed.",
+          "field": "contract.unit",
+          "kind": "MISMATCH"
+        }
+      ],
+      "headline": "MISMATCH",
+      "identity": "DIFFERENT",
+      "record_id": "etf_spx_claimed_traded_basis",
+      "runtime_scope": "EQUITY_ETF_GATEWAY_CHECKS_STILL_APPLY"
+    },
+    {
+      "asset_class": "ETF",
+      "authority": "NON_AUTHORITATIVE",
+      "counts": {
+        "AMBIGUOUS": 0,
+        "INFO": 0,
+        "INVALID": 0,
+        "MISMATCH": 3,
+        "MISSING": 0,
+        "UNSUPPORTED": 0
+      },
+      "findings": [
+        {
+          "code": "PRICE_BASIS_NOT_TRADED_CONTRACT",
+          "detail": "The quoted level is a source-series level, not the instrument's own price. No conversion is performed; the gateway holds such actions as SOURCE_TO_BROKER_PRICE_BASIS_UNRESOLVED.",
+          "field": "price_basis",
+          "kind": "MISMATCH"
+        },
+        {
+          "code": "SOURCE_SERIES_PROXY_MISMATCH",
+          "detail": "The quoted SPOT series GOLD_SPOT is not the ETF GLD; using one as a proxy for the other is a mapping decision this diagnostic does not make.",
+          "field": "source.symbol",
+          "kind": "MISMATCH"
+        },
+        {
+          "code": "UNIT_MISMATCH",
+          "detail": "Source unit USD_PER_TROY_OUNCE differs from instrument unit USD_PER_SHARE; no unit conversion is performed.",
+          "field": "contract.unit",
+          "kind": "MISMATCH"
+        }
+      ],
+      "headline": "MISMATCH",
+      "identity": "DIFFERENT",
+      "record_id": "etf_gold_spot_proxy",
+      "runtime_scope": "EQUITY_ETF_GATEWAY_CHECKS_STILL_APPLY"
+    },
+    {
+      "asset_class": "ETF",
+      "authority": "NON_AUTHORITATIVE",
+      "counts": {
+        "AMBIGUOUS": 0,
+        "INFO": 0,
+        "INVALID": 0,
+        "MISMATCH": 4,
+        "MISSING": 0,
+        "UNSUPPORTED": 0
+      },
+      "findings": [
+        {
+          "code": "PRICE_BASIS_NOT_TRADED_CONTRACT",
+          "detail": "The quoted level is a source-series level, not the instrument's own price. No conversion is performed; the gateway holds such actions as SOURCE_TO_BROKER_PRICE_BASIS_UNRESOLVED.",
+          "field": "price_basis",
+          "kind": "MISMATCH"
+        },
+        {
+          "code": "SOURCE_SERIES_PROXY_MISMATCH",
+          "detail": "The quoted SPOT series WTI_SPOT is not the ETF OILF; using one as a proxy for the other is a mapping decision this diagnostic does not make.",
+          "field": "source.symbol",
+          "kind": "MISMATCH"
+        },
+        {
+          "code": "CURRENCY_MISMATCH",
+          "detail": "Source currency USD differs from instrument currency GBP; no FX conversion is performed.",
+          "field": "contract.currency",
+          "kind": "MISMATCH"
+        },
+        {
+          "code": "UNIT_MISMATCH",
+          "detail": "Source unit USD_PER_BARREL differs from instrument unit GBP_PER_SHARE; no unit conversion is performed.",
+          "field": "contract.unit",
+          "kind": "MISMATCH"
+        }
+      ],
+      "headline": "MISMATCH",
+      "identity": "DIFFERENT",
+      "record_id": "etf_crude_spot_proxy_currency",
+      "runtime_scope": "EQUITY_ETF_GATEWAY_CHECKS_STILL_APPLY"
+    },
+    {
+      "asset_class": "OPTION",
+      "authority": "NON_AUTHORITATIVE",
+      "counts": {
+        "AMBIGUOUS": 0,
+        "INFO": 1,
+        "INVALID": 0,
+        "MISMATCH": 1,
+        "MISSING": 0,
+        "UNSUPPORTED": 1
+      },
+      "findings": [
+        {
+          "code": "PRICE_BASIS_NOT_TRADED_CONTRACT",
+          "detail": "The quoted level is a source-series level, not the instrument's own price. No conversion is performed; the gateway holds such actions as SOURCE_TO_BROKER_PRICE_BASIS_UNRESOLVED.",
+          "field": "price_basis",
+          "kind": "MISMATCH"
+        },
+        {
+          "code": "SOURCE_IS_STATED_UNDERLYING",
+          "detail": "The record states SPX as the underlying of SPX-SYN-20261218-6000-C. The contract's price is not the underlying level; no basis, carry, premium, roll or contract selection is derived.",
+          "field": null,
+          "kind": "INFO"
+        },
+        {
+          "code": "RUNTIME_ASSET_CLASS_UNSUPPORTED",
+          "detail": "OPTION cannot be acted on by the current paper adapter: the gateway holds it as ASSET_CLASS_PAPER_ADAPTER_UNSUPPORTED however complete the contract metadata is.",
+          "field": "instrument.asset_class",
+          "kind": "UNSUPPORTED"
+        }
+      ],
+      "headline": "MISMATCH",
+      "identity": "DERIVATIVE_OF_SOURCE",
+      "record_id": "opt_index_complete",
+      "runtime_scope": "ASSET_CLASS_UNSUPPORTED_IN_CURRENT_RUNTIME"
+    },
+    {
+      "asset_class": "OPTION",
+      "authority": "NON_AUTHORITATIVE",
+      "counts": {
+        "AMBIGUOUS": 0,
+        "INFO": 1,
+        "INVALID": 0,
+        "MISMATCH": 0,
+        "MISSING": 0,
+        "UNSUPPORTED": 1
+      },
+      "findings": [
+        {
+          "code": "DIRECT_IDENTITY_CONTROL",
+          "detail": "Source label SPX-SYN-20261218-6000-C equals instrument label SPX-SYN-20261218-6000-C and the quoted level is stated as the traded contract's own price. Informational control only: this is not trading permission and the gateway still applies every provenance, freshness, quote and policy rule.",
+          "field": null,
+          "kind": "INFO"
+        },
+        {
+          "code": "RUNTIME_ASSET_CLASS_UNSUPPORTED",
+          "detail": "OPTION cannot be acted on by the current paper adapter: the gateway holds it as ASSET_CLASS_PAPER_ADAPTER_UNSUPPORTED however complete the contract metadata is.",
+          "field": "instrument.asset_class",
+          "kind": "UNSUPPORTED"
+        }
+      ],
+      "headline": "UNSUPPORTED",
+      "identity": "DIRECT",
+      "record_id": "opt_premium_quoted_complete",
+      "runtime_scope": "ASSET_CLASS_UNSUPPORTED_IN_CURRENT_RUNTIME"
+    },
+    {
+      "asset_class": "OPTION",
+      "authority": "NON_AUTHORITATIVE",
+      "counts": {
+        "AMBIGUOUS": 3,
+        "INFO": 1,
+        "INVALID": 0,
+        "MISMATCH": 0,
+        "MISSING": 6,
+        "UNSUPPORTED": 1
+      },
+      "findings": [
+        {
+          "code": "PRICE_BASIS_UNKNOWN",
+          "detail": "The record does not say whether the quoted level is the traded contract's price or a source-series level; no basis is assumed.",
+          "field": "price_basis",
+          "kind": "AMBIGUOUS"
+        },
+        {
+          "code": "SOURCE_IS_STATED_UNDERLYING",
+          "detail": "The record states SPX as the underlying of SPXOPT. The contract's price is not the underlying level; no basis, carry, premium, roll or contract selection is derived.",
+          "field": null,
+          "kind": "INFO"
+        },
+        {
+          "code": "MULTIPLIER_MISSING",
+          "detail": "A derivative without a stated multiplier has undefined notional per contract.",
+          "field": "contract.multiplier",
+          "kind": "MISSING"
+        },
+        {
+          "code": "LISTING_VENUE_UNSPECIFIED",
+          "detail": "The venue is part of a derivative's identity and is not stated.",
+          "field": "instrument.exchange",
+          "kind": "AMBIGUOUS"
+        },
+        {
+          "code": "OPTION_EXPIRY_MISSING",
+          "detail": "OPTION states no expiry / last trade date.",
+          "field": "instrument.expiry",
+          "kind": "MISSING"
+        },
+        {
+          "code": "OPTION_STRIKE_MISSING",
+          "detail": "The option states no strike.",
+          "field": "instrument.strike",
+          "kind": "MISSING"
+        },
+        {
+          "code": "OPTION_RIGHT_MISSING",
+          "detail": "The option states neither CALL nor PUT.",
+          "field": "instrument.option_right",
+          "kind": "MISSING"
+        },
+        {
+          "code": "OPTION_EXERCISE_STYLE_MISSING",
+          "detail": "Exercise style (AMERICAN/EUROPEAN) is not stated.",
+          "field": "contract.exercise_style",
+          "kind": "MISSING"
+        },
+        {
+          "code": "OPTION_SETTLEMENT_MISSING",
+          "detail": "Settlement (CASH/PHYSICAL) is not stated.",
+          "field": "contract.settlement",
+          "kind": "MISSING"
+        },
+        {
+          "code": "OPTION_SETTLEMENT_TIME_UNSPECIFIED",
+          "detail": "Cash-settled option series with AM and PM settlement are distinct listings; the record does not say which.",
+          "field": "contract.settlement_time",
+          "kind": "AMBIGUOUS"
+        },
+        {
+          "code": "RUNTIME_ASSET_CLASS_UNSUPPORTED",
+          "detail": "OPTION cannot be acted on by the current paper adapter: the gateway holds it as ASSET_CLASS_PAPER_ADAPTER_UNSUPPORTED however complete the contract metadata is.",
+          "field": "instrument.asset_class",
+          "kind": "UNSUPPORTED"
+        }
+      ],
+      "headline": "MISSING",
+      "identity": "DERIVATIVE_OF_SOURCE",
+      "record_id": "opt_incomplete",
+      "runtime_scope": "ASSET_CLASS_UNSUPPORTED_IN_CURRENT_RUNTIME"
+    },
+    {
+      "asset_class": "OPTION",
+      "authority": "NON_AUTHORITATIVE",
+      "counts": {
+        "AMBIGUOUS": 0,
+        "INFO": 1,
+        "INVALID": 3,
+        "MISMATCH": 1,
+        "MISSING": 0,
+        "UNSUPPORTED": 1
+      },
+      "findings": [
+        {
+          "code": "PRICE_BASIS_NOT_TRADED_CONTRACT",
+          "detail": "The quoted level is a source-series level, not the instrument's own price. No conversion is performed; the gateway holds such actions as SOURCE_TO_BROKER_PRICE_BASIS_UNRESOLVED.",
+          "field": "price_basis",
+          "kind": "MISMATCH"
+        },
+        {
+          "code": "SOURCE_IS_STATED_UNDERLYING",
+          "detail": "The record states ABC as the underlying of ABC-SYN-20261016-95-P. The contract's price is not the underlying level; no basis, carry, premium, roll or contract selection is derived.",
+          "field": null,
+          "kind": "INFO"
+        },
+        {
+          "code": "MULTIPLIER_INVALID",
+          "detail": "Multiplier '0' is not a positive finite decimal.",
+          "field": "contract.multiplier",
+          "kind": "INVALID"
+        },
+        {
+          "code": "CONTRACT_EXPIRED_AT_AS_OF",
+          "detail": "Expiry 2026-10-16 is before the record's as_of date 2026-11-06.",
+          "field": "instrument.expiry",
+          "kind": "INVALID"
+        },
+        {
+          "code": "OPTION_STRIKE_INVALID",
+          "detail": "Strike '-95' is not a positive finite decimal.",
+          "field": "instrument.strike",
+          "kind": "INVALID"
+        },
+        {
+          "code": "RUNTIME_ASSET_CLASS_UNSUPPORTED",
+          "detail": "OPTION cannot be acted on by the current paper adapter: the gateway holds it as ASSET_CLASS_PAPER_ADAPTER_UNSUPPORTED however complete the contract metadata is.",
+          "field": "instrument.asset_class",
+          "kind": "UNSUPPORTED"
+        }
+      ],
+      "headline": "INVALID",
+      "identity": "DERIVATIVE_OF_SOURCE",
+      "record_id": "opt_invalid_economics",
+      "runtime_scope": "ASSET_CLASS_UNSUPPORTED_IN_CURRENT_RUNTIME"
+    },
+    {
+      "asset_class": "FUTURE",
+      "authority": "NON_AUTHORITATIVE",
+      "counts": {
+        "AMBIGUOUS": 0,
+        "INFO": 1,
+        "INVALID": 0,
+        "MISMATCH": 1,
+        "MISSING": 0,
+        "UNSUPPORTED": 1
+      },
+      "findings": [
+        {
+          "code": "PRICE_BASIS_NOT_TRADED_CONTRACT",
+          "detail": "The quoted level is a source-series level, not the instrument's own price. No conversion is performed; the gateway holds such actions as SOURCE_TO_BROKER_PRICE_BASIS_UNRESOLVED.",
+          "field": "price_basis",
+          "kind": "MISMATCH"
+        },
+        {
+          "code": "SOURCE_IS_STATED_UNDERLYING",
+          "detail": "The record states SPX as the underlying of IDXFZ26. The contract's price is not the underlying level; no basis, carry, premium, roll or contract selection is derived.",
+          "field": null,
+          "kind": "INFO"
+        },
+        {
+          "code": "RUNTIME_ASSET_CLASS_UNSUPPORTED",
+          "detail": "FUTURE cannot be acted on by the current paper adapter: the gateway holds it as ASSET_CLASS_PAPER_ADAPTER_UNSUPPORTED however complete the contract metadata is.",
+          "field": "instrument.asset_class",
+          "kind": "UNSUPPORTED"
+        }
+      ],
+      "headline": "MISMATCH",
+      "identity": "DERIVATIVE_OF_SOURCE",
+      "record_id": "fut_index_complete",
+      "runtime_scope": "ASSET_CLASS_UNSUPPORTED_IN_CURRENT_RUNTIME"
+    },
+    {
+      "asset_class": "FUTURE",
+      "authority": "NON_AUTHORITATIVE",
+      "counts": {
+        "AMBIGUOUS": 0,
+        "INFO": 1,
+        "INVALID": 0,
+        "MISMATCH": 0,
+        "MISSING": 0,
+        "UNSUPPORTED": 1
+      },
+      "findings": [
+        {
+          "code": "DIRECT_IDENTITY_CONTROL",
+          "detail": "Source label IDXFZ26 equals instrument label IDXFZ26 and the quoted level is stated as the traded contract's own price. Informational control only: this is not trading permission and the gateway still applies every provenance, freshness, quote and policy rule.",
+          "field": null,
+          "kind": "INFO"
+        },
+        {
+          "code": "RUNTIME_ASSET_CLASS_UNSUPPORTED",
+          "detail": "FUTURE cannot be acted on by the current paper adapter: the gateway holds it as ASSET_CLASS_PAPER_ADAPTER_UNSUPPORTED however complete the contract metadata is.",
+          "field": "instrument.asset_class",
+          "kind": "UNSUPPORTED"
+        }
+      ],
+      "headline": "UNSUPPORTED",
+      "identity": "DIRECT",
+      "record_id": "fut_dated_contract_quoted_complete",
+      "runtime_scope": "ASSET_CLASS_UNSUPPORTED_IN_CURRENT_RUNTIME"
+    },
+    {
+      "asset_class": "FUTURE",
+      "authority": "NON_AUTHORITATIVE",
+      "counts": {
+        "AMBIGUOUS": 2,
+        "INFO": 0,
+        "INVALID": 0,
+        "MISMATCH": 1,
+        "MISSING": 0,
+        "UNSUPPORTED": 1
+      },
+      "findings": [
+        {
+          "code": "PRICE_BASIS_NOT_TRADED_CONTRACT",
+          "detail": "The quoted level is a source-series level, not the instrument's own price. No conversion is performed; the gateway holds such actions as SOURCE_TO_BROKER_PRICE_BASIS_UNRESOLVED.",
+          "field": "price_basis",
+          "kind": "MISMATCH"
+        },
+        {
+          "code": "SOURCE_UNDERLYING_LABEL_MISMATCH",
+          "detail": "Source label WTI_CONT differs from the stated underlying WTI; the diagnostic does not resolve aliases, so the relationship is unverified.",
+          "field": "instrument.underlying",
+          "kind": "AMBIGUOUS"
+        },
+        {
+          "code": "CONTINUOUS_SERIES_ROLL_UNRESOLVED",
+          "detail": "A continuous front-month series does not identify a dated contract; no roll choice is made.",
+          "field": "source.kind",
+          "kind": "AMBIGUOUS"
+        },
+        {
+          "code": "RUNTIME_ASSET_CLASS_UNSUPPORTED",
+          "detail": "FUTURE cannot be acted on by the current paper adapter: the gateway holds it as ASSET_CLASS_PAPER_ADAPTER_UNSUPPORTED however complete the contract metadata is.",
+          "field": "instrument.asset_class",
+          "kind": "UNSUPPORTED"
+        }
+      ],
+      "headline": "MISMATCH",
+      "identity": "DIFFERENT",
+      "record_id": "fut_crude_continuous_series",
+      "runtime_scope": "ASSET_CLASS_UNSUPPORTED_IN_CURRENT_RUNTIME"
+    },
+    {
+      "asset_class": "FUTURE",
+      "authority": "NON_AUTHORITATIVE",
+      "counts": {
+        "AMBIGUOUS": 0,
+        "INFO": 1,
+        "INVALID": 0,
+        "MISMATCH": 2,
+        "MISSING": 0,
+        "UNSUPPORTED": 1
+      },
+      "findings": [
+        {
+          "code": "PRICE_BASIS_NOT_TRADED_CONTRACT",
+          "detail": "The quoted level is a source-series level, not the instrument's own price. No conversion is performed; the gateway holds such actions as SOURCE_TO_BROKER_PRICE_BASIS_UNRESOLVED.",
+          "field": "price_basis",
+          "kind": "MISMATCH"
+        },
+        {
+          "code": "SOURCE_IS_STATED_UNDERLYING",
+          "detail": "The record states GOLD_SPOT as the underlying of AUFG27. The contract's price is not the underlying level; no basis, carry, premium, roll or contract selection is derived.",
+          "field": null,
+          "kind": "INFO"
+        },
+        {
+          "code": "FUTURES_CONTRACT_MONTH_CONFLICT",
+          "detail": "Contract code 'AUFG27' reads as month 02/year ...27 but contract_month says 2027-04.",
+          "field": "instrument.futures_contract",
+          "kind": "MISMATCH"
+        },
+        {
+          "code": "RUNTIME_ASSET_CLASS_UNSUPPORTED",
+          "detail": "FUTURE cannot be acted on by the current paper adapter: the gateway holds it as ASSET_CLASS_PAPER_ADAPTER_UNSUPPORTED however complete the contract metadata is.",
+          "field": "instrument.asset_class",
+          "kind": "UNSUPPORTED"
+        }
+      ],
+      "headline": "MISMATCH",
+      "identity": "DERIVATIVE_OF_SOURCE",
+      "record_id": "fut_gold_month_conflict",
+      "runtime_scope": "ASSET_CLASS_UNSUPPORTED_IN_CURRENT_RUNTIME"
+    },
+    {
+      "asset_class": "FUTURE",
+      "authority": "NON_AUTHORITATIVE",
+      "counts": {
+        "AMBIGUOUS": 1,
+        "INFO": 1,
+        "INVALID": 3,
+        "MISMATCH": 1,
+        "MISSING": 0,
+        "UNSUPPORTED": 1
+      },
+      "findings": [
+        {
+          "code": "PRICE_BASIS_NOT_TRADED_CONTRACT",
+          "detail": "The quoted level is a source-series level, not the instrument's own price. No conversion is performed; the gateway holds such actions as SOURCE_TO_BROKER_PRICE_BASIS_UNRESOLVED.",
+          "field": "price_basis",
+          "kind": "MISMATCH"
+        },
+        {
+          "code": "SOURCE_IS_STATED_UNDERLYING",
+          "detail": "The record states HENRY_HUB as the underlying of NGSH7. The contract's price is not the underlying level; no basis, carry, premium, roll or contract selection is derived.",
+          "field": null,
+          "kind": "INFO"
+        },
+        {
+          "code": "SOURCE_LEVEL_INVALID",
+          "detail": "Quoted level '-3.10' is not a positive finite decimal.",
+          "field": "source.quoted_level",
+          "kind": "INVALID"
+        },
+        {
+          "code": "MULTIPLIER_INVALID",
+          "detail": "Multiplier '0' is not a positive finite decimal.",
+          "field": "contract.multiplier",
+          "kind": "INVALID"
+        },
+        {
+          "code": "TICK_SIZE_INVALID",
+          "detail": "Tick size 'abc' is not a positive finite decimal.",
+          "field": "contract.tick_size",
+          "kind": "INVALID"
+        },
+        {
+          "code": "FUTURES_YEAR_DIGIT_AMBIGUOUS",
+          "detail": "Contract code 'NGSH7' uses a single year digit, which repeats every decade.",
+          "field": "instrument.futures_contract",
+          "kind": "AMBIGUOUS"
+        },
+        {
+          "code": "RUNTIME_ASSET_CLASS_UNSUPPORTED",
+          "detail": "FUTURE cannot be acted on by the current paper adapter: the gateway holds it as ASSET_CLASS_PAPER_ADAPTER_UNSUPPORTED however complete the contract metadata is.",
+          "field": "instrument.asset_class",
+          "kind": "UNSUPPORTED"
+        }
+      ],
+      "headline": "INVALID",
+      "identity": "DERIVATIVE_OF_SOURCE",
+      "record_id": "fut_natgas_invalid_economics",
+      "runtime_scope": "ASSET_CLASS_UNSUPPORTED_IN_CURRENT_RUNTIME"
+    },
+    {
+      "asset_class": "FUTURE",
+      "authority": "NON_AUTHORITATIVE",
+      "counts": {
+        "AMBIGUOUS": 0,
+        "INFO": 1,
+        "INVALID": 0,
+        "MISMATCH": 1,
+        "MISSING": 0,
+        "UNSUPPORTED": 1
+      },
+      "findings": [
+        {
+          "code": "DIRECT_IDENTITY_CONTROL",
+          "detail": "Source label NGSH27 equals instrument label NGSH27 and the quoted level is stated as the traded contract's own price. Informational control only: this is not trading permission and the gateway still applies every provenance, freshness, quote and policy rule.",
+          "field": null,
+          "kind": "INFO"
+        },
+        {
+          "code": "TICK_VALUE_INCONSISTENT",
+          "detail": "Stated tick value 20 is not multiplier 2500 x tick size 0.005 = 12.500.",
+          "field": "contract.tick_value",
+          "kind": "MISMATCH"
+        },
+        {
+          "code": "RUNTIME_ASSET_CLASS_UNSUPPORTED",
+          "detail": "FUTURE cannot be acted on by the current paper adapter: the gateway holds it as ASSET_CLASS_PAPER_ADAPTER_UNSUPPORTED however complete the contract metadata is.",
+          "field": "instrument.asset_class",
+          "kind": "UNSUPPORTED"
+        }
+      ],
+      "headline": "MISMATCH",
+      "identity": "DIRECT",
+      "record_id": "fut_tick_value_inconsistent",
+      "runtime_scope": "ASSET_CLASS_UNSUPPORTED_IN_CURRENT_RUNTIME"
+    },
+    {
+      "asset_class": "FUTURE",
+      "authority": "NON_AUTHORITATIVE",
+      "counts": {
+        "AMBIGUOUS": 0,
+        "INFO": 1,
+        "INVALID": 3,
+        "MISMATCH": 0,
+        "MISSING": 0,
+        "UNSUPPORTED": 1
+      },
+      "findings": [
+        {
+          "code": "DIRECT_IDENTITY_CONTROL",
+          "detail": "Source label IDXFZ26 equals instrument label IDXFZ26 and the quoted level is stated as the traded contract's own price. Informational control only: this is not trading permission and the gateway still applies every provenance, freshness, quote and policy rule.",
+          "field": null,
+          "kind": "INFO"
+        },
+        {
+          "code": "SOURCE_LEVEL_INVALID",
+          "detail": "Quoted level '1e30' is outside the supported numeric range (at most 28 significant digits and a magnitude from 1e-12 up to but excluding 1e16).",
+          "field": "source.quoted_level",
+          "kind": "INVALID"
+        },
+        {
+          "code": "MULTIPLIER_INVALID",
+          "detail": "Multiplier '1e999999' is outside the supported numeric range (at most 28 significant digits and a magnitude from 1e-12 up to but excluding 1e16).",
+          "field": "contract.multiplier",
+          "kind": "INVALID"
+        },
+        {
+          "code": "TICK_SIZE_INVALID",
+          "detail": "Tick size '1e-30' is outside the supported numeric range (at most 28 significant digits and a magnitude from 1e-12 up to but excluding 1e16).",
+          "field": "contract.tick_size",
+          "kind": "INVALID"
+        },
+        {
+          "code": "RUNTIME_ASSET_CLASS_UNSUPPORTED",
+          "detail": "FUTURE cannot be acted on by the current paper adapter: the gateway holds it as ASSET_CLASS_PAPER_ADAPTER_UNSUPPORTED however complete the contract metadata is.",
+          "field": "instrument.asset_class",
+          "kind": "UNSUPPORTED"
+        }
+      ],
+      "headline": "INVALID",
+      "identity": "DIRECT",
+      "record_id": "fut_numeric_range_unsupported",
+      "runtime_scope": "ASSET_CLASS_UNSUPPORTED_IN_CURRENT_RUNTIME"
+    },
+    {
+      "asset_class": "FUTURE",
+      "authority": "NON_AUTHORITATIVE",
+      "counts": {
+        "AMBIGUOUS": 2,
+        "INFO": 0,
+        "INVALID": 0,
+        "MISMATCH": 0,
+        "MISSING": 7,
+        "UNSUPPORTED": 1
+      },
+      "findings": [
+        {
+          "code": "PRICE_BASIS_UNKNOWN",
+          "detail": "The record does not say whether the quoted level is the traded contract's price or a source-series level; no basis is assumed.",
+          "field": "price_basis",
+          "kind": "AMBIGUOUS"
+        },
+        {
+          "code": "SOURCE_UNDERLYING_UNCOMPARABLE",
+          "detail": "Source label HENRY_HUB differs from instrument label NGS and no underlying is stated, so the relationship cannot be assessed.",
+          "field": "instrument.underlying",
+          "kind": "AMBIGUOUS"
+        },
+        {
+          "code": "SOURCE_CURRENCY_MISSING",
+          "detail": "The source series states no currency.",
+          "field": "source.currency",
+          "kind": "MISSING"
+        },
+        {
+          "code": "SOURCE_UNIT_MISSING",
+          "detail": "The source series states no unit (per share, index point, per barrel...).",
+          "field": "source.unit",
+          "kind": "MISSING"
+        },
+        {
+          "code": "CONTRACT_SPEC_MISSING",
+          "detail": "No contract economics (currency, unit, multiplier, tick) are stated for the instrument.",
+          "field": "contract",
+          "kind": "MISSING"
+        },
+        {
+          "code": "UNDERLYING_MISSING",
+          "detail": "FUTURE states no underlying.",
+          "field": "instrument.underlying",
+          "kind": "MISSING"
+        },
+        {
+          "code": "FUTURES_VENUE_MISSING",
+          "detail": "The venue is part of a derivative's identity and is not stated.",
+          "field": "instrument.exchange",
+          "kind": "MISSING"
+        },
+        {
+          "code": "FUTURES_EXPIRY_MISSING",
+          "detail": "FUTURE states no expiry / last trade date.",
+          "field": "instrument.expiry",
+          "kind": "MISSING"
+        },
+        {
+          "code": "FUTURES_CONTRACT_CODE_MISSING",
+          "detail": "No dated contract code is stated; a product root alone does not identify a contract.",
+          "field": "instrument.futures_contract",
+          "kind": "MISSING"
+        },
+        {
+          "code": "RUNTIME_ASSET_CLASS_UNSUPPORTED",
+          "detail": "FUTURE cannot be acted on by the current paper adapter: the gateway holds it as ASSET_CLASS_PAPER_ADAPTER_UNSUPPORTED however complete the contract metadata is.",
+          "field": "instrument.asset_class",
+          "kind": "UNSUPPORTED"
+        }
+      ],
+      "headline": "MISSING",
+      "identity": "DIFFERENT",
+      "record_id": "fut_incomplete",
+      "runtime_scope": "ASSET_CLASS_UNSUPPORTED_IN_CURRENT_RUNTIME"
+    },
+    {
+      "asset_class": null,
+      "authority": "NON_AUTHORITATIVE",
+      "counts": {
+        "AMBIGUOUS": 0,
+        "INFO": 0,
+        "INVALID": 0,
+        "MISMATCH": 0,
+        "MISSING": 1,
+        "UNSUPPORTED": 0
+      },
+      "findings": [
+        {
+          "code": "INSTRUMENT_MISSING",
+          "detail": "No traded instrument is stated; nothing to map to.",
+          "field": "instrument",
+          "kind": "MISSING"
+        }
+      ],
+      "headline": "MISSING",
+      "identity": "UNDETERMINED",
+      "record_id": "no_instrument",
+      "runtime_scope": "UNDETERMINED"
+    }
+  ],
+  "report_kind": "INSTRUMENT_MAPPING_DIAGNOSTIC",
+  "rules_version": 2,
+  "totals": {
+    "AMBIGUOUS": 14,
+    "INFO": 18,
+    "INVALID": 9,
+    "MISMATCH": 24,
+    "MISSING": 20,
+    "UNSUPPORTED": 12
+  }
+}
