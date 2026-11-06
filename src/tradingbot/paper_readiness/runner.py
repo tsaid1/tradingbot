@@ -5,7 +5,8 @@ Order of operations is fixed and observable through ``ReadinessReport.dispatched
 
 1. refuse any transport that is not the FAKE kind (connected checks are blocked in this scaffold);
 2. take the session attestation and run ``preflight``; a refusal dispatches nothing;
-3. request contract details; only a unique, consistent identity yields a conId for one quote snapshot;
+3. request contract details; only a complete (contractDetailsEnd seen), unique, consistent identity with no
+   broker error and no non-INFO correlation finding on that stream yields a conId for one quote snapshot;
 4. request the account summary and the positions for the expected synthetic account;
 5. correlate every response stream deterministically (stray, duplicate, permuted, truncated, post-END);
 6. assess each stage and derive the outcome: ``CONTROL_COMPLETE`` only when every finding is INFO.
@@ -226,10 +227,16 @@ def run_readiness_check(transport: ReadOnlyTransport, expectation: ReadinessExpe
         now=now, request_id=REQUEST_IDS["request_contract_details"])
     findings.extend(contract_findings)
 
-    if con_id is None:
+    # Identity is established only by a complete, consistent, error-free stream: assess_contract withholds
+    # the conId without contractDetailsEnd or on a broker error, and any non-INFO correlation finding on the
+    # contract request (stray id, conflicting duplicate, response after END, foreign kind, truncation) means
+    # the kept rows cannot be trusted to be the whole answer.
+    stream_clean = not any(f.kind != FindingKind.INFO for f in contract.findings)
+    if con_id is None or not stream_clean:
         findings.append(Finding(code="QUOTE_SKIPPED_NO_CONTRACT_IDENTITY", kind=FindingKind.INCOMPLETE,
-                                stage=Stage.QUOTE, detail="No quote was requested because contract identity "
-                                "was absent, ambiguous or inconsistent."))
+                                stage=Stage.QUOTE, detail="No quote was requested: the contract stream was "
+                                "incomplete, ambiguous, inconsistent, or carried a broker error or a correlation "
+                                "anomaly, so contract identity is not established."))
     else:
         quote = read("request_quote_snapshot", con_id)
         findings.extend(assess_quote(

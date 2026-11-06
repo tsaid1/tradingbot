@@ -48,6 +48,17 @@ NOTICE = (
 )
 # Required accountSummary tags (documented tag names) beyond AccountType, which is held separately.
 REQUIRED_ACCOUNT_TAGS = ("NetLiquidation", "TotalCashValue", "BuyingPower")
+# Documented accountSummary tag names (account_summary reference: "AccountType,NetLiquidation,TotalCashValue,
+# SettledCash,AccruedCash,BuyingPower,EquityWithLoanValue" plus SMA, InitMarginReq, MaintMarginReq,
+# AvailableFunds, ExcessLiquidity, Cushion, Leverage, DayTradesRemaining). Only these names may ever be
+# rendered into a diagnostic; any other key in an observation is counted and withheld, so an untrusted or
+# sensitive key can never reach a report.
+DOCUMENTED_ACCOUNT_TAGS = frozenset({
+    "AccountType", "NetLiquidation", "TotalCashValue", "SettledCash", "AccruedCash", "BuyingPower",
+    "EquityWithLoanValue", "SMA", "InitMarginReq", "MaintMarginReq", "AvailableFunds", "ExcessLiquidity",
+    "Cushion", "Leverage", "DayTradesRemaining",
+})
+assert set(REQUIRED_ACCOUNT_TAGS) <= DOCUMENTED_ACCOUNT_TAGS
 # Session-level codes that are informational: data farms connected / connectivity restored intact.
 SESSION_OK_CODES = frozenset({2104, 2106, 2158, 1102})
 DATA_FARM_OK_CODES = frozenset({2104, 2158})
@@ -286,7 +297,9 @@ def assess_contract(expectation: ReadinessExpectation, rows: list[ContractObserv
                     errors: list[ApiMessage], *, now: datetime, request_id: int,
                     ) -> tuple[list[Finding], int | None]:
     """Identity, USD basis and regular-session checks. Returns the con_id a quote may be requested for,
-    or None when identity is absent, ambiguous or inconsistent (then no quote is requested)."""
+    or None when identity is absent, ambiguous or inconsistent, when the stream did not complete
+    (no contractDetailsEnd) or when a broker error or connectivity loss accompanied it. The caller adds
+    the correlation condition: a stream with any non-INFO correlation finding establishes nothing."""
     s = Stage.CONTRACT
     found = classify_messages(errors, s, request_id)
     if not end_seen:
@@ -332,14 +345,16 @@ def assess_contract(expectation: ReadinessExpectation, rows: list[ContractObserv
     found.extend(_session_scope(row, now, request_id))
 
     identity_consistent = (
-        all(getattr(row, n) is not None for n in identity_fields)
-        and not any(f.kind == FindingKind.MISMATCH and f.stage == s for f in found)
+        end_seen
+        and all(getattr(row, n) is not None for n in identity_fields)
+        and not any(f.stage == s and f.kind in (FindingKind.MISMATCH, FindingKind.ERROR, FindingKind.INCOMPLETE)
+                    for f in found)
     )
     if identity_consistent:
         found.append(_f("CONTRACT_IDENTITY_CONTROL", FindingKind.INFO, s,
                         "Exactly one contractDetails row matched the explicit USD STK description on every "
-                        "identity field. Informational control only; no contract was selected for trading.",
-                        request_id))
+                        "identity field and the stream completed with contractDetailsEnd. Informational control "
+                        "only; no contract was selected for trading.", request_id))
     return found, (row.con_id if identity_consistent else None)
 
 
@@ -473,10 +488,21 @@ def assess_account_summary(expectation: ReadinessExpectation, rows: list[Account
     if missing_tags:
         found.append(_f("ACCOUNT_TAGS_MISSING", FindingKind.MISSING, s,
                         f"Required tags absent: {', '.join(missing_tags)}.", request_id))
-    bad_tags = sorted(t for t, v in row.values.items() if _decimal(v) is None)
-    if bad_tags:
+    unrecognised = [t for t in row.values if t not in DOCUMENTED_ACCOUNT_TAGS]
+    if unrecognised:
+        found.append(_f("ACCOUNT_TAGS_UNRECOGNIZED_WITHHELD", FindingKind.INFO, s,
+                        f"{len(unrecognised)} tag name(s) outside the documented accountSummary allowlist were "
+                        "withheld from diagnostics.", request_id))
+    bad_known = sorted(t for t, v in row.values.items() if _decimal(v) is None and t in DOCUMENTED_ACCOUNT_TAGS)
+    bad_unknown = sum(1 for t, v in row.values.items() if _decimal(v) is None and t not in DOCUMENTED_ACCOUNT_TAGS)
+    if bad_known or bad_unknown:
+        parts = []
+        if bad_known:
+            parts.append(f"documented tags {', '.join(bad_known)}")
+        if bad_unknown:
+            parts.append(f"{bad_unknown} unrecognised tag(s) (names withheld)")
         found.append(_f("ACCOUNT_VALUES_UNPARSEABLE", FindingKind.MISMATCH, s,
-                        f"Tags whose value is not a finite decimal: {', '.join(bad_tags)}.", request_id))
+                        f"Values that are not finite decimals: {'; '.join(parts)}.", request_id))
     if not _has_problem(found, s):
         found.append(_f("ACCOUNT_SNAPSHOT_CONTROL", FindingKind.INFO, s,
                         "One complete USD account summary for the expected synthetic account. Values are "

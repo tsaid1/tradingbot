@@ -344,6 +344,45 @@ def test_pinned_con_id_must_match_and_a_mismatch_prevents_the_quote():
     assert "request_quote_snapshot" not in report.dispatched and "QUOTE_SKIPPED_NO_CONTRACT_IDENTITY" in codes(report)
 
 
+def test_quote_is_withheld_unless_the_contract_stream_establishes_identity():
+    """Review follow-up (PR #19): a conflicting duplicate sequence with differing conIds, a missing
+    contractDetailsEnd, a stray request id, a row after END and a broker error must each withhold the quote;
+    exact duplicates and reordering (INFO) must not."""
+
+    def run(contract_stream):
+        script = sc.CONTROL.model_copy(update={"contract_details": contract_stream})
+        transport = FakeReadOnlyTransport(script, FakeClock(NOW))
+        report = run_readiness_check(transport, sc.EXPECTATION, clock=transport.clock)
+        return report, sum(method == "request_quote_snapshot" for method, _ in transport.dispatch_log)
+
+    row = sc.env("request_contract_details", 1, ResponseKind.CONTRACT_DETAILS, contract=sc.contract_row())
+    end = sc.env("request_contract_details", 2, ResponseKind.CONTRACT_DETAILS_END)
+    other = sc.env("request_contract_details", 1, ResponseKind.CONTRACT_DETAILS, contract=sc.contract_row(con_id=900002))
+    withheld = {
+        "conflicting_duplicate_con_ids": ([row, other, end], "CONFLICTING_DUPLICATE_RESPONSE"),
+        "missing_contract_details_end": ([row], "CONTRACT_DETAILS_END_MISSING"),
+        "stray_request_id": ([row, sc.env("request_contract_details", 5, ResponseKind.CONTRACT_DETAILS, request_id=4242,
+                                          contract=sc.contract_row()), end], "UNCORRELATED_RESPONSE_IGNORED"),
+        "row_after_end": ([row, end, sc.env("request_contract_details", 3, ResponseKind.CONTRACT_DETAILS,
+                                            contract=sc.contract_row(con_id=900002))], "RESPONSE_AFTER_END_IGNORED"),
+        "broker_error_with_row": ([row, sc.env("request_contract_details", 2, ResponseKind.ERROR, message=ApiMessage(code=321)),
+                                   sc.env("request_contract_details", 3, ResponseKind.CONTRACT_DETAILS_END)],
+                                  "BROKER_REQUEST_VALIDATION_ERROR"),
+    }
+    for name, (stream, code) in withheld.items():
+        report, quote_calls = run(stream)
+        assert report.outcome == NOT_READY, name
+        assert code in codes(report) and "QUOTE_SKIPPED_NO_CONTRACT_IDENTITY" in codes(report), (name, codes(report))
+        assert quote_calls == 0 and "request_quote_snapshot" not in report.dispatched, name
+        assert report.dispatched == ["request_contract_details", "request_account_summary", "request_positions"], name
+    incomplete, _ = run([row])
+    assert "CONTRACT_IDENTITY_CONTROL" not in codes(incomplete)  # no identity control without the END marker
+    for name, stream in (("exact_duplicates", [row, row, end, end]), ("reordered", [end, row])):
+        report, quote_calls = run(stream)
+        assert report.outcome == COMPLETE and quote_calls == 1 and report.dispatched == list(READ_METHODS), name
+        assert "CONTRACT_IDENTITY_CONTROL" in codes(report) and "QUOTE_LIVE_CONTROL" in codes(report), name
+
+
 # ----------------------------------------------------------------------------- every scripted scenario
 
 @pytest.mark.parametrize("name", list(sc.SCENARIOS))
@@ -453,6 +492,13 @@ def test_contract_identity_is_explicit_and_every_mismatch_or_gap_withholds_the_c
         findings, con_id = contract([sc.contract_row(**{field: None})])
         assert "CONTRACT_FIELDS_MISSING" in codes(findings) and con_id is None, field
     assert "CONTRACT_IDENTITY_CONTROL" in codes(contract([sc.contract_row(symbol=" tlt ")])[0])  # trimmed/upper only
+    # A single matching row establishes nothing while the stream is incomplete or a broker error accompanies it.
+    findings, con_id = contract([sc.contract_row()], end=False)
+    assert con_id is None and "CONTRACT_DETAILS_END_MISSING" in codes(findings)
+    assert "CONTRACT_IDENTITY_CONTROL" not in codes(findings)
+    for code in (321, 1100):
+        findings, con_id = contract([sc.contract_row()], errors=[ApiMessage(code=code)])
+        assert con_id is None and "CONTRACT_IDENTITY_CONTROL" not in codes(findings), code
     findings, con_id = contract([], end=False)
     assert codes(findings) == ["CONTRACT_DETAILS_END_MISSING", "CONTRACT_OBSERVATION_MISSING"] and con_id is None
     findings, con_id = contract([sc.contract_row(), sc.contract_row(con_id=900002)])
@@ -547,6 +593,43 @@ def test_account_summary_checks_identity_currency_and_completeness_without_rende
     assert codes(bad) == ["ACCOUNT_VALUES_UNPARSEABLE"]
     assert "BuyingPower, NetLiquidation" in bad[0].detail and "lots" not in bad[0].detail
     assert codes(account([sc.account_row()], errors=[ApiMessage(code=1100)])) == ["CONNECTIVITY_LOST_MID_REQUEST"]
+
+
+def test_account_summary_diagnostics_render_only_documented_tag_names():
+    """Review follow-up (PR #19): an untrusted or sensitive key among accountSummary values must never reach a
+    rendered diagnostic in JSON, full-text or summary form; documented tag names still may."""
+    sentinel_bad, sentinel_ok = "SYNTH-PRIVATE1234", "SYNTH-PRIVATE5678"
+    required = {"NetLiquidation": "1.00", "TotalCashValue": "1.00", "BuyingPower": "1.00"}
+
+    def run(values):
+        row = AccountSummaryObservation(account_id=sc.SYNTH_ACCOUNT, account_type="SYNTHETIC-PAPER", currency="USD",
+                                        values=values)
+        script = sc.CONTROL.model_copy(update={"account_summary": [
+            sc.env("request_account_summary", 1, ResponseKind.ACCOUNT_SUMMARY, account_summary=row),
+            sc.env("request_account_summary", 2, ResponseKind.ACCOUNT_SUMMARY_END)]})
+        transport = FakeReadOnlyTransport(script, FakeClock(NOW))
+        report = run_readiness_check(transport, sc.EXPECTATION, clock=transport.clock)
+        rendered = render_json(report) + render_text(report) + render_text(report, summary=True)
+        account = [f for f in report.findings if f.stage == Stage.ACCOUNT]
+        return report, rendered, account
+
+    leaky, rendered, account = run({**required, sentinel_bad: "not-a-decimal"})
+    assert leaky.outcome == NOT_READY and codes(account) == ["ACCOUNT_TAGS_UNRECOGNIZED_WITHHELD", "ACCOUNT_VALUES_UNPARSEABLE"]
+    assert sentinel_bad not in rendered and "not-a-decimal" not in rendered
+    assert "1 unrecognised tag(s) (names withheld)" in account[1].detail
+    withheld, rendered, account = run({**required, sentinel_ok: "1.00"})
+    assert withheld.outcome == COMPLETE and codes(account) == ["ACCOUNT_TAGS_UNRECOGNIZED_WITHHELD", "ACCOUNT_SNAPSHOT_CONTROL"]
+    assert sentinel_ok not in rendered and "1 tag name(s) outside the documented" in account[0].detail
+    known, rendered, account = run({**required, "SMA": "lots", "Cushion": "NaN"})
+    assert known.outcome == NOT_READY and codes(account) == ["ACCOUNT_VALUES_UNPARSEABLE"]
+    assert "documented tags Cushion, SMA" in account[0].detail and "lots" not in rendered and "NaN" not in rendered
+    mixed, rendered, account = run({**required, "SMA": "lots", sentinel_bad: "x"})
+    assert mixed.outcome == NOT_READY and mixed.headline == FindingKind.MISMATCH
+    assert account[-1].detail == "Values that are not finite decimals: documented tags SMA; 1 unrecognised tag(s) (names withheld)."
+    assert sentinel_bad not in rendered
+    clean, rendered, account = run({**required, "SMA": "5.00", "Leverage": "1.5"})
+    assert clean.outcome == COMPLETE and codes(account) == ["ACCOUNT_SNAPSHOT_CONTROL"]
+    assert "5.00" not in rendered and "1.5" not in rendered
 
 
 def test_positions_snapshot_requires_completeness_and_the_expected_account():

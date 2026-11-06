@@ -79,8 +79,10 @@ From Python: build a `ReadinessExpectation` (synthetic account id, `TargetContra
    A socket port, if attested, only produces the INFO note `SOCKET_PORT_NOT_EVIDENCE`.
 3. Session capability findings (server version, connection time, data-farm status, other session codes).
 4. Contract details. Only a **unique** row that matches symbol, secType, currency, routing exchange and
-   primary listing with no missing identity field yields a conId; otherwise the quote is skipped
-   (`QUOTE_SKIPPED_NO_CONTRACT_IDENTITY`).
+   primary listing with no missing identity field, whose stream **completed** with `contractDetailsEnd`,
+   carried **no broker error** and produced **no non-INFO correlation finding** (stray id, conflicting
+   duplicate, row after END, foreign kind, truncation) yields a conId; otherwise the quote is skipped
+   (`QUOTE_SKIPPED_NO_CONTRACT_IDENTITY`). Exact duplicates and reordering are INFO and do not withhold it.
 5. One quote snapshot for that conId; account summary; positions.
 6. Correlation of every stream: stray request ids ignored (AMBIGUOUS), truncation at 64 (INCOMPLETE),
    reordering by sequence (INFO), exact duplicates dropped (INFO), conflicting duplicates (MISMATCH),
@@ -92,7 +94,9 @@ From Python: build a `ReadinessExpectation` (synthetic account id, `TargetContra
 Every report carries `authority: NON_AUTHORITATIVE`, `trading_permission: false`, a redacted
 `account_ref` (prefix plus 8 hex digits of a SHA-256), per-stage observation digests and the findings.
 Details name codes, field names, counts and documented message texts; the tests assert that no account id,
-balance, price or raw payload ever appears in a rendered report.
+balance, price or raw payload ever appears in a rendered report. Account-summary tag names are rendered only
+when they belong to the documented allowlist (`DOCUMENTED_ACCOUNT_TAGS`); any other key is counted and
+withheld, so an untrusted or sensitive key in an observation can never reach a report.
 
 ## Documented versus synthetic proof versus still unknown
 
@@ -136,7 +140,8 @@ Session: `SERVER_VERSION_MISSING` (MISSING), `CONNECTION_TIME_MISSING` (MISSING)
 `SESSION_CONNECTIVITY_BROKEN` / `BROKER_MESSAGE_UNCLASSIFIED` (ERROR), INFO `DATA_FARM_STATUS_NOT_OBSERVED`,
 INFO `SESSION_ATTESTATION_CONTROL`.
 
-Contract: `CONTRACT_DETAILS_END_MISSING` (INCOMPLETE), `CONTRACT_OBSERVATION_MISSING` / `CONTRACT_FIELDS_MISSING`
+Contract (any MISMATCH, ERROR or INCOMPLETE finding here, or a missing END marker, withholds the conId and
+therefore the quote): `CONTRACT_DETAILS_END_MISSING` (INCOMPLETE), `CONTRACT_OBSERVATION_MISSING` / `CONTRACT_FIELDS_MISSING`
 (MISSING), `CONTRACT_IDENTITY_AMBIGUOUS` / `TIME_ZONE_UNRESOLVED` / `LIQUID_HOURS_UNPARSEABLE` (AMBIGUOUS),
 `CONTRACT_SYMBOL_MISMATCH` / `CONTRACT_SEC_TYPE_MISMATCH` / `CONTRACT_CURRENCY_MISMATCH` /
 `CONTRACT_EXCHANGE_MISMATCH` / `CONTRACT_PRIMARY_EXCHANGE_MISMATCH` / `CON_ID_MISMATCH` (MISMATCH),
@@ -155,8 +160,9 @@ Quote: `QUOTE_SKIPPED_NO_CONTRACT_IDENTITY` / `TICK_SNAPSHOT_END_MISSING` (INCOM
 
 Account: `ACCOUNT_SUMMARY_END_MISSING` (INCOMPLETE), `ACCOUNT_SUMMARY_MISSING` / `ACCOUNT_TYPE_MISSING` /
 `ACCOUNT_CURRENCY_MISSING` / `ACCOUNT_TAGS_MISSING` (MISSING), `ACCOUNT_SUMMARY_MULTIPLE` (AMBIGUOUS),
-`ACCOUNT_ID_MISMATCH` / `ACCOUNT_CURRENCY_MISMATCH` / `ACCOUNT_VALUES_UNPARSEABLE` (MISMATCH), INFO
-`ACCOUNT_SNAPSHOT_CONTROL`.
+`ACCOUNT_ID_MISMATCH` / `ACCOUNT_CURRENCY_MISMATCH` / `ACCOUNT_VALUES_UNPARSEABLE` (MISMATCH; names only
+documented tags and counts unrecognised ones), INFO `ACCOUNT_TAGS_UNRECOGNIZED_WITHHELD` (keys outside the
+documented allowlist were counted, never printed), INFO `ACCOUNT_SNAPSHOT_CONTROL`.
 
 Positions: `POSITIONS_END_MISSING` (INCOMPLETE), `POSITION_LINES_INCOMPLETE` (MISSING), `POSITION_ACCOUNT_MISMATCH`
 (MISMATCH), INFO `POSITIONS_SNAPSHOT_CONTROL`.
@@ -184,7 +190,9 @@ the table above; `CONNECTIVITY_LOST_MID_REQUEST` (1100) is INCOMPLETE.
 
 The test suite additionally covers a conflicting duplicate, a response after END, a foreign response kind, the
 64-response bound, the pinned-conId mismatch, the fake-clock transitions complete -> stale -> out of session,
-and the non-fake transport refusal.
+the non-fake transport refusal, the quote being withheld for a conflicting-duplicate / incomplete / stray /
+post-END / broker-error contract stream, and a sensitive sentinel key in account-summary values that never
+reaches any rendered report.
 
 ## Gate checklist for future read-only paper checks
 
