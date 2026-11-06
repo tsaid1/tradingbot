@@ -162,8 +162,9 @@ policy and an out-of-range cursor are all refused before anything is delivered.
 - no network socket is opened during a run;
 - the documented command: fresh run, simulated crash (exit 3), bounded resume (exit 4), final
   resume (exit 0) across separate processes with different `PYTHONHASHSEED`s, identical digests;
-  a paused default-mode run preserves its temporary directory and the advertised resume succeeds,
-  while a completed default-mode run removes it.
+  a default-mode run paused by the delivery cap or by the wall-clock budget preserves its temporary
+  directory and the advertised resume succeeds; a completed default-mode run removes it, and an
+  explicit `--workdir` is never removed.
 
 ## Limits and follow-ups
 

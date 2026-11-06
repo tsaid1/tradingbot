@@ -438,11 +438,27 @@ def test_cli_paused_run_without_workdir_preserves_state_and_its_advertised_resum
     report = json.loads((tmp_path / "resumed.json").read_text())
     assert (report["status"], report["resumed_from"], report["cursor"]) == ("COMPLETE", 5, TOTAL)
     assert report["convergence_digest"] == baseline.convergence_digest
+    # the wall-clock bound pauses the same way: a 1 ns budget cannot finish 17 deliveries
+    budgeted = cli("--quiet", "--max-seconds", "1e-9", tmpdir=tmp_path)
+    assert budgeted.returncode == 4, budgeted.stderr[-800:]
+    assert "paused (WALL_BUDGET_EXHAUSTED)" in budgeted.stdout
+    kept = Path(re.search(r"temporary workdir preserved for --resume: (\S+)", budgeted.stdout).group(1))
+    assert kept.is_dir() and kept.is_relative_to(tmp_path) and kept != preserved
+    assert 0 <= ShadowCheckpoint.model_validate_json((kept / CHECKPOINT_FILE).read_text()).cursor < TOTAL
+    finished = cli("--quiet", "--workdir", str(kept), "--resume", "--json", str(tmp_path / "budget.json"), tmpdir=tmp_path)
+    assert finished.returncode == 0, finished.stderr[-800:]
+    budget_report = json.loads((tmp_path / "budget.json").read_text())
+    assert budget_report["status"] == "COMPLETE" and budget_report["convergence_digest"] == baseline.convergence_digest
     # a default-mode run that completes leaves nothing behind
     completed = cli("--quiet", tmpdir=tmp_path)
     assert completed.returncode == 0, completed.stderr[-800:]
     removed = re.search(r"temporary workdir removed: (\S+)", completed.stdout)
     assert removed is not None and not Path(removed.group(1)).exists()
+    # explicit-workdir control: a completed run never removes a directory the operator chose
+    chosen = tmp_path / "chosen"
+    explicit = cli("--quiet", "--workdir", str(chosen), tmpdir=tmp_path)
+    assert explicit.returncode == 0 and "temporary workdir" not in explicit.stdout
+    assert sorted(p.name for p in chosen.iterdir()) == [CHECKPOINT_FILE, LEDGER_FILE]
 
 
 def test_cli_refuses_an_occupied_workdir_and_requires_workdir_for_resume(tmp_path):
