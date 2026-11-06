@@ -9,6 +9,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import re
+import sqlite3
 from datetime import timedelta
 from itertools import pairwise
 from pathlib import Path
@@ -169,6 +170,44 @@ def test_replaying_a_processed_post_is_rejected_and_changes_nothing(tmp_path):
         session(tmp_path, "empty.sqlite3").replay()
 
 
+def test_replaying_an_early_post_does_not_rewind_the_reconciliation_clock(tmp_path):
+    s = session(tmp_path)
+    s.run_all()
+    rows, summary = s.reconciliation(), s.summary()
+    assert rows[0].publisher_state == "CLOSED" and summary["ledger_agrees_with_publisher"]
+    for sid in ("d1", "d2", "d5"):
+        replayed = s.replay(sid)
+        assert replayed.duplicate and replayed.matches_expectation
+        assert replayed.processed_as_of == next(p.published_at for p in s.processed_posts if p.source_id == sid)
+        assert s.reconciliation() == rows                 # evaluated at the lifecycle's latest time, not at d1
+    assert s.summary() == {**summary, "duplicates_rejected": 3}
+
+
+def test_a_failed_step_is_not_marked_processed_and_is_retried(tmp_path, monkeypatch):
+    s = session(tmp_path)
+    original = s.coordinator.process
+    calls = {"n": 0}
+
+    def flaky(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(s.coordinator, "process", flaky)
+    with pytest.raises(sqlite3.OperationalError):
+        s.run_next()
+    assert s.steps_done == 0 and s.processed_posts == [] and s.entries == [] and s.ledger() == []
+    assert s.interpreter.context.ideas == {}              # the publisher-book context did not advance either
+    with pytest.raises(ValueError):
+        s.replay()                                        # a failed step never counts as processed
+    entry = s.run_next()                                  # the retry processes the same post
+    assert (entry.source_id, entry.step, entry.matches_expectation) == ("d1", 1, True)
+    assert s.steps_done == 1 and [p.source_id for p in s.processed_posts] == ["d1"]
+    rest = s.run_all()
+    assert rest[0].source_id == "d2" and s.summary()["expectations_met"]
+
+
 def test_restarting_on_the_same_ledger_never_fills_twice(tmp_path):
     first = session(tmp_path)
     first.run_all()
@@ -200,7 +239,7 @@ def test_a_drift_between_publisher_book_and_ledger_is_reported_not_traded(tmp_pa
     s.run_next()
     view = s.interpreter.context.ideas["d1:a1"]
     view.closed_at = view.opened_at + timedelta(seconds=1)     # the publisher said "closed"; the ledger still holds 4 units
-    s._last_now = view.closed_at + timedelta(hours=1)
+    s._as_of = view.closed_at + timedelta(hours=1)
     (row,) = s.reconciliation()
     assert (row.publisher_state, row.ledger_state, row.ledger_quantity, row.agrees) == ("CLOSED", "OPEN", 4, False)
     assert s.summary()["ledger_agrees_with_publisher"] is False

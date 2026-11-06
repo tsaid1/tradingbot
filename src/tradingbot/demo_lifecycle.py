@@ -245,6 +245,9 @@ class DemoSession:
         self._cursor = 0
         self._last_now: datetime | None = None
         self._last_quotes: dict[str, Quote] = {}
+        # Reconciliation watermark: the latest replay clock this session has seen. It never moves
+        # backwards, so a duplicate replay of an earlier post cannot rewind the comparison.
+        self._as_of: datetime | None = None
 
     # ------------------------------------------------------------------ state
 
@@ -277,8 +280,10 @@ class DemoSession:
         if self.is_complete:
             return None
         post = self._posts[self._cursor]
-        self._cursor += 1
         entry = self._process(post, replay=False)
+        # Advance only after the coordinator committed and the audit entry exists: a failure (for
+        # example a SQLite lock timeout) leaves the post unprocessed and the next call retries it.
+        self._cursor += 1
         self.entries.append(entry)
         return entry
 
@@ -315,6 +320,8 @@ class DemoSession:
                             lag_seconds=self.script.golden.lag_seconds)[0]
         after = self.ledger()
         assert self._last_now is not None
+        now = self._last_now
+        self._as_of = now if self._as_of is None else max(self._as_of, now)
         grouped = {a.action_id: a for a in group_linked_actions(step.interpreted).actions}
         interpretations = [
             InterpretationView(
@@ -359,7 +366,7 @@ class DemoSession:
                 headline = " | ".join(o.headline for o in outcomes) or "No clause produced an action"
         return AuditEntry(
             step=len(self.entries) + 1, source_id=post.source_id, post_id=post.post_id, published_at=post.published_at,
-            processed_as_of=self._last_now, text=post.text, narration=self.script.narration.get(post.source_id, ""),
+            processed_as_of=now, text=post.text, narration=self.script.narration.get(post.source_id, ""),
             provenance=post.to_replay_source(),
             quotes={s: {"bid": str(q.bid), "ask": str(q.ask)} for s, q in self._last_quotes.items()},
             interpretations=interpretations, outcomes=outcomes, duplicate=step.result.duplicate,
@@ -385,7 +392,7 @@ class DemoSession:
     def reconciliation(self) -> list[ReconciliationRow]:
         """Publisher's stated book (as the interpreter understood it, as of the last processed post)
         against the mock ledger. A disagreement is an operator task, never an automatic order."""
-        as_of = self._last_now or datetime.now(timezone.utc)
+        as_of = self._as_of or datetime.now(timezone.utc)
         ledger = {i.idea_id: i for i in self.ledger()}
         views = self.interpreter.context.ideas
         rows: list[ReconciliationRow] = []
