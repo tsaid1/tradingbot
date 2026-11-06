@@ -1,0 +1,226 @@
+{
+  "notice": "SYNTHETIC ONLY. Every symbol, venue, multiplier, tick, expiry, level and currency below is invented for diagnostics tests. Nothing here is a real contract specification, a publisher mapping or a trading instruction.",
+  "records": [
+    {
+      "record_id": "eq_direct_control",
+      "synthetic": true,
+      "description": "Positive informational control: the quoted level is the equity's own price on a stated venue.",
+      "source": {"symbol": "ABC", "kind": "TRADED_SECURITY", "currency": "USD", "unit": "USD_PER_SHARE", "quoted_level": "100.00"},
+      "instrument": {"asset_class": "EQUITY", "symbol": "ABC", "exchange": "SYNTH-X"},
+      "price_basis": "TRADED_CONTRACT",
+      "contract": {"currency": "USD", "unit": "USD_PER_SHARE", "multiplier": "1", "tick_size": "0.01"}
+    },
+    {
+      "record_id": "etf_direct_control",
+      "synthetic": true,
+      "description": "Positive informational control for an ETF quoted on itself.",
+      "source": {"symbol": "$TLT", "kind": "TRADED_SECURITY", "currency": "USD", "unit": "USD_PER_SHARE", "quoted_level": "88.50"},
+      "instrument": {"asset_class": "ETF", "symbol": "TLT", "exchange": "SYNTH-X"},
+      "price_basis": "TRADED_CONTRACT",
+      "contract": {"currency": "USD", "unit": "USD_PER_SHARE", "multiplier": "1", "tick_size": "0.01"}
+    },
+    {
+      "record_id": "eq_bare_ticker",
+      "synthetic": true,
+      "description": "Same label on both sides, but no venue, currency, unit or contract economics.",
+      "source": {"symbol": "ABC", "kind": "TRADED_SECURITY", "quoted_level": "100.00"},
+      "instrument": {"asset_class": "EQUITY", "symbol": "ABC"},
+      "price_basis": "TRADED_CONTRACT"
+    },
+    {
+      "record_id": "eq_basis_unknown",
+      "synthetic": true,
+      "description": "Complete identifiers, but the record does not say what the quoted level refers to.",
+      "source": {"symbol": "ABC", "kind": "TRADED_SECURITY", "currency": "USD", "unit": "USD_PER_SHARE", "quoted_level": "100.00"},
+      "instrument": {"asset_class": "EQUITY", "symbol": "ABC", "exchange": "SYNTH-X"},
+      "price_basis": "UNKNOWN",
+      "contract": {"currency": "USD", "unit": "USD_PER_SHARE", "multiplier": "1", "tick_size": "0.01"}
+    },
+    {
+      "record_id": "eq_source_kind_unknown",
+      "synthetic": true,
+      "description": "Same label, traded-contract basis claimed, but the source series is unclassified.",
+      "source": {"symbol": "ABC", "kind": "UNKNOWN", "currency": "USD", "unit": "USD_PER_SHARE", "quoted_level": "100.00"},
+      "instrument": {"asset_class": "EQUITY", "symbol": "ABC", "exchange": "SYNTH-X"},
+      "price_basis": "TRADED_CONTRACT",
+      "contract": {"currency": "USD", "unit": "USD_PER_SHARE", "multiplier": "1", "tick_size": "0.01"}
+    },
+    {
+      "record_id": "eq_off_tick_grid",
+      "synthetic": true,
+      "description": "A level said to be the contract's own price that does not sit on the stated tick grid.",
+      "source": {"symbol": "ABC", "kind": "TRADED_SECURITY", "currency": "USD", "unit": "USD_PER_SHARE", "quoted_level": "100.005"},
+      "instrument": {"asset_class": "EQUITY", "symbol": "ABC", "exchange": "SYNTH-X"},
+      "price_basis": "TRADED_CONTRACT",
+      "contract": {"currency": "USD", "unit": "USD_PER_SHARE", "multiplier": "1", "tick_size": "0.01"}
+    },
+    {
+      "record_id": "eq_suffix_and_currency",
+      "synthetic": true,
+      "description": "Share-class suffix spelling and a currency/unit difference between the quote and the listing.",
+      "source": {"symbol": "ABC.A", "kind": "TRADED_SECURITY", "currency": "CAD", "unit": "CAD_PER_SHARE", "quoted_level": "41.20"},
+      "instrument": {"asset_class": "EQUITY", "symbol": "ABC.A", "exchange": "SYNTH-CA"},
+      "price_basis": "TRADED_CONTRACT",
+      "contract": {"currency": "USD", "unit": "USD_PER_SHARE", "multiplier": "1", "tick_size": "0.01"}
+    },
+    {
+      "record_id": "eq_derivative_fields",
+      "synthetic": true,
+      "description": "An equity record carrying option identifiers; the identifiers contradict the asset class.",
+      "source": {"symbol": "ABC", "kind": "TRADED_SECURITY", "currency": "USD", "unit": "USD_PER_SHARE", "quoted_level": "100.00"},
+      "instrument": {"asset_class": "EQUITY", "symbol": "ABC", "exchange": "SYNTH-X", "expiry": "2026-12-18", "strike": "100", "option_right": "CALL"},
+      "price_basis": "TRADED_CONTRACT",
+      "contract": {"currency": "USD", "unit": "USD_PER_SHARE", "multiplier": "1", "tick_size": "0.01"}
+    },
+    {
+      "record_id": "etf_spx_index_proxy",
+      "synthetic": true,
+      "description": "An index level quoted against an ETF: proxy relationship, index points versus per-share.",
+      "source": {"symbol": "SPX", "kind": "INDEX", "currency": "USD", "unit": "INDEX_POINT", "quoted_level": "6000.00"},
+      "instrument": {"asset_class": "ETF", "symbol": "SPY", "exchange": "SYNTH-X"},
+      "price_basis": "SOURCE_SERIES",
+      "contract": {"currency": "USD", "unit": "USD_PER_SHARE", "multiplier": "1", "tick_size": "0.01"}
+    },
+    {
+      "record_id": "etf_spx_claimed_traded_basis",
+      "synthetic": true,
+      "description": "The same index-versus-ETF record, but the record claims the level is the ETF's own price.",
+      "source": {"symbol": "SPX", "kind": "INDEX", "currency": "USD", "unit": "INDEX_POINT", "quoted_level": "6000.00"},
+      "instrument": {"asset_class": "ETF", "symbol": "SPY", "exchange": "SYNTH-X"},
+      "price_basis": "TRADED_CONTRACT",
+      "contract": {"currency": "USD", "unit": "USD_PER_SHARE", "multiplier": "1", "tick_size": "0.01"}
+    },
+    {
+      "record_id": "etf_gold_spot_proxy",
+      "synthetic": true,
+      "description": "A spot gold level quoted against a gold ETF: proxy relationship, per-ounce versus per-share.",
+      "source": {"symbol": "GOLD_SPOT", "kind": "SPOT", "currency": "USD", "unit": "USD_PER_TROY_OUNCE", "quoted_level": "2500.00"},
+      "instrument": {"asset_class": "ETF", "symbol": "GLD", "exchange": "SYNTH-X"},
+      "price_basis": "SOURCE_SERIES",
+      "contract": {"currency": "USD", "unit": "USD_PER_SHARE", "multiplier": "1", "tick_size": "0.01"}
+    },
+    {
+      "record_id": "etf_crude_spot_proxy_currency",
+      "synthetic": true,
+      "description": "A dollar spot crude level quoted against a sterling-listed ETF: proxy, currency and unit differences.",
+      "source": {"symbol": "WTI_SPOT", "kind": "SPOT", "currency": "USD", "unit": "USD_PER_BARREL", "quoted_level": "70.25"},
+      "instrument": {"asset_class": "ETF", "symbol": "OILF", "exchange": "SYNTH-LDN"},
+      "price_basis": "SOURCE_SERIES",
+      "contract": {"currency": "GBP", "unit": "GBP_PER_SHARE", "multiplier": "1", "tick_size": "0.01"}
+    },
+    {
+      "record_id": "opt_index_complete",
+      "synthetic": true,
+      "description": "A fully specified synthetic index option quoted on its underlying index level.",
+      "as_of": "2026-11-06",
+      "source": {"symbol": "SPX", "kind": "INDEX", "currency": "USD", "unit": "INDEX_POINT", "quoted_level": "6010.50"},
+      "instrument": {"asset_class": "OPTION", "symbol": "SPX-SYN-20261218-6000-C", "underlying": "SPX", "expiry": "2026-12-18", "strike": "6000", "option_right": "CALL", "exchange": "SYNTH-OPT"},
+      "price_basis": "SOURCE_SERIES",
+      "contract": {"currency": "USD", "unit": "INDEX_POINT", "multiplier": "10", "tick_size": "0.05", "settlement": "CASH", "settlement_time": "PM", "exercise_style": "EUROPEAN"}
+    },
+    {
+      "record_id": "opt_premium_quoted_complete",
+      "synthetic": true,
+      "description": "The same synthetic option quoted on its own premium: complete, directly identified, still unsupported.",
+      "as_of": "2026-11-06",
+      "source": {"symbol": "SPX-SYN-20261218-6000-C", "kind": "DATED_CONTRACT", "currency": "USD", "unit": "INDEX_POINT", "quoted_level": "45.50"},
+      "instrument": {"asset_class": "OPTION", "symbol": "SPX-SYN-20261218-6000-C", "underlying": "SPX", "expiry": "2026-12-18", "strike": "6000", "option_right": "CALL", "exchange": "SYNTH-OPT"},
+      "price_basis": "TRADED_CONTRACT",
+      "contract": {"currency": "USD", "unit": "INDEX_POINT", "multiplier": "10", "tick_size": "0.05", "settlement": "CASH", "settlement_time": "PM", "exercise_style": "EUROPEAN"}
+    },
+    {
+      "record_id": "opt_incomplete",
+      "synthetic": true,
+      "description": "An option named only by its underlying: no expiry, strike, right, venue, multiplier, style or settlement.",
+      "source": {"symbol": "SPX", "kind": "INDEX", "currency": "USD", "unit": "INDEX_POINT", "quoted_level": "6010.50"},
+      "instrument": {"asset_class": "OPTION", "symbol": "SPXOPT", "underlying": "SPX"},
+      "price_basis": "UNKNOWN",
+      "contract": {"currency": "USD", "unit": "INDEX_POINT"}
+    },
+    {
+      "record_id": "opt_invalid_economics",
+      "synthetic": true,
+      "description": "An option whose strike is negative, whose expiry precedes the record date and whose multiplier is zero.",
+      "as_of": "2026-11-06",
+      "source": {"symbol": "ABC", "kind": "TRADED_SECURITY", "currency": "USD", "unit": "USD_PER_SHARE", "quoted_level": "100.00"},
+      "instrument": {"asset_class": "OPTION", "symbol": "ABC-SYN-20261016-95-P", "underlying": "ABC", "expiry": "2026-10-16", "strike": "-95", "option_right": "PUT", "exchange": "SYNTH-OPT"},
+      "price_basis": "SOURCE_SERIES",
+      "contract": {"currency": "USD", "unit": "USD_PER_SHARE", "multiplier": "0", "tick_size": "0.01", "settlement": "PHYSICAL", "exercise_style": "AMERICAN"}
+    },
+    {
+      "record_id": "fut_index_complete",
+      "synthetic": true,
+      "description": "A fully specified synthetic index future quoted on its underlying index level.",
+      "as_of": "2026-11-06",
+      "source": {"symbol": "SPX", "kind": "INDEX", "currency": "USD", "unit": "INDEX_POINT", "quoted_level": "6000.00"},
+      "instrument": {"asset_class": "FUTURE", "symbol": "IDXFZ26", "underlying": "SPX", "expiry": "2026-12-18", "futures_contract": "IDXFZ26", "exchange": "SYNTH-FUT"},
+      "price_basis": "SOURCE_SERIES",
+      "contract": {"currency": "USD", "unit": "INDEX_POINT", "multiplier": "10", "tick_size": "0.5", "tick_value": "5", "settlement": "CASH", "contract_month": "2026-12"}
+    },
+    {
+      "record_id": "fut_dated_contract_quoted_complete",
+      "synthetic": true,
+      "description": "The same synthetic future quoted on itself: complete, directly identified, still unsupported.",
+      "as_of": "2026-11-06",
+      "source": {"symbol": "IDXFZ26", "kind": "DATED_CONTRACT", "currency": "USD", "unit": "INDEX_POINT", "quoted_level": "6025.5"},
+      "instrument": {"asset_class": "FUTURE", "symbol": "IDXFZ26", "underlying": "SPX", "expiry": "2026-12-18", "futures_contract": "IDXFZ26", "exchange": "SYNTH-FUT"},
+      "price_basis": "TRADED_CONTRACT",
+      "contract": {"currency": "USD", "unit": "INDEX_POINT", "multiplier": "10", "tick_size": "0.5", "tick_value": "5", "settlement": "CASH", "contract_month": "2026-12"}
+    },
+    {
+      "record_id": "fut_crude_continuous_series",
+      "synthetic": true,
+      "description": "A continuous crude series quoted against a dated synthetic contract whose underlying label is spelled differently.",
+      "as_of": "2026-11-06",
+      "source": {"symbol": "WTI_CONT", "kind": "CONTINUOUS_FUTURES", "currency": "USD", "unit": "USD_PER_BARREL", "quoted_level": "70.25"},
+      "instrument": {"asset_class": "FUTURE", "symbol": "CRDG27", "underlying": "WTI", "expiry": "2027-01-20", "futures_contract": "CRDG27", "exchange": "SYNTH-NRG"},
+      "price_basis": "SOURCE_SERIES",
+      "contract": {"currency": "USD", "unit": "USD_PER_BARREL", "multiplier": "500", "tick_size": "0.05", "tick_value": "25", "settlement": "PHYSICAL", "contract_month": "2027-02"}
+    },
+    {
+      "record_id": "fut_gold_month_conflict",
+      "synthetic": true,
+      "description": "A spot gold level against a synthetic gold future whose contract code and contract month disagree.",
+      "as_of": "2026-11-06",
+      "source": {"symbol": "GOLD_SPOT", "kind": "SPOT", "currency": "USD", "unit": "USD_PER_TROY_OUNCE", "quoted_level": "2500.00"},
+      "instrument": {"asset_class": "FUTURE", "symbol": "AUFG27", "underlying": "GOLD_SPOT", "expiry": "2027-04-28", "futures_contract": "AUFG27", "exchange": "SYNTH-MTL"},
+      "price_basis": "SOURCE_SERIES",
+      "contract": {"currency": "USD", "unit": "USD_PER_TROY_OUNCE", "multiplier": "50", "tick_size": "0.2", "tick_value": "10", "settlement": "PHYSICAL", "contract_month": "2027-04"}
+    },
+    {
+      "record_id": "fut_natgas_invalid_economics",
+      "synthetic": true,
+      "description": "A natural-gas record with a negative quoted level, a zero multiplier, a non-numeric tick and a one-digit year code.",
+      "as_of": "2026-11-06",
+      "source": {"symbol": "HENRY_HUB", "kind": "SPOT", "currency": "USD", "unit": "USD_PER_MMBTU", "quoted_level": "-3.10"},
+      "instrument": {"asset_class": "FUTURE", "symbol": "NGSH7", "underlying": "HENRY_HUB", "expiry": "2027-02-24", "futures_contract": "NGSH7", "exchange": "SYNTH-NRG"},
+      "price_basis": "SOURCE_SERIES",
+      "contract": {"currency": "USD", "unit": "USD_PER_MMBTU", "multiplier": "0", "tick_size": "abc", "tick_value": "12.5", "settlement": "PHYSICAL", "contract_month": "2027-03"}
+    },
+    {
+      "record_id": "fut_tick_value_inconsistent",
+      "synthetic": true,
+      "description": "A dated contract quoted on itself whose stated tick value does not equal multiplier times tick size.",
+      "as_of": "2026-11-06",
+      "source": {"symbol": "NGSH27", "kind": "DATED_CONTRACT", "currency": "USD", "unit": "USD_PER_MMBTU", "quoted_level": "3.105"},
+      "instrument": {"asset_class": "FUTURE", "symbol": "NGSH27", "underlying": "HENRY_HUB", "expiry": "2027-02-24", "futures_contract": "NGSH27", "exchange": "SYNTH-NRG"},
+      "price_basis": "TRADED_CONTRACT",
+      "contract": {"currency": "USD", "unit": "USD_PER_MMBTU", "multiplier": "2500", "tick_size": "0.005", "tick_value": "20", "settlement": "PHYSICAL", "contract_month": "2027-03"}
+    },
+    {
+      "record_id": "fut_incomplete",
+      "synthetic": true,
+      "description": "A future named only by a product root: no underlying, contract code, expiry, venue or economics.",
+      "source": {"symbol": "HENRY_HUB", "kind": "SPOT", "quoted_level": "3.10"},
+      "instrument": {"asset_class": "FUTURE", "symbol": "NGS"},
+      "price_basis": "UNKNOWN"
+    },
+    {
+      "record_id": "no_instrument",
+      "synthetic": true,
+      "description": "A source series with nothing to map to.",
+      "source": {"symbol": "SPX", "kind": "INDEX", "currency": "USD", "unit": "INDEX_POINT", "quoted_level": "6000.00"},
+      "price_basis": "SOURCE_SERIES"
+    }
+  ]
+}
