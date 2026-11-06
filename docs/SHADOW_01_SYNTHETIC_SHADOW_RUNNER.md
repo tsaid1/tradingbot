@@ -48,7 +48,7 @@ coordinator is the engine with an injectable `now` and the full HOLD / RECONCILE
 ```bash
 python -m pip install -e '.[dev]'
 
-# 1. straight run in a temporary directory (removed at exit)
+# 1. straight run in a temporary directory (removed when it completes; preserved, path printed, if it pauses)
 python scripts/run_shadow_synthetic.py
 
 # 2. simulate a crash after the 7th delivery committed but before its checkpoint was written
@@ -68,7 +68,9 @@ pytest tests/test_shadow_runner.py
 
 Exit codes: `0` complete, `2` refused (occupied directory, invalid checkpoint, usage error),
 `3` interrupted by the injected crash, `4` paused by a bound. `--max-seconds` (default 60) is a
-wall-clock stop guard only; it is never a decision input.
+wall-clock stop guard only; it is never a decision input. Without `--workdir` the script uses a
+private temporary directory that is removed only when the run completes; a paused run keeps it and
+prints the exact `--workdir … --resume` command, so bounded default-mode runs remain resumable.
 
 The runner **refuses** a working directory that contains anything unless `--resume` is given, so
 it can never read or write `data/`, an existing demo database, or any private path by accident.
@@ -159,7 +161,9 @@ policy and an out-of-range cursor are all refused before anything is delivered.
   policy, changed feed, ledger behind the checkpoint, malformed JSON, strict feed contract;
 - no network socket is opened during a run;
 - the documented command: fresh run, simulated crash (exit 3), bounded resume (exit 4), final
-  resume (exit 0) across separate processes with different `PYTHONHASHSEED`s, identical digests.
+  resume (exit 0) across separate processes with different `PYTHONHASHSEED`s, identical digests;
+  a paused default-mode run preserves its temporary directory and the advertised resume succeeds,
+  while a completed default-mode run removes it.
 
 ## Limits and follow-ups
 

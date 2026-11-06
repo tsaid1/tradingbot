@@ -18,6 +18,7 @@ the injected crash (resume with ``--resume``), 4 paused by a bound (resume with 
 from __future__ import annotations
 
 import argparse
+import shutil
 import sys
 import tempfile
 import time
@@ -41,8 +42,8 @@ EXIT_OK, EXIT_REFUSED, EXIT_INTERRUPTED, EXIT_PAUSED = 0, 2, 3, 4
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--workdir", type=Path, default=None,
-                        help="fresh (empty or absent) directory for the ledger and checkpoint; "
-                             "default: a temporary directory removed at exit")
+                        help="fresh (empty or absent) directory for the ledger and checkpoint; default: a "
+                             "temporary directory, removed when the run completes and preserved when it pauses")
     parser.add_argument("--resume", action="store_true",
                         help="continue from the checkpoint in --workdir (validated against the feed and policy)")
     parser.add_argument("--interrupt-at", type=int, default=None, metavar="INDEX",
@@ -125,10 +126,18 @@ def main(argv: list[str] | None = None) -> int:
             return EXIT_PAUSED
         return EXIT_OK
 
-    if args.workdir is None:
-        with tempfile.TemporaryDirectory(prefix="tradingbot-shadow-") as folder:
-            return execute(Path(folder))
-    return execute(args.workdir)
+    if args.workdir is not None:
+        return execute(args.workdir)
+    # Default mode: a private temporary directory. It is removed only when the run completes; a
+    # paused or otherwise unfinished run keeps it so the advertised --resume command is valid.
+    folder = Path(tempfile.mkdtemp(prefix="tradingbot-shadow-"))
+    code = execute(folder)
+    if code == EXIT_OK:
+        shutil.rmtree(folder, ignore_errors=True)
+        print(f"temporary workdir removed: {folder}")
+    else:
+        print(f"temporary workdir preserved for --resume: {folder}")
+    return code
 
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@ from __future__ import annotations
 import itertools
 import json
 import os
+import re
 import socket
 import sqlite3
 import subprocess
@@ -387,9 +388,13 @@ def test_no_network_socket_is_ever_opened(tmp_path, monkeypatch):
 
 # ----------------------------------------------------------------------------- 5. the documented command
 
-def cli(*args: str, seed: str = "0") -> subprocess.CompletedProcess:
+def cli(*args: str, seed: str = "0", tmpdir: Path | None = None) -> subprocess.CompletedProcess:
+    """Run the documented command. ``tmpdir`` redirects the script's default temporary directory
+    (via TMPDIR) under pytest's tmp_path so anything it preserves is cleaned up with the test."""
     env = {**os.environ, "PYTHONHASHSEED": seed,
            "PYTHONPATH": str(REPO / "src") + os.pathsep + os.environ.get("PYTHONPATH", "")}
+    if tmpdir is not None:
+        env["TMPDIR"] = str(tmpdir)
     return subprocess.run([sys.executable, str(SCRIPT), *args], capture_output=True, text=True, cwd=REPO,
                           env=env, check=False)
 
@@ -414,6 +419,30 @@ def test_cli_fresh_run_simulated_crash_and_resume_converge_across_processes(tmp_
     assert (a["resumed_from"], b["resumed_from"], b["cursor"]) == (0, 9, TOTAL)
     assert a["this_run"]["duplicate_returns"] == len(DUPLICATES)
     assert b["this_run"]["duplicate_returns"] == len(DUPLICATES & set(range(9, TOTAL)))
+
+
+def test_cli_paused_run_without_workdir_preserves_state_and_its_advertised_resume_succeeds(tmp_path, straight):
+    _, baseline, _ = straight
+    paused = cli("--max-deliveries", "5", tmpdir=tmp_path)
+    assert paused.returncode == 4, paused.stderr[-800:]
+    assert "paused (DELIVERY_CAP_REACHED)" in paused.stdout
+    advertised = re.search(r"resume with: --workdir (\S+) --resume", paused.stdout)
+    assert advertised is not None
+    preserved = Path(advertised.group(1))
+    assert f"temporary workdir preserved for --resume: {preserved}" in paused.stdout
+    assert preserved.is_dir() and preserved.is_relative_to(tmp_path)
+    assert sorted(p.name for p in preserved.iterdir()) == [CHECKPOINT_FILE, LEDGER_FILE]
+    assert ShadowCheckpoint.model_validate_json((preserved / CHECKPOINT_FILE).read_text()).cursor == 5
+    resumed = cli("--workdir", str(preserved), "--resume", "--json", str(tmp_path / "resumed.json"), tmpdir=tmp_path)
+    assert resumed.returncode == 0, resumed.stderr[-800:]
+    report = json.loads((tmp_path / "resumed.json").read_text())
+    assert (report["status"], report["resumed_from"], report["cursor"]) == ("COMPLETE", 5, TOTAL)
+    assert report["convergence_digest"] == baseline.convergence_digest
+    # a default-mode run that completes leaves nothing behind
+    completed = cli("--quiet", tmpdir=tmp_path)
+    assert completed.returncode == 0, completed.stderr[-800:]
+    removed = re.search(r"temporary workdir removed: (\S+)", completed.stdout)
+    assert removed is not None and not Path(removed.group(1)).exists()
 
 
 def test_cli_refuses_an_occupied_workdir_and_requires_workdir_for_resume(tmp_path):
