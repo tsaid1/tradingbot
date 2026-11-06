@@ -1,0 +1,71 @@
+{
+ "synthetic_only": true,
+ "notice": "Every post, price level, date and expected outcome in this file is invented for the mock lifecycle demonstration. Nothing here is derived from, or quotes, any publisher content. Dates sit in an invented future window so they cannot coincide with a real publication. Mock-only: no broker, no live market data, no real orders.",
+ "narration": {
+  "d1": "Entry. A synthetic open instruction with explicit levels is interpreted as a CURRENT OPEN, approved by the deterministic gateway and filled in the mock ledger as a protected position (stop 96.00 and target 108.00 are recorded in the ledger only).",
+  "d2": "Add and protect. One sentence carries an ADD and a stop raise; they form one atomic group, so either both apply or neither. The stop tightens from 96.00 to 98.00.",
+  "d3": "Conditional exit. A rule for the future ('if ... we will exit') is held: the gateway never triggers a condition on its own.",
+  "d4": "Commentary. An outlook that mentions a price is not an instruction; nothing is executed.",
+  "d5": "Partial exit. Half of the 6-unit position (3 units) is sold at the bid; 3 units remain protected.",
+  "d6": "Full exit. The remaining 3 units are sold and the idea is CLOSED in the mock ledger.",
+  "d7": "Reconciliation. A past-tense confirmation of the exit produces no order; the mock ledger is checked for consistency instead.",
+  "d8": "Position summary. A summary of positions is never re-entered.",
+  "d9": "Provenance block. The same entry wording from an author that could not be verified is blocked before any level is trusted."
+ },
+ "golden": {
+  "name": "Mock TLT lifecycle demo (synthetic, invented levels)",
+  "policy": {"quantity": 4, "quantity_per_add": 2},
+  "quotes": {
+   "d1": {"TLT": "100.00"},
+   "d2": {"TLT": "101.00"},
+   "d3": {"TLT": "99.00"},
+   "d4": {"TLT": "101.50"},
+   "d5": {"TLT": "104.00"},
+   "d6": {"TLT": "106.00"},
+   "d7": {"TLT": "106.00"},
+   "d8": {"TLT": "105.50"},
+   "d9": {"TLT": "105.50"}
+  },
+  "lag_seconds": 0.0,
+  "posts": [
+   {"schema_version": "1.2", "source_id": "d1", "post_id": "d1", "revision": 1, "author_id": "DEMO-SYNTH", "verified_author": true,
+    "text": "We are now long $TLT at $100.00. Stop: $96.00. Target: $108.00.",
+    "text_complete": true, "is_repost": false, "published_at": "2026-11-16T14:30:00Z", "received_at": "2026-11-16T14:30:00Z", "provenance": "SYNTHETIC"},
+   {"schema_version": "1.2", "source_id": "d2", "post_id": "d2", "revision": 1, "author_id": "DEMO-SYNTH", "verified_author": true,
+    "text": "Adding to our $TLT long at $101.00 and raising our stop to $98.00.",
+    "text_complete": true, "is_repost": false, "published_at": "2026-11-17T14:30:00Z", "received_at": "2026-11-17T14:30:00Z", "provenance": "SYNTHETIC"},
+   {"schema_version": "1.2", "source_id": "d3", "post_id": "d3", "revision": 1, "author_id": "DEMO-SYNTH", "verified_author": true,
+    "text": "If $TLT closes below $98.00 we will exit the position.",
+    "text_complete": true, "is_repost": false, "published_at": "2026-11-18T14:30:00Z", "received_at": "2026-11-18T14:30:00Z", "provenance": "SYNTHETIC"},
+   {"schema_version": "1.2", "source_id": "d4", "post_id": "d4", "revision": 1, "author_id": "DEMO-SYNTH", "verified_author": true,
+    "text": "We remain constructive on $TLT and our view is unchanged, with $108.00 still looking reachable.",
+    "text_complete": true, "is_repost": false, "published_at": "2026-11-19T14:30:00Z", "received_at": "2026-11-19T14:30:00Z", "provenance": "SYNTHETIC"},
+   {"schema_version": "1.2", "source_id": "d5", "post_id": "d5", "revision": 1, "author_id": "DEMO-SYNTH", "verified_author": true,
+    "text": "Taking profits on half of our $TLT long at $104.00.",
+    "text_complete": true, "is_repost": false, "published_at": "2026-11-21T14:30:00Z", "received_at": "2026-11-21T14:30:00Z", "provenance": "SYNTHETIC"},
+   {"schema_version": "1.2", "source_id": "d6", "post_id": "d6", "revision": 1, "author_id": "DEMO-SYNTH", "verified_author": true,
+    "text": "Closing the remaining $TLT long here at $106.00.",
+    "text_complete": true, "is_repost": false, "published_at": "2026-11-24T14:30:00Z", "received_at": "2026-11-24T14:30:00Z", "provenance": "SYNTHETIC"},
+   {"schema_version": "1.2", "source_id": "d7", "post_id": "d7", "revision": 1, "author_id": "DEMO-SYNTH", "verified_author": true,
+    "text": "We have closed our $TLT long and are out at $106.00, up +6.0%.",
+    "text_complete": true, "is_repost": false, "published_at": "2026-11-24T15:30:00Z", "received_at": "2026-11-24T15:30:00Z", "provenance": "SYNTHETIC"},
+   {"schema_version": "1.2", "source_id": "d8", "post_id": "d8", "revision": 1, "author_id": "DEMO-SYNTH", "verified_author": true,
+    "text": "Current positions: none.",
+    "text_complete": true, "is_repost": false, "published_at": "2026-11-25T14:30:00Z", "received_at": "2026-11-25T14:30:00Z", "provenance": "SYNTHETIC"},
+   {"schema_version": "1.2", "source_id": "d9", "post_id": "d9", "revision": 1, "author_id": "DEMO-UNVERIFIED", "verified_author": false,
+    "text": "We are now long $TLT at $100.00. Stop: $96.00. Target: $108.00.",
+    "text_complete": true, "is_repost": false, "published_at": "2026-11-26T14:30:00Z", "received_at": "2026-11-26T14:30:00Z", "provenance": "SYNTHETIC"}
+  ],
+  "steps": [
+   {"source_id": "d1", "statuses": ["SIMULATED"], "orders": [{"side": "BUY", "quantity": 4}], "classes": ["OPEN"]},
+   {"source_id": "d2", "statuses": ["SIMULATED", "SIMULATED"], "orders": [{"side": "BUY", "quantity": 2}, {"side": "NONE", "quantity": 0}], "classes": ["ADD", "MODIFY"]},
+   {"source_id": "d3", "statuses": ["HOLD"], "orders": [], "classes": ["CONDITIONAL"]},
+   {"source_id": "d4", "statuses": ["NO_TRADE"], "orders": [], "classes": ["COMMENTARY"]},
+   {"source_id": "d5", "statuses": ["SIMULATED"], "orders": [{"side": "SELL", "quantity": 3}], "classes": ["REDUCE"]},
+   {"source_id": "d6", "statuses": ["SIMULATED"], "orders": [{"side": "SELL", "quantity": 3}], "classes": ["CLOSE"]},
+   {"source_id": "d7", "statuses": ["RECONCILE"], "orders": [], "classes": ["RETROSPECTIVE"]},
+   {"source_id": "d8", "statuses": ["NO_TRADE"], "orders": [], "classes": ["POSITION_SUMMARY"]},
+   {"source_id": "d9", "statuses": ["BLOCK"], "orders": [], "classes": ["OPEN"]}
+  ]
+ }
+}
