@@ -312,6 +312,31 @@ def test_a_snapshot_without_end_stays_incomplete_even_with_a_returned_attempt():
     assert report.local_quiescence_established is False
 
 
+@pytest.mark.parametrize("settle", [None, Outcome.UNKNOWN, Outcome.FAILED],
+                         ids=["unsettled", "unknown", "failed"])
+def test_a_reserved_snapshot_attempt_after_end_must_return(settle):
+    """Review P2: once reserved, a snapshot attempt that is not RETURNED blocks local quiescence."""
+    ledger = RetirementLedger()
+    opened_reads(ledger)
+    retire(ledger, SUMMARY, POSITIONS)
+    ledger.reserve_attempt(SNAPSHOT)
+    if settle is not None:
+        ledger.settle_attempt(SNAPSHOT, settle)
+    terminate(ledger)
+    report = ledger.report()
+    assert slot(report, SNAPSHOT).read_complete is True
+    assert slot(report, SNAPSHOT).retirement_attempt == (settle or Outcome.UNKNOWN).value
+    assert report.faults == () and report.local_quiescence_established is False
+
+
+def test_a_returned_snapshot_attempt_after_end_keeps_the_control():
+    ledger = RetirementLedger()
+    opened_reads(ledger)
+    retire(ledger, SUMMARY, POSITIONS, SNAPSHOT)
+    terminate(ledger)
+    assert ledger.report().local_quiescence_established is True
+
+
 def test_a_snapshot_end_alone_is_not_connection_retirement():
     ledger = RetirementLedger()
     ledger.open_read(SNAPSHOT)

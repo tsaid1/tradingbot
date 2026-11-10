@@ -338,7 +338,9 @@ class RetirementLedger:
             if state is None:
                 continue
             complete = state.end_seen and not state.errored
-            needs_attempt = slot in _CONTINUING
+            # Continuing reads always need a returned attempt. Any other read needs one once reserved:
+            # an unsettled, UNKNOWN or FAILED attempt is local work that did not finish.
+            needs_attempt = slot in _CONTINUING or state.attempt != _NOT_RESERVED
             if not complete or (needs_attempt and state.attempt != Outcome.RETURNED.value):
                 reads_retired = False
             slots.append(SlotReport(slot.value, state.end_seen, state.errored, complete,

@@ -54,7 +54,8 @@ No cancellation acknowledgement is established by the inspected sources. That is
 `local_quiescence_established` is true only when all of these hold:
 - the ledger is sealed, with no fault
 - every opened read has its END and no error
-- account summary and positions each have a `RETURNED` attempt
+- account summary and positions each have a `RETURNED` attempt, and any other reserved attempt (a snapshot
+  attempt after its END) is also `RETURNED`; a snapshot with END and no reserved attempt needs none
 - admission is closed, with nothing queued or in flight
 - the consumer, reader and socket are each `STOPPED`
 - the disconnect attempt is `RETURNED`
@@ -82,6 +83,7 @@ Events are capped at 4096 and recorded faults at 64. Overflow is counted and blo
 - late and post-END callbacks
 - positions reuse
 - a snapshot without END, and a snapshot END alone
+- a reserved snapshot attempt after END that stays unsettled, or settles `UNKNOWN` or `FAILED`
 
 **Surface and bounds:** event bounds, fixed report fields, and a module surface with no forbidden names
 or I/O imports.
