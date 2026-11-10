@@ -51,6 +51,10 @@ whether the `AccountType` row carries a currency.
   - `avgCost` is a finite `float` or `int`.
   - `bool` is never accepted as a number.
   - A summary value is carried as its exact string, so the existing check rejects a non-decimal value.
+- **Currency.** A row's currency describes only its own value. If any required monetary tag
+  (`NetLiquidation`, `TotalCashValue`, `BuyingPower`) arrives with an empty currency, the summary's
+  `currency` stays missing. The existing check then reports `ACCOUNT_CURRENCY_MISSING`, and the snapshot
+  cannot pass. A currency-less non-monetary row, such as `AccountType`, is allowed.
 - **Fail closed.** Each of these latches a fixed `AccountIssueCode` and withholds every END, including a
   repeated END:
   - a malformed value or contract

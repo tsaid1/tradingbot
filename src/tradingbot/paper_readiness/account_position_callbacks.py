@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from enum import Enum
 
+from tradingbot.paper_readiness.diagnostics import REQUIRED_ACCOUNT_TAGS
 from tradingbot.paper_readiness.observations import (
     SYNTHETIC_ACCOUNT_RE,
     AccountSummaryObservation,
@@ -175,6 +176,7 @@ class _SummaryAccount:
         self.sequence = sequence
         self.account_type: str | None = None
         self.currencies: set[str] = set()
+        self.currency_missing = False  # a required monetary row arrived without its currency
         self.values: dict[str, str] = {}
         self.tags: set[str] = set()
 
@@ -230,6 +232,9 @@ class AccountSummaryCallbacks(_Stream):
             state.account_type = row_value or None
             return
         state.values[tag] = row_value
+        if row_currency is None and tag in REQUIRED_ACCOUNT_TAGS:
+            # Each row's currency describes only its own value; one row cannot vouch for another.
+            state.currency_missing = True
         if row_currency is not None:
             state.currencies.add(row_currency)
             if len(state.currencies) > 1:
@@ -251,7 +256,8 @@ class AccountSummaryCallbacks(_Stream):
     def _own(self) -> list[ResponseEnvelope]:
         out = []
         for account, state in self._accounts.items():
-            currency = next(iter(state.currencies)) if len(state.currencies) == 1 else None
+            known = len(state.currencies) == 1 and not state.currency_missing
+            currency = next(iter(state.currencies)) if known else None
             row = AccountSummaryObservation(account_id=account, account_type=state.account_type,
                                             currency=currency, values=dict(state.values))
             out.append(ResponseEnvelope(request_id=self.request_id, sequence=state.sequence,

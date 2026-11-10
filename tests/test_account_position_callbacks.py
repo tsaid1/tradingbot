@@ -266,6 +266,32 @@ def test_conflicting_summary_currencies_withhold_end():
     assert issue_codes(n) == [AccountIssueCode.CONFLICTING_CURRENCY] and not n.completed
 
 
+@pytest.mark.parametrize("missing", [("NetLiquidation",), ("TotalCashValue",), ("BuyingPower",),
+                                     ("TotalCashValue", "BuyingPower")],
+                         ids=["net-liquidation", "total-cash", "buying-power", "two-of-three"])
+def test_a_required_monetary_row_without_currency_cannot_pass(missing):
+    """Review P2: one row's currency does not establish the currency of the others."""
+    n = AccountSummaryCallbacks(SRID)
+    n.accountSummary(SRID, ACCOUNT, "AccountType", "INVENTED-TYPE", "")
+    for tag in ("NetLiquidation", "TotalCashValue", "BuyingPower"):
+        n.accountSummary(SRID, ACCOUNT, tag, "1.00", "" if tag in missing else "USD")
+    n.accountSummaryEnd(SRID)
+    row = next(e.account_summary for e in n.envelopes() if e.kind == ResponseKind.ACCOUNT_SUMMARY)
+    assert row.currency is None
+    assert "ACCOUNT_CURRENCY_MISSING" in summary_findings(n)
+    report = readiness(n, good_positions())
+    assert report.outcome == ReadinessOutcome.NOT_READY and "ACCOUNT_SNAPSHOT_CONTROL" not in codes(report)
+
+
+def test_currency_less_nonmonetary_rows_still_complete():
+    n = AccountSummaryCallbacks(SRID)
+    summary_rows(n)  # AccountType carries no currency
+    n.accountSummary(SRID, ACCOUNT, "Cushion", "0.85", "")
+    n.accountSummaryEnd(SRID)
+    assert summary_findings(n)[-1] == "ACCOUNT_SNAPSHOT_CONTROL"
+    assert readiness(n, good_positions()).outcome == ReadinessOutcome.CONTROL_COMPLETE
+
+
 def test_a_missing_end_never_completes():
     n = AccountSummaryCallbacks(SRID)
     summary_rows(n)
