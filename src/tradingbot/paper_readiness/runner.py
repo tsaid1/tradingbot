@@ -245,14 +245,6 @@ def run_readiness_check(transport: ReadOnlyTransport, expectation: ReadinessExpe
     observations: list[ObservationDigest] = []
     refused = ReadinessOutcome.REFUSED_BEFORE_DISPATCH
 
-    if getattr(transport, "transport_kind", None) != FAKE_TRANSPORT_KIND:
-        findings.append(Finding(code="TRANSPORT_NOT_FAKE", kind=FindingKind.REFUSED, stage=Stage.PREFLIGHT,
-                                detail="Only the deterministic FAKE transport is admitted by this scaffold; "
-                                       "connected checks remain blocked until the owner prerequisites are "
-                                       "verified. Nothing was attested or dispatched."))
-        return _report(expectation, as_of=now, label=label, findings=findings, dispatched=dispatched,
-                       observations=observations, outcome=refused)
-
     if type(expectation) is not ReadinessExpectation:
         findings.append(Finding(code="RECORDS_VERSION_MISMATCH", kind=FindingKind.REFUSED, stage=Stage.PREFLIGHT,
                                 detail="This runner admits only a version 1 ReadinessExpectation; nothing was "
@@ -261,6 +253,14 @@ def run_readiness_check(transport: ReadOnlyTransport, expectation: ReadinessExpe
         return _report(_ExpectationView(account_id=_UNBOUND, target=target), as_of=now, label=label,
                        findings=findings, dispatched=dispatched, observations=observations, outcome=refused,
                        account_ref=_UNBOUND)
+
+    if getattr(transport, "transport_kind", None) != FAKE_TRANSPORT_KIND:
+        findings.append(Finding(code="TRANSPORT_NOT_FAKE", kind=FindingKind.REFUSED, stage=Stage.PREFLIGHT,
+                                detail="Only the deterministic FAKE transport is admitted by this scaffold; "
+                                       "connected checks remain blocked until the owner prerequisites are "
+                                       "verified. Nothing was attested or dispatched."))
+        return _report(expectation, as_of=now, label=label, findings=findings, dispatched=dispatched,
+                       observations=observations, outcome=refused)
 
     session = transport.attest_session()
     if not isinstance(session, SessionAttestation):

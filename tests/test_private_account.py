@@ -265,6 +265,19 @@ def test_versions_never_mix():
         PrivateAccountReplay("not-a-scenario", KEY)
 
 
+def test_a_v2_expectation_with_a_non_fake_transport_refuses_without_any_call():
+    """Review P2: the version check runs before any branch reads a v1-only field."""
+    from tradingbot.paper_readiness.runner import run_readiness_check
+    clock = FakeClock(sc.CLOCK_START)
+    v2 = ReadinessExpectationV2(account_ref="acctref-v1:" + "0" * 32, target=sc.TLT_TARGET)
+    socket_transport = RecordingSocketTransport()
+    report = run_readiness_check(socket_transport, v2, clock=clock)
+    assert report.outcome == REFUSED and codes(report) == {"RECORDS_VERSION_MISMATCH"}
+    assert socket_transport.calls == [] and report.dispatched == [] and report.account_ref == "UNBOUND"
+    v1 = run_readiness_check(RecordingSocketTransport(), sc.EXPECTATION, clock=clock)
+    assert codes(v1) == {"TRANSPORT_NOT_FAKE"}  # a v1 expectation keeps its existing refusal
+
+
 def pa_run_v1(expectation, clock):
     from tradingbot.paper_readiness.runner import run_readiness_check
     return run_readiness_check(FakeReadOnlyTransport(sc.control_script(), clock), expectation, clock=clock)
