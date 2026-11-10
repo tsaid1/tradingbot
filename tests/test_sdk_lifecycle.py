@@ -540,4 +540,3 @@ def test_a_fetched_item_must_match_its_admission_record(admitted, physical):
     assert report.ledger.in_flight_callbacks == 0 and report.ledger.queued_callbacks == 1
     adapter.shutdown(join_timeout=0.01)
     assert adapter.report().completed is False
-
