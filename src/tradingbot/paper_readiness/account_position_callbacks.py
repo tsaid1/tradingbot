@@ -113,9 +113,15 @@ class _Stream:
 
     _end_kind: ResponseKind
 
-    def __init__(self, request_id: int) -> None:
+    def __init__(self, request_id: int, *, owner: object = None) -> None:
         if not _is_id(request_id):
             raise ValueError("request_id must be a non-negative 32-bit int")
+        if owner is not None:
+            # Version 2 owner mode (private_account.py). Imported here to keep module imports acyclic.
+            from tradingbot.paper_readiness.private_account import AccountOwner
+            if type(owner) is not AccountOwner or not owner.owns(owner.binding):
+                raise ValueError("owner must be an open AccountOwner holding its own binding")
+        self._owner = owner
         self.request_id = request_id
         self._callbacks = 0
         self._ignored = 0
@@ -140,6 +146,19 @@ class _Stream:
     def completed(self) -> bool:
         """The explicit END arrived and every callback was represented faithfully."""
         return self._end_sequence is not None and not self._issues and not self._issue_overflow
+
+    def _account(self, value: object) -> str | None:
+        """The account label for a row. Without an owner: the exact synthetic identifier, or None for any
+        other string. With an owner: the raw identity is compared privately before projection, to the
+        binding's reference on a match or the row's own keyed reference otherwise."""
+        if self._owner is None:
+            return _synthetic_account(value)
+        if type(value) is not str or len(value) > MAX_TEXT:
+            raise _Malformed
+        label = self._owner._project_row(value)
+        if label is None:
+            raise _Malformed
+        return label
 
     def _issue(self, code: AccountIssueCode, callback: str) -> None:
         if len(self._issues) < MAX_ISSUES:
@@ -193,8 +212,8 @@ class AccountSummaryCallbacks(_Stream):
 
     _end_kind = ResponseKind.ACCOUNT_SUMMARY_END
 
-    def __init__(self, request_id: int) -> None:
-        super().__init__(request_id)
+    def __init__(self, request_id: int, *, owner: object = None) -> None:
+        super().__init__(request_id, owner=owner)
         self._accounts: dict[str, _SummaryAccount] = {}
 
     def accountSummary(self, reqId: int, account: str, tag: str, value: str,
@@ -205,7 +224,7 @@ class AccountSummaryCallbacks(_Stream):
         try:
             if not _is_id(reqId):
                 raise _Malformed
-            synthetic = _synthetic_account(account)
+            synthetic = self._account(account)
             if type(tag) is not str or not _TAG_RE.fullmatch(tag):
                 raise _Malformed
             row_value = _text(value, empty_is_none=False)
@@ -316,8 +335,8 @@ class PositionSnapshotCallbacks(_Stream):
 
     _end_kind = ResponseKind.POSITION_END
 
-    def __init__(self, snapshot_id: int) -> None:
-        super().__init__(snapshot_id)
+    def __init__(self, snapshot_id: int, *, owner: object = None) -> None:
+        super().__init__(snapshot_id, owner=owner)
         self._rows: set[tuple[str, int]] = set()
         self._count = 0
 
@@ -326,7 +345,7 @@ class PositionSnapshotCallbacks(_Stream):
         if sequence is None:
             return
         try:
-            synthetic = _synthetic_account(account)
+            synthetic = self._account(account)
             try:
                 con_id = _con_id(contract.conId)
                 symbol = _text(contract.symbol)

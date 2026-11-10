@@ -37,13 +37,16 @@ from tradingbot.paper_readiness.diagnostics import (
 )
 from tradingbot.paper_readiness.observations import (
     END_KINDS,
+    RECORDS_VERSION_V2,
     ApiMessage,
     ReadinessExpectation,
+    ReadinessExpectationV2,
     ResponseEnvelope,
     ResponseKind,
     SessionAttestation,
 )
-from tradingbot.paper_readiness.preflight import preflight
+from tradingbot.paper_readiness.preflight import preflight, preflight_v2
+from tradingbot.paper_readiness.private_account import REPLAY_TARGET, PrivateAccountReplay
 from tradingbot.paper_readiness.transport import FAKE_TRANSPORT_KIND, FakeClock, ReadOnlyTransport
 
 __all__ = [
@@ -53,6 +56,7 @@ __all__ = [
     "correlate",
     "render_json",
     "render_text",
+    "run_private_account_replay",
     "run_readiness_check",
 ]
 
@@ -162,7 +166,8 @@ def correlate(envelopes: list[ResponseEnvelope], *, request_id: int, stage: Stag
 
 
 def _report(expectation: ReadinessExpectation, *, as_of, label, findings, dispatched, observations,
-            outcome: ReadinessOutcome | None = None) -> ReadinessReport:
+            outcome: ReadinessOutcome | None = None, account_ref: str | None = None,
+            records_version: int | None = None) -> ReadinessReport:
     counts = {kind.value: 0 for kind in FindingKind}
     for f in findings:
         counts[f.kind.value] += 1
@@ -170,46 +175,20 @@ def _report(expectation: ReadinessExpectation, *, as_of, label, findings, dispat
     if outcome is None:
         outcome = (ReadinessOutcome.CONTROL_COMPLETE if headline == FindingKind.INFO
                    else ReadinessOutcome.NOT_READY)
+    version = {} if records_version is None else {"records_version": records_version}
     return ReadinessReport(
-        label=label, as_of=as_of, account_ref=redact_account(expectation.account_id),
-        target_symbol=expectation.target.instrument.symbol, outcome=outcome, headline=headline,
-        counts=counts, dispatched=dispatched, observations=observations, findings=findings,
+        label=label, as_of=as_of,
+        account_ref=redact_account(expectation.account_id) if account_ref is None else account_ref,
+        target_symbol=("UNKNOWN" if expectation.target is None else expectation.target.instrument.symbol),
+        outcome=outcome, headline=headline,
+        counts=counts, dispatched=dispatched, observations=observations, findings=findings, **version,
     )
 
 
-def run_readiness_check(transport: ReadOnlyTransport, expectation: ReadinessExpectation, *,
-                        clock: FakeClock, policy: MockPolicy | None = None,
-                        label: str | None = None) -> ReadinessReport:
-    policy = policy or MockPolicy()
-    now = clock.now()
-    findings: list[Finding] = []
-    dispatched: list[str] = []
-    observations: list[ObservationDigest] = []
-    refused = ReadinessOutcome.REFUSED_BEFORE_DISPATCH
-
-    if getattr(transport, "transport_kind", None) != FAKE_TRANSPORT_KIND:
-        findings.append(Finding(code="TRANSPORT_NOT_FAKE", kind=FindingKind.REFUSED, stage=Stage.PREFLIGHT,
-                                detail="Only the deterministic FAKE transport is admitted by this scaffold; "
-                                       "connected checks remain blocked until the owner prerequisites are "
-                                       "verified. Nothing was attested or dispatched."))
-        return _report(expectation, as_of=now, label=label, findings=findings, dispatched=dispatched,
-                       observations=observations, outcome=refused)
-
-    session = transport.attest_session()
-    if not isinstance(session, SessionAttestation):
-        findings.append(Finding(code="SESSION_ATTESTATION_INVALID", kind=FindingKind.REFUSED,
-                                stage=Stage.PREFLIGHT,
-                                detail="The transport did not return a SessionAttestation record."))
-        return _report(expectation, as_of=now, label=label, findings=findings, dispatched=dispatched,
-                       observations=observations, outcome=refused)
-    decision = preflight(expectation, session)
-    findings.extend(decision.notes)
-    findings.extend(decision.refusals)
-    if decision.refused:
-        return _report(expectation, as_of=now, label=label, findings=findings, dispatched=dispatched,
-                       observations=observations, outcome=refused)
-    findings.extend(assess_session(session, now=now))
-
+def _dispatch_reads(transport, expectation, account_argument, *, now, policy, findings, dispatched,
+                    observations) -> None:
+    """The four reads and their assessments, shared by both versions. Version 1 passes the expectation
+    and its account id; version 2 passes a view carrying only the opaque reference, and the binding."""
     def read(method: str, *args) -> Correlated:
         request_id = REQUEST_IDS[method]
         stage, end_kind, data_kinds = _STREAMS[method]
@@ -244,18 +223,115 @@ def run_readiness_check(transport: ReadOnlyTransport, expectation: ReadinessExpe
             quote.end_seen, quote.errors, con_id, now=now, policy=policy,
             request_id=REQUEST_IDS["request_quote_snapshot"]))
 
-    account = read("request_account_summary", expectation.account_id)
+    account = read("request_account_summary", account_argument)
     findings.extend(assess_account_summary(
         expectation, account.payloads(ResponseKind.ACCOUNT_SUMMARY), account.end_seen, account.errors,
         request_id=REQUEST_IDS["request_account_summary"]))
 
-    positions = read("request_positions", expectation.account_id)
+    positions = read("request_positions", account_argument)
     findings.extend(assess_positions(
         expectation, positions.payloads(ResponseKind.POSITION), positions.end_seen, positions.errors,
         request_id=REQUEST_IDS["request_positions"]))
 
+
+
+def run_readiness_check(transport: ReadOnlyTransport, expectation: ReadinessExpectation, *,
+                        clock: FakeClock, policy: MockPolicy | None = None,
+                        label: str | None = None) -> ReadinessReport:
+    policy = policy or MockPolicy()
+    now = clock.now()
+    findings: list[Finding] = []
+    dispatched: list[str] = []
+    observations: list[ObservationDigest] = []
+    refused = ReadinessOutcome.REFUSED_BEFORE_DISPATCH
+
+    if getattr(transport, "transport_kind", None) != FAKE_TRANSPORT_KIND:
+        findings.append(Finding(code="TRANSPORT_NOT_FAKE", kind=FindingKind.REFUSED, stage=Stage.PREFLIGHT,
+                                detail="Only the deterministic FAKE transport is admitted by this scaffold; "
+                                       "connected checks remain blocked until the owner prerequisites are "
+                                       "verified. Nothing was attested or dispatched."))
+        return _report(expectation, as_of=now, label=label, findings=findings, dispatched=dispatched,
+                       observations=observations, outcome=refused)
+
+    if type(expectation) is not ReadinessExpectation:
+        findings.append(Finding(code="RECORDS_VERSION_MISMATCH", kind=FindingKind.REFUSED, stage=Stage.PREFLIGHT,
+                                detail="This runner admits only a version 1 ReadinessExpectation; nothing was "
+                                       "converted, attested or dispatched."))
+        target = expectation.target if type(expectation) is ReadinessExpectationV2 else None
+        return _report(_ExpectationView(account_id=_UNBOUND, target=target), as_of=now, label=label,
+                       findings=findings, dispatched=dispatched, observations=observations, outcome=refused,
+                       account_ref=_UNBOUND)
+
+    session = transport.attest_session()
+    if not isinstance(session, SessionAttestation):
+        findings.append(Finding(code="SESSION_ATTESTATION_INVALID", kind=FindingKind.REFUSED,
+                                stage=Stage.PREFLIGHT,
+                                detail="The transport did not return a SessionAttestation record."))
+        return _report(expectation, as_of=now, label=label, findings=findings, dispatched=dispatched,
+                       observations=observations, outcome=refused)
+    decision = preflight(expectation, session)
+    findings.extend(decision.notes)
+    findings.extend(decision.refusals)
+    if decision.refused:
+        return _report(expectation, as_of=now, label=label, findings=findings, dispatched=dispatched,
+                       observations=observations, outcome=refused)
+    findings.extend(assess_session(session, now=now))
+    _dispatch_reads(transport, expectation, expectation.account_id, now=now, policy=policy, findings=findings,
+                    dispatched=dispatched, observations=observations)
     return _report(expectation, as_of=now, label=label, findings=findings, dispatched=dispatched,
                    observations=observations)
+
+
+_UNBOUND = "UNBOUND"
+
+
+@dataclass(frozen=True)
+class _ExpectationView:
+    """What the shared assessments read: the target and the opaque reference standing for the account."""
+    account_id: str
+    target: object
+
+
+
+def run_private_account_replay(replay: PrivateAccountReplay, *, policy: MockPolicy | None = None,
+                               label: str | None = None) -> ReadinessReport:
+    """Version 2: one closed invented replay. The account stays with the replay's private owner; the report
+    carries only the binding's reference, and nothing here takes a callable, client or transport kind."""
+    if type(replay) is not PrivateAccountReplay:
+        raise TypeError("run_private_account_replay requires a PrivateAccountReplay")
+    policy = policy or MockPolicy()
+    now = replay.clock.now()
+    findings: list[Finding] = []
+    dispatched: list[str] = []
+    observations: list[ObservationDigest] = []
+    expectation = replay.expectation()
+    view = _ExpectationView(account_id=_UNBOUND if expectation is None else expectation.account_ref,
+                            target=REPLAY_TARGET)
+
+    def report(outcome: ReadinessOutcome | None = None) -> ReadinessReport:
+        return _report(view, as_of=now, label=label, findings=findings, dispatched=dispatched,
+                       observations=observations, outcome=outcome, account_ref=view.account_id,
+                       records_version=RECORDS_VERSION_V2)
+
+    refused = ReadinessOutcome.REFUSED_BEFORE_DISPATCH
+    if not replay.begin():
+        findings.append(Finding(code="REPLAY_ALREADY_USED", kind=FindingKind.REFUSED, stage=Stage.PREFLIGHT,
+                                detail="A private replay runs once; its owner and binding are not reused."))
+        return report(refused)
+    try:
+        session = replay.attest_session()
+        decision = preflight_v2(expectation, session, replay.account_status,
+                                binding_owned=replay.binding_owned(replay.binding))
+        findings.extend(decision.notes)
+        findings.extend(decision.refusals)
+        if decision.refused:
+            return report(refused)
+        findings.extend(assess_session(session, now=now))
+        _dispatch_reads(replay.transport, view, replay.binding, now=now, policy=policy, findings=findings,
+                        dispatched=dispatched, observations=observations)
+        return report()
+    finally:
+        replay.close()  # the binding is stale from here on
 
 
 def render_json(report: ReadinessReport) -> str:
