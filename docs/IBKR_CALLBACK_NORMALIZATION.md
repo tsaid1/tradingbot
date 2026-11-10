@@ -42,6 +42,7 @@ fetching** on 2026-11-10 and were not verified.
 | `tickGeneric(int tickerId, int field, double value)` | Tick 49, halted: -1, 0, 1 or 2 |
 | `tickSnapshotEnd(int tickerId)` | Stamps `received_at` from the injected clock and emits `TICK_SNAPSHOT_END`, only when `completed` |
 | `error(int id, int errorCode, string errorMsg, string advancedOrderRejectJson)` | An `ERROR` envelope with the code only. Id -1 is session-level and recorded in `session_messages`. Neither text argument is read or retained |
+| `error_1052(reqId, errorTime, errorCode, errorString[, advancedOrderRejectJson])`, positional only | The SDK 1052 argument order, routed by the caller explicitly. `errorTime` must be an exact `int` (0 allowed) and is discarded with no unit, range, freshness or clock meaning. The code then follows the legacy row exactly, giving the same code-only evidence. Any other arity, or a non-`int` time, is a malformed callback that withholds completion. Neither text argument is read or retained |
 
 Tick ids and their delivery callbacks are from https://interactivebrokers.github.io/tws-api/tick_types.html.
 `DOCUMENTED_TICK_CALLBACKS` holds the whole documented table (99 ids):
@@ -114,10 +115,15 @@ The remaining official references, and their limits, are in [PAPER_READINESS.md]
 
 - Exercised only with invented values in plain Python objects shaped like the documented ones. Real SDK
   types, versions and callback ordering are not verified.
-- Newer API versions may add `error` arguments (for example an error time). Only the legacy four-argument
-  form is implemented, and a bridge for another form must route it explicitly. The `error(Exception)` and
-  `error(string)` overloads are API-internal, so route them to `unsupported_callback`.
+- Two `error` orders exist. The legacy four-argument form goes to `error`, and the SDK 1052 order, which adds
+  `errorTime` before `errorCode`, goes to `error_1052`. The caller must choose explicitly. Nothing infers a
+  version from arity or values, and a 1052 call mislabelled as legacy cannot be detected by `error`
+  (its time would be read as the code). The meaning and units of `errorTime` are not established, so it is
+  validated as an exact `int` and discarded. The `error(Exception)` and `error(string)` overloads are
+  API-internal, so route them to `unsupported_callback`.
 - `TickAttrib` fields, including pre-open, are not interpreted.
+- An SDK whose decoder emits both a raw message and its converted callbacks must have only one of those
+  surfaces routed here. Routing both would record the same data twice as independent observations.
 - A real snapshot can legitimately update a tick within its window. Here that is reported as ambiguous
   rather than resolved.
 - Callbacks outside the request window (for example connection-time `nextValidId`) must not be routed to

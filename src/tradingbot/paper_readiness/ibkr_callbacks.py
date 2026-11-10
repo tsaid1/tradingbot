@@ -466,21 +466,47 @@ class IbkrCallbackNormalizer:
 
     def error(self, reqId: int, errorCode: int, errorString: str,
               advancedOrderRejectJson: str = "") -> None:
-        """The documented four-argument form. The text arguments are never read or retained."""
+        """The documented legacy four-argument form. The text arguments are never read or retained.
+
+        It cannot tell a mislabelled SDK 1052 call apart: an SDK 1052 caller must use ``error_1052``."""
         sequence = self._admit("error")
         if sequence is None:
             return
+        self._error("error", sequence, reqId, errorCode)
+
+    def error_1052(self, *args: object) -> None:
+        """The SDK 1052 order, positional only: ``reqId, errorTime, errorCode, errorString`` and an
+        optional ``advancedOrderRejectJson``.
+
+        Any other arity is a malformed callback, never a raised TypeError a caller could swallow.
+        ``errorTime`` must be an exact ``int`` (0 allowed) and is then discarded: no unit, range,
+        freshness or clock meaning is taken from it. The text arguments are never read or retained.
+        Nothing here infers a version from arity or values; the caller chooses this entry point."""
+        sequence = self._admit("error_1052")
+        if sequence is None:
+            return
+        if len(args) not in (4, 5):
+            self._issue(IssueCode.MALFORMED_CALLBACK, "error_1052", args[0] if args else None)
+            return
+        req_id, error_time, error_code = args[0], args[1], args[2]
+        if not _is_int(error_time):
+            self._issue(IssueCode.MALFORMED_CALLBACK, "error_1052", req_id)
+            return
+        self._error("error_1052", sequence, req_id, error_code)
+
+    def _error(self, callback: str, sequence: int, reqId: object, errorCode: object) -> None:
+        """The code-only normalization both entry points share."""
         if not _is_int(errorCode) or errorCode < 0 or not _is_int(reqId):
-            self._issue(IssueCode.MALFORMED_CALLBACK, "error", reqId)
+            self._issue(IssueCode.MALFORMED_CALLBACK, callback, reqId)
             return
         if reqId == SESSION_REQUEST_ID:
             if len(self._session_messages) < MAX_SESSION_MESSAGES:
                 self._session_messages.append(ApiMessage(code=errorCode))
             if errorCode not in SESSION_OK_CODES:
-                self._issue(IssueCode.SESSION_MESSAGE_DURING_REQUEST, "error")
+                self._issue(IssueCode.SESSION_MESSAGE_DURING_REQUEST, callback)
             return
         if reqId < 0:
-            self._issue(IssueCode.MALFORMED_CALLBACK, "error")
+            self._issue(IssueCode.MALFORMED_CALLBACK, callback)
             return
         self._record(reqId, sequence, ResponseKind.ERROR,
                      message=ApiMessage(code=errorCode, request_id=reqId))

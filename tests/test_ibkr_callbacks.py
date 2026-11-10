@@ -593,7 +593,8 @@ def test_issue_list_is_bounded():
 def test_surface_is_documented_callbacks_and_read_only_outputs_only():
     public = {name for name in dir(IbkrCallbackNormalizer) if not name.startswith("_")}
     assert public == {"contractDetails", "contractDetailsEnd", "marketDataType", "tickPrice", "tickSize",
-                      "tickString", "tickGeneric", "tickSnapshotEnd", "error", "unsupported_callback",
+                      "tickString", "tickGeneric", "tickSnapshotEnd", "error", "error_1052",
+                      "unsupported_callback",
                       "envelopes", "completed", "issues", "issue_overflow", "ignored_callbacks",
                       "session_messages"}
     for name in public | set(vars(quote_normalizer())):
@@ -638,3 +639,109 @@ def test_module_imports_no_sdk_or_network_and_reads_no_wall_clock():
 def test_constructor_refuses_an_unbound_or_mismatched_request(args, kwargs):
     with pytest.raises(ValueError):
         IbkrCallbackNormalizer(*args, **kwargs)
+
+
+# ----------------------------------------------------------------------------- SDK 1052 error order
+
+ERROR_TIME = 1_762_443_000  # invented; discarded without meaning
+
+
+def _dump(n: IbkrCallbackNormalizer) -> list:
+    return [e.model_dump(mode="json") for e in n.envelopes()]
+
+
+@pytest.mark.parametrize(("legacy", "versioned"), [
+    ((QRID, 354, CANARY, CANARY), (QRID, ERROR_TIME, 354, CANARY, CANARY)),
+    ((QRID, 354, CANARY), (QRID, 0, 354, CANARY)),
+    ((QRID + 50, 200, CANARY), (QRID + 50, ERROR_TIME, 200, CANARY)),
+], ids=["five-argument", "four-argument-zero-time", "foreign-id"])
+def test_1052_and_legacy_errors_give_the_same_code_only_evidence(legacy, versioned):
+    a, b = live_ticks(quote_normalizer()), live_ticks(quote_normalizer())
+    a.error(*legacy)
+    b.error_1052(*versioned)
+    a.tickSnapshotEnd(QRID)
+    b.tickSnapshotEnd(QRID)
+    assert _dump(a) == _dump(b) and a.issues == b.issues == ()
+    assert quote_findings(a) == quote_findings(b)
+    message = next(e.message for e in b.envelopes() if e.kind == ResponseKind.ERROR)
+    assert message.code == versioned[2]  # the code, never the time
+    assert CANARY not in repr(b.envelopes()) and CANARY not in json.dumps(_dump(b))
+
+
+def test_a_1052_entitlement_error_keeps_its_classification_through_the_runner():
+    n = live_ticks(quote_normalizer())
+    n.error_1052(QRID, ERROR_TIME, 354, CANARY, CANARY)
+    n.tickSnapshotEnd(QRID)
+    report = readiness(contract_normalizer(), n)
+    assert "ENTITLEMENT_UNAVAILABLE" in codes(report) and CANARY not in render_json(report)
+
+
+@pytest.mark.parametrize(("code", "completes"), [(2104, True), (1100, False)])
+def test_1052_session_errors_keep_the_existing_session_code_policy(code, completes):
+    n = live_ticks(quote_normalizer())
+    n.error_1052(ic.SESSION_REQUEST_ID, 0, code, CANARY)
+    n.tickSnapshotEnd(QRID)
+    assert [m.code for m in n.session_messages] == [code] and n.completed is completes
+    if not completes:
+        assert issue_codes(n) == [IssueCode.SESSION_MESSAGE_DURING_REQUEST]
+    assert CANARY not in repr(n.session_messages) and CANARY not in repr(n.issues)
+
+
+@pytest.mark.parametrize("args", [
+    (QRID, True, 354, CANARY),
+    (QRID, "0", 354, CANARY),
+    (QRID, 0.0, 354, CANARY),
+    (QRID, Decimal(0), 354, CANARY),
+    (QRID, None, 354, CANARY),
+    ("1002", 0, 354, CANARY),
+    (QRID, 0, -1, CANARY),
+    (QRID, 0, True, CANARY),
+    (QRID, 0, "354", CANARY),
+    (-7, 0, 354, CANARY),
+    (QRID, 354, CANARY, CANARY),  # legacy order sent to the 1052 entry point
+    (QRID, 0, 354),
+    (QRID, 0, 354, CANARY, CANARY, CANARY),
+    (),
+], ids=["time-bool", "time-text", "time-float", "time-decimal", "time-none", "id-text", "code-negative",
+        "code-bool", "code-text", "id-negative", "legacy-order", "too-few", "too-many", "empty"])
+def test_a_malformed_1052_error_latches_an_issue_and_withholds_end(args):
+    n = live_ticks(quote_normalizer())
+    n.error_1052(*args)  # never raises, so a caller cannot swallow it into a clean stream
+    n.tickSnapshotEnd(QRID)
+    assert issue_codes(n) == [IssueCode.MALFORMED_CALLBACK]
+    assert [i.callback for i in n.issues] == ["error_1052"] and not n.completed
+    assert "TICK_SNAPSHOT_END_MISSING" in quote_findings(n)
+    assert CANARY not in repr(n.envelopes()) and CANARY not in repr(n.issues)
+
+
+def test_a_malformed_1052_error_after_end_withdraws_completion():
+    n = live_snapshot()
+    assert n.completed
+    n.error_1052(QRID, "late", 354, CANARY)
+    assert not n.completed
+    assert ResponseKind.TICK_SNAPSHOT_END not in [e.kind for e in n.envelopes()]
+
+
+def test_a_valid_1052_error_after_end_is_after_end():
+    n = live_snapshot()
+    n.error_1052(QRID, ERROR_TIME, 354, CANARY)
+    assert "RESPONSE_AFTER_END_IGNORED" in quote_findings(n)
+
+
+def test_a_1052_error_counts_once_against_the_callback_bound():
+    n = quote_normalizer()
+    for _ in range(ic.MAX_CALLBACKS - 1):
+        n.tickPrice(QRID, 1, 100.0, ATTRIB)
+    n.error_1052(QRID, 0, 354, CANARY)  # the 256th callback
+    assert n.ignored_callbacks == 0 and n.issues == ()
+    n.error_1052(QRID, 0, 354, CANARY)  # the 257th
+    assert n.ignored_callbacks == 1 and issue_codes(n) == [IssueCode.CALLBACK_LIMIT_EXCEEDED]
+
+
+def test_legacy_error_behaviour_is_unchanged():
+    n = live_ticks(quote_normalizer())
+    n.error(QRID, 354, CANARY)
+    n.error(QRID, "354", CANARY)
+    n.tickSnapshotEnd(QRID)
+    assert [i.callback for i in n.issues] == ["error"]
+    assert [e.message.code for e in n.envelopes() if e.kind == ResponseKind.ERROR] == [354]
