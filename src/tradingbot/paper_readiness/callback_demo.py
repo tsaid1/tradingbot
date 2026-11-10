@@ -12,14 +12,23 @@ The account summary and positions are **preassembled control envelopes**, invent
 produced from callbacks. No account or position callback adapter, installed SDK, broker connection or
 network is involved, and nothing here authorizes paper readiness or trading.
 
+Each run also composes one ``LifecycleAdapter`` and its ``RetirementLedger`` over invented SDK-free
+doubles. Only the quote-snapshot callbacks pass through it: a reader double queues each one, and
+only the adapter's consumer delivers it to the quote normalizer. The adapter then retires the
+connection and observes the reader, socket and consumer separately. Contract-details callbacks have
+no lifecycle read slot and reach their normalizer directly, and the account summary and positions
+are not callbacks, so all three are reported as outside the lifecycle model. A completed lifecycle
+is local only: broker-side retirement stays not established and PAPER-READ-1 stays not assessed.
+
 Every fixture value is invented for this demonstration only, under one fixed ``FakeClock``.
 """
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from typing import Self
 
 from tradingbot.models import AssetClass, Instrument
 from tradingbot.paper_readiness.diagnostics import ReadinessOutcome, ReadinessReport
@@ -33,15 +42,19 @@ from tradingbot.paper_readiness.observations import (
     SessionAttestation,
     TargetContract,
 )
+from tradingbot.paper_readiness.read_retirement import CallbackKind, ReadSlot
 from tradingbot.paper_readiness.runner import REQUEST_IDS, render_text, run_readiness_check
+from tradingbot.paper_readiness.sdk_lifecycle import AdapterReport, DirectCallback, LifecycleAdapter
 from tradingbot.paper_readiness.transport import FakeClock, FakeReadOnlyTransport, FakeScript
 
 __all__ = [
     "DEMO_CLOCK",
     "DEMO_EXPECTATION",
+    "LIFECYCLE_NOTICE",
     "PREASSEMBLED_STREAMS",
     "SCENARIOS",
     "SIMULATION_NOTICE",
+    "UNKNOWN_CLEANUP",
     "DemoResult",
     "DemoScenario",
     "main",
@@ -57,6 +70,20 @@ SIMULATION_NOTICE = (
 )
 # The two streams this demonstration supplies as preassembled envelopes instead of callbacks.
 PREASSEMBLED_STREAMS = ("account_summary", "positions")
+LIFECYCLE_NOTICE = (
+    "LOCAL LIFECYCLE, SIMULATED: only the quote-snapshot callbacks pass through the SDK-free "
+    "LifecycleAdapter and its RetirementLedger, over invented doubles. Contract details (direct "
+    "callbacks, no lifecycle read slot), account summary and positions (preassembled controls) are "
+    "outside the lifecycle model. A completed lifecycle is local only: broker-side retirement is "
+    "not established, PAPER-READ-1 is not assessed and trading_permission is False."
+)
+# The one stream whose callbacks pass through the lifecycle adapter, and why the others do not.
+_LIFECYCLE_STREAMS = ("quote_snapshot",)
+_OUTSIDE_LIFECYCLE = {
+    "contract_details": "callbacks go to the normalizer directly; no lifecycle read slot exists",
+    "account_summary": "preassembled control envelopes, not callbacks",
+    "positions": "preassembled control envelopes, not callbacks",
+}
 
 # ----------------------------------------------------------------------------- invented fixtures
 
@@ -136,7 +163,7 @@ def _contract_callbacks(n: IbkrCallbackNormalizer) -> None:
     n.contractDetailsEnd(_CRID)
 
 
-def _live_ticks(n: IbkrCallbackNormalizer) -> None:
+def _live_ticks(n: _QuoteReader) -> None:
     attrib = _NoAttrib()
     n.marketDataType(_QRID, 1)
     n.tickPrice(_QRID, 1, 48.25, attrib)
@@ -147,14 +174,13 @@ def _live_ticks(n: IbkrCallbackNormalizer) -> None:
     n.tickString(_QRID, 45, _LAST_TRADE)
 
 
-def _control(contract: IbkrCallbackNormalizer, quote: IbkrCallbackNormalizer) -> None:
+def _control(contract: IbkrCallbackNormalizer, quote: _QuoteReader) -> None:
     _contract_callbacks(contract)
     _live_ticks(quote)
     quote.tickSnapshotEnd(_QRID)
 
 
-def _delayed_size_mixed_with_live(contract: IbkrCallbackNormalizer,
-                                  quote: IbkrCallbackNormalizer) -> None:
+def _delayed_size_mixed_with_live(contract: IbkrCallbackNormalizer, quote: _QuoteReader) -> None:
     """PR #25 review P2: delayed bid size (tick 69) among otherwise live ticks."""
     _contract_callbacks(contract)
     _live_ticks(quote)
@@ -162,7 +188,7 @@ def _delayed_size_mixed_with_live(contract: IbkrCallbackNormalizer,
     quote.tickSnapshotEnd(_QRID)
 
 
-def _issue_with_repeated_end(contract: IbkrCallbackNormalizer, quote: IbkrCallbackNormalizer) -> None:
+def _issue_with_repeated_end(contract: IbkrCallbackNormalizer, quote: _QuoteReader) -> None:
     """PR #25 review P1: a valid row, an unsupported callback, then contractDetailsEnd twice."""
     contract.contractDetails(_CRID, _details())
     contract.unsupported_callback("connectionClosed")
@@ -178,6 +204,9 @@ class DemoScenario:
     description: str
     expected_outcome: ReadinessOutcome
     feed: object
+    # Whether the invented connection double can report its socket closed after the disconnect.
+    socket_closure_known: bool = True
+    expected_lifecycle_completed: bool = True
 
 
 SCENARIOS = {
@@ -193,6 +222,156 @@ SCENARIOS = {
     )
 }
 
+# The CLI's fourth scenario. It stays out of SCENARIOS, so the dashboard's three-scenario selector
+# is unchanged. Same callbacks as the control: readiness is CONTROL_COMPLETE, but after the
+# disconnect returns, the connection double cannot say whether its socket closed.
+UNKNOWN_CLEANUP = DemoScenario(
+    "control_with_unknown_socket_closure",
+    "Control callbacks; after the returned disconnect the socket closure is unknown.",
+    ReadinessOutcome.CONTROL_COMPLETE, _control,
+    socket_closure_known=False, expected_lifecycle_completed=False,
+)
+
+
+# ----------------------------------------------------------------------------- lifecycle doubles
+
+_QueueItem = tuple[ReadSlot, CallbackKind]
+_Callback = tuple[str, tuple]  # a quote-normalizer method name and its invented arguments
+
+
+class _SingleThreadLock:
+    """The demonstration runs on one thread, so this lock only refuses re-entry, which is a bug."""
+
+    def __init__(self) -> None:
+        self._held = False
+
+    def __enter__(self) -> Self:
+        if self._held:
+            raise RuntimeError("lock re-entered")
+        self._held = True
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._held = False
+
+
+class _Connection:
+    def __init__(self) -> None:
+        self.connected = True
+        self.closed: bool | None = False
+
+    def is_connected(self) -> bool:
+        return self.connected
+
+    def socket_closed(self) -> bool | None:
+        return self.closed  # None: closure unknown
+
+
+class _Queue:
+    """FIFO between the reader double and the adapter's consumer. Each item keeps its callback."""
+
+    def __init__(self) -> None:
+        self._items: list[tuple[_QueueItem, _Callback]] = []
+        self.fetched: tuple[_QueueItem, _Callback] | None = None
+
+    def put(self, item: _QueueItem, callback: _Callback) -> None:
+        self._items.append((item, callback))
+
+    def get_nowait(self) -> _QueueItem | None:
+        if not self._items:
+            return None
+        self.fetched = self._items.pop(0)
+        return self.fetched[0]
+
+    def size(self) -> int:
+        return len(self._items)
+
+
+class _QuoteReader:
+    """Stands in for the reader thread on the quote read. Each invented quote callback it receives
+    is queued whole; only the adapter's consumer delivers it to the quote normalizer. It holds no
+    partial message, and its invented input has ended by the time the adapter joins it."""
+
+    def __init__(self, adapter: LifecycleAdapter, queue: _Queue) -> None:
+        self._adapter = adapter
+        self._queue = queue
+        self._alive = True
+
+    def _receive(self, kind: CallbackKind, name: str, *args: object) -> None:
+        item = (ReadSlot.QUOTE_SNAPSHOT, kind)
+        self._queue.put(item, (name, args))
+        self._adapter.on_enqueued(*item)
+
+    # Only the documented quote callbacks these scenarios use; no other read type is modelled here.
+    def marketDataType(self, reqId: int, marketDataType: int) -> None:
+        self._receive(CallbackKind.DATA, "marketDataType", reqId, marketDataType)
+
+    def tickPrice(self, reqId: int, tickType: int, price: float, attrib: object) -> None:
+        self._receive(CallbackKind.DATA, "tickPrice", reqId, tickType, price, attrib)
+
+    def tickSize(self, reqId: int, tickType: int, size: object) -> None:
+        self._receive(CallbackKind.DATA, "tickSize", reqId, tickType, size)
+
+    def tickString(self, reqId: int, tickType: int, value: str) -> None:
+        self._receive(CallbackKind.DATA, "tickString", reqId, tickType, value)
+
+    def tickSnapshotEnd(self, reqId: int) -> None:
+        self._receive(CallbackKind.END, "tickSnapshotEnd", reqId)
+
+    def join(self, timeout: float) -> None:
+        self._alive = False
+
+    def is_alive(self) -> bool:
+        return self._alive
+
+    def partial_bytes(self) -> int:
+        return 0
+
+
+class _QuoteBoundary:
+    """Invented SDK-free client double for one local connection carrying the quote read."""
+
+    def __init__(self, quote: IbkrCallbackNormalizer, socket_closure_known: bool) -> None:
+        self._quote = quote
+        self._socket_closure_known = socket_closure_known
+        self.adapter: LifecycleAdapter | None = None
+        self.connection, self.queue = _Connection(), _Queue()
+        self.reader: _QuoteReader | None = None
+
+    def connect(self) -> _QuoteBoundary:
+        return self  # the adapter retains .connection, .reader and .queue
+
+    def stop_read(self, slot: ReadSlot) -> None:
+        """Not reached here: the adapter makes no attempt for a snapshot whose END it delivered."""
+
+    def disconnect(self) -> None:
+        self.connection.connected = False
+        self.connection.closed = True if self._socket_closure_known else None
+        self.adapter.on_direct_callback(DirectCallback.CONNECTION_CLOSED)  # not evidence of closure
+
+    def dispatch(self, slot: ReadSlot, kind: CallbackKind) -> None:
+        fetched, self.queue.fetched = self.queue.fetched, None
+        if fetched is None or fetched[0] != (slot, kind):
+            raise RuntimeError("dispatched item is not the fetched one")
+        name, args = fetched[1]
+        getattr(self._quote, name)(*args)
+
+
+def _run_lifecycle(scenario: DemoScenario, contract: IbkrCallbackNormalizer,
+                   quote: IbkrCallbackNormalizer) -> AdapterReport:
+    """Feed the scenario with its quote callbacks routed through one adapter, then shut it down."""
+    boundary = _QuoteBoundary(quote, scenario.socket_closure_known)
+    adapter = LifecycleAdapter(boundary, _SingleThreadLock())
+    boundary.adapter = adapter
+    boundary.reader = _QuoteReader(adapter, boundary.queue)
+    adapter.start()
+    adapter.open_read(ReadSlot.QUOTE_SNAPSHOT)
+    scenario.feed(contract, boundary.reader)  # contract callbacks reach their normalizer directly
+    while adapter.consume_one():  # delivers each queued quote callback, END included, in order
+        pass
+    adapter.shutdown(join_timeout=0.0)  # the reader double's join returns at once
+    return adapter.report()
+
 
 # ----------------------------------------------------------------------------- running and rendering
 
@@ -204,19 +383,26 @@ class DemoResult:
     contract_issues: tuple[str, ...]
     quote_completed: bool
     quote_issues: tuple[str, ...]
+    lifecycle: AdapterReport
 
     @property
     def matches_expectation(self) -> bool:
-        return self.report.outcome == self.scenario.expected_outcome
+        """Both expected outcomes occurred. Only that: never readiness, retirement or authority."""
+        return (self.report.outcome == self.scenario.expected_outcome
+                and self.lifecycle.completed == self.scenario.expected_lifecycle_completed)
+
+
+def _scenario(name: str) -> DemoScenario:
+    return UNKNOWN_CLEANUP if name == UNKNOWN_CLEANUP.name else SCENARIOS[name]
 
 
 def run_demo(name: str) -> DemoResult:
-    """Run one named scenario from fresh normalizers under the fixed clock."""
-    scenario = SCENARIOS[name]
+    """Run one named scenario from fresh normalizers, doubles and adapter under the fixed clock."""
+    scenario = _scenario(name)
     clock = FakeClock(DEMO_CLOCK)
     contract = IbkrCallbackNormalizer(_CRID, CallbackRequest.CONTRACT_DETAILS)
     quote = IbkrCallbackNormalizer(_QRID, CallbackRequest.QUOTE_SNAPSHOT, con_id=_CON_ID, clock=clock)
-    scenario.feed(contract, quote)
+    lifecycle = _run_lifecycle(scenario, contract, quote)
     script = FakeScript(session=_session(), contract_details=contract.envelopes(),
                         quote_snapshot=quote.envelopes(), **_preassembled_account_streams())
     report = run_readiness_check(FakeReadOnlyTransport(script, clock), DEMO_EXPECTATION, clock=clock,
@@ -225,6 +411,7 @@ def run_demo(name: str) -> DemoResult:
         scenario=scenario, report=report,
         contract_completed=contract.completed, contract_issues=tuple(i.code.value for i in contract.issues),
         quote_completed=quote.completed, quote_issues=tuple(i.code.value for i in quote.issues),
+        lifecycle=lifecycle,
     )
 
 
@@ -241,20 +428,29 @@ def _summary(result: DemoResult) -> dict:
             "quote_snapshot": {"completed": result.quote_completed, "issues": list(result.quote_issues)},
         },
         "preassembled_control_streams": list(PREASSEMBLED_STREAMS),
+        "local_lifecycle": {
+            "modelled_streams": list(_LIFECYCLE_STREAMS),
+            "outside_lifecycle_model": dict(_OUTSIDE_LIFECYCLE),
+            "expected_completed": result.scenario.expected_lifecycle_completed,
+            "completed": result.lifecycle.completed,
+            "local_quiescence_established": result.lifecycle.ledger.local_quiescence_established,
+        },
     }
 
 
 def render_demo_json(results: list[DemoResult]) -> str:
-    payload = {"notice": SIMULATION_NOTICE,
-               "scenarios": [{**_summary(r), "report": r.report.model_dump(mode="json")} for r in results]}
+    payload = {"notice": SIMULATION_NOTICE, "lifecycle_notice": LIFECYCLE_NOTICE,
+               "scenarios": [{**_summary(r), "report": r.report.model_dump(mode="json"),
+                              "lifecycle_report": asdict(r.lifecycle)} for r in results]}
     return json.dumps(payload, indent=2, sort_keys=True) + "\n"
 
 
 def render_demo_text(results: list[DemoResult]) -> str:
-    lines = [SIMULATION_NOTICE, ""]
+    lines = [SIMULATION_NOTICE, LIFECYCLE_NOTICE, ""]
     for r in results:
         s = _summary(r)
         ingestion = s["callback_ingestion"]
+        life, ledger = r.lifecycle, r.lifecycle.ledger
         lines.append(f"== {r.scenario.name}: {r.scenario.description}")
         lines.append(f"   expected={s['expected_outcome']} outcome={s['outcome']} "
                      f"matches_expectation={s['matches_expectation']}")
@@ -262,18 +458,30 @@ def render_demo_text(results: list[DemoResult]) -> str:
             issues = ", ".join(state["issues"]) or "none"
             lines.append(f"   {stream}: completed={state['completed']} issues={issues}")
         lines.append(f"   preassembled control streams: {', '.join(PREASSEMBLED_STREAMS)}")
+        lines.append(f"   local lifecycle ({', '.join(_LIFECYCLE_STREAMS)} only): "
+                     f"expected_completed={r.scenario.expected_lifecycle_completed} "
+                     f"completed={life.completed} "
+                     f"local_quiescence_established={ledger.local_quiescence_established}")
+        lines.append(f"   observed: reader={ledger.reader} socket={ledger.socket} "
+                     f"consumer={ledger.consumer} disconnect={ledger.disconnect_attempt} "
+                     f"state={life.state} failures={', '.join(life.failures) or 'none'}")
+        lines.append(f"   outside the lifecycle model: {', '.join(_OUTSIDE_LIFECYCLE)}; "
+                     f"broker_side_retirement={ledger.broker_side_retirement} "
+                     f"paper_read_1={life.paper_read_1}")
         lines.append(render_text(r.report, summary=True).rstrip("\n"))
         lines.append("")
     matched = sum(r.matches_expectation for r in results)
-    lines.append(f"{matched}/{len(results)} scenarios matched their expected outcome. "
-                 "NON_AUTHORITATIVE; trading_permission=False.")
+    lines.append(f"{matched}/{len(results)} scenarios matched their expected readiness and "
+                 "lifecycle outcomes. A match means only that: NON_AUTHORITATIVE; "
+                 "trading_permission=False; never PAPER-READ-1, broker-side retirement or trading "
+                 "authority.")
     return "\n".join(lines) + "\n"
 
 
 def main() -> int:
-    """Print every scenario. Exit 0 only if each outcome equals its expected outcome; never a verdict
-    on any real broker, account or readiness."""
-    results = [run_demo(name) for name in SCENARIOS]
+    """Print every scenario, the CLI-only counterpart last. Exit 0 only if each matches both of its
+    expected outcomes; never a verdict on any real broker, account, retirement or readiness."""
+    results = [run_demo(name) for name in (*SCENARIOS, UNKNOWN_CLEANUP.name)]
     print(render_demo_text(results), end="")
     return 0 if all(r.matches_expectation for r in results) else 1
 
