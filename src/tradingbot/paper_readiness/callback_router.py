@@ -55,6 +55,8 @@ MAX_QUEUE_RECORDS = 256    # retained records awaiting the consumer
 MAX_QUEUE_BYTES = 64 * 1024  # estimated retained text and fields
 MAX_TEXT = 4096            # longest retained string
 MAX_INT_BITS = 128         # larger integers are not retained
+MAX_DECIMAL_DIGITS = 40    # a finite Decimal's coefficient digits
+MAX_DECIMAL_EXPONENT = 40  # and its exponent's magnitude, both checked without expanding it
 MAX_FAULTS = 64
 MAX_ID = 2**31 - 1
 SESSION_REQUEST_ID = -1
@@ -69,6 +71,7 @@ class RouterFault(str, Enum):
     UNKNOWN_REQUEST_ID = "UNKNOWN_REQUEST_ID"
     UNROUTABLE_CALLBACK = "UNROUTABLE_CALLBACK"
     SESSION_ERROR = "SESSION_ERROR"
+    SESSION_ERROR_MALFORMED = "SESSION_ERROR_MALFORMED"
     ADMISSION_REFUSED = "ADMISSION_REFUSED"
     QUEUE_OVERFLOW = "QUEUE_OVERFLOW"
     ARRIVAL_AFTER_CLOSE = "ARRIVAL_AFTER_CLOSE"
@@ -95,8 +98,14 @@ _MALFORMED = _Malformed()
 def _value(value: object) -> object:
     """A bounded immutable primitive, or the malformed sentinel. Never a reference to a mutable object."""
     kind = type(value)
-    if value is None or kind is float or kind is Decimal:
+    if value is None or kind is float:
         return value
+    if kind is Decimal:
+        if not value.is_finite():
+            return value  # NaN and infinities are small; the normalizers reject them
+        _sign, digits, exponent = value.as_tuple()
+        bounded = len(digits) <= MAX_DECIMAL_DIGITS and abs(exponent) <= MAX_DECIMAL_EXPONENT
+        return value if bounded else _MALFORMED
     if kind is int:
         return value if value.bit_length() <= MAX_INT_BITS else _MALFORMED
     if kind is str:
@@ -197,7 +206,8 @@ def _cost(args: tuple) -> int:
         if isinstance(arg, _ContractSnapshot):
             cost += _cost(tuple(vars(arg).values()))
         else:
-            cost += _FIELD_COST + (len(arg) if type(arg) is str else 0)
+            cost += _FIELD_COST + (len(arg) if type(arg) is str else
+                                   len(arg.as_tuple().digits) if type(arg) is Decimal else 0)
     return cost
 
 
@@ -590,14 +600,16 @@ class CallbackRouter:
                     normalizer.error_1052(*copied)
 
     def _session_error(self, copied: tuple) -> None:
-        """A session-level error reaches every stream directly; a non-OK code fails each one."""
-        code = copied[2] if len(copied) > 2 else _MALFORMED
+        """A session-level error reaches every stream directly. Only a well-formed 1052 call with an OK
+        code is exempt; a malformed call or a non-OK code fails each stream."""
         for normalizer in (self._contract, self._quote):
             if normalizer is not None:
                 normalizer.error_1052(*copied)
-        if type(code) is int and code in SESSION_OK_CODES:
+        well_formed = (len(copied) in (4, 5) and type(copied[1]) is int and type(copied[2]) is int
+                       and copied[2] >= 0)
+        if well_formed and copied[2] in SESSION_OK_CODES:
             return
-        self._fault(RouterFault.SESSION_ERROR)
+        self._fault(RouterFault.SESSION_ERROR if well_formed else RouterFault.SESSION_ERROR_MALFORMED)
         for stream in (self._account, self._positions):
             if stream is not None:
                 stream.unsupported_callback("error")

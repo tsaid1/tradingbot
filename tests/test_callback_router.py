@@ -299,6 +299,32 @@ def test_an_unretainable_value_still_fails_as_malformed():
     assert ResponseKind.TICK_SNAPSHOT_END not in kinds(r.quote_envelopes())  # the malformed fault held
 
 
+@pytest.mark.parametrize("quantity", [Decimal("0." + "1" * 1_000_000), Decimal("1E+1000000000"),
+                                      Decimal("1E-1000000000")],
+                         ids=["large-coefficient", "large-exponent", "small-exponent"])
+def test_an_unbounded_decimal_is_not_retained_and_still_fails(quantity):
+    """Review P2: bounded before retention, without expanding it downstream."""
+    r, _ = router()
+    r.position(ACCOUNT, Contract(840001), quantity, 1.0)
+    r.tickSize(QRID, 0, quantity)
+    r.positionEnd()
+    r.tickSnapshotEnd(QRID)
+    drain(r)
+    assert ResponseKind.POSITION_END not in kinds(r.position_envelopes())
+    assert ResponseKind.TICK_SNAPSHOT_END not in kinds(r.quote_envelopes())
+    assert not [e for e in r.position_envelopes() if e.kind == ResponseKind.POSITION]
+
+
+def test_bounded_decimals_at_the_limits_still_route():
+    r, _ = router()
+    r.position(ACCOUNT, Contract(840001), Decimal("1" * 29), 1.0)  # inside the normalizer's own bound too
+    r.position(ACCOUNT, Contract(840002), Decimal("1E-40"), 1.0)  # the router's exponent bound, inclusive
+    r.positionEnd()
+    drain(r)
+    lines = [e.position for e in r.position_envelopes() if e.kind == ResponseKind.POSITION]
+    assert [line.position for line in lines] == ["1" * 29, "1E-40"]
+
+
 # ----------------------------------------------------------------------------- routing rules
 
 def test_an_unknown_request_id_is_a_recorded_stray_with_its_original_id():
@@ -334,6 +360,38 @@ def test_session_errors_reach_every_stream_under_the_existing_ok_policy(code, fa
     report = r.report()
     assert report.completed is (not fails)
     assert ("SESSION_ERROR" in report.faults) is fails
+
+
+def account_only_router() -> CallbackRouter:
+    r = CallbackRouter(Client(), _Lock(), FakeClock(NOW))
+    r.start()
+    r.register_account_summary(SRID)
+    r.register_positions(PRID)
+    summary_feed(r)
+    positions_feed(r)
+    return r
+
+
+@pytest.mark.parametrize("args", [(-1, "bad-time", 2104, "ignored"), (-1, 0, 2104), (-1, 0, True, "x")],
+                         ids=["time-text", "three-arguments", "code-bool"])
+def test_a_malformed_session_error_fails_account_and_position_streams(args):
+    """Review P2: the OK-code exemption applies only to a well-formed 1052 call."""
+    r = account_only_router()
+    r.error_1052(*args)
+    drain(r)
+    r.shutdown(join_timeout=0.01)
+    report = r.report()
+    assert "SESSION_ERROR_MALFORMED" in report.faults and report.completed is False
+    assert ResponseKind.ACCOUNT_SUMMARY_END not in kinds(r.account_summary_envelopes())
+    assert ResponseKind.POSITION_END not in kinds(r.position_envelopes())
+
+
+def test_control_a_well_formed_ok_session_error_with_only_account_streams_completes():
+    r = account_only_router()
+    r.error_1052(-1, 0, 2104, "ignored")
+    drain(r)
+    r.shutdown(join_timeout=0.01)
+    assert r.report().faults == () and r.report().completed is True
 
 
 def test_account_errors_are_fixed_refusals_with_a_lifecycle_error():
