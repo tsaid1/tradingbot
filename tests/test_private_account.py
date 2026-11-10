@@ -193,6 +193,47 @@ def test_missing_end_errors_and_the_pr35_regressions_remain_visible_non_success(
     assert absent_control not in codes(report)  # the affected stream never earns its control
 
 
+class RecordingSocketTransport:
+    """A non-FAKE transport that records any call. It must never be reached."""
+    transport_kind = "SOCKET"
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def __getattr__(self, name: str):
+        def record(*_args, **_kwargs):
+            self.calls.append(name)
+            return []
+        return record
+
+
+def test_the_replay_transport_cannot_be_reassigned():
+    replay = PrivateAccountReplay("matching_singleton", KEY)
+    with pytest.raises(AttributeError):
+        replay.transport = RecordingSocketTransport()
+    for name in ("scenario", "clock"):
+        with pytest.raises(AttributeError):
+            setattr(replay, name, None)
+
+
+def test_a_replaced_transport_is_refused_before_any_of_its_methods_run():
+    """Review P1: even a transport forced past the read-only property is never dispatched."""
+    replay = PrivateAccountReplay("matching_singleton", KEY)
+    socket_transport = RecordingSocketTransport()
+    object.__setattr__(replay, "_transport", socket_transport)
+    report = run_private_account_replay(replay)
+    assert socket_transport.calls == []
+    assert report.outcome == REFUSED and codes(report) == {"REPLAY_TRANSPORT_REFUSED"}
+    assert report.dispatched == [] and not replay.binding_owned(replay.binding)  # closed, binding stale
+
+
+def test_a_transport_bound_to_another_replay_is_refused():
+    replay, other = PrivateAccountReplay("matching_singleton", KEY), PrivateAccountReplay("matching_singleton", KEY)
+    object.__setattr__(replay, "_transport", other.transport)
+    report = run_private_account_replay(replay)
+    assert report.outcome == REFUSED and codes(report) == {"REPLAY_TRANSPORT_REFUSED"}
+
+
 def test_a_replay_runs_once():
     replay = PrivateAccountReplay("matching_singleton", KEY)
     assert run_private_account_replay(replay).outcome == COMPLETE

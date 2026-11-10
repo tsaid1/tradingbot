@@ -318,6 +318,13 @@ def run_private_account_replay(replay: PrivateAccountReplay, *, policy: MockPoli
         findings.append(Finding(code="REPLAY_ALREADY_USED", kind=FindingKind.REFUSED, stage=Stage.PREFLIGHT,
                                 detail="A private replay runs once; its owner and binding are not reused."))
         return report(refused)
+    transport = replay.transport
+    if not replay.owns_transport(transport):
+        replay.close()
+        findings.append(Finding(code="REPLAY_TRANSPORT_REFUSED", kind=FindingKind.REFUSED, stage=Stage.PREFLIGHT,
+                                detail="Only the replay's own fixed transport is dispatched; a replaced or foreign "
+                                       "transport was refused before any of its methods ran."))
+        return report(refused)
     try:
         session = replay.attest_session()
         decision = preflight_v2(expectation, session, replay.account_status,
@@ -327,7 +334,7 @@ def run_private_account_replay(replay: PrivateAccountReplay, *, policy: MockPoli
         if decision.refused:
             return report(refused)
         findings.extend(assess_session(session, now=now))
-        _dispatch_reads(replay.transport, view, replay.binding, now=now, policy=policy, findings=findings,
+        _dispatch_reads(transport, view, replay.binding, now=now, policy=policy, findings=findings,
                         dispatched=dispatched, observations=observations)
         return report()
     finally:

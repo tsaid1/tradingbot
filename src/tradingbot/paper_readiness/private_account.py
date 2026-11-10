@@ -267,15 +267,35 @@ class PrivateAccountReplay:
     """One single-use run of a fixed invented scenario. The caller supplies only the scenario name and
     the per-run key; everything else is fixed here."""
 
+    __slots__ = ("_clock", "_handle_refusals", "_owner", "_scenario", "_transport", "_used")
+
     def __init__(self, scenario: str, key: bytes) -> None:
         if type(scenario) is not str or scenario not in REPLAY_SCENARIOS:
             raise ValueError("unknown replay scenario")
-        self.scenario = REPLAY_SCENARIOS[scenario]
-        self._owner = AccountOwner(_EXPECTED, self.scenario.managed, key)
-        self.clock = FakeClock(REPLAY_CLOCK)
-        self.transport = _ReplayTransport(self)
+        self._scenario = REPLAY_SCENARIOS[scenario]
+        self._owner = AccountOwner(_EXPECTED, self._scenario.managed, key)
+        self._clock = FakeClock(REPLAY_CLOCK)
+        self._transport = _ReplayTransport(self)
         self._used = False
         self._handle_refusals = 0
+
+    # Read-only: the scenario, clock and transport are fixed at construction and cannot be reassigned.
+    @property
+    def scenario(self) -> ReplayScenario:
+        return self._scenario
+
+    @property
+    def clock(self) -> FakeClock:
+        return self._clock
+
+    @property
+    def transport(self) -> _ReplayTransport:
+        return self._transport
+
+    def owns_transport(self, transport: object) -> bool:
+        """True only for this replay's own internally created transport, checked without calling it."""
+        return (type(transport) is _ReplayTransport and transport is self._transport
+                and transport._replay is self)
 
     @property
     def account_status(self) -> MatchStatus:
@@ -314,7 +334,7 @@ class PrivateAccountReplay:
         self._owner.close()
 
     def __repr__(self) -> str:
-        return f"PrivateAccountReplay(scenario={self.scenario.name}, status={self._owner.status.value})"
+        return f"PrivateAccountReplay(scenario={self._scenario.name}, status={self._owner.status.value})"
 
     def __reduce_ex__(self, protocol: object) -> object:
         raise TypeError(_NO_COPY)

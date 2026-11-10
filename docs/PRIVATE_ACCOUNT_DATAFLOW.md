@@ -41,6 +41,10 @@ Versions never mix:
   and is recognised by exact type and object identity while the owner is open. A copied, deep-copied,
   pickled, forged, foreign-owner or stale (after `close`) handle is refused. A reference string or a
   caller's `AccountMatch` is never a binding.
+- **Closed dispatch.** The replay's scenario, clock and transport are read-only. Before preflight and before
+  any transport method runs, the runner checks that the transport is the replay's own internally created
+  one: exact type, bound to this replay, the same object. A replaced or foreign transport, of any kind, is
+  refused as `REPLAY_TRANSPORT_REFUSED` without being called.
 - **Requests.** The owned replay transport answers the account and position reads only for its owner's
   binding. Any other handle returns nothing and is counted, so the stream stays incomplete. Neither read
   needs a raw identifier, and there is no raw resolver.
