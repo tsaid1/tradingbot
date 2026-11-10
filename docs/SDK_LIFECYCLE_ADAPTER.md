@@ -42,6 +42,13 @@ competing or recursive call returns `False` without removing an item. A fetched 
 admitted record, with the same slot and kind. Otherwise it is `ITEM_NOT_ADMITTED`: it is not dispatched,
 the ledger is not advanced, and completion stays false.
 
+Consumption runs only while the adapter is open or shutting down. After it closes, `consume_one` removes
+nothing. An item whose fetch crosses the closure is `ITEM_FETCHED_AFTER_CLOSE` and is not dispatched. The
+hook runs only once the ledger has accepted this exact callback start, with one item moved from queued to
+in flight. A start the ledger refuses, after its seal or at its event bound, is `DISPATCH_START_REFUSED`:
+the admission record stays and the hook never runs. The shutdown drain still runs before the seal. The
+callbacks it drains follow their reads' retirement attempts, so the ledger records them as late.
+
 ## Shutdown, once
 
 1. **Reads.** Each open account-summary or positions read, and a snapshot without END, gets its attempt

@@ -88,6 +88,8 @@ class Failure(str, Enum):
     READ_AFTER_SHUTDOWN = "READ_AFTER_SHUTDOWN"
     READ_BEFORE_OPEN = "READ_BEFORE_OPEN"
     ITEM_NOT_ADMITTED = "ITEM_NOT_ADMITTED"
+    ITEM_FETCHED_AFTER_CLOSE = "ITEM_FETCHED_AFTER_CLOSE"
+    DISPATCH_START_REFUSED = "DISPATCH_START_REFUSED"
     READER_ALIVE = "READER_ALIVE"
     PARTIAL_BYTES_UNRESOLVED = "PARTIAL_BYTES_UNRESOLVED"
     PARTIAL_BYTES_UNKNOWN = "PARTIAL_BYTES_UNKNOWN"
@@ -268,8 +270,9 @@ class LifecycleAdapter:
         One logical owner at a time: a competing or recursive call returns False before it removes
         anything. The fetched item must equal the oldest admitted record, or it is not dispatched."""
         with self._lock:
-            if self._queue is None or self._consumer_failed or self._consumer_owned:
-                return False
+            draining = self._state in (AdapterState.OPEN, AdapterState.SHUTTING_DOWN)
+            if self._queue is None or self._consumer_failed or self._consumer_owned or not draining:
+                return False  # nothing is removed after closure, so nothing is lost
             self._consumer_owned = True
             queue = self._queue
         try:
@@ -283,11 +286,20 @@ class LifecycleAdapter:
         if item is None:
             return False
         with self._lock:
+            if self._state is AdapterState.CLOSED:
+                self._fail(Failure.ITEM_FETCHED_AFTER_CLOSE)  # the fetch crossed shutdown; not dispatched
+                return False
             if not self._admitted or not _same_item(item, self._admitted[0]):
                 self._fail(Failure.ITEM_NOT_ADMITTED)  # removed from the queue, never dispatched
                 return True
-            slot, kind = self._admitted.pop(0)
+            before = self._ledger.report()
             self._ledger.callback_started()
+            after = self._ledger.report()
+            if not (before.in_flight_callbacks == 0 and after.in_flight_callbacks == 1
+                    and after.queued_callbacks == before.queued_callbacks - 1):
+                self._fail(Failure.DISPATCH_START_REFUSED)  # sealed or bounded ledger: not dispatched
+                return False
+            slot, kind = self._admitted.pop(0)
             self._dispatching += 1
         try:
             self._call(self._boundary.dispatch, slot, kind)

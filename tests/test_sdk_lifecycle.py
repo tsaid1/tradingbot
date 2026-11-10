@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from tradingbot.paper_readiness import read_retirement as rr
 from tradingbot.paper_readiness import sdk_lifecycle as sl
 from tradingbot.paper_readiness.read_retirement import CallbackKind, ReadSlot
 from tradingbot.paper_readiness.sdk_lifecycle import DirectCallback, LifecycleAdapter
@@ -540,3 +541,76 @@ def test_a_fetched_item_must_match_its_admission_record(admitted, physical):
     assert report.ledger.in_flight_callbacks == 0 and report.ledger.queued_callbacks == 1
     adapter.shutdown(join_timeout=0.01)
     assert adapter.report().completed is False
+
+
+# ----------------------------------------------------------------------------- review: dispatch after closure
+
+def test_the_remaining_item_is_not_consumed_after_the_adapter_closes():
+    """Review: release the blocked dispatch after shutdown, then consume again."""
+    adapter, boundary, resources = harness()
+    adapter.open_read(SUMMARY)
+    enqueue(adapter, resources, SUMMARY, DATA, END)
+    entered, release = threading.Event(), threading.Event()
+    _blocked_dispatch(boundary, entered, release)
+    worker = threading.Thread(target=adapter.consume_one)
+    worker.start()
+    assert entered.wait(5)
+    adapter.shutdown(join_timeout=0.01)
+    release.set()
+    worker.join(5)
+    assert adapter.report().state == "CLOSED"
+    assert adapter.consume_one() is False
+    assert resources.queue.items == [(SUMMARY, END)]  # not removed, so not lost
+    assert ("dispatch", SUMMARY, END) not in boundary.calls
+    assert adapter.report().completed is False
+
+
+def test_an_item_fetched_across_shutdown_is_never_dispatched():
+    adapter, boundary, resources = harness()
+    adapter.open_read(SUMMARY)
+    enqueue(adapter, resources, SUMMARY, DATA)
+    queue = resources.queue
+    fetch = queue.get_nowait
+
+    def crossing():
+        queue.get_nowait = fetch  # once: shutdown finishes while this fetch is outstanding
+        adapter.shutdown(join_timeout=0.01)
+        return fetch()
+
+    queue.get_nowait = crossing
+    assert adapter.consume_one() is False
+    report = adapter.report()
+    assert report.state == "CLOSED" and "ITEM_FETCHED_AFTER_CLOSE" in report.failures
+    assert not [c for c in boundary.calls if c[0] == "dispatch"]
+    assert report.ledger.queued_callbacks == 1 and report.completed is False
+
+
+def test_a_callback_start_refused_at_the_ledger_event_bound_is_not_dispatched():
+    adapter, boundary, resources = harness()
+    adapter.open_read(SUMMARY)
+    enqueue(adapter, resources, SUMMARY, DATA)  # the one physical item
+    for _ in range(rr.MAX_EVENTS - 2):  # fault-free admitted events fill the ledger's bound exactly
+        adapter.on_enqueued(SUMMARY, DATA)
+    assert adapter.consume_one() is False
+    report = adapter.report()
+    assert "DISPATCH_START_REFUSED" in report.failures
+    assert "EVENT_LIMIT_EXCEEDED" in report.ledger.faults
+    assert not [c for c in boundary.calls if c[0] == "dispatch"]
+
+
+
+
+def test_control_shutdown_still_drains_queued_callbacks_before_seal():
+    """The closure gate does not block the shutdown drain. Drained callbacks arrive after their
+    reads' retirement attempts, so the existing ledger rule still records them as late."""
+    adapter, boundary, resources = harness()
+    for slot in (SUMMARY, POSITIONS):
+        adapter.open_read(slot)
+    enqueue(adapter, resources, SUMMARY, DATA, END)
+    enqueue(adapter, resources, POSITIONS, END)  # nothing consumed before shutdown
+    adapter.shutdown(join_timeout=0.01)
+    report = adapter.report()
+    assert resources.queue.items == [] and report.ledger.queued_callbacks == 0
+    assert len([c for c in boundary.calls if c[0] == "dispatch"]) == 3
+    assert report.failures == ()  # no ITEM_FETCHED_AFTER_CLOSE or DISPATCH_START_REFUSED
+    assert set(report.ledger.faults) == {"LATE_CALLBACK"} and report.completed is False
