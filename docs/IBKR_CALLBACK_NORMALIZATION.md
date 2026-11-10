@@ -43,11 +43,19 @@ fetching** on 2026-11-10 and were not verified.
 | `tickSnapshotEnd(int tickerId)` | Stamps `received_at` from the injected clock and emits `TICK_SNAPSHOT_END`, only when `completed` |
 | `error(int id, int errorCode, string errorMsg, string advancedOrderRejectJson)` | An `ERROR` envelope with the code only. Id -1 is session-level and recorded in `session_messages`. Neither text argument is read or retained |
 
-The tick ids and their delivery callbacks are from https://interactivebrokers.github.io/tws-api/tick_types.html.
-These types are recorded in `tick_types_received` but populate no field: 5 last size, the delayed ticks 66,
-67 and 68 (`tickPrice`), 69 and 70 (`tickSize`), and 88 (`tickString`). So delayed evidence reaches the
-existing `QUOTE_DELAYED` check and is never mapped onto live fields. A documented tick type delivered
-through any other callback is refused.
+Tick ids and their delivery callbacks are from https://interactivebrokers.github.io/tws-api/tick_types.html.
+`DOCUMENTED_TICK_CALLBACKS` holds the whole documented table (99 ids):
+
+- **Populates a field:** 0, 1, 2, 3, 4, 45 and 49.
+- **Recorded only:** other documented live types (for example 5, 6, 7, 9, 14 and 57) go into
+  `tick_types_received`.
+- **Delayed, caught by the existing check:** 66, 67, 68 and 88 are recorded, so they reach
+  `QUOTE_DELAYED`. They are never mapped onto live fields.
+- **Other delayed and frozen types withhold completion.** The unchanged existing delayed set does not
+  contain them, so recording them would let a live control pass. These are 69 and 70 (delayed bid and ask
+  size), 71–76 and 80–83 (other "Delayed ..." types) and 97 ("ETF Nav Frozen Last").
+- **Other cases withhold completion too:** an undocumented id, and a documented id delivered through a
+  different callback (including option-computation and EFP ids).
 
 Snapshot behaviour is from https://interactivebrokers.github.io/tws-api/md_request.html: the snapshot is
 followed by `tickSnapshotEnd`, "values may not be returned for all tick types", and "no generic ticks can
@@ -62,6 +70,9 @@ The remaining official references, and their limits, are in [PAPER_READINESS.md]
   `RESPONSE_AFTER_END_IGNORED` as it already does.
 - **Held until explicit completion.** Ticks for this request form one pending aggregate. Before
   `tickSnapshotEnd` it is still returned, but with no receipt time and no END envelope. Nothing is discarded.
+- **No END while incomplete.** While `completed` is false, `envelopes()` contains no END for this request,
+  including the END of a repeated `contractDetailsEnd` or `tickSnapshotEnd` callback. Once complete, a
+  repeated END stays visible and `correlate` reports it as `RESPONSE_AFTER_END_IGNORED`.
 - **Conflicts are never resolved.** A tick type repeated with another value starts a second aggregate
   (`QUOTE_OBSERVATIONS_MULTIPLE`). Several contract rows, identical or not, stay several rows
   (`CONTRACT_IDENTITY_AMBIGUOUS`).
@@ -94,8 +105,8 @@ The remaining official references, and their limits, are in [PAPER_READINESS.md]
 | Ambiguous or conflicting contract identity | `CONTRACT_IDENTITY_AMBIGUOUS`, the mismatch codes or `CONTRACT_FIELDS_MISSING`, and no quote is requested |
 | Wrong request id | `UNCORRELATED_RESPONSE_IGNORED`. Another id's END never completes this request |
 | Missing END marker | `CONTRACT_DETAILS_END_MISSING`, or `TICK_SNAPSHOT_END_MISSING` with `QUOTE_RECEIPT_UNTIMED`. Ticks are preserved |
-| Malformed or unsupported tick payload | An issue, END withheld, `TICK_SNAPSHOT_END_MISSING`, `NOT_READY` |
-| Delayed or frozen data | `QUOTE_DELAYED`, `QUOTE_FROZEN`, `MARKET_DATA_TYPE_UNKNOWN` or `MARKET_DATA_TYPE_CHANGED`, never `QUOTE_LIVE_CONTROL` |
+| Malformed or unsupported tick payload | An issue, END withheld, `TICK_SNAPSHOT_END_MISSING`, `NOT_READY`. A repeated END cannot complete it |
+| Delayed or frozen data | `QUOTE_DELAYED`, `QUOTE_FROZEN`, `MARKET_DATA_TYPE_UNKNOWN` or `MARKET_DATA_TYPE_CHANGED`. Any other delayed or frozen tick withholds completion. Never `QUOTE_LIVE_CONTROL` |
 | Missing or stale timestamps | `QUOTE_UNTIMED`, `QUOTE_STALE` or `QUOTE_TIMESTAMP_FUTURE` |
 | Unknown callbacks | Recorded by a validated name, bounded, and they withhold completion |
 

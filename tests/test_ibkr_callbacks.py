@@ -388,12 +388,65 @@ def test_delayed_ticks_are_recorded_and_never_mapped_onto_live_fields():
     n.marketDataType(QRID, 1)
     n.tickPrice(QRID, 66, 100.0, ATTRIB)
     n.tickPrice(QRID, 67, 100.02, ATTRIB)
-    n.tickSize(QRID, 69, Decimal(300))
     n.tickString(QRID, 88, LAST_TRADE)
     n.tickSnapshotEnd(QRID)
     quote = n.envelopes()[1].quote
     assert (quote.bid, quote.ask, quote.bid_size, quote.last_timestamp) == (None, None, None, None)
     assert {"QUOTE_DELAYED", "QUOTE_BID_ASK_MISSING", "QUOTE_UNTIMED"} <= set(quote_findings(n))
+
+
+@pytest.mark.parametrize("tick_type", [69, 70], ids=["delayed-bid-size", "delayed-ask-size"])
+def test_delayed_size_tick_mixed_into_live_ticks_blocks_the_live_control(tick_type):
+    """Review P2: 69/70 are outside the existing delayed set, so they must withhold completion."""
+    n = live_ticks(quote_normalizer())
+    n.tickSize(QRID, tick_type, Decimal(300))
+    n.tickSnapshotEnd(QRID)
+    assert not ({66, 67, 68, 88} & set(n.envelopes()[1].quote.tick_types_received))
+    found = quote_findings(n)
+    assert "QUOTE_LIVE_CONTROL" not in found and not n.completed
+    assert readiness(contract_normalizer(), n).outcome == ReadinessOutcome.NOT_READY
+    assert "TICK_SNAPSHOT_END_MISSING" in found
+    assert issue_codes(n) == [IssueCode.NON_LIVE_TICK_UNREPRESENTED]
+
+
+@pytest.mark.parametrize("tick_type", sorted(ic.UNREPRESENTED_NON_LIVE_TICK_TYPES))
+def test_every_unrepresented_delayed_or_frozen_tick_blocks_the_live_control(tick_type):
+    n = live_ticks(quote_normalizer())
+    callback = ic.DOCUMENTED_TICK_CALLBACKS[tick_type]
+    value = {"tickPrice": 100.0, "tickSize": Decimal(1)}[callback]
+    (n.tickPrice(QRID, tick_type, value, ATTRIB) if callback == "tickPrice"
+     else n.tickSize(QRID, tick_type, value))
+    n.tickSnapshotEnd(QRID)
+    assert issue_codes(n) == [IssueCode.NON_LIVE_TICK_UNREPRESENTED] and not n.completed
+    assert readiness(contract_normalizer(), n).outcome == ReadinessOutcome.NOT_READY
+
+
+def test_every_documented_non_live_tick_either_reaches_the_delayed_check_or_withholds():
+    from tradingbot.paper_readiness.observations import DELAYED_TICK_TYPES
+    assert ic.NON_LIVE_TICK_TYPES == DELAYED_TICK_TYPES | ic.UNREPRESENTED_NON_LIVE_TICK_TYPES
+    assert not DELAYED_TICK_TYPES & ic.UNREPRESENTED_NON_LIVE_TICK_TYPES
+
+
+@pytest.mark.parametrize("tick_type", [6, 7, 9, 14, 57])
+def test_documented_live_ticks_are_recorded_and_keep_the_live_control(tick_type):
+    n = live_ticks(quote_normalizer())
+    n.tickPrice(QRID, tick_type, 100.0, ATTRIB)
+    n.tickSnapshotEnd(QRID)
+    assert n.completed and "QUOTE_LIVE_CONTROL" in quote_findings(n)
+
+
+@pytest.mark.parametrize(("feed", "issue"), [
+    (lambda n: n.tickPrice(QRID, 47, 100.0, ATTRIB), IssueCode.TICK_TYPE_UNSUPPORTED),
+    (lambda n: n.tickSize(QRID, 500, Decimal(1)), IssueCode.TICK_TYPE_UNSUPPORTED),
+    (lambda n: n.tickPrice(QRID, 10, 0.5, ATTRIB), IssueCode.TICK_TYPE_CALLBACK_MISMATCH),
+    (lambda n: n.tickPrice(QRID, 38, 0.5, ATTRIB), IssueCode.TICK_TYPE_CALLBACK_MISMATCH),
+], ids=["undocumented-47", "undocumented-500", "option-computation-id", "efp-id"])
+def test_undocumented_or_foreign_tick_ids_withhold_completion(feed, issue):
+    n = live_ticks(quote_normalizer())
+    feed(n)
+    n.tickSnapshotEnd(QRID)
+    assert "QUOTE_LIVE_CONTROL" not in quote_findings(n) and not n.completed
+    assert issue_codes(n) == [issue]
 
 
 def test_a_changing_market_data_type_is_ambiguous():
@@ -456,6 +509,67 @@ def test_unsupported_callbacks_are_recorded_by_name_and_never_interpreted(name, 
     n.tickSnapshotEnd(QRID)
     assert [(i.code, i.callback) for i in n.issues] == [(IssueCode.UNSUPPORTED_CALLBACK, label)]
     assert not n.completed and "TICK_SNAPSHOT_END_MISSING" in quote_findings(n)
+
+
+_ISSUES = {
+    "unsupported": lambda n, rid: n.unsupported_callback("connectionClosed"),
+    "malformed": lambda n, rid: n.marketDataType(rid, "1"),
+    "session-1100": lambda n, rid: n.error(ic.SESSION_REQUEST_ID, 1100, CANARY),
+}
+
+
+@pytest.mark.parametrize("issue", sorted(_ISSUES))
+def test_a_repeated_contract_end_cannot_complete_a_stream_with_an_issue(issue):
+    """Review P1: valid row + recorded issue + END twice must not establish identity."""
+    n = IbkrCallbackNormalizer(CRID, CallbackRequest.CONTRACT_DETAILS)
+    n.contractDetails(CRID, details())
+    _ISSUES[issue](n, CRID)
+    n.contractDetailsEnd(CRID)
+    n.contractDetailsEnd(CRID)
+    assert n.issues and not n.completed
+    assert ResponseKind.CONTRACT_DETAILS_END not in [e.kind for e in n.envelopes()]
+    report = readiness(n)
+    assert report.outcome == ReadinessOutcome.NOT_READY
+    assert "CONTRACT_DETAILS_END_MISSING" in codes(report)
+    assert "request_quote_snapshot" not in report.dispatched
+
+
+@pytest.mark.parametrize("issue", sorted(_ISSUES))
+def test_a_repeated_snapshot_end_cannot_complete_a_stream_with_an_issue(issue):
+    """Review P1: valid ticks + recorded issue + END twice must not complete, even through the fake
+    transport, which stamps a missing receipt time."""
+    n = live_ticks(quote_normalizer())
+    _ISSUES[issue](n, QRID)
+    n.tickSnapshotEnd(QRID)
+    n.tickSnapshotEnd(QRID)
+    assert n.issues and not n.completed
+    assert ResponseKind.TICK_SNAPSHOT_END not in [e.kind for e in n.envelopes()]
+    assert "TICK_SNAPSHOT_END_MISSING" in quote_findings(n)
+    report = readiness(contract_normalizer(), n)
+    assert report.outcome == ReadinessOutcome.NOT_READY
+    assert "TICK_SNAPSHOT_END_MISSING" in codes(report) and "QUOTE_LIVE_CONTROL" not in codes(report)
+
+
+def test_a_repeated_end_after_overflow_cannot_complete():
+    n = live_ticks(quote_normalizer())
+    for _ in range(ic.MAX_CALLBACKS):
+        n.tickPrice(QRID, 1, 100.0, ATTRIB)
+    n.tickSnapshotEnd(QRID)
+    n.tickSnapshotEnd(QRID)
+    assert not n.completed
+    assert ResponseKind.TICK_SNAPSHOT_END not in [e.kind for e in n.envelopes()]
+
+
+def test_a_repeated_end_on_a_completed_stream_keeps_the_after_end_classification():
+    c = contract_normalizer()
+    c.contractDetailsEnd(CRID)
+    assert c.completed
+    assert [e.kind for e in c.envelopes()].count(ResponseKind.CONTRACT_DETAILS_END) == 2
+    report = readiness(c)
+    assert "RESPONSE_AFTER_END_IGNORED" in codes(report) and report.outcome == ReadinessOutcome.NOT_READY
+    q = live_snapshot()
+    q.tickSnapshotEnd(QRID)
+    assert "RESPONSE_AFTER_END_IGNORED" in quote_findings(q)
 
 
 def test_callback_count_is_bounded_and_overflow_is_incomplete():

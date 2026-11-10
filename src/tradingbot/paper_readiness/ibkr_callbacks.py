@@ -37,6 +37,7 @@ from typing import Protocol
 
 from tradingbot.paper_readiness.diagnostics import SESSION_OK_CODES
 from tradingbot.paper_readiness.observations import (
+    DELAYED_TICK_TYPES,
     MARKET_DATA_TYPE_CODES,
     ApiMessage,
     ContractObservation,
@@ -50,7 +51,9 @@ __all__ = [
     "DOCUMENTED_TICK_CALLBACKS",
     "MAX_CALLBACKS",
     "MAX_ISSUES",
+    "NON_LIVE_TICK_TYPES",
     "SESSION_REQUEST_ID",
+    "UNREPRESENTED_NON_LIVE_TICK_TYPES",
     "CallbackIssue",
     "CallbackRequest",
     "IbkrCallbackNormalizer",
@@ -69,14 +72,29 @@ MAX_HOURS_TEXT = 4096
 # ``error`` uses -1 for messages that answer no request.
 SESSION_REQUEST_ID = -1
 
-# Documented tick types and the callback each is delivered through (tick_types.html).
-DOCUMENTED_TICK_CALLBACKS = {
-    0: "tickSize", 1: "tickPrice", 2: "tickPrice", 3: "tickSize", 4: "tickPrice", 5: "tickSize",
-    45: "tickString", 49: "tickGeneric", 66: "tickPrice", 67: "tickPrice", 68: "tickPrice",
-    69: "tickSize", 70: "tickSize", 88: "tickString",
-}
-# The tick types that populate a QuoteObservation field. Others are recorded in
-# ``tick_types_received`` only, which is how delayed ticks 66/67/68/88 reach the existing check.
+# Every documented tick type and the callback it is delivered through (tick_types.html). A type not
+# listed here is unsupported, and a listed type arriving through another callback is misrouted.
+_P, _S, _T, _G, _O, _E = ("tickPrice", "tickSize", "tickString", "tickGeneric", "tickOptionComputation",
+                          "tickEFP")
+DOCUMENTED_TICK_CALLBACKS = {k: {"P": _P, "S": _S, "T": _T, "G": _G, "O": _O, "E": _E}[v] for k, v in {
+    0: "S", 1: "P", 2: "P", 3: "S", 4: "P", 5: "S", 6: "P", 7: "P", 8: "S", 9: "P",
+    10: "O", 11: "O", 12: "O", 13: "O", 14: "P", 15: "P", 16: "P", 17: "P", 18: "P", 19: "P",
+    20: "P", 21: "S", 22: "S", 23: "G", 24: "G", 25: "T", 26: "T", 27: "S", 28: "S", 29: "S",
+    30: "S", 31: "G", 32: "T", 33: "T", 34: "S", 35: "P", 36: "S", 37: "P", 38: "E", 39: "E",
+    40: "E", 41: "E", 42: "E", 43: "E", 44: "E", 45: "T", 46: "G", 48: "T", 49: "G", 50: "P",
+    51: "P", 52: "P", 53: "O", 54: "G", 55: "G", 56: "G", 57: "P", 58: "G", 59: "T", 60: "G",
+    61: "S", 62: "T", 63: "S", 64: "S", 65: "S", 66: "P", 67: "P", 68: "P", 69: "S", 70: "S",
+    71: "S", 72: "P", 73: "P", 74: "S", 75: "P", 76: "P", 77: "T", 78: "P", 79: "P", 80: "P",
+    81: "P", 82: "P", 83: "P", 84: "T", 85: "T", 86: "S", 87: "S", 88: "T", 89: "S", 92: "P",
+    93: "P", 94: "P", 95: "P", 96: "P", 97: "P", 98: "P", 99: "P", 101: "G", 102: "G",
+}.items()}
+# Documented delayed ("Delayed ...") and frozen ("ETF Nav Frozen Last") tick types.
+NON_LIVE_TICK_TYPES = frozenset({66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 80, 81, 82, 83, 88, 97})
+# The existing delayed check sees only DELAYED_TICK_TYPES, so any other non-live type cannot be carried
+# without letting a live control pass. It withholds completion instead.
+UNREPRESENTED_NON_LIVE_TICK_TYPES = NON_LIVE_TICK_TYPES - DELAYED_TICK_TYPES
+# The tick types that populate a QuoteObservation field. Other documented live types and the delayed
+# types in DELAYED_TICK_TYPES are recorded in ``tick_types_received`` only.
 _PRICE_FIELDS = {1: "bid", 2: "ask", 4: "last"}
 _SIZE_FIELDS = {0: "bid_size", 3: "ask_size"}
 _LAST_TIMESTAMP = 45
@@ -98,6 +116,8 @@ class IssueCode(str, Enum):
     MALFORMED_CALLBACK = "MALFORMED_CALLBACK"
     TICK_TYPE_CALLBACK_MISMATCH = "TICK_TYPE_CALLBACK_MISMATCH"
     TICK_TYPE_LIMIT_EXCEEDED = "TICK_TYPE_LIMIT_EXCEEDED"
+    TICK_TYPE_UNSUPPORTED = "TICK_TYPE_UNSUPPORTED"
+    NON_LIVE_TICK_UNREPRESENTED = "NON_LIVE_TICK_UNREPRESENTED"
     UNSUPPORTED_CALLBACK = "UNSUPPORTED_CALLBACK"
     SESSION_MESSAGE_DURING_REQUEST = "SESSION_MESSAGE_DURING_REQUEST"
     CALLBACK_LIMIT_EXCEEDED = "CALLBACK_LIMIT_EXCEEDED"
@@ -384,8 +404,14 @@ class IbkrCallbackNormalizer:
             self._issue(IssueCode.MALFORMED_CALLBACK, callback, rid)
             return
         documented = DOCUMENTED_TICK_CALLBACKS.get(tickType)
-        if documented is not None and documented != callback:
+        if documented is None:
+            self._issue(IssueCode.TICK_TYPE_UNSUPPORTED, callback, rid)
+            return
+        if documented != callback:
             self._issue(IssueCode.TICK_TYPE_CALLBACK_MISMATCH, callback, rid)
+            return
+        if tickType in UNREPRESENTED_NON_LIVE_TICK_TYPES:
+            self._issue(IssueCode.NON_LIVE_TICK_UNREPRESENTED, callback, rid)
             return
         try:
             name, converted = self._tick_field(callback, tickType, value)
@@ -470,8 +496,11 @@ class IbkrCallbackNormalizer:
 
     def envelopes(self) -> list[ResponseEnvelope]:
         """Every record so far, in callback order. The END envelope appears only if ``completed``."""
-        out = list(self._records)
         complete = self.completed
+        end_kind = _END_KIND[self.request]
+        # While incomplete, no END for this request may appear, including a repeated END callback.
+        out = [e for e in self._records
+               if complete or not (e.request_id == self.request_id and e.kind == end_kind)]
         tick_types = sorted(self._tick_types)
         for pending in self._pending:
             quote = QuoteObservation(con_id=self.con_id, tick_types_received=tick_types,
