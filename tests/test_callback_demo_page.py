@@ -35,9 +35,12 @@ FAILURES = {
         "QUOTE_SKIPPED_NO_CONTRACT_IDENTITY",
     ),
 }
-# Invented input records in callback_demo.py that no page element may show.
+# Invented input records in callback_demo.py that no page element may show, including the
+# account-summary values and the position rows now produced by callbacks.
 RAW_INPUTS = ("SYNTH-DEMO0001", "DEMO0001", "250000", "500000", "48.25", "48.27", "48.26",
-              "700001", "INVENTED DEMO ETF", "INVENTED-DEMO", "DEMO-LISTING")
+              "700001", "INVENTED DEMO ETF", "INVENTED-DEMO", "DEMO-LISTING", "DEMOPOSA",
+              "DEMOPOSB", "700011", "700012", "-12.5", "300.25", "101.25")
+STREAMS = ("contract_details", "quote_snapshot", "account_summary", "positions")
 INPUT_WIDGETS = ("text_input", "number_input", "text_area", "selectbox", "multiselect",
                  "checkbox", "toggle", "slider", "select_slider", "file_uploader",
                  "download_button", "chat_input", "date_input", "time_input", "color_picker",
@@ -138,8 +141,14 @@ def test_each_scenario_renders_its_actual_result(tmp_path, monkeypatch, name):
     for f in report.findings:
         if f.kind != FindingKind.INFO:
             assert f"| {f.stage.value} | `{f.kind.value}` | **{f.code}** |" in text, f.code
-    for code in result.contract_issues + result.quote_issues:
+    issues = (result.contract_issues + result.quote_issues + result.account_summary_issues
+              + result.positions_issues)
+    for code in issues:
         assert f"`{code}`" in text
+    # One ingestion row per stream, each labelled with the demonstration's own source text.
+    for stream in STREAMS:
+        assert f"| {stream} | {demo.STREAM_SOURCES[stream]} |" in text, stream
+    assert "not applicable" not in text and "PREASSEMBLED" not in text
     codes = [c.value.rstrip("\n") for c in at.code]
     assert render_text(report).rstrip("\n") in codes
     assert demo.render_demo_json([result]).rstrip("\n") in codes
@@ -177,9 +186,12 @@ def test_the_control_is_labelled_a_simulation_without_trading_authority(tmp_path
     assert at.title[0].value == "Callback Demo (OFFLINE SIMULATION)"
     banner = at.error[0].value
     assert banner.startswith("SIMULATION ONLY") and "No trading authority" in banner
-    proof = "not callback, SDK, broker or paper-account proof"
-    assert any("PREASSEMBLED invented control envelopes" in w.value and proof in w.value
-               for w in at.warning)
+    source_note = [w.value for w in at.warning if w.value.startswith("Every stream is produced")]
+    assert len(source_note) == 1
+    for phrase in ("INVENTED callback values", "none is preassembled",
+                   "outside the lifecycle model", "never a broker request id",
+                   "not SDK, broker or paper-account proof"):
+        assert phrase in source_note[0], phrase
     verdict = [w.value for w in at.warning if w.value.startswith("CONTROL_COMPLETE:")]
     assert len(verdict) == 1 and "never authorizes trading" in verdict[0]
     assert not at.success and demo.SIMULATION_NOTICE in shown(at)
@@ -238,5 +250,7 @@ def test_view_docs_give_run_instructions_and_limits():
     for token in ("PYTHONPATH=src streamlit run dashboard/app.py",
                   "PYTHONPATH=src streamlit run dashboard/pages/5_Callback_Demo.py",
                   "PYTHONPATH=src python -m pytest tests/test_callback_demo_page.py",
-                  "PREASSEMBLED", "trading_permission", "NON_AUTHORITATIVE", "## Limits"):
+                  "AccountSummaryCallbacks", "PositionSnapshotCallbacks", "local snapshot",
+                  "outside the lifecycle model", "trading_permission", "NON_AUTHORITATIVE",
+                  "## Limits"):
         assert token in text, token

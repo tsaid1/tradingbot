@@ -5,9 +5,10 @@ invented scenarios: the expected and actual outcome, the callback ingestion stat
 sequence, the failure codes by stage, and the canonical redacted report through the existing
 renderers.
 
-The contract and quote envelopes come from invented callback values. The account summary and
-positions are preassembled invented control envelopes, not callbacks, so nothing here is callback,
-SDK, broker or paper-account proof.
+All four readiness streams come from invented callback values through the accepted offline
+normalizers; none is preassembled. Only the quote snapshot passes through the local lifecycle
+adapter. Positions carry a local snapshot id, never a broker request id. Nothing here is SDK,
+broker or paper-account proof.
 
 The only control is the choice among the three bundled scenarios. The page reads no file, path,
 environment variable, wall clock or network, writes nothing and builds no transport. Everything
@@ -21,9 +22,9 @@ from __future__ import annotations
 import streamlit as st
 
 from tradingbot.paper_readiness.callback_demo import (
-    PREASSEMBLED_STREAMS,
     SCENARIOS,
     SIMULATION_NOTICE,
+    STREAM_SOURCES,
     DemoResult,
     render_demo_json,
     run_demo,
@@ -37,9 +38,12 @@ BANNER = (
     "FAKE clock. No trading authority, trading_permission = False. No broker, SDK, network, "
     "credential, account or order path exists on this page."
 )
-PREASSEMBLED_NOTE = (
-    "The account summary and positions are PREASSEMBLED invented control envelopes, not produced "
-    "from callbacks. They are not callback, SDK, broker or paper-account proof."
+SOURCE_NOTE = (
+    "Every stream is produced from INVENTED callback values through the accepted offline "
+    "normalizers; none is preassembled. Only the quote snapshot passes through the local lifecycle "
+    "adapter; contract details, account summary and positions are outside the lifecycle model. "
+    "Positions carry a local snapshot id, never a broker request id. This is not SDK, broker or "
+    "paper-account proof."
 )
 OUTCOME_MEANING = {
     ReadinessOutcome.CONTROL_COMPLETE: (
@@ -56,8 +60,6 @@ OUTCOME_MEANING = {
         "trading_permission = False."
     ),
 }
-CALLBACK_SOURCE = "invented callbacks, via IbkrCallbackNormalizer"
-PREASSEMBLED_SOURCE = "PREASSEMBLED invented control envelopes, not callbacks"
 
 
 def _cell(text: str) -> str:
@@ -65,23 +67,24 @@ def _cell(text: str) -> str:
 
 
 def _source(stream: str) -> str:
-    return PREASSEMBLED_SOURCE if stream in PREASSEMBLED_STREAMS else CALLBACK_SOURCE
+    return _cell(STREAM_SOURCES[stream])
 
 
 def _ingestion_rows(result: DemoResult) -> list[str]:
     rows = [
-        "| Stream | Envelope source | Callbacks completed | Ingestion issues |",
+        ("| Stream | Envelope source and lifecycle coverage | Callbacks completed "
+         "| Ingestion issues |"),
         "|---|---|---|---|",
     ]
     for stream, completed, issues in (
         ("contract_details", result.contract_completed, result.contract_issues),
         ("quote_snapshot", result.quote_completed, result.quote_issues),
+        ("account_summary", result.account_summary_completed, result.account_summary_issues),
+        ("positions", result.positions_completed, result.positions_issues),
     ):
         listed = ", ".join(f"`{code}`" for code in issues) or "none"
         done = "yes" if completed else "NO"
         rows.append(f"| {stream} | {_source(stream)} | {done} | {listed} |")
-    for stream in PREASSEMBLED_STREAMS:
-        rows.append(f"| {stream} | {_source(stream)} | not applicable | not applicable |")
     return rows
 
 
@@ -115,7 +118,7 @@ def _failure_rows(result: DemoResult) -> list[str]:
 st.set_page_config(page_title="Callback Demo (simulation)", page_icon="🧪", layout="wide")
 st.title("Callback Demo (OFFLINE SIMULATION)")
 st.error(BANNER)
-st.warning(PREASSEMBLED_NOTE)
+st.warning(SOURCE_NOTE)
 st.caption(SIMULATION_NOTICE)
 
 with st.sidebar:

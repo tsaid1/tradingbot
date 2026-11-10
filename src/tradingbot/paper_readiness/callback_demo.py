@@ -3,22 +3,24 @@
 Run it with ``python -m tradingbot.paper_readiness.callback_demo``. It takes no arguments: the package
 admits only pure standard-library imports, so there is no ``sys`` or ``argparse`` here.
 
-Each scenario feeds invented primitive values for documented IBKR callbacks into the merged
-``IbkrCallbackNormalizer`` for the contract-details and quote-snapshot requests. The resulting
-``ResponseEnvelope`` records go through the unchanged ``FakeReadOnlyTransport`` and readiness runner,
-which produce the usual NON_AUTHORITATIVE report with ``trading_permission: false``.
-
-The account summary and positions are **preassembled control envelopes**, invented here. They are not
-produced from callbacks. No account or position callback adapter, installed SDK, broker connection or
-network is involved, and nothing here authorizes paper readiness or trading.
+Each scenario feeds invented primitive values for documented IBKR callbacks into the accepted
+callback normalizers, one per readiness stream: ``IbkrCallbackNormalizer`` for contract details and
+the quote snapshot, ``AccountSummaryCallbacks`` for the account summary (its broker request id is
+kept) and ``PositionSnapshotCallbacks`` for positions (one local snapshot; its id is local, never a
+broker request id). The resulting ``ResponseEnvelope`` records go through the unchanged
+``FakeReadOnlyTransport`` and readiness runner, which produce the usual NON_AUTHORITATIVE report
+with ``trading_permission: false``. No envelope is preassembled. No installed SDK, broker
+connection, account or network is involved, and nothing here authorizes paper readiness or
+trading.
 
 Each run also composes one ``LifecycleAdapter`` and its ``RetirementLedger`` over invented SDK-free
 doubles. Only the quote-snapshot callbacks pass through it: a reader double queues each one, and
 only the adapter's consumer delivers it to the quote normalizer. The adapter then retires the
-connection and observes the reader, socket and consumer separately. Contract-details callbacks have
-no lifecycle read slot and reach their normalizer directly, and the account summary and positions
-are not callbacks, so all three are reported as outside the lifecycle model. A completed lifecycle
-is local only: broker-side retirement stays not established and PAPER-READ-1 stays not assessed.
+connection and observes the reader, socket and consumer separately. The contract-details,
+account-summary and position callbacks are passed to their normalizers directly, so all three are
+reported as outside the lifecycle model, with no lifecycle, retirement or cancellation coverage
+claimed. A completed lifecycle is local only: broker-side retirement stays not established and
+PAPER-READ-1 stays not assessed.
 
 Every fixture value is invented for this demonstration only, under one fixed ``FakeClock``.
 """
@@ -31,14 +33,15 @@ from decimal import Decimal
 from typing import Self
 
 from tradingbot.models import AssetClass, Instrument
+from tradingbot.paper_readiness.account_position_callbacks import (
+    AccountSummaryCallbacks,
+    PositionSnapshotCallbacks,
+)
 from tradingbot.paper_readiness.diagnostics import ReadinessOutcome, ReadinessReport
 from tradingbot.paper_readiness.ibkr_callbacks import CallbackRequest, IbkrCallbackNormalizer
 from tradingbot.paper_readiness.observations import (
-    AccountSummaryObservation,
     ApiMessage,
     ReadinessExpectation,
-    ResponseEnvelope,
-    ResponseKind,
     SessionAttestation,
     TargetContract,
 )
@@ -48,12 +51,13 @@ from tradingbot.paper_readiness.sdk_lifecycle import AdapterReport, DirectCallba
 from tradingbot.paper_readiness.transport import FakeClock, FakeReadOnlyTransport, FakeScript
 
 __all__ = [
+    "ACCOUNT_POSITION_FAILURES",
     "DEMO_CLOCK",
     "DEMO_EXPECTATION",
     "LIFECYCLE_NOTICE",
-    "PREASSEMBLED_STREAMS",
     "SCENARIOS",
     "SIMULATION_NOTICE",
+    "STREAM_SOURCES",
     "UNKNOWN_CLEANUP",
     "DemoResult",
     "DemoScenario",
@@ -64,25 +68,38 @@ __all__ = [
 ]
 
 SIMULATION_NOTICE = (
-    "SIMULATION: contract and quote envelopes come from invented callback values through "
-    "IbkrCallbackNormalizer; account summary and positions are PREASSEMBLED CONTROL envelopes, not "
-    "callbacks. No SDK, broker, network or account is involved. Not paper-readiness authorization."
+    "SIMULATION: all four readiness streams come from INVENTED callback values through the "
+    "accepted offline normalizers: IbkrCallbackNormalizer (contract details, quote snapshot), "
+    "AccountSummaryCallbacks and PositionSnapshotCallbacks. No envelope is preassembled. No SDK, "
+    "broker, network or account is involved. Not paper-readiness authorization."
 )
-# The two streams this demonstration supplies as preassembled envelopes instead of callbacks.
-PREASSEMBLED_STREAMS = ("account_summary", "positions")
+# Where each stream's envelopes come from, and whether the local lifecycle adapter covers it.
+STREAM_SOURCES = {
+    "contract_details": "invented callbacks via IbkrCallbackNormalizer, called directly; outside "
+                        "the lifecycle model",
+    "quote_snapshot": "invented callbacks delivered by the LifecycleAdapter consumer to "
+                      "IbkrCallbackNormalizer; local lifecycle only",
+    "account_summary": "invented callbacks via AccountSummaryCallbacks, called directly; broker "
+                       "request id kept; outside the lifecycle model",
+    "positions": "invented callbacks via PositionSnapshotCallbacks, called directly; one local "
+                 "snapshot whose id is local, never a broker request id; outside the lifecycle "
+                 "model",
+}
 LIFECYCLE_NOTICE = (
     "LOCAL LIFECYCLE, SIMULATED: only the quote-snapshot callbacks pass through the SDK-free "
-    "LifecycleAdapter and its RetirementLedger, over invented doubles. Contract details (direct "
-    "callbacks, no lifecycle read slot), account summary and positions (preassembled controls) are "
-    "outside the lifecycle model. A completed lifecycle is local only: broker-side retirement is "
-    "not established, PAPER-READ-1 is not assessed and trading_permission is False."
+    "LifecycleAdapter and its RetirementLedger, over invented doubles. The contract-details, "
+    "account-summary and position callbacks go to their normalizers directly and are outside the "
+    "lifecycle model; no lifecycle, retirement or cancellation coverage is claimed for them. A "
+    "completed lifecycle is local only: broker-side retirement is not established, PAPER-READ-1 is "
+    "not assessed and trading_permission is False."
 )
 # The one stream whose callbacks pass through the lifecycle adapter, and why the others do not.
 _LIFECYCLE_STREAMS = ("quote_snapshot",)
+_DIRECT = "callbacks go to the normalizer directly, not through the lifecycle adapter"
 _OUTSIDE_LIFECYCLE = {
-    "contract_details": "callbacks go to the normalizer directly; no lifecycle read slot exists",
-    "account_summary": "preassembled control envelopes, not callbacks",
-    "positions": "preassembled control envelopes, not callbacks",
+    "contract_details": f"{_DIRECT}; the ledger has no read slot for it",
+    "account_summary": f"{_DIRECT}; no lifecycle or retirement coverage is claimed",
+    "positions": f"{_DIRECT}; no lifecycle or retirement coverage is claimed",
 }
 
 # ----------------------------------------------------------------------------- invented fixtures
@@ -99,6 +116,8 @@ _TRADING_HOURS = "20260114:0400-20260114:2000;20260115:0400-20260115:2000"
 _LAST_TRADE = str(int((DEMO_CLOCK - timedelta(seconds=8)).timestamp()))
 _CRID = REQUEST_IDS["request_contract_details"]
 _QRID = REQUEST_IDS["request_quote_snapshot"]
+_ARID = REQUEST_IDS["request_account_summary"]  # the account-summary broker request id
+_PSID = REQUEST_IDS["request_positions"]  # a local snapshot id; positions carry no broker id
 
 DEMO_EXPECTATION = ReadinessExpectation(
     account_id=_ACCOUNT,
@@ -136,27 +155,51 @@ def _session() -> SessionAttestation:
     )
 
 
-def _preassembled_account_streams() -> dict[str, list[ResponseEnvelope]]:
-    """PREASSEMBLED CONTROL envelopes for the two reads this demonstration does not drive by callback."""
-    summary = AccountSummaryObservation(
-        account_id=_ACCOUNT, account_type="INVENTED-DEMO", currency="USD",
-        values={"NetLiquidation": "250000.00", "TotalCashValue": "250000.00",
-                "BuyingPower": "500000.00"},
-    )
-    account_rid = REQUEST_IDS["request_account_summary"]
-    positions_rid = REQUEST_IDS["request_positions"]
-    return {
-        "account_summary": [
-            ResponseEnvelope(request_id=account_rid, sequence=1, kind=ResponseKind.ACCOUNT_SUMMARY,
-                             account_summary=summary),
-            ResponseEnvelope(request_id=account_rid, sequence=2, kind=ResponseKind.ACCOUNT_SUMMARY_END),
-        ],
-        "positions": [ResponseEnvelope(request_id=positions_rid, sequence=1,
-                                       kind=ResponseKind.POSITION_END)],
-    }
+def _position_contract(con_id: int, symbol: str) -> _Values:
+    return _Values(conId=con_id, symbol=symbol, secType="STK", currency="USD")
 
 
 # ----------------------------------------------------------------------------- callback sequences
+
+def _summary_rows(n: AccountSummaryCallbacks, *, buying_power_currency: str = "USD") -> None:
+    """One invented account, every row on the account-summary request id."""
+    n.accountSummary(_ARID, _ACCOUNT, "AccountType", "INVENTED-DEMO", "")  # non-monetary
+    n.accountSummary(_ARID, _ACCOUNT, "NetLiquidation", "250000.00", "USD")
+    n.accountSummary(_ARID, _ACCOUNT, "TotalCashValue", "250000.00", "USD")
+    n.accountSummary(_ARID, _ACCOUNT, "BuyingPower", "500000.00", buying_power_currency)
+
+
+def _summary_callbacks(n: AccountSummaryCallbacks) -> None:
+    _summary_rows(n)
+    n.accountSummaryEnd(_ARID)
+
+
+def _summary_with_monetary_currency_missing(n: AccountSummaryCallbacks) -> None:
+    """PR #35 review P2: a required monetary row without its currency; one row cannot vouch for
+    another, so the summary's currency stays missing."""
+    _summary_rows(n, buying_power_currency="")
+    n.accountSummaryEnd(_ARID)
+
+
+def _position_rows(n: PositionSnapshotCallbacks) -> None:
+    """A fractional negative and a fractional positive quantity, kept exactly by the normalizer."""
+    n.position(_ACCOUNT, _position_contract(700011, "DEMOPOSA"), Decimal("-12.5"), 101.25)
+    n.position(_ACCOUNT, _position_contract(700012, "DEMOPOSB"), Decimal("300.25"), 55.0)
+
+
+def _position_callbacks(n: PositionSnapshotCallbacks) -> None:
+    _position_rows(n)
+    n.positionEnd()
+
+
+def _malformed_position_then_repeated_end(n: PositionSnapshotCallbacks) -> None:
+    """PR #35 review P2: an oversized quantity is malformed and latches, so neither END nor a
+    repeated END can present the lost row as a complete snapshot."""
+    _position_rows(n)
+    n.position(_ACCOUNT, _position_contract(700013, "DEMOPOSC"), Decimal("1E+5000"), 1.0)
+    n.positionEnd()
+    n.positionEnd()
+
 
 def _contract_callbacks(n: IbkrCallbackNormalizer) -> None:
     n.contractDetails(_CRID, _details())
@@ -207,6 +250,9 @@ class DemoScenario:
     # Whether the invented connection double can report its socket closed after the disconnect.
     socket_closure_known: bool = True
     expected_lifecycle_completed: bool = True
+    # The invented account-summary and position callbacks, passed to their normalizers directly.
+    summary_feed: object = _summary_callbacks
+    positions_feed: object = _position_callbacks
 
 
 SCENARIOS = {
@@ -230,6 +276,20 @@ UNKNOWN_CLEANUP = DemoScenario(
     "Control callbacks; after the returned disconnect the socket closure is unknown.",
     ReadinessOutcome.CONTROL_COMPLETE, _control,
     socket_closure_known=False, expected_lifecycle_completed=False,
+)
+# The CLI's two account and position failure cases, also kept out of SCENARIOS. Contract and quote
+# callbacks are the control's; each case changes one accepted-normalizer stream only.
+ACCOUNT_POSITION_FAILURES = (
+    DemoScenario("summary_monetary_currency_missing",
+                 "Control callbacks, but BuyingPower arrives without its currency "
+                 "(PR #35 review P2).",
+                 ReadinessOutcome.NOT_READY, _control,
+                 summary_feed=_summary_with_monetary_currency_missing),
+    DemoScenario("malformed_position_then_repeated_end",
+                 "Control callbacks, then an oversized position quantity and positionEnd twice "
+                 "(PR #35 review P2).",
+                 ReadinessOutcome.NOT_READY, _control,
+                 positions_feed=_malformed_position_then_repeated_end),
 )
 
 
@@ -383,6 +443,10 @@ class DemoResult:
     contract_issues: tuple[str, ...]
     quote_completed: bool
     quote_issues: tuple[str, ...]
+    account_summary_completed: bool
+    account_summary_issues: tuple[str, ...]
+    positions_completed: bool
+    positions_issues: tuple[str, ...]
     lifecycle: AdapterReport
 
     @property
@@ -392,8 +456,17 @@ class DemoResult:
                 and self.lifecycle.completed == self.scenario.expected_lifecycle_completed)
 
 
+def _cli_only() -> tuple[DemoScenario, ...]:
+    """The CLI's extra fixed cases, after the three SCENARIOS, in the order they are printed."""
+    return (UNKNOWN_CLEANUP, *ACCOUNT_POSITION_FAILURES)
+
+
 def _scenario(name: str) -> DemoScenario:
-    return UNKNOWN_CLEANUP if name == UNKNOWN_CLEANUP.name else SCENARIOS[name]
+    return next((s for s in _cli_only() if s.name == name), None) or SCENARIOS[name]
+
+
+def _codes(normalizer: object) -> tuple[str, ...]:
+    return tuple(issue.code.value for issue in normalizer.issues)
 
 
 def run_demo(name: str) -> DemoResult:
@@ -402,15 +475,22 @@ def run_demo(name: str) -> DemoResult:
     clock = FakeClock(DEMO_CLOCK)
     contract = IbkrCallbackNormalizer(_CRID, CallbackRequest.CONTRACT_DETAILS)
     quote = IbkrCallbackNormalizer(_QRID, CallbackRequest.QUOTE_SNAPSHOT, con_id=_CON_ID, clock=clock)
+    summary = AccountSummaryCallbacks(_ARID)
+    positions = PositionSnapshotCallbacks(_PSID)
     lifecycle = _run_lifecycle(scenario, contract, quote)
+    scenario.summary_feed(summary)  # passed to the accepted normalizers directly
+    scenario.positions_feed(positions)
     script = FakeScript(session=_session(), contract_details=contract.envelopes(),
-                        quote_snapshot=quote.envelopes(), **_preassembled_account_streams())
+                        quote_snapshot=quote.envelopes(), account_summary=summary.envelopes(),
+                        positions=positions.envelopes())
     report = run_readiness_check(FakeReadOnlyTransport(script, clock), DEMO_EXPECTATION, clock=clock,
                                  label=f"callback-demo:{name}")
     return DemoResult(
         scenario=scenario, report=report,
-        contract_completed=contract.completed, contract_issues=tuple(i.code.value for i in contract.issues),
-        quote_completed=quote.completed, quote_issues=tuple(i.code.value for i in quote.issues),
+        contract_completed=contract.completed, contract_issues=_codes(contract),
+        quote_completed=quote.completed, quote_issues=_codes(quote),
+        account_summary_completed=summary.completed, account_summary_issues=_codes(summary),
+        positions_completed=positions.completed, positions_issues=_codes(positions),
         lifecycle=lifecycle,
     )
 
@@ -426,8 +506,12 @@ def _summary(result: DemoResult) -> dict:
             "contract_details": {"completed": result.contract_completed,
                                  "issues": list(result.contract_issues)},
             "quote_snapshot": {"completed": result.quote_completed, "issues": list(result.quote_issues)},
+            "account_summary": {"completed": result.account_summary_completed,
+                                "issues": list(result.account_summary_issues)},
+            "positions": {"completed": result.positions_completed,
+                          "issues": list(result.positions_issues)},
         },
-        "preassembled_control_streams": list(PREASSEMBLED_STREAMS),
+        "stream_sources": dict(STREAM_SOURCES),
         "local_lifecycle": {
             "modelled_streams": list(_LIFECYCLE_STREAMS),
             "outside_lifecycle_model": dict(_OUTSIDE_LIFECYCLE),
@@ -457,7 +541,7 @@ def render_demo_text(results: list[DemoResult]) -> str:
         for stream, state in ingestion.items():
             issues = ", ".join(state["issues"]) or "none"
             lines.append(f"   {stream}: completed={state['completed']} issues={issues}")
-        lines.append(f"   preassembled control streams: {', '.join(PREASSEMBLED_STREAMS)}")
+            lines.append(f"      source: {STREAM_SOURCES[stream]}")
         lines.append(f"   local lifecycle ({', '.join(_LIFECYCLE_STREAMS)} only): "
                      f"expected_completed={r.scenario.expected_lifecycle_completed} "
                      f"completed={life.completed} "
@@ -479,9 +563,9 @@ def render_demo_text(results: list[DemoResult]) -> str:
 
 
 def main() -> int:
-    """Print every scenario, the CLI-only counterpart last. Exit 0 only if each matches both of its
+    """Print the three scenarios, then the CLI-only cases. Exit 0 only if each matches both of its
     expected outcomes; never a verdict on any real broker, account, retirement or readiness."""
-    results = [run_demo(name) for name in (*SCENARIOS, UNKNOWN_CLEANUP.name)]
+    results = [run_demo(name) for name in (*SCENARIOS, *(s.name for s in _cli_only()))]
     print(render_demo_text(results), end="")
     return 0 if all(r.matches_expectation for r in results) else 1
 
