@@ -44,7 +44,10 @@ whether the `AccountType` row carries a currency.
   account reaches the existing `ACCOUNT_ID_MISMATCH`, `ACCOUNT_SUMMARY_MULTIPLE` or
   `POSITION_ACCOUNT_MISMATCH`.
 - **Types:**
-  - `reqId` and `conId` are exact non-negative `int`; a `conId` of 0 is unset.
+  - `reqId` and `conId` are exact `int` from 0 to 2³¹−1; a `conId` of 0 is unset.
+  - Magnitudes are bounded before any conversion to text. An integer quantity of 30 or more digits, a
+    `Decimal` with an exponent of 30 or more, or any conversion failure is malformed. It never escapes
+    the callback.
   - Text fields are exact `str`, at most 64 characters, with no control characters.
   - `pos` is a finite `Decimal` or a whole `int` from older APIs. Fractional and negative values are kept
     exactly. A `float` is refused rather than rounded.

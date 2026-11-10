@@ -56,6 +56,8 @@ MAX_ACCOUNTS = 8
 MAX_TAGS_PER_ACCOUNT = 64
 MAX_POSITION_ROWS = 64
 MAX_TEXT = 64
+MAX_ID = 2**31 - 1            # documented ids are 32-bit ints
+MAX_QUANTITY_DIGITS = 30      # bounded before any int or Decimal is converted to text
 ACCOUNT_TYPE_TAG = "AccountType"
 _TAG_RE = re.compile(r"^[A-Za-z$][A-Za-z0-9$._-]{0,63}$")
 _CALLBACK_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,63}$")
@@ -86,6 +88,11 @@ def _is_int(value: object) -> bool:
     return type(value) is int
 
 
+def _is_id(value: object) -> bool:
+    """An exact non-negative int within the documented 32-bit range, checked without conversion."""
+    return _is_int(value) and 0 <= value <= MAX_ID
+
+
 def _text(value: object, *, empty_is_none: bool = True) -> str | None:
     if type(value) is not str or len(value) > MAX_TEXT:
         raise _Malformed
@@ -107,8 +114,8 @@ class _Stream:
     _end_kind: ResponseKind
 
     def __init__(self, request_id: int) -> None:
-        if not _is_int(request_id) or request_id < 0:
-            raise ValueError("request_id must be a non-negative int")
+        if not _is_id(request_id):
+            raise ValueError("request_id must be a non-negative 32-bit int")
         self.request_id = request_id
         self._callbacks = 0
         self._ignored = 0
@@ -196,7 +203,7 @@ class AccountSummaryCallbacks(_Stream):
         if sequence is None:
             return
         try:
-            if not _is_int(reqId) or reqId < 0:
+            if not _is_id(reqId):
                 raise _Malformed
             synthetic = _synthetic_account(account)
             if type(tag) is not str or not _TAG_RE.fullmatch(tag):
@@ -244,7 +251,7 @@ class AccountSummaryCallbacks(_Stream):
         sequence = self._admit("accountSummaryEnd")
         if sequence is None:
             return
-        if not _is_int(reqId) or reqId < 0:
+        if not _is_id(reqId):
             self._issue(AccountIssueCode.MALFORMED_CALLBACK, "accountSummaryEnd")
             return
         if reqId == self.request_id and self._end_sequence is None:
@@ -266,12 +273,22 @@ class AccountSummaryCallbacks(_Stream):
 
 
 def _position_quantity(value: object) -> str:
-    """A documented ``decimal`` (or a whole ``int`` from older APIs); fractional and negative kept."""
+    """A documented ``decimal`` (or a whole ``int`` from older APIs); fractional and negative kept.
+
+    Magnitude is bounded before any conversion to text, so an oversized value is malformed and can
+    never raise out of the callback."""
     if _is_int(value):
+        if abs(value) >= 10**MAX_QUANTITY_DIGITS:
+            raise _Malformed
+    elif type(value) is Decimal and value.is_finite():
+        if value and value.adjusted() >= MAX_QUANTITY_DIGITS:
+            raise _Malformed
+    else:
+        raise _Malformed
+    try:
         return str(value)
-    if type(value) is Decimal and value.is_finite():
-        return str(value)
-    raise _Malformed
+    except (ValueError, OverflowError):
+        raise _Malformed from None
 
 
 def _average_cost(value: object) -> str:
@@ -288,7 +305,7 @@ def _average_cost(value: object) -> str:
 
 
 def _con_id(value: object) -> int | None:
-    if not _is_int(value) or value < 0:
+    if not _is_id(value):
         raise _Malformed
     return value or None  # 0 is the unset default
 

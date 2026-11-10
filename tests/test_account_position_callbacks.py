@@ -243,6 +243,48 @@ def test_a_malformed_position_latches_an_issue_and_withholds_end(call):
     assert "POSITIONS_END_MISSING" in position_findings(n)
 
 
+@pytest.mark.parametrize("call", [
+    lambda p: p.position(ACCOUNT, contract(conId=700299), 10**5000, 1.0),
+    lambda p: p.position(ACCOUNT, contract(conId=700299), -(10**5000), 1.0),
+    lambda p: p.position(ACCOUNT, contract(conId=700299), 10**apc.MAX_QUANTITY_DIGITS, 1.0),
+    lambda p: p.position(ACCOUNT, contract(conId=700299), Decimal("1E+5000"), 1.0),
+    lambda p: p.position(ACCOUNT, contract(conId=700299), Decimal(1), 10**5000),
+    lambda p: p.position(ACCOUNT, contract(conId=10**5000), Decimal(1), 1.0),
+    lambda p: p.position(ACCOUNT, contract(conId=apc.MAX_ID + 1), Decimal(1), 1.0),
+], ids=["pos-huge-int", "pos-huge-negative", "pos-at-digit-bound", "pos-huge-decimal", "cost-huge-int",
+        "con-id-huge", "con-id-over-32-bit"])
+def test_an_oversized_number_is_malformed_never_escapes_and_end_stays_withheld(call):
+    """Review P2: a conversion failure must latch, not escape, so a later or repeated END cannot
+    present the lost position as a complete snapshot."""
+    n = PositionSnapshotCallbacks(PRID)
+    call(n)  # no exception escapes the callback
+    n.positionEnd()
+    n.positionEnd()
+    assert issue_codes(n) == [AccountIssueCode.MALFORMED_CALLBACK] and not n.completed
+    assert ResponseKind.POSITION_END not in [e.kind for e in n.envelopes()]
+    assert readiness(good_summary(), n).outcome == ReadinessOutcome.NOT_READY
+
+
+def test_an_oversized_summary_request_id_is_malformed():
+    n = AccountSummaryCallbacks(SRID)
+    summary_rows(n)
+    n.accountSummary(10**5000, ACCOUNT, "NetLiquidation", "1.00", "USD")
+    n.accountSummaryEnd(10**5000)
+    n.accountSummaryEnd(SRID)
+    assert issue_codes(n) == [AccountIssueCode.MALFORMED_CALLBACK] * 2 and not n.completed
+    assert summary_findings(n)  # correlation serializes without raising
+
+
+def test_large_but_bounded_quantities_keep_their_exact_value():
+    big = 10**(apc.MAX_QUANTITY_DIGITS - 1)
+    n = PositionSnapshotCallbacks(PRID)
+    n.position(ACCOUNT, contract(), -big, 1.0)
+    n.position(ACCOUNT, contract(conId=700202), Decimal("-0.000001"), 2.5)
+    n.positionEnd()
+    lines = [e.position.position for e in n.envelopes() if e.kind == ResponseKind.POSITION]
+    assert n.completed and lines == [str(-big), "-0.000001"]
+
+
 # ----------------------------------------------------------------------------- duplicates, conflicts, END
 
 def test_a_duplicate_summary_tag_withholds_end_even_with_the_same_value():
