@@ -1,11 +1,12 @@
 """The offline callback-driven readiness demonstration. Invented fixtures only; a SIMULATION.
 
-Covers the complete path (invented callbacks -> IbkrCallbackNormalizer -> ResponseEnvelope -> FAKE
-transport -> unchanged runner -> NON_AUTHORITATIVE report), the successful control, the two failure
-scenarios tied to the PR #25 review defects, and the stable CLI and report semantics. It also
-covers the composed local lifecycle: quote callbacks delivered only by the merged LifecycleAdapter's
-consumer, and the CLI-only unknown-cleanup counterpart, which stays incomplete beside
-CONTROL_COMPLETE.
+Covers the complete path (invented callbacks -> the accepted callback normalizers ->
+ResponseEnvelope -> FAKE transport -> unchanged runner -> NON_AUTHORITATIVE report) for all four
+readiness streams, the successful control, the two failure scenarios tied to the PR #25 review
+defects, the two account and position failure classes from the PR #35 review, and the stable CLI
+and report semantics. It also covers the composed local lifecycle: quote callbacks delivered only
+by the merged LifecycleAdapter's consumer, and the CLI-only unknown-cleanup counterpart, which
+stays incomplete beside CONTROL_COMPLETE.
 """
 from __future__ import annotations
 
@@ -15,18 +16,27 @@ import os
 import subprocess
 import sys
 from dataclasses import asdict
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
 
 from tradingbot.paper_readiness import callback_demo as demo
-from tradingbot.paper_readiness.diagnostics import ReadinessOutcome
+from tradingbot.paper_readiness.account_position_callbacks import (
+    AccountSummaryCallbacks,
+    PositionSnapshotCallbacks,
+)
+from tradingbot.paper_readiness.diagnostics import ReadinessOutcome, Stage
+from tradingbot.paper_readiness.observations import ResponseKind
+from tradingbot.paper_readiness.runner import REQUEST_IDS
 from tradingbot.paper_readiness.sdk_lifecycle import LifecycleAdapter
 from tradingbot.paper_readiness.transport import FORBIDDEN_NAME_RE
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 UNKNOWN = demo.UNKNOWN_CLEANUP.name
-ALL_NAMES = [*demo.SCENARIOS, UNKNOWN]
+CURRENCY_MISSING, MALFORMED_POSITION = (s.name for s in demo.ACCOUNT_POSITION_FAILURES)
+ALL_NAMES = [*demo.SCENARIOS, UNKNOWN, CURRENCY_MISSING, MALFORMED_POSITION]
+STREAMS = ["contract_details", "quote_snapshot", "account_summary", "positions"]
 CONTROL_CODES = {"SESSION_ATTESTATION_CONTROL", "CONTRACT_IDENTITY_CONTROL", "REGULAR_SESSION_CONTROL",
                  "QUOTE_LIVE_CONTROL", "ACCOUNT_SNAPSHOT_CONTROL", "POSITIONS_SNAPSHOT_CONTROL"}
 ALL_READS = ["request_contract_details", "request_quote_snapshot", "request_account_summary",
@@ -37,14 +47,120 @@ def codes(result) -> list[str]:
     return [f.code for f in result.report.findings]
 
 
+def stage_codes(result, stage: str) -> list[str]:
+    return [f.code for f in result.report.findings if f.stage.value == stage]
+
+
+def captured(monkeypatch, name: str):
+    """Run one case and capture the account and position normalizers and the script they fed."""
+    made, scripts = {}, []
+
+    class Summary(AccountSummaryCallbacks):
+        def __init__(self, request_id):
+            super().__init__(request_id)
+            made["summary"] = self
+
+    class Positions(PositionSnapshotCallbacks):
+        def __init__(self, snapshot_id):
+            super().__init__(snapshot_id)
+            made["positions"] = self
+
+    real_script = demo.FakeScript
+
+    def script(**fields):
+        scripts.append(real_script(**fields))
+        return scripts[-1]
+
+    monkeypatch.setattr(demo, "AccountSummaryCallbacks", Summary)
+    monkeypatch.setattr(demo, "PositionSnapshotCallbacks", Positions)
+    monkeypatch.setattr(demo, "FakeScript", script)
+    result = demo.run_demo(name)
+    [fed] = scripts
+    return result, made["summary"], made["positions"], fed
+
+
 def test_callback_control_completes_through_the_unchanged_runner():
     result = demo.run_demo("callback_control")
     assert result.report.outcome == ReadinessOutcome.CONTROL_COMPLETE and result.matches_expectation
     assert CONTROL_CODES <= set(codes(result))
     assert result.contract_completed and result.quote_completed
-    assert result.contract_issues == () and result.quote_issues == ()
+    assert result.account_summary_completed and result.positions_completed
+    assert result.contract_issues == result.quote_issues == ()
+    assert result.account_summary_issues == result.positions_issues == ()
     assert result.report.dispatched == ALL_READS
     assert all(o.end_seen for o in result.report.observations)
+    rows = {o.stage.value: (o.request_id, o.rows) for o in result.report.observations}
+    assert rows["ACCOUNT"] == (REQUEST_IDS["request_account_summary"], 1)
+    assert rows["POSITIONS"] == (REQUEST_IDS["request_positions"], 2)
+
+
+# Requirement: all four streams come from the accepted callback normalizers; none is preassembled.
+
+@pytest.mark.parametrize("name", ALL_NAMES)
+def test_account_and_position_envelopes_are_exactly_the_normalizers_output(monkeypatch, name):
+    result, summary, positions, fed = captured(monkeypatch, name)
+    assert fed.account_summary == summary.envelopes() and fed.positions == positions.envelopes()
+    assert fed.account_summary and fed.positions
+    # The summary keeps its broker request id; positions carry only the local snapshot id.
+    assert summary.request_id == REQUEST_IDS["request_account_summary"]
+    assert {e.request_id for e in fed.account_summary} == {summary.request_id}
+    assert positions.request_id == REQUEST_IDS["request_positions"]
+    assert {e.request_id for e in fed.positions} == {positions.request_id}
+    assert (result.account_summary_completed, result.positions_completed) == (
+        summary.completed, positions.completed)
+
+
+def test_fractional_and_negative_positions_reach_the_script_exactly(monkeypatch):
+    _, _, positions, fed = captured(monkeypatch, "callback_control")
+    lines = [e.position for e in fed.positions if e.kind == ResponseKind.POSITION]
+    assert [(line.con_id, line.position) for line in lines] == [(700011, "-12.5"),
+                                                                (700012, "300.25")]
+    assert [Decimal(line.position) for line in lines] == [Decimal("-12.5"), Decimal("300.25")]
+    assert fed.positions[-1].kind == ResponseKind.POSITION_END and positions.completed
+
+
+def test_no_preassembled_envelope_or_observation_is_built_in_the_demo():
+    tree = ast.parse(Path(demo.__file__).read_text(encoding="utf-8"))
+    names = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
+    names |= {alias.name for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)
+              for alias in node.names}
+    for built in ("ResponseEnvelope", "ResponseKind", "AccountSummaryObservation", "PositionLine"):
+        assert built not in names, built
+    assert not hasattr(demo, "PREASSEMBLED_STREAMS")
+
+
+# Requirement: the two PR #35 failure classes cannot reach success through this composition.
+
+def test_a_monetary_row_without_currency_cannot_reach_success(monkeypatch):
+    control = demo.run_demo("callback_control")
+    result, summary, _, fed = captured(monkeypatch, CURRENCY_MISSING)
+    assert result.report.outcome == ReadinessOutcome.NOT_READY and result.matches_expectation
+    assert "ACCOUNT_CURRENCY_MISSING" in codes(result)
+    assert "ACCOUNT_SNAPSHOT_CONTROL" not in codes(result)
+    [row] = [e.account_summary for e in fed.account_summary
+             if e.kind == ResponseKind.ACCOUNT_SUMMARY]
+    assert row.currency is None  # one row's currency never vouches for another
+    assert summary.completed and result.account_summary_issues == ()  # the existing check decides
+    # Paired with the control, only the account stage differs; the lifecycle report is unmodified.
+    for stage in (s.value for s in Stage if s is not Stage.ACCOUNT):
+        assert stage_codes(result, stage) == stage_codes(control, stage), stage
+    assert asdict(result.lifecycle) == asdict(control.lifecycle)
+
+
+def test_a_malformed_quantity_then_repeated_end_cannot_reach_success(monkeypatch):
+    control = demo.run_demo("callback_control")
+    result, _, positions, fed = captured(monkeypatch, MALFORMED_POSITION)
+    assert result.report.outcome == ReadinessOutcome.NOT_READY and result.matches_expectation
+    assert result.positions_issues == ("MALFORMED_CALLBACK",) and not result.positions_completed
+    assert ResponseKind.POSITION_END not in [e.kind for e in fed.positions]  # neither END survives
+    assert "POSITIONS_END_MISSING" in codes(result)
+    assert "POSITIONS_SNAPSHOT_CONTROL" not in codes(result)
+    # The two valid rows stay visible records; the malformed one was never stored.
+    assert [e.position.con_id for e in fed.positions] == [700011, 700012]
+    assert not positions.completed
+    for stage in (s.value for s in Stage if s is not Stage.POSITIONS):
+        assert stage_codes(result, stage) == stage_codes(control, stage), stage
+    assert asdict(result.lifecycle) == asdict(control.lifecycle)
 
 
 def test_delayed_size_mixed_with_live_ticks_cannot_become_a_live_control():
@@ -123,12 +239,17 @@ def test_unknown_socket_closure_keeps_the_lifecycle_incomplete_beside_control_co
     assert unknown.matches_expectation  # it expects the incomplete lifecycle
 
 
-def test_the_counterpart_is_cli_only_and_the_three_scenarios_are_unchanged():
+def test_the_extra_cases_are_cli_only_and_the_three_scenarios_are_unchanged():
     assert list(demo.SCENARIOS) == ["callback_control", "delayed_size_mixed_with_live",
                                     "issue_with_repeated_end"]
-    assert UNKNOWN not in demo.SCENARIOS
+    assert not {UNKNOWN, CURRENCY_MISSING, MALFORMED_POSITION} & set(demo.SCENARIOS)
+    assert len(demo.ACCOUNT_POSITION_FAILURES) == 2
     assert all(s.expected_lifecycle_completed for s in demo.SCENARIOS.values())
+    assert all(s.expected_lifecycle_completed for s in demo.ACCOUNT_POSITION_FAILURES)
     assert demo.UNKNOWN_CLEANUP.expected_lifecycle_completed is False
+    # Each failure case keeps the control's contract and quote callbacks.
+    control = demo.SCENARIOS["callback_control"]
+    assert all(s.feed is control.feed for s in demo.ACCOUNT_POSITION_FAILURES)
 
 
 @pytest.mark.parametrize("name", ALL_NAMES)
@@ -145,16 +266,34 @@ def test_every_report_is_non_authoritative_without_trading_permission(name):
     assert ledger.broker_side_retirement == "NOT_ESTABLISHED_BY_INSPECTED_SOURCES"
 
 
-def test_account_and_position_streams_are_labelled_preassembled_controls():
+def test_every_stream_is_labelled_with_its_callback_source_and_lifecycle_coverage():
     results = [demo.run_demo(name) for name in ALL_NAMES]
     text, payload = demo.render_demo_text(results), json.loads(demo.render_demo_json(results))
-    assert "PREASSEMBLED CONTROL" in demo.SIMULATION_NOTICE and "not callbacks" in demo.SIMULATION_NOTICE
+    assert "No envelope is preassembled" in demo.SIMULATION_NOTICE
+    for normalizer in ("IbkrCallbackNormalizer", "AccountSummaryCallbacks",
+                       "PositionSnapshotCallbacks"):
+        assert normalizer in demo.SIMULATION_NOTICE, normalizer
     assert payload["notice"] == demo.SIMULATION_NOTICE and demo.SIMULATION_NOTICE in text
     assert payload["lifecycle_notice"] == demo.LIFECYCLE_NOTICE and demo.LIFECYCLE_NOTICE in text
     assert "outside the lifecycle model" in demo.LIFECYCLE_NOTICE
+    sources = demo.STREAM_SOURCES
+    assert list(sources) == STREAMS
+    assert "LifecycleAdapter consumer" in sources["quote_snapshot"]
+    assert "broker request id kept" in sources["account_summary"]
+    assert "never a broker request id" in sources["positions"]
+    for stream in ("contract_details", "account_summary", "positions"):
+        assert "outside the lifecycle model" in sources[stream], stream
+    for stream, source in sources.items():
+        assert f"   {stream}: completed=" in text and f"      source: {source}" in text, stream
     for entry, result in zip(payload["scenarios"], results):
-        assert entry["preassembled_control_streams"] == ["account_summary", "positions"]
-        assert set(entry["callback_ingestion"]) == {"contract_details", "quote_snapshot"}
+        assert "preassembled_control_streams" not in entry
+        assert entry["stream_sources"] == sources
+        assert set(entry["callback_ingestion"]) == set(STREAMS)  # the JSON sorts its keys
+        assert entry["callback_ingestion"]["positions"] == {
+            "completed": result.positions_completed, "issues": list(result.positions_issues)}
+        assert entry["callback_ingestion"]["account_summary"] == {
+            "completed": result.account_summary_completed,
+            "issues": list(result.account_summary_issues)}
         assert entry["report"]["trading_permission"] is False
         lifecycle = entry["local_lifecycle"]
         assert lifecycle["modelled_streams"] == ["quote_snapshot"]
@@ -184,18 +323,24 @@ def test_module_cli_runs_all_scenarios_deterministically_and_exits_zero():
             for _ in range(2)]
     assert [r.returncode for r in runs] == [0, 0] and runs[0].stdout == runs[1].stdout
     out = runs[0].stdout
-    assert "4/4 scenarios matched their expected readiness and lifecycle outcomes" in out
+    assert "6/6 scenarios matched their expected readiness and lifecycle outcomes" in out
     assert "NON_AUTHORITATIVE; trading_permission=False" in out
     assert "never PAPER-READ-1, broker-side retirement or trading authority" in out
-    for name, outcome in (("callback_control", "CONTROL_COMPLETE"),
-                          ("delayed_size_mixed_with_live", "NOT_READY"),
-                          ("issue_with_repeated_end", "NOT_READY"),
-                          (UNKNOWN, "CONTROL_COMPLETE")):
+    expected = (("callback_control", "CONTROL_COMPLETE"),
+                ("delayed_size_mixed_with_live", "NOT_READY"),
+                ("issue_with_repeated_end", "NOT_READY"),
+                (UNKNOWN, "CONTROL_COMPLETE"),
+                (CURRENCY_MISSING, "NOT_READY"),
+                (MALFORMED_POSITION, "NOT_READY"))
+    for name, outcome in expected:
         assert f"== {name}:" in out and f"expected={outcome} outcome={outcome}" in out
-    assert out.index(f"== {UNKNOWN}:") > out.index("== issue_with_repeated_end:")  # printed last
+    order = [out.index(f"== {name}:") for name, _ in expected]
+    assert order == sorted(order)  # the three scenarios first, then the CLI-only cases
     assert "expected_completed=False completed=False local_quiescence_established=False" in out
     assert "socket=UNKNOWN" in out and "failures=SOCKET_NOT_CLOSED" in out
-    assert out.count("completed=True local_quiescence_established=True") == 3
+    assert out.count("completed=True local_quiescence_established=True") == 5
+    assert "MISSING:ACCOUNT_CURRENCY_MISSING" in out and "INCOMPLETE:POSITIONS_END_MISSING" in out
+    assert "positions: completed=False issues=MALFORMED_CALLBACK" in out
     assert runs[0].stderr == ""
 
 
@@ -205,7 +350,7 @@ def test_main_exit_status_reports_an_unexpected_outcome(monkeypatch, capsys):
                                 original.feed)
     monkeypatch.setitem(demo.SCENARIOS, original.name, altered)
     assert demo.main() == 1
-    assert "3/4 scenarios matched" in capsys.readouterr().out
+    assert "5/6 scenarios matched" in capsys.readouterr().out
 
 
 def test_a_readiness_match_alone_is_not_a_match(monkeypatch, capsys):
@@ -218,7 +363,7 @@ def test_a_readiness_match_alone_is_not_a_match(monkeypatch, capsys):
     assert result.report.outcome == ReadinessOutcome.CONTROL_COMPLETE
     assert result.lifecycle.completed is False and not result.matches_expectation
     assert demo.main() == 1
-    assert "3/4 scenarios matched" in capsys.readouterr().out
+    assert "5/6 scenarios matched" in capsys.readouterr().out
 
 
 def test_fixtures_are_invented_here_and_no_held_fixture_or_forbidden_surface_is_used():
