@@ -605,8 +605,9 @@ class CallbackRouter:
         for normalizer in (self._contract, self._quote):
             if normalizer is not None:
                 normalizer.error_1052(*copied)
-        well_formed = (len(copied) in (4, 5) and type(copied[1]) is int and type(copied[2]) is int
-                       and copied[2] >= 0)
+        # The exact integer session id is required: -1.0 or Decimal("-1") compare equal but are malformed.
+        well_formed = (len(copied) in (4, 5) and type(copied[0]) is int and type(copied[1]) is int
+                       and type(copied[2]) is int and copied[2] >= 0)
         if well_formed and copied[2] in SESSION_OK_CODES:
             return
         self._fault(RouterFault.SESSION_ERROR if well_formed else RouterFault.SESSION_ERROR_MALFORMED)
