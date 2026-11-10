@@ -58,6 +58,7 @@ MAX_FAILURES = 64
 
 class AdapterState(str, Enum):
     NOT_STARTED = "NOT_STARTED"
+    STARTING = "STARTING"
     OPEN = "OPEN"
     SHUTTING_DOWN = "SHUTTING_DOWN"
     CLOSED = "CLOSED"
@@ -85,6 +86,8 @@ class Failure(str, Enum):
     DIRECT_ERROR = "DIRECT_ERROR"
     REUSE_REFUSED = "REUSE_REFUSED"
     READ_AFTER_SHUTDOWN = "READ_AFTER_SHUTDOWN"
+    READ_BEFORE_OPEN = "READ_BEFORE_OPEN"
+    ITEM_NOT_ADMITTED = "ITEM_NOT_ADMITTED"
     READER_ALIVE = "READER_ALIVE"
     PARTIAL_BYTES_UNRESOLVED = "PARTIAL_BYTES_UNRESOLVED"
     PARTIAL_BYTES_UNKNOWN = "PARTIAL_BYTES_UNKNOWN"
@@ -117,6 +120,10 @@ class _Lock(Protocol):
     def __enter__(self) -> object: ...
 
     def __exit__(self, *exc: object) -> object: ...
+
+
+def _same_item(item: object, admitted: tuple[ReadSlot, CallbackKind]) -> bool:
+    return type(item) is tuple and len(item) == 2 and item[0] == admitted[0] and item[1] == admitted[1]
 
 
 class _Raised(Exception):
@@ -153,6 +160,9 @@ class LifecycleAdapter:
         self._pending = 0
         self._dispatching = 0
         self._consumer_failed = False
+        self._consumer_owned = False
+        self._admitted: list[tuple[ReadSlot, CallbackKind]] = []
+        self._deferred_timeout: float | None = None
         self._active_stop: ReadSlot | None = None
         self._stop_error = False
         self._failures: list[Failure] = []
@@ -196,7 +206,7 @@ class LifecycleAdapter:
             if self._state is not AdapterState.NOT_STARTED:
                 self._fail(Failure.REUSE_REFUSED)
                 return
-            self._state = AdapterState.OPEN
+            self._state = AdapterState.STARTING
         try:
             resources = self._call(self._boundary.connect)
         except _Raised:
@@ -212,18 +222,31 @@ class LifecycleAdapter:
             self._connection, self._reader, self._queue = connection, reader, queue
             if connection is None or reader is None or queue is None:
                 self._fail(Failure.RESOURCES_INVALID)
+            self._state = AdapterState.OPEN
+            deferred = self._deferred_timeout
+        if deferred is not None:
+            # A shutdown requested while connect was pending runs now, with the references retained.
+            self._shutdown(deferred)
 
     def open_read(self, slot: ReadSlot) -> None:
         with self._lock:
-            if self._state is not AdapterState.OPEN or self._shutdown_requested:
+            if self._shutdown_requested or self._state in (AdapterState.SHUTTING_DOWN,
+                                                           AdapterState.CLOSED):
                 self._fail(Failure.READ_AFTER_SHUTDOWN)
+                return
+            if self._state is not AdapterState.OPEN:
+                self._fail(Failure.READ_BEFORE_OPEN)
                 return
             self._ledger.open_read(slot)
 
     def on_enqueued(self, slot: ReadSlot, kind: CallbackKind) -> None:
         """The reader put one callback on the queue. After admission closes the ledger faults it."""
+        item = (ReadSlot(slot), CallbackKind(kind))
         with self._lock:
-            self._ledger.callback_received(slot, kind)
+            before = self._ledger.report().queued_callbacks
+            self._ledger.callback_received(*item)
+            if self._ledger.report().queued_callbacks == before + 1:
+                self._admitted.append(item)  # the exact record a fetched item must match
 
     def on_direct_callback(self, callback: DirectCallback) -> None:
         """A callback outside the consumer flow. Recorded; a read callback here is never applied."""
@@ -240,21 +263,34 @@ class LifecycleAdapter:
                     self._fail(Failure.DIRECT_ERROR)
 
     def consume_one(self) -> bool:
-        """The adapter-owned consumer: take one queued callback and dispatch it. False if none."""
+        """The adapter-owned consumer: take one queued callback and dispatch it. False if none.
+
+        One logical owner at a time: a competing or recursive call returns False before it removes
+        anything. The fetched item must equal the oldest admitted record, or it is not dispatched."""
         with self._lock:
-            if self._queue is None or self._consumer_failed:
+            if self._queue is None or self._consumer_failed or self._consumer_owned:
                 return False
+            self._consumer_owned = True
             queue = self._queue
+        try:
+            return self._consume(queue)
+        finally:
+            with self._lock:
+                self._consumer_owned = False
+
+    def _consume(self, queue: Any) -> bool:
         item = self._observe(queue.get_nowait)
         if item is None:
             return False
         with self._lock:
+            if not self._admitted or not _same_item(item, self._admitted[0]):
+                self._fail(Failure.ITEM_NOT_ADMITTED)  # removed from the queue, never dispatched
+                return True
+            slot, kind = self._admitted.pop(0)
             self._ledger.callback_started()
-            if self._ledger.report().in_flight_callbacks != 1:
-                return True  # never admitted: the ledger recorded the fault, and it is not dispatched
             self._dispatching += 1
         try:
-            self._call(self._boundary.dispatch, *item)
+            self._call(self._boundary.dispatch, slot, kind)
         except _Raised:
             with self._lock:
                 self._dispatching -= 1
@@ -269,14 +305,25 @@ class LifecycleAdapter:
     # ------------------------------------------------------------------ shutdown
 
     def shutdown(self, join_timeout: float) -> None:
-        """Retire reads, disconnect, close admission, drain, then observe each resource. Once only."""
+        """Retire reads, disconnect, close admission, drain, then observe each resource. Once only.
+
+        Requested while ``connect`` is still pending, it is deferred, never blocking, and runs as
+        soon as ``start`` has retained the returned references."""
         with self._lock:
             if self._state is AdapterState.START_FAILED:
                 return  # nothing was acquired; the report already shows the failed start
-            if self._state is not AdapterState.OPEN or self._shutdown_requested:
+            if self._shutdown_requested or self._state not in (AdapterState.STARTING,
+                                                               AdapterState.OPEN):
                 self._fail(Failure.REUSE_REFUSED)
                 return
             self._shutdown_requested = True
+            if self._state is AdapterState.STARTING:
+                self._deferred_timeout = join_timeout
+                return
+        self._shutdown(join_timeout)
+
+    def _shutdown(self, join_timeout: float) -> None:
+        with self._lock:
             self._state = AdapterState.SHUTTING_DOWN
             ledger_view = self._ledger.report()
         for slot_view in ledger_view.slots:

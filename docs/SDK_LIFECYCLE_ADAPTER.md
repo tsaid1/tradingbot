@@ -26,8 +26,21 @@ The adapter takes its lock from the caller, a context manager. The package admit
 standard-library imports, so it cannot create a thread lock itself. The lock is never held while a hook
 or observation runs. Every such call counts as pending until it returns.
 
-The reader reports each enqueue through `on_enqueued`. Callbacks outside the consumer flow
-(`CONNECT_ACK`, `CONNECTION_CLOSED`, `ERROR`, `READ`) arrive through `on_direct_callback`.
+The reader reports each enqueue through `on_enqueued`. The adapter keeps an exact copy of each record the
+ledger admitted. Callbacks outside the consumer flow (`CONNECT_ACK`, `CONNECTION_CLOSED`, `ERROR`, `READ`)
+arrive through `on_direct_callback`.
+
+**Startup.** The adapter is `STARTING` until `connect` returns and its references are retained, and only
+then `OPEN`. Reads before then are refused (`READ_BEFORE_OPEN`). A `shutdown` requested during startup
+is recorded and deferred, never blocking, whether it comes from another thread or reentrantly from the
+connect hook. `start` runs it once the references are retained, so a pending connect's resources are
+never stranded.
+
+**Consumer.** `consume_one` reserves one logical consumer owner under the lock before it fetches anything,
+and keeps it through dispatch and finish, while still releasing the real lock around the hook. A
+competing or recursive call returns `False` without removing an item. A fetched item must equal the oldest
+admitted record, with the same slot and kind. Otherwise it is `ITEM_NOT_ADMITTED`: it is not dispatched,
+the ledger is not advanced, and completion stays false.
 
 ## Shutdown, once
 
@@ -41,7 +54,8 @@ The reader reports each enqueue through `on_enqueued`. Callbacks outside the con
 2. **Disconnect.** This runs independently of step 1's results.
 3. **Admission.** Admission closes. Later enqueues are ledger faults.
 4. **Drain.** The adapter-owned consumer drains the queue, up to 1024 items. A raising `dispatch` stops
-   the consumer and leaves its callback in flight. An item the ledger never admitted is not dispatched.
+   the consumer and leaves its callback in flight. An item that does not match its admission record is
+   not dispatched. A drain that finds another consumer active stops, and the consumer is reported busy.
 5. **Observe.** Each resource is observed through the retained references, even if the boundary has
    since reset its own:
    - the reader, joined with a timeout that bounds only that wait
@@ -75,7 +89,10 @@ is no retry or recovery. The ledger refuses a second positions read on the conne
   - raising stop, disconnect, dispatch and connect hooks
   - a stop while disconnected
   - a direct read callback, and an error during a stop
-  - an item enqueued without admission
+  - an item enqueued without admission, a wrong kind, a wrong slot, and an unadmitted item ahead of an
+    admitted one
+  - a blocked connect with a concurrent shutdown, and a shutdown from inside the connect hook
+  - a blocked dispatch with a competing consume or a concurrent shutdown, and recursive consumption
   - a late enqueue after admission closes, and data after END
   - a snapshot without END
   - references erased by a reset, with the reader alive and with it stopped

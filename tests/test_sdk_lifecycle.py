@@ -298,7 +298,7 @@ def test_a_queued_item_never_admitted_is_not_dispatched_silently():
     adapter.consume_one()
     report = adapter.report()
     assert ("dispatch", SUMMARY, DATA) not in boundary.calls
-    assert "DISPATCH_OUT_OF_ORDER" in report.ledger.faults
+    assert "ITEM_NOT_ADMITTED" in report.failures
 
 
 # ----------------------------------------------------------------------------- late and post-END work
@@ -401,3 +401,143 @@ def test_module_surface_and_imports_stay_sdk_free():
     roots = {(n.module or "").split(".")[0] for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)}
     roots |= {a.name.split(".")[0] for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names}
     assert roots <= {"__future__", "dataclasses", "enum", "typing", "tradingbot"}
+
+
+# ----------------------------------------------------------------------------- review: startup and shutdown
+
+def test_a_shutdown_during_a_blocked_connect_runs_once_the_references_are_retained():
+    lock = RecordingLock()
+    entered, release = threading.Event(), threading.Event()
+
+    class Blocking(Boundary):
+        def connect(self):
+            entered.set()
+            assert release.wait(5)
+            return super().connect()
+
+    boundary = Blocking(lock)
+    adapter = LifecycleAdapter(boundary, lock)
+    boundary.adapter = adapter
+    worker = threading.Thread(target=adapter.start)
+    worker.start()
+    assert entered.wait(5)
+    adapter.shutdown(join_timeout=0.01)  # deferred, not blocked, while connect is pending
+    pending = adapter.report()
+    assert pending.state == "STARTING" and pending.completed is False and pending.pending_calls == 1
+    release.set()
+    worker.join(5)
+    report = adapter.report()
+    assert not worker.is_alive() and report.state == "CLOSED"
+    assert ("disconnect",) in boundary.calls and boundary.resources.reader.alive is False
+    assert (report.ledger.reader, report.ledger.socket) == ("STOPPED", "STOPPED")
+    assert "REUSE_REFUSED" not in report.failures
+
+
+def test_a_shutdown_from_inside_the_connect_hook_is_deferred_not_lost():
+    lock = RecordingLock()
+
+    class Reentrant(Boundary):
+        def connect(self):
+            self.adapter.shutdown(join_timeout=0.01)
+            return super().connect()
+
+    boundary = Reentrant(lock)
+    adapter = LifecycleAdapter(boundary, lock)
+    boundary.adapter = adapter
+    adapter.start()
+    report = adapter.report()
+    assert report.state == "CLOSED" and ("disconnect",) in boundary.calls
+    assert (report.ledger.reader, report.ledger.socket) == ("STOPPED", "STOPPED")
+    assert not any(boundary.lock_held_in_hooks)
+
+
+# ----------------------------------------------------------------------------- review: exclusive consumer
+
+def _blocked_dispatch(boundary, entered, release):
+    original = boundary.dispatch
+
+    def dispatch(slot, kind):
+        if kind is DATA and not entered.is_set():
+            entered.set()
+            assert release.wait(5)
+        original(slot, kind)
+
+    boundary.dispatch = dispatch
+
+
+def test_a_competing_consume_during_a_blocked_dispatch_removes_nothing():
+    adapter, boundary, resources = harness()
+    adapter.open_read(SUMMARY)
+    enqueue(adapter, resources, SUMMARY, DATA, END)
+    entered, release = threading.Event(), threading.Event()
+    _blocked_dispatch(boundary, entered, release)
+    worker = threading.Thread(target=adapter.consume_one)
+    worker.start()
+    assert entered.wait(5)
+    assert adapter.consume_one() is False and resources.queue.items == [(SUMMARY, END)]
+    release.set()
+    worker.join(5)
+    assert adapter.consume_one() is True
+    report = adapter.report()
+    assert report.ledger.faults == () and report.failures == ()
+    assert report.ledger.slots[0].end_marker_seen is True
+
+
+def test_a_shutdown_during_a_blocked_dispatch_stays_incomplete():
+    adapter, boundary, resources = harness()
+    adapter.open_read(SUMMARY)
+    enqueue(adapter, resources, SUMMARY, DATA, END)
+    entered, release = threading.Event(), threading.Event()
+    _blocked_dispatch(boundary, entered, release)
+    worker = threading.Thread(target=adapter.consume_one)
+    worker.start()
+    assert entered.wait(5)
+    adapter.shutdown(join_timeout=0.01)
+    assert resources.queue.items == [(SUMMARY, END)]  # the drain did not take over the consumer
+    release.set()
+    worker.join(5)
+    report = adapter.report()
+    assert "CONSUMER_BUSY" in report.failures and report.completed is False
+
+
+def test_recursive_consumption_from_dispatch_is_refused_before_removing_an_item():
+    adapter, boundary, resources = harness()
+    adapter.open_read(SUMMARY)
+    enqueue(adapter, resources, SUMMARY, DATA, END)
+    nested: list[bool] = []
+    original = boundary.dispatch
+
+    def dispatch(slot, kind):
+        if kind is DATA:
+            nested.append(adapter.consume_one())
+            nested.append(len(resources.queue.items) == 1)
+        original(slot, kind)
+
+    boundary.dispatch = dispatch
+    assert adapter.consume_one() is True and nested == [False, True]
+    assert adapter.consume_one() is True
+    assert adapter.report().ledger.faults == () and adapter.report().failures == ()
+
+
+# ----------------------------------------------------------------------------- review: item correlation
+
+@pytest.mark.parametrize(("admitted", "physical"), [
+    ([(SNAPSHOT, END)], [(SNAPSHOT, DATA)]),
+    ([(SUMMARY, END)], [(POSITIONS, END)]),
+    ([(SUMMARY, END)], [(SUMMARY, DATA), (SUMMARY, END)]),
+], ids=["wrong-kind", "wrong-slot", "unadmitted-ahead-of-admitted"])
+def test_a_fetched_item_must_match_its_admission_record(admitted, physical):
+    adapter, boundary, resources = harness()
+    for slot in (SUMMARY, POSITIONS, SNAPSHOT):
+        adapter.open_read(slot)
+    for slot, kind in admitted:
+        adapter.on_enqueued(slot, kind)
+    resources.queue.items.extend(physical)
+    adapter.consume_one()
+    report = adapter.report()
+    assert "ITEM_NOT_ADMITTED" in report.failures
+    assert not [c for c in boundary.calls if c[0] == "dispatch"]
+    assert report.ledger.in_flight_callbacks == 0 and report.ledger.queued_callbacks == 1
+    adapter.shutdown(join_timeout=0.01)
+    assert adapter.report().completed is False
+
