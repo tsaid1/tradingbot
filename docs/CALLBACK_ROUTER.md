@@ -71,7 +71,7 @@ fault survives. Text arguments of errors and the tick attribute are never retain
 | `position`, `positionEnd` | The single positions window, through the FIFO |
 | `error_1052` for the quote or contract id | That stream's `error_1052` (quote through the FIFO) |
 | `error_1052` for the account id | A fixed `unsupported_callback("error")` plus a lifecycle ERROR. Account and position streams have no `error_1052` |
-| `error_1052` with id -1 | Every stream, directly. Only a well-formed call (4 or 5 arguments, the exact integer id -1, integer time and non-negative integer code) with an OK code is exempt. A non-OK code (`SESSION_ERROR`) or a malformed call (`SESSION_ERROR_MALFORMED`) fails every stream, account and positions included |
+| `error_1052` with id -1 | Every stream, directly. Only a well-formed call (4 or 5 arguments, the exact integer id -1, an exact integer time and an exact non-negative integer code; the same fields the contract and quote normalizers require) with an OK code is exempt. A non-OK code (`SESSION_ERROR`) or a malformed call (`SESSION_ERROR_MALFORMED`) fails every stream, account and positions included |
 | `error_1052` for another valid id | The contract stream, as a stray with its original id (`UNKNOWN_REQUEST_ID`) |
 | `error_1052` with an id that is not a valid request id | Latches both `error_1052` streams (`UNKNOWN_REQUEST_ID`) |
 | A quote or account callback for another id | Its own stream, as a stray with its original id, outside lifecycle accounting (`UNKNOWN_REQUEST_ID`) |

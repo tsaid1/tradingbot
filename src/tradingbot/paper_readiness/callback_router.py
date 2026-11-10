@@ -275,6 +275,17 @@ def _request_id(value: object) -> int | None:
     return value if type(value) is int and 0 <= value <= MAX_ID else None
 
 
+def _well_formed_session_error(copied: tuple) -> bool:
+    """Every field the accepted normalizer requires of a session 1052 call, checked together: 4 or 5
+    arguments, the exact integer id -1 (a numerically equal -1.0 or Decimal is malformed), an exact
+    integer time and an exact non-negative integer code. The text arguments are never read."""
+    if len(copied) not in (4, 5):
+        return False
+    req_id, error_time, error_code = copied[0], copied[1], copied[2]
+    return (type(req_id) is int and req_id == SESSION_REQUEST_ID and type(error_time) is int
+            and type(error_code) is int and error_code >= 0)
+
+
 class CallbackRouter:
     """Routes invented callbacks for one connection. Single-threaded arrival is the supported model."""
 
@@ -605,9 +616,7 @@ class CallbackRouter:
         for normalizer in (self._contract, self._quote):
             if normalizer is not None:
                 normalizer.error_1052(*copied)
-        # The exact integer session id is required: -1.0 or Decimal("-1") compare equal but are malformed.
-        well_formed = (len(copied) in (4, 5) and type(copied[0]) is int and type(copied[1]) is int
-                       and type(copied[2]) is int and copied[2] >= 0)
+        well_formed = _well_formed_session_error(copied)
         if well_formed and copied[2] in SESSION_OK_CODES:
             return
         self._fault(RouterFault.SESSION_ERROR if well_formed else RouterFault.SESSION_ERROR_MALFORMED)

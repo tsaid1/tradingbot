@@ -372,9 +372,13 @@ def account_only_router() -> CallbackRouter:
     return r
 
 
-@pytest.mark.parametrize("args", [(-1, "bad-time", 2104, "ignored"), (-1, 0, 2104), (-1, 0, True, "x"),
-                                  (-1.0, 0, 2104, "ignored"), (Decimal(-1), 0, 2104, "ignored")],
-                         ids=["time-text", "three-arguments", "code-bool", "id-float", "id-decimal"])
+@pytest.mark.parametrize("args", [
+    (-1, "bad-time", 2104, "ignored"), (-1, True, 2104, "ignored"), (-1, 0.0, 2104, "ignored"),
+    (-1, 0, 2104), (-1, 0, 2104, "a", "b", "c"),
+    (-1, 0, True, "x"), (-1, 0, 2104.0, "x"), (-1, 0, Decimal(2104), "x"), (-1, 0, -2104, "x"),
+    (-1.0, 0, 2104, "ignored"), (Decimal(-1), 0, 2104, "ignored"),
+], ids=["time-text", "time-bool", "time-float", "three-arguments", "six-arguments",
+        "code-bool", "code-float", "code-decimal", "code-negative", "id-float", "id-decimal"])
 def test_a_malformed_session_error_fails_account_and_position_streams(args):
     """Review P2: the OK-code exemption applies only to a well-formed 1052 call."""
     r = account_only_router()
