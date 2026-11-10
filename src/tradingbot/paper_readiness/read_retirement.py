@@ -80,6 +80,8 @@ class Fault(str, Enum):
     CALLBACK_AFTER_ADMISSION_CLOSED = "CALLBACK_AFTER_ADMISSION_CLOSED"
     POST_END_EVENT = "POST_END_EVENT"
     DISPATCH_OUT_OF_ORDER = "DISPATCH_OUT_OF_ORDER"
+    DISPATCH_AFTER_CONSUMER_STOPPED = "DISPATCH_AFTER_CONSUMER_STOPPED"
+    RECEIPT_AFTER_READER_STOPPED = "RECEIPT_AFTER_READER_STOPPED"
     ATTEMPT_ALREADY_RESERVED = "ATTEMPT_ALREADY_RESERVED"
     ATTEMPT_NOT_RESERVED = "ATTEMPT_NOT_RESERVED"
     ATTEMPT_AFTER_DISCONNECT = "ATTEMPT_AFTER_DISCONNECT"
@@ -153,6 +155,10 @@ class RetirementLedger:
 
     # ------------------------------------------------------------------ bookkeeping
 
+    def _reported_stopped(self, component: Component) -> bool:
+        """Work by a component after it was reported STOPPED contradicts that report."""
+        return self._components.get(component) == Outcome.STOPPED.value
+
     def _fault(self, fault: Fault) -> None:
         if len(self._faults) < MAX_FAULTS:
             self._faults.append(fault)
@@ -187,6 +193,8 @@ class RetirementLedger:
         """The reader queued one callback. After admission closes it is a fault and is not queued."""
         if not self._admit():
             return
+        if self._reported_stopped(Component.READER):
+            self._fault(Fault.RECEIPT_AFTER_READER_STOPPED)
         if self._admission_closed:
             self._fault(Fault.CALLBACK_AFTER_ADMISSION_CLOSED)
             return
@@ -196,6 +204,8 @@ class RetirementLedger:
         """The consumer took the oldest queued callback. One consumer, so one callback in flight."""
         if not self._admit():
             return
+        if self._reported_stopped(Component.CONSUMER):
+            self._fault(Fault.DISPATCH_AFTER_CONSUMER_STOPPED)
         if self._in_flight is not None or not self._queued:
             self._fault(Fault.DISPATCH_OUT_OF_ORDER)
             return
@@ -205,6 +215,8 @@ class RetirementLedger:
         """The in-flight callback was dispatched; its effect is applied now."""
         if not self._admit():
             return
+        if self._reported_stopped(Component.CONSUMER):
+            self._fault(Fault.DISPATCH_AFTER_CONSUMER_STOPPED)
         if self._in_flight is None:
             self._fault(Fault.DISPATCH_OUT_OF_ORDER)
             return

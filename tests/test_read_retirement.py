@@ -127,6 +127,52 @@ def test_queued_or_in_flight_callbacks_at_seal_block_quiescence():
     assert in_flight.report().local_quiescence_established is False
 
 
+def test_review_scenario_dispatch_after_consumer_stopped_blocks_quiescence():
+    """Review P2: snapshot END queued, consumer reported STOPPED, then the callback is dispatched."""
+    ledger = RetirementLedger()
+    ledger.open_read(SNAPSHOT)
+    ledger.callback_received(SNAPSHOT, CallbackKind.END)
+    ledger.component_stopped(Component.CONSUMER, Outcome.STOPPED)
+    ledger.callback_started()
+    ledger.callback_finished()
+    ledger.close_admission()
+    ledger.reserve_disconnect()
+    ledger.settle_disconnect(Outcome.RETURNED)
+    ledger.component_stopped(Component.READER, Outcome.STOPPED)
+    ledger.component_stopped(Component.SOCKET, Outcome.STOPPED)
+    ledger.seal()
+    report = ledger.report()
+    assert report.faults == ("DISPATCH_AFTER_CONSUMER_STOPPED", "DISPATCH_AFTER_CONSUMER_STOPPED")
+    assert report.local_quiescence_established is False
+
+
+def test_an_in_flight_callback_finished_after_consumer_stopped_is_a_fault():
+    ledger = RetirementLedger()
+    opened_reads(ledger)
+    retire(ledger, SUMMARY, POSITIONS)
+    ledger.callback_received(SNAPSHOT, CallbackKind.DATA)
+    ledger.callback_started()
+    ledger.component_stopped(Component.CONSUMER, Outcome.STOPPED)
+    ledger.callback_finished()
+    terminate(ledger, skip=(Component.CONSUMER,))
+    report = ledger.report()
+    assert "DISPATCH_AFTER_CONSUMER_STOPPED" in report.faults
+    assert report.local_quiescence_established is False
+
+
+def test_a_receipt_after_reader_stopped_is_a_fault():
+    ledger = RetirementLedger()
+    opened_reads(ledger)
+    retire(ledger, SUMMARY, POSITIONS)
+    ledger.component_stopped(Component.READER, Outcome.STOPPED)
+    ledger.callback_received(SNAPSHOT, CallbackKind.DATA)
+    queued_before = ledger.report().queued_callbacks
+    terminate(ledger, skip=(Component.READER,))
+    report = ledger.report()
+    assert queued_before == 1 and "RECEIPT_AFTER_READER_STOPPED" in report.faults
+    assert report.local_quiescence_established is False
+
+
 def test_a_callback_after_admission_closes_is_a_fault_not_queued():
     ledger = RetirementLedger()
     opened_reads(ledger)

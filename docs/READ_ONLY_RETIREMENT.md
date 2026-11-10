@@ -46,7 +46,7 @@ No cancellation acknowledgement is established by the inspected sources. That is
 | `reserve_attempt` → `settle_attempt` | Reserved before any outcome, allowed from a requested read with or without END (for example after an error). It settles once with `RETURNED`, `FAILED` or `UNKNOWN`. It is never retried and never replaced |
 | `reserve_disconnect` → `settle_disconnect` | Independent of read attempts, so a failed attempt never blocks it. Reserving a read attempt after it is a fault |
 | `close_admission` | Terminal dispatch exclusion. Already queued callbacks may still drain |
-| `component_stopped(CONSUMER / READER / SOCKET, outcome)` | Each is reported separately, once. `FAILED` and `UNKNOWN` are kept |
+| `component_stopped(CONSUMER / READER / SOCKET, outcome)` | Each is reported separately, once. `FAILED` and `UNKNOWN` are kept. A dispatch start or finish after the consumer is reported `STOPPED` is `DISPATCH_AFTER_CONSUMER_STOPPED`, and a receipt after the reader is reported `STOPPED` is `RECEIPT_AFTER_READER_STOPPED` |
 | `seal()` | The settlement bound. Unsettled attempts and unreported components become `UNKNOWN`. Later events are `EVENT_AFTER_SEAL` |
 
 `RETURNED` means only that a local call returned. A timeout or silence is never success.
@@ -69,6 +69,8 @@ Events are capped at 4096 and recorded faults at 64. Overflow is counted and blo
 
 **Known E3 failures:**
 - a reader stopped alone, and each missing component
+- dispatch of a queued or in-flight callback after the consumer is reported stopped, and a receipt after
+  the reader is reported stopped
 - callbacks still queued or in flight at seal
 - a callback after admission closes
 - a failed attempt that is retained and not retried, with disconnect still independent
