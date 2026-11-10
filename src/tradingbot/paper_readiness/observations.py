@@ -27,13 +27,17 @@ from tradingbot.models import AssetClass, Instrument, StrictModel
 from tradingbot.validator import SYMBOL_RE
 
 RECORDS_VERSION = 1
+# Opt-in version 2: identity is held by a private per-run owner (private_account.py). Never mixed with 1.
+RECORDS_VERSION_V2 = 2
 __all__ = [
+    "ACCOUNT_REF_PATTERN",
     "AUTHORITY",
     "DELAYED_TICK_TYPES",
     "END_KINDS",
     "MARKET_DATA_TYPE_CODES",
     "PAYLOAD_FIELD",
     "RECORDS_VERSION",
+    "RECORDS_VERSION_V2",
     "STK_ASSET_CLASSES",
     "SYNTHETIC_ACCOUNT_RE",
     "AccountSummaryObservation",
@@ -44,14 +48,18 @@ __all__ = [
     "PositionLine",
     "QuoteObservation",
     "ReadinessExpectation",
+    "ReadinessExpectationV2",
     "ResponseEnvelope",
     "ResponseKind",
     "SessionAttestation",
+    "SessionAttestationV2",
     "TargetContract",
 ]
 
 # Only explicitly synthetic account identifiers are admitted anywhere in this scaffold.
 SYNTHETIC_ACCOUNT_RE = re.compile(r"^SYNTH-[A-Z0-9]{4,24}$")
+# The fixed opaque reference format issued by account_ref.compare_account.
+ACCOUNT_REF_PATTERN = r"^acctref-v1:[0-9a-f]{32}$"
 # IBKR secType STK covers both equities and ETFs; the scaffold admits nothing else.
 STK_ASSET_CLASSES = frozenset({AssetClass.EQUITY, AssetClass.ETF})
 
@@ -135,6 +143,33 @@ class SessionAttestation(StrictModel):
     connected: bool
     environment_claim: Environment = "UNKNOWN"
     managed_accounts: list[str] = Field(default_factory=list)
+    read_only_api_attested: bool | None = None
+    server_version: int | None = Field(default=None, gt=0)
+    connection_time: datetime | None = None
+    socket_port: int | None = Field(default=None, ge=1, le=65535)
+    messages: list[ApiMessage] = Field(default_factory=list)
+
+
+class ReadinessExpectationV2(StrictModel):
+    """Version 2 expectation. It carries only the opaque reference of an owner-issued binding, never an
+    account identifier. The reference is a label, not authority: the version 2 preflight also requires
+    the issuing owner to confirm its own binding. PAPER and the regular session are still the only
+    expressible scope."""
+    records_version: Literal[2] = 2
+    environment: Literal["PAPER"] = "PAPER"
+    account_ref: str = Field(pattern=ACCOUNT_REF_PATTERN)
+    session_scope: Literal["REGULAR"] = "REGULAR"
+    target: TargetContract
+
+
+class SessionAttestationV2(StrictModel):
+    """Version 2 session attestation. Managed accounts are not carried here: they stay with the private
+    owner, which reports only its comparison status. ``synthetic`` remains ``True``: every version 2
+    session is an invented replay, and no external session is admitted."""
+    records_version: Literal[2] = 2
+    synthetic: Literal[True]
+    connected: bool
+    environment_claim: Environment = "UNKNOWN"
     read_only_api_attested: bool | None = None
     server_version: int | None = Field(default=None, gt=0)
     connection_time: datetime | None = None
