@@ -38,7 +38,10 @@ another. These are refused without any normalizer delivery:
 
 - a dispatch with nothing fetched (`DISPATCH_WITHOUT_FETCH`)
 - a dispatch for another record (`DISPATCH_MISMATCH`)
-- a reentrant dispatch or arrival
+- a reentrant dispatch, or a dispatch during an arrival
+- an arrival while another arrival or a dispatch is in progress (`ARRIVAL_REENTERED`). One guard covers
+  the whole arrival, including snapshotting and direct routes, so a nested call from a contract getter or
+  from the clock during dispatch is refused
 - an arrival after closure (`ARRIVAL_AFTER_CLOSE`)
 
 A fetched record left undispatched stays outstanding, so cleanup cannot pass. The router has no public

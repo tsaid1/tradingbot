@@ -361,14 +361,20 @@ class CallbackRouter:
 
     # ------------------------------------------------------------------ admission
 
-    def _arrival_open(self) -> bool:
+    def _arrive(self, route: Any, *args: object) -> None:
+        """One guard around a whole arrival: snapshotting, direct routes and admission. An arrival while
+        another arrival or a dispatch is in progress is refused and delivers nothing."""
         if self._closed:
             self._fault(RouterFault.ARRIVAL_AFTER_CLOSE)
-            return False
-        if self._arriving:
+            return
+        if self._arriving or self._dispatching:
             self._fault(RouterFault.ARRIVAL_REENTERED)
-            return False
-        return True
+            return
+        self._arriving = True
+        try:
+            route(*args)
+        finally:
+            self._arriving = False
 
     def _admit(self, method: _Method, args: tuple) -> None:
         """Retain and admit as one step: a record is queued only if the adapter admitted it."""
@@ -376,20 +382,16 @@ class CallbackRouter:
         if len(self._fifo) >= MAX_QUEUE_RECORDS or self._bytes + cost > MAX_QUEUE_BYTES:
             self._fault(RouterFault.QUEUE_OVERFLOW)
             return
-        self._arriving = True
-        try:
-            record = _Record(self._next_id, method, args)
-            self._next_id += 1
-            slot, kind = record.item
-            before = self._adapter.report().ledger.queued_callbacks
-            self._adapter.on_enqueued(slot, kind)
-            if self._adapter.report().ledger.queued_callbacks != before + 1:
-                self._fault(RouterFault.ADMISSION_REFUSED)  # nothing dispatchable is retained
-                return
-            self._fifo.append(record)
-            self._bytes += cost
-        finally:
-            self._arriving = False
+        record = _Record(self._next_id, method, args)
+        self._next_id += 1
+        slot, kind = record.item
+        before = self._adapter.report().ledger.queued_callbacks
+        self._adapter.on_enqueued(slot, kind)
+        if self._adapter.report().ledger.queued_callbacks != before + 1:
+            self._fault(RouterFault.ADMISSION_REFUSED)  # nothing dispatchable is retained
+            return
+        self._fifo.append(record)
+        self._bytes += cost
 
     # ------------------------------------------------------------------ the adapter's consumer side
 
@@ -409,8 +411,8 @@ class CallbackRouter:
 
     def _dispatch(self, slot: ReadSlot, kind: CallbackKind) -> None:
         """Deliver only the one fetched record, once."""
-        if self._dispatching:
-            self._fault(RouterFault.DISPATCH_REENTERED)
+        if self._dispatching or self._arriving:
+            self._fault(RouterFault.DISPATCH_REENTERED)  # the record stays outstanding
             return
         record = self._fetched
         if record is None:
@@ -457,12 +459,10 @@ class CallbackRouter:
     # ------------------------------------------------------------------ EWrapper-named arrivals
 
     def contractDetails(self, reqId: object, contractDetails: object) -> None:
-        if self._arrival_open():
-            self._direct_contract(reqId, lambda n, rid: n.contractDetails(rid, _details(contractDetails)))
+        self._arrive(self._direct_contract, reqId, lambda n, rid: n.contractDetails(rid, _details(contractDetails)))
 
     def contractDetailsEnd(self, reqId: object) -> None:
-        if self._arrival_open():
-            self._direct_contract(reqId, lambda n, rid: n.contractDetailsEnd(rid))
+        self._arrive(self._direct_contract, reqId, lambda n, rid: n.contractDetailsEnd(rid))
 
     def _direct_contract(self, req_id: object, deliver: Any) -> None:
         """Outside lifecycle accounting. Another id keeps its own value and is a recorded stray."""
@@ -475,8 +475,9 @@ class CallbackRouter:
         deliver(self._contract, rid)
 
     def _quote_arrival(self, method: _Method, req_id: object, *rest: object) -> None:
-        if not self._arrival_open():
-            return
+        self._arrive(self._route_quote, method, req_id, *rest)
+
+    def _route_quote(self, method: _Method, req_id: object, *rest: object) -> None:
         if self._quote is None:
             self._fault(RouterFault.UNROUTABLE_CALLBACK)
             return
@@ -529,8 +530,9 @@ class CallbackRouter:
         self._account_arrival(_Method.ACCOUNT_SUMMARY_END, reqId)
 
     def _account_arrival(self, method: _Method, req_id: object, *rest: object) -> None:
-        if not self._arrival_open():
-            return
+        self._arrive(self._route_account, method, req_id, *rest)
+
+    def _route_account(self, method: _Method, req_id: object, *rest: object) -> None:
         if self._account is None:
             self._fault(RouterFault.UNROUTABLE_CALLBACK)
             return
@@ -545,16 +547,18 @@ class CallbackRouter:
             self._account.accountSummaryEnd(*args)
 
     def position(self, account: object, contract: object, pos: object, avgCost: object) -> None:
-        if not self._arrival_open():
-            return
+        self._arrive(self._route_position, account, contract, pos, avgCost)
+
+    def _route_position(self, account: object, contract: object, pos: object, avg_cost: object) -> None:
         if self._positions is None:
             self._fault(RouterFault.POSITIONS_WINDOW_ABSENT)
             return
-        self._admit(_Method.POSITION, (_value(account), _contract(contract), _value(pos), _value(avgCost)))
+        self._admit(_Method.POSITION, (_value(account), _contract(contract), _value(pos), _value(avg_cost)))
 
     def positionEnd(self) -> None:
-        if not self._arrival_open():
-            return
+        self._arrive(self._route_position_end)
+
+    def _route_position_end(self) -> None:
         if self._positions is None:
             self._fault(RouterFault.POSITIONS_WINDOW_ABSENT)
             return
@@ -562,8 +566,9 @@ class CallbackRouter:
 
     def error_1052(self, *args: object) -> None:
         """The SDK 1052 error order. Routed by its request id under fixed rules; text is never kept."""
-        if not self._arrival_open():
-            return
+        self._arrive(self._route_error, *args)
+
+    def _route_error(self, *args: object) -> None:
         copied = tuple(_value(v) for v in args[:3]) + tuple(_MALFORMED for _ in args[3:])
         rid = copied[0] if copied else _MALFORMED
         if self._quote is not None and rid == self._quote.request_id:
@@ -599,11 +604,12 @@ class CallbackRouter:
 
     def unsupported_callback(self, name: object, reqId: object = None) -> None:
         """Any other callback. Routed to its owner when the id is registered, otherwise to every stream."""
-        if not self._arrival_open():
-            return
+        self._arrive(self._route_unsupported, name, reqId)
+
+    def _route_unsupported(self, name: object, req_id: object) -> None:
         label = name if type(name) is str and len(name) <= 64 else "INVALID_NAME"
         owners = [n for n in (self._contract, self._quote, self._account)
-                  if n is not None and reqId == n.request_id]
+                  if n is not None and req_id == n.request_id]
         if not owners:
             owners = [n for n in (self._contract, self._quote, self._account, self._positions) if n is not None]
         for normalizer in owners:

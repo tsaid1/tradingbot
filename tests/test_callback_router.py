@@ -212,6 +212,74 @@ def test_a_payload_mutated_after_enqueue_is_delivered_as_enqueued():
     assert (line.con_id, line.symbol) == (840001, "RTRPOS")
 
 
+class ReentrantContract(Contract):
+    """A contract whose field getter calls back into the router during snapshotting."""
+
+    def __init__(self, con_id: int, router: CallbackRouter) -> None:
+        super().__init__(con_id)
+        self._router, self._fired = router, False
+
+    def __getattribute__(self, name):
+        if name == "conId" and not object.__getattribute__(self, "_fired"):
+            object.__setattr__(self, "_fired", True)
+            object.__getattribute__(self, "_router").position(ACCOUNT, Contract(849999), Decimal(1), 1.0)
+        return object.__getattribute__(self, name)
+
+
+def test_a_reentrant_contract_getter_is_refused_and_its_payload_never_delivered():
+    """Review P2: the guard covers snapshotting, not only admission."""
+    r, _ = router()
+    everything(r)
+    r.position(ACCOUNT, ReentrantContract(840003, r), Decimal(1), 1.0)
+    drain(r)
+    r.shutdown(join_timeout=0.01)
+    report = r.report()
+    con_ids = {e.position.con_id for e in r.position_envelopes() if e.kind == ResponseKind.POSITION}
+    assert 849999 not in con_ids and 840003 in con_ids  # the outer row arrived, the nested one never did
+    assert "ARRIVAL_REENTERED" in report.faults and report.completed is False
+
+
+class ReentrantClock:
+    """A clock whose now() calls back into the router while quote END is being dispatched."""
+
+    def __init__(self) -> None:
+        self.router: CallbackRouter | None = None
+        self.calls = 0
+
+    def now(self):
+        self.calls += 1
+        if self.router is not None:
+            self.router.position(ACCOUNT, Contract(849998), Decimal(1), 1.0)
+        return NOW
+
+
+def test_an_arrival_during_dispatch_is_refused_and_its_payload_never_delivered():
+    clock = ReentrantClock()
+    r = CallbackRouter(Client(), _Lock(), clock)
+    r.start()
+    r.register_quote(QRID, CON_ID)
+    r.register_positions(PRID)
+    clock.router = r
+    quote_feed(r)
+    r.positionEnd()
+    drain(r)
+    r.shutdown(join_timeout=0.01)
+    report = r.report()
+    assert clock.calls >= 1  # tickSnapshotEnd read the clock during dispatch
+    assert not [e for e in r.position_envelopes() if e.kind == ResponseKind.POSITION]
+    assert "ARRIVAL_REENTERED" in report.faults and report.completed is False
+
+
+def test_control_an_ordinary_arrival_after_a_refused_reentry_still_routes():
+    r, _ = router()
+    r.position(ACCOUNT, ReentrantContract(840003, r), Decimal(1), 1.0)
+    r.position(ACCOUNT, Contract(840004), Decimal(2), 1.0)  # not reentrant: routed normally
+    r.positionEnd()
+    drain(r)
+    con_ids = [e.position.con_id for e in r.position_envelopes() if e.kind == ResponseKind.POSITION]
+    assert con_ids == [840003, 840004]
+
+
 def test_overflow_is_refused_before_admission_and_blocks_completion():
     r, _ = router()
     for i in range(cr.MAX_QUEUE_RECORDS + 1):
