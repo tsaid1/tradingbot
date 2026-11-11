@@ -5,7 +5,8 @@ the paper TWS and approved the run).
 
 Steps: load config -> connect + identity gate -> resolve TLT -> account summary -> positions ->
 TLT quote snapshot -> disconnect -> reconnect once + disconnect (recovery proof). Writes a JSON report
-(masked account only) and prints a summary. Exit 0 only if every step, including cleanup, passed.
+(masked account only) and prints a summary. Exit 0 only for PASS or PASS_WITH_WARNINGS (every step,
+including cleanup, passed; warnings such as an owner-attested read-only API need human review).
 
 Default report dir: $TRADINGBOT_IBKR_REPORT_DIR, else ``private/ibkr_reports`` in the workspace that
 contains this checkout (the parent or grandparent of the repo root). See docs/IBKR_ADAPTER.md.
@@ -50,7 +51,7 @@ def main(argv: list[str] | None = None) -> int:
     path = write_report(report, report_dir)
     print(summarize(report))
     print(f"report: {path}")
-    return 0 if report["overall"] == "PASS" else 1
+    return 0 if report["overall"] in ("PASS", "PASS_WITH_WARNINGS") else 1
 
 
 if __name__ == "__main__":

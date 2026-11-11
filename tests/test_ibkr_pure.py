@@ -27,7 +27,9 @@ from tradingbot.ibkr.redact import mask_account, redact_accounts
 
 ROOT = Path(__file__).resolve().parents[1]
 ACCT = "DU9990001"  # synthetic
-GOOD = {"host": "127.0.0.1", "port": 7497, "client_id": 17, "account": ACCT, "mode": "paper"}
+GOOD = {"mode": "paper", "host": "127.0.0.1", "port": 7497, "client_id": 17, "account": ACCT,
+        "tws_profile_ini": "/Users/someone/Jts/jts.ini", "tws_os_user": "someone",
+        "read_only_check": "config-read"}  # synthetic values
 
 
 def _toml(d: dict) -> str:
@@ -93,10 +95,35 @@ def test_ipv6_loopback_allowed():
     assert validate_config({**GOOD, "host": "::1"}).host == "::1"
 
 
-@pytest.mark.parametrize("port", [7496, 4001])
-def test_live_ports_rejected(port):
-    with pytest.raises(E.LivePortRejected):
+@pytest.mark.parametrize("port", [7496, 4001, 7498, 1, 4003])
+def test_only_paper_ports_allowed(port):
+    with pytest.raises(E.PortNotAllowed):
         validate_config({**GOOD, "port": port})
+
+
+@pytest.mark.parametrize("port", [7497, 4002])
+def test_paper_ports_accepted(port):
+    assert validate_config({**GOOD, "port": port}).port == port
+
+
+@pytest.mark.parametrize("patch", [{"read_only_check": "none"}, {"read_only_check": ""},
+                                   {"tws_profile_ini": "Jts/jts.ini"}, {"tws_os_user": "Bad User"},
+                                   {"tws_os_user": ""}])
+def test_new_keys_validated(patch):
+    with pytest.raises(E.ConfigInvalid):
+        validate_config({**GOOD, **patch})
+
+
+@pytest.mark.parametrize("key", ["tws_profile_ini", "tws_os_user", "read_only_check"])
+def test_new_keys_required_no_default(key):
+    with pytest.raises(E.ConfigInvalid):
+        validate_config({k: v for k, v in GOOD.items() if k != key})
+
+
+def test_final_key_set():
+    from tradingbot.ibkr.config import _KEYS
+    assert _KEYS == {"mode", "host", "port", "client_id", "account", "tws_profile_ini",
+                     "tws_os_user", "read_only_check"}
 
 
 @pytest.mark.parametrize("account", ["U1234567", "F7654321", "I1234567"])
@@ -131,7 +158,7 @@ def test_bad_toml_does_not_echo_content(tmp_path):
 
 def test_config_errors_are_distinct_types():
     types = [E.ConfigNotFound, E.ConfigIsSymlink, E.ConfigNotRegularFile, E.ConfigWrongOwner,
-             E.ConfigPermissionsTooOpen, E.ConfigInvalid, E.NonLoopbackHost, E.LivePortRejected,
+             E.ConfigPermissionsTooOpen, E.ConfigInvalid, E.NonLoopbackHost, E.PortNotAllowed,
              E.NonPaperAccount, E.ModeNotPaper]
     assert len(set(types)) == 10 and all(issubclass(t, E.ConfigError) for t in types)
 
@@ -251,7 +278,9 @@ def test_other_codes_are_errors(code):
 # --- structural: no order-affecting calls anywhere in the adapter ---------------------------------
 FORBIDDEN = {"placeOrder", "cancelOrder", "reqGlobalCancel", "exerciseOptions", "placeOrderProtoBuf",
              "cancelOrderProtoBuf", "reqGlobalCancelProtoBuf", "exerciseOptionsProtoBuf",
-             "reqAutoOpenOrders", "PLACE_ORDER", "CANCEL_ORDER", "REQ_GLOBAL_CANCEL"}
+             "reqAutoOpenOrders", "PLACE_ORDER", "CANCEL_ORDER", "REQ_GLOBAL_CANCEL",
+             "updateConfigProtoBuf", "UPDATE_CONFIG", "replaceFA", "replaceFAProtoBuf",
+             "REPLACE_FA", "setServerLogLevel", "updateDisplayGroup"}
 
 
 def _adapter_sources() -> list[Path]:
@@ -292,7 +321,7 @@ def test_no_order_methods_referenced(path):
 def test_pure_modules_do_not_import_ibapi():
     code = ("import sys; import tradingbot.ibkr.config, tradingbot.ibkr.models, "
             "tradingbot.ibkr.errors, tradingbot.ibkr.identity, tradingbot.ibkr.redact, "
-            "tradingbot.ibkr.check; "
+            "tradingbot.ibkr.check, tradingbot.ibkr.environment; "
             "bad = [m for m in sys.modules if m.split('.')[0] == 'ibapi']; "
             "assert not bad, bad")
     env = {**os.environ, "PYTHONPATH": str(ROOT / "src")}
@@ -312,6 +341,11 @@ class FakeSession:
         self.internal_errors, self.cleanup_failures = [], []
         self.poisoned = False
         self.calls: list[str] = []
+        self.preflight_result = {"stub": True}
+        self.read_only_status = "VERIFIED" if cfg.read_only_check == "config-read" else \
+            "OWNER_ATTESTED_NOT_VERIFIED"
+        self.read_only_settings = None
+        self.reader_joined = True
 
     def _maybe(self, name):
         self.calls.append(name)
@@ -366,6 +400,7 @@ def test_check_pass_and_report_is_masked(tmp_path):
     text = json.dumps(report)
     assert ACCT not in text and report["account"] == "DU…01"
     assert report["sdk_version"] == "0.0-fake" and report["session"]["server_version"] == 226
+    assert "read_only_check=config-read" in summarize(report).splitlines()[0]
     path = write_report(report, tmp_path / "reports")
     assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
     assert stat.S_IMODE(os.stat(tmp_path / "reports").st_mode) == 0o700
@@ -389,9 +424,51 @@ def test_cleanup_failure_recorded_on_session_is_fail(tmp_path):
     assert report["overall"] == "FAIL"
 
 
-def test_delayed_quote_passes_with_warning(tmp_path):
+def test_delayed_quote_passes_with_note(tmp_path):
     report, _ = _run(tmp_path, quality=QuoteQuality.DELAYED)
-    assert report["overall"] == "PASS" and any("DELAYED" in w for w in report["warnings"])
+    assert report["overall"] == "PASS" and any("DELAYED" in n for n in report["notes"])
+
+
+def test_unavailable_quote_is_pass_with_warnings(tmp_path):
+    report, _ = _run(tmp_path, quality=QuoteQuality.UNAVAILABLE)
+    assert report["overall"] == "PASS_WITH_WARNINGS"
+    assert "no market data delivered" in summarize(report).splitlines()[0]
+
+
+def test_owner_attested_read_only_is_at_best_pass_with_warnings(tmp_path):
+    report = run_check(_write(tmp_path, {**GOOD, "read_only_check": "owner-attested"}),
+                       session_factory=FakeSession)
+    assert report["overall"] == "PASS_WITH_WARNINGS"
+    assert report["session"]["read_only_status"] == "OWNER_ATTESTED_NOT_VERIFIED"
+    assert "read-only API not verified" in summarize(report).splitlines()[0]
+
+
+def test_reader_not_joined_is_fail_for_both_sessions(tmp_path):
+    made = []
+
+    def factory(cfg):
+        s = FakeSession(cfg)
+        if made:
+            s.reader_joined = False  # only the reconnect session
+        made.append(s)
+        return s
+
+    report = run_check(_write(tmp_path), session_factory=factory)
+    assert report["overall"] == "FAIL"
+    assert any(st["name"] == "reconnect_threads_joined" and st["status"] == "FAIL"
+               for st in report["steps"])
+
+
+def test_script_exit_codes(tmp_path, monkeypatch):
+    sys.path.insert(0, str(ROOT / "scripts"))
+    try:
+        import ibkr_paper_check
+    finally:
+        sys.path.pop(0)
+    for overall, code in (("PASS", 0), ("PASS_WITH_WARNINGS", 0), ("FAIL", 1)):
+        monkeypatch.setattr(ibkr_paper_check, "run_check",
+                            lambda path, o=overall: {"overall": o, "steps": [], "warnings": []})
+        assert ibkr_paper_check.main(["--report-dir", str(tmp_path)]) == code
 
 
 def test_bad_config_is_fail_without_session(tmp_path):
@@ -419,3 +496,12 @@ def test_script_report_dir_env(monkeypatch, tmp_path):
         sys.path.pop(0)
     monkeypatch.setenv("TRADINGBOT_IBKR_REPORT_DIR", str(tmp_path))
     assert ibkr_paper_check.default_report_dir() == tmp_path
+
+
+def test_plain_pass_needs_verified_config_read(tmp_path):
+    def factory(cfg):
+        s = FakeSession(cfg)
+        s.read_only_status = "NOT_CHECKED"  # config-read configured but not verified
+        return s
+
+    assert run_check(_write(tmp_path), session_factory=factory)["overall"] == "PASS_WITH_WARNINGS"

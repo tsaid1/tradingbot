@@ -2,7 +2,9 @@
 
 SDK-free at import time (the real session is imported lazily), so the step/verdict/report logic is
 tested offline with a fake session. Overall ``PASS`` requires every step, including both
-disconnects, to pass.
+disconnects, to pass with no warning. ``PASS_WITH_WARNINGS`` (exit 0) means every step passed but
+something must be read by a human: read-only API only owner-attested, no market data delivered, or
+an invalid two-sided quote. Anything else is ``FAIL``.
 """
 from __future__ import annotations
 
@@ -21,6 +23,9 @@ from tradingbot.ibkr.redact import redact_accounts
 
 REPORT_SCHEMA = "tradingbot.ibkr.paper_check/1"
 PASS, FAIL, SKIPPED = "PASS", "FAIL", "SKIPPED"
+PASS_WITH_WARNINGS = "PASS_WITH_WARNINGS"
+NO_MARKET_DATA = "no market data delivered"
+READ_ONLY_NOT_VERIFIED = "read-only API NOT verified (OWNER_ATTESTED_NOT_VERIFIED)"
 
 
 def _default_session_factory(config: PaperConnectionConfig) -> Any:
@@ -78,6 +83,10 @@ def _session_facts(s: Any) -> dict:
         "cleanup_failures": list(s.cleanup_failures),
         "internal_errors": list(s.internal_errors),
         "poisoned": bool(s.poisoned),
+        "preflight": getattr(s, "preflight_result", None),
+        "read_only_status": getattr(s, "read_only_status", None),
+        "read_only_settings": getattr(s, "read_only_settings", None),
+        "reader_joined": getattr(s, "reader_joined", None),
     }
 
 
@@ -90,12 +99,14 @@ def run_check(config_path: str | os.PathLike | None = None, *,
     steps = _Steps()
     report: dict[str, Any] = {"schema": REPORT_SCHEMA, "started_at": started, "read_only": True}
     warnings: list[str] = []
+    report["notes"] = []
 
     ok, cfg = steps.run("load_config", lambda: loader(config_path))
     if not ok:
         return _finish(report, steps, warnings, None)
     report.update(account=cfg.masked_account(), mode=cfg.mode, host=cfg.host, port=cfg.port,
-                  client_id=cfg.client_id)
+                  client_id=cfg.client_id, tws_os_user=cfg.tws_os_user,
+                  read_only_check=cfg.read_only_check)
 
     ok, session = steps.run("create_session", lambda: factory(cfg))
     if not ok:
@@ -105,15 +116,16 @@ def run_check(config_path: str | os.PathLike | None = None, *,
     connected, _ = steps.run("connect_identity_gate", session.connect)
     report["session"] = _session_facts(session)
     if connected:
-        _data_steps(session, steps, warnings)
+        if session.read_only_status != "VERIFIED":
+            warnings.append(READ_ONLY_NOT_VERIFIED)
+        _data_steps(session, steps, warnings, report["notes"])
     else:
         for name in ("resolve_contract", "account_summary", "positions", "quote_snapshot"):
             steps.skip(name, "identity gate did not pass")
 
     clean, _ = steps.run("disconnect", session.disconnect)
     report["session"] = _session_facts(session)
-    if clean and session.threads_alive():
-        steps.fail("threads_joined", f"threads still alive: {session.threads_alive()}")
+    _check_joined(session, connected, steps, "threads_joined")
     if session.cleanup_failures:
         steps.fail("request_cleanup", "; ".join(session.cleanup_failures))
 
@@ -125,7 +137,14 @@ def run_check(config_path: str | os.PathLike | None = None, *,
     return _finish(report, steps, warnings, cfg)
 
 
-def _data_steps(s: Any, steps: _Steps, warnings: list[str]) -> None:
+def _check_joined(s: Any, connected: bool, steps: _Steps, name: str) -> None:
+    if s.threads_alive():
+        steps.fail(name, f"threads still alive: {s.threads_alive()}")
+    elif connected and not s.reader_joined:
+        steps.fail(name, "EReader thread was not observed to exit")
+
+
+def _data_steps(s: Any, steps: _Steps, warnings: list[str], notes: list[str]) -> None:
     ok, contract = steps.run("resolve_contract", lambda: s.resolve_contract(TLT_QUERY),
                              lambda c: c)
 
@@ -142,11 +161,14 @@ def _data_steps(s: Any, steps: _Steps, warnings: list[str]) -> None:
         return
     ok, quote = steps.run("quote_snapshot", lambda: s.quote_snapshot(contract), lambda q: q)
     if ok:
-        if quote.quality is not QuoteQuality.LIVE:
-            warnings.append(f"TLT quote quality is {quote.quality.value} "
-                            f"(delivered market data type {quote.market_data_type_name})")
-        if not quote.two_sided_valid:
-            warnings.append(f"TLT quote flags: {list(quote.flags)}")
+        if quote.quality is QuoteQuality.UNAVAILABLE:
+            warnings.append(f"{NO_MARKET_DATA} for TLT (code {quote.unavailable_code}, "
+                            f"flags {list(quote.flags)})")
+        elif not quote.two_sided_valid:
+            warnings.append(f"TLT quote not two-sided valid: flags {list(quote.flags)}")
+        if quote.quality not in (QuoteQuality.LIVE, QuoteQuality.UNAVAILABLE):
+            notes.append(f"TLT quote quality is {quote.quality.value} "
+                         f"(delivered market data type {quote.market_data_type_name})")
 
 
 def _reconnect(cfg: PaperConnectionConfig, factory: Callable, steps: _Steps, report: dict) -> None:
@@ -154,8 +176,9 @@ def _reconnect(cfg: PaperConnectionConfig, factory: Callable, steps: _Steps, rep
     if not ok:
         steps.skip("reconnect_identity_gate", "session not created")
         return
-    steps.run("reconnect_identity_gate", s2.connect)
+    connected, _ = steps.run("reconnect_identity_gate", s2.connect)
     steps.run("reconnect_disconnect", s2.disconnect)
+    _check_joined(s2, connected, steps, "reconnect_threads_joined")
     report["reconnect_session"] = _session_facts(s2)
     if s2.cleanup_failures:
         steps.fail("reconnect_cleanup", "; ".join(s2.cleanup_failures))
@@ -171,7 +194,12 @@ def _finish(report: dict, steps: _Steps, warnings: list[str],
                 "account_summary", "positions", "quote_snapshot", "disconnect",
                 "reconnect_identity_gate", "reconnect_disconnect"]
     passed = {st["name"] for st in steps.steps if st["status"] == PASS}
-    report["overall"] = PASS if not failed and all(n in passed for n in expected) else FAIL
+    if failed or not all(n in passed for n in expected):
+        report["overall"] = FAIL
+    else:
+        verified = report.get("session", {}).get("read_only_status") == "VERIFIED"
+        clean = not warnings and report.get("read_only_check") == "config-read" and verified
+        report["overall"] = PASS if clean else PASS_WITH_WARNINGS
     if cfg is not None:  # belt and braces: the full account ID must never be in the report
         text = json.dumps(report, default=str)
         if cfg.account in text:
@@ -209,12 +237,19 @@ def write_report(report: dict, report_dir: str | os.PathLike) -> Path:
 def summarize(report: dict) -> str:
     head = (f"IBKR paper check: {report['overall']}  account={report.get('account', '?')}  "
             f"sdk={report.get('sdk_version')}  server_version="
-            f"{report.get('session', {}).get('server_version')}")
+            f"{report.get('session', {}).get('server_version')}  "
+            f"read_only_check={report.get('read_only_check', '?')}")
+    if any(w.startswith(NO_MARKET_DATA) for w in report.get("warnings", [])):
+        head += f"  [{NO_MARKET_DATA}]"
+    if READ_ONLY_NOT_VERIFIED in report.get("warnings", []):
+        head += "  [read-only API not verified]"
     lines = [head]
     for st in report["steps"]:
         extra = st.get("error") or st.get("reason") or ""
         lines.append(f"  {st['status']:<7} {st['name']:<26} {st['duration_ms']:>6} ms  {extra}")
     for w in report.get("warnings", []):
         lines.append(f"  WARNING {w}")
+    for n in report.get("notes", []):
+        lines.append(f"  NOTE    {n}")
     return "\n".join(lines)
 
