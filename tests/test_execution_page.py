@@ -91,7 +91,7 @@ def test_page_shows_protection_and_working_orders_mid_lifecycle(monkeypatch, tmp
     rt.run(3)  # only the entry has been processed
     text = shown(page(monkeypatch, write_config(rt, tmp_path / "runtime.toml")))
     assert "CONFIRMED" in text and "| STOP |" in text
-    assert "| TLT | 2 | 2 | yes |" in text
+    assert "| TLT STK x1 (" in text and "| 1 | 2 | 2 | yes |" in text  # contract and multiplier
 
 
 def test_halt_engages_in_one_click_and_clears_only_with_the_confirmation_word(monkeypatch, ran):

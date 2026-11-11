@@ -385,7 +385,11 @@ def test_every_stage_is_timestamped_and_latency_comes_from_the_stamps(tmp_path):
     assert lat["end_to_end"] is not None and lat["end_to_end"] >= 0
     assert row["protective"][0]["role"] == "STOP" and row["protective"][0]["working"]
     assert view["protection"][0]["protection"] == "CONFIRMED"
-    assert view["positions"] == [{"symbol": "TLT", "follower": 2, "broker": 2, "match": True}]
+    [pos] = view["positions"]
+    assert {k: pos[k] for k in ("symbol", "follower", "broker", "match", "multiplier")} == {
+        "symbol": "TLT", "follower": 2, "broker": 2, "match": True, "multiplier": "1"
+    }
+    assert pos["contract"].startswith("TLT STK x1 (") and pos["contract_key"].startswith("STK:TLT")
 
 
 def test_unprotected_position_is_notified(tmp_path):

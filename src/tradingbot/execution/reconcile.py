@@ -27,7 +27,7 @@ from tradingbot.execution.broker import (
     QuoteQuality,
 )
 from tradingbot.execution.store import UNRESOLVED_STATES, ExecutionStore, Role
-from tradingbot.models import PositionSide, StrictModel
+from tradingbot.models import Instrument, PositionSide, StrictModel
 
 
 class DiscrepancyKind(str, Enum):
@@ -66,6 +66,8 @@ SAFETY_KINDS = frozenset(
 class Discrepancy(StrictModel):
     kind: DiscrepancyKind
     symbol: str | None = None
+    # The instrument's identity (ContractRef.contract_key) where the discrepancy is per contract.
+    contract_key: str | None = None
     idea_id: str | None = None
     order_ref: str | None = None
     detail: str = ""
@@ -126,6 +128,16 @@ def _stop_problem(stop, p, quote) -> tuple[DiscrepancyKind | None, str]:
     return None, ""
 
 
+def _ledger_key(broker: Broker, p) -> str:
+    """The idea's contract key; a row written before round 2 is resolved by symbol."""
+    if p.contract_key:
+        return p.contract_key
+    try:
+        return broker.resolve(Instrument(asset_class=p.asset_class, symbol=p.symbol)).contract_key
+    except BrokerError:
+        return f"SYMBOL:{p.symbol}"
+
+
 def _quote(broker: Broker, contract):
     try:
         return broker.quote(contract)
@@ -158,17 +170,23 @@ def reconcile(
             (e.id for e in open_exceptions if e.kind == kind and e.idea_id == idea_id), None
         )
 
-    # 1. Net quantity per symbol: ledger (signed by idea side) versus broker.
+    # 1. Net quantity per contract (never per symbol: two months of a future, or a stock and a
+    #    future sharing a symbol, are different instruments): ledger (signed) versus broker.
     ledger_net: dict[str, int] = {}
+    symbols: dict[str, str] = {}
     for p in ledger:
         if p.quantity > 0:
+            key = _ledger_key(broker, p)
             sign = 1 if p.position_side == PositionSide.LONG else -1
-            ledger_net[p.symbol] = ledger_net.get(p.symbol, 0) + sign * p.quantity
+            ledger_net[key] = ledger_net.get(key, 0) + sign * p.quantity
+            symbols[key] = p.symbol
     broker_net: dict[str, int] = {}
     for bp in broker_positions:
-        broker_net[bp.contract.symbol] = broker_net.get(bp.contract.symbol, 0) + bp.quantity
-    for symbol in sorted(set(ledger_net) | set(broker_net)):
-        ours, theirs = ledger_net.get(symbol, 0), broker_net.get(symbol, 0)
+        key = bp.contract.contract_key
+        broker_net[key] = broker_net.get(key, 0) + bp.quantity
+        symbols[key] = bp.contract.symbol
+    for key in sorted(set(ledger_net) | set(broker_net)):
+        ours, theirs = ledger_net.get(key, 0), broker_net.get(key, 0)
         if ours == theirs:
             continue
         if ours == 0:
@@ -177,7 +195,7 @@ def reconcile(
             kind, detail = DiscrepancyKind.LEDGER_POSITION_MISSING_AT_BROKER, f"ledger holds {ours}"
         else:
             kind, detail = DiscrepancyKind.QUANTITY_MISMATCH, f"ledger {ours}, broker {theirs}"
-        out.append(Discrepancy(kind=kind, symbol=symbol, detail=detail))
+        out.append(Discrepancy(kind=kind, symbol=symbols[key], contract_key=key, detail=detail))
 
     # 2. Every open idea with a stop level needs a working stop covering exactly its quantity less
     #    what is committed to exits that may be live (review R1).
@@ -195,6 +213,7 @@ def reconcile(
                 Discrepancy(
                     kind=DiscrepancyKind.POSITION_WITHOUT_PROTECTIVE_STOP,
                     symbol=p.symbol,
+                    contract_key=p.contract_key,
                     idea_id=p.idea_id,
                     order_ref=p.stop_ref,
                     detail=f"ledger {p.quantity}, fully committed to working exits; no stop",
@@ -209,6 +228,7 @@ def reconcile(
                     Discrepancy(
                         kind=kind,
                         symbol=p.symbol,
+                        contract_key=p.contract_key,
                         idea_id=p.idea_id,
                         order_ref=p.stop_ref,
                         detail=problem,
@@ -232,6 +252,7 @@ def reconcile(
                 Discrepancy(
                     kind=DiscrepancyKind.POSITION_WITHOUT_PROTECTIVE_STOP,
                     symbol=p.symbol,
+                    contract_key=p.contract_key,
                     idea_id=p.idea_id,
                     order_ref=p.stop_ref,
                     detail=f"ledger {p.quantity}, working stop covers {covered}",
@@ -248,6 +269,7 @@ def reconcile(
                 Discrepancy(
                     kind=DiscrepancyKind.ORPHAN_WORKING_ORDER,
                     symbol=o.contract.symbol,
+                    contract_key=o.contract.contract_key,
                     order_ref=o.order_ref,
                     detail="working order not placed by this ledger",
                 )
@@ -261,6 +283,7 @@ def reconcile(
                     Discrepancy(
                         kind=DiscrepancyKind.ORPHAN_WORKING_ORDER,
                         symbol=o.contract.symbol,
+                        contract_key=o.contract.contract_key,
                         idea_id=row.idea_id,
                         order_ref=o.order_ref,
                         detail="protective order working while the follower idea is flat",
@@ -271,6 +294,7 @@ def reconcile(
                     Discrepancy(
                         kind=DiscrepancyKind.ORPHAN_WORKING_ORDER,
                         symbol=o.contract.symbol,
+                        contract_key=o.contract.contract_key,
                         idea_id=row.idea_id,
                         order_ref=o.order_ref,
                         detail=(
@@ -291,6 +315,7 @@ def reconcile(
                     Discrepancy(
                         kind=DiscrepancyKind.WORKING_ENTRY_ON_CLOSED_IDEA,
                         symbol=o.contract.symbol,
+                        contract_key=o.contract.contract_key,
                         idea_id=row.idea_id,
                         order_ref=o.order_ref,
                         detail=f"entry/add working while the idea is {pos.status}"
@@ -303,6 +328,7 @@ def reconcile(
                 Discrepancy(
                     kind=DiscrepancyKind.ORPHAN_WORKING_ORDER,
                     symbol=o.contract.symbol,
+                    contract_key=o.contract.contract_key,
                     idea_id=row.idea_id,
                     order_ref=o.order_ref,
                     detail=f"working although its intent is {intent.state.value}",

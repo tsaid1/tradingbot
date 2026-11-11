@@ -16,7 +16,7 @@ from collections.abc import Sequence
 from datetime import datetime
 from decimal import Decimal
 from enum import Enum
-from typing import Protocol, runtime_checkable
+from typing import Literal, Protocol, runtime_checkable
 
 from pydantic import ConfigDict, Field, model_validator
 
@@ -84,7 +84,14 @@ TERMINAL_STATUSES = frozenset(
 
 
 class ContractRef(StrictModel):
-    """A broker-resolved, orderable contract. ``con_id`` is IBKR's contract id when known."""
+    """A broker-resolved, orderable contract. ``con_id`` is IBKR's contract id when known.
+
+    The execution core identifies an instrument by ``contract_key`` (never by symbol alone): two
+    months of one future, or a stock and a future sharing a symbol, are different instruments.
+    The fields after ``con_id`` are optional with defaults that describe a stock, so a stock's
+    behaviour is unchanged: notional = quantity x price x ``multiplier``; limit and stop prices
+    must be multiples of ``min_tick`` and quantities multiples of ``size_increment``.
+    """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
     symbol: str = Field(min_length=1, max_length=40)
@@ -94,6 +101,28 @@ class ContractRef(StrictModel):
     currency: str = "USD"
     primary_exchange: str | None = None
     con_id: int | None = None
+    # Derivatives: expiry or contract month (IBKR lastTradeDateOrContractMonth, YYYYMM[DD]),
+    # strike and right (options). None for a stock or ETF.
+    expiry: str | None = Field(default=None, pattern=r"^\d{6}(\d{2})?$")
+    strike: Decimal | None = Field(default=None, gt=0)
+    right: Literal["C", "P"] | None = None
+    local_symbol: str | None = None
+    multiplier: Decimal = Field(default=Decimal(1), gt=0)
+    min_tick: Decimal = Field(default=Decimal("0.01"), gt=0)
+    size_increment: int = Field(default=1, ge=1)
+
+    @property
+    def contract_key(self) -> str:
+        """Instrument identity: security type, symbol, expiry, strike, right and contract id."""
+        strike = format(self.strike.normalize(), "f") if self.strike is not None else "-"
+        parts = (self.sec_type, self.symbol, self.expiry or "-", strike, self.right or "-")
+        return ":".join((*parts, str(self.con_id) if self.con_id is not None else "-"))
+
+    def on_tick(self, price: Decimal) -> bool:
+        return price > 0 and price % self.min_tick == 0
+
+    def on_increment(self, quantity: int) -> bool:
+        return quantity > 0 and quantity % self.size_increment == 0
 
 
 class BrokerQuote(StrictModel):
@@ -176,7 +205,9 @@ class Fill(StrictModel):
 
 
 class BrokerPosition(StrictModel):
-    """Net position per contract; quantity is signed (short < 0)."""
+    """Net position per contract; quantity is signed (short < 0). ``avg_cost`` is the average price
+    per unit of quantity, before the contract multiplier (IBKR reports avgCost multiplied for
+    derivatives: the adapter divides it by the multiplier)."""
 
     account: str
     contract: ContractRef

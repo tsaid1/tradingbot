@@ -138,9 +138,15 @@ st.caption(f"Broker snapshot taken {view['snapshot_at'] or 'never'}.")
 if view["positions"]:
     st.markdown(
         table(
-            ["Symbol", "Follower", "Broker", "Match"],
+            ["Contract", "Multiplier", "Follower", "Broker", "Match"],
             [
-                [p["symbol"], p["follower"], p["broker"], "yes" if p["match"] else "**NO**"]
+                [
+                    p["contract"],
+                    p["multiplier"],
+                    p["follower"],
+                    p["broker"],
+                    "yes" if p["match"] else "**NO**",
+                ]
                 for p in view["positions"]
             ],
         )
@@ -150,11 +156,12 @@ else:
 if view["protection"]:
     st.markdown(
         table(
-            ["Idea", "Symbol", "Side", "Qty", "Avg", "Stop", "Stop covers", "Protection"],
+            ["Idea", "Contract", "Mult", "Side", "Qty", "Avg", "Stop", "Stop covers", "Protection"],
             [
                 [
                     p["idea_id"],
-                    p["symbol"],
+                    p["contract"],
+                    p["multiplier"],
                     p["side"],
                     p["quantity"],
                     p["avg_price"],
@@ -175,7 +182,7 @@ if view["working_orders"]:
                 "Ref",
                 "Role",
                 "Idea",
-                "Symbol",
+                "Contract",
                 "Side",
                 "Type",
                 "Qty",
@@ -189,7 +196,7 @@ if view["working_orders"]:
                     o["order_ref"],
                     o["role"],
                     o["idea_id"],
-                    o["symbol"],
+                    o["contract"],
                     o["side"],
                     o["order_type"],
                     o["quantity"],

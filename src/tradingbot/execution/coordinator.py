@@ -70,7 +70,6 @@ from tradingbot.models import (
 )
 from tradingbot.validator import fill_quantity, source_is_fresh
 
-CENT = Decimal("0.01")
 UNPROTECTED_POSITION = "UNPROTECTED_POSITION"
 # The broker could not be read after a fill: protection is unknown, never assumed (review M1).
 PROTECTION_UNVERIFIED = "PROTECTION_UNVERIFIED"
@@ -218,6 +217,29 @@ def _dec(value: str | None) -> Decimal | None:
     return d if d.is_finite() and d > 0 else None
 
 
+def snap_to_tick(price: Decimal, tick: Decimal, rounding: str) -> Decimal:
+    """``price`` moved to a multiple of ``tick``: ROUND_FLOOR (down) or ROUND_CEILING (up). Used
+    only for collar-bounded limits, always in the direction that keeps the limit inside the
+    collar (a buy limit down, a sell limit up). Stop and target prices are never snapped: an
+    off-tick one is refused, so a protective stop can never be loosened by rounding."""
+    return (price / tick).to_integral_value(rounding) * tick
+
+
+def _contract_from(raw: str | None) -> ContractRef | None:
+    return ContractRef.model_validate_json(raw) if raw else None
+
+
+def _rule_problems(contract: ContractRef, quantity: int | None, **prices) -> list[str]:
+    """The contract's tick and size rules, as typed refusal reasons (never silently rounded)."""
+    out = []
+    if quantity is not None and not contract.on_increment(quantity):
+        out.append("QUANTITY_OFF_INCREMENT")
+    for name, price in prices.items():
+        if price is not None and not contract.on_tick(price):
+            out.append(f"{name.upper()}_PRICE_OFF_TICK")
+    return out
+
+
 def _intent_state(status: OrderStatus, filled: int, quantity: int) -> IntentState:
     if status == OrderStatus.FILLED or (filled >= quantity > 0):
         return IntentState.FILLED
@@ -300,25 +322,48 @@ class ExecutionCoordinator:
         self, instrument: Instrument, side: PositionSide, staged=()
     ) -> str | None:
         """The id of an open (or pending) idea on the other side of ``side`` in the same contract,
-        from the follower ledger and from ``staged`` replay ideas; None when there is none."""
-        ideas = [
-            (p.idea_id, p.symbol, p.asset_class, p.position_side)
-            for p in self.store.positions()
-            if p.quantity > 0 or p.status == "PENDING"
-        ]
-        ideas += [
-            (i.idea_id, i.symbol, i.asset_class, i.position_side)
-            for i in staged
-            if i.quantity > 0 and i.status not in ("CLOSED", "REVERSED", "NOT_FILLED")
-        ]
-        for idea_id, symbol, asset_class, idea_side in ideas:
+        from the follower ledger (by contract key) and from ``staged`` replay ideas that are not
+        yet in the ledger (by symbol and asset class: conservative); None when there is none."""
+        contract, _ = self._resolve_contract(instrument)
+        key = contract.contract_key if contract is not None else None
+        ledger = self.store.positions()
+        for p in ledger:
+            if p.position_side == side or not (p.quantity > 0 or p.status == "PENDING"):
+                continue
+            if key is not None and p.contract_key is not None:
+                if p.contract_key == key:
+                    return p.idea_id
+            elif p.symbol == instrument.symbol and p.asset_class == instrument.asset_class:
+                return p.idea_id
+        known = {p.idea_id for p in ledger}
+        for i in staged:
             if (
-                symbol == instrument.symbol
-                and asset_class == instrument.asset_class
-                and idea_side != side
+                i.idea_id not in known
+                and i.position_side != side
+                and i.quantity > 0
+                and i.status not in ("CLOSED", "REVERSED", "NOT_FILLED")
+                and i.symbol == instrument.symbol
+                and i.asset_class == instrument.asset_class
             ):
-                return idea_id
+                return i.idea_id
         return None
+
+    def _contract_for(self, intent: Intent) -> tuple[ContractRef | None, str | None]:
+        """The intent's recorded contract; an intent recorded before round 2 is resolved again."""
+        contract = _contract_from(intent.contract)
+        if contract is not None:
+            return contract, None
+        pos = self.store.position(intent.idea_id)
+        if pos is None:
+            return None, "IDEA_UNKNOWN"
+        return self._resolve_contract(Instrument(asset_class=pos.asset_class, symbol=intent.symbol))
+
+    def _key_of(self, symbol: str, asset_class, contract_key: str | None) -> str:
+        """A row's contract key; rows written before round 2 are resolved by symbol once."""
+        if contract_key:
+            return contract_key
+        contract, _ = self._resolve_contract(Instrument(asset_class=asset_class, symbol=symbol))
+        return contract.contract_key if contract is not None else f"SYMBOL:{symbol}"
 
     def intent_for(self, source: ReplaySource, action: TradeAction) -> Intent | None:
         return self.store.intent(order_ref_for(source.source_id, source.revision, action.action_id))
@@ -569,6 +614,11 @@ class ExecutionCoordinator:
         long = action.position_side == PositionSide.LONG
         side = OrderSide.BUY if long else OrderSide.SELL
         qty = fill_quantity(Action.OPEN, self.policy, None)
+        rules = _rule_problems(
+            contract, qty, stop=_dec(action.stop_price), target=_dec(action.target_price)
+        )
+        if rules:
+            return self._refuse(source, action, gate, ref, account, rules, now)
         limit, reasons = self._entry_checks(
             contract, side, qty, action.entry_reference, idea_id, now
         )
@@ -622,6 +672,7 @@ class ExecutionCoordinator:
             account,
             idea_id,
             now,
+            contract=contract,
             side=side.value,
             quantity=qty,
             order_type="LMT",
@@ -631,6 +682,8 @@ class ExecutionCoordinator:
             idea_id=idea_id,
             symbol=contract.symbol,
             asset_class=contract.asset_class,
+            contract_key=contract.contract_key,
+            contract=contract.model_dump_json(),
             position_side=action.position_side,
             quantity=0,
             stop_price=str(stop) if stop is not None else None,
@@ -657,6 +710,9 @@ class ExecutionCoordinator:
         long = pos.position_side == PositionSide.LONG
         side = OrderSide.BUY if long else OrderSide.SELL
         qty = fill_quantity(Action.ADD, self.policy, self._as_position(pos))
+        rules = _rule_problems(contract, qty)
+        if rules:
+            return self._refuse(source, action, gate, ref, account, rules, now, idea_id=pos.idea_id)
         limit, reasons = self._entry_checks(
             contract, side, qty, action.entry_reference, pos.idea_id, now
         )
@@ -680,6 +736,7 @@ class ExecutionCoordinator:
             account,
             pos.idea_id,
             now,
+            contract=contract,
             side=side.value,
             quantity=qty,
             order_type="LMT",
@@ -713,9 +770,13 @@ class ExecutionCoordinator:
             return self._refuse(
                 source, action, gate, ref, account, ["EXIT_EXCEEDS_FOLLOWER_POSITION"], now
             )
+        rules = _rule_problems(contract, qty)
+        if rules:
+            return self._refuse(source, action, gate, ref, account, rules, now, idea_id=pos.idea_id)
+        key = contract.contract_key
         try:
             held = sum(
-                p.quantity for p in self.broker.positions() if p.contract.symbol == contract.symbol
+                p.quantity for p in self.broker.positions() if p.contract.contract_key == key
             )
         except BrokerError as exc:
             self._broker_unreadable("positions", exc)
@@ -763,6 +824,7 @@ class ExecutionCoordinator:
             account,
             pos.idea_id,
             now,
+            contract=contract,
             side=side.value,
             quantity=qty,
             order_type="LMT",
@@ -786,6 +848,15 @@ class ExecutionCoordinator:
             return self._refuse(
                 source, action, gate, ref, account, ["NO_TARGET_ORDER_TO_AMEND"], now
             )
+        contract = _contract_from(pos.contract)
+        if contract is not None:
+            rules = _rule_problems(
+                contract, None, stop=_dec(action.stop_price), target=_dec(action.target_price)
+            )
+            if rules:
+                return self._refuse(
+                    source, action, gate, ref, account, rules, now, idea_id=pos.idea_id
+                )
         intent = self._new_intent(
             source,
             action,
@@ -794,6 +865,7 @@ class ExecutionCoordinator:
             account,
             pos.idea_id,
             now,
+            contract=contract,
             quantity=0,
             stop_price=action.stop_price,
             target_price=action.target_price,
@@ -926,13 +998,15 @@ class ExecutionCoordinator:
         """Broker truth: every working order on the exit side of this instrument (one-cancels-other
         siblings once, at the larger remaining), plus exits of unknown outcome, plus this exit,
         within the broker position. Never relies on a broker-side reduce-only clamp."""
+        key = self._key_of(intent.symbol, self.store.position(intent.idea_id).asset_class,
+                           intent.contract_key)
         try:
             held = sum(
-                p.quantity for p in self.broker.positions() if p.contract.symbol == intent.symbol
+                p.quantity for p in self.broker.positions() if p.contract.contract_key == key
             )
             working = [
                 o for o in self.broker.open_orders()
-                if o.contract.symbol == intent.symbol and o.side.value == intent.side
+                if o.contract.contract_key == key and o.side.value == intent.side
             ]
         except BrokerError:
             return ["BROKER_POSITIONS_UNAVAILABLE"]
@@ -946,7 +1020,7 @@ class ExecutionCoordinator:
             max(i.quantity - self.store.filled_quantity(i.order_ref), 0)
             for i in self.store.intents(UNRESOLVED_STATES)
             if i.action in (Action.REDUCE, Action.CLOSE)
-            and i.symbol == intent.symbol
+            and (i.contract_key or i.symbol) == (intent.contract_key or intent.symbol)
             and i.order_ref not in visible
             and i.order_ref != intent.order_ref
         )
@@ -1224,9 +1298,7 @@ class ExecutionCoordinator:
         pos = self.store.position(intent.idea_id)
         if pos is None or intent.side is None:
             return ["IDEA_UNKNOWN"]
-        contract, problem = self._resolve_contract(
-            Instrument(asset_class=pos.asset_class, symbol=intent.symbol)
-        )
+        contract, problem = self._contract_for(intent)
         if problem:
             return [problem]
         limit, reasons = self._entry_checks(
@@ -1245,7 +1317,7 @@ class ExecutionCoordinator:
         EXIT_WITHOUT_QUOTE exception; it is never sent at its old limit. True when re-priced."""
         pos = self.store.position(intent.idea_id)
         contract, problem = (None, "IDEA_UNKNOWN") if pos is None or intent.side is None else (
-            self._resolve_contract(Instrument(asset_class=pos.asset_class, symbol=intent.symbol))
+            self._contract_for(intent)
         )
         limit = None
         if problem is None:
@@ -1445,10 +1517,11 @@ class ExecutionCoordinator:
     ) -> tuple[OrderIntent, list[OrderIntent]]:
         """Recreate exactly the orders recorded write-ahead (same refs, same prices, same sizes)."""
         assert intent.side is not None
-        inst = Instrument(
-            asset_class=self.store.position(intent.idea_id).asset_class, symbol=intent.symbol
+        contract = _contract_from(intent.contract) or self.broker.resolve(
+            Instrument(
+                asset_class=self.store.position(intent.idea_id).asset_class, symbol=intent.symbol
+            )
         )
-        contract = self.broker.resolve(inst)
         built = []
         for r in rows:
             built.append(
@@ -1777,12 +1850,13 @@ class ExecutionCoordinator:
     ) -> tuple[Decimal | None, list[str]]:
         """Broker-quote sanity, the price collar and exposure caps, before any entry or add.
         Returns the collar-bounded limit price, or the reasons to refuse."""
-        blocked = self._instrument_block(contract.symbol)
+        key = contract.contract_key
+        blocked = self._instrument_block(contract)
         if blocked:
             return None, [f"INSTRUMENT_BLOCKED_{blocked}"]
         if any(
             i.action in (Action.OPEN, Action.ADD)
-            and i.symbol == contract.symbol
+            and ((i.contract_key == key) if i.contract_key else (i.symbol == contract.symbol))
             and i.order_ref != exclude_ref
             for i in self.store.intents(UNRESOLVED_STATES)
         ):
@@ -1799,15 +1873,22 @@ class ExecutionCoordinator:
         band = self.policy.max_price_deviation_pct / Decimal(100)
         if abs(price - ref) / ref > band:
             return None, ["BROKER_QUOTE_OUTSIDE_COLLAR"]
+        # Snapped to the contract's tick inside the collar: a buy limit down, a sell limit up.
         limit = (
-            (ref * (1 + band)).quantize(CENT, ROUND_FLOOR)
+            snap_to_tick(ref * (1 + band), contract.min_tick, ROUND_FLOOR)
             if buy
-            else (ref * (1 - band)).quantize(CENT, ROUND_CEILING)
+            else snap_to_tick(ref * (1 - band), contract.min_tick, ROUND_CEILING)
         )
+        mult = contract.multiplier
+        pos = self.store.position(idea_id)
+        idea_notional = price * ((pos.quantity if pos else 0) + qty) * mult
+        if idea_notional > self.policy.max_notional_usd:
+            # The gateway's per-idea notional, with the contract multiplier it cannot see.
+            return None, [f"NOTIONAL_LIMIT:{idea_notional}>{self.policy.max_notional_usd}"]
         per_cap = self.policy.max_instrument_exposure_usd or self.policy.max_notional_usd
-        new = limit * qty
+        new = limit * qty * mult
         try:
-            symbol_exposure, total_exposure = self._exposure(contract.symbol, exclude_ref, now)
+            symbol_exposure, total_exposure = self._exposure(contract, exclude_ref, now)
         except BrokerError as exc:
             self._broker_unreadable("positions", exc)
             return None, ["BROKER_POSITIONS_UNAVAILABLE"]
@@ -1861,14 +1942,20 @@ class ExecutionCoordinator:
         if problem:
             return None, problem
         band = self.policy.max_price_deviation_pct / Decimal(100)
-        if side == OrderSide.SELL:
-            return (q.bid * (1 - band)).quantize(CENT, ROUND_CEILING), None
-        return (q.ask * (1 + band)).quantize(CENT, ROUND_FLOOR), None
+        tick = contract.min_tick
+        if side == OrderSide.SELL:  # snapped up / down: always inside the collar
+            return snap_to_tick(q.bid * (1 - band), tick, ROUND_CEILING), None
+        return snap_to_tick(q.ask * (1 + band), tick, ROUND_FLOOR), None
 
-    def _instrument_block(self, symbol: str) -> str | None:
+    def _instrument_block(self, contract: ContractRef) -> str | None:
         """The first open exception, of a kind in ``INSTRUMENT_BLOCKING_KINDS``, on any idea in this
-        instrument: while it is open no new exposure is taken in that instrument (review R2, F2)."""
-        in_instrument = {p.idea_id for p in self.store.positions() if p.symbol == symbol}
+        contract: while it is open no new exposure is taken in that instrument (review R2, F2)."""
+        key = contract.contract_key
+        in_instrument = {
+            p.idea_id
+            for p in self.store.positions()
+            if self._key_of(p.symbol, p.asset_class, p.contract_key) == key
+        }
         open_ = [
             e for e in self.store.exceptions(open_only=True) if e.idea_id in in_instrument
         ]
@@ -1878,38 +1965,44 @@ class ExecutionCoordinator:
         return None
 
     def _exposure(
-        self, symbol: str, exclude_ref: str | None = None, now: datetime | None = None
+        self, contract: ContractRef, exclude_ref: str | None = None, now: datetime | None = None
     ) -> tuple[Decimal, Decimal]:
-        """Gross exposure per instrument: the larger of the follower ledger's and the broker's
-        position (a broker-only position counts), valued at the current quote when a usable one is
-        available and at cost otherwise (review S3); plus every non-terminal entry or add at its
-        limit (``exclude_ref``: the intent being checked for its own resend). Raises BrokerError
-        when the broker positions cannot be read."""
+        """Gross exposure per contract (keyed by ``contract_key``, never by symbol): the larger of
+        the follower ledger's and the broker's position (a broker-only position counts), valued
+        at quantity x the current quote x the contract multiplier when a usable quote is available
+        and at cost otherwise (review S3); plus every non-terminal entry or add at its limit
+        (``exclude_ref``: the intent being checked for its own resend). Returns the exposure in
+        ``contract`` and the total. Raises BrokerError when the broker positions cannot be read."""
         now = now or self.clock()
         held: dict[str, int] = {}
         cost: dict[str, Decimal] = {}
         contracts: dict[str, ContractRef | Instrument] = {}
+        mult: dict[str, Decimal] = {}
         for p in self.store.positions():
             if p.quantity > 0:
-                held[p.symbol] = held.get(p.symbol, 0) + p.quantity
+                key = self._key_of(p.symbol, p.asset_class, p.contract_key)
+                held[key] = held.get(key, 0) + p.quantity
                 if p.avg_price:
-                    cost[p.symbol] = max(cost.get(p.symbol, Decimal(0)), Decimal(p.avg_price))
+                    cost[key] = max(cost.get(key, Decimal(0)), Decimal(p.avg_price))
+                stored = _contract_from(p.contract)
                 contracts.setdefault(
-                    p.symbol, Instrument(asset_class=p.asset_class, symbol=p.symbol)
+                    key, stored or Instrument(asset_class=p.asset_class, symbol=p.symbol)
                 )
+                mult.setdefault(key, stored.multiplier if stored else Decimal(1))
         broker_held: dict[str, int] = {}
         for bp in self.broker.positions():
-            sym = bp.contract.symbol
-            broker_held[sym] = broker_held.get(sym, 0) + bp.quantity
+            key = bp.contract.contract_key
+            broker_held[key] = broker_held.get(key, 0) + bp.quantity
             if bp.avg_cost:
-                cost[sym] = max(cost.get(sym, Decimal(0)), bp.avg_cost)
-            contracts[sym] = bp.contract
+                cost[key] = max(cost.get(key, Decimal(0)), bp.avg_cost)
+            contracts[key] = bp.contract
+            mult[key] = bp.contract.multiplier
         per: dict[str, Decimal] = {}
-        for sym in set(held) | set(broker_held):
-            qty = max(held.get(sym, 0), abs(broker_held.get(sym, 0)))
+        for key in set(held) | set(broker_held):
+            qty = max(held.get(key, 0), abs(broker_held.get(key, 0)))
             if qty == 0:
                 continue
-            per[sym] = self._mark(contracts[sym], cost.get(sym), now) * qty
+            per[key] = self._mark(contracts[key], cost.get(key), now) * qty * mult[key]
         # Every entry or add that is not terminal may be live at the broker, whatever our view of
         # its order rows (recorded, ack lost, held PreSubmitted): its full intended quantity counts,
         # less what has already been applied to the ledger (counted above). Review M2.
@@ -1921,8 +2014,13 @@ class ExecutionCoordinator:
                 continue
             left = intent.quantity - self.store.filled_quantity(intent.order_ref)
             if left > 0:
-                per[intent.symbol] = per.get(intent.symbol, Decimal(0)) + price * left
-        return per.get(symbol, Decimal(0)), sum(per.values(), Decimal(0))
+                stored = _contract_from(intent.contract)
+                key = stored.contract_key if stored else self._key_of(
+                    intent.symbol, self.store.position(intent.idea_id).asset_class, None
+                )
+                m = stored.multiplier if stored else Decimal(1)
+                per[key] = per.get(key, Decimal(0)) + price * left * m
+        return per.get(contract.contract_key, Decimal(0)), sum(per.values(), Decimal(0))
 
     def _resolve_contract(self, instrument: Instrument) -> tuple[ContractRef | None, str | None]:
         try:
@@ -1946,8 +2044,12 @@ class ExecutionCoordinator:
             target_price=pos.target_price,
         )
 
-    def _new_intent(self, source, action, gate, ref, account, idea_id, now, **fields) -> Intent:
+    def _new_intent(
+        self, source, action, gate, ref, account, idea_id, now, *, contract=None, **fields
+    ) -> Intent:
         assert action.instrument is not None
+        if contract is not None:
+            fields.update(contract_key=contract.contract_key, contract=contract.model_dump_json())
         return Intent(
             order_ref=ref,
             source_id=source.source_id,
@@ -1997,6 +2099,7 @@ class ExecutionCoordinator:
                         role=r,
                         parent_ref=o.parent_ref,
                         symbol=o.contract.symbol,
+                        contract_key=o.contract.contract_key,
                         side=o.side.value,
                         quantity=o.quantity,
                         order_type=o.order_type.value,
@@ -2013,6 +2116,7 @@ class ExecutionCoordinator:
                 idea_id=intent.idea_id,
                 c=c,
                 action=intent.action.value,
+                contract=intent.contract_key,
                 side=intent.side,
                 quantity=intent.quantity,
                 limit=intent.limit_price,

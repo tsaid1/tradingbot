@@ -11,8 +11,10 @@ import json
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime
+from decimal import Decimal
 from pathlib import Path
 
+from tradingbot.execution.broker import ContractRef
 from tradingbot.runtime.config import RuntimeConfig
 
 STAGES = (
@@ -61,6 +63,31 @@ def _ms(a: datetime | None, b: datetime | None) -> float | None:
     if a is None or b is None:
         return None
     return round((b - a).total_seconds() * 1000, 1)
+
+
+def _num(value) -> str:
+    return format(Decimal(str(value)).normalize(), "f")
+
+
+def contract_label(contract: dict | None) -> str:
+    """A contract's identity and multiplier for display: symbol, security type, expiry or month,
+    strike and right, the multiplier and the broker contract id."""
+    if not contract:
+        return "-"
+    parts = [contract.get("symbol", "?"), contract.get("sec_type") or "STK"]
+    if contract.get("expiry"):
+        parts.append(contract["expiry"])
+    if contract.get("strike") is not None:
+        parts.append(_num(contract["strike"]) + (contract.get("right") or ""))
+    parts.append(f"x{_num(contract.get('multiplier') or 1)}")
+    con_id = contract.get("con_id")
+    return " ".join(parts) + (f" ({con_id})" if con_id is not None else "")
+
+
+def _key(contract: dict | None, symbol: str) -> str:
+    if not contract:
+        return f"SYMBOL:{symbol}"
+    return ContractRef.model_validate(contract).contract_key
 
 
 def load(config: RuntimeConfig) -> dict:
@@ -205,22 +232,32 @@ def load(config: RuntimeConfig) -> dict:
                 }
             )
 
-    broker_positions = {
-        p["contract"]["symbol"]: p["quantity"] for p in snapshot.get("positions", [])
-    }
+    # Per contract, never per symbol (two months of one future are two rows).
+    contracts: dict[str, dict] = {}
+    broker_positions: dict[str, int] = {}
+    for p in snapshot.get("positions", []):
+        key = _key(p["contract"], p["contract"]["symbol"])
+        contracts[key] = p["contract"]
+        broker_positions[key] = broker_positions.get(key, 0) + p["quantity"]
     follower_net: dict[str, int] = {}
     for p in ledger:
+        p["contract_dict"] = json.loads(p["contract"]) if p.get("contract") else None
         if p["quantity"] > 0:
+            key = p.get("contract_key") or _key(p["contract_dict"], p["symbol"])
+            contracts.setdefault(key, p["contract_dict"] or {"symbol": p["symbol"]})
             sign = 1 if p["position_side"] == "LONG" else -1
-            follower_net[p["symbol"]] = follower_net.get(p["symbol"], 0) + sign * p["quantity"]
+            follower_net[key] = follower_net.get(key, 0) + sign * p["quantity"]
     positions = [
         {
-            "symbol": sym,
-            "follower": follower_net.get(sym, 0),
-            "broker": broker_positions.get(sym, 0),
-            "match": follower_net.get(sym, 0) == broker_positions.get(sym, 0),
+            "symbol": contracts[key].get("symbol"),
+            "contract": contract_label(contracts[key]),
+            "contract_key": key,
+            "multiplier": _num(contracts[key].get("multiplier") or 1),
+            "follower": follower_net.get(key, 0),
+            "broker": broker_positions.get(key, 0),
+            "match": follower_net.get(key, 0) == broker_positions.get(key, 0),
         }
-        for sym in sorted(set(follower_net) | set(broker_positions))
+        for key in sorted(set(follower_net) | set(broker_positions))
     ]
     role_by_ref = {o["order_ref"]: o for o in orders}
     working_orders = [
@@ -229,6 +266,7 @@ def load(config: RuntimeConfig) -> dict:
             "role": (role_by_ref.get(o["order_ref"]) or {}).get("role", "UNKNOWN_TO_LEDGER"),
             "idea_id": (role_by_ref.get(o["order_ref"]) or {}).get("idea_id"),
             "symbol": o["contract"]["symbol"],
+            "contract": contract_label(o["contract"]),
             "side": o["side"],
             "order_type": o["order_type"],
             "quantity": o["quantity"],
@@ -262,6 +300,8 @@ def load(config: RuntimeConfig) -> dict:
             {
                 "idea_id": p["idea_id"],
                 "symbol": p["symbol"],
+                "contract": contract_label(p["contract_dict"] or {"symbol": p["symbol"]}),
+                "multiplier": _num((p["contract_dict"] or {}).get("multiplier") or 1),
                 "side": p["position_side"],
                 "quantity": p["quantity"],
                 "avg_price": p["avg_price"],

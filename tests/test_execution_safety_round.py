@@ -121,7 +121,7 @@ def test_m2_a_recorded_entry_counts_and_does_not_count_against_its_own_resend(tm
     h = _capped(tmp_path)
     ref = h.record_never_sent("p1", open_action())  # round 2 (F5): the only late-sent entry case
     assert h.coord.intent(ref).state == IntentState.RECORDED
-    _, total = h.coord._exposure("ZZQ")
+    _, total = h.coord._exposure(h.broker.resolve(open_action().instrument))
     assert total == Decimal("50.50") * 4  # the full intended quantity at its limit
     h.coord.recover()  # no trace: the resend is not refused by its own exposure
     assert h.coord.intent(ref).state == IntentState.FILLED

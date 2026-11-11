@@ -105,6 +105,20 @@ CREATE TABLE IF NOT EXISTS sim_positions (
     quantity INTEGER NOT NULL,
     avg_cost TEXT
 );
+CREATE TABLE IF NOT EXISTS sim_contract_positions (
+    contract_key TEXT PRIMARY KEY,
+    symbol TEXT NOT NULL,
+    contract_json TEXT NOT NULL,
+    quantity INTEGER NOT NULL,
+    avg_cost TEXT
+);
+CREATE TABLE IF NOT EXISTS sim_contracts (
+    contract_key TEXT PRIMARY KEY,
+    symbol TEXT NOT NULL,
+    asset_class TEXT NOT NULL,
+    month TEXT,
+    contract_json TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS sim_quotes (
     symbol TEXT PRIMARY KEY,
     bid TEXT, ask TEXT, last TEXT,
@@ -215,9 +229,21 @@ class SimBroker:
                 ("pending_at", "TEXT"),
                 ("pending_race", "TEXT"),
                 ("activated", "INTEGER NOT NULL DEFAULT 0"),
+                ("contract_json", "TEXT"),
             ):
                 if col not in cols:
                     c.execute(f"ALTER TABLE sim_orders ADD COLUMN {col} {kind}")
+            # A store written before positions were keyed by contract: move its rows once.
+            for r in c.execute("SELECT * FROM sim_positions").fetchall():
+                contract = self.resolve(
+                    Instrument(asset_class=AssetClass(r["asset_class"]), symbol=r["symbol"])
+                )
+                c.execute(
+                    "INSERT OR IGNORE INTO sim_contract_positions VALUES (?,?,?,?,?)",
+                    (contract.contract_key, r["symbol"], contract.model_dump_json(),
+                     r["quantity"], r["avg_cost"]),
+                )
+            c.execute("DELETE FROM sim_positions")
 
     # ------------------------------------------------------------------ plumbing
 
@@ -240,9 +266,41 @@ class SimBroker:
 
     @staticmethod
     def _contract(row: sqlite3.Row) -> ContractRef:
+        if "contract_json" in row.keys() and row["contract_json"]:  # noqa: SIM118 (sqlite3.Row)
+            return ContractRef.model_validate_json(row["contract_json"])
         return ContractRef(
             symbol=row["symbol"], asset_class=AssetClass(row["asset_class"]), con_id=row["con_id"]
         )
+
+    def _quote_for(self, c: sqlite3.Connection, contract: ContractRef):
+        """A quote published for this exact contract, else (stocks and ETFs only) by symbol."""
+        row = self._quote_row(c, contract.contract_key)
+        if row is None and contract.sec_type == "STK":
+            row = self._quote_row(c, contract.symbol)
+        return row
+
+    @staticmethod
+    def _check_rules(item: OrderIntent | None, contract: ContractRef, quantity=None, *prices):
+        """The contract's tick and size rules: a non-conforming order is refused, never rounded."""
+        qty = item.quantity if item is not None else quantity
+        if qty is not None and not contract.on_increment(qty):
+            raise BrokerError(
+                f"quantity {qty} is not a multiple of the size increment {contract.size_increment}"
+            )
+        if item is not None:
+            prices = (item.limit_price, item.stop_price)
+        for price in prices:
+            if price is not None and not contract.on_tick(price):
+                raise BrokerError(f"price {price} is not on the minimum tick {contract.min_tick}")
+
+    def register_contract(self, contract: ContractRef) -> None:
+        """Test control: make a derivative contract resolvable (by symbol and contract month)."""
+        with self._tx() as c:
+            c.execute(
+                "INSERT OR REPLACE INTO sim_contracts VALUES (?,?,?,?,?)",
+                (contract.contract_key, contract.symbol, contract.asset_class.value,
+                 contract.expiry, contract.model_dump_json()),
+            )
 
     def _order(self, row: sqlite3.Row) -> BrokerOrder:
         return BrokerOrder(
@@ -294,9 +352,12 @@ class SimBroker:
         last: str | Decimal | None = None,
         quality: QuoteQuality = QuoteQuality.LIVE,
         received_at: datetime | None = None,
+        contract: ContractRef | None = None,
     ) -> None:
-        """Publish a quote and run every working order against it (stops, targets, limits)."""
+        """Publish a quote and run every working order against it (stops, targets, limits). With
+        ``contract`` the quote is for that exact contract; otherwise for the stock ``symbol``."""
         at = received_at or self._now()
+        symbol = contract.contract_key if contract is not None else symbol
         with self._tx() as c:
             self._settle(c)
             c.execute(
@@ -322,7 +383,7 @@ class SimBroker:
             row = self._working_row(c, order_ref)
             qty = quantity or (row["quantity"] - row["filled_quantity"])
             if price is None:
-                q = self._quote_row(c, row["symbol"])
+                q = self._quote_for(c, self._contract(row))
                 price = Decimal(q["ask"] if row["side"] == "BUY" else q["bid"])
             self._execute(c, row["broker_order_id"], qty, Decimal(price))
             self._match(c)
@@ -360,9 +421,25 @@ class SimBroker:
 
     def resolve(self, instrument: Instrument) -> ContractRef:
         if instrument.asset_class not in (AssetClass.EQUITY, AssetClass.ETF):
-            raise BrokerError(
-                f"SimBroker trades stocks and ETFs only, not {instrument.asset_class}"
+            month = instrument.futures_contract or (
+                instrument.expiry.replace("-", "") if instrument.expiry else None
             )
+            with self._tx() as c:
+                rows = c.execute(
+                    "SELECT * FROM sim_contracts WHERE symbol=? AND asset_class=?",
+                    (instrument.symbol, instrument.asset_class.value),
+                ).fetchall()
+            found = [
+                ContractRef.model_validate_json(r["contract_json"])
+                for r in rows
+                if month and (r["month"] or "").startswith(month)
+            ]
+            if len(found) != 1:
+                raise BrokerError(
+                    f"SimBroker: no single registered {instrument.asset_class.value} contract "
+                    f"for {instrument.symbol} {month or '(no month)'}"
+                )
+            return found[0]
         con_id = int(hashlib.sha256(instrument.symbol.encode()).hexdigest()[:8], 16)
         return ContractRef(
             symbol=instrument.symbol, asset_class=instrument.asset_class, con_id=con_id
@@ -370,7 +447,7 @@ class SimBroker:
 
     def quote(self, contract: ContractRef) -> BrokerQuote:
         with self._tx() as c:
-            row = self._quote_row(c, contract.symbol)
+            row = self._quote_for(c, contract)
         if row is None:
             return BrokerQuote(
                 contract=contract, received_at=self._now(), quality=QuoteQuality.UNAVAILABLE
@@ -395,6 +472,8 @@ class SimBroker:
             raise BrokerError("every child must name the entry as its parent")
         if order.parent_ref is not None:
             raise BrokerError("an entry cannot itself be a child")
+        for item in (order, *children):
+            self._check_rules(item, item.contract)
         if script.behaviour == Behaviour.LOST_ACK_NOT_PLACED:
             raise AckLost("simulated: request lost before reaching the broker")
         now = self._now().isoformat()
@@ -423,8 +502,8 @@ class SimBroker:
                     """INSERT INTO sim_orders (order_ref,parent_ref,symbol,asset_class,con_id,side,
                     quantity,
                     order_type,limit_price,stop_price,tif,reduce_only,status,reason,held,updated_at,
-                    placed_at)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    placed_at,contract_json)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         item.order_ref,
                         item.parent_ref,
@@ -443,11 +522,12 @@ class SimBroker:
                         held,
                         now,
                         now,
+                        item.contract.model_dump_json(),
                     ),
                 )
                 ids.append(cur.lastrowid)
             if script.behaviour == Behaviour.PARTIAL:
-                q = self._quote_row(c, order.contract.symbol)
+                q = self._quote_for(c, order.contract)
                 price = Decimal(q["ask"] if order.side == OrderSide.BUY else q["bid"])
                 self._execute(c, ids[0], script.quantity or 1, price)
             if script.behaviour not in (
@@ -489,6 +569,10 @@ class SimBroker:
                 raise BrokerError("simulated: modify rejected")
             if quantity is not None and quantity < row["filled_quantity"]:
                 raise BrokerError("cannot size an order below its filled quantity")
+            remaining = None if quantity is None else quantity - row["filled_quantity"]
+            self._check_rules(
+                None, self._contract(row), remaining or None, limit_price, stop_price
+            )
             if self.strict:
                 if row["status"] == OrderStatus.PENDING_CANCEL.value:
                     raise BrokerError("simulated: cannot modify an order that is pending cancel")
@@ -601,7 +685,7 @@ class SimBroker:
         with self._tx() as c:
             self._settle(c)
             rows = c.execute(
-                """SELECT e.*, o.asset_class, o.con_id FROM sim_executions e
+                """SELECT e.*, o.asset_class, o.con_id, o.contract_json FROM sim_executions e
                 JOIN sim_orders o ON o.broker_order_id = e.broker_order_id ORDER BY e.seq"""
             ).fetchall()
         fills = [
@@ -639,13 +723,11 @@ class SimBroker:
         with self._tx() as c:
             self._settle(c)
             rows = c.execute(
-                "SELECT * FROM sim_positions WHERE quantity<>0 ORDER BY symbol"
+                "SELECT * FROM sim_contract_positions WHERE quantity<>0 ORDER BY contract_key"
             ).fetchall()
         out = []
         for r in rows:
-            contract = self.resolve(
-                Instrument(asset_class=AssetClass(r["asset_class"]), symbol=r["symbol"])
-            )
+            contract = ContractRef.model_validate_json(r["contract_json"])
             out.append(
                 BrokerPosition(
                     account=self.account,
@@ -707,7 +789,7 @@ class SimBroker:
                 # As if the market touched the order's own price just before the request landed.
                 price = _d(row["limit_price"]) or _d(row["stop_price"])
                 if price is None:
-                    q = self._quote_row(c, row["symbol"])
+                    q = self._quote_for(c, self._contract(row))
                     price = Decimal(q["ask"] if row["side"] == "BUY" else q["bid"])
                 self._execute(c, oid, row["quantity"] - row["filled_quantity"], price)
             cur = c.execute("SELECT * FROM sim_orders WHERE broker_order_id=?", (oid,)).fetchone()
@@ -756,7 +838,7 @@ class SimBroker:
             "ORDER BY broker_order_id"
         ).fetchall()
         for row in rows:
-            q = self._quote_row(c, row["symbol"])
+            q = self._quote_for(c, self._contract(row))
             if q is None or q["quality"] == QuoteQuality.UNAVAILABLE.value or q["bid"] is None:
                 continue
             bid, ask = Decimal(q["bid"]), Decimal(q["ask"])
@@ -785,7 +867,11 @@ class SimBroker:
             "SELECT * FROM sim_orders WHERE broker_order_id=?", (broker_order_id,)
         ).fetchone()
         buy = row["side"] == "BUY"
-        pos = c.execute("SELECT * FROM sim_positions WHERE symbol=?", (row["symbol"],)).fetchone()
+        contract = self._contract(row)
+        key = contract.contract_key
+        pos = c.execute(
+            "SELECT * FROM sim_contract_positions WHERE contract_key=?", (key,)
+        ).fetchone()
         held = pos["quantity"] if pos else 0
         now = self._now().isoformat()
         if row["reduce_only"] and not self.strict:
@@ -844,8 +930,8 @@ class SimBroker:
         new_qty = held + signed
         if pos is None:
             c.execute(
-                "INSERT INTO sim_positions (symbol,asset_class,quantity,avg_cost) VALUES (?,?,?,?)",
-                (row["symbol"], row["asset_class"], new_qty, str(price)),
+                "INSERT INTO sim_contract_positions VALUES (?,?,?,?,?)",
+                (key, row["symbol"], contract.model_dump_json(), new_qty, str(price)),
             )
         else:
             cost = _d(pos["avg_cost"]) or price
@@ -854,8 +940,8 @@ class SimBroker:
             else:
                 new_cost = (cost * abs(held) + price * qty) / abs(new_qty)
             c.execute(
-                "UPDATE sim_positions SET quantity=?, avg_cost=? WHERE symbol=?",
-                (new_qty, str(new_cost.quantize(Decimal("0.0001"))), row["symbol"]),
+                "UPDATE sim_contract_positions SET quantity=?, avg_cost=? WHERE contract_key=?",
+                (new_qty, str(new_cost.quantize(Decimal("0.0001"))), key),
             )
         if row["parent_ref"] is None and self.strict:
             # Strict: a parent fill activates its children at the quantity they were submitted with.
