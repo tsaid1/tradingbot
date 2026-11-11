@@ -10,8 +10,8 @@ proven from public report evidence.
   is a fixed sequence of steps naming fixed router entries; there is no parser, no field splitting, no
   numeric message-id or protobuf selection, no dynamic method name and no user callable. Wire selection and
   any real SDK decoder stay absent.
-* **Ownership until settlement.** One frame at a time. A frame is reserved before it is taken and released
-  only when decoding returned, at least one callback reached the router, no router fault or adapter failure
+* **Ownership until settlement.** One frame at a time. A frame is reserved before it is taken; the taken
+  frame itself is then kept privately on every failure path, and released only when decoding returned, at least one callback reached the router, no router fault or adapter failure
   appeared, and every admitted record was dispatched by the consumer. Delivery is never inferred from a
   callback count or an empty queue alone.
 * **Latched failure.** A callback-free return, a decoder exception (also after callbacks), a version
@@ -37,6 +37,7 @@ from tradingbot.ibkr_read_facade import ReadCallbackFacade
 from tradingbot.paper_readiness.callback_router import CallbackRouter, RouterReport
 from tradingbot.paper_readiness.read_framing import (
     FeedResult,
+    Frame,
     FrameAccumulator,
     FramingLimits,
     FramingOutcome,
@@ -309,6 +310,7 @@ class DecodeHandoff:
         if frame is None:
             self._latch(Failure.TAKE_FAILED)
             return False
+        held.frame = frame  # the exact taken frame stays owned until settlement releases it
         held.sequence, held.length = frame.sequence, len(frame.payload)
         if self._decoder.server_version != self._server_version:
             self._latch(Failure.VERSION_MISMATCH)
@@ -423,11 +425,13 @@ class DecodeHandoff:
 
 
 class _Held:
-    """The reservation for the one frame in flight."""
+    """The reservation for the one frame in flight. It keeps the exact taken ``Frame`` (immutable, with a
+    payload-free repr) on every failure path; only settlement releases it."""
 
-    __slots__ = ("admitted", "dispatched", "length", "recorded", "sequence", "sink")
+    __slots__ = ("admitted", "dispatched", "frame", "length", "recorded", "sequence", "sink")
 
     def __init__(self) -> None:
+        self.frame: Frame | None = None
         self.sequence = 0
         self.length = 0
         self.admitted = 0

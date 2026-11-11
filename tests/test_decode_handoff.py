@@ -400,3 +400,35 @@ def test_reentry_is_refused():
     assert handoff.process_one() is False
     handoff._busy = False
     assert handoff.report().failure is Failure.REENTERED
+
+
+@pytest.mark.parametrize(("scripts_change", "failure"), [
+    ({}, Failure.RETURNED_WITHOUT_DELIVERY),
+    ({b"INV-unknown": (Step(StepKind.RAISE),)}, Failure.DECODER_RAISED),
+], ids=["unknown-payload", "decoder-raised"])
+def test_a_failed_frame_keeps_its_exact_payload_owned_and_reports_stay_payload_free(scripts_change, failure):
+    """Review P2: take() removes the frame from the accumulator, so the held reservation must keep it."""
+    scripts = dict(CONTROL)
+    scripts.update(scripts_change)
+    _router, _decoder, handoff = handoff_for(scripts)
+    feed_fragmented(handoff, (b"INV-unknown", *ORDER))
+    handoff.process_available()
+    assert handoff.report().failure is failure
+    held = handoff._held.frame  # private retention: the exact taken frame, still owned
+    assert (held.sequence, held.payload) == (1, b"INV-unknown")
+    assert "INV-unknown" not in repr(handoff.report()) + repr(handoff) + repr(held)
+
+
+def test_a_version_mismatch_keeps_the_taken_frame_owned():
+    _router, _decoder, handoff = handoff_for(CONTROL, decoder_version=VERSION + 1)
+    feed_fragmented(handoff, ORDER)
+    handoff.process_available()
+    assert handoff.report().failure is Failure.VERSION_MISMATCH
+    assert handoff._held.frame.payload == b"INV-contract"
+
+
+def test_control_a_settled_frame_is_released():
+    _router, _decoder, handoff = handoff_for(CONTROL)
+    feed_fragmented(handoff, ORDER[:1])
+    assert handoff.process_one() is True
+    assert handoff._held is None and handoff.report().held_sequence is None

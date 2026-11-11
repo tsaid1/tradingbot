@@ -47,7 +47,8 @@ method name and no user callable.
 
 1. **Refuse foreign work.** Queued or fetched router work that did not come from this handoff is
    `FOREIGN_QUEUED_WORK`. Nothing is taken.
-2. **Reserve, then take.** Ownership is reserved before `take()`, keeping the frame's sequence and length.
+2. **Reserve, then take.** Ownership is reserved before `take()`. The exact taken frame is then kept privately
+   on every failure path, and only settlement releases it. Reports show only its sequence and length.
 3. **Check version provenance.** The decoder's current version must equal the version pinned at
    construction; otherwise `VERSION_MISMATCH`, and the frame is not decoded.
 4. **Decode synchronously** into a fresh frame-scoped sink. The sink forwards each callback to one fixed
