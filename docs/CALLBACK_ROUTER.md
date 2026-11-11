@@ -17,6 +17,7 @@ router = CallbackRouter(client, lock, clock)  # client: connect / stop_read / di
 router.start()
 router.register_contract(rid); router.register_quote(rid, con_id)
 router.register_account_summary(rid); router.register_positions(snapshot_id)
+# or, in owner mode: register_account_summary(rid, owner=owner); register_positions(snapshot_id, owner=owner)
 # Deliver callbacks by their EWrapper names, consume, then:
 router.shutdown(join_timeout)
 router.report()  # RouterReport: fixed fault codes and counts, never a payload
@@ -24,6 +25,33 @@ router.report()  # RouterReport: fixed fault codes and counts, never a payload
 
 The router builds the one adapter itself. It wraps the caller's client double so that the queue and
 `dispatch` belong to the router, and only fixed attribute names are read from what `connect` returns.
+
+## Owner mode
+
+`register_account_summary` and `register_positions` take an optional keyword-only `owner`, default
+`None`. Without it, registration and outputs are unchanged: the producers admit only `SYNTH-` account
+identifiers and refuse any other value.
+
+With an owner, the router passes it unchanged to the accepted producers (`AccountSummaryCallbacks` and
+`PositionSnapshotCallbacks`, owner mode). The producers validate it: it must be an exact, open
+`AccountOwner` holding its own binding. Each row's account is then compared privately and projected:
+
+- the expected identity becomes the binding's reference
+- a valid foreign identity becomes its own distinct reference, so downstream mismatch evidence survives
+- a malformed identity is a `MALFORMED_CALLBACK` refusal that withholds END
+
+The router copies no normalizer and resolves no identity itself. Raw account text waits only in its
+bounded, payload-free FIFO until the adapter's consumer delivers it to the producer.
+
+An owner the producers refuse (another type, a binding, a closed owner, or one without a binding) is the
+fixed `OWNER_REFUSED` fault. No producer is stored, no ledger slot opens, the positions window is not
+used, no exception escapes, and the fault blocks completion.
+
+**The caller owns the owner's lifetime.** The router never closes it, and it may be shared. Keep it open
+until shutdown has drained the queue. If it closes between enqueue and delivery, projection fails and
+END is withheld; that is never treated as successful empty data. A reference is a comparison label
+within that owner's run. It is not authentication, ongoing identity evidence, or proof that the rows
+came from one connection.
 
 ## Payload ownership
 
@@ -67,8 +95,8 @@ fault survives. Text arguments of errors and the tick attribute are never retain
 |---|---|
 | `contractDetails`, `contractDetailsEnd` | Contract normalizer, **directly, outside lifecycle accounting**. Contract details have no ledger slot and never borrow the quote slot |
 | `marketDataType`, `tick*`, `tickSnapshotEnd` | Quote snapshot slot, through the FIFO |
-| `accountSummary`, `accountSummaryEnd` | Account-summary slot, through the FIFO |
-| `position`, `positionEnd` | The single positions window, through the FIFO |
+| `accountSummary`, `accountSummaryEnd` | Account-summary slot, through the FIFO; projected by the owner in owner mode |
+| `position`, `positionEnd` | The single positions window, through the FIFO; projected by the owner in owner mode |
 | `error_1052` for the quote or contract id | That stream's `error_1052` (quote through the FIFO) |
 | `error_1052` for the account id | A fixed `unsupported_callback("error")` plus a lifecycle ERROR. Account and position streams have no `error_1052` |
 | `error_1052` with id -1 | Every stream, directly. Only a well-formed call (4 or 5 arguments, the exact integer id -1, an exact integer time and an exact non-negative integer code; the same fields the contract and quote normalizers require) with an OK code is exempt. A non-OK code (`SESSION_ERROR`) or a malformed call (`SESSION_ERROR_MALFORMED`) fails every stream, account and positions included |

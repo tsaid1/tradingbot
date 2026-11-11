@@ -20,6 +20,10 @@ is a later, separately reviewed task.
   Unknown ids and session errors follow fixed rules, keep their original ids and are never dropped
   silently. Contract and quote errors use ``error_1052``; account and position errors are fixed
   unsupported refusals plus a lifecycle ERROR. No version is inferred.
+* **Owner mode.** Account-summary and position registration take an optional ``owner``, passed to the
+  accepted producers unchanged. The caller owns its lifetime: the router never closes it, and a
+  projected reference is a comparison label within that owner's run, not authentication or proof that
+  the rows came from one connection.
 * **Direct and refused callbacks.** ``connectAck`` and ``connectionClosed`` are recorded by the adapter
   as direct observations, never socket or broker evidence. Every unsupported callback is a persistent
   router fault, even before any stream registers. An applicable error inside a stop hook is also
@@ -70,6 +74,7 @@ _FIELD_COST = 16
 class RouterFault(str, Enum):
     ADAPTER_NOT_OPEN = "ADAPTER_NOT_OPEN"
     REGISTRATION_REFUSED = "REGISTRATION_REFUSED"
+    OWNER_REFUSED = "OWNER_REFUSED"
     POSITIONS_WINDOW_REOPENED = "POSITIONS_WINDOW_REOPENED"
     POSITIONS_WINDOW_ABSENT = "POSITIONS_WINDOW_ABSENT"
     UNKNOWN_REQUEST_ID = "UNKNOWN_REQUEST_ID"
@@ -374,14 +379,24 @@ class CallbackRouter:
             return
         self._adapter.open_read(ReadSlot.QUOTE_SNAPSHOT)
 
-    def register_account_summary(self, request_id: int) -> None:
+    def register_account_summary(self, request_id: int, *, owner: object = None) -> None:
+        """The account summary. With ``owner``, the accepted producer runs in owner mode: an open
+        ``AccountOwner`` holding its own binding projects each row's account privately to a reference.
+        An owner the producer refuses is ``OWNER_REFUSED``: nothing is stored and no slot opens."""
         rid = self._can_register(request_id, self._account)
-        if rid is not None:
-            self._account = AccountSummaryCallbacks(rid)
-            self._adapter.open_read(ReadSlot.ACCOUNT_SUMMARY)
+        if rid is None:
+            return
+        try:
+            stream = AccountSummaryCallbacks(rid, owner=owner)
+        except ValueError:
+            self._fault(RouterFault.OWNER_REFUSED)
+            return
+        self._account = stream
+        self._adapter.open_read(ReadSlot.ACCOUNT_SUMMARY)
 
-    def register_positions(self, snapshot_id: int) -> None:
-        """The one positions window. It never reopens, even after it ends or closes."""
+    def register_positions(self, snapshot_id: int, *, owner: object = None) -> None:
+        """The one positions window. It never reopens, even after it ends or closes. ``owner`` works as
+        for the account summary; a refused owner opens no window and no slot."""
         if self._positions_opened:
             self._fault(RouterFault.POSITIONS_WINDOW_REOPENED)
             return
@@ -389,8 +404,13 @@ class CallbackRouter:
         if self._closed or rid is None or self._adapter.report().state != "OPEN":
             self._fault(RouterFault.REGISTRATION_REFUSED)
             return
+        try:
+            stream = PositionSnapshotCallbacks(rid, owner=owner)
+        except ValueError:
+            self._fault(RouterFault.OWNER_REFUSED)
+            return
         self._positions_opened = True
-        self._positions = PositionSnapshotCallbacks(rid)
+        self._positions = stream
         self._adapter.open_read(ReadSlot.POSITIONS)
 
     # ------------------------------------------------------------------ admission

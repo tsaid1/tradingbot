@@ -18,9 +18,11 @@ from tradingbot.paper_readiness.account_position_callbacks import (
     AccountSummaryCallbacks,
     PositionSnapshotCallbacks,
 )
+from tradingbot.paper_readiness.account_ref import REFERENCE_PREFIX
 from tradingbot.paper_readiness.callback_router import CallbackRouter
 from tradingbot.paper_readiness.ibkr_callbacks import CallbackRequest, IbkrCallbackNormalizer
 from tradingbot.paper_readiness.observations import ResponseKind
+from tradingbot.paper_readiness.private_account import AccountOwner
 from tradingbot.paper_readiness.read_retirement import ReadSlot
 from tradingbot.paper_readiness.transport import FORBIDDEN_NAME_RE, FakeClock
 
@@ -669,3 +671,192 @@ def test_an_error_outside_any_stop_hook_is_not_reported_as_a_direct_error():
     r.error_1052(SRID, 0, 321, CANARY)
     drain(r)
     assert "DIRECT_ERROR" not in r.report().adapter.failures
+
+
+# ----------------------------------------------------------------------------- INT-1: owner-mode registration
+
+EXPECTED_ACCOUNT, FOREIGN_ACCOUNT = "INVENTEDACCT01", "INVENTEDACCT02"  # invented, deliberately not SYNTH-shaped
+OWNER_KEY = b"r" * 32
+
+
+def account_owner(managed=(EXPECTED_ACCOUNT,)) -> AccountOwner:
+    return AccountOwner(EXPECTED_ACCOUNT, list(managed), OWNER_KEY)
+
+
+def owner_router(owner) -> CallbackRouter:
+    r = CallbackRouter(Client(), _Lock(), FakeClock(NOW))
+    r.start()
+    r.register_account_summary(SRID, owner=owner)
+    r.register_positions(PRID, owner=owner)
+    return r
+
+
+def owned_summary(target, account=EXPECTED_ACCOUNT) -> None:
+    target.accountSummary(SRID, account, "AccountType", "INVENTED", "")
+    for tag, value in (("NetLiquidation", "50000.00"), ("TotalCashValue", "40000.00"), ("BuyingPower", "1.00")):
+        target.accountSummary(SRID, account, tag, value, "USD")
+    target.accountSummaryEnd(SRID)
+
+
+def owned_positions(target, account=EXPECTED_ACCOUNT) -> None:
+    target.position(account, Contract(840001), Decimal("-3.5"), 12.5)
+    target.position(account, Contract(840002), Decimal(7), 3.0)
+    target.positionEnd()
+
+
+def direct_producers(owner):
+    return AccountSummaryCallbacks(SRID, owner=owner), PositionSnapshotCallbacks(PRID, owner=owner)
+
+
+def assert_parity(r: CallbackRouter, summary, positions) -> None:
+    assert r.account_summary_envelopes() == summary.envelopes()
+    assert r.position_envelopes() == positions.envelopes()
+    assert r._account.issues == summary.issues and r._positions.issues == positions.issues
+
+
+def test_owner_mode_routing_matches_direct_owner_mode_producers_and_projects_references():
+    owner = account_owner()
+    r = owner_router(owner)
+    owned_summary(r)
+    owned_positions(r)
+    drain(r)
+    r.shutdown(join_timeout=0.01)
+    summary, positions = direct_producers(owner)
+    owned_summary(summary)
+    owned_positions(positions)
+    assert_parity(r, summary, positions)
+    text = repr(r.account_summary_envelopes()) + repr(r.position_envelopes()) + repr(r.report())
+    assert owner.binding.reference in text and EXPECTED_ACCOUNT not in text
+    assert ResponseKind.POSITION_END in kinds(r.position_envelopes())
+    assert r.report().completed is True and r.report().faults == ()
+    assert owner.owns(owner.binding)  # the caller's owner is never closed by the router
+
+
+def test_a_foreign_identity_keeps_its_own_distinct_reference_through_the_router():
+    owner = account_owner()
+    r = owner_router(owner)
+    owned_positions(r, FOREIGN_ACCOUNT)
+    drain(r)
+    _summary, positions = direct_producers(owner)
+    owned_positions(positions, FOREIGN_ACCOUNT)
+    assert r.position_envelopes() == positions.envelopes()
+    text = repr(r.position_envelopes())
+    assert owner.binding.reference not in text and FOREIGN_ACCOUNT not in text
+    assert REFERENCE_PREFIX in text  # a distinct keyed reference, so downstream mismatch evidence survives
+
+
+@pytest.mark.parametrize("account", [123, "x" * 5000, None], ids=["int", "oversized", "none"])
+def test_a_malformed_identity_is_refused_and_withholds_end_exactly_as_directly(account):
+    owner = account_owner()
+    r = owner_router(owner)
+    owned_positions(r, account)
+    drain(r)
+    _, positions = direct_producers(owner)
+    owned_positions(positions, account)
+    assert r.position_envelopes() == positions.envelopes() and r._positions.issues == positions.issues
+    assert ResponseKind.POSITION_END not in kinds(r.position_envelopes()) and r._positions.issues
+
+
+def test_errors_duplicates_and_post_end_input_fail_exactly_as_directly():
+    owner = account_owner()
+    r = owner_router(owner)
+    owned_summary(r)
+    r.accountSummaryEnd(SRID)  # duplicate END
+    r.error_1052(SRID, 0, 321, CANARY)  # account error: a fixed refusal plus a lifecycle ERROR
+    owned_positions(r)
+    r.position(EXPECTED_ACCOUNT, Contract(840003), Decimal(1), 1.0)  # after positionEnd
+    drain(r)
+    summary, positions = direct_producers(owner)
+    owned_summary(summary)
+    summary.accountSummaryEnd(SRID)
+    summary.unsupported_callback("error")
+    owned_positions(positions)
+    positions.position(EXPECTED_ACCOUNT, Contract(840003), Decimal(1), 1.0)
+    assert_parity(r, summary, positions)  # the producers judge duplicates, errors and post-END rows
+    assert ResponseKind.ACCOUNT_SUMMARY_END not in kinds(r.account_summary_envelopes())
+    assert "POST_END_EVENT" in r.report().adapter.ledger.faults  # and the lifecycle records the late rows
+    assert CANARY not in repr(r.report())
+
+
+def closed_owner():
+    owner = account_owner()
+    owner.close()
+    return owner
+
+
+@pytest.mark.parametrize("make", [
+    lambda: object(), lambda: account_owner().binding, closed_owner,
+    lambda: account_owner((FOREIGN_ACCOUNT,)), lambda: type("Sub", (), {})(),
+], ids=["object", "binding", "closed", "unbound-mismatch", "foreign-type"])
+def test_a_refused_owner_latches_a_fixed_fault_and_opens_no_slot(make):
+    r = CallbackRouter(Client(), _Lock(), FakeClock(NOW))
+    r.start()
+    r.register_account_summary(SRID, owner=make())
+    r.register_positions(PRID, owner=make())
+    report = r.report()
+    assert report.faults.count("OWNER_REFUSED") == 2
+    assert report.adapter.ledger.slots == ()  # no producer stored, no ledger slot opened
+    assert r._account is None and r._positions is None
+    r.accountSummary(SRID, EXPECTED_ACCOUNT, "NetLiquidation", "1.00", "USD")
+    assert "UNROUTABLE_CALLBACK" in r.report().faults  # nothing can arrive at a refused stream
+    r.shutdown(join_timeout=0.01)
+    assert r.report().completed is False and EXPECTED_ACCOUNT not in repr(r.report())
+
+
+def test_closing_the_owner_between_enqueue_and_delivery_fails_never_as_empty_success():
+    owner = account_owner()
+    r = owner_router(owner)
+    owned_positions(r)
+    assert r.report().queued_records == 3  # enqueued, not yet delivered
+    owner.close()
+    drain(r)
+    _, positions = direct_producers(account_owner())
+    owned_positions(positions)
+    assert r.position_envelopes() != positions.envelopes()
+    assert r._positions.issues and ResponseKind.POSITION_END not in kinds(r.position_envelopes())
+    assert not [e for e in r.position_envelopes() if e.kind == ResponseKind.POSITION]
+
+
+def test_shutdown_drains_queued_rows_while_the_caller_keeps_the_owner_open():
+    owner = account_owner()
+    r = owner_router(owner)
+    owned_summary(r)
+    owned_positions(r)
+    r.shutdown(join_timeout=0.01)  # the adapter's drain delivers every queued record, projected
+    summary, positions = direct_producers(owner)
+    owned_summary(summary)
+    owned_positions(positions)
+    assert_parity(r, summary, positions)
+    assert r.report().queued_records == 0 and owner.owns(owner.binding)
+    # Rows drained after the stop attempts are late, exactly as without an owner: owner mode changes no
+    # lifecycle verdict.
+    without = CallbackRouter(Client(), _Lock(), FakeClock(NOW))
+    without.start()
+    without.register_account_summary(SRID)
+    without.register_positions(PRID)
+    summary_feed(without)
+    positions_feed(without)
+    without.shutdown(join_timeout=0.01)
+    assert r.report().adapter.ledger.faults == without.report().adapter.ledger.faults
+    assert r.report().completed is without.report().completed is False
+
+
+def test_owner_mode_keeps_fifo_and_request_accounting_identical_to_no_owner_routing():
+    owner = account_owner()
+    with_owner = owner_router(owner)
+    owned_summary(with_owner)
+    owned_positions(with_owner)
+    without = CallbackRouter(Client(), _Lock(), FakeClock(NOW))
+    without.start()
+    without.register_account_summary(SRID)
+    without.register_positions(PRID, owner=None)
+    summary_feed(without)
+    positions_feed(without)
+    for r in (with_owner, without):
+        drain(r)
+        r.shutdown(join_timeout=0.01)
+    a, b = with_owner.report(), without.report()
+    assert a.adapter.ledger.slots == b.adapter.ledger.slots and a.faults == b.faults == ()
+    assert (a.completed, a.queued_records) == (b.completed, b.queued_records) == (True, 0)
+    assert with_owner.register_positions(PRID, owner=owner) is None
+    assert "POSITIONS_WINDOW_REOPENED" in with_owner.report().faults  # the single window holds in owner mode
