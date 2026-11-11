@@ -133,6 +133,12 @@ class Role(str, Enum):
     EXIT = "EXIT"  # reduce-only REDUCE / CLOSE
     STOP = "STOP"  # protective stop child
     TARGET = "TARGET"  # protective target child
+    # A stop in the execution instrument beside a reference-triggered stop (multi-asset mapping):
+    # it protects the hours the reference series does not update.
+    BACKSTOP = "BACKSTOP"
+
+
+PROTECTIVE_ROLES = frozenset({Role.STOP, Role.TARGET, Role.BACKSTOP})
 
 
 class Intent(StrictModel):
@@ -168,6 +174,8 @@ class Intent(StrictModel):
     # and on intents recorded before round 2.
     contract_key: str | None = None
     contract: str | None = None
+    # The gateway's execution plan for an action in a mapped family (models.ExecutionPlan JSON).
+    plan: str | None = None
 
 
 class OrderRow(StrictModel):
@@ -186,6 +194,8 @@ class OrderRow(StrictModel):
     filled_quantity: int = 0
     updated_at: datetime
     contract_key: str | None = None
+    # A broker-side price condition on a reference series (broker.PriceCondition JSON).
+    condition: str | None = None
 
 
 class LedgerPosition(StrictModel):
@@ -212,6 +222,13 @@ class LedgerPosition(StrictModel):
     # reconciliation key on this, never on the symbol alone.
     contract_key: str | None = None
     contract: str | None = None
+    # Multi-asset mapping. EXECUTION: stop and target are execution prices (as before). REFERENCE:
+    # they are reference-series levels held as broker-side conditions on ``reference_key``; a
+    # ``backstop_ref`` stop at ``backstop_price`` (execution prices) may work beside them.
+    protection_series: str | None = None
+    reference_key: str | None = None
+    backstop_ref: str | None = None
+    backstop_price: str | None = None
 
 
 class JournalEntry(StrictModel):
@@ -250,16 +267,19 @@ class ExecutionStore:
             for col in ("source_published_at", "entry_reference", "submitted_at"):
                 if col not in cols:  # a store created before this column existed
                     c.execute(f"ALTER TABLE exec_intents ADD COLUMN {col} TEXT")
-            for col in ("contract_key", "contract"):  # round 2, Part B: contract identity
+            # round 2, Part B: contract identity; multi-asset mapping: the gateway's plan
+            for col in ("contract_key", "contract", "plan"):
                 if col not in cols:
                     c.execute(f"ALTER TABLE exec_intents ADD COLUMN {col} TEXT")
             pcols = {r["name"] for r in c.execute("PRAGMA table_info(exec_positions)")}
-            for col in ("protection", "contract_key", "contract"):
+            for col in ("protection", "contract_key", "contract", "protection_series",
+                        "reference_key", "backstop_ref", "backstop_price"):
                 if col not in pcols:
                     c.execute(f"ALTER TABLE exec_positions ADD COLUMN {col} TEXT")
             ocols = {r["name"] for r in c.execute("PRAGMA table_info(exec_orders)")}
-            if "contract_key" not in ocols:
-                c.execute("ALTER TABLE exec_orders ADD COLUMN contract_key TEXT")
+            for col in ("contract_key", "condition"):
+                if col not in ocols:
+                    c.execute(f"ALTER TABLE exec_orders ADD COLUMN {col} TEXT")
 
     @contextmanager
     def tx(self) -> Iterator[sqlite3.Connection]:
@@ -528,7 +548,7 @@ class ExecutionStore:
         return [_row(LedgerPosition, r) for r in rows]
 
     def update_position(self, idea_id: str, at: datetime, **fields) -> None:
-        allowed = {"status", "stop_price", "target_price", "protection"}
+        allowed = {"status", "stop_price", "target_price", "protection", "backstop_price"}
         if not fields or set(fields) - allowed:
             raise ValueError(f"only {allowed} may be set directly; quantities change through fills")
         sets = ",".join(f"{k}=?" for k in fields)

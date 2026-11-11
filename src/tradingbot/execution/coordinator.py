@@ -40,14 +40,17 @@ from tradingbot.execution.broker import (
     BrokerError,
     BrokerOrder,
     BrokerQuote,
+    ConditionDirection,
     ContractRef,
     OrderIntent,
     OrderNotFound,
     OrderSide,
     OrderStatus,
     OrderType,
+    PriceCondition,
     QuoteQuality,
     TimeInForce,
+    supports_price_conditions,
 )
 from tradingbot.execution.store import (
     LEDGER_REVERSAL,
@@ -61,6 +64,7 @@ from tradingbot.execution.store import (
 )
 from tradingbot.models import (
     Action,
+    ExecutionPlan,
     GateDecision,
     Instrument,
     MockPolicy,
@@ -109,6 +113,11 @@ ENTRY_REMAINDER_NOT_CANCELLED = "ENTRY_REMAINDER_NOT_CANCELLED"
 # The broker nets one position per contract: an idea on the opposite side of an open idea in the
 # same contract is never opened beside it. A publisher reversal is a close followed by an open.
 OPPOSITE_IDEA_IN_SAME_CONTRACT = "OPPOSITE_IDEA_IN_SAME_CONTRACT"
+# Multi-asset mapping: a REFERENCE_TRIGGER family needs broker-side price conditions; a broker that
+# does not report supporting them never receives a conditional order.
+CONDITIONS_UNSUPPORTED = "CONDITIONAL_ORDERS_UNSUPPORTED_BY_BROKER"
+# The contract the broker resolves now differs from the one the gateway decided on.
+CONTRACT_CHANGED = "CONTRACT_CHANGED_SINCE_DECISION"
 
 
 class BrokerUnreadable(BrokerError):
@@ -207,6 +216,26 @@ def target_ref(entry_ref: str) -> str:
     return f"{entry_ref}.TGT"
 
 
+def backstop_ref(entry_ref: str) -> str:
+    return f"{entry_ref}.BKS"
+
+
+def _plan_of(raw: str | None) -> ExecutionPlan | None:
+    return ExecutionPlan.model_validate_json(raw) if raw else None
+
+
+def _exit_condition(plan: ExecutionPlan, long: bool, level, kind: str) -> PriceCondition:
+    """The broker-side condition on the reference series that releases an exit: a long's stop
+    below / target above its level, a short's the other way round."""
+    below = (kind == "stop") == long
+    return PriceCondition(
+        contract=ContractRef.model_validate_json(plan.reference_contract),
+        direction=ConditionDirection.BELOW if below else ConditionDirection.ABOVE,
+        trigger_price=level,
+        released_order_type=OrderType.MKT,
+    )
+
+
 def _dec(value: str | None) -> Decimal | None:
     if value is None:
         return None
@@ -238,6 +267,13 @@ def _rule_problems(contract: ContractRef, quantity: int | None, **prices) -> lis
         if price is not None and not contract.on_tick(price):
             out.append(f"{name.upper()}_PRICE_OFF_TICK")
     return out
+
+
+def _field(order: BrokerOrder, name: str):
+    """A working order's amendable level: a price field, or its condition's trigger level."""
+    if name == "trigger_price":
+        return order.condition.trigger_price if order.condition else None
+    return getattr(order, name)
 
 
 def _intent_state(status: OrderStatus, filled: int, quantity: int) -> IntentState:
@@ -523,7 +559,11 @@ class ExecutionCoordinator:
         Each is cancelled and the cancel confirmed at the broker; an unconfirmed cancel opens
         ENTRY_REMAINDER_NOT_CANCELLED, which blocks new exposure in the instrument. Returns True
         when a cancel was requested."""
-        stopped = {f["idea_id"] for f in self.store.fills() if f["role"] == Role.STOP.value}
+        stopped = {
+            f["idea_id"]
+            for f in self.store.fills()
+            if f["role"] in (Role.STOP.value, Role.BACKSTOP.value)
+        }
         stopped |= {
             p.idea_id for p in self.store.positions() if p.status in ("CLOSED", "REVERSED")
         }
@@ -611,17 +651,32 @@ class ExecutionCoordinator:
         contract, problem = self._resolve_contract(action.instrument)
         if problem:
             return self._refuse(source, action, gate, ref, account, [problem], now)
+        plan = gate.plan
+        problem = self._plan_problem(plan, contract)
+        if problem:
+            return self._refuse(source, action, gate, ref, account, [problem], now)
         long = action.position_side == PositionSide.LONG
         side = OrderSide.BUY if long else OrderSide.SELL
-        qty = fill_quantity(Action.OPEN, self.policy, None)
+        qty = fill_quantity(
+            Action.OPEN, self.policy, None, per_signal=plan.quantity if plan else None
+        )
+        if plan is None:
+            stop, target = _dec(action.stop_price), _dec(action.target_price)
+            entry_level = action.entry_reference
+        else:  # the gateway's prices, each in its own series
+            stop, target = plan.stop, plan.target
+            entry_level = str(plan.execution_reference)
+        reference_series = plan is not None and plan.protection_series == "REFERENCE"
         rules = _rule_problems(
-            contract, qty, stop=_dec(action.stop_price), target=_dec(action.target_price)
+            contract,
+            qty,
+            stop=None if reference_series else stop,
+            target=None if reference_series else target,
+            backstop=plan.backstop_stop if plan else None,
         )
         if rules:
             return self._refuse(source, action, gate, ref, account, rules, now)
-        limit, reasons = self._entry_checks(
-            contract, side, qty, action.entry_reference, idea_id, now
-        )
+        limit, reasons = self._entry_checks(contract, side, qty, entry_level, idea_id, now)
         if reasons:
             return self._refuse(source, action, gate, ref, account, reasons, now, idea_id=idea_id)
         exit_side = OrderSide.SELL if long else OrderSide.BUY
@@ -635,8 +690,14 @@ class ExecutionCoordinator:
             tif=TimeInForce.DAY,
         )
         children = []
-        stop, target = _dec(action.stop_price), _dec(action.target_price)
-        if stop is not None:
+        if reference_series:
+            children = self._reference_children(ref, contract, exit_side, qty, plan, long)
+            if not supports_price_conditions(self.broker):
+                return self._refuse(
+                    source, action, gate, ref, account, [CONDITIONS_UNSUPPORTED], now,
+                    idea_id=idea_id,
+                )
+        elif stop is not None:
             children.append(
                 OrderIntent(
                     order_ref=stop_ref(ref),
@@ -650,7 +711,7 @@ class ExecutionCoordinator:
                     reduce_only=True,
                 )
             )
-        if target is not None:
+        if target is not None and not reference_series:
             children.append(
                 OrderIntent(
                     order_ref=target_ref(ref),
@@ -692,10 +753,87 @@ class ExecutionCoordinator:
             target_ref=target_ref(ref) if target is not None else None,
             status="PENDING",
             updated_at=now,
+            protection_series=plan.protection_series if plan else None,
+            reference_key=plan.reference_contract_key if reference_series else None,
+            backstop_ref=backstop_ref(ref) if plan and plan.backstop_stop else None,
+            backstop_price=str(plan.backstop_stop) if plan and plan.backstop_stop else None,
         )
         self._record(intent, [entry, *children], ledger)
         self._submit(intent, entry, children)
         return self._outcome(ref)
+
+    @staticmethod
+    def _idea_contract_problem(pos: LedgerPosition, contract: ContractRef) -> str | None:
+        """A follow-up acts only on the idea's own contract (two months are never confused)."""
+        if pos.contract_key and contract.contract_key != pos.contract_key:
+            return "IDEA_CONTRACT_MISMATCH"
+        return None
+
+    def _plan_problem(self, plan: ExecutionPlan | None, contract: ContractRef) -> str | None:
+        """A mapped action executes only in the contract the gateway decided on."""
+        if plan is None:
+            return None
+        if self._key_for_plan(contract) != plan.execution_key:
+            return CONTRACT_CHANGED
+        return None
+
+    @staticmethod
+    def _key_for_plan(contract: ContractRef) -> str:
+        """``Instrument.quote_key`` of a resolved contract (stocks: the symbol)."""
+        if contract.sec_type == "STK":
+            return contract.symbol
+        month = contract.expiry or "-"
+        if contract.asset_class.value == "FUTURE":
+            month = month[:6]
+        elif month != "-" and len(month) == 8:
+            month = f"{month[:4]}-{month[4:6]}-{month[6:]}"
+        strike = format(contract.strike.normalize(), "f") if contract.strike is not None else "-"
+        right = {"C": "CALL", "P": "PUT"}.get(contract.right or "", "-")
+        return f"{contract.asset_class.value}:{contract.symbol}:{month}:{strike}:{right}"
+
+    def _reference_children(
+        self, ref: str, contract: ContractRef, exit_side: OrderSide, qty: int,
+        plan: ExecutionPlan, long: bool,
+    ) -> list[OrderIntent]:
+        """REFERENCE_TRIGGER: the stop and target are exits held at the broker as conditions on
+        the reference series, released as market orders in the execution contract; a backstop
+        stop in the execution contract (BASIS_SHIFT priced) may work beside them. All reduce-only
+        children of one bracket (one-cancels-other)."""
+        out = []
+        for level, kind, child_ref in (
+            (plan.stop, "stop", stop_ref(ref)),
+            (plan.target, "target", target_ref(ref)),
+        ):
+            if level is None:
+                continue
+            out.append(
+                OrderIntent(
+                    order_ref=child_ref,
+                    contract=contract,
+                    side=exit_side,
+                    quantity=qty,
+                    order_type=OrderType.MKT,
+                    tif=self.config.protective_tif,
+                    parent_ref=ref,
+                    reduce_only=True,
+                    condition=_exit_condition(plan, long, level, kind),
+                )
+            )
+        if plan.backstop_stop is not None:
+            out.append(
+                OrderIntent(
+                    order_ref=backstop_ref(ref),
+                    contract=contract,
+                    side=exit_side,
+                    quantity=qty,
+                    order_type=OrderType.STP,
+                    stop_price=plan.backstop_stop,
+                    tif=self.config.protective_tif,
+                    parent_ref=ref,
+                    reduce_only=True,
+                )
+            )
+        return out
 
     def _add(self, source, action, gate, ref, account, now) -> ExecutionOutcome:
         pos = self._open_position(action.idea_reference)
@@ -707,14 +845,22 @@ class ExecutionCoordinator:
         contract, problem = self._resolve_contract(action.instrument)
         if problem:
             return self._refuse(source, action, gate, ref, account, [problem], now)
+        plan = gate.plan
+        problem = self._plan_problem(plan, contract) or self._idea_contract_problem(pos, contract)
+        if problem:
+            return self._refuse(source, action, gate, ref, account, [problem], now)
         long = pos.position_side == PositionSide.LONG
         side = OrderSide.BUY if long else OrderSide.SELL
-        qty = fill_quantity(Action.ADD, self.policy, self._as_position(pos))
+        qty = fill_quantity(
+            Action.ADD, self.policy, self._as_position(pos),
+            per_signal=plan.quantity if plan else None,
+        )
         rules = _rule_problems(contract, qty)
         if rules:
             return self._refuse(source, action, gate, ref, account, rules, now, idea_id=pos.idea_id)
+        entry_level = str(plan.execution_reference) if plan else action.entry_reference
         limit, reasons = self._entry_checks(
-            contract, side, qty, action.entry_reference, pos.idea_id, now
+            contract, side, qty, entry_level, pos.idea_id, now
         )
         if reasons:
             return self._refuse(
@@ -756,6 +902,11 @@ class ExecutionCoordinator:
             )
         assert action.instrument is not None
         contract, problem = self._resolve_contract(action.instrument)
+        if problem:
+            return self._refuse(source, action, gate, ref, account, [problem], now)
+        problem = self._plan_problem(gate.plan, contract) or self._idea_contract_problem(
+            pos, contract
+        )
         if problem:
             return self._refuse(source, action, gate, ref, account, [problem], now)
         try:
@@ -849,9 +1000,35 @@ class ExecutionCoordinator:
                 source, action, gate, ref, account, ["NO_TARGET_ORDER_TO_AMEND"], now
             )
         contract = _contract_from(pos.contract)
+        plan = gate.plan
+        if plan is None:
+            stop, target = action.stop_price, action.target_price
+        else:  # the gateway's levels, in the series the idea's protection lives in
+            stop = str(plan.stop) if plan.stop is not None else None
+            target = str(plan.target) if plan.target is not None else None
+            if (plan.protection_series == "REFERENCE") != (pos.protection_series == "REFERENCE"):
+                return self._refuse(
+                    source, action, gate, ref, account, ["PROTECTION_SERIES_MISMATCH"], now,
+                    idea_id=pos.idea_id,
+                )
+            if pos.backstop_ref and stop is not None and plan.backstop_stop is None:
+                return self._refuse(
+                    source, action, gate, ref, account, ["BACKSTOP_NOT_PRICED"], now,
+                    idea_id=pos.idea_id,
+                )
+            if contract is not None and self._key_for_plan(contract) != plan.execution_key:
+                return self._refuse(
+                    source, action, gate, ref, account, [CONTRACT_CHANGED], now,
+                    idea_id=pos.idea_id,
+                )
         if contract is not None:
+            reference_series = pos.protection_series == "REFERENCE"
             rules = _rule_problems(
-                contract, None, stop=_dec(action.stop_price), target=_dec(action.target_price)
+                contract,
+                None,
+                stop=None if reference_series else _dec(stop),
+                target=None if reference_series else _dec(target),
+                backstop=plan.backstop_stop if plan else None,
             )
             if rules:
                 return self._refuse(
@@ -867,8 +1044,9 @@ class ExecutionCoordinator:
             now,
             contract=contract,
             quantity=0,
-            stop_price=action.stop_price,
-            target_price=action.target_price,
+            stop_price=stop,
+            target_price=target,
+            plan=plan.model_dump_json() if plan else None,
         )
         with self.store.tx() as c:
             self.store.insert_intent(c, intent)
@@ -879,8 +1057,10 @@ class ExecutionCoordinator:
                 idea_id=pos.idea_id,
                 c=c,
                 action="MODIFY",
-                stop=action.stop_price,
-                target=action.target_price,
+                stop=stop,
+                target=target,
+                backstop=str(plan.backstop_stop) if plan and plan.backstop_stop else None,
+                basis=str(plan.basis_value) if plan and plan.basis_value is not None else None,
                 gate=gate.reasons,
             )
         self._apply_modify(self.store.intent(ref))
@@ -977,7 +1157,7 @@ class ExecutionCoordinator:
             open_by_ref = {o.order_ref: o for o in self.broker.open_orders()}
         except BrokerError:
             return ["BROKER_OPEN_ORDERS_UNAVAILABLE"]
-        for ref in (pos.stop_ref, pos.target_ref):
+        for ref in (pos.stop_ref, pos.target_ref, pos.backstop_ref):
             o = open_by_ref.get(ref) if ref else None
             if o is None:
                 continue
@@ -1535,11 +1715,14 @@ class ExecutionCoordinator:
                     stop_price=_dec(r.stop_price),
                     tif=(
                         self.config.protective_tif
-                        if r.role in (Role.STOP, Role.TARGET)
+                        if r.role in (Role.STOP, Role.TARGET, Role.BACKSTOP)
                         else TimeInForce.DAY
                     ),
                     parent_ref=r.parent_ref,
                     reduce_only=r.role != Role.ENTRY,
+                    condition=(
+                        PriceCondition.model_validate_json(r.condition) if r.condition else None
+                    ),
                 )
             )
         return built[0], built[1:]
@@ -1582,7 +1765,7 @@ class ExecutionCoordinator:
             self._protection_unverified(pos, str(exc))
             self._broker_unreadable("open_orders", exc)
             return
-        refs = [r for r in (pos.stop_ref, pos.target_ref) if r]
+        refs = [r for r in (pos.stop_ref, pos.target_ref, pos.backstop_ref) if r]
         if pos.quantity == 0:
             if pos.status == "PENDING":
                 return
@@ -1666,23 +1849,26 @@ class ExecutionCoordinator:
             return
         stop = open_by_ref.get(pos.stop_ref) if pos.stop_ref else None
         exit_side = OrderSide.SELL if pos.position_side == PositionSide.LONG else OrderSide.BUY
-        # Review F3: type, side, quantity AND price against the ledger's confirmed stop.
-        price_ok = stop is not None and stop.stop_price == _dec(pos.stop_price)
+        # Review F3: type, side, quantity AND price against the ledger's confirmed stop. A
+        # reference-triggered stop is confirmed only as a working conditional exit in the right
+        # contract, on the right reference series, direction and trigger level (multi-asset).
+        price_ok = stop is not None and self._stop_matches(stop, pos)
         # A PreSubmitted child is present only once its parent's fill is established by the
         # parent's own executions (at IBKR it is PreSubmitted before the fill as well).
         parent_ok = stop is not None and (
             stop.status != OrderStatus.PRE_SUBMITTED
             or self.store.filled_quantity(stop.parent_ref or pos.stop_ref.rsplit(".", 1)[0]) > 0
         )
+        backstop_problem = self._backstop_problem(pos, open_by_ref, cover, exit_side)
         if (
             stop is not None
             and stop.working
             and stop.status != OrderStatus.PENDING_CANCEL
             and stop.remaining == cover
-            and stop.order_type == OrderType.STP
             and stop.side == exit_side
             and price_ok
             and parent_ok
+            and backstop_problem is None
         ):
             self.store.update_position(idea_id, now, protection="CONFIRMED")
             if self.store.resolve_exceptions(now, UNPROTECTED_POSITION, idea_id=idea_id):
@@ -1694,15 +1880,58 @@ class ExecutionCoordinator:
             f"{stop.remaining if stop else 0} ({stop.status.value if stop else 'absent'})"
         )
         if stop is not None and not price_ok:
-            detail += (
-                f"; STOP_PRICE_MISMATCH: working stop {stop.stop_price}, ledger {pos.stop_price}"
+            working = (
+                f"condition {stop.condition.direction.value} {stop.condition.trigger_price} on "
+                f"{stop.condition.contract.contract_key}" if stop.condition
+                else f"{stop.order_type.value} {stop.stop_price}"
             )
+            detail += f"; STOP_PRICE_MISMATCH: working stop {working}, ledger {pos.stop_price}"
+        if backstop_problem:
+            detail += f"; {backstop_problem}"
         if self.store.raise_exception(
             now, UNPROTECTED_POSITION, detail, idea_id=idea_id, order_ref=pos.stop_ref
         ):
             self.store.log(
                 now, UNPROTECTED_POSITION, order_ref=pos.stop_ref, idea_id=idea_id, detail=detail
             )
+
+    @staticmethod
+    def _stop_matches(stop: BrokerOrder, pos: LedgerPosition) -> bool:
+        level = _dec(pos.stop_price)
+        if pos.protection_series != "REFERENCE":
+            return stop.order_type == OrderType.STP and stop.condition is None \
+                and stop.stop_price == level
+        c = stop.condition
+        long = pos.position_side == PositionSide.LONG
+        want = ConditionDirection.BELOW if long else ConditionDirection.ABOVE
+        return (
+            c is not None
+            and c.contract.contract_key == pos.reference_key
+            and c.direction == want
+            and c.trigger_price == level
+            and stop.order_type == c.released_order_type
+            and (pos.contract_key is None or stop.contract.contract_key == pos.contract_key)
+        )
+
+    @staticmethod
+    def _backstop_problem(pos, open_by_ref, cover: int, exit_side: OrderSide) -> str | None:
+        """A required backstop counts only as a working STP in the execution contract at the
+        ledger's backstop price covering the same quantity as the stop."""
+        if not pos.backstop_ref:
+            return None
+        b = open_by_ref.get(pos.backstop_ref)
+        if (
+            b is None
+            or not b.working
+            or b.status == OrderStatus.PENDING_CANCEL
+            or b.order_type != OrderType.STP
+            or b.side != exit_side
+            or b.remaining != cover
+            or b.stop_price != _dec(pos.backstop_price)
+        ):
+            have = f"{b.order_type.value} {b.stop_price} x{b.remaining}" if b else "absent"
+            return f"BACKSTOP_NOT_CONFIRMED: want STP {pos.backstop_price} x{cover}, have {have}"
+        return None
 
     def _protection_unverified(self, pos: LedgerPosition, error: str) -> None:
         """The broker could not be read: protection is UNKNOWN until a later check succeeds."""
@@ -1742,9 +1971,14 @@ class ExecutionCoordinator:
         """
         pos = self.store.position(intent.idea_id)
         now = self.clock()
+        reference_series = pos.protection_series == "REFERENCE"
+        level_field = "trigger_price" if reference_series else "stop_price"
+        plan = _plan_of(intent.plan)
         wanted = [
-            (pos.stop_ref, "stop_price", _dec(intent.stop_price)),
-            (pos.target_ref, "limit_price", _dec(intent.target_price)),
+            (pos.stop_ref, level_field, _dec(intent.stop_price)),
+            (pos.target_ref, "trigger_price" if reference_series else "limit_price",
+             _dec(intent.target_price)),
+            (pos.backstop_ref, "stop_price", plan.backstop_stop if plan else None),
         ]
         wanted = [(ref, field, price) for ref, field, price in wanted if price is not None and ref]
         try:
@@ -1753,7 +1987,7 @@ class ExecutionCoordinator:
             self._mark_unresolved(intent, "LOOKUP_FAILED", str(exc))
             return
         pending = [
-            (r, f, p) for r, f, p in wanted if r in open_by_ref and getattr(open_by_ref[r], f) != p
+            (r, f, p) for r, f, p in wanted if r in open_by_ref and _field(open_by_ref[r], f) != p
         ]
         missing = [r for r, _, _ in wanted if r not in open_by_ref]
         if missing:
@@ -1774,7 +2008,13 @@ class ExecutionCoordinator:
             for ref, field, price in pending:
                 self.store.log(self.clock(), "AMEND_SUBMIT", order_ref=ref, idea_id=intent.idea_id)
                 try:
-                    self.broker.modify(ref, **{field: price})
+                    if field == "trigger_price":
+                        amend = getattr(self.broker, "modify_condition", None)
+                        if not callable(amend):
+                            raise BrokerError("broker cannot amend price conditions")
+                        amend(ref, trigger_price=price)
+                    else:
+                        self.broker.modify(ref, **{field: price})
                     self.store.log(
                         self.clock(),
                         "AMEND",
@@ -1796,20 +2036,23 @@ class ExecutionCoordinator:
                 self._mark_unresolved(intent, "LOOKUP_FAILED", str(exc))
                 return
         unconfirmed = [
-            r for r, f, p in wanted if r not in open_by_ref or getattr(open_by_ref[r], f) != p
+            r for r, f, p in wanted if r not in open_by_ref or _field(open_by_ref[r], f) != p
         ]
         if unconfirmed:
             self._modify_failed(intent, f"amendment not visible at broker: {unconfirmed}")
             return
         fields = {}
         for ref, field, price in wanted:
+            column = "limit_price" if field == "limit_price" else "stop_price"
             self.store.update_order(
-                ref,
-                now,
-                status=open_by_ref[ref].status.value,
-                **{"stop_price" if field == "stop_price" else "limit_price": str(price)},
+                ref, now, status=open_by_ref[ref].status.value, **{column: str(price)}
             )
-            fields["stop_price" if field == "stop_price" else "target_price"] = str(price)
+            if ref == pos.backstop_ref:
+                fields["backstop_price"] = str(price)
+            elif ref == pos.stop_ref:
+                fields["stop_price"] = str(price)
+            else:
+                fields["target_price"] = str(price)
         self.store.update_position(intent.idea_id, now, **fields)
         self.store.set_state(intent.order_ref, IntentState.APPLIED, now)
         self.store.log(
@@ -2050,6 +2293,8 @@ class ExecutionCoordinator:
         assert action.instrument is not None
         if contract is not None:
             fields.update(contract_key=contract.contract_key, contract=contract.model_dump_json())
+        if gate.plan is not None:
+            fields.setdefault("plan", gate.plan.model_dump_json())
         return Intent(
             order_ref=ref,
             source_id=source.source_id,
@@ -2085,11 +2330,14 @@ class ExecutionCoordinator:
             if ledger is not None:
                 self.store.insert_position(c, ledger)
             for o in orders:
-                r = (
-                    role
-                    if o.parent_ref is None
-                    else (Role.STOP if o.order_type == OrderType.STP else Role.TARGET)
-                )
+                if o.parent_ref is None:
+                    r = role
+                elif o.order_ref == backstop_ref(o.parent_ref):
+                    r = Role.BACKSTOP
+                elif o.condition is not None:
+                    r = Role.STOP if o.order_ref == stop_ref(o.parent_ref) else Role.TARGET
+                else:
+                    r = Role.STOP if o.order_type == OrderType.STP else Role.TARGET
                 self.store.insert_order(
                     c,
                     OrderRow(
@@ -2104,9 +2352,13 @@ class ExecutionCoordinator:
                         quantity=o.quantity,
                         order_type=o.order_type.value,
                         limit_price=str(o.limit_price) if o.limit_price else None,
-                        stop_price=str(o.stop_price) if o.stop_price else None,
+                        stop_price=(
+                            str(o.stop_price) if o.stop_price
+                            else str(o.condition.trigger_price) if o.condition else None
+                        ),
                         status="Recorded",
                         updated_at=intent.created_at,
+                        condition=o.condition.model_dump_json() if o.condition else None,
                     ),
                 )
             self.store.log(

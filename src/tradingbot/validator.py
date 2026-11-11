@@ -15,13 +15,26 @@ quantity, venue or account. Engines apply fictional fills only after an APPROVE.
 from __future__ import annotations
 
 import re
-from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation
+from datetime import UTC, date, datetime, timedelta
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, InvalidOperation
+from zoneinfo import ZoneInfo
 
 from tradingbot.event_models import PriceBasis, ReplaySource, Timing, TradeAction
 from tradingbot.models import (
-    Action, AssetClass, Decision, GateDecision, MockPolicy, Position, PositionSide,
-    Quote, SignalCandidate, SourceEvent,
+    Action,
+    AssetClass,
+    Decision,
+    ExecutionPlan,
+    GateDecision,
+    LegQuote,
+    MappedQuote,
+    MarketTerms,
+    MockPolicy,
+    Position,
+    PositionSide,
+    Quote,
+    SignalCandidate,
+    SourceEvent,
 )
 
 SYMBOL_RE = re.compile(r"^[A-Z][A-Z0-9.]{0,9}$")
@@ -142,6 +155,10 @@ def gate_action(
     if a.instrument is None:
         return _gate("HOLD", "ORDERABLE_INSTRUMENT_MISSING")
     inst = a.instrument
+    if isinstance(quote, MappedQuote):
+        # An owner-approved mapping (runtime/mapping.py, version 2) relates the publisher's series
+        # to the execution contract; every price is checked in the series it belongs to.
+        return _gate_mapped(a, published_at, quote, policy, position, now, supported_actions)
     if a.price_basis != PriceBasis.TRADED_CONTRACT:
         return _gate("HOLD", "SOURCE_TO_BROKER_PRICE_BASIS_UNRESOLVED")
     if not a.source_market_symbol:
@@ -262,12 +279,408 @@ def _gate_follow_up(a: TradeAction, quote: Quote, policy: MockPolicy, position: 
     return _gate("HOLD", "UNKNOWN_ACTION")
 
 
+# ----------------------------------------------------------------------------- mapped families
+#
+# Reached only with a ``MappedQuote``: the runtime built it from an owner-approved mapping entry,
+# the selected execution contract and the broker's quotes of both legs. A stock or ETF quoted in
+# its own price never gets one, so its path above is unchanged. Treatments:
+#   DIRECT             levels are the execution instrument's own prices.
+#   BASIS_SHIFT        levels are converted with the basis (execution mid - reference mid) seen at
+#                      this decision from two live, fresh, near-simultaneous quotes, within a cap.
+#   REFERENCE_TRIGGER  the entry is priced from the execution quote; stop and target stay in
+#                      reference levels and are held as broker-side conditions on the reference.
+#   UNSUPPORTED        always HOLD.
+# A reference level is never used as an execution price.
+
+ROLL_WINDOW = "CONTRACT_IN_ROLL_WINDOW"
+OUTSIDE_SESSION = "OUTSIDE_PERMITTED_SESSION"
+MAPPING_NOT_APPROVED = "MAPPING_NOT_APPROVED"
+UNSUPPORTED_MAPPING = "UNSUPPORTED_INSTRUMENT_MAPPING"
+
+
+def business_days_until(today: date, target: date, holidays=()) -> int:
+    """Business days d with today < d <= target (weekends and ``holidays`` excluded); negative
+    when ``target`` has passed."""
+    if target < today:
+        return -business_days_until(target, today, holidays)
+    n, d, off = 0, today, set(holidays)
+    while d < target:
+        d += timedelta(days=1)
+        if d.weekday() < 5 and d not in off:
+            n += 1
+    return n
+
+
+def in_roll_window(t: MarketTerms, now: datetime) -> bool:
+    """Inside the last ``roll_business_days`` business days before the contract's roll date (or
+    past it): no new exposure may be taken in it."""
+    if t.roll_date is None or t.roll_business_days is None:
+        return False
+    today = now.astimezone(ZoneInfo(t.session_timezone)).date()
+    return business_days_until(today, t.roll_date, t.holidays) <= t.roll_business_days
+
+
+def in_windows(windows, days, tz: str, now: datetime) -> bool:
+    local = now.astimezone(ZoneInfo(tz))
+    minute = local.hour * 60 + local.minute
+    return local.weekday() in days and any(a <= minute < b for a, b in windows)
+
+
+def _mid(leg: LegQuote) -> Decimal | None:
+    if leg.bid is not None and leg.ask is not None and leg.bid > 0 and leg.ask >= leg.bid:
+        return (leg.bid + leg.ask) / 2
+    return leg.last if leg.last is not None and leg.last > 0 else None
+
+
+def _leg_problem(leg: LegQuote | None, t: MarketTerms, now: datetime, max_age: float,
+                 *, need_touch: bool = True) -> str | None:
+    if leg is None or leg.quality == "UNAVAILABLE":
+        return "UNAVAILABLE"
+    if leg.quality not in t.accepted_qualities:
+        return f"QUALITY_{leg.quality}"
+    age = (now - leg.observed_at).total_seconds()
+    if age < -5 or age > max_age:
+        return "STALE"
+    if need_touch and (leg.bid is None or leg.ask is None or leg.bid <= 0 or leg.ask < leg.bid):
+        return "INVALID_BID_ASK"
+    if _mid(leg) is None:
+        return "NO_PRICE"
+    return None
+
+
+def _touch(leg: LegQuote, buy: bool) -> Decimal:
+    """The price a buy (ask) or sell (bid) trades against; a reference series that reports only a
+    last price uses that."""
+    side = leg.ask if buy else leg.bid
+    return side if side is not None and side > 0 else (leg.last or Decimal(0))
+
+
+def _basis(q: MappedQuote, now: datetime) -> tuple[ExecutionPlan | None, list[str]]:
+    """The basis observed now from two live, fresh, near-simultaneous quotes, within its cap."""
+    t = q.terms
+    age = t.max_basis_age_seconds or 0
+    execution = LegQuote(contract_key=t.execution_key, bid=q.bid, ask=q.ask,
+                         observed_at=q.observed_at, quality=q.quality)
+    for name, leg in (("EXECUTION", execution), ("REFERENCE", q.reference)):
+        problem = _leg_problem(leg, t, now, age, need_touch=(name == "EXECUTION"))
+        if problem:
+            return None, ["BASIS_QUOTE_UNUSABLE", f"{name}_QUOTE_{problem}"]
+    skew = abs((execution.observed_at - q.reference.observed_at).total_seconds())
+    if skew > age:
+        return None, ["BASIS_QUOTE_UNUSABLE", "QUOTES_NOT_SIMULTANEOUS"]
+    em, rm = _mid(execution), _mid(q.reference)
+    basis = em - rm
+    if t.max_abs_basis is None or abs(basis) > t.max_abs_basis:
+        return None, ["BASIS_EXCEEDS_CAP", f"BASIS:{basis}"]
+    plan = ExecutionPlan(family=t.family, basis=t.basis, execution_key=t.execution_key,
+                         basis_value=basis, basis_execution_mid=em, basis_reference_mid=rm,
+                         basis_observed_at=min(execution.observed_at, q.reference.observed_at))
+    return plan, []
+
+
+def _snap(price: Decimal, tick: Decimal, rounding: str) -> Decimal:
+    return (price / tick).to_integral_value(rounding) * tick
+
+
+def _shift_protection(level: Decimal, basis: Decimal, tick: Decimal, long: bool, kind: str):
+    """A converted stop moves to the tick nearer the market side that protects the position (never
+    looser); a converted target to the tick nearer the entry (never further)."""
+    raw = level + basis
+    tighter = ROUND_CEILING if long else ROUND_FLOOR
+    nearer = ROUND_FLOOR if long else ROUND_CEILING
+    return _snap(raw, tick, tighter if kind == "stop" else nearer)
+
+
+def _gate_mapped(a: TradeAction, published_at: datetime, q: MappedQuote, policy: MockPolicy,
+                 position: Position | None, now: datetime,
+                 supported_actions: frozenset[Action]) -> GateDecision:
+    t = q.terms
+    inst = a.instrument
+    assert inst is not None
+    if not t.approved:
+        return _gate("HOLD", MAPPING_NOT_APPROVED, f"FAMILY:{t.family}")
+    if t.basis == "UNSUPPORTED":
+        return _gate("HOLD", UNSUPPORTED_MAPPING, f"FAMILY:{t.family}")
+    if t.problems:
+        return _gate("HOLD", *t.problems)
+    if a.source_market_symbol != t.family.removesuffix(".OPT"):
+        return _gate("HOLD", "SOURCE_TO_BROKER_MAPPING_UNAPPROVED")
+    if a.price_basis == PriceBasis.UNKNOWN:
+        return _gate("HOLD", "SOURCE_TO_BROKER_PRICE_BASIS_UNRESOLVED")
+    if inst.quote_key != t.execution_key or inst.symbol != t.execution_symbol:
+        return _gate("BLOCK", "QUOTE_INSTRUMENT_MISMATCH")
+    if not SYMBOL_RE.fullmatch(inst.symbol):
+        return _gate("BLOCK", "INVALID_SYMBOL")
+    if policy.allowed_symbols is not None and inst.symbol not in policy.allowed_symbols:
+        return _gate("BLOCK", "INSTRUMENT_NOT_ALLOWLISTED")
+    if a.action not in supported_actions:
+        return _gate("HOLD", "ACTION_UNSUPPORTED")
+    if published_at.tzinfo is None:
+        return _gate("BLOCK", "SOURCE_TIMEZONE_MISSING")
+    if not source_is_fresh(published_at, now, policy):
+        return _gate("BLOCK", "SOURCE_STALE_OR_FUTURE")
+    if (position is not None and position.contract_key and t.execution_contract_key
+            and position.contract_key != t.execution_contract_key):
+        return _gate("BLOCK", "IDEA_CONTRACT_MISMATCH")
+    trades_now = a.action in (Action.OPEN, Action.ADD, Action.REDUCE, Action.CLOSE)
+    if trades_now and not in_windows(t.permitted_windows, t.session_days, t.session_timezone, now):
+        return _gate("HOLD", OUTSIDE_SESSION)
+    if a.action in (Action.OPEN, Action.ADD) and in_roll_window(t, now):
+        return _gate("HOLD", ROLL_WINDOW, f"ROLL_DATE:{t.roll_date}")
+    # The execution instrument's own quote.
+    execution = LegQuote(contract_key=t.execution_key, bid=q.bid, ask=q.ask,
+                         observed_at=q.observed_at, quality=q.quality)
+    problem = _leg_problem(execution, t, now, policy.max_quote_age_seconds)
+    if problem:
+        legacy = {"UNAVAILABLE": "QUOTE_UNAVAILABLE", "STALE": "QUOTE_STALE_OR_FUTURE",
+                  "INVALID_BID_ASK": "INVALID_BID_ASK", "NO_PRICE": "QUOTE_UNAVAILABLE"}
+        return _gate("BLOCK", legacy.get(problem, f"QUOTE_{problem}"))
+    spread_pct = (q.ask - q.bid) / ((q.bid + q.ask) / 2) * 100
+    if spread_pct > policy.max_spread_pct:
+        return _gate("BLOCK", "SPREAD_TOO_WIDE")
+    if a.action == Action.OPEN:
+        return _mapped_open(a, q, policy, now)
+    return _mapped_follow_up(a, q, policy, position, now)
+
+
+def _reference_leg(q: MappedQuote, policy: MockPolicy, now: datetime) -> GateDecision | None:
+    problem = _leg_problem(q.reference, q.terms, now, policy.max_quote_age_seconds,
+                           need_touch=False)
+    return _gate("HOLD", f"REFERENCE_QUOTE_{problem}") if problem else None
+
+
+def _mapped_levels(a: TradeAction) -> tuple[Decimal | None, Decimal | None, GateDecision | None]:
+    stop, target = _num(a.stop_price), _num(a.target_price)
+    if a.stop_price is not None and stop is None:
+        return None, None, _gate("BLOCK", "INVALID_STOP_PRICE")
+    if a.target_price is not None and target is None:
+        return None, None, _gate("BLOCK", "INVALID_TARGET_PRICE")
+    return stop, target, None
+
+
+def _off_tick(t: MarketTerms, **prices) -> GateDecision | None:
+    bad = [f"{k.upper()}_PRICE_OFF_TICK" for k, p in prices.items()
+           if p is not None and p % t.min_tick != 0]
+    return _gate("BLOCK", *bad) if bad else None
+
+
+def _mapped_open(a: TradeAction, q: MappedQuote, policy: MockPolicy, now: datetime) -> GateDecision:
+    t = q.terms
+    if a.idea_reference is not None:
+        return _gate("HOLD", "OPEN_SHOULD_NOT_REFERENCE_EXISTING_IDEA")
+    if a.position_side is None:
+        return _gate("HOLD", "DIRECTION_MISSING")
+    long = a.position_side == PositionSide.LONG
+    if not long and not t.allow_short:
+        return _gate("HOLD", "SHORT_NOT_PERMITTED_FOR_FAMILY")
+    ref = _num(a.entry_reference)
+    if ref is None:
+        return _gate("HOLD", "OPEN_ENTRY_PRICE_MISSING")
+    stop, target, bad = _mapped_levels(a)
+    if bad:
+        return bad
+    if policy.require_stop_on_open and stop is None:
+        return _gate("HOLD", "PROTECTIVE_STOP_MISSING")
+    # Direction checks in the publisher's own series (both sides of each comparison are there).
+    if stop is not None and (stop >= ref if long else stop <= ref):
+        return _gate("BLOCK", "STOP_DIRECTION_CONTRADICTION")
+    if target is not None and (target <= ref if long else target >= ref):
+        return _gate("BLOCK", "TARGET_DIRECTION_CONTRADICTION")
+    band = policy.max_price_deviation_pct
+    exec_touch = q.ask if long else q.bid
+    plan = ExecutionPlan(family=t.family, basis=t.basis, execution_key=t.execution_key,
+                         quantity=t.units_per_signal, entry_reference=ref,
+                         publisher_stop=stop, publisher_target=target)
+    if t.basis == "DIRECT":
+        bad = _off_tick(t, stop=stop, target=target)
+        if bad:
+            return bad
+        if abs(exec_touch - ref) / ref * 100 > band:
+            return _gate("BLOCK", "ENTRY_PRICE_COLLAR")
+        if stop is not None and (stop >= q.bid if long else stop <= q.ask):
+            return _gate("BLOCK", "STOP_ALREADY_CROSSED_AT_ENTRY")
+        plan = plan.model_copy(update={"execution_reference": ref, "stop": stop, "target": target})
+    elif t.basis == "BASIS_SHIFT":
+        shifted, reasons = _basis(q, now)
+        if shifted is None:
+            return _gate("HOLD", *reasons)
+        b = shifted.basis_value
+        entry = ref + b
+        stop_x = _shift_protection(stop, b, t.min_tick, long, "stop") if stop is not None else None
+        target_x = (_shift_protection(target, b, t.min_tick, long, "target")
+                    if target is not None else None)
+        if abs(exec_touch - entry) / entry * 100 > band:
+            return _gate("BLOCK", "ENTRY_PRICE_COLLAR")
+        if stop_x is not None and (stop_x >= q.bid if long else stop_x <= q.ask):
+            return _gate("BLOCK", "STOP_ALREADY_CROSSED_AT_ENTRY")
+        plan = plan.model_copy(update={
+            **shifted.model_dump(include={"basis_value", "basis_execution_mid",
+                                          "basis_reference_mid", "basis_observed_at"}),
+            "execution_reference": entry, "stop": stop_x, "target": target_x})
+    else:  # REFERENCE_TRIGGER
+        if not in_windows(t.reference_windows, t.session_days, t.session_timezone, now):
+            return _gate("HOLD", "REFERENCE_SERIES_NOT_UPDATING")
+        held = _reference_leg(q, policy, now)
+        if held:
+            return held
+        ref_touch = _touch(q.reference, long)
+        if abs(ref_touch - ref) / ref * 100 > band:
+            return _gate("BLOCK", "ENTRY_PRICE_COLLAR")
+        ref_bid, ref_ask = _touch(q.reference, False), _touch(q.reference, True)
+        if stop is not None and (stop >= ref_bid if long else stop <= ref_ask):
+            return _gate("BLOCK", "STOP_ALREADY_CROSSED_AT_ENTRY")
+        plan = plan.model_copy(update={
+            "execution_reference": exec_touch, "stop": stop, "target": target,
+            "protection_series": "REFERENCE", "reference_contract_key": t.reference_contract_key,
+            "reference_contract": t.reference_contract})
+        if t.require_backstop:
+            if stop is None:
+                return _gate("HOLD", "BACKSTOP_NEEDS_A_STOP")
+            shifted, reasons = _basis(q, now)
+            if shifted is None:
+                return _gate("HOLD", "BACKSTOP_UNPRICEABLE", *reasons)
+            backstop = _shift_protection(stop, shifted.basis_value, t.min_tick, long, "stop")
+            if backstop >= q.bid if long else backstop <= q.ask:
+                return _gate("BLOCK", "BACKSTOP_ALREADY_CROSSED_AT_ENTRY")
+            plan = plan.model_copy(update={
+                **shifted.model_dump(include={"basis_value", "basis_execution_mid",
+                                              "basis_reference_mid", "basis_observed_at"}),
+                "backstop_stop": backstop})
+    qty = t.units_per_signal
+    if qty > t.max_units or qty % t.size_increment:
+        return _gate("BLOCK", "UNIT_CAP_OR_INCREMENT")
+    notional = plan.execution_reference * qty * t.multiplier
+    if notional > min(t.max_notional, policy.max_notional_usd):
+        return _gate("BLOCK", "NOTIONAL_LIMIT")
+    return _gate_plan(plan, "PAPER_OPEN", f"MAPPING_{t.basis}")
+
+
+def _gate_plan(plan: ExecutionPlan, *reasons: str) -> GateDecision:
+    return GateDecision(status="APPROVE", reasons=list(reasons), plan=plan)
+
+
+def _mapped_follow_up(a: TradeAction, q: MappedQuote, policy: MockPolicy,
+                      position: Position | None, now: datetime) -> GateDecision:
+    t = q.terms
+    inst = a.instrument
+    assert inst is not None
+    if not a.idea_reference or position is None or position.idea_id != a.idea_reference \
+            or position.quantity <= 0:
+        return _gate("HOLD", "REFERENCED_ACTIVE_IDEA_NOT_FOUND")
+    if position.symbol != inst.symbol or position.asset_class != inst.asset_class:
+        return _gate("BLOCK", "IDEA_INSTRUMENT_MISMATCH")
+    if a.position_side is not None and a.position_side != position.side:
+        return _gate("BLOCK", "IDEA_SIDE_MISMATCH")
+    long = position.side == PositionSide.LONG
+    reference_series = t.basis == "REFERENCE_TRIGGER"
+    base = ExecutionPlan(family=t.family, basis=t.basis, execution_key=t.execution_key,
+                         protection_series="REFERENCE" if reference_series else "EXECUTION",
+                         reference_contract_key=t.reference_contract_key,
+                         reference_contract=t.reference_contract)
+    if a.action in (Action.CLOSE, Action.REDUCE):
+        if a.action == Action.REDUCE:
+            fraction = _num(a.close_fraction)
+            if fraction is None or fraction > 1:
+                return _gate("HOLD", "REDUCTION_FRACTION_UNDEFINED")
+            units = Decimal(position.quantity) * fraction
+            if units < 1 or units != units.to_integral_value():
+                return _gate("HOLD", "NON_INTEGER_REDUCTION")
+            if int(units) % t.size_increment:
+                return _gate("HOLD", "REDUCTION_OFF_SIZE_INCREMENT")
+        return _gate_plan(base, "PAPER_REDUCE_ONLY", f"MAPPING_{t.basis}")
+    # The series the position's protection lives in, and the market it is compared against.
+    if reference_series:
+        held = _reference_leg(q, policy, now)
+        if held:
+            return held
+        bid, ask = _touch(q.reference, False), _touch(q.reference, True)
+    else:
+        bid, ask = q.bid, q.ask
+    if a.action == Action.ADD:
+        prior_stop = _num(position.stop_price)
+        if prior_stop is not None and (prior_stop >= bid if long else prior_stop <= ask):
+            return _gate("HOLD", "EXISTING_STOP_ALREADY_CROSSED")
+        ref = _num(a.entry_reference)
+        if ref is None:
+            return _gate("HOLD", "ADD_ENTRY_REFERENCE_MISSING")
+        exec_touch = q.ask if long else q.bid
+        if t.basis == "DIRECT":
+            entry = ref
+        elif t.basis == "BASIS_SHIFT":
+            shifted, reasons = _basis(q, now)
+            if shifted is None:
+                return _gate("HOLD", *reasons)
+            entry = ref + shifted.basis_value
+            base = base.model_copy(update=shifted.model_dump(
+                include={"basis_value", "basis_execution_mid", "basis_reference_mid",
+                         "basis_observed_at"}))
+        else:
+            entry = exec_touch
+            if abs((ask if long else bid) - ref) / ref * 100 > policy.max_price_deviation_pct:
+                return _gate("BLOCK", "ENTRY_PRICE_COLLAR")
+        if abs(exec_touch - entry) / entry * 100 > policy.max_price_deviation_pct:
+            return _gate("BLOCK", "ENTRY_PRICE_COLLAR")
+        qty = t.units_per_signal
+        if position.quantity + qty > t.max_units:
+            return _gate("BLOCK", "UNIT_CAP")
+        if entry * (position.quantity + qty) * t.multiplier > min(t.max_notional,
+                                                                   policy.max_notional_usd):
+            return _gate("BLOCK", "NOTIONAL_LIMIT")
+        plan = base.model_copy(update={"quantity": qty, "entry_reference": ref,
+                                       "execution_reference": entry})
+        return _gate_plan(plan, "PAPER_ADD", f"MAPPING_{t.basis}")
+    if a.action == Action.MODIFY:
+        if a.stop_price is None and a.target_price is None:
+            return _gate("HOLD", "NO_FIELDS_TO_MODIFY")
+        stop, target, bad = _mapped_levels(a)
+        if bad:
+            return bad
+        plan = base.model_copy(update={"publisher_stop": stop, "publisher_target": target})
+        if t.basis == "BASIS_SHIFT" or (reference_series and t.require_backstop
+                                        and stop is not None):
+            shifted, reasons = _basis(q, now)
+            if shifted is None:
+                return _gate("HOLD", *reasons)
+            b = shifted.basis_value
+            plan = plan.model_copy(update=shifted.model_dump(
+                include={"basis_value", "basis_execution_mid", "basis_reference_mid",
+                         "basis_observed_at"}))
+            if t.basis == "BASIS_SHIFT":
+                stop = _shift_protection(stop, b, t.min_tick, long, "stop") if stop else None
+                target = (_shift_protection(target, b, t.min_tick, long, "target")
+                          if target else None)
+            else:
+                backstop = _shift_protection(stop, b, t.min_tick, long, "stop")
+                if backstop >= q.bid if long else backstop <= q.ask:
+                    return _gate("BLOCK", "BACKSTOP_ON_WRONG_SIDE_OF_MARKET")
+                plan = plan.model_copy(update={"backstop_stop": backstop})
+        elif t.basis == "DIRECT":
+            bad = _off_tick(t, stop=stop, target=target)
+            if bad:
+                return bad
+        if stop is not None:
+            old_stop = _num(position.stop_price)
+            if old_stop is not None and (stop < old_stop if long else stop > old_stop):
+                return _gate("HOLD", "STOP_WIDENING_REQUIRES_POLICY_REVIEW")
+            if stop >= bid if long else stop <= ask:
+                return _gate("BLOCK", "STOP_ON_WRONG_SIDE_OF_MARKET")
+        if target is not None and (target <= bid if long else target >= ask):
+            return _gate("BLOCK", "TARGET_ON_WRONG_SIDE_OF_MARKET")
+        plan = plan.model_copy(update={"stop": stop, "target": target})
+        return _gate_plan(plan, "PAPER_PROTECTION_AMENDMENT", f"MAPPING_{t.basis}")
+    return _gate("HOLD", "UNKNOWN_ACTION")
+
+
 # ----------------------------------------------------------------------------- sizing
 
 def fill_quantity(action: Action, policy: MockPolicy, position: Position | None,
-                  close_fraction: str | None = None) -> int:
+                  close_fraction: str | None = None, *, per_signal: int | None = None) -> int:
     """Deterministic fictional fill size. Only policy and ledger state decide; never model output.
-    Call after an APPROVE; raises if the inputs could not have been approved."""
+    Call after an APPROVE; raises if the inputs could not have been approved. ``per_signal`` is
+    the units per signal of an approved mapping entry (multi-asset mapping, from the gateway's
+    plan); without it the policy sizes exactly as before."""
+    if action in (Action.OPEN, Action.ADD) and per_signal is not None:
+        return per_signal
     if action == Action.OPEN:
         return policy.quantity
     if action == Action.ADD:
@@ -331,7 +744,7 @@ def validate(
     A manual-demo SourceEvent carries no provenance metadata, so no post-level gate applies here;
     the Sprint 1.1 adapter path supplies that through ``gate_source``.
     """
-    now = now or datetime.now(timezone.utc)
+    now = now or datetime.now(UTC)
     if signal.action == Action.NO_TRADE:
         return Decision(status="NO_TRADE", reasons=[signal.reason or "NOT_ACTIONABLE"])
     gate = gate_action(as_trade_action(signal), source.published_at, quote, policy, position,
