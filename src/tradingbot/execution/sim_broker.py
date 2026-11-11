@@ -5,9 +5,19 @@ the execution core: brackets whose children wait (PreSubmitted) until the parent
 sized to the filled quantity, one-cancels-other children, stop and limit triggers on later quotes,
 reduce-only orders that can never open or reverse a position, and order refs echoed on every row.
 
-Failure behaviours are scripted by the test (``script_next_submit`` / ``script_next_modify``); the
-script lives in memory, everything the broker "knows" lives in SQLite and survives a restart. No
-network, no real broker, invented data only.
+Failure behaviours are scripted by the test (``script_next_submit`` / ``script_next_modify`` /
+``script_next_cancel``); the script lives in memory, everything the broker "knows" lives in SQLite
+and survives a restart. No network, no real broker, invented data only.
+
+``strict=True`` removes the kindnesses an Interactive Brokers account does not offer (safety review
+"SimBroker kinder than IBKR"): no reduce-only clamp (an oversized exit really reverses the
+position), protective children keep the quantity they were submitted with (they neither grow with
+the parent's fills nor shrink when a sibling partly fills; a sibling's complete fill still cancels
+them, one-cancels-other), ``executions()`` covers the current (UTC) day only, and cancels and
+modifies pass through a pending state (``PendingCancel`` / an unapplied amendment) that takes effect
+only after ``pending_seconds`` and at the next broker interaction, during which the order can still
+fill (``script_next_cancel("FILL_FIRST")`` / ``script_next_modify("FILL_FIRST")`` make a fill win
+the race deterministically). ``open_orders_lag_seconds`` can additionally hide fresh orders.
 """
 
 from __future__ import annotations
@@ -64,6 +74,12 @@ CREATE TABLE IF NOT EXISTS sim_orders (
     reason TEXT NOT NULL DEFAULT '',
     held INTEGER NOT NULL DEFAULT 0,
     placed_at TEXT,
+    pending_action TEXT,
+    pending_quantity INTEGER,
+    pending_limit TEXT,
+    pending_stop TEXT,
+    pending_at TEXT,
+    pending_race TEXT,
     updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS sim_orders_ref ON sim_orders(order_ref);
@@ -150,13 +166,26 @@ def _s(value: Decimal | None) -> str | None:
 
 
 class SimBroker:
-    def __init__(self, db_path: str | Path, *, account: str = "SIM-PAPER-0001", clock=None):
+    def __init__(
+        self,
+        db_path: str | Path,
+        *,
+        account: str = "SIM-PAPER-0001",
+        clock=None,
+        strict: bool = False,
+        pending_seconds: float = 0.0,
+    ):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.account = account
         self.clock = clock or (lambda: datetime.now(UTC))
         self._submit_script: deque[_Script] = deque()
         self._modify_script: deque[str] = deque()
+        self._cancel_script: deque[str] = deque()
+        self.strict = strict
+        # Strict mode: a cancel or modify takes effect this long after the request, and only at the
+        # next broker interaction (0 = at the next interaction).
+        self.pending_seconds = pending_seconds
         self.lookup_failures = 0  # next N open_orders()/executions() calls raise BrokerError
         self.submit_calls = 0
         # IBKR realism, off by default: a freshly placed order is invisible to open_orders() for
@@ -166,8 +195,17 @@ class SimBroker:
         with self._tx() as c:
             c.executescript(SCHEMA)
             cols = {r["name"] for r in c.execute("PRAGMA table_info(sim_orders)")}
-            if "placed_at" not in cols:
-                c.execute("ALTER TABLE sim_orders ADD COLUMN placed_at TEXT")
+            for col, kind in (
+                ("placed_at", "TEXT"),
+                ("pending_action", "TEXT"),
+                ("pending_quantity", "INTEGER"),
+                ("pending_limit", "TEXT"),
+                ("pending_stop", "TEXT"),
+                ("pending_at", "TEXT"),
+                ("pending_race", "TEXT"),
+            ):
+                if col not in cols:
+                    c.execute(f"ALTER TABLE sim_orders ADD COLUMN {col} {kind}")
 
     # ------------------------------------------------------------------ plumbing
 
@@ -226,8 +264,14 @@ class SimBroker:
         self._submit_script.append(_Script(Behaviour(behaviour), quantity, reason))
 
     def script_next_modify(self, behaviour: str) -> None:
-        """``LOST_ACK_APPLIED`` | ``LOST_ACK_NOT_APPLIED`` | ``REJECT``"""
+        """``LOST_ACK_APPLIED`` | ``LOST_ACK_NOT_APPLIED`` | ``REJECT`` | ``FILL_FIRST`` (strict:
+        the order fills its remaining quantity before the amendment takes effect)"""
         self._modify_script.append(behaviour)
+
+    def script_next_cancel(self, behaviour: str) -> None:
+        """``FILL_FIRST`` (strict: the order fills its remaining quantity before the cancel takes
+        effect, so the cancel loses the race) | ``REJECT`` (the cancel request fails)"""
+        self._cancel_script.append(behaviour)
 
     def set_quote(
         self,
@@ -242,6 +286,7 @@ class SimBroker:
         """Publish a quote and run every working order against it (stops, targets, limits)."""
         at = received_at or self._now()
         with self._tx() as c:
+            self._settle(c)
             c.execute(
                 """INSERT INTO sim_quotes (symbol,bid,ask,last,received_at,quality)
                 VALUES (?,?,?,?,?,?)
@@ -261,6 +306,7 @@ class SimBroker:
     def fill(self, order_ref: str, quantity: int | None = None, price: str | Decimal | None = None):
         """Fill a working order now (a resting or partially filled order completing later)."""
         with self._tx() as c:
+            self._settle(c)
             row = self._working_row(c, order_ref)
             qty = quantity or (row["quantity"] - row["filled_quantity"])
             if price is None:
@@ -324,6 +370,7 @@ class SimBroker:
             raise AckLost("simulated: request lost before reaching the broker")
         now = self._now().isoformat()
         with self._tx() as c:
+            self._settle(c)
             ids = []
             for idx, item in enumerate([order, *children]):
                 status = OrderStatus.PRE_SUBMITTED if item.parent_ref else OrderStatus.SUBMITTED
@@ -407,11 +454,36 @@ class SimBroker:
         if behaviour == "LOST_ACK_NOT_APPLIED":
             raise AckLost("simulated: modify lost before reaching the broker")
         with self._tx() as c:
+            self._settle(c)
             row = self._working_row(c, order_ref)
             if behaviour == "REJECT":
                 raise BrokerError("simulated: modify rejected")
             if quantity is not None and quantity < row["filled_quantity"]:
                 raise BrokerError("cannot size an order below its filled quantity")
+            if self.strict:
+                if row["status"] == OrderStatus.PENDING_CANCEL.value:
+                    raise BrokerError("simulated: cannot modify an order that is pending cancel")
+                # The amendment is pending: the order keeps working on its old terms until then.
+                c.execute(
+                    """UPDATE sim_orders SET pending_action='MODIFY',
+                    pending_quantity=COALESCE(?,pending_quantity),
+                    pending_limit=COALESCE(?,pending_limit), pending_stop=COALESCE(?,pending_stop),
+                    pending_at=?, pending_race=? WHERE broker_order_id=?""",
+                    (
+                        quantity,
+                        _s(limit_price),
+                        _s(stop_price),
+                        self._now().isoformat(),
+                        "FILL_FIRST" if behaviour == "FILL_FIRST" else None,
+                        row["broker_order_id"],
+                    ),
+                )
+                out = c.execute(
+                    "SELECT * FROM sim_orders WHERE broker_order_id=?", (row["broker_order_id"],)
+                ).fetchone()
+                if behaviour == "LOST_ACK_APPLIED":
+                    raise AckLost("simulated: modify accepted, acknowledgement lost")
+                return self._order(out)
             c.execute(
                 """UPDATE sim_orders SET limit_price=COALESCE(?,limit_price),
                 stop_price=COALESCE(?,stop_price),
@@ -433,8 +505,28 @@ class SimBroker:
         return self._order(out)
 
     def cancel(self, order_ref: str) -> BrokerOrder:
+        behaviour = self._cancel_script.popleft() if self._cancel_script else "APPLY"
         with self._tx() as c:
+            self._settle(c)
             row = self._working_row(c, order_ref)
+            if behaviour == "REJECT":
+                raise BrokerError("simulated: cancel request failed")
+            if self.strict:
+                if row["status"] != OrderStatus.PENDING_CANCEL.value:
+                    c.execute(
+                        """UPDATE sim_orders SET status='PendingCancel', pending_action='CANCEL',
+                        pending_at=?, pending_race=?, updated_at=? WHERE broker_order_id=?""",
+                        (
+                            self._now().isoformat(),
+                            "FILL_FIRST" if behaviour == "FILL_FIRST" else None,
+                            self._now().isoformat(),
+                            row["broker_order_id"],
+                        ),
+                    )
+                out = c.execute(
+                    "SELECT * FROM sim_orders WHERE broker_order_id=?", (row["broker_order_id"],)
+                ).fetchone()
+                return self._order(out)
             self._cancel(c, row["broker_order_id"], "CANCELLED_BY_CLIENT")
             # Cancelling an entry cancels children that are still waiting on it.
             c.execute(
@@ -451,6 +543,7 @@ class SimBroker:
         self._maybe_fail_lookup()
         placeholders = ",".join("?" * len(WORKING_STATUSES))
         with self._tx() as c:
+            self._settle(c)
             rows = c.execute(
                 f"SELECT * FROM sim_orders WHERE status IN ({placeholders}) "
                 "ORDER BY broker_order_id",
@@ -462,15 +555,22 @@ class SimBroker:
                     or datetime.fromisoformat(r["placed_at"]) <= cutoff]
         return [self._order(r) for r in rows]
 
-    def _history_cutoff(self, since: datetime | None) -> datetime | None:
-        if self.history_seconds is None:
+    def _history_cutoff(self, since: datetime | None, *, day_only: bool = False) -> datetime | None:
+        floors = []
+        if self.history_seconds is not None:
+            floors.append(self._now() - timedelta(seconds=self.history_seconds))
+        if day_only:
+            now = self._now().astimezone(UTC)
+            floors.append(now.replace(hour=0, minute=0, second=0, microsecond=0))
+        if not floors:
             return since
-        floor = self._now() - timedelta(seconds=self.history_seconds)
+        floor = max(floors)
         return floor if since is None or since < floor else since
 
     def executions(self, since: datetime | None = None) -> list[Fill]:
         self._maybe_fail_lookup()
         with self._tx() as c:
+            self._settle(c)
             rows = c.execute(
                 """SELECT e.*, o.asset_class, o.con_id FROM sim_executions e
                 JOIN sim_orders o ON o.broker_order_id = e.broker_order_id ORDER BY e.seq"""
@@ -488,13 +588,15 @@ class SimBroker:
             )
             for r in rows
         ]
-        since = self._history_cutoff(since)
+        # Strict: like IBKR reqExecutions, only the current day's executions are returned.
+        since = self._history_cutoff(since, day_only=self.strict)
         return [f for f in fills if since is None or f.executed_at >= since]
 
     def completed_orders(self, since: datetime | None = None) -> list[BrokerOrder]:
         self._maybe_fail_lookup()
         placeholders = ",".join("?" * len(TERMINAL_STATUSES))
         with self._tx() as c:
+            self._settle(c)
             rows = c.execute(
                 f"SELECT * FROM sim_orders WHERE status IN ({placeholders}) "
                 "ORDER BY broker_order_id",
@@ -506,6 +608,7 @@ class SimBroker:
 
     def positions(self) -> list[BrokerPosition]:
         with self._tx() as c:
+            self._settle(c)
             rows = c.execute(
                 "SELECT * FROM sim_positions WHERE quantity<>0 ORDER BY symbol"
             ).fetchall()
@@ -554,6 +657,62 @@ class SimBroker:
             (reason, self._now().isoformat(), broker_order_id),
         )
 
+    def _settle(self, c: sqlite3.Connection) -> None:
+        """Strict mode: apply every pending cancel or amendment whose time has come. A request
+        scripted FILL_FIRST loses the race: the order fills its remaining quantity first."""
+        if not self.strict:
+            return
+        now = self._now()
+        rows = c.execute(
+            "SELECT * FROM sim_orders WHERE pending_action IS NOT NULL ORDER BY broker_order_id"
+        ).fetchall()
+        changed = False
+        for row in rows:
+            if now < datetime.fromisoformat(row["pending_at"]) + timedelta(
+                seconds=self.pending_seconds
+            ):
+                continue
+            changed = True
+            oid = row["broker_order_id"]
+            if row["pending_race"] == "FILL_FIRST" and row["quantity"] > row["filled_quantity"]:
+                # As if the market touched the order's own price just before the request landed.
+                price = _d(row["limit_price"]) or _d(row["stop_price"])
+                if price is None:
+                    q = self._quote_row(c, row["symbol"])
+                    price = Decimal(q["ask"] if row["side"] == "BUY" else q["bid"])
+                self._execute(c, oid, row["quantity"] - row["filled_quantity"], price)
+            cur = c.execute("SELECT * FROM sim_orders WHERE broker_order_id=?", (oid,)).fetchone()
+            working = cur["status"] in {s.value for s in WORKING_STATUSES}
+            if working and row["pending_action"] == "CANCEL":
+                self._cancel(c, oid, "CANCELLED_BY_CLIENT")
+                c.execute(
+                    """UPDATE sim_orders SET status='Cancelled', reason='PARENT_CANCELLED',
+                    updated_at=? WHERE parent_ref=? AND status='PreSubmitted'""",
+                    (now.isoformat(), row["order_ref"]),
+                )
+            elif working and row["pending_action"] == "MODIFY":
+                qty = row["pending_quantity"]
+                if qty is None or qty >= cur["filled_quantity"]:
+                    c.execute(
+                        """UPDATE sim_orders SET limit_price=COALESCE(?,limit_price),
+                        stop_price=COALESCE(?,stop_price), quantity=COALESCE(?,quantity),
+                        updated_at=? WHERE broker_order_id=?""",
+                        (row["pending_limit"], row["pending_stop"], qty, now.isoformat(), oid),
+                    )
+                    if qty is not None and qty == cur["filled_quantity"]:
+                        c.execute(
+                            "UPDATE sim_orders SET status='Filled' WHERE broker_order_id=?",
+                            (oid,),
+                        )
+            c.execute(
+                """UPDATE sim_orders SET pending_action=NULL, pending_quantity=NULL,
+                pending_limit=NULL, pending_stop=NULL, pending_at=NULL, pending_race=NULL
+                WHERE broker_order_id=?""",
+                (oid,),
+            )
+        if changed:
+            self._match(c)
+
     def _match(self, c: sqlite3.Connection) -> None:
         """Run working orders against the current quotes until nothing more triggers."""
         for _ in range(100):
@@ -563,7 +722,8 @@ class SimBroker:
 
     def _match_once(self, c: sqlite3.Connection) -> bool:
         rows = c.execute(
-            "SELECT * FROM sim_orders WHERE status IN ('Submitted','PartiallyFilled') AND held=0 "
+            "SELECT * FROM sim_orders WHERE status IN ('Submitted','PartiallyFilled','PendingCancel') "
+            "AND held=0 "
             "ORDER BY broker_order_id"
         ).fetchall()
         for row in rows:
@@ -599,7 +759,7 @@ class SimBroker:
         pos = c.execute("SELECT * FROM sim_positions WHERE symbol=?", (row["symbol"],)).fetchone()
         held = pos["quantity"] if pos else 0
         now = self._now().isoformat()
-        if row["reduce_only"]:
+        if row["reduce_only"] and not self.strict:
             # Reduce-only: never more than the position held in the opposite direction.
             reducible = max(-held, 0) if buy else max(held, 0)
             if reducible <= 0:
@@ -629,7 +789,12 @@ class SimBroker:
         avg = (prior_avg * row["filled_quantity"] + price * qty) / filled
         status = OrderStatus.FILLED if filled >= row["quantity"] else OrderStatus.PARTIALLY_FILLED
         reason = row["reason"]
-        if row["reduce_only"] and status != OrderStatus.FILLED and filled < row["quantity"]:
+        if (
+            row["reduce_only"]
+            and not self.strict
+            and status != OrderStatus.FILLED
+            and filled < row["quantity"]
+        ):
             reducible_after = (max(-held, 0) if buy else max(held, 0)) - qty
             if reducible_after <= 0:
                 status, reason = OrderStatus.CANCELLED, "REDUCE_ONLY_CLAMPED"
@@ -663,7 +828,23 @@ class SimBroker:
                 "UPDATE sim_positions SET quantity=?, avg_cost=? WHERE symbol=?",
                 (new_qty, str(new_cost.quantize(Decimal("0.0001"))), row["symbol"]),
             )
-        if row["parent_ref"] is None:
+        if row["parent_ref"] is None and self.strict:
+            # Strict: a parent fill activates its children at the quantity they were submitted with.
+            c.execute(
+                "UPDATE sim_orders SET status='Submitted', updated_at=? "
+                "WHERE parent_ref=? AND status='PreSubmitted'",
+                (now, row["order_ref"]),
+            )
+        elif self.strict:
+            # Strict one-cancels-other: only a complete fill cancels the working siblings.
+            if status == OrderStatus.FILLED:
+                for sib in c.execute(
+                    "SELECT * FROM sim_orders WHERE parent_ref=? AND broker_order_id<>? AND "
+                    "status IN ('Submitted','PartiallyFilled','PendingCancel')",
+                    (row["parent_ref"], broker_order_id),
+                ).fetchall():
+                    self._cancel(c, sib["broker_order_id"], "OCA_SIBLING_FILLED")
+        elif row["parent_ref"] is None:
             # A parent fill activates (or grows) its bracket children to the filled quantity.
             for child in c.execute(
                 "SELECT * FROM sim_orders WHERE parent_ref=? AND status IN "

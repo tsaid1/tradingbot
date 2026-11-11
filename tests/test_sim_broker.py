@@ -248,3 +248,82 @@ def test_order_intent_price_rules():
             order_type=OrderType.MKT,
             limit_price=Decimal(1),
         )
+
+
+# ------------------------------------------------------------------ strict mode (IBKR-like)
+
+
+@pytest.fixture
+def strict(tmp_path):
+    clock = SimClock(START)
+    b = SimBroker(tmp_path / "s.sqlite3", clock=clock.now, strict=True)
+    b.set_quote("ZZQ", "49.98", "50.02")
+    b.test_clock = clock
+    return b
+
+
+def test_strict_exit_larger_than_position_reverses_it(strict):
+    strict.submit(*bracket(strict, qty=2, target=None))
+    c = strict.resolve(INSTRUMENT)
+    sell5 = OrderIntent(
+        order_ref="R1",
+        contract=c,
+        side=OrderSide.SELL,
+        quantity=5,
+        order_type=OrderType.MKT,
+        reduce_only=True,
+    )
+    assert strict.submit(sell5)[0].filled_quantity == 5
+    assert net(strict) == -3  # no reduce-only clamp: the account is now short
+
+
+def test_strict_children_keep_their_submitted_quantity(strict):
+    strict.script_next_submit("PARTIAL", quantity=1)
+    strict.submit(*bracket(strict))
+    working = {o.order_ref: o for o in strict.open_orders()}
+    assert working["E1.STP"].status == OrderStatus.SUBMITTED and working["E1.STP"].quantity == 4
+    strict.fill("E1")
+    assert {o.order_ref: o for o in strict.open_orders()}["E1.STP"].quantity == 4
+
+
+def test_strict_cancel_passes_through_pending_cancel(strict):
+    strict.submit(*bracket(strict))
+    assert strict.cancel("E1.TGT").status == OrderStatus.PENDING_CANCEL
+    [done] = [o for o in strict.completed_orders() if o.order_ref == "E1.TGT"]
+    assert done.status == OrderStatus.CANCELLED
+
+
+def test_strict_pending_cancel_takes_time_and_can_lose_the_race(strict):
+    strict.pending_seconds = 2
+    strict.submit(*bracket(strict))
+    strict.cancel("E1.STP")
+    assert {o.order_ref: o.status for o in strict.open_orders()}["E1.STP"] == (
+        OrderStatus.PENDING_CANCEL
+    )
+    strict.set_quote("ZZQ", "47.90", "47.95")  # still working: the stop triggers
+    assert strict.orders_with_ref("E1.STP")[0].status == OrderStatus.FILLED
+    strict.pending_seconds = 0
+    strict.set_quote("ZZQ", "49.98", "50.02")
+    strict.script_next_cancel("FILL_FIRST")
+    strict.submit(*bracket(strict, ref="E2"))
+    strict.cancel("E2.TGT")
+    assert strict.orders_with_ref("E2.TGT")[0].status == OrderStatus.PENDING_CANCEL
+    strict.open_orders()
+    assert strict.orders_with_ref("E2.TGT")[0].status == OrderStatus.FILLED
+
+
+def test_strict_modify_is_pending_until_the_next_interaction(strict):
+    strict.pending_seconds = 1
+    strict.submit(*bracket(strict))
+    assert strict.modify("E1.STP", quantity=2).quantity == 4
+    assert {o.order_ref: o for o in strict.open_orders()}["E1.STP"].quantity == 4
+    strict.test_clock.advance(1)
+    assert {o.order_ref: o for o in strict.open_orders()}["E1.STP"].quantity == 2
+
+
+def test_strict_executions_cover_the_current_day_only(strict):
+    strict.submit(*bracket(strict))
+    assert len(strict.executions()) == 1
+    strict.test_clock.advance(24 * 3600)
+    assert strict.executions() == []
+    assert net(strict) == 4
