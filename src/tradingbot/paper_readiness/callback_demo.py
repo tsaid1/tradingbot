@@ -22,6 +22,14 @@ reported as outside the lifecycle model, with no lifecycle, retirement or cancel
 claimed. A completed lifecycle is local only: broker-side retirement stays not established and
 PAPER-READ-1 stays not assessed.
 
+The quote reader double's buffer is the accepted ``FrameAccumulator``, fed fixed invented opaque
+byte chunks. Normal processing hands each complete frame off to the reader double, which holds it
+unprocessed; no payload is decoded, and nothing claims the bytes are SDK messages or carry the
+quote callbacks. When the adapter joins the reader, it only ends input with ``finish()``: nothing is
+drained or discarded. The adapter's reader observation reads the accumulator's retained byte count.
+Refusals and untaken frames, which the lifecycle model cannot express, appear only in the unchanged
+framing report. The local-components aggregate requires both reports and grants nothing.
+
 Every fixture value is invented for this demonstration only, under one fixed ``FakeClock``.
 """
 from __future__ import annotations
@@ -45,6 +53,13 @@ from tradingbot.paper_readiness.observations import (
     SessionAttestation,
     TargetContract,
 )
+from tradingbot.paper_readiness.read_framing import (
+    HEADER_BYTES,
+    Frame,
+    FrameAccumulator,
+    FramingOutcome,
+    FramingReport,
+)
 from tradingbot.paper_readiness.read_retirement import CallbackKind, ReadSlot
 from tradingbot.paper_readiness.runner import REQUEST_IDS, render_text, run_readiness_check
 from tradingbot.paper_readiness.sdk_lifecycle import AdapterReport, DirectCallback, LifecycleAdapter
@@ -54,7 +69,9 @@ __all__ = [
     "ACCOUNT_POSITION_FAILURES",
     "DEMO_CLOCK",
     "DEMO_EXPECTATION",
+    "FRAMING_NOTICE",
     "LIFECYCLE_NOTICE",
+    "READER_FRAMING_CASES",
     "SCENARIOS",
     "SIMULATION_NOTICE",
     "STREAM_SOURCES",
@@ -92,6 +109,14 @@ LIFECYCLE_NOTICE = (
     "lifecycle model; no lifecycle, retirement or cancellation coverage is claimed for them. A "
     "completed lifecycle is local only: broker-side retirement is not established, PAPER-READ-1 is "
     "not assessed and trading_permission is False."
+)
+FRAMING_NOTICE = (
+    "READER FRAMING, SIMULATED: the quote reader double buffers fixed INVENTED opaque byte chunks "
+    "in the accepted FrameAccumulator. Payloads are never decoded and are not SDK messages or the "
+    "quote callbacks. Its retained byte count feeds the lifecycle's reader observation; refusals "
+    "and untaken frames appear only in the framing report. Local completion requires both reports. "
+    "Handed-off frames are not processed or retired downstream. Nothing here is readiness, "
+    "PAPER-READ-1, broker-side retirement or trading permission."
 )
 # The one stream whose callbacks pass through the lifecycle adapter, and why the others do not.
 _LIFECYCLE_STREAMS = ("quote_snapshot",)
@@ -157,6 +182,22 @@ def _session() -> SessionAttestation:
 
 def _position_contract(con_id: int, symbol: str) -> _Values:
     return _Values(conId=con_id, symbol=symbol, secType="STK", currency="USD")
+
+
+def _length_prefixed(payload: bytes) -> bytes:
+    """Fixture bytes in the accumulator's frame shape; the payload is an opaque control."""
+    return len(payload).to_bytes(HEADER_BYTES, "big") + payload
+
+
+# Three invented opaque frames of 29, 4 (zero-length) and 29 bytes. They are not SDK messages and
+# are unrelated to the quote callbacks. Headers cross chunk boundaries at bytes 2 and 31 and the
+# first payload at byte 20, so frames complete in the third and fourth chunks.
+_OPAQUE = (_length_prefixed(b"invented opaque control A") + _length_prefixed(b"")
+           + _length_prefixed(b"invented opaque control C"))
+_COMPLETE_BYTES = (_OPAQUE[:2], _OPAQUE[2:20], _OPAQUE[20:31], _OPAQUE[31:])
+_PARTIAL_HEADER = b"\x00\x00"  # two of a further frame's four header bytes
+_PARTIAL_PAYLOAD = _length_prefixed(b"invented opaque control D")[:10]  # header plus six bytes
+_OVERSIZED_HEADER = (2**32 - 1).to_bytes(HEADER_BYTES, "big")  # beyond the default payload limit
 
 
 # ----------------------------------------------------------------------------- callback sequences
@@ -253,6 +294,11 @@ class DemoScenario:
     # The invented account-summary and position callbacks, passed to their normalizers directly.
     summary_feed: object = _summary_callbacks
     positions_feed: object = _position_callbacks
+    # The fixed opaque chunks the quote reader double buffers, and whether it hands off the frames
+    # that its final chunk completes.
+    reader_bytes: tuple[bytes, ...] = _COMPLETE_BYTES
+    takes_final_frames: bool = True
+    expected_framing_outcome: FramingOutcome = FramingOutcome.COMPLETE
 
 
 SCENARIOS = {
@@ -290,6 +336,33 @@ ACCOUNT_POSITION_FAILURES = (
                  "(PR #35 review P2).",
                  ReadinessOutcome.NOT_READY, _control,
                  positions_feed=_malformed_position_then_repeated_end),
+)
+# The CLI's four reader-framing cases, also kept out of SCENARIOS. Every callback is the control's,
+# so readiness stays CONTROL_COMPLETE; only the reader double's fixed opaque bytes, or whether it
+# hands off its final frames, differ from the control.
+READER_FRAMING_CASES = (
+    DemoScenario("framing_partial_header",
+                 "Control callbacks; the reader keeps two header bytes of a further frame.",
+                 ReadinessOutcome.CONTROL_COMPLETE, _control, expected_lifecycle_completed=False,
+                 reader_bytes=(*_COMPLETE_BYTES, _PARTIAL_HEADER),
+                 expected_framing_outcome=FramingOutcome.PARTIAL_HEADER),
+    DemoScenario("framing_partial_payload",
+                 "Control callbacks; the reader keeps a further frame's header and part payload.",
+                 ReadinessOutcome.CONTROL_COMPLETE, _control, expected_lifecycle_completed=False,
+                 reader_bytes=(*_COMPLETE_BYTES, _PARTIAL_PAYLOAD),
+                 expected_framing_outcome=FramingOutcome.PARTIAL_PAYLOAD),
+    DemoScenario("framing_declared_length_refused",
+                 "Control callbacks; a further header declares an oversized length and is refused.",
+                 ReadinessOutcome.CONTROL_COMPLETE, _control, expected_lifecycle_completed=False,
+                 reader_bytes=(*_COMPLETE_BYTES, _OVERSIZED_HEADER),
+                 expected_framing_outcome=FramingOutcome.REFUSED),
+    # Nothing is retained, so the lifecycle's reader observation completes: the lifecycle model
+    # cannot express untaken frames, and only the framing report and the aggregate show them.
+    DemoScenario("framing_untaken_frames",
+                 "Control callbacks; the reader never hands off the frames its last chunk "
+                 "completes.",
+                 ReadinessOutcome.CONTROL_COMPLETE, _control, takes_final_frames=False,
+                 expected_framing_outcome=FramingOutcome.UNTAKEN_FRAMES),
 )
 
 
@@ -349,13 +422,27 @@ class _Queue:
 
 class _QuoteReader:
     """Stands in for the reader thread on the quote read. Each invented quote callback it receives
-    is queued whole; only the adapter's consumer delivers it to the quote normalizer. It holds no
-    partial message, and its invented input has ended by the time the adapter joins it."""
+    is queued whole; only the adapter's consumer delivers it to the quote normalizer.
 
-    def __init__(self, adapter: LifecycleAdapter, queue: _Queue) -> None:
+    Its buffer is the accepted ``FrameAccumulator``, fed fixed opaque chunks that are unrelated to
+    the callbacks. Normal processing hands complete frames off to ``handed_off``, where they stay
+    unprocessed. Joining only ends input with ``finish()``; ``partial_bytes`` reports the
+    accumulator's retained byte count."""
+
+    def __init__(self, adapter: LifecycleAdapter, queue: _Queue, framing: FrameAccumulator) -> None:
         self._adapter = adapter
         self._queue = queue
+        self._framing = framing
         self._alive = True
+        self.handed_off: list[Frame] = []  # the downstream owner; nothing processes or retires them
+
+    def receive_bytes(self, chunks: tuple[bytes, ...], *, takes_final_frames: bool) -> None:
+        """Normal processing: buffer each chunk, then hand off every frame it completed."""
+        for index, chunk in enumerate(chunks):
+            self._framing.feed(chunk)
+            if index < len(chunks) - 1 or takes_final_frames:
+                while (frame := self._framing.take()) is not None:
+                    self.handed_off.append(frame)
 
     def _receive(self, kind: CallbackKind, name: str, *args: object) -> None:
         item = (ReadSlot.QUOTE_SNAPSHOT, kind)
@@ -379,13 +466,14 @@ class _QuoteReader:
         self._receive(CallbackKind.END, "tickSnapshotEnd", reqId)
 
     def join(self, timeout: float) -> None:
+        self._framing.finish()  # ends input only: retained bytes and queued frames stay as they are
         self._alive = False
 
     def is_alive(self) -> bool:
         return self._alive
 
     def partial_bytes(self) -> int:
-        return 0
+        return self._framing.report().bytes_retained  # observed, never set to force a status
 
 
 class _QuoteBoundary:
@@ -418,19 +506,23 @@ class _QuoteBoundary:
 
 
 def _run_lifecycle(scenario: DemoScenario, contract: IbkrCallbackNormalizer,
-                   quote: IbkrCallbackNormalizer) -> AdapterReport:
-    """Feed the scenario with its quote callbacks routed through one adapter, then shut it down."""
+                   quote: IbkrCallbackNormalizer) -> tuple[AdapterReport, FramingReport]:
+    """Feed the scenario with its quote callbacks routed through one adapter, then shut it down.
+    Returns the adapter's report and the reader buffer's framing report, both unmodified."""
     boundary = _QuoteBoundary(quote, scenario.socket_closure_known)
     adapter = LifecycleAdapter(boundary, _SingleThreadLock())
+    framing = FrameAccumulator()
     boundary.adapter = adapter
-    boundary.reader = _QuoteReader(adapter, boundary.queue)
+    boundary.reader = _QuoteReader(adapter, boundary.queue, framing)
     adapter.start()
     adapter.open_read(ReadSlot.QUOTE_SNAPSHOT)
+    boundary.reader.receive_bytes(scenario.reader_bytes,
+                                  takes_final_frames=scenario.takes_final_frames)
     scenario.feed(contract, boundary.reader)  # contract callbacks reach their normalizer directly
     while adapter.consume_one():  # delivers each queued quote callback, END included, in order
         pass
     adapter.shutdown(join_timeout=0.0)  # the reader double's join returns at once
-    return adapter.report()
+    return adapter.report(), framing.report()
 
 
 # ----------------------------------------------------------------------------- running and rendering
@@ -448,17 +540,26 @@ class DemoResult:
     positions_completed: bool
     positions_issues: tuple[str, ...]
     lifecycle: AdapterReport
+    framing: FramingReport
 
     @property
     def matches_expectation(self) -> bool:
-        """Both expected outcomes occurred. Only that: never readiness, retirement or authority."""
+        """Every expected outcome occurred. Only that: never readiness, retirement or authority."""
         return (self.report.outcome == self.scenario.expected_outcome
-                and self.lifecycle.completed == self.scenario.expected_lifecycle_completed)
+                and self.lifecycle.completed == self.scenario.expected_lifecycle_completed
+                and self.framing.outcome == self.scenario.expected_framing_outcome)
+
+    @property
+    def local_components_complete(self) -> bool:
+        """Both local components finished cleanly. Local and NON_AUTHORITATIVE only: it never
+        changes the readiness outcome and is never PAPER-READ-1, retirement or trading
+        permission."""
+        return self.lifecycle.completed and self.framing.clean
 
 
 def _cli_only() -> tuple[DemoScenario, ...]:
     """The CLI's extra fixed cases, after the three SCENARIOS, in the order they are printed."""
-    return (UNKNOWN_CLEANUP, *ACCOUNT_POSITION_FAILURES)
+    return (UNKNOWN_CLEANUP, *ACCOUNT_POSITION_FAILURES, *READER_FRAMING_CASES)
 
 
 def _scenario(name: str) -> DemoScenario:
@@ -477,7 +578,7 @@ def run_demo(name: str) -> DemoResult:
     quote = IbkrCallbackNormalizer(_QRID, CallbackRequest.QUOTE_SNAPSHOT, con_id=_CON_ID, clock=clock)
     summary = AccountSummaryCallbacks(_ARID)
     positions = PositionSnapshotCallbacks(_PSID)
-    lifecycle = _run_lifecycle(scenario, contract, quote)
+    lifecycle, framing = _run_lifecycle(scenario, contract, quote)
     scenario.summary_feed(summary)  # passed to the accepted normalizers directly
     scenario.positions_feed(positions)
     script = FakeScript(session=_session(), contract_details=contract.envelopes(),
@@ -491,7 +592,7 @@ def run_demo(name: str) -> DemoResult:
         quote_completed=quote.completed, quote_issues=_codes(quote),
         account_summary_completed=summary.completed, account_summary_issues=_codes(summary),
         positions_completed=positions.completed, positions_issues=_codes(positions),
-        lifecycle=lifecycle,
+        lifecycle=lifecycle, framing=framing,
     )
 
 
@@ -519,18 +620,45 @@ def _summary(result: DemoResult) -> dict:
             "completed": result.lifecycle.completed,
             "local_quiescence_established": result.lifecycle.ledger.local_quiescence_established,
         },
+        "reader_framing": {
+            "expected_outcome": result.scenario.expected_framing_outcome.value,
+            "outcome": result.framing.outcome.value,
+            "clean": result.framing.clean,
+            "bytes_retained": result.framing.bytes_retained,
+            "lifecycle_reader_partial_bytes": result.lifecycle.reader_partial_bytes,
+            "downstream_retirement": result.framing.downstream_retirement,
+        },
+        "local_components": {
+            "lifecycle_completed": result.lifecycle.completed,
+            "framing_clean": result.framing.clean,
+            "both_complete": result.local_components_complete,
+            "authority": "NON_AUTHORITATIVE",
+            "trading_permission": False,
+            "paper_read_1": "NOT_ASSESSED",
+        },
     }
+
+
+def _framing_json(report: FramingReport) -> dict:
+    """The accumulator's report field by field, enum members as values. Counts and codes only."""
+    fields = asdict(report)
+    fields["outcome"] = report.outcome.value
+    fields["first_refusal"] = None if report.first_refusal is None else report.first_refusal.value
+    fields["refusals"] = [[code.value, count] for code, count in report.refusals]
+    return fields
 
 
 def render_demo_json(results: list[DemoResult]) -> str:
     payload = {"notice": SIMULATION_NOTICE, "lifecycle_notice": LIFECYCLE_NOTICE,
+               "framing_notice": FRAMING_NOTICE,
                "scenarios": [{**_summary(r), "report": r.report.model_dump(mode="json"),
-                              "lifecycle_report": asdict(r.lifecycle)} for r in results]}
+                              "lifecycle_report": asdict(r.lifecycle),
+                              "framing_report": _framing_json(r.framing)} for r in results]}
     return json.dumps(payload, indent=2, sort_keys=True) + "\n"
 
 
 def render_demo_text(results: list[DemoResult]) -> str:
-    lines = [SIMULATION_NOTICE, LIFECYCLE_NOTICE, ""]
+    lines = [SIMULATION_NOTICE, LIFECYCLE_NOTICE, FRAMING_NOTICE, ""]
     for r in results:
         s = _summary(r)
         ingestion = s["callback_ingestion"]
@@ -552,18 +680,29 @@ def render_demo_text(results: list[DemoResult]) -> str:
         lines.append(f"   outside the lifecycle model: {', '.join(_OUTSIDE_LIFECYCLE)}; "
                      f"broker_side_retirement={ledger.broker_side_retirement} "
                      f"paper_read_1={life.paper_read_1}")
+        framing = r.framing
+        refusal = "none" if framing.first_refusal is None else framing.first_refusal.value
+        lines.append(f"   reader framing: expected={r.scenario.expected_framing_outcome.value} "
+                     f"outcome={framing.outcome.value} clean={framing.clean} "
+                     f"retained={framing.bytes_retained} extracted={framing.frames_extracted} "
+                     f"handed_off={framing.frames_handed_off} queued={framing.frames_queued} "
+                     f"first_refusal={refusal} "
+                     f"downstream_retirement={framing.downstream_retirement}")
+        lines.append(f"   local components (NON_AUTHORITATIVE): "
+                     f"lifecycle_completed={life.completed} framing_clean={framing.clean} "
+                     f"both_complete={r.local_components_complete}")
         lines.append(render_text(r.report, summary=True).rstrip("\n"))
         lines.append("")
     matched = sum(r.matches_expectation for r in results)
-    lines.append(f"{matched}/{len(results)} scenarios matched their expected readiness and "
-                 "lifecycle outcomes. A match means only that: NON_AUTHORITATIVE; "
+    lines.append(f"{matched}/{len(results)} scenarios matched their expected readiness, lifecycle "
+                 "and framing outcomes. A match means only that: NON_AUTHORITATIVE; "
                  "trading_permission=False; never PAPER-READ-1, broker-side retirement or trading "
                  "authority.")
     return "\n".join(lines) + "\n"
 
 
 def main() -> int:
-    """Print the three scenarios, then the CLI-only cases. Exit 0 only if each matches both of its
+    """Print the three scenarios, then the CLI-only cases. Exit 0 only if each matches all of its
     expected outcomes; never a verdict on any real broker, account, retirement or readiness."""
     results = [run_demo(name) for name in (*SCENARIOS, *(s.name for s in _cli_only()))]
     print(render_demo_text(results), end="")

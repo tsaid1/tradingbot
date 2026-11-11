@@ -15,15 +15,16 @@ PYTHONPATH=src python -m tradingbot.paper_readiness.callback_demo
 ```
 
 It takes no arguments. The package admits only pure standard-library imports, so the module has no `sys`
-or `argparse`. It prints the three scenarios in `SCENARIOS`, then three CLI-only cases: `UNKNOWN_CLEANUP`
-and the two `ACCOUNT_POSITION_FAILURES`. The exit status is 0 only when every case reaches both its
-expected readiness outcome and its expected lifecycle completion, and 1 otherwise. A match means only that.
-It checks the demonstration itself and is never a verdict on any real broker, account, retirement or
-readiness. For JSON from Python:
+or `argparse`. It prints the three scenarios in `SCENARIOS`, then seven CLI-only cases: `UNKNOWN_CLEANUP`,
+the two `ACCOUNT_POSITION_FAILURES` and the four `READER_FRAMING_CASES`. The exit status is 0 only when
+every case reaches its expected readiness outcome, lifecycle completion and framing outcome, and 1
+otherwise. A match means only that. It checks the demonstration itself and is never a verdict on any real
+broker, account, retirement or readiness. For JSON from Python:
 
 ```python
 from tradingbot.paper_readiness import callback_demo as demo
-names = [*demo.SCENARIOS, demo.UNKNOWN_CLEANUP.name, *(s.name for s in demo.ACCOUNT_POSITION_FAILURES)]
+extra = [demo.UNKNOWN_CLEANUP, *demo.ACCOUNT_POSITION_FAILURES, *demo.READER_FRAMING_CASES]
+names = [*demo.SCENARIOS, *(s.name for s in extra)]
 print(demo.render_demo_json([demo.run_demo(name) for name in names]))
 ```
 
@@ -79,6 +80,33 @@ A completed lifecycle is local only. Every adapter and ledger report stays `NON_
 `trading_permission` false, broker-side retirement `NOT_ESTABLISHED_BY_INSPECTED_SOURCES` and PAPER-READ-1
 `NOT_ASSESSED`.
 
+## Reader framing
+
+The quote reader double's buffer is the accepted `FrameAccumulator` ([READ_FRAMING.md](READ_FRAMING.md)),
+with its default limits.
+
+1. Each case gives the reader fixed invented opaque byte chunks in the accumulator's documented frame shape:
+   a four-byte length, then the payload. The control's chunks hold three complete frames, one of them
+   zero-length, and split headers and a payload across chunk boundaries.
+2. Normal processing feeds each chunk, then hands off with `take()` every frame that chunk completed. The
+   reader double holds handed-off frames unprocessed. Nothing decodes a payload. The bytes are not SDK
+   messages, do not carry the quote callbacks and do not affect callback routing.
+3. When the adapter joins the reader, the reader only calls `finish()`. Nothing is drained, taken,
+   discarded or decoded at shutdown.
+4. The adapter's reader observation reads `partial_bytes()`, which returns the accumulator's observed
+   `bytes_retained`. A retained partial frame therefore makes the lifecycle reader `FAILED` with
+   `PARTIAL_BYTES_UNRESOLVED`. No byte count is invented.
+5. The accumulator's own report goes unmodified into `DemoResult.framing` and the JSON `framing_report`.
+   Only enum members are written as their values.
+
+**Two reports, one aggregate.** The lifecycle model has no state for a refusal without retained bytes or
+for untaken frames, so those appear only in the framing report. `DemoResult.local_components_complete`
+(JSON `local_components.both_complete`) is true only when the lifecycle completed **and** the framing
+outcome is `COMPLETE`. It is local and `NON_AUTHORITATIVE`. It never changes the readiness outcome, and
+it is never PAPER-READ-1, broker-side retirement or trading permission. A handed-off frame is local buffer
+accounting only (`downstream_retirement` stays `NOT_ESTABLISHED`); it is not consumer processing or
+retirement.
+
 ## Scenarios
 
 Every scenario uses the control's account-summary and position callbacks unless its row says otherwise:
@@ -93,6 +121,21 @@ Every scenario uses the control's account-summary and position callbacks unless 
 | `summary_monetary_currency_missing` (CLI only) | As the control, but `BuyingPower` arrives with an empty currency (PR #35 review P2) | `NOT_READY`: `ACCOUNT_CURRENCY_MISSING`, so no `ACCOUNT_SNAPSHOT_CONTROL` | Completed; the account read is outside the model |
 | `malformed_position_then_repeated_end` (CLI only) | As the control, then an oversized position quantity and `positionEnd` twice (PR #35 review P2) | `NOT_READY`: `MALFORMED_CALLBACK` withholds every END, so `POSITIONS_END_MISSING` | Completed; the position read is outside the model |
 
+Every scenario above uses the control's reader bytes, so its framing outcome is `COMPLETE`. The four
+reader-framing cases (`READER_FRAMING_CASES`, CLI only) keep every callback of the control, so readiness
+stays `CONTROL_COMPLETE`. Each differs from the control only in the reader's bytes, or in whether the
+reader hands off its final frames:
+
+| Case | Reader input | Framing outcome | Local lifecycle | Both local components |
+|---|---|---|---|---|
+| `framing_partial_header` | The control's chunks, then two header bytes of a further frame | `PARTIAL_HEADER`, 2 bytes retained | **Not completed**: reader `FAILED`, `PARTIAL_BYTES_UNRESOLVED` | No |
+| `framing_partial_payload` | The control's chunks, then a further frame's header and six payload bytes | `PARTIAL_PAYLOAD`, 10 bytes retained | **Not completed**: reader `FAILED`, `PARTIAL_BYTES_UNRESOLVED` | No |
+| `framing_declared_length_refused` | The control's chunks, then a header declaring a length beyond the payload limit | `REFUSED` (`DECLARED_LENGTH_TOO_LARGE`), its 4 header bytes retained | **Not completed**: reader `FAILED`, `PARTIAL_BYTES_UNRESOLVED` | No |
+| `framing_untaken_frames` | The control's chunks; the frames the last chunk completes are never handed off | `UNTAKEN_FRAMES`, nothing retained | Completed: the lifecycle model cannot express untaken frames | No |
+
+The unknown-socket counterpart keeps its incomplete lifecycle, with framing `COMPLETE`, so it is not
+complete on both components either.
+
 In the counterpart, the disconnect returned, `CONNECTION_CLOSED` was recorded, the queue is empty and the
 reader stopped. None of these clears the unknown socket closure, so readiness `CONTROL_COMPLETE` sits next
 to an incomplete lifecycle.
@@ -106,8 +149,13 @@ to an incomplete lifecycle.
   account and position failure cases are fixed; there is no free-form callback input.
 - The lifecycle doubles run on one thread with a fixed schedule: every queued callback is delivered before
   shutdown. This adds no timing, tick, risk or retirement policy.
-- The normalizers, the lifecycle adapter and ledger, and the shared contracts are unchanged. The dashboard
-  page keeps its three-scenario input and only relabels stream sources.
+- The reader bytes are fixed invented opaque controls, unrelated to the callbacks. This is not a reader of
+  any real socket or SDK stream. It does not resolve which component owns a real reader buffer, and it
+  makes no protocol, decoding or SDK-admission claim. The accumulator's limits are its documented
+  defaults, chosen as model policy.
+- The normalizers, the accumulator, the lifecycle adapter and ledger, and the shared contracts are
+  unchanged. The dashboard page and its three-scenario input are unchanged; its JSON view now also carries
+  the framing report.
 - The fake transport, runner and diagnostics are unchanged. This adds no connected path, and connected checks
   stay blocked as described in [PAPER_READINESS.md](PAPER_READINESS.md).
 - There is no order, cancel, replace, reset, settings, subscription or credential interface.
