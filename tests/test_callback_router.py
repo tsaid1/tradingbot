@@ -19,7 +19,7 @@ from tradingbot.paper_readiness.account_position_callbacks import (
     PositionSnapshotCallbacks,
 )
 from tradingbot.paper_readiness.account_ref import REFERENCE_PREFIX
-from tradingbot.paper_readiness.callback_router import CallbackRouter
+from tradingbot.paper_readiness.callback_router import CallbackRouter, StreamKind, StreamStatus
 from tradingbot.paper_readiness.ibkr_callbacks import CallbackRequest, IbkrCallbackNormalizer
 from tradingbot.paper_readiness.observations import ResponseKind
 from tradingbot.paper_readiness.private_account import AccountOwner
@@ -860,3 +860,145 @@ def test_owner_mode_keeps_fifo_and_request_accounting_identical_to_no_owner_rout
     assert (a.completed, a.queued_records) == (b.completed, b.queued_records) == (True, 0)
     assert with_owner.register_positions(PRID, owner=owner) is None
     assert "POSITIONS_WINDOW_REOPENED" in with_owner.report().faults  # the single window holds in owner mode
+
+
+# ----------------------------------------------------------------------------- ROUTER-STATUS: stream_status
+
+
+def status_by_kind(r: CallbackRouter) -> dict:
+    return {s.stream: s for s in r.stream_status()}
+
+
+def direct_normalizers():
+    contract = IbkrCallbackNormalizer(CRID, CallbackRequest.CONTRACT_DETAILS)
+    quote = IbkrCallbackNormalizer(QRID, CallbackRequest.QUOTE_SNAPSHOT, con_id=CON_ID, clock=FakeClock(NOW))
+    return {StreamKind.CONTRACT_DETAILS: contract, StreamKind.QUOTE_SNAPSHOT: quote,
+            StreamKind.ACCOUNT_SUMMARY: AccountSummaryCallbacks(SRID),
+            StreamKind.POSITIONS: PositionSnapshotCallbacks(PRID)}
+
+
+def assert_status_parity(r: CallbackRouter, direct: dict) -> None:
+    status = status_by_kind(r)
+    for kind, normalizer in direct.items():
+        expected = StreamStatus(kind, True, normalizer.completed,
+                                tuple(i.code.value for i in normalizer.issues), normalizer.issue_overflow)
+        assert status[kind] == expected, kind
+
+
+def test_status_distinguishes_unregistered_streams_in_fixed_order():
+    r = CallbackRouter(Client(), _Lock(), FakeClock(NOW))
+    r.start()
+    r.register_quote(QRID, CON_ID)
+    status = r.stream_status()
+    assert [s.stream for s in status] == list(StreamKind)
+    assert [s.registered for s in status] == [False, True, False, False]
+    assert status[0] == StreamStatus(StreamKind.CONTRACT_DETAILS, False, False, (), 0)
+    assert status[1] == StreamStatus(StreamKind.QUOTE_SNAPSHOT, True, False, (), 0)
+
+
+def test_status_matches_direct_normalizers_before_delivery_and_after_normal_completion():
+    r, _ = router()
+    everything(r)  # quote, account and position callbacks are queued, not yet delivered
+    direct = direct_normalizers()
+    direct[StreamKind.CONTRACT_DETAILS].contractDetails(CRID, Details())  # contract is direct
+    direct[StreamKind.CONTRACT_DETAILS].contractDetailsEnd(CRID)
+    assert_status_parity(r, direct)
+    assert not status_by_kind(r)[StreamKind.QUOTE_SNAPSHOT].completed  # queued is not delivered
+    drain(r)
+    quote_feed(direct[StreamKind.QUOTE_SNAPSHOT])
+    summary_feed(direct[StreamKind.ACCOUNT_SUMMARY])
+    positions_feed(direct[StreamKind.POSITIONS])
+    assert_status_parity(r, direct)
+    assert all(s.registered and s.completed and s.issue_codes == () for s in r.stream_status())
+
+
+def test_status_carries_the_delayed_size_non_live_tick_issue():
+    r, _ = router()
+    for target in (r, direct := direct_normalizers()[StreamKind.QUOTE_SNAPSHOT]):
+        target.marketDataType(QRID, 1)
+        target.tickPrice(QRID, 1, 40.0, None)
+        target.tickSize(QRID, 69, Decimal(700))  # delayed bid size among live ticks
+        target.tickSnapshotEnd(QRID)
+    drain(r)
+    quote = status_by_kind(r)[StreamKind.QUOTE_SNAPSHOT]
+    assert quote.issue_codes == ("NON_LIVE_TICK_UNREPRESENTED",) and quote.completed is False
+    assert quote.issue_codes == tuple(i.code.value for i in direct.issues)
+
+
+def test_status_matches_malformed_repeated_end_and_refusal_evidence():
+    r, _ = router()
+    direct = direct_normalizers()
+    r.contractDetails(CRID, Details())
+    r.unsupported_callback("connectionClosed", CRID)  # as the demo's repeated-END case
+    direct[StreamKind.CONTRACT_DETAILS].contractDetails(CRID, Details())
+    direct[StreamKind.CONTRACT_DETAILS].unsupported_callback("connectionClosed")
+    for target in (r, direct[StreamKind.CONTRACT_DETAILS]):
+        target.contractDetailsEnd(CRID)
+        target.contractDetailsEnd(CRID)  # repeated END
+    for target in (r, direct[StreamKind.POSITIONS]):
+        target.position(ACCOUNT, Contract(840001), Decimal("1E+5000"), 1.0)  # unretainable quantity
+        target.positionEnd()
+    r.error_1052(SRID, 0, 321, CANARY)  # an account error: a fixed refusal in the summary stream
+    direct[StreamKind.ACCOUNT_SUMMARY].unsupported_callback("error")
+    quote_feed(r)
+    quote_feed(direct[StreamKind.QUOTE_SNAPSHOT])
+    drain(r)
+    assert_status_parity(r, direct)
+    status = status_by_kind(r)
+    assert status[StreamKind.POSITIONS].issue_codes and not status[StreamKind.POSITIONS].completed
+    assert status[StreamKind.ACCOUNT_SUMMARY].issue_codes == ("UNSUPPORTED_CALLBACK",)
+    assert status[StreamKind.CONTRACT_DETAILS].issue_codes and not status[StreamKind.CONTRACT_DETAILS].completed
+
+
+def test_a_refused_owner_is_reported_as_not_registered():
+    r = CallbackRouter(Client(), _Lock(), FakeClock(NOW))
+    r.start()
+    r.register_account_summary(SRID, owner=object())
+    assert status_by_kind(r)[StreamKind.ACCOUNT_SUMMARY].registered is False
+
+
+def test_a_snapshot_keeps_its_capture_values_while_a_later_call_sees_invalidation():
+    r, _ = router()
+    r.contractDetails(CRID, Details())
+    r.contractDetailsEnd(CRID)
+    before = r.stream_status()
+    assert before[0].completed is True and before[0].issue_codes == ()
+    r.unsupported_callback("inventedLateCallback", CRID)  # reaches the contract normalizer after END
+    after = status_by_kind(r)[StreamKind.CONTRACT_DETAILS]
+    assert after.completed is False and after.issue_codes == ("UNSUPPORTED_CALLBACK",)  # not cached
+    assert before[0].completed is True and before[0].issue_codes == ()  # the snapshot is unchanged
+    with pytest.raises(AttributeError):
+        before[0].completed = False  # type: ignore[misc]
+    assert type(before) is tuple and type(before[0].issue_codes) is tuple
+
+
+def test_status_is_normalizer_evidence_not_a_lifecycle_verdict():
+    r, _ = router()
+    quote_feed(r)
+    drain(r)
+    r.tickPrice(QRID, 1, 41.0, None)  # after END: refused by the lifecycle, never delivered
+    drain(r)
+    assert status_by_kind(r)[StreamKind.QUOTE_SNAPSHOT].completed is True  # the normalizer's own flag
+    assert "POST_END_EVENT" in r.report().adapter.ledger.faults  # the lifecycle records the failure
+
+
+def test_reading_status_delivers_nothing_and_changes_no_evidence():
+    r, _ = router()
+    everything(r)
+    report, envelopes = r.report(), (r.quote_envelopes(), r.account_summary_envelopes(), r.position_envelopes())
+    for _ in range(3):
+        r.stream_status()
+    assert r.report() == report and report.queued_records > 0
+    assert (r.quote_envelopes(), r.account_summary_envelopes(), r.position_envelopes()) == envelopes
+
+
+def test_status_is_payload_free_in_owner_mode():
+    owner = account_owner()
+    r = owner_router(owner)
+    owned_positions(r, FOREIGN_ACCOUNT)
+    r.error_1052(SRID, 0, 321, CANARY)
+    drain(r)
+    text = repr(r.stream_status())
+    for secret in (EXPECTED_ACCOUNT, FOREIGN_ACCOUNT, owner.binding.reference, CANARY, "RTRPOS", "840001"):
+        assert secret not in text, secret
+    assert set(StreamStatus.__slots__) == {"stream", "registered", "completed", "issue_codes", "issue_overflow"}

@@ -53,6 +53,29 @@ END is withheld; that is never treated as successful empty data. A reference is 
 within that owner's run. It is not authentication, ongoing identity evidence, or proof that the rows
 came from one connection.
 
+## Stream status
+
+`router.stream_status()` returns one frozen `StreamStatus` per closed `StreamKind`, in fixed order:
+`CONTRACT_DETAILS`, `QUOTE_SNAPSHOT`, `ACCOUNT_SUMMARY`, `POSITIONS`. Each has:
+
+| Field | Meaning |
+|---|---|
+| `registered` | A normalizer is registered for the stream. `False` also covers a refused registration |
+| `completed` | That normalizer's own `completed` flag; `False` when not registered |
+| `issue_codes` | Its existing fixed issue codes, in recorded order, as a tuple |
+| `issue_overflow` | Its count of issues beyond its bound |
+
+It is **read only**. It delivers no queued callback, changes no queue, state or fault, and is recomputed
+on every call. A captured snapshot keeps its capture-time values, while a later call sees any later
+invalidation; completion is never cached across a failure.
+
+It never exposes a normalizer object, callback value, callback-name label, request id, account
+identifier or reference, error text or envelope.
+
+It is **normalizer evidence, not a readiness or lifecycle verdict.** A callback the lifecycle refuses
+after END never reaches the normalizer, so its status can stay completed while the router report shows
+the fault.
+
 ## Payload ownership
 
 Quote, account-summary and position callbacks are lifecycle reads. Each is copied into an immutable record

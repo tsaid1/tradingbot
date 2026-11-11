@@ -57,6 +57,8 @@ __all__ = [
     "CallbackRouter",
     "RouterFault",
     "RouterReport",
+    "StreamKind",
+    "StreamStatus",
 ]
 
 MAX_QUEUE_RECORDS = 256    # retained records awaiting the consumer
@@ -219,6 +221,34 @@ def _cost(args: tuple) -> int:
             cost += _FIELD_COST + (len(arg) if type(arg) is str else
                                    len(arg.as_tuple().digits) if type(arg) is Decimal else 0)
     return cost
+
+
+class StreamKind(str, Enum):
+    """The closed set of streams a router can register, in ``stream_status`` order."""
+
+    CONTRACT_DETAILS = "CONTRACT_DETAILS"
+    QUOTE_SNAPSHOT = "QUOTE_SNAPSHOT"
+    ACCOUNT_SUMMARY = "ACCOUNT_SUMMARY"
+    POSITIONS = "POSITIONS"
+
+
+@dataclass(frozen=True, slots=True)
+class StreamStatus:
+    """One stream's evidence at capture time: its normalizer's own completion flag and fixed issue
+    codes, never a value, label, request id, reference, envelope or normalizer object."""
+
+    stream: StreamKind
+    registered: bool  # False: no normalizer was registered for this stream (or registration was refused)
+    completed: bool   # the normalizer's own ``completed``; False when not registered
+    issue_codes: tuple[str, ...]  # fixed issue codes in the order recorded
+    issue_overflow: int
+
+
+def _stream_status(kind: StreamKind, normalizer: object) -> StreamStatus:
+    if normalizer is None:
+        return StreamStatus(kind, False, False, (), 0)
+    return StreamStatus(kind, True, normalizer.completed,
+                        tuple(issue.code.value for issue in normalizer.issues), normalizer.issue_overflow)
 
 
 @dataclass(frozen=True)
@@ -712,6 +742,15 @@ class CallbackRouter:
 
     def position_envelopes(self) -> list[ResponseEnvelope]:
         return [] if self._positions is None else self._positions.envelopes()
+
+    def stream_status(self) -> tuple[StreamStatus, ...]:
+        """Each closed stream's current status, in ``StreamKind`` order. Read only: it delivers nothing,
+        changes no queue, state or fault, and is recomputed on every call, so a snapshot keeps its
+        capture-time values while a later call sees any later invalidation. Not a readiness verdict."""
+        return (_stream_status(StreamKind.CONTRACT_DETAILS, self._contract),
+                _stream_status(StreamKind.QUOTE_SNAPSHOT, self._quote),
+                _stream_status(StreamKind.ACCOUNT_SUMMARY, self._account),
+                _stream_status(StreamKind.POSITIONS, self._positions))
 
     def report(self) -> RouterReport:
         adapter = self._adapter.report()
