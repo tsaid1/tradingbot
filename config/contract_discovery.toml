@@ -90,6 +90,12 @@ sec_type = "FUT"
 exchange = "NYMEX"
 
 [[contract]]
+name = "MHNG fut (micro Henry Hub, symbol as reported by IBKR product search; UNCONFIRMED)"
+symbol = "MHNG"
+sec_type = "FUT"
+exchange = "NYMEX"
+
+[[contract]]
 name = "GC fut"
 symbol = "GC"
 sec_type = "FUT"
