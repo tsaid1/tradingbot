@@ -15,7 +15,8 @@ proven from public report evidence.
   appeared, and every admitted record was dispatched by the consumer. Delivery is never inferred from a
   callback count or an empty queue alone.
 * **Latched failure.** A callback-free return, a decoder exception (also after callbacks), a version
-  mismatch, a router fault (refused or unsupported callback), callback overflow, incomplete settlement,
+  mismatch, a router fault (checked around each forwarded callback), an unsupported callback, callback
+  overflow, incomplete settlement,
   foreign queued work, a late callback or reentry latches one fixed failure. The failing frame stays held,
   processing stops, and the failure persists after END. Unsupported, refused and late callbacks also reach
   the router as its persistent refusal.
@@ -229,7 +230,15 @@ class _FrameSink:
             return
         if handoff._failure is not None:
             return  # after a latched failure the frame's remaining callbacks are not forwarded
+        router = handoff._router
+        before = router.report()
         handoff._forward(entry, args)
+        after = router.report()
+        held = handoff._held
+        if held is not None:
+            held.admitted = after.queued_records  # current before any failure record can freeze
+        if _evidence(after) != _evidence(before):
+            handoff._latch(Failure.ROUTER_REFUSED)  # before another step can forward
 
     def __repr__(self) -> str:
         return f"_FrameSink(open={self._open}, callbacks={self.callbacks})"

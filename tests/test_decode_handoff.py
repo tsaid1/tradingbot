@@ -432,3 +432,37 @@ def test_control_a_settled_frame_is_released():
     feed_fragmented(handoff, ORDER[:1])
     assert handoff.process_one() is True
     assert handoff._held is None and handoff.report().held_sequence is None
+
+
+def test_a_refused_call_form_stops_every_later_queued_and_direct_callback_in_its_frame():
+    """Review P2: the refusal latches at the forwarding call, before another step can forward."""
+    scripts = dict(CONTROL)
+    scripts[b"INV-quote"] = ((call(Entry.TICK_PRICE, QRID, 1),) + CONTRACT + QUOTE)  # refused, then direct, queued
+    router, _decoder, handoff = handoff_for(scripts)
+    feed_fragmented(handoff, (b"INV-quote",))
+    handoff.process_available()
+    report = handoff.report()
+    assert report.failure is Failure.ROUTER_REFUSED and report.held_sequence == 1
+    assert router.report().queued_records == 0  # no later quote callback was admitted
+    assert router.contract_envelopes() == []  # no later direct contract callback was delivered
+    assert report.handoffs[0].records_admitted == 0
+
+
+@pytest.mark.parametrize(("script", "failure", "admitted"), [
+    (QUOTE[:3] + (Step(StepKind.RAISE),), Failure.DECODER_RAISED, 3),
+    (QUOTE[:2] + (call(Entry.UNSUPPORTED),), Failure.UNSUPPORTED_CALLBACK, 2),
+    (tuple(call(Entry.TICK_SIZE, QRID, 0, Decimal(200)) for _ in range(MAX_CALLBACKS_PER_FRAME + 1)),
+     Failure.CALLBACK_OVERFLOW, MAX_CALLBACKS_PER_FRAME),
+], ids=["raise-after-three", "unsupported-after-two", "overflow-after-limit"])
+def test_a_failed_record_counts_every_record_its_frame_admitted(script, failure, admitted):
+    """Review P2: admission accounting is current before the failure record freezes."""
+    scripts = dict(CONTROL)
+    scripts[b"INV-quote"] = script
+    router, _decoder, handoff = handoff_for(scripts)
+    feed_fragmented(handoff, (b"INV-quote",))
+    handoff.process_available()
+    record = handoff.report().handoffs[0]
+    assert (record.status, record.failure) == (HandoffStatus.FAILED, failure)
+    assert (record.records_admitted, record.records_dispatched) == (admitted, 0)
+    assert router.report().queued_records == admitted  # the record matches the router's own evidence
+    assert handoff._held.frame.payload == b"INV-quote"  # and the frame stays owned

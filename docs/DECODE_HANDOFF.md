@@ -52,7 +52,10 @@ method name and no user callable.
 3. **Check version provenance.** The decoder's current version must equal the version pinned at
    construction; otherwise `VERSION_MISMATCH`, and the frame is not decoded.
 4. **Decode synchronously** into a fresh frame-scoped sink. The sink forwards each callback to one fixed
-   facade entry and is closed when decoding returns.
+   facade entry and is closed when decoding returns. Around **each** forward it compares the router's public
+   failure evidence: a new fault or adapter failure latches `ROUTER_REFUSED` at once, so no later queued or
+   direct callback in that frame is forwarded. It also updates the frame's admitted-record count after each
+   forward, so a failure record always matches the router's own queue.
 5. **Check delivery.** A return with no callback, a decoder exception (also after callbacks), or any new
    router fault or adapter failure fails the frame.
 6. **Settle.** Every record decoding admitted is dispatched with the router's own `consume_one`. Afterwards
