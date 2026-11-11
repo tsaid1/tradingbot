@@ -33,6 +33,7 @@ SCENARIOS = {"Synthetic: populated run": "populated", "Synthetic: empty run": "e
 MARK_PRICE_TEXT = re.compile(r"[0-9]{1,15}(\.[0-9]{1,10})?")  # plain positive decimal text, bounded
 MAX_MARK_TIME_TEXT = 40
 POLICY = MockPolicy()  # the policy build_snapshot uses by default
+LEDGER_NAMES = {"journal": "Journal ledger (Sprint 1)", "replay": "Replay ledger (Sprint 1.1)"}
 
 st.set_page_config(page_title="Mock Operations", page_icon="📋", layout="wide")
 st.title("Mock Operations (read-only)")
@@ -79,6 +80,13 @@ with st.sidebar:
 
 ledgers = _ensure_fixture(SCENARIOS[choice])
 snapshot: OperationsSnapshot = build_snapshot(ledgers, now=datetime.now(timezone.utc))
+# This page reconciles both ledgers. One without a configured path is MISSING evidence, never an empty
+# ledger: the page's reconciliation, totals and mark report are then incomplete. The shared read model,
+# which single-ledger views also use, is unchanged.
+missing = [engine for engine, path in (("journal", ledgers.journal_path), ("replay", ledgers.replay_path))
+           if path is None]
+if missing:
+    snapshot = snapshot.model_copy(update={"reconciliation_complete": False})
 counts = snapshot.counts()
 
 
@@ -164,8 +172,13 @@ built = st.session_state.get("mock_ops_built_at")
 st.markdown(
     f"**Fixture:** `{ledgers.label}` built {built or 'unknown'} in a task-local temporary directory."
 )
+for engine in missing:
+    st.error(
+        f"{LEDGER_NAMES[engine]}: NOT CONFIGURED — no ledger path was supplied, so its evidence is MISSING, "
+        "not empty. See reconciliation."
+    )
 for act in snapshot.activity:
-    name = "Journal ledger (Sprint 1)" if act.engine == "journal" else "Replay ledger (Sprint 1.1)"
+    name = LEDGER_NAMES[act.engine]
     if not act.readable:
         st.error(
             f"{name}: UNREADABLE — `{act.path}` could not be opened read-only. See reconciliation."
@@ -201,17 +214,34 @@ for act in snapshot.activity:
         )
 
 m1, m2, m3, m4 = st.columns(4)
-m1.metric("Open mock positions", counts["open_positions"])
-m2.metric("Fictional fills", counts["fills"])
-m3.metric("Outcomes needing review", counts["needs_review"])
-m4.metric("Discrepancies", counts["serious_discrepancies"] + counts["warning_discrepancies"])
-if snapshot.is_empty:
+totals = {
+    "Open mock positions": counts["open_positions"],
+    "Fictional fills": counts["fills"],
+    "Outcomes needing review": counts["needs_review"],
+    "Discrepancies": counts["serious_discrepancies"] + counts["warning_discrepancies"],
+}
+for column, (label, value) in zip((m1, m2, m3, m4), totals.items(), strict=True):
+    # A missing ledger makes every total across both ledgers UNKNOWN: never zero, never a partial count.
+    column.metric(label, "UNKNOWN" if missing else value)
+if missing:
+    st.warning(
+        "Totals are UNKNOWN: "
+        + ", ".join(LEDGER_NAMES[e] for e in missing)
+        + " not configured. "
+        + ("Rows below come only from the configured ledger." if len(missing) == 1 else "Nothing was read.")
+    )
+elif snapshot.is_empty:
     st.info("Empty run: no positions, fills or validation outcomes are recorded in either ledger.")
 
 # ----------------------------------------------------------------------------- positions
 st.subheader("Mock positions")
 open_positions = snapshot.open_positions
-if not open_positions:
+if not open_positions and missing:
+    st.warning(
+        "No open mock position in the configured ledger; positions in the missing ledger are UNKNOWN."
+        if len(missing) == 1 else "No ledger is configured: positions are UNKNOWN."
+    )
+elif not open_positions:
     st.info("No open mock positions recorded in either ledger.")
 else:
     st.dataframe(
@@ -334,8 +364,17 @@ if snapshot.discrepancies:
         message = f"{d.severity} {d.code} [{d.engine}] {d.subject}: {d.detail}"
         (st.error if d.severity == "SERIOUS" else st.warning)(message)
 if not snapshot.reconciliation_complete:
+    causes = [f"{LEDGER_NAMES[e]} not configured (evidence missing)" for e in missing]
+    for act in snapshot.activity:
+        if not act.readable:
+            causes.append(f"{LEDGER_NAMES[act.engine]} unreadable")
+        if act.history_truncated:
+            causes.append(f"{LEDGER_NAMES[act.engine]} only partly read")
+        if act.undecodable_rows:
+            causes.append(f"{LEDGER_NAMES[act.engine]} has {act.undecodable_rows} undecodable record(s)")
     st.error(
-        "Reconciliation is INCOMPLETE: at least one ledger was unreadable or only partly read."
+        "Reconciliation is INCOMPLETE: " + "; ".join(causes) + ". Missing or failed evidence is never shown as "
+        "empty or clean."
     )
 elif not snapshot.discrepancies:
     if snapshot.is_empty:
