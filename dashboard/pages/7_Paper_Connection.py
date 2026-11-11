@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import builtins
 import hashlib
+import inspect
 import json
 import math
 import re
@@ -333,11 +334,16 @@ st.title("Paper Connection (saved report, read-only)")
 st.error(BANNER)
 st.warning(MEANING)
 
+# The supported range starts at streamlit 1.36, whose uploader has no max_upload_size. Where the installed one has
+# it, use the smallest transport limit (1 MB); the page's own 64 KiB cap below applies either way.
+_TRANSPORT_LIMIT = ({"max_upload_size": 1}
+                    if "max_upload_size" in inspect.signature(st.file_uploader).parameters else {})
 uploaded = st.file_uploader(
     "Saved diagnostic report (JSON, at most 64 KiB)", type=["json"], accept_multiple_files=False,
-    key="paper_connection_report", max_upload_size=1,  # transport limit (whole MB); the 64 KiB cap is below
-    help="At most 64 KiB is accepted; the uploader's 1 MB is only its transport limit. Held in memory for this "
-    "session only. Nothing is saved, run or connected.",
+    key="paper_connection_report",
+    help="At most 64 KiB is accepted; any larger limit the uploader shows is only its transport limit. Held in "
+    "memory for this session only. Nothing is saved, run or connected.",
+    **_TRANSPORT_LIMIT,
 )
 if uploaded is None:
     st.info("NO REPORT: no saved diagnostic report is loaded. Nothing has been run or connected.")

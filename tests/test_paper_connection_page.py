@@ -18,6 +18,7 @@ import urllib.request
 from pathlib import Path
 
 import pytest
+import streamlit
 from streamlit.testing.v1 import AppTest
 
 import tradingbot
@@ -100,7 +101,13 @@ def page() -> AppTest:
     return AppTest.from_file(str(PAGE), default_timeout=60)
 
 
+# Driving an upload needs AppTest file-uploader support; without it these cases are skipped, never faked.
+CAN_UPLOAD = hasattr(AppTest, "file_uploader")
+
+
 def upload(data: bytes, name: str = "result.json") -> AppTest:
+    if not CAN_UPLOAD:
+        pytest.skip("this Streamlit's AppTest cannot drive st.file_uploader")
     at = page().run()
     at.file_uploader[0].set_value((name, data, "application/json"))
     return at.run()
@@ -127,7 +134,7 @@ def test_page_imports_only_streamlit_the_stdlib_and_sdk_free_enums():
     tree = ast.parse(source)
     modules = {node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)}
     modules |= {alias.name for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names}
-    assert modules == {"__future__", "builtins", "hashlib", "json", "math", "re", "datetime", "streamlit",
+    assert modules == {"__future__", "builtins", "hashlib", "inspect", "json", "math", "re", "datetime", "streamlit",
                        "tradingbot.paper_readiness.account_position_callbacks",
                        "tradingbot.paper_readiness.callback_router", "tradingbot.paper_readiness.ibkr_callbacks",
                        "tradingbot.paper_readiness.managed_accounts_input",
@@ -141,14 +148,42 @@ def test_page_imports_only_streamlit_the_stdlib_and_sdk_free_enums():
 def test_default_is_no_report_and_the_only_input_is_one_upload():
     at = page().run()
     assert not at.exception
-    assert [u.label for u in at.file_uploader] == ["Saved diagnostic report (JSON, at most 64 KiB)"]
-    assert not at.file_uploader[0].accept_multiple_files and at.file_uploader[0].allowed_type == [".json"]
+    if CAN_UPLOAD:
+        assert [u.label for u in at.file_uploader] == ["Saved diagnostic report (JSON, at most 64 KiB)"]
+        assert not at.file_uploader[0].accept_multiple_files and at.file_uploader[0].allowed_type == [".json"]
     for widget in INPUT_WIDGETS:
         assert not list(getattr(at, widget, [])), widget
     text = shown(at)
     assert "NO REPORT" in text and not at.metric
     assert "NON_AUTHORITATIVE" in text and "trading_permission = False" in text
     assert "PASS" not in [m.value for m in at.metric]
+
+
+def test_the_page_opens_with_an_uploader_that_has_no_max_upload_size_parameter(monkeypatch):
+    """Review P2: pyproject allows streamlit>=1.36, whose st.file_uploader has no max_upload_size. With that
+    older signature (simulated here exactly; passing the argument raises TypeError) the page must still open on
+    NO REPORT, and its own 64 KiB cap still applies."""
+    real = streamlit.file_uploader
+
+    def uploader_1_36(label, type=None, accept_multiple_files=False, key=None, help=None, on_change=None,
+                      args=None, kwargs=None, *, disabled=False, label_visibility="visible"):
+        return real(label, type=type, accept_multiple_files=accept_multiple_files, key=key, help=help,
+                    on_change=on_change, args=args, kwargs=kwargs, disabled=disabled,
+                    label_visibility=label_visibility)
+
+    monkeypatch.setattr(streamlit, "file_uploader", uploader_1_36)
+    at = page().run()
+    assert not at.exception
+    assert "NO REPORT" in shown(at) and not at.metric
+    if CAN_UPLOAD:
+        assert len(at.file_uploader) == 1
+        data = encode(invented_pass())
+        oversize = data + b" " * (64 * 1024 + 1 - len(data))
+        at.file_uploader[0].set_value(("result.json", oversize, "application/json"))
+        at.run()
+        assert not at.exception
+        assert [e.value for e in at.error if e.value.startswith("REPORT REFUSED")] == [
+            "REPORT REFUSED: OVERSIZE. Nothing from the file is read or shown; no digest is computed."]
 
 
 # ----------------------------------------------------------------------------- reported PASS, as reported

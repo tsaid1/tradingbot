@@ -20,8 +20,9 @@ for the session and never saved.
 
 The upload is checked before anything is shown:
 - **Size:** at most 64 KiB, checked against the declared size before reading and again after a bounded read.
-  Larger files are refused before parsing, and no digest is computed for them. The uploader's own
-  transport limit is 1 MB, the smallest Streamlit allows; that is not the acceptance cap.
+  Larger files are refused before parsing, and no digest is computed for them. Where the installed
+  Streamlit supports it, the uploader's own transport limit is 1 MB, the smallest allowed. The supported
+  minimum, 1.36, has no such limit and uses the server default instead. Neither is the acceptance cap.
 - **Parsing:** strict UTF-8 JSON, with no duplicate keys or `NaN`/`Infinity`, at most 16 levels deep and
   20 000 values, and a top-level object.
 - **Closed shape:** every top-level field must belong to the diagnostic's accepted result shape (head
@@ -84,3 +85,7 @@ The page recognises these sections and **never displays them**; it lists only th
   needs review.
 - The page cannot tell an edited or fabricated file from a genuine one; only the digest comparison can.
 - Nothing is persisted; reloading the page clears the upload.
+- **Streamlit versions:** the page runs on the declared `streamlit>=1.36`. The test that opens it with the
+  1.36 uploader signature simulates that signature in the installed version; it was not run on a 1.36
+  install. Upload-driven tests need AppTest file-uploader support. Where that is missing they are skipped,
+  never faked.
