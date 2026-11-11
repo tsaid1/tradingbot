@@ -15,10 +15,10 @@ version >= MIN_SERVER_VERSION -> identity gate -> read-only check -> READY.
 """
 from __future__ import annotations
 
+import itertools
 import logging
 import threading
 import time
-import weakref
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -151,12 +151,13 @@ def _outgoing_msg_id(frame: bytes, server_version: int | None) -> int | None:
         return None
 
 
-# The SDK ``Connection`` (and through it the socket) behind each ``_GuardedConnection``. It is held
-# ONLY here, never as an attribute, closure cell or default of anything the session reaches, so no
-# attribute path from a session leads to an unfiltered send. Reaching this dict needs module globals
-# (``import`` or a function's ``__globals__``): the same in-process power as ``import socket`` or
-# ``gc``, which an in-process filter cannot stop (docs/IBKR_ADAPTER.md, section 4).
-_RAW_CONNECTIONS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+# The SDK ``Connection`` (and through it the socket) behind each ``_GuardedConnection``, keyed by an
+# opaque int token. It is held ONLY here: never as an attribute, closure cell, default or weakref
+# callback of anything the session reaches (the guard is not weak-referenceable), so no attribute
+# or weak-reference path from a session leads to an unfiltered send. Reaching this dict needs
+# module globals: out of scope for an in-process filter (docs/IBKR_ADAPTER.md, section 4).
+_RAW_CONNECTIONS: dict[int, Any] = {}
+_TOKENS = itertools.count(1)
 _RAW_METHODS = frozenset({"connect", "disconnect", "isConnected", "recvMsg", "sendMsg"})
 
 
@@ -168,7 +169,7 @@ def _raw_call(guard: _GuardedConnection, name: str, *args: Any) -> Any:
         raise ReadOnlyViolation(f"connection method {name!r} is not exposed")
     err: BaseException | None = None
     try:
-        return getattr(_RAW_CONNECTIONS[guard], name)(*args)
+        return getattr(_RAW_CONNECTIONS[guard._token], name)(*args)
     except BaseException as exc:  # noqa: BLE001 - re-raised below, stripped
         err = exc
     err.__traceback__ = None
@@ -184,12 +185,16 @@ class _GuardedConnection:
     It exposes exactly the five methods the SDK uses (no ``__getattr__`` forwarding, no ``socket``,
     no ``lock``) and holds no reference to the raw connection (see ``_RAW_CONNECTIONS``)."""
 
-    __slots__ = ("__weakref__", "_client", "_handshake_sent")
+    __slots__ = ("_client", "_handshake_sent", "_token")  # no __weakref__: see _RAW_CONNECTIONS
 
     def __init__(self, raw, client: EClient) -> None:
-        _RAW_CONNECTIONS[self] = raw
+        self._token = next(_TOKENS)
+        _RAW_CONNECTIONS[self._token] = raw
         self._client = client
         self._handshake_sent = False
+
+    def __del__(self) -> None:  # the entry lives exactly as long as its guard
+        _RAW_CONNECTIONS.pop(getattr(self, "_token", None), None)
 
     def sendMsg(self, msg: bytes):
         if not isinstance(msg, (bytes, bytearray)):

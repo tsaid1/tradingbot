@@ -1021,7 +1021,8 @@ _NOT_FOLLOWED_TYPES = (type, types.ModuleType, io.IOBase, types.CodeType)
 _NOT_FOLLOWED_ATTRS = {"f_globals", "f_builtins", "f_back"}
 # Dunder attributes that hold references (the rest are slot wrappers of the type's protocol).
 _DUNDERS = ("__self__", "__func__", "__closure__", "__wrapped__", "__defaults__", "__kwdefaults__",
-            "__traceback__", "__context__", "__cause__", "__notes__", "__args__")
+            "__traceback__", "__context__", "__cause__", "__notes__", "__args__",
+            "__callback__")
 MAX_DEPTH = 16
 
 
@@ -1055,6 +1056,18 @@ def _children(obj):
             pass
     if isinstance(obj, weakref.ref):
         yield "()", obj()
+        yield ".__callback__", obj.__callback__
+    try:
+        refs = weakref.getweakrefs(obj)  # reverse weak references and their callbacks
+    except TypeError:
+        refs = []
+    for i, ref in enumerate(refs):
+        yield f"<getweakrefs[{i}]>", ref
+    if isinstance(obj, (types.FunctionType, types.MethodType)):
+        fn = getattr(obj, "__func__", obj)
+        yield ".__defaults__", fn.__defaults__
+        yield ".__kwdefaults__", fn.__kwdefaults__
+        yield ".__closure__", fn.__closure__
     for name in dir(obj):
         if name in _NOT_FOLLOWED_ATTRS or (name.startswith("__") and name not in _DUNDERS):
             continue
@@ -1160,6 +1173,35 @@ def test_object_graph_of_connected_session_reaches_no_unfiltered_send(tws):
     assert s._client.isConnected() and len(s.positions()) == 1  # still a working read session
     s.disconnect()
     assert_closed(s)
+
+
+def test_reviewer_weakref_probe_finds_nothing(tws):
+    """Merge review probe: weakref.getweakrefs(conn)[0].__callback__.__defaults__[0]() once
+    returned the raw-connection mapping. The guard is now not weak-referenceable at all."""
+    s = session()
+    s.connect()
+    conn = s._client.conn
+    assert weakref.getweakrefs(conn) == []
+    with pytest.raises(TypeError):
+        weakref.ref(conn)
+    assert not hasattr(conn, "__dict__") and type(conn._token) is int
+    s.disconnect()
+
+
+def test_raw_connection_entry_is_dropped_with_its_guard(tws):
+    import gc
+
+    from tradingbot.ibkr import session as sess
+
+    before = set(sess._RAW_CONNECTIONS)
+    s = session()
+    s.connect()
+    token = s._client.conn._token
+    assert token in sess._RAW_CONNECTIONS
+    s.disconnect()
+    del s
+    gc.collect()
+    assert token not in sess._RAW_CONNECTIONS and set(sess._RAW_CONNECTIONS) <= before
 
 
 def test_exception_from_raw_send_carries_no_raw_frame(tws):
