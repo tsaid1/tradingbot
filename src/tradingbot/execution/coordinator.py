@@ -27,6 +27,7 @@ from pydantic import Field
 
 from tradingbot.event_models import ReplaySource, TradeAction
 from tradingbot.execution.broker import (
+    WORKING_STATUSES,
     AckLost,
     Broker,
     BrokerError,
@@ -159,7 +160,7 @@ def _intent_state(status: OrderStatus, filled: int, quantity: int) -> IntentStat
         return IntentState.FILLED
     if status in (OrderStatus.REJECTED, OrderStatus.INACTIVE):
         return IntentState.CANCELLED if filled else IntentState.REJECTED
-    if status == OrderStatus.CANCELLED:
+    if status in (OrderStatus.CANCELLED, OrderStatus.API_CANCELLED):
         return IntentState.CANCELLED
     if status == OrderStatus.UNKNOWN:
         return IntentState.UNRESOLVED
@@ -1292,15 +1293,7 @@ class ExecutionCoordinator:
     def _refresh_orders(self, open_orders: list[BrokerOrder], now: datetime) -> None:
         """Bring our order rows and working intents up to the broker's view."""
         open_by_ref = {o.order_ref: o for o in open_orders}
-        live = {"Recorded"} | {
-            s.value
-            for s in (
-                OrderStatus.PENDING_SUBMIT,
-                OrderStatus.PRE_SUBMITTED,
-                OrderStatus.SUBMITTED,
-                OrderStatus.PARTIALLY_FILLED,
-            )
-        }
+        live = {"Recorded"} | {s.value for s in WORKING_STATUSES}
         intents = {i.order_ref: i for i in self.store.intents()}
         for row in self.store.orders():
             intent = intents.get(row.intent_ref)

@@ -53,8 +53,11 @@ class OrderStatus(str, Enum):
     PRE_SUBMITTED = "PreSubmitted"  # accepted, held (e.g. a bracket child awaiting its parent)
     SUBMITTED = "Submitted"
     PARTIALLY_FILLED = "PartiallyFilled"
+    # A cancel was requested and the broker has not confirmed it: the order can still fill.
+    PENDING_CANCEL = "PendingCancel"
     FILLED = "Filled"
     CANCELLED = "Cancelled"
+    API_CANCELLED = "ApiCancelled"  # cancelled through the API before the exchange acknowledged it
     REJECTED = "Rejected"
     INACTIVE = "Inactive"
     UNKNOWN = "Unknown"
@@ -66,12 +69,14 @@ WORKING_STATUSES = frozenset(
         OrderStatus.PRE_SUBMITTED,
         OrderStatus.SUBMITTED,
         OrderStatus.PARTIALLY_FILLED,
+        OrderStatus.PENDING_CANCEL,
     }
 )
 TERMINAL_STATUSES = frozenset(
     {
         OrderStatus.FILLED,
         OrderStatus.CANCELLED,
+        OrderStatus.API_CANCELLED,
         OrderStatus.REJECTED,
         OrderStatus.INACTIVE,
     }
