@@ -118,6 +118,9 @@ class ExecutionConfig(StrictModel):
     # Cancel / resize confirmation before an exit: this many broker reads, this far apart.
     confirm_attempts: int = Field(default=3, ge=1, le=20)
     confirm_wait_seconds: float = Field(default=0.0, ge=0, le=5)
+    # Time in force of the protective stop / target children (and their recovery rebuild). GTC by
+    # default; an experiment whose broker caps allow DAY only (IBKR paper-test-1) sets DAY.
+    protective_tif: TimeInForce = TimeInForce.GTC
 
 
 class ExecutionOutcome(StrictModel):
@@ -444,7 +447,7 @@ class ExecutionCoordinator:
                     quantity=qty,
                     order_type=OrderType.STP,
                     stop_price=stop,
-                    tif=TimeInForce.GTC,
+                    tif=self.config.protective_tif,
                     parent_ref=ref,
                     reduce_only=True,
                 )
@@ -458,7 +461,7 @@ class ExecutionCoordinator:
                     quantity=qty,
                     order_type=OrderType.LMT,
                     limit_price=target,
-                    tif=TimeInForce.GTC,
+                    tif=self.config.protective_tif,
                     parent_ref=ref,
                     reduce_only=True,
                 )
@@ -1190,7 +1193,7 @@ class ExecutionCoordinator:
                     order_type=OrderType(r.order_type),
                     limit_price=_dec(r.limit_price),
                     stop_price=_dec(r.stop_price),
-                    tif=TimeInForce.GTC if r.role in (Role.STOP, Role.TARGET) else TimeInForce.DAY,
+                    tif=self.config.protective_tif if r.role in (Role.STOP, Role.TARGET) else TimeInForce.DAY,
                     parent_ref=r.parent_ref,
                     reduce_only=r.role != Role.ENTRY,
                 )
