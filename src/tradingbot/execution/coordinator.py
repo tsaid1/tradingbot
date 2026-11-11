@@ -358,12 +358,34 @@ class ExecutionCoordinator:
                     ledger_quantity=pos.quantity,
                 )
         self._refresh_orders(open_orders, now)
+        if self.halted() and self._cancel_entries_for_halt(open_orders):
+            # Risk-reducing: re-read so a fill that beat the cancel is applied and covered at once.
+            return self.sync()
         positions = {p.idea_id: p for p in self.store.positions()}
         for idea_id in sorted(
             touched | {i for i, p in positions.items() if p.status in ("OPEN", "PENDING")}
         ):
             self._maintain_protection(idea_id)
         return True
+
+    def _cancel_entries_for_halt(self, open_orders: list[BrokerOrder]) -> bool:
+        """Under the halt no entry or add may keep working (it could fill while nothing else may
+        be sent): every working one is cancelled. Returns True when a cancel was requested."""
+        entries = {r.order_ref: r for r in self.store.orders() if r.role == Role.ENTRY}
+        asked = False
+        for o in open_orders:
+            row = entries.get(o.order_ref)
+            if row is None or o.status == OrderStatus.PENDING_CANCEL:
+                continue
+            asked |= self._try(
+                lambda r=o.order_ref: self.broker.cancel(r),
+                "HALT_ENTRY_CANCELLED",
+                row.idea_id,
+                o.order_ref,
+                reason="halt engaged: working entries and adds are cancelled",
+                halt_file=str(self.config.halt_file),
+            )
+        return asked
 
     # ================================================================== actions
 
@@ -1183,26 +1205,16 @@ class ExecutionCoordinator:
                     reason="position fully committed to working exits",
                 )
                 continue
-            if o.remaining != cover:
-                if self.halted():
-                    self.store.log(
-                        now,
-                        "PROTECTIVE_RESIZE_HALTED",
-                        order_ref=ref,
-                        idea_id=idea_id,
-                        working=o.remaining,
-                        ledger=pos.quantity,
-                    )
-                    continue
-                if self._try(
-                    lambda o=o: self.broker.modify(o.order_ref, quantity=o.filled_quantity + cover),
-                    "PROTECTIVE_RESIZED",
-                    idea_id,
-                    ref,
-                    before=o.remaining,
-                    after=cover,
-                ):
-                    changed = True
+            # Allowed under the halt: sizing protection to the position never adds exposure.
+            if o.remaining != cover and self._try(
+                lambda o=o: self.broker.modify(o.order_ref, quantity=o.filled_quantity + cover),
+                "PROTECTIVE_RESIZED",
+                idea_id,
+                ref,
+                before=o.remaining,
+                after=cover,
+            ):
+                changed = True
         if changed:
             try:
                 open_by_ref = {o.order_ref: o for o in self.broker.open_orders()}

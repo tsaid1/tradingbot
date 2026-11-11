@@ -353,3 +353,38 @@ def test_r6_reconcile_flags_a_working_entry_of_a_closed_idea(tmp_path):
     kinds = [d.kind.value for d in h.coord.reconcile().discrepancies]
     assert "WORKING_ENTRY_ON_CLOSED_IDEA" in kinds and not h.coord.reconcile().clean
     assert opened.order_ref in h.working()
+
+
+# ----------------------------------------------------------------------------------------- R7
+
+
+def test_r7_halt_cancels_working_entries_and_still_resizes_the_stop(tmp_path):
+    h = Harness(tmp_path, strict=True)
+    opened = h.execute("p1", open_action())
+    stop = f"{opened.order_ref}.STP"
+    h.broker.script_next_submit("REST")
+    add = h.execute("p2", action("add", Action.ADD, idea="p1:open", entry="50"))
+    assert add.state == IntentState.WORKING
+    h.halt()
+    h.broker.script_next_cancel("FILL_FIRST")  # the add fills before the halt's cancel lands
+    h.coord.sync()
+    assert add.order_ref not in h.working()  # no entry keeps working under the halt
+    assert h.coord.store.position("p1:open").quantity == 6
+    assert h.working()[stop].remaining == 6  # the protective resize is not blocked by the halt
+    assert h.coord._outcome(add.order_ref).protection == "CONFIRMED"
+    # Anything that would add exposure stays blocked.
+    calls = h.broker.submit_calls
+    more = h.execute("p3", action("add2", Action.ADD, idea="p1:open", entry="50"))
+    assert more.state == IntentState.HALTED and h.broker.submit_calls == calls
+
+
+def test_r7_halt_cancels_a_resting_entry_without_a_fill(tmp_path):
+    h = Harness(tmp_path, strict=True)
+    h.broker.script_next_submit("PARTIAL", quantity=1)
+    opened = h.execute("p1", open_action())
+    h.halt()
+    h.coord.sync()
+    assert opened.order_ref not in h.working()
+    assert h.coord.intent(opened.order_ref).state == IntentState.CANCELLED
+    assert h.working()[f"{opened.order_ref}.STP"].remaining == 1
+    assert "HALT_ENTRY_CANCELLED" in h.events(opened.order_ref)
