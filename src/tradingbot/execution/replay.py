@@ -26,6 +26,8 @@ from tradingbot.execution.store import LedgerPosition
 from tradingbot.models import Action, GateDecision, Quote
 
 PRIOR_INTENT = "INTENT_ALREADY_ON_RECORD"
+# A member of an approved atomic group did not end EXECUTED: the rest of the group is held.
+PARTIAL_GROUP = "PARTIAL_GROUP"
 
 
 def _idea(p: LedgerPosition) -> Idea:
@@ -75,8 +77,22 @@ class BrokerEventReplay(PaperEventReplay):
         return super()._simulate(source, a, quotes, ideas, now)
 
     def _execute_group(self, source, group, outcomes, ideas, now) -> list[ActionOutcome]:
+        """Execute the approved group in order. In a multi-action group, the first member that
+        does not end EXECUTED stops it: every later member is HELD (never sent) and a PARTIAL_GROUP
+        exception records the half-done group for a human (safety review M3)."""
         results = []
+        stopped: tuple[TradeAction, str] | None = None
         for action, approved in zip(group, outcomes, strict=True):
+            if stopped is not None:
+                first, status = stopped
+                results.append(
+                    ActionOutcome(
+                        action_id=action.action_id,
+                        status="HOLD",
+                        reasons=[PARTIAL_GROUP, f"GROUP_STOPPED_AT:{first.action_id}:{status}"],
+                    )
+                )
+                continue
             gate = GateDecision(status="APPROVE", reasons=list(approved.reasons))
             r = self.coordinator.execute(source, action, gate, now=now)
             reasons = [
@@ -97,6 +113,10 @@ class BrokerEventReplay(PaperEventReplay):
                     order_ref=r.order_ref,
                 )
             )
+            if len(group) > 1 and r.replay_status != "EXECUTED":
+                stopped = (action, r.replay_status)
+        if stopped is not None:
+            self._record_partial_group(source, group, stopped, results)
         ledger = {p.idea_id: p for p in self.coordinator.ledger()}
         for action in group:
             if action.action == Action.OPEN:
@@ -104,3 +124,29 @@ class BrokerEventReplay(PaperEventReplay):
         for idea_id, p in ledger.items():
             ideas[idea_id] = _idea(p)
         return results
+
+    def _record_partial_group(self, source, group, stopped, results) -> None:
+        first, status = stopped
+        store = self.coordinator.store
+        at = self.coordinator.clock()
+        held = [r.action_id for r in results if r.status == "HOLD" and PARTIAL_GROUP in r.reasons]
+        ref = next((r.order_ref for r in results if r.action_id == first.action_id), None)
+        done = [r.action_id for r in results if r.status == "EXECUTED"]
+        detail = (
+            f"atomic group of source {source.source_id} rev {source.revision}: "
+            f"{first.action_id} ended {status}; executed {done or 'none'}; held {held}"
+        )
+        if store.raise_exception(
+            at, PARTIAL_GROUP, detail, idea_id=first.idea_reference, order_ref=ref
+        ):
+            store.log(
+                at,
+                PARTIAL_GROUP,
+                order_ref=ref,
+                idea_id=first.idea_reference,
+                group=[a.action_id for a in group],
+                stopped_at=first.action_id,
+                status=status,
+                executed=done,
+                held=held,
+            )

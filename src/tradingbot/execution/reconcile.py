@@ -29,6 +29,9 @@ class DiscrepancyKind(str, Enum):
     INTENT_STUCK_UNRESOLVED = "INTENT_STUCK_UNRESOLVED"
     UNAPPLIED_EXECUTION = "UNAPPLIED_EXECUTION"
     BROKER_UNREADABLE = "BROKER_UNREADABLE"
+    # An approved atomic group executed only in part (an open PARTIAL_GROUP exception): never
+    # explained away, it stays unclean until a human resolves the exception.
+    PARTIAL_GROUP = "PARTIAL_GROUP"
 
 
 class Discrepancy(StrictModel):
@@ -197,6 +200,18 @@ def reconcile(
                     idea_id=i.idea_id,
                     order_ref=i.order_ref,
                     detail=f"{i.state.value} since {i.updated_at.isoformat()}",
+                )
+            )
+
+    # 6. Atomic groups that executed only in part.
+    for e in open_exceptions:
+        if e.kind == DiscrepancyKind.PARTIAL_GROUP.value:
+            out.append(
+                Discrepancy(
+                    kind=DiscrepancyKind.PARTIAL_GROUP,
+                    idea_id=e.idea_id,
+                    order_ref=e.order_ref,
+                    detail=e.detail,
                 )
             )
 

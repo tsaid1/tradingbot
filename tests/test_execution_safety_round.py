@@ -7,12 +7,16 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from execution_harness import Harness, action, open_action
+from execution_harness import Harness, action, open_action, source
 
+from tradingbot.event_models import ParsedPost
 from tradingbot.execution.broker import (
     TERMINAL_STATUSES,
     WORKING_STATUSES,
+    OrderIntent,
+    OrderSide,
     OrderStatus,
+    OrderType,
 )
 from tradingbot.execution.coordinator import PROTECTION_UNVERIFIED, _intent_state
 from tradingbot.execution.store import IntentState
@@ -111,3 +115,43 @@ def test_m2_a_recorded_entry_counts_and_does_not_count_against_its_own_resend(tm
     h.clock.advance(h.config.settle_seconds + 1)
     h.coord.recover()  # no trace: the resend is not refused by its own exposure
     assert h.coord.intent(first.order_ref).state == IntentState.FILLED
+
+
+# ----------------------------------------------------------------------------------------- M3
+
+
+def test_m3_a_refused_close_stops_the_group_and_holds_the_open(tmp_path):
+    h = Harness(tmp_path, strict=True)
+    h.post("p1", open_action())  # idea p1:open, 4 held
+    foreign = OrderIntent(
+        order_ref="FOREIGN-1",
+        contract=h.broker.resolve(open_action().instrument),
+        side=OrderSide.SELL,
+        quantity=3,
+        order_type=OrderType.MKT,
+    )
+    h.broker.submit(foreign)  # someone else trades the account: the CLOSE will be refused
+    h.broker.set_quote("QQZ", "19.99", "20.01")
+    quotes = {**h.quotes(), **h.quotes("QQZ")}
+    calls = h.broker.submit_calls
+    result = h.replay.process(
+        source("p2", at=h.clock.now()),
+        ParsedPost(
+            actions=[
+                action("close", Action.CLOSE, idea="p1:open", group="swap"),
+                open_action(
+                    "open-b", symbol="QQZ", entry="20", stop="19", target="22", group="swap"
+                ),
+            ]
+        ),
+        quotes,
+        now=h.clock.now(),
+    )
+    assert [o.status for o in result.outcomes] == ["REFUSED", "HOLD"]
+    assert "PARTIAL_GROUP" in result.outcomes[1].reasons
+    assert h.broker.submit_calls == calls  # OPEN B never reached the broker
+    assert h.coord.store.position("p2:open-b") is None
+    assert "PARTIAL_GROUP" in [e.kind for e in h.coord.store.exceptions(open_only=True)]
+    report = h.coord.reconcile()
+    assert "PARTIAL_GROUP" in [d.kind.value for d in report.discrepancies]
+    assert not report.clean
