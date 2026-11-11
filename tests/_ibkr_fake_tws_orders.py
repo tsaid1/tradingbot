@@ -129,6 +129,8 @@ class FakeOrderTws(FakeTws):
         self.foreign_open_order = False  # open-order replies include another account's order
         self.foreign_completed = False
         self.modify_error: tuple[int, str] | None = None
+        self.positions_lag = False  # fills do not (yet) move the position read
+        self._lagged: list[tuple[ContractProto, Decimal]] = []
         self._perm = itertools.count(900001)
         self._exec_n = itertools.count(1)
         self.on.update({
@@ -346,7 +348,16 @@ class FakeOrderTws(FakeTws):
         self.push(self._open(fo))
         self.push(self._status(fo))
 
+    def catch_up_positions(self) -> None:
+        self.positions_lag = False
+        for contract, delta in self._lagged:
+            self._move_position(contract, delta)
+        self._lagged.clear()
+
     def _move_position(self, contract: ContractProto, delta: Decimal) -> None:
+        if self.positions_lag:
+            self._lagged.append((contract, delta))
+            return
         for i, (acct, sym, con, qty) in enumerate(self.positions):
             if con == contract.conId and acct == PAPER:
                 self.positions[i] = (acct, sym, con, str(Decimal(qty) + delta))

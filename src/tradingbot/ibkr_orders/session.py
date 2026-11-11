@@ -369,6 +369,7 @@ class _Track:
     errors: list[tuple[int, str, str]] = field(default_factory=list)
     rejected: str = ""
     send_failed: bool = False
+    placed_here: bool = False  # a new order (not an amendment) this session sent
     cancel_error: str = ""
     modify_pending: bool = False
     modify_error: str = ""
@@ -450,6 +451,8 @@ class PaperOrderSession(IbkrSession):
         self._nvid_seq = 0
         self._next_local_id = 0
         self._contract: ResolvedContract | None = None
+        self._baseline_position: Decimal | None = None  # read once at connect
+        self._baseline_exec_ids: frozenset[str] = frozenset()  # executions known at that read
         self.order_mode_status = "NOT_CHECKED"
 
     # ------------------------------------------------------------------ properties
@@ -501,6 +504,7 @@ class PaperOrderSession(IbkrSession):
             with self._cond:
                 self._contract = resolved
                 _set_policy(self._client.conn, (self._cfg.account, resolved.con_id, caps))
+            self._take_baseline()
         except BaseException as exc:
             try:
                 self.disconnect()
@@ -715,7 +719,46 @@ class PaperOrderSession(IbkrSession):
         if self._counter.used is None:
             raise SessionStateError("submission counter is not open")
 
-    def _fresh_state(self) -> tuple[ContractFacts, Decimal | None, list[WorkingOrder]]:
+    def _take_baseline(self) -> None:
+        """The executions known so far, then the position read: from here on the session's own
+        figure is this position plus every later fill it receives (see ``_implied_position``). A
+        read that lags at this moment shows up later as a disagreement (refused, never guessed)."""
+        self.executions()
+        rows = self.positions()
+        with self._cond:
+            self._baseline_exec_ids = frozenset(self._execs)
+            self._baseline_position = sum((r.quantity for r in rows
+                                           if r.con_id == self.contract.con_id), Decimal(0))
+
+    def _implied_position(self, con_id: int) -> Decimal | None:
+        """Baseline position plus every fill since, signed. For an order this session placed, the
+        larger of its execution total and its ``orderStatus`` filled quantity (either can arrive
+        first). None when unknown."""
+        with self._cond:
+            if self._baseline_position is None:
+                return None
+            here = {t.order_id: t for t in self._tracks.values()
+                    if t.own and t.placed_here and t.con_id == con_id}
+            sign = {"BUY": Decimal(1), "SELL": Decimal(-1)}
+            total = self._baseline_position
+            by_order: dict[int, Decimal] = {}
+            for rec in self._execs.values():
+                if rec.exec_id in self._baseline_exec_ids or rec.con_id != con_id:
+                    continue
+                if rec.side not in sign:
+                    return None
+                if rec.client_id == self._cfg.client_id and rec.order_id in here:
+                    by_order[rec.order_id] = by_order.get(rec.order_id, Decimal(0)) + rec.shares
+                else:
+                    total += sign[rec.side] * rec.shares
+            for oid, t in here.items():
+                if t.action not in sign:
+                    return None
+                total += sign[t.action] * max(t.filled, by_order.get(oid, Decimal(0)))
+            return total
+
+    def _fresh_state(self) -> tuple[ContractFacts, tuple[Decimal | None, Decimal | None],
+                                    list[WorkingOrder]]:
         c = self.contract
         facts = ContractFacts(con_id=c.con_id, symbol=c.symbol, sec_type=c.sec_type,
                               currency=c.currency, min_tick=_dec(c.min_tick),
@@ -730,7 +773,7 @@ class PaperOrderSession(IbkrSession):
                                 parent_id=s.parent_id if s.own else 0,
                                 parent_working=(s.client_id, s.parent_id) in working_ids)
                    for n, s in enumerate(snaps)]
-        return facts, position, working
+        return facts, (position, self._implied_position(c.con_id)), working
 
     def _allocate_ids(self, n: int) -> list[int]:
         """``reqIds`` then ``nextValidId``; ids are never reused (above every id this session or
@@ -765,13 +808,14 @@ class PaperOrderSession(IbkrSession):
                 oca_group=oca if i else ""))
         return out
 
-    def _evaluate(self, p: ProposedOrder, facts: ContractFacts, position: Decimal | None,
-                  working: list[WorkingOrder], still: int, *, parent: ProposedOrder | None = None,
+    def _evaluate(self, p: ProposedOrder, facts: ContractFacts,
+                  position: tuple[Decimal | None, Decimal | None], working: list[WorkingOrder], still: int, *, parent: ProposedOrder | None = None,
                   original: ProposedOrder | None = None) -> object:
         return order_guard(p, GuardContext(
             caps=self._caps, submissions_used=self._counter.used, contract=facts,
-            expected_account=self._cfg.account, position=position, working=tuple(working),
-            now=self._clock(), still_to_send=still, parent=parent, original=original))
+            expected_account=self._cfg.account, position=position[0], working=tuple(working),
+            now=self._clock(), implied_position=position[1], still_to_send=still, parent=parent,
+            original=original))
 
     def _proto(self, p: ProposedOrder) -> PlaceOrderRequest:
         c = Contract()
@@ -811,6 +855,8 @@ class PaperOrderSession(IbkrSession):
                 t = self._tracks[p.order_id] = _Track(order_id=p.order_id, own=True,
                                                       client_id=self._cfg.client_id)
             self._apply_proposed(t, p)
+            if kind != "MODIFY":
+                t.placed_here = True
             _issue_permit(self._client.conn, OUT.PLACE_ORDER, body)
             self._client.placeOrderProtoBuf(req)
 

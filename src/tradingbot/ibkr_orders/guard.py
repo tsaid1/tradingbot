@@ -46,6 +46,8 @@ class RefusalReason(str, Enum):
     OFF_TICK_PRICE = "OFF_TICK_PRICE"
     TICK_UNKNOWN = "TICK_UNKNOWN"
     POSITION_UNKNOWN = "POSITION_UNKNOWN"
+    # the broker's position read and the position implied by this session's own fills differ
+    POSITION_DISAGREEMENT = "POSITION_DISAGREEMENT"
     SHORT_POSITION_PRESENT = "SHORT_POSITION_PRESENT"
     SHORT_SALE = "SHORT_SALE"  # a sell with nothing long to sell, and not a protective child
     SELL_EXCEEDS_POSITION = "SELL_EXCEEDS_POSITION"  # net of other working sells
@@ -129,9 +131,12 @@ class GuardContext:
     submissions_used: int | None  # from the durable counter; None = unknown
     contract: ContractFacts  # what the session resolved for caps.symbol
     expected_account: str
-    position: Decimal | None  # net position in contract.con_id; None = unknown
+    position: Decimal | None  # the broker's position read in contract.con_id; None = unknown
     working: Sequence[WorkingOrder]
     now: datetime
+    # the position implied by the session's baseline read plus every fill it has received since
+    # (executions and order statuses, the larger per order); None = unknown
+    implied_position: Decimal | None
     still_to_send: int = 0  # further placeOrder calls of the same bracket after this one
     parent: ProposedOrder | None = None  # set for a child of a bracket being placed now
     original: ProposedOrder | None = None  # set for a modification: the order as it stands
@@ -297,9 +302,16 @@ def order_guard(order: ProposedOrder, ctx: GuardContext) -> Allow | Refusal:
             return _refuse(RefusalReason.MODIFICATION_INVALID,
                            "a modification may change only price or quantity")
     # --- position rules: long only, capped, never short ---
-    pos = ctx.position
+    pos, implied = ctx.position, ctx.implied_position
     if pos is None or not isinstance(pos, Decimal) or not pos.is_finite():
         return _refuse(RefusalReason.POSITION_UNKNOWN)
+    if implied is None or not isinstance(implied, Decimal) or not implied.is_finite():
+        return _refuse(RefusalReason.POSITION_UNKNOWN, "the session's own fills are unknown")
+    if implied != pos:  # one of the two lags: refuse until they agree again
+        return _refuse(RefusalReason.POSITION_DISAGREEMENT,
+                       f"position read {pos} != {implied} implied by this session's own fills")
+    # the more cautious of the two (equal here; kept so the rule survives a later relaxation)
+    pos = max(pos, implied) if order.action == "BUY" else min(pos, implied)
     if caps.long_only and pos < 0:
         return _refuse(RefusalReason.SHORT_POSITION_PRESENT, str(pos))
     if order.action == "BUY":

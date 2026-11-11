@@ -738,3 +738,63 @@ def test_inactive_order_can_become_active_again_or_be_rejected(tws, tmp_path):
         assert settle(lambda: s._tracks[child].status == OrderStatus.REJECTED)
     finally:
         s.disconnect()
+
+
+# --- review round 2: the position read can lag this session's own fills -----------------------
+def test_probe_second_buy_refused_while_the_position_read_lags_the_entry_fill(tws, tmp_path):
+    tws.positions = []
+    s = make(tws, tmp_path)
+    try:
+        snaps = s.place([buy(), stop()])
+        tws.positions_lag = True
+        tws.fill(snaps[0].order_id, 1, 88.11)  # long 1; the read still says 0
+        assert settle(lambda: s._tracks[snaps[0].order_id].status == OrderStatus.FILLED)
+        with pytest.raises(OrderRefused) as info:
+            s.place([buy("TB-0002")])
+        assert info.value.refusal.reason == RefusalReason.POSITION_DISAGREEMENT
+        tws.catch_up_positions()  # the read agrees again: the cap decides
+        with pytest.raises(OrderRefused) as info:
+            s.place([buy("TB-0003")])
+        assert info.value.refusal.reason == RefusalReason.POSITION_CAP
+        assert placed(tws) == 2
+    finally:
+        s.disconnect()
+
+
+def test_probe_second_sell_refused_while_the_position_read_lags_the_closing_fill(tws, tmp_path):
+    tws.positions = []
+    s = make(tws, tmp_path)
+    try:
+        snaps = s.place([buy(), stop()])
+        tws.fill(snaps[0].order_id, 1, 88.11)
+        assert settle(lambda: s.positions() and s.positions()[0].quantity == 1)
+        s.cancel(snaps[1].order_id)  # the stop is gone
+        close = s.place([OrderSpec("TB-C", "SELL", 1, "LMT", limit_price=D("88.00"))])
+        tws.positions_lag = True
+        tws.fill(close[0].order_id, 1, 88.00)  # flat; the read still says 1
+        assert settle(lambda: s._tracks[close[0].order_id].status == OrderStatus.FILLED)
+        with pytest.raises(OrderRefused) as info:
+            s.place([OrderSpec("TB-C2", "SELL", 1, "LMT", limit_price=D("88.00"))])
+        assert info.value.refusal.reason == RefusalReason.POSITION_DISAGREEMENT
+        assert placed(tws) == 3
+    finally:
+        s.disconnect()
+
+
+def test_order_status_fill_ahead_of_its_execution_is_counted(tws, tmp_path):
+    """orderStatus says Filled but execDetails has not arrived: the session's own figure is the
+    larger of the two per order, so the read (0) and the session (1) disagree."""
+    tws.positions = []
+    s = make(tws, tmp_path)
+    try:
+        snaps = s.place([buy(), stop()])
+        tws.positions_lag = True
+        fo = tws.orders[snaps[0].order_id]
+        fo.filled = D(1)
+        tws.set_status(fo.order_id, "Filled")  # status only, no execution
+        assert settle(lambda: s._tracks[fo.order_id].status == OrderStatus.FILLED)
+        with pytest.raises(OrderRefused) as info:
+            s.place([buy("TB-0002")])
+        assert info.value.refusal.reason == RefusalReason.POSITION_DISAGREEMENT
+    finally:
+        s.disconnect()

@@ -212,6 +212,7 @@ def ctx(**over) -> GuardContext:
     base = {"caps": C.PAPER_TEST_1, "submissions_used": 0, "contract": FACTS, "expected_account": PAPER,
                 "position": Decimal(0), "working": (), "now": OPEN_NOW}
     base.update(over)
+    base.setdefault("implied_position", base["position"])  # the session's own fills agree
     return GuardContext(**base)
 
 
@@ -468,3 +469,37 @@ def test_inactive_is_not_sticky():
                         total=one) == OrderStatus.CANCELLED
     assert merge_status(OrderStatus.CANCELLED, OrderStatus.INACTIVE, filled=Decimal(0),
                         total=one) == OrderStatus.CANCELLED
+
+
+# The reviewer's probes: the broker's position read lags a fill this session already received.
+def test_probe_second_sell_refused_when_the_position_read_lags_the_closing_fill():
+    """The closing SELL filled (own fills imply 0), the read still says 1, the stop is gone."""
+    sell = order(order_id=130, action="SELL", limit_price=Decimal("88.00"))
+    c = ctx(position=Decimal(1), implied_position=Decimal(0))
+    assert refused(sell, c) == RefusalReason.POSITION_DISAGREEMENT
+
+
+def test_probe_second_buy_refused_when_the_position_read_lags_the_entry_fill():
+    """The entry filled (own fills imply 1), the read still says 0, no buy is working."""
+    c = ctx(position=Decimal(0), implied_position=Decimal(1))
+    assert refused(order(order_id=130), c) == RefusalReason.POSITION_DISAGREEMENT
+
+
+def test_mirror_sell_refused_when_own_fills_show_more_than_the_read():
+    sell = order(order_id=130, action="SELL", limit_price=Decimal("88.00"))
+    assert refused(sell, ctx(position=Decimal(0), implied_position=Decimal(1))) == \
+        RefusalReason.POSITION_DISAGREEMENT
+
+
+def test_mirror_buy_refused_when_the_read_shows_more_than_own_fills():
+    assert refused(order(order_id=130), ctx(position=Decimal(1), implied_position=Decimal(0))) \
+        == RefusalReason.POSITION_DISAGREEMENT
+
+
+def test_disagreement_also_stops_children_and_amendments_and_unknown_own_fills_refuse():
+    child = order(order_id=101, action="SELL", order_type="STP", limit_price=None,
+                  stop_price=Decimal("87.00"), parent_id=100)
+    assert refused(child, ctx(parent=order(), implied_position=Decimal(1))) == \
+        RefusalReason.POSITION_DISAGREEMENT
+    assert refused(order(), ctx(implied_position=None)) == RefusalReason.POSITION_UNKNOWN
+    assert order_guard(order(), ctx(position=Decimal(0), implied_position=Decimal(0))) is ALLOW
