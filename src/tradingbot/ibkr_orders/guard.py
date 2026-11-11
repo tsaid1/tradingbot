@@ -52,6 +52,8 @@ class RefusalReason(str, Enum):
     CHILD_INVALID = "CHILD_INVALID"  # a child that is not a SELL protecting a BUY parent
     ORDER_REF_MISSING = "ORDER_REF_MISSING"
     MODIFICATION_INVALID = "MODIFICATION_INVALID"  # changes side/type/contract/parent/TIF/account
+    BUY_NOT_LIMIT = "BUY_NOT_LIMIT"  # a BUY STP becomes a market order when triggered
+    STOP_NOT_PROTECTIVE = "STOP_NOT_PROTECTIVE"  # a SELL STP that neither protects nor reduces
 
 
 @dataclass(frozen=True)
@@ -303,6 +305,9 @@ def order_guard(order: ProposedOrder, ctx: GuardContext) -> Allow | Refusal:
     if order.action == "BUY":
         if order.parent_id or ctx.parent is not None:
             return _refuse(RefusalReason.CHILD_INVALID, "a child must be a protective SELL")
+        if order.order_type != "LMT":
+            return _refuse(RefusalReason.BUY_NOT_LIMIT, f"a BUY must be a limit order, not "
+                           f"{order.order_type} (a stop becomes a market order when triggered)")
         projected = pos + _working_buys(ctx, order) + qty
         if projected > caps.max_net_position:
             return _refuse(RefusalReason.POSITION_CAP, f"{pos} held + working buys + {qty} > "
@@ -328,6 +333,9 @@ def order_guard(order: ProposedOrder, ctx: GuardContext) -> Allow | Refusal:
                            "a child must be a SELL no larger than its BUY parent in the contract")
         return ALLOW
     if pos <= 0:
+        if order.order_type == "STP":
+            return _refuse(RefusalReason.STOP_NOT_PROTECTIVE, "a stop must protect a bracketed "
+                           "BUY or reduce a held long")
         return _refuse(RefusalReason.SHORT_SALE, "nothing long to sell")
     capacity = pos - _other_working_sells(ctx, order)
     if qty > capacity:

@@ -441,3 +441,20 @@ def test_broker_time_formats():
     assert parse_broker_time("20261111-15:00:01") == datetime(2026, 11, 11, 15, 0, 1, tzinfo=UTC)
     assert parse_broker_time("nonsense") is None
     assert parse_broker_time("") is None
+
+
+# --- review round 2 -----------------------------------------------------------------------------
+def test_buy_stop_entry_refused_a_buy_must_be_a_limit():
+    """A BUY STP is a market order once triggered: outside "limit entry" and "no market orders"."""
+    buy_stop = order(order_type="STP", limit_price=None, stop_price=Decimal("88.50"))
+    assert refused(buy_stop, ctx()) == RefusalReason.BUY_NOT_LIMIT
+    assert refused(buy_stop, ctx(position=Decimal(0), working=())) == RefusalReason.BUY_NOT_LIMIT
+
+
+def test_a_stop_is_allowed_only_as_a_protective_or_reducing_sell():
+    sell_stop = order(action="SELL", order_type="STP", limit_price=None,
+                      stop_price=Decimal("87.00"))
+    assert refused(sell_stop, ctx()) == RefusalReason.STOP_NOT_PROTECTIVE  # nothing long
+    assert order_guard(sell_stop, ctx(position=Decimal(1))) is ALLOW  # reduces a held long
+    child = replace(sell_stop, order_id=101, parent_id=100)
+    assert order_guard(child, ctx(parent=order())) is ALLOW  # protects a bracketed long

@@ -151,6 +151,8 @@ def _wire_check(req: PlaceOrderRequest, policy: tuple[str, int, ExperimentCaps])
         problems.append("contract")
     if o.orderType not in caps.order_types or o.tif not in caps.tifs:
         problems.append("order type / tif")
+    if o.action == "BUY" and o.orderType != "LMT":
+        problems.append("a BUY must be a limit order")
     if not (o.HasField("outsideRth") and o.outsideRth is False) and not caps.outside_rth_allowed:
         problems.append("outsideRth must be explicitly false")
     if not o.HasField("transmit") or not o.orderRef or o.action not in ("BUY", "SELL"):
