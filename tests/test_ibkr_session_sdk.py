@@ -10,27 +10,27 @@ import time
 
 import pytest
 
-ibapi = pytest.importorskip("ibapi")
+pytest.importorskip("ibapi")
 
-import ibapi.client  # noqa: E402
-from _ibkr_fake_tws import OTHER_PAPER, PAPER, FakeTws, error_frame, frame, tlt_contract_frame  # noqa: E402
-from ibapi.message import IN  # noqa: E402
-from ibapi.protobuf.ContractDataEnd_pb2 import ContractDataEnd  # noqa: E402
-from ibapi.protobuf.TickPrice_pb2 import TickPrice  # noqa: E402
-from ibapi.protobuf.TickSnapshotEnd_pb2 import TickSnapshotEnd  # noqa: E402
-from ibapi.server_versions import MIN_SERVER_VER_CANCEL_CONTRACT_DATA  # noqa: E402
-from ibapi.ticktype import TickTypeEnum  # noqa: E402
-from ibapi.wrapper import EWrapper  # noqa: E402
+import ibapi.client
+from _ibkr_fake_tws import OTHER_PAPER, PAPER, FakeTws, error_frame, frame, tlt_contract_frame
+from ibapi.message import IN
+from ibapi.protobuf.ContractDataEnd_pb2 import ContractDataEnd
+from ibapi.protobuf.TickPrice_pb2 import TickPrice
+from ibapi.protobuf.TickSnapshotEnd_pb2 import TickSnapshotEnd
+from ibapi.server_versions import MIN_SERVER_VER_CANCEL_CONTRACT_DATA
+from ibapi.ticktype import TickTypeEnum
+from ibapi.wrapper import EWrapper
 
-from tradingbot.ibkr import errors as E  # noqa: E402
-from tradingbot.ibkr import models  # noqa: E402
-from tradingbot.ibkr.check import run_check  # noqa: E402
-from tradingbot.ibkr.config import validate_config  # noqa: E402
-from tradingbot.ibkr.models import TLT_QUERY, QuoteQuality  # noqa: E402
-from tradingbot.ibkr.session import (  # noqa: E402
+from tradingbot.ibkr import errors as E
+from tradingbot.ibkr import models
+from tradingbot.ibkr.check import run_check
+from tradingbot.ibkr.config import validate_config
+from tradingbot.ibkr.models import TLT_QUERY, QuoteQuality
+from tradingbot.ibkr.session import (
     MIN_SERVER_VER_CANCEL_CONTRACT_DATA as OUR_MIN_CANCEL,
 )
-from tradingbot.ibkr.session import IbkrSession, SessionState, _Wrapper  # noqa: E402
+from tradingbot.ibkr.session import IbkrSession, SessionState, _Wrapper
 
 CFG = validate_config({"host": "127.0.0.1", "port": 7497, "client_id": 7, "account": PAPER,
                        "mode": "paper"})
@@ -119,7 +119,7 @@ def test_happy_path(tws):
     assert q.two_sided_valid and q.flags == ()
     mdt = [r for n, r in tws.requests if n == "REQ_MARKET_DATA_TYPE"]
     assert mdt[0].marketDataType == 3
-    mkt = [r for n, r in tws.requests if n == "REQ_MKT_DATA"][0]
+    mkt = next(r for n, r in tws.requests if n == "REQ_MKT_DATA")
     assert mkt.snapshot and not mkt.regulatorySnapshot and mkt.contract.conId == 15547841
 
 
