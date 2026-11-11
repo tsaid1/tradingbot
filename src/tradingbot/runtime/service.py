@@ -167,6 +167,11 @@ class RuntimeService:
         self.cycles = int(self.store.get("cycles", 0) or 0)
         self.last_reconciliation: ReconciliationReport | None = None
         now = self.clock()
+        # Review F7: a live post published before the service first ever started is never acted on.
+        first = self.store.get("first_start_at")
+        if first is None:
+            self.store.put("first_start_at", now.isoformat(), now)
+        self.first_start_at = datetime.fromisoformat(first) if first else now
         self.store.event(
             now,
             "SERVICE_START",
@@ -331,6 +336,18 @@ class RuntimeService:
 
     def _handle(self, post: SourcePost) -> tuple[int, bool]:
         """One post through the whole pipeline. Returns (held action count, duplicate)."""
+        if post.is_live and post.published_at < self.first_start_at:
+            # Existed before the first run: consumed and journaled by identity, never acted on.
+            self.store.event(
+                self.clock(),
+                "POST_BEFORE_FIRST_START",
+                source_id=post.source_id,
+                post_id=post.post_id,
+                revision=post.revision,
+                published_at=post.published_at.isoformat(),
+                first_start_at=self.first_start_at.isoformat(),
+            )
+            return 0, False
         if self.source.realtime or post.is_live:
             decision_now = self.clock()
         else:

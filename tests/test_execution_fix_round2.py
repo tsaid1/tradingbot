@@ -382,3 +382,67 @@ def test_f6_a_long_failure_run_keeps_the_backoff_bounded(tmp_path):
     assert h.consecutive_failures == 5000
     wait = (datetime.fromisoformat(h.next_attempt_at) - now).total_seconds()
     assert wait == rt.config.service.max_backoff_seconds
+
+
+# ------------------------------------------------------------------- F7: a real source baseline
+
+
+def test_f7_an_empty_first_page_still_sets_a_real_baseline(tmp_path):
+    from test_runtime_sources import RATE, FakeX, make, raw
+
+    from tradingbot.runtime.store import RuntimeStore
+
+    store = RuntimeStore(tmp_path / "runtime.sqlite3")
+    fake = FakeX()
+    fake.timeline.append((200, {"data": []}, RATE))  # the account has no posts yet
+    src, _ = make(store, fake)
+    assert src.poll() == [] and src.cursor() != "0"
+    before = raw("50", ENTRY, created="2026-05-30T10:00:00Z")  # existed before the first run
+    after = raw("60", ENTRY, created="2026-06-01T14:00:05Z")
+    fake.timeline.append((200, {"data": [before, after]}, RATE))
+    assert [p.post_id for p in src.poll()] == ["60"]
+    assert "start_time=" in fake.timeline_urls()[-1]
+
+
+class _LiveStub:
+    """A realtime source handing over one live post once (invented)."""
+
+    name = "live_stub"
+    realtime = True
+
+    def __init__(self, posts):
+        self.posts, self.committed = list(posts), []
+
+    def poll(self):
+        return [p for p in self.posts if p not in self.committed]
+
+    def commit(self, p):
+        self.committed.append(p)
+
+    def cursor(self):
+        return str(len(self.committed))
+
+    def next_poll_delay(self, cadence):
+        return cadence
+
+
+def test_f7_a_live_post_older_than_the_first_start_is_never_acted_on(tmp_path):
+    from datetime import timedelta
+
+    from tradingbot.source_events import Provenance
+
+    rt = Runtime(tmp_path, [])
+    start = rt.clock.now()
+    old = post("1", 0, ENTRY).model_copy(
+        update={
+            "provenance": Provenance.LIVE_API_USER_CONTEXT,
+            "published_at": start - timedelta(hours=1),
+            "received_at": start,
+        }
+    )
+    stub = _LiveStub([old])
+    rt.restart(source=stub)
+    rt.step()
+    assert stub.committed == [old]  # consumed, so it never comes back
+    assert rt.signals() == [] and rt.broker.all_orders() == []
+    assert "POST_BEFORE_FIRST_START" in [e["event"] for e in rt.store.events()]
