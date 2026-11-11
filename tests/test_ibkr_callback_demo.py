@@ -6,7 +6,9 @@ readiness streams, the successful control, the two failure scenarios tied to the
 defects, the two account and position failure classes from the PR #35 review, and the stable CLI
 and report semantics. It also covers the composed local lifecycle: quote callbacks delivered only
 by the merged LifecycleAdapter's consumer, and the CLI-only unknown-cleanup counterpart, which
-stays incomplete beside CONTROL_COMPLETE.
+stays incomplete beside CONTROL_COMPLETE. Finally it covers the quote reader buffer: the accepted
+FrameAccumulator, whose observed retained bytes feed the lifecycle's reader observation and whose
+unchanged report is carried beside it, with complete, partial, refused and untaken-output controls.
 """
 from __future__ import annotations
 
@@ -28,6 +30,7 @@ from tradingbot.paper_readiness.account_position_callbacks import (
 )
 from tradingbot.paper_readiness.diagnostics import ReadinessOutcome, Stage
 from tradingbot.paper_readiness.observations import ResponseKind
+from tradingbot.paper_readiness.read_framing import FrameAccumulator, FramingOutcome
 from tradingbot.paper_readiness.runner import REQUEST_IDS
 from tradingbot.paper_readiness.sdk_lifecycle import LifecycleAdapter
 from tradingbot.paper_readiness.transport import FORBIDDEN_NAME_RE
@@ -35,7 +38,9 @@ from tradingbot.paper_readiness.transport import FORBIDDEN_NAME_RE
 SRC = Path(__file__).resolve().parents[1] / "src"
 UNKNOWN = demo.UNKNOWN_CLEANUP.name
 CURRENCY_MISSING, MALFORMED_POSITION = (s.name for s in demo.ACCOUNT_POSITION_FAILURES)
-ALL_NAMES = [*demo.SCENARIOS, UNKNOWN, CURRENCY_MISSING, MALFORMED_POSITION]
+PARTIAL_HEADER, PARTIAL_PAYLOAD, REFUSED, UNTAKEN = (s.name for s in demo.READER_FRAMING_CASES)
+FRAMING = [PARTIAL_HEADER, PARTIAL_PAYLOAD, REFUSED, UNTAKEN]
+ALL_NAMES = [*demo.SCENARIOS, UNKNOWN, CURRENCY_MISSING, MALFORMED_POSITION, *FRAMING]
 STREAMS = ["contract_details", "quote_snapshot", "account_summary", "positions"]
 CONTROL_CODES = {"SESSION_ATTESTATION_CONTROL", "CONTRACT_IDENTITY_CONTROL", "REGULAR_SESSION_CONTROL",
                  "QUOTE_LIVE_CONTROL", "ACCOUNT_SNAPSHOT_CONTROL", "POSITIONS_SNAPSHOT_CONTROL"}
@@ -239,11 +244,160 @@ def test_unknown_socket_closure_keeps_the_lifecycle_incomplete_beside_control_co
     assert unknown.matches_expectation  # it expects the incomplete lifecycle
 
 
+# Requirement: the reader buffer is the accepted FrameAccumulator; its observed retained bytes feed
+# the lifecycle's reader observation, and its unchanged report is carried beside the lifecycle one.
+
+CONTROL = "callback_control"
+LOG_METHODS = ("feed", "take", "finish")
+
+
+def run_logged(monkeypatch, name: str):
+    """Run one case through a call-logging accumulator whose behaviour is the accepted one."""
+    made = []
+
+    class Logged(FrameAccumulator):
+        __slots__ = ("calls",)
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.calls = []
+            made.append(self)
+
+    for method in LOG_METHODS:
+        def logged(self, *args, _name=method):
+            self.calls.append(_name)
+            return getattr(FrameAccumulator, _name)(self, *args)
+        setattr(Logged, method, logged)
+    monkeypatch.setattr(demo, "FrameAccumulator", Logged)
+    result = demo.run_demo(name)
+    [accumulator] = made
+    return result, accumulator
+
+
+@pytest.mark.parametrize("name", ALL_NAMES)
+def test_the_reader_observation_reads_the_accumulators_retained_bytes(monkeypatch, name):
+    result, accumulator = run_logged(monkeypatch, name)
+    report = accumulator.report()
+    assert result.framing == report  # carried unchanged
+    assert report.finished
+    assert report.bytes_accepted == report.bytes_consumed + report.bytes_retained
+    # No byte count is set: the lifecycle classifies exactly what the accumulator retains.
+    life, ledger = result.lifecycle, result.lifecycle.ledger
+    if report.bytes_retained == 0:
+        assert life.reader_partial_bytes == "NONE" and ledger.reader == "STOPPED"
+    else:
+        assert life.reader_partial_bytes == "UNRESOLVED" and ledger.reader == "FAILED"
+        assert "PARTIAL_BYTES_UNRESOLVED" in life.failures
+    # Shutdown only ends input: finish() runs once, last, and nothing is fed or taken after it.
+    assert accumulator.calls.count("finish") == 1 and accumulator.calls[-1] == "finish"
+    assert result.local_components_complete is (life.completed and report.clean)
+    assert result.matches_expectation
+
+
+def test_the_control_buffer_is_complete_and_every_frame_is_handed_off():
+    framing = demo.run_demo(CONTROL).framing
+    assert framing.outcome is FramingOutcome.COMPLETE and framing.clean
+    assert (framing.chunks_accepted, framing.bytes_accepted, framing.bytes_retained) == (4, 62, 0)
+    assert (framing.frames_extracted, framing.zero_length_frames) == (3, 1)
+    assert (framing.frames_handed_off, framing.frames_queued) == (3, 0)
+    assert framing.downstream_retirement == "NOT_ESTABLISHED"
+
+
+@pytest.mark.parametrize("name, outcome, retained", [
+    (PARTIAL_HEADER, FramingOutcome.PARTIAL_HEADER, 2),
+    (PARTIAL_PAYLOAD, FramingOutcome.PARTIAL_PAYLOAD, 10),
+])
+def test_a_retained_partial_frame_keeps_lifecycle_and_framing_incomplete(name, outcome, retained):
+    control, partial = demo.run_demo(CONTROL), demo.run_demo(name)
+    # The pair differs only in a trailing partial chunk after the control's complete input.
+    case = next(s for s in demo.READER_FRAMING_CASES if s.name == name)
+    base = demo.SCENARIOS[CONTROL]
+    assert case.feed is base.feed and case.reader_bytes[:-1] == base.reader_bytes
+    assert case.takes_final_frames and case.socket_closure_known
+    # Readiness is unchanged and stays CONTROL_COMPLETE; lifecycle closure cannot hide the bytes.
+    assert partial.report.model_dump(mode="json") == control.report.model_dump(mode="json") | {
+        "label": f"callback-demo:{name}"}
+    framing = partial.framing
+    assert framing.outcome is outcome and framing.bytes_retained == retained and not framing.clean
+    assert framing.frames_handed_off == control.framing.frames_handed_off == 3
+    life = partial.lifecycle
+    assert life.completed is False and life.failures == ("PARTIAL_BYTES_UNRESOLVED",)
+    a, b = asdict(control.lifecycle), asdict(life)
+    assert {k for k in a if a[k] != b[k]} == {"completed", "failures", "reader_partial_bytes",
+                                              "ledger"}
+    assert {k for k in a["ledger"] if a["ledger"][k] != b["ledger"][k]} == {
+        "reader", "local_quiescence_established"}
+    assert not partial.local_components_complete and partial.matches_expectation
+
+
+def test_an_oversized_declared_length_is_refused_and_its_header_stays_retained():
+    result = demo.run_demo(REFUSED)
+    framing = result.framing
+    assert framing.outcome is FramingOutcome.REFUSED and not framing.clean
+    assert framing.first_refusal.value == "DECLARED_LENGTH_TOO_LARGE"
+    assert [(code.value, count) for code, count in framing.refusals] == [
+        ("DECLARED_LENGTH_TOO_LARGE", 1)]
+    assert framing.bytes_retained == 4 and framing.frames_handed_off == 3
+    assert result.lifecycle.completed is False
+    assert result.lifecycle.reader_partial_bytes == "UNRESOLVED"
+    assert result.report.outcome == ReadinessOutcome.CONTROL_COMPLETE
+    assert not result.local_components_complete
+
+
+def test_untaken_frames_show_only_in_the_framing_report_and_the_aggregate():
+    control, untaken = demo.run_demo(CONTROL), demo.run_demo(UNTAKEN)
+    framing = untaken.framing
+    assert framing.outcome is FramingOutcome.UNTAKEN_FRAMES and not framing.clean
+    assert (framing.bytes_retained, framing.frames_handed_off, framing.frames_queued) == (0, 1, 2)
+    # Nothing is retained, so the lifecycle model, which cannot express untaken frames, completes.
+    assert asdict(untaken.lifecycle) == asdict(control.lifecycle)
+    assert untaken.lifecycle.completed and not untaken.local_components_complete
+    assert untaken.report.outcome == ReadinessOutcome.CONTROL_COMPLETE
+
+
+def test_an_unknown_socket_closure_stays_unknown_beside_a_complete_buffer():
+    result = demo.run_demo(UNKNOWN)
+    assert result.framing.clean and result.lifecycle.ledger.socket == "UNKNOWN"
+    assert not result.lifecycle.completed and not result.local_components_complete
+
+
+def test_a_framing_mismatch_alone_is_not_a_match(monkeypatch):
+    case = demo.READER_FRAMING_CASES[0]
+    altered = demo.DemoScenario(case.name, case.description, case.expected_outcome, case.feed,
+                                expected_lifecycle_completed=False, reader_bytes=case.reader_bytes,
+                                expected_framing_outcome=FramingOutcome.COMPLETE)
+    monkeypatch.setattr(demo, "READER_FRAMING_CASES", (altered, *demo.READER_FRAMING_CASES[1:]))
+    result = demo.run_demo(case.name)
+    assert result.report.outcome == altered.expected_outcome and not result.lifecycle.completed
+    assert not result.matches_expectation
+
+
+def test_reports_and_the_aggregate_carry_codes_and_counts_but_never_payload_bytes():
+    results = [demo.run_demo(name) for name in ALL_NAMES]
+    text, payload = demo.render_demo_text(results), json.loads(demo.render_demo_json(results))
+    assert payload["framing_notice"] == demo.FRAMING_NOTICE and demo.FRAMING_NOTICE in text
+    for phrase in ("never decoded", "not SDK messages", "requires both"):
+        assert phrase in demo.FRAMING_NOTICE, phrase
+    for rendered in (text, json.dumps(payload)):
+        assert "invented opaque control" not in rendered
+    for entry, result in zip(payload["scenarios"], results):
+        framing = entry["framing_report"]
+        assert framing["outcome"] == result.framing.outcome.value
+        assert framing["bytes_retained"] == result.framing.bytes_retained
+        assert framing["downstream_retirement"] == "NOT_ESTABLISHED"
+        assert framing["authority"] == "NON_AUTHORITATIVE"
+        local = entry["local_components"]
+        assert local["both_complete"] is (local["lifecycle_completed"] and local["framing_clean"])
+        assert (local["authority"], local["trading_permission"], local["paper_read_1"]) == (
+            "NON_AUTHORITATIVE", False, "NOT_ASSESSED")
+        assert entry["outcome"] == result.report.outcome.value  # readiness is never reinterpreted
+
+
 def test_the_extra_cases_are_cli_only_and_the_three_scenarios_are_unchanged():
     assert list(demo.SCENARIOS) == ["callback_control", "delayed_size_mixed_with_live",
                                     "issue_with_repeated_end"]
-    assert not {UNKNOWN, CURRENCY_MISSING, MALFORMED_POSITION} & set(demo.SCENARIOS)
-    assert len(demo.ACCOUNT_POSITION_FAILURES) == 2
+    assert not {UNKNOWN, CURRENCY_MISSING, MALFORMED_POSITION, *FRAMING} & set(demo.SCENARIOS)
+    assert len(demo.ACCOUNT_POSITION_FAILURES) == 2 and len(demo.READER_FRAMING_CASES) == 4
     assert all(s.expected_lifecycle_completed for s in demo.SCENARIOS.values())
     assert all(s.expected_lifecycle_completed for s in demo.ACCOUNT_POSITION_FAILURES)
     assert demo.UNKNOWN_CLEANUP.expected_lifecycle_completed is False
@@ -323,7 +477,7 @@ def test_module_cli_runs_all_scenarios_deterministically_and_exits_zero():
             for _ in range(2)]
     assert [r.returncode for r in runs] == [0, 0] and runs[0].stdout == runs[1].stdout
     out = runs[0].stdout
-    assert "6/6 scenarios matched their expected readiness and lifecycle outcomes" in out
+    assert "10/10 scenarios matched their expected readiness, lifecycle and framing outcomes" in out
     assert "NON_AUTHORITATIVE; trading_permission=False" in out
     assert "never PAPER-READ-1, broker-side retirement or trading authority" in out
     expected = (("callback_control", "CONTROL_COMPLETE"),
@@ -331,14 +485,19 @@ def test_module_cli_runs_all_scenarios_deterministically_and_exits_zero():
                 ("issue_with_repeated_end", "NOT_READY"),
                 (UNKNOWN, "CONTROL_COMPLETE"),
                 (CURRENCY_MISSING, "NOT_READY"),
-                (MALFORMED_POSITION, "NOT_READY"))
+                (MALFORMED_POSITION, "NOT_READY"),
+                *((name, "CONTROL_COMPLETE") for name in FRAMING))
     for name, outcome in expected:
         assert f"== {name}:" in out and f"expected={outcome} outcome={outcome}" in out
     order = [out.index(f"== {name}:") for name, _ in expected]
     assert order == sorted(order)  # the three scenarios first, then the CLI-only cases
     assert "expected_completed=False completed=False local_quiescence_established=False" in out
     assert "socket=UNKNOWN" in out and "failures=SOCKET_NOT_CLOSED" in out
-    assert out.count("completed=True local_quiescence_established=True") == 5
+    assert out.count("completed=True local_quiescence_established=True") == 6
+    assert out.count("failures=PARTIAL_BYTES_UNRESOLVED") == 3
+    for outcome in ("PARTIAL_HEADER", "PARTIAL_PAYLOAD", "REFUSED", "UNTAKEN_FRAMES"):
+        assert f"expected={outcome} outcome={outcome} clean=False" in out, outcome
+    assert out.count("both_complete=True") == 5 and out.count("both_complete=False") == 5
     assert "MISSING:ACCOUNT_CURRENCY_MISSING" in out and "INCOMPLETE:POSITIONS_END_MISSING" in out
     assert "positions: completed=False issues=MALFORMED_CALLBACK" in out
     assert runs[0].stderr == ""
@@ -350,7 +509,7 @@ def test_main_exit_status_reports_an_unexpected_outcome(monkeypatch, capsys):
                                 original.feed)
     monkeypatch.setitem(demo.SCENARIOS, original.name, altered)
     assert demo.main() == 1
-    assert "5/6 scenarios matched" in capsys.readouterr().out
+    assert "9/10 scenarios matched" in capsys.readouterr().out
 
 
 def test_a_readiness_match_alone_is_not_a_match(monkeypatch, capsys):
@@ -363,7 +522,7 @@ def test_a_readiness_match_alone_is_not_a_match(monkeypatch, capsys):
     assert result.report.outcome == ReadinessOutcome.CONTROL_COMPLETE
     assert result.lifecycle.completed is False and not result.matches_expectation
     assert demo.main() == 1
-    assert "5/6 scenarios matched" in capsys.readouterr().out
+    assert "9/10 scenarios matched" in capsys.readouterr().out
 
 
 def test_fixtures_are_invented_here_and_no_held_fixture_or_forbidden_surface_is_used():
