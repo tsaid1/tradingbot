@@ -14,21 +14,22 @@ connection, account or network is involved, and nothing here authorizes paper re
 trading.
 
 Each run also composes one ``CallbackRouter``, with its ``LifecycleAdapter`` and ``RetirementLedger``,
-over invented SDK-free doubles. Only the quote-snapshot callbacks pass through it, and they travel in
-owned invented frames: each callback is one frame whose payload is a whole invented key, not an SDK
-message. The accepted ``DecodeHandoff`` buffers the fragmented chunks in its ``FrameAccumulator``,
+over invented SDK-free doubles. The quote-snapshot, account-summary and position callbacks all pass
+through it, and they travel in owned invented frames: each callback is one frame whose payload is a
+whole invented key, not an SDK message. The accepted ``DecodeHandoff`` buffers the fragmented chunks in its ``FrameAccumulator``,
 decodes each complete frame with a closed ``InventedDecoder`` into the ``ReadCallbackFacade``, and
 settles the delivery through the router's own consumer before releasing the frame. The router then
-retires the connection and observes the reader, socket and consumer separately. The quote stream's
-completion and issue codes are read through ``CallbackRouter.stream_status()``. The contract-details,
-account-summary and position callbacks are passed to their normalizers directly, so all three are
-reported as outside the lifecycle model, with no lifecycle, retirement or cancellation coverage
-claimed. A completed lifecycle is local only: broker-side retirement stays not established and
+retires the connection, with its invented stop hook returning for the continuing account-summary and
+position reads (never an SDK cancellation), and observes the reader, socket and consumer separately.
+Each of the three streams' completion and issue codes is read through ``CallbackRouter.stream_status()``.
+The contract-details callbacks are passed to their normalizer directly, outside the lifecycle model,
+with no lifecycle, retirement or cancellation coverage claimed. A completed lifecycle is local only: broker-side retirement stays not established and
 PAPER-READ-1 stays not assessed.
 
 The reader double's partial-byte observation reads the handoff's framing report. Refusals, untaken
 frames and handoff failures appear in the unchanged framing and handoff reports. The local-components
-aggregate requires the lifecycle, the framing and every handoff together, and grants nothing. No
+aggregate requires the lifecycle, the framing, every handoff and every stream's own completion
+together, and grants nothing. No
 message-id, protobuf or wire-format selection is modelled.
 
 Every fixture value is invented for this demonstration only, under one fixed ``FakeClock``.
@@ -42,10 +43,6 @@ from decimal import Decimal
 from typing import Self
 
 from tradingbot.models import AssetClass, Instrument
-from tradingbot.paper_readiness.account_position_callbacks import (
-    AccountSummaryCallbacks,
-    PositionSnapshotCallbacks,
-)
 from tradingbot.paper_readiness.callback_router import CallbackRouter, RouterReport, StreamKind
 from tradingbot.paper_readiness.decode_handoff import (
     DecodeHandoff,
@@ -104,38 +101,41 @@ STREAM_SOURCES = {
                       "format) through DecodeHandoff, a closed InventedDecoder and the "
                       "ReadCallbackFacade to the CallbackRouter, whose adapter consumer delivers "
                       "them to IbkrCallbackNormalizer; local lifecycle only",
-    "account_summary": "invented callbacks via AccountSummaryCallbacks, called directly; broker "
-                       "request id kept; outside the lifecycle model",
-    "positions": "invented callbacks via PositionSnapshotCallbacks, called directly; one local "
-                 "snapshot whose id is local, never a broker request id; outside the lifecycle "
-                 "model",
+    "account_summary": "invented callbacks carried by owned invented frames (not an SDK wire "
+                       "format) through DecodeHandoff to the CallbackRouter, whose adapter consumer "
+                       "delivers them to AccountSummaryCallbacks; broker-style synthetic request id "
+                       "kept; local lifecycle only",
+    "positions": "invented callbacks carried by owned invented frames (not an SDK wire format) "
+                 "through DecodeHandoff to the CallbackRouter, whose adapter consumer delivers them "
+                 "to PositionSnapshotCallbacks; one local snapshot window whose id is local, never a "
+                 "broker request id; local lifecycle only",
 }
 LIFECYCLE_NOTICE = (
-    "LOCAL LIFECYCLE, SIMULATED: only the quote-snapshot callbacks pass through the SDK-free "
-    "CallbackRouter's LifecycleAdapter and its RetirementLedger, over invented doubles, after "
-    "DecodeHandoff settles each owned frame. The contract-details, "
-    "account-summary and position callbacks go to their normalizers directly and are outside the "
-    "lifecycle model; no lifecycle, retirement or cancellation coverage is claimed for them. A "
+    "LOCAL LIFECYCLE, SIMULATED: the quote-snapshot, account-summary and position callbacks pass "
+    "through the SDK-free CallbackRouter's LifecycleAdapter and its RetirementLedger, over invented "
+    "doubles, after DecodeHandoff settles each owned frame. The continuing account-summary and position "
+    "reads end with the invented client's returned stop hook, never an SDK cancellation. The "
+    "contract-details callbacks go to their normalizer directly and are outside the lifecycle model; no "
+    "lifecycle, retirement or cancellation coverage is claimed for them. A "
     "completed lifecycle is local only: broker-side retirement is not established, PAPER-READ-1 is "
     "not assessed and trading_permission is False."
 )
 FRAMING_NOTICE = (
-    "READER FRAMING AND DECODE HANDOFF, SIMULATED: each quote callback travels in one owned "
+    "READER FRAMING AND DECODE HANDOFF, SIMULATED: each read callback travels in one owned "
     "INVENTED frame. DecodeHandoff buffers the chunks in its FrameAccumulator, decodes each frame "
     "with a closed InventedDecoder that maps whole invented payloads to fixed callbacks (no SDK "
     "message format, message id or protobuf selection), and settles the delivery through the "
     "router's consumer before releasing the frame. Its retained byte count feeds the lifecycle's "
     "reader observation; refusals, untaken frames and handoff failures appear in the framing and "
-    "handoff reports. Local completion requires the lifecycle, the framing and every handoff. "
+    "handoff reports. Local completion requires the lifecycle, the framing, every handoff and every "
+    "stream's own completion. "
     "Nothing here is readiness, PAPER-READ-1, broker-side retirement or trading permission."
 )
-# The one stream whose callbacks pass through the lifecycle adapter, and why the others do not.
-_LIFECYCLE_STREAMS = ("quote_snapshot",)
+# The read streams whose callbacks pass through the lifecycle adapter, and why contract details do not.
+_LIFECYCLE_STREAMS = ("quote_snapshot", "account_summary", "positions")
 _DIRECT = "callbacks go to the normalizer directly, not through the lifecycle adapter"
 _OUTSIDE_LIFECYCLE = {
     "contract_details": f"{_DIRECT}; the ledger has no read slot for it",
-    "account_summary": f"{_DIRECT}; no lifecycle or retirement coverage is claimed",
-    "positions": f"{_DIRECT}; no lifecycle or retirement coverage is claimed",
 }
 
 # ----------------------------------------------------------------------------- invented fixtures
@@ -204,7 +204,7 @@ def _length_prefixed(payload: bytes) -> bytes:
 # an SDK message: the closed InventedDecoder maps it to that one callback. The frames' bytes arrive
 # fragmented across fixed-size chunks, so headers and payloads cross chunk boundaries.
 _DEMO_SERVER_VERSION = 1  # invented version provenance for the closed decoder; no wire meaning
-_QUOTE_FRAME_KEY = b"invented-demo-quote-frame-%02d"
+_READ_FRAME_KEY = b"invented-demo-read-frame-%02d"
 _CHUNK_BYTES = 13
 # Trailing reader bytes for the framing cases, after every quote frame.
 _PARTIAL_HEADER = b"\x00\x00"  # two of a further frame's four header bytes
@@ -215,7 +215,7 @@ _UNTAKEN_FRAME = _length_prefixed(b"invented trailing frame E")  # complete, but
 
 # ----------------------------------------------------------------------------- callback sequences
 
-def _summary_rows(n: AccountSummaryCallbacks, *, buying_power_currency: str = "USD") -> None:
+def _summary_rows(n: _ReadRecorder, *, buying_power_currency: str = "USD") -> None:
     """One invented account, every row on the account-summary request id."""
     n.accountSummary(_ARID, _ACCOUNT, "AccountType", "INVENTED-DEMO", "")  # non-monetary
     n.accountSummary(_ARID, _ACCOUNT, "NetLiquidation", "250000.00", "USD")
@@ -223,30 +223,30 @@ def _summary_rows(n: AccountSummaryCallbacks, *, buying_power_currency: str = "U
     n.accountSummary(_ARID, _ACCOUNT, "BuyingPower", "500000.00", buying_power_currency)
 
 
-def _summary_callbacks(n: AccountSummaryCallbacks) -> None:
+def _summary_callbacks(n: _ReadRecorder) -> None:
     _summary_rows(n)
     n.accountSummaryEnd(_ARID)
 
 
-def _summary_with_monetary_currency_missing(n: AccountSummaryCallbacks) -> None:
+def _summary_with_monetary_currency_missing(n: _ReadRecorder) -> None:
     """PR #35 review P2: a required monetary row without its currency; one row cannot vouch for
     another, so the summary's currency stays missing."""
     _summary_rows(n, buying_power_currency="")
     n.accountSummaryEnd(_ARID)
 
 
-def _position_rows(n: PositionSnapshotCallbacks) -> None:
+def _position_rows(n: _ReadRecorder) -> None:
     """A fractional negative and a fractional positive quantity, kept exactly by the normalizer."""
     n.position(_ACCOUNT, _position_contract(700011, "DEMOPOSA"), Decimal("-12.5"), 101.25)
     n.position(_ACCOUNT, _position_contract(700012, "DEMOPOSB"), Decimal("300.25"), 55.0)
 
 
-def _position_callbacks(n: PositionSnapshotCallbacks) -> None:
+def _position_callbacks(n: _ReadRecorder) -> None:
     _position_rows(n)
     n.positionEnd()
 
 
-def _malformed_position_then_repeated_end(n: PositionSnapshotCallbacks) -> None:
+def _malformed_position_then_repeated_end(n: _ReadRecorder) -> None:
     """PR #35 review P2: an oversized quantity is malformed and latches, so neither END nor a
     repeated END can present the lost row as a complete snapshot."""
     _position_rows(n)
@@ -260,7 +260,7 @@ def _contract_callbacks(n: IbkrCallbackNormalizer) -> None:
     n.contractDetailsEnd(_CRID)
 
 
-def _live_ticks(n: _QuoteRecorder) -> None:
+def _live_ticks(n: _ReadRecorder) -> None:
     attrib = _NoAttrib()
     n.marketDataType(_QRID, 1)
     n.tickPrice(_QRID, 1, 48.25, attrib)
@@ -271,13 +271,13 @@ def _live_ticks(n: _QuoteRecorder) -> None:
     n.tickString(_QRID, 45, _LAST_TRADE)
 
 
-def _control(contract: IbkrCallbackNormalizer, quote: _QuoteRecorder) -> None:
+def _control(contract: IbkrCallbackNormalizer, quote: _ReadRecorder) -> None:
     _contract_callbacks(contract)
     _live_ticks(quote)
     quote.tickSnapshotEnd(_QRID)
 
 
-def _delayed_size_mixed_with_live(contract: IbkrCallbackNormalizer, quote: _QuoteRecorder) -> None:
+def _delayed_size_mixed_with_live(contract: IbkrCallbackNormalizer, quote: _ReadRecorder) -> None:
     """PR #25 review P2: delayed bid size (tick 69) among otherwise live ticks."""
     _contract_callbacks(contract)
     _live_ticks(quote)
@@ -285,7 +285,7 @@ def _delayed_size_mixed_with_live(contract: IbkrCallbackNormalizer, quote: _Quot
     quote.tickSnapshotEnd(_QRID)
 
 
-def _issue_with_repeated_end(contract: IbkrCallbackNormalizer, quote: _QuoteRecorder) -> None:
+def _issue_with_repeated_end(contract: IbkrCallbackNormalizer, quote: _ReadRecorder) -> None:
     """PR #25 review P1: a valid row, an unsupported callback, then contractDetailsEnd twice."""
     contract.contractDetails(_CRID, _details())
     contract.unsupported_callback("connectionClosed")
@@ -352,7 +352,10 @@ ACCOUNT_POSITION_FAILURES = (
                  "Control callbacks, then an oversized position quantity and positionEnd twice "
                  "(PR #35 review P2).",
                  ReadinessOutcome.NOT_READY, _control,
-                 positions_feed=_malformed_position_then_repeated_end),
+                 positions_feed=_malformed_position_then_repeated_end,
+                 # The positions read is in the lifecycle model, so the repeated positionEnd is a
+                 # post-END ledger fault and the lifecycle does not complete.
+                 expected_lifecycle_completed=False),
 )
 # The CLI's four reader-framing cases, also kept out of SCENARIOS. Every callback is the control's and
 # is delivered, so readiness stays CONTROL_COMPLETE; only trailing reader bytes after the quote
@@ -425,9 +428,10 @@ class _Connection:
         return self.closed  # None: closure unknown
 
 
-class _QuoteRecorder:
-    """Records a scenario's invented quote callbacks, in order, as fixed decoder steps. Nothing is
-    delivered here: each step becomes the decoding of one owned invented frame."""
+class _ReadRecorder:
+    """Records a scenario's invented quote, account-summary and position callbacks, in order, as fixed
+    decoder steps. Nothing is delivered here: each step becomes the decoding of one owned invented
+    frame."""
 
     def __init__(self) -> None:
         self.steps: list[Step] = []
@@ -435,7 +439,7 @@ class _QuoteRecorder:
     def _add(self, entry: Entry, *args: object) -> None:
         self.steps.append(Step(StepKind.CALL, entry, args))
 
-    # Only the documented quote callbacks these scenarios use; no other read type is modelled here.
+    # Only the documented read callbacks these scenarios use; contract details go directly.
     def marketDataType(self, reqId: int, marketDataType: int) -> None:
         self._add(Entry.MARKET_DATA_TYPE, reqId, marketDataType)
 
@@ -450,6 +454,18 @@ class _QuoteRecorder:
 
     def tickSnapshotEnd(self, reqId: int) -> None:
         self._add(Entry.TICK_SNAPSHOT_END, reqId)
+
+    def accountSummary(self, reqId: int, account: str, tag: str, value: str, currency: str) -> None:
+        self._add(Entry.ACCOUNT_SUMMARY, reqId, account, tag, value, currency)
+
+    def accountSummaryEnd(self, reqId: int) -> None:
+        self._add(Entry.ACCOUNT_SUMMARY_END, reqId)
+
+    def position(self, account: str, contract: object, pos: object, avgCost: float) -> None:
+        self._add(Entry.POSITION, account, contract, pos, avgCost)
+
+    def positionEnd(self) -> None:
+        self._add(Entry.POSITION_END)
 
 
 class _HandoffReader:
@@ -492,10 +508,10 @@ class _QuoteClient:
         self.router.connectionClosed()  # an observation only, never evidence of closure
 
 
-def _quote_frames(scenario: DemoScenario, steps: list[Step]) -> tuple[tuple[bytes, ...], dict]:
+def _read_frames(scenario: DemoScenario, steps: list[Step]) -> tuple[tuple[bytes, ...], dict]:
     """One owned invented frame per recorded callback, fragmented into fixed chunks, then the
     scenario's trailing bytes; and the closed decoder's script for each frame's whole payload."""
-    keys = [_QUOTE_FRAME_KEY % i for i in range(len(steps))]
+    keys = [_READ_FRAME_KEY % i for i in range(len(steps))]
     scripts = {key: (step,) for key, step in zip(keys, steps, strict=True)}
     if scenario.decoder_raises_after_end and steps and steps[-1].entry is Entry.TICK_SNAPSHOT_END:
         scripts[keys[-1]] = (steps[-1], Step(StepKind.RAISE))
@@ -506,15 +522,21 @@ def _quote_frames(scenario: DemoScenario, steps: list[Step]) -> tuple[tuple[byte
 
 def _run_lifecycle(scenario: DemoScenario, contract: IbkrCallbackNormalizer,
                    clock: FakeClock) -> tuple[CallbackRouter, DecodeHandoff]:
-    """Carry the scenario's quote callbacks in owned frames through the decode handoff to the router's
-    consumer, then shut the router down. Contract callbacks reach their normalizer directly."""
-    recorder = _QuoteRecorder()
-    scenario.feed(contract, recorder)
-    chunks, scripts = _quote_frames(scenario, recorder.steps)
+    """Carry the scenario's account-summary, position and quote callbacks, in that order, in owned
+    frames through the decode handoff to the router's consumer, then shut the router down. The quote
+    frames come last, so the snapshot END is the final frame. Contract callbacks reach their normalizer
+    directly."""
+    summary, positions, quote = _ReadRecorder(), _ReadRecorder(), _ReadRecorder()
+    scenario.summary_feed(summary)
+    scenario.positions_feed(positions)
+    scenario.feed(contract, quote)
+    chunks, scripts = _read_frames(scenario, summary.steps + positions.steps + quote.steps)
     client = _QuoteClient(scenario.socket_closure_known)
     router = CallbackRouter(client, _SingleThreadLock(), clock)
     client.router = router
     router.start()
+    router.register_account_summary(_ARID)  # its broker-style synthetic request id
+    router.register_positions(_PSID)  # the single local positions window; its id is local
     router.register_quote(_QRID, _CON_ID)
     handoff = DecodeHandoff(router, InventedDecoder(_DEMO_SERVER_VERSION, scripts),
                             server_version=_DEMO_SERVER_VERSION)
@@ -555,11 +577,27 @@ class DemoResult:
                 and self.handoff.failure == self.scenario.expected_handoff_failure)
 
     @property
+    def streams_completed(self) -> bool:
+        """Every stream's own normalizer completed: one stream's success never clears another's
+        failure. Normalizer evidence only; the readiness runner still decides readiness."""
+        return (self.contract_completed and self.quote_completed and self.account_summary_completed
+                and self.positions_completed)
+
+    @property
     def local_components_complete(self) -> bool:
-        """The lifecycle, the framing and every decode handoff finished cleanly, together. Local and
-        NON_AUTHORITATIVE only: it never changes the readiness outcome and is never PAPER-READ-1,
-        retirement or trading permission."""
-        return self.lifecycle.completed and self.framing.clean and self.handoff.completed
+        """The lifecycle, the framing, every decode handoff and every stream's normalizer finished
+        cleanly, together. Local and NON_AUTHORITATIVE only: it never changes the readiness outcome and
+        is never PAPER-READ-1, retirement or trading permission."""
+        return (self.lifecycle.completed and self.framing.clean and self.handoff.completed
+                and self.streams_completed)
+
+    @property
+    def aggregate_complete(self) -> bool:
+        """Every local component and stream completed **and** the unchanged readiness runner returned
+        CONTROL_COMPLETE, so no local success can sit beside a readiness failure. It only ever narrows:
+        it never changes or upgrades the readiness outcome, and is never PAPER-READ-1, retirement or
+        trading permission."""
+        return self.local_components_complete and self.report.outcome == ReadinessOutcome.CONTROL_COMPLETE
 
 
 def _cli_only() -> tuple[DemoScenario, ...]:
@@ -580,25 +618,26 @@ def run_demo(name: str) -> DemoResult:
     scenario = _scenario(name)
     clock = FakeClock(DEMO_CLOCK)
     contract = IbkrCallbackNormalizer(_CRID, CallbackRequest.CONTRACT_DETAILS)
-    summary = AccountSummaryCallbacks(_ARID)
-    positions = PositionSnapshotCallbacks(_PSID)
     router, handoff = _run_lifecycle(scenario, contract, clock)
     router_report, handoff_report = router.report(), handoff.report()
-    # The quote normalizer is the router's own; its evidence is read through stream_status().
-    quote = next(st for st in router.stream_status() if st.stream is StreamKind.QUOTE_SNAPSHOT)
-    scenario.summary_feed(summary)  # passed to the accepted normalizers directly
-    scenario.positions_feed(positions)
+    # The quote, account-summary and position normalizers are the router's own; their evidence is read
+    # through stream_status(), and their envelopes through the router.
+    status = {st.stream: st for st in router.stream_status()}
+    quote = status[StreamKind.QUOTE_SNAPSHOT]
+    summary = status[StreamKind.ACCOUNT_SUMMARY]
+    positions = status[StreamKind.POSITIONS]
     script = FakeScript(session=_session(), contract_details=contract.envelopes(),
-                        quote_snapshot=router.quote_envelopes(), account_summary=summary.envelopes(),
-                        positions=positions.envelopes())
+                        quote_snapshot=router.quote_envelopes(),
+                        account_summary=router.account_summary_envelopes(),
+                        positions=router.position_envelopes())
     report = run_readiness_check(FakeReadOnlyTransport(script, clock), DEMO_EXPECTATION, clock=clock,
                                  label=f"callback-demo:{name}")
     return DemoResult(
         scenario=scenario, report=report,
         contract_completed=contract.completed, contract_issues=_codes(contract),
         quote_completed=quote.completed, quote_issues=quote.issue_codes,
-        account_summary_completed=summary.completed, account_summary_issues=_codes(summary),
-        positions_completed=positions.completed, positions_issues=_codes(positions),
+        account_summary_completed=summary.completed, account_summary_issues=summary.issue_codes,
+        positions_completed=positions.completed, positions_issues=positions.issue_codes,
         lifecycle=router_report.adapter, framing=handoff_report.framing, handoff=handoff_report,
         router=router_report,
     )
@@ -650,7 +689,9 @@ def _summary(result: DemoResult) -> dict:
             "lifecycle_completed": result.lifecycle.completed,
             "framing_clean": result.framing.clean,
             "handoff_completed": result.handoff.completed,
-            "all_complete": result.local_components_complete,
+            "streams_completed": result.streams_completed,
+            "local_components_complete": result.local_components_complete,
+            "all_complete": result.aggregate_complete,
             "authority": "NON_AUTHORITATIVE",
             "trading_permission": False,
             "paper_read_1": "NOT_ASSESSED",
@@ -702,7 +743,8 @@ def render_demo_text(results: list[DemoResult]) -> str:
                      f"local_quiescence_established={ledger.local_quiescence_established}")
         lines.append(f"   observed: reader={ledger.reader} socket={ledger.socket} "
                      f"consumer={ledger.consumer} disconnect={ledger.disconnect_attempt} "
-                     f"state={life.state} failures={', '.join(life.failures) or 'none'}")
+                     f"state={life.state} failures={', '.join(life.failures) or 'none'} "
+                     f"ledger_faults={', '.join(ledger.faults) or 'none'}")
         lines.append(f"   outside the lifecycle model: {', '.join(_OUTSIDE_LIFECYCLE)}; "
                      f"broker_side_retirement={ledger.broker_side_retirement} "
                      f"paper_read_1={life.paper_read_1}")
@@ -723,7 +765,9 @@ def render_demo_text(results: list[DemoResult]) -> str:
         lines.append(f"   local components (NON_AUTHORITATIVE): "
                      f"lifecycle_completed={life.completed} framing_clean={framing.clean} "
                      f"handoff_completed={r.handoff.completed} "
-                     f"all_complete={r.local_components_complete}")
+                     f"streams_completed={r.streams_completed} "
+                     f"local_components_complete={r.local_components_complete} "
+                     f"all_complete={r.aggregate_complete}")
         lines.append(render_text(r.report, summary=True).rstrip("\n"))
         lines.append("")
     matched = sum(r.matches_expectation for r in results)

@@ -157,6 +157,38 @@ def test_each_scenario_renders_its_actual_result(tmp_path, monkeypatch, name):
     assert not at.success and "UNEXPECTED" not in text
 
 
+# Requirement: the page shows the actual modelled scope, the three read slots and every part of the
+# local aggregate, read from the demo's own reports.
+
+
+@pytest.mark.parametrize("name", list(demo.SCENARIOS))
+def test_the_local_read_composition_shows_each_read_slot_and_the_aggregate(tmp_path, monkeypatch, name):
+    at = select(page(tmp_path, monkeypatch).run(), name)
+    result = demo.run_demo(name)
+    text = shown(at)
+    assert "Local read composition" in [s.value for s in at.subheader]
+    slots = result.lifecycle.ledger.slots
+    assert [s.slot for s in slots] == ["ACCOUNT_SUMMARY", "POSITIONS", "QUOTE_SNAPSHOT"]
+    for s in slots:
+        end, complete = ("yes" if s.end_marker_seen else "NO"), ("yes" if s.read_complete else "NO")
+        assert f"| {s.slot} | {s.data_callbacks} | {end} | {complete} | {s.retirement_attempt} |" in text
+    handoff = result.handoff
+    assert f"{len(handoff.handoffs)}/{len(handoff.handoffs)} settled, failure: none |" in text
+    flags = {"lifecycle": result.lifecycle.completed, "framing": result.framing.clean,
+             "decode handoff": handoff.completed, "every stream": result.streams_completed,
+             "local components": result.local_components_complete,
+             "all_complete": result.aggregate_complete}
+    for row, flag in flags.items():
+        assert f"| {row} | {'yes' if flag else 'NO'} |" in text, row
+    assert "| CONTRACT_DETAILS |" not in text  # contract details have no lifecycle slot
+    assert result.aggregate_complete is (name == CONTROL)  # one failed stream is never cleared
+    note = [c.value for c in at.caption if c.value.startswith("Local and NON_AUTHORITATIVE")]
+    assert len(note) == 1
+    for phrase in ("returned stop hook, never an SDK cancellation", "requires CONTROL_COMPLETE",
+                   "none of it is broker-side retirement, PAPER-READ-1 or trading permission"):
+        assert phrase in note[0], phrase
+
+
 # Requirement: the two failure scenarios cannot display readiness or trading success.
 
 
@@ -189,9 +221,12 @@ def test_the_control_is_labelled_a_simulation_without_trading_authority(tmp_path
     source_note = [w.value for w in at.warning if w.value.startswith("Every stream is produced")]
     assert len(source_note) == 1
     for phrase in ("INVENTED callback values", "none is preassembled",
-                   "outside the lifecycle model", "never a broker request id",
+                   "quote snapshot, account summary and positions callbacks travel",
+                   "in owned invented frames", "local lifecycle adapter",
+                   "contract details are outside the lifecycle model", "never a broker request id",
                    "not SDK, broker or paper-account proof"):
         assert phrase in source_note[0], phrase
+    assert "Only the quote snapshot" not in shown(at)
     verdict = [w.value for w in at.warning if w.value.startswith("CONTROL_COMPLETE:")]
     assert len(verdict) == 1 and "never authorizes trading" in verdict[0]
     assert not at.success and demo.SIMULATION_NOTICE in shown(at)
@@ -251,6 +286,7 @@ def test_view_docs_give_run_instructions_and_limits():
                   "PYTHONPATH=src streamlit run dashboard/pages/5_Callback_Demo.py",
                   "PYTHONPATH=src python -m pytest tests/test_callback_demo_page.py",
                   "AccountSummaryCallbacks", "PositionSnapshotCallbacks", "local snapshot",
-                  "outside the lifecycle model", "trading_permission", "NON_AUTHORITATIVE",
+                  "outside the lifecycle model", "Local read composition", "never an SDK cancellation",
+                  "trading_permission", "NON_AUTHORITATIVE",
                   "## Limits"):
         assert token in text, token

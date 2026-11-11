@@ -2,13 +2,14 @@
 
 NON-AUTHORITATIVE. Shows what ``tradingbot.paper_readiness.callback_demo`` produces for its three
 invented scenarios: the expected and actual outcome, the callback ingestion state, the request
-sequence, the failure codes by stage, and the canonical redacted report through the existing
-renderers.
+sequence, the local read composition's evidence, the failure codes by stage, and the canonical
+redacted report through the existing renderers.
 
 All four readiness streams come from invented callback values through the accepted offline
-normalizers; none is preassembled. Only the quote snapshot passes through the local lifecycle
-adapter. Positions carry a local snapshot id, never a broker request id. Nothing here is SDK,
-broker or paper-account proof.
+normalizers; none is preassembled. The quote snapshot, account summary and positions callbacks
+travel in owned invented frames through the decode handoff to the router's consumer and the local
+lifecycle adapter; contract details are outside the lifecycle model. Positions carry a local
+snapshot id, never a broker request id. Nothing here is SDK, broker or paper-account proof.
 
 The only control is the choice among the three bundled scenarios. The page reads no file, path,
 environment variable, wall clock or network, writes nothing and builds no transport. Everything
@@ -40,10 +41,17 @@ BANNER = (
 )
 SOURCE_NOTE = (
     "Every stream is produced from INVENTED callback values through the accepted offline "
-    "normalizers; none is preassembled. Only the quote snapshot passes through the local lifecycle "
-    "adapter; contract details, account summary and positions are outside the lifecycle model. "
-    "Positions carry a local snapshot id, never a broker request id. This is not SDK, broker or "
+    "normalizers; none is preassembled. The quote snapshot, account summary and positions "
+    "callbacks travel in owned invented frames through the decode handoff to the router's consumer "
+    "and the local lifecycle adapter; contract details are outside the lifecycle model. Positions "
+    "carry a local snapshot id, never a broker request id. This is not SDK, broker or "
     "paper-account proof."
+)
+COMPOSITION_NOTE = (
+    "Local and NON_AUTHORITATIVE: these are the demo's own lifecycle, framing, decode-handoff and "
+    "per-stream reports. The continuing account-summary and positions reads end with the invented "
+    "client's returned stop hook, never an SDK cancellation. all_complete also requires "
+    "CONTROL_COMPLETE; none of it is broker-side retirement, PAPER-READ-1 or trading permission."
 )
 OUTCOME_MEANING = {
     ReadinessOutcome.CONTROL_COMPLETE: (
@@ -101,6 +109,40 @@ def _sequence_rows(result: DemoResult) -> list[str]:
         source = _source(method.removeprefix("request_"))
         rows.append(f"| {number} | `{method}` | {digest.request_id} | {digest.stage.value} | "
                     f"{digest.rows} | {end} | {source} |")
+    return rows
+
+
+def _yes(flag: bool) -> str:
+    return "yes" if flag else "NO"
+
+
+def _composition_rows(result: DemoResult) -> list[str]:
+    """The lifecycle ledger's read slots, then the aggregate's parts, all from the demo's reports."""
+    ledger, handoff = result.lifecycle.ledger, result.handoff
+    rows = [
+        "| Lifecycle read slot | Data callbacks | END seen | Read complete | Stop attempt |",
+        "|---|---|---|---|---|",
+    ]
+    for slot in ledger.slots:
+        rows.append(f"| {slot.slot} | {slot.data_callbacks} | {_yes(slot.end_marker_seen)} | "
+                    f"{_yes(slot.read_complete)} | {slot.retirement_attempt} |")
+    settled = sum(record.status.value == "SETTLED" for record in handoff.handoffs)
+    failure = "none" if handoff.failure is None else handoff.failure.value
+    faults = ", ".join(f"`{code}`" for code in ledger.faults) or "none"
+    rows += [
+        "",
+        "| Component | Complete | Evidence |",
+        "|---|---|---|",
+        f"| lifecycle | {_yes(result.lifecycle.completed)} | ledger faults: {faults} |",
+        (f"| framing | {_yes(result.framing.clean)} | `{result.framing.outcome.value}`, "
+         f"{result.framing.frames_handed_off} frames handed off |"),
+        (f"| decode handoff | {_yes(handoff.completed)} | {settled}/{len(handoff.handoffs)} "
+         f"settled, failure: {failure} |"),
+        f"| every stream | {_yes(result.streams_completed)} | per-stream table above |",
+        f"| local components | {_yes(result.local_components_complete)} | all four rows above |",
+        (f"| all_complete | {_yes(result.aggregate_complete)} | local components and "
+         f"`{result.report.outcome.value}` |"),
+    ]
     return rows
 
 
@@ -167,6 +209,10 @@ st.markdown(
 
 st.subheader("Callback ingestion")
 st.markdown("\n".join(_ingestion_rows(result)))
+
+st.subheader("Local read composition")
+st.markdown("\n".join(_composition_rows(result)))
+st.caption(COMPOSITION_NOTE)
 
 st.subheader("Request sequence")
 st.markdown("\n".join(_sequence_rows(result)))
