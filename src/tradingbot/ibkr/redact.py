@@ -4,8 +4,9 @@ from __future__ import annotations
 import re
 
 # IBKR account IDs: one to three capital letters followed by digits (DU1234567, U1234567, F...).
-# Bounded by any non-alphanumeric character, underscore included (``report_DU1234567.json``).
-_ACCOUNT_LIKE = re.compile(r"(?<![A-Za-z0-9])[A-Z]{1,3}\d{4,12}(?![A-Za-z0-9])")
+# Matched regardless of what adjoins it (``aDU1234567``, ``DU1234567DU7654321``, ``_DU1234567``):
+# this over-redacts some harmless tokens (e.g. ``T090000`` in a UTC stamp), deliberately.
+_ACCOUNT_LIKE = re.compile(r"[A-Z]{1,3}\d{4,12}")
 
 
 def mask_account(account: str) -> str:

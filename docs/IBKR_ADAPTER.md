@@ -144,36 +144,35 @@ Other protections:
     `cancelOrder`, `reqGlobalCancel` and `updateConfigProtoBuf` on every attribute of a connected
     session, two levels deep, and also as unbound base-class calls. Every attempt is refused and
     nothing reaches the transport. An AST test forbids those names anywhere in the package.
-  - **No attribute path to an unfiltered send.** `_GuardedConnection` has `__slots__`, exposes
+  - **No attribute or weak-reference path to an unfiltered send.** `_GuardedConnection` has
+    `__slots__` without `__weakref__` (so it cannot be weak-referenced at all), exposes
     exactly the five methods the SDK uses (`connect`, `disconnect`, `isConnected`, `recvMsg`,
     `sendMsg`) and does not forward other attributes, so `conn.socket` and `conn.lock` no longer
     exist. It holds no reference to the SDK `Connection`. That object lives only in the
-    module-private `session._RAW_CONNECTIONS` (a `WeakKeyDictionary` keyed by the guard), and
-    `_raw_call` never binds it to a local. An exception raised inside the transport leaves the
+    module-private `session._RAW_CONNECTIONS`, a plain dict keyed by an opaque int token that
+    the guard's `__del__` removes, and `_raw_call` never binds it to a local. An exception raised inside the transport leaves the
     guard with its traceback, context and cause cut, so a handed-out exception's frames cannot lead
     back to it either.
   - A permanent test (`test_object_graph_of_connected_session_reaches_no_unfiltered_send`) walks
     the object graph of a connected session, plus an exception the session raised, breadth-first
     to depth 16 with cycle protection. It follows container items, `__dict__` entries, `__slots__`,
     every non-dunder attribute and property, and `__self__`, `__func__`, `__closure__` cells,
-    `__wrapped__`, `__defaults__`, `__traceback__`/`tb_next`/`tb_frame`/`f_locals`, `__context__`,
-    `__cause__` and weak references. It asserts that no fake connection or `socket.socket` is
+    `__wrapped__`, `__traceback__`/`tb_next`/`tb_frame`/`f_locals`, `__context__`, `__cause__`,
+    weak references and their `__callback__`, `weakref.getweakrefs(obj)` for every object, and
+    the `__defaults__`, `__kwdefaults__` and `__closure__` of every function. It asserts that no fake connection or `socket.socket` is
     reachable. It then calls every reachable callable named like a send or write with
     PLACE_ORDER and UPDATE_CONFIG, in each argument shape the SDK's send primitives take, and
-    asserts that not one byte reached the fake wire and that the session still reads.
+    asserts that not one byte reached the fake wire and that the session still reads. The merge
+    review's probe (`weakref.getweakrefs(conn)[0].__callback__.__defaults__[0]()`) is a permanent
+    test too.
     - It deliberately does not follow classes, modules, `__globals__`, `f_globals`, builtins or the
       caller's own stack (`f_back`), and it skips stdio streams and code objects.
-  - **What remains, and is out of scope for an in-process filter.** Code running in the same
-    Python process can still:
-    - open its own socket to the TWS port;
-    - reach the raw connection or socket through module globals (`import`, a function's
-      `__globals__`, `session._RAW_CONNECTIONS`), `gc.get_objects()`/`gc.get_referents()`,
-      `sys._current_frames()` or the `socket` module.
-
-    The filter stops mistakes and stray calls inside the adapter's own object graph, not
-    deliberate in-process code. The real controls for that are TWS's own **Read-Only API**
-    setting, which the adapter verifies on every connect (step 5 above), and process isolation
-    (run nothing untrusted in the process that holds the session).
+  - **What remains, and is out of scope.** The guarantee is: no route by attribute or
+    weak-reference traversal from any object the package hands out. Code that deliberately uses
+    `gc`, module globals, imports the private module by name, uses `ctypes` or opens its own socket
+    is out of scope for an in-process filter. The control for that class of risk during
+    diagnostics is TWS's own Read-Only API setting, which the adapter verifies before any data
+    request.
 - **Logging.** The `ibapi` logger is disabled, has `propagate = False` and a `NullHandler`. Without
   this, the SDK's field-count-mismatch path would log raw fields, account included, to stderr.
   Exception text is masked by `redact_accounts`. The report never contains the full account ID.
@@ -286,7 +285,9 @@ PYTHONPATH=src python -m pytest tests/test_ibkr_paper_check_page.py
   including NaN, a naive timestamp, an unknown verdict or step status, or invalid UTF-8, gets one
   fixed message and nothing from the file.
 - Every string, dict keys included, passes through `redact_accounts` before rendering. The
-  redaction pattern is bounded by any non-alphanumeric character, so `_DU1234567` is masked too.
+  redaction (`redact_accounts`, shared by the session, the report and the page) masks every
+  account-shaped substring whatever adjoins it (`aDU1234567`, `DU1234567DU7654321`). It
+  deliberately over-redacts some harmless tokens, such as `T090000` in a UTC file stamp.
 - The page imports no SDK and no session, opens no socket, writes nothing, and has no button or
   other control that connects to the broker. Its tests use invented reports in a temporary
   directory.

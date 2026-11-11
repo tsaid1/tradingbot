@@ -174,6 +174,13 @@ def test_masking():
     assert "DU…67" in text and "U7…21" in text and "15547841" in text and "TLT" in text
 
 
+@pytest.mark.parametrize("raw", ["DU1234567DU7654321", "aDU1234567", "DU1234567a",
+                                 "_DU1234567_", "x9DU1234567", "acctDU1234567x"])
+def test_redaction_ignores_what_adjoins_the_id(raw):
+    out = redact_accounts(raw)
+    assert "1234567" not in out and "7654321" not in out
+
+
 def test_exceptions_redact_account_ids():
     exc = E.IbkrRequestError(321, f"Error validating request for {ACCT}", 9001)
     assert ACCT not in str(exc) and ACCT not in exc.broker_message and exc.code == 321

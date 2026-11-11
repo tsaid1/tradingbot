@@ -165,7 +165,7 @@ def test_newest_report_by_name_is_shown(tmp_path, monkeypatch):
     _write(tmp_path, _report(overall="PASS"), "ibkr_paper_check_20261112T090000Z_1.json")
     at = page(monkeypatch, tmp_path)
     assert {m.label: m.value for m in at.metric}["Overall"] == "PASS"
-    assert "ibkr_paper_check_20261112T090000Z_1.json" in shown(at)
+    assert "_1.json" in shown(at)  # the UTC stamp itself is over-redacted (T090000 is ID-shaped)
 
 
 def test_text_input_overrides_the_directory(tmp_path, monkeypatch):
@@ -225,10 +225,11 @@ def test_full_account_id_is_never_displayed(tmp_path, monkeypatch):
     r["steps"].append({"name": "redaction_guard", "status": "FAIL", "duration_ms": 0,
                        "error": f"leaked {FULL} and U1234567"})
     r["warnings"].append(f"warning about {FULL}")
+    r["warnings"].append(f"run together {FULL}DU1234567 and a{FULL}x")
     _write(tmp_path, r, f"ibkr_paper_check_20261112T100000Z_{FULL}.json")
     at = page(monkeypatch, tmp_path)
     text = shown(at)
-    assert FULL not in text and "U1234567" not in text
+    assert "7654321" not in text and "1234567" not in text
     assert MASKED in text and "leaked DU…21 and U1…67" in text
 
 
