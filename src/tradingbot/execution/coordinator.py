@@ -94,9 +94,11 @@ EXIT_NOT_NETTED = "EXIT_NOT_NETTED"
 # An exit was not sent because the broker quote was not usable to price its limit (review S2); the
 # broker-side protective stop remains the protection.
 EXIT_WITHOUT_QUOTE = "EXIT_WITHOUT_QUOTE"
-# A child of the entry is active at the broker, so the entry filled, but its executions are no
-# longer in the broker's history: the ledger cannot be updated from fills; a human must.
-ENTRY_FILL_NOT_IN_EXECUTIONS = "ENTRY_FILL_NOT_IN_EXECUTIONS"
+# The entry's own evidence (its row in open or completed orders, its executions) is missing or
+# incomplete, so whether and how much it filled is unknown. Never inferred from a child order: at
+# IBKR a bracket child is PreSubmitted before the parent fills and may stay so after it. The
+# intent stays UNRESOLVED and new exposure in the instrument is blocked until it is settled.
+ENTRY_STATE_UNKNOWN = "ENTRY_STATE_UNKNOWN"
 # A broker read failed (open orders, executions, completed orders or positions): the ledger may be
 # stale, every position's protection is UNKNOWN and nothing that creates or increases exposure is
 # sent until a full sync succeeds (review F1).
@@ -119,6 +121,7 @@ INSTRUMENT_BLOCKING_KINDS = (
     ENTRY_REMAINDER_NOT_CANCELLED,
     UNPROTECTED_POSITION,
     PROTECTION_UNVERIFIED,
+    ENTRY_STATE_UNKNOWN,
 )
 
 
@@ -416,8 +419,11 @@ class ExecutionCoordinator:
         try:
             fills = self.broker.executions()
             open_orders = self.broker.open_orders()
-            # Read for health only: every read the coordinator depends on must succeed (F1).
-            self.broker.completed_orders(since=now)
+            # Every read the coordinator depends on must succeed (F1). Completed orders are the
+            # only evidence of an order that has left the working set (it is never inferred).
+            completed = self.broker.completed_orders(
+                since=now - timedelta(seconds=self.config.lookup_horizon_seconds)
+            )
             self.broker.positions()
         except BrokerError as exc:
             self._broker_unreadable("sync", exc)
@@ -452,7 +458,7 @@ class ExecutionCoordinator:
                     exec_id=f.exec_id,
                     ledger_quantity=pos.quantity,
                 )
-        self._refresh_orders(open_orders, now)
+        self._refresh_orders(open_orders, now, completed)
         asked = self._cancel_stopped_out_entries(open_orders)
         if _rerun and self.halted() and self._cancel_entries_for_halt(open_orders):
             asked = True
@@ -1377,38 +1383,23 @@ class ExecutionCoordinator:
             broker_status = entry.status.value
             reasons = [entry.reason] if entry.reason else None
         else:
-            # Not working at the broker but executions exist: the entry completed.
+            # The entry's own row is not visible: only its own executions can settle it. A child
+            # order's visibility or status proves nothing about the parent (IBKR brackets).
             filled = sum(f.quantity for f in fills if f.order_ref == intent.order_ref)
-            # A child of the entry that is active (or has filled) means the entry filled, even when
-            # the entry's own executions have left the broker's history.
-            child_active = any(
-                o.parent_ref == intent.order_ref and o.status != OrderStatus.PRE_SUBMITTED
-                for o in orders
-            ) or any(f.order_ref != intent.order_ref for f in fills)
-            state = (
-                IntentState.FILLED
-                if filled >= intent.quantity or child_active
-                else IntentState.CANCELLED
-            )
-            broker_status, reasons = None, None
-            if child_active and filled < intent.quantity:
-                reasons = [ENTRY_FILL_NOT_IN_EXECUTIONS]
-                for row in rows:
-                    if row.order_ref == intent.order_ref:
-                        self.store.update_order(row.order_ref, now, status="Filled")
-                detail = (
-                    f"a protective child of {intent.order_ref} is active at the broker, so the "
-                    f"entry filled, but only {filled} of {intent.quantity} is in the executions "
-                    "history; the ledger cannot apply what it cannot see. Reconcile by hand."
+            if filled < intent.quantity:
+                self._entry_state_unknown(
+                    intent,
+                    f"the entry's own row is in neither open nor completed orders and its "
+                    f"executions show {filled} of {intent.quantity}",
                 )
-                self.store.raise_exception(
-                    now, ENTRY_FILL_NOT_IN_EXECUTIONS, detail, idea_id=intent.idea_id,
-                    order_ref=intent.order_ref,
-                )
-                self.store.log(
-                    now, ENTRY_FILL_NOT_IN_EXECUTIONS, order_ref=intent.order_ref,
-                    idea_id=intent.idea_id, filled_seen=filled, quantity=intent.quantity,
-                )
+                self.sync()
+                return
+            state, broker_status, reasons = IntentState.FILLED, None, None
+        if intent.action in (Action.OPEN, Action.ADD) and self.store.resolve_exceptions(
+            now, ENTRY_STATE_UNKNOWN, idea_id=intent.idea_id, order_ref=intent.order_ref
+        ):
+            self.store.log(now, "ENTRY_STATE_SETTLED", order_ref=intent.order_ref,
+                           idea_id=intent.idea_id, state=state.value)
         self.store.set_state(
             intent.order_ref, state, now, broker_status=broker_status, reasons=reasons
         )
@@ -1429,6 +1420,25 @@ class ExecutionCoordinator:
                 reason=entry.reason if entry else "",
             )
         self.sync()
+
+    def _entry_state_unknown(self, intent: Intent, detail: str) -> None:
+        """Never FILLED or CANCELLED on inference: the intent stays (or becomes) UNRESOLVED, is
+        looked up again every cycle, and an ENTRY_STATE_UNKNOWN exception blocks new exposure in
+        the instrument until the entry's own evidence settles it."""
+        now = self.clock()
+        self.store.set_state(intent.order_ref, IntentState.UNRESOLVED, now, broker_status="Unknown")
+        if intent.action not in (Action.OPEN, Action.ADD):
+            self.store.log(now, "EXIT_STATE_UNKNOWN", order_ref=intent.order_ref,
+                           idea_id=intent.idea_id, detail=detail)
+            return
+        if self.store.raise_exception(
+            now, ENTRY_STATE_UNKNOWN, f"{intent.order_ref}: {detail}", idea_id=intent.idea_id,
+            order_ref=intent.order_ref,
+        ):
+            self.store.log(
+                now, ENTRY_STATE_UNKNOWN, order_ref=intent.order_ref, idea_id=intent.idea_id,
+                detail=detail, rule="an entry's fill is decided only from its own evidence",
+            )
 
     def _rebuild(
         self, intent: Intent, rows: list[OrderRow]
@@ -1585,6 +1595,12 @@ class ExecutionCoordinator:
         exit_side = OrderSide.SELL if pos.position_side == PositionSide.LONG else OrderSide.BUY
         # Review F3: type, side, quantity AND price against the ledger's confirmed stop.
         price_ok = stop is not None and stop.stop_price == _dec(pos.stop_price)
+        # A PreSubmitted child is present only once its parent's fill is established by the
+        # parent's own executions (at IBKR it is PreSubmitted before the fill as well).
+        parent_ok = stop is not None and (
+            stop.status != OrderStatus.PRE_SUBMITTED
+            or self.store.filled_quantity(stop.parent_ref or pos.stop_ref.rsplit(".", 1)[0]) > 0
+        )
         if (
             stop is not None
             and stop.working
@@ -1593,6 +1609,7 @@ class ExecutionCoordinator:
             and stop.order_type == OrderType.STP
             and stop.side == exit_side
             and price_ok
+            and parent_ok
         ):
             self.store.update_position(idea_id, now, protection="CONFIRMED")
             if self.store.resolve_exceptions(now, UNPROTECTED_POSITION, idea_id=idea_id):
@@ -2022,10 +2039,15 @@ class ExecutionCoordinator:
             )
         return self._outcome(ref)
 
-    def _refresh_orders(self, open_orders: list[BrokerOrder], now: datetime) -> None:
-        """Bring our order rows and working intents up to the broker's view."""
+    def _refresh_orders(
+        self, open_orders: list[BrokerOrder], now: datetime, completed: list[BrokerOrder] = ()
+    ) -> None:
+        """Bring our order rows and working intents up to the broker's view. An order that left the
+        working set takes its final state from its own completed-orders row (or, for a full fill,
+        its own executions); with neither it is UNKNOWN, never assumed cancelled or filled."""
         open_by_ref = {o.order_ref: o for o in open_orders}
-        live = {"Recorded"} | {s.value for s in WORKING_STATUSES}
+        done_by_ref = {o.order_ref: o for o in completed}
+        live = {"Recorded", "Unknown"} | {s.value for s in WORKING_STATUSES}
         intents = {i.order_ref: i for i in self.store.intents()}
         for row in self.store.orders():
             intent = intents.get(row.intent_ref)
@@ -2038,22 +2060,30 @@ class ExecutionCoordinator:
                         row.order_ref, now, status=o.status.value, quantity=o.quantity
                     )
             elif row.status in live:
-                final = (
-                    OrderStatus.FILLED
-                    if row.filled_quantity >= row.quantity > 0
-                    else OrderStatus.CANCELLED
-                )
-                self.store.update_order(row.order_ref, now, status=final.value)
+                done = done_by_ref.get(row.order_ref)
+                if done is not None:
+                    final = done.status.value
+                elif row.filled_quantity >= row.quantity > 0:
+                    final = OrderStatus.FILLED.value
+                else:
+                    final = "Unknown"
+                if final != row.status:
+                    self.store.update_order(row.order_ref, now, status=final)
         for intent in self.store.intents(frozenset({IntentState.WORKING})):
             entry = self.store.order(intent.order_ref)
             filled = self.store.filled_quantity(intent.order_ref)
-            o = open_by_ref.get(intent.order_ref)
+            o = open_by_ref.get(intent.order_ref) or done_by_ref.get(intent.order_ref)
             if o is not None:
-                state = _intent_state(o.status, filled, intent.quantity)
+                state = _intent_state(o.status, max(filled, o.filled_quantity), intent.quantity)
             elif filled >= intent.quantity:
                 state = IntentState.FILLED
             else:
-                state = IntentState.CANCELLED
+                self._entry_state_unknown(
+                    intent,
+                    f"left the working orders with {filled} of {intent.quantity} filled and no "
+                    "completed-orders row",
+                )
+                continue
             if state != intent.state:
                 self.store.set_state(
                     intent.order_ref,

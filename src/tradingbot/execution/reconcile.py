@@ -214,9 +214,16 @@ def reconcile(
                         detail=problem,
                     )
                 )
+        # A PreSubmitted stop counts only once its parent's own fills are applied (never inferred).
+        unproven = (
+            stop is not None
+            and stop.status == OrderStatus.PRE_SUBMITTED
+            and store.filled_quantity(stop.parent_ref or p.stop_ref.rsplit(".", 1)[0]) == 0
+        )
         if (
             stop is None
             or not stop.working
+            or unproven
             or stop.status == OrderStatus.PENDING_CANCEL
             or stop.remaining != cover[p.idea_id]
         ):

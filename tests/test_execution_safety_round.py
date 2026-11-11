@@ -509,10 +509,13 @@ def test_s3_exposure_is_valued_at_the_current_quote(tmp_path):
 # ------------------------------------------------------------- previous engineer's open notes
 
 
-def test_note_a_visible_child_means_the_entry_filled_even_without_its_execution(tmp_path):
+def test_note_a_visible_child_does_not_decide_the_entry_without_its_own_evidence(tmp_path):
+    # Round 2 (IBKR binding): a bracket child is PreSubmitted before the parent fills and may stay
+    # so after it, so child visibility never proves the entry filled. Without the entry's own row
+    # or executions the state is UNKNOWN: UNRESOLVED, an exception, new exposure blocked.
     h = Harness(tmp_path, strict=True)
     h.broker.script_next_submit("LOST_ACK_PLACED")  # placed and filled, the ack is lost
-    h.broker.lookup_failures_after_submit = 1  # the post-submit lookup fails (the pre-trade sync must succeed, F1)
+    h.broker.lookup_failures_after_submit = 1  # the post-submit lookup fails
     out = h.execute("p1", open_action())
     assert out.state == IntentState.UNRESOLVED
     h.broker.history_seconds = 3600  # yesterday's fill and completed entry are out of history
@@ -521,13 +524,11 @@ def test_note_a_visible_child_means_the_entry_filled_even_without_its_execution(
     assert h.broker.executions() == []
     h.coord.recover()
     intent = h.coord.intent(out.order_ref)
-    assert intent.state == IntentState.FILLED  # not CANCELLED
+    assert intent.state == IntentState.UNRESOLVED  # neither FILLED nor CANCELLED on inference
     assert h.coord.store.position("p1:open").status != "NOT_FILLED"
     working = h.working()
     assert f"{out.order_ref}.STP" in working  # the protection at the broker is left alone
-    assert "ENTRY_FILL_NOT_IN_EXECUTIONS" in [
-        e.kind for e in h.coord.store.exceptions(open_only=True)
-    ]
+    assert "ENTRY_STATE_UNKNOWN" in [e.kind for e in h.coord.store.exceptions(open_only=True)]
     assert not h.coord.reconcile().clean  # the broker holds 4 the ledger cannot see
 
 

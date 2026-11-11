@@ -15,7 +15,9 @@ and survives a restart. No network, no real broker, invented data only.
 "SimBroker kinder than IBKR"): no reduce-only clamp (an oversized exit really reverses the
 position), protective children keep the quantity they were submitted with (they neither grow with
 the parent's fills nor shrink when a sibling partly fills; a sibling's complete fill still cancels
-them, one-cancels-other), ``executions()`` covers the current (UTC) day only, and cancels and
+them, one-cancels-other; they are visible as ``PreSubmitted`` before the parent fills and, with
+``children_stay_presubmitted``, stay ``PreSubmitted`` after it while working, as a stop held and
+simulated broker-side does at IBKR), ``executions()`` covers the current (UTC) day only, and cancels and
 modifies pass through a pending state (``PendingCancel`` / an unapplied amendment) that takes effect
 only after ``pending_seconds`` and at the next broker interaction, during which the order can still
 fill (``script_next_cancel("FILL_FIRST")`` / ``script_next_modify("FILL_FIRST")`` make a fill win
@@ -82,6 +84,7 @@ CREATE TABLE IF NOT EXISTS sim_orders (
     pending_stop TEXT,
     pending_at TEXT,
     pending_race TEXT,
+    activated INTEGER NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS sim_orders_ref ON sim_orders(order_ref);
@@ -197,6 +200,9 @@ class SimBroker:
         # this long, and executions / completed orders reach back only this far (IBKR: one day).
         self.open_orders_lag_seconds = 0.0
         self.history_seconds: float | None = None
+        # Strict mode: a protective child keeps reporting PreSubmitted after its parent fills while
+        # it works (IBKR holds and simulates many stops broker-side). Off by default.
+        self.children_stay_presubmitted = False
         with self._tx() as c:
             c.executescript(SCHEMA)
             cols = {r["name"] for r in c.execute("PRAGMA table_info(sim_orders)")}
@@ -208,6 +214,7 @@ class SimBroker:
                 ("pending_stop", "TEXT"),
                 ("pending_at", "TEXT"),
                 ("pending_race", "TEXT"),
+                ("activated", "INTEGER NOT NULL DEFAULT 0"),
             ):
                 if col not in cols:
                     c.execute(f"ALTER TABLE sim_orders ADD COLUMN {col} {kind}")
@@ -553,7 +560,7 @@ class SimBroker:
             # Cancelling an entry cancels children that are still waiting on it.
             c.execute(
                 """UPDATE sim_orders SET status='Cancelled', reason='PARENT_CANCELLED', updated_at=?
-                WHERE parent_ref=? AND status='PreSubmitted'""",
+                WHERE parent_ref=? AND status='PreSubmitted' AND activated=0""",
                 (self._now().isoformat(), order_ref),
             )
             out = c.execute(
@@ -709,7 +716,7 @@ class SimBroker:
                 self._cancel(c, oid, "CANCELLED_BY_CLIENT")
                 c.execute(
                     """UPDATE sim_orders SET status='Cancelled', reason='PARENT_CANCELLED',
-                    updated_at=? WHERE parent_ref=? AND status='PreSubmitted'""",
+                    updated_at=? WHERE parent_ref=? AND status='PreSubmitted' AND activated=0""",
                     (now.isoformat(), row["order_ref"]),
                 )
             elif working and row["pending_action"] == "MODIFY":
@@ -744,8 +751,8 @@ class SimBroker:
 
     def _match_once(self, c: sqlite3.Connection) -> bool:
         rows = c.execute(
-            "SELECT * FROM sim_orders WHERE status IN ('Submitted','PartiallyFilled','PendingCancel') "
-            "AND held=0 "
+            "SELECT * FROM sim_orders WHERE (status IN ('Submitted','PartiallyFilled','PendingCancel') "
+            "OR (status='PreSubmitted' AND activated=1)) AND held=0 "
             "ORDER BY broker_order_id"
         ).fetchall()
         for row in rows:
@@ -853,16 +860,21 @@ class SimBroker:
         if row["parent_ref"] is None and self.strict:
             # Strict: a parent fill activates its children at the quantity they were submitted with.
             c.execute(
-                "UPDATE sim_orders SET status='Submitted', updated_at=? "
-                "WHERE parent_ref=? AND status='PreSubmitted'",
-                (now, row["order_ref"]),
+                "UPDATE sim_orders SET status=?, activated=1, updated_at=? "
+                "WHERE parent_ref=? AND status='PreSubmitted' AND activated=0",
+                (
+                    "PreSubmitted" if self.children_stay_presubmitted else "Submitted",
+                    now,
+                    row["order_ref"],
+                ),
             )
         elif self.strict:
             # Strict one-cancels-other: only a complete fill cancels the working siblings.
             if status == OrderStatus.FILLED:
                 for sib in c.execute(
                     "SELECT * FROM sim_orders WHERE parent_ref=? AND broker_order_id<>? AND "
-                    "status IN ('Submitted','PartiallyFilled','PendingCancel')",
+                    "(status IN ('Submitted','PartiallyFilled','PendingCancel') "
+                    "OR (status='PreSubmitted' AND activated=1))",
                     (row["parent_ref"], broker_order_id),
                 ).fetchall():
                     self._cancel(c, sib["broker_order_id"], "OCA_SIBLING_FILLED")

@@ -492,3 +492,73 @@ def test_add2_a_day_setting_gives_day_children_and_an_expired_stop_is_flagged(tm
     assert [p.quantity for p in h.broker.positions()] == [4]
     report = h.coord.reconcile()
     assert "POSITION_WITHOUT_PROTECTIVE_STOP" in _kinds(report) and not report.clean
+
+
+# ------------------------------------- addition 1: an entry's fill is never inferred from a child
+
+ENTRY_STATE_UNKNOWN = "ENTRY_STATE_UNKNOWN"
+
+
+def _hide(h: Harness, ref: str) -> None:
+    real = h.broker.open_orders
+    h.broker.open_orders = lambda: [o for o in real() if o.order_ref != ref]
+
+
+def test_add1_a_presubmitted_child_before_the_fill_does_not_decide_the_entry(tmp_path):
+    h = Harness(tmp_path)
+    h.broker.script_next_submit("LOST_ACK_PLACED_RESTING")  # resting, unfilled, ack lost
+    ref = "TB-9fa95bd5b57815dc9409"  # order_ref_for("p1", 1, "open")
+    _hide(h, ref)  # the entry's own row is unavailable; its children show PreSubmitted
+    out = h.execute("p1", open_action())
+    assert out.order_ref == ref
+    assert h.working()[f"{ref}.STP"].status.value == "PreSubmitted"
+    intent = h.coord.intent(ref)
+    assert intent.state == IntentState.UNRESOLVED  # neither CANCELLED nor FILLED
+    assert h.coord.store.position("p1:open").status == "PENDING"
+    assert ENTRY_STATE_UNKNOWN in _open_kinds(h)
+    h.broker.set_quote("QQZ", "19.99", "20.01")
+    blocked = h.execute("p2", open_action())  # new exposure in the instrument is blocked
+    assert blocked.state == IntentState.REFUSED
+
+
+def test_add1_a_child_still_presubmitted_after_the_fill_does_not_decide_the_entry(tmp_path):
+    h = Harness(tmp_path)
+    h.broker.children_stay_presubmitted = True  # held and simulated broker-side after the fill
+    h.broker.script_next_submit("LOST_ACK_PLACED")  # placed and filled, ack lost
+    h.broker.lookup_failures_after_submit = 1
+    out = h.execute("p1", open_action())
+    h.broker.history_seconds = 3600  # the entry's executions and completed row roll off
+    h.clock.advance(10 * 3600)
+    h.broker.set_quote(SYMBOL, "49.98", "50.02")
+    assert h.working()[f"{out.order_ref}.STP"].status.value == "PreSubmitted"
+    h.coord.recover()
+    assert h.coord.intent(out.order_ref).state == IntentState.UNRESOLVED  # not CANCELLED
+    assert h.coord.store.position("p1:open").status != "NOT_FILLED"
+    assert ENTRY_STATE_UNKNOWN in _open_kinds(h)
+    assert not h.coord.reconcile().clean
+
+
+def test_add1_a_presubmitted_stop_counts_once_the_entry_fill_is_established(tmp_path):
+    h = Harness(tmp_path)
+    h.broker.children_stay_presubmitted = True
+    out = h.execute("p1", open_action())
+    stop = h.working()[f"{out.order_ref}.STP"]
+    assert stop.status.value == "PreSubmitted"
+    assert out.state == IntentState.FILLED and out.protection == "CONFIRMED"
+    assert h.coord.reconcile().clean
+    h.broker.set_quote(SYMBOL, "47.90", "47.94")  # the broker-held stop still triggers
+    h.coord.sync()
+    assert h.coord.store.position("p1:open").status == "CLOSED"
+
+
+def test_add1_a_working_entry_missing_from_every_read_is_unknown_not_cancelled(tmp_path):
+    h = Harness(tmp_path)
+    h.broker.script_next_submit("REST")
+    out = h.execute("p1", open_action())
+    assert out.state == IntentState.WORKING
+    _hide(h, out.order_ref)
+    h.broker.completed_orders = lambda since=None: []
+    h.coord.sync()
+    assert h.coord.intent(out.order_ref).state == IntentState.UNRESOLVED
+    assert h.coord.store.position("p1:open").status == "PENDING"
+    assert ENTRY_STATE_UNKNOWN in _open_kinds(h)
