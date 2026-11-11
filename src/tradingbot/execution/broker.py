@@ -134,9 +134,38 @@ class BrokerQuote(StrictModel):
     quality: QuoteQuality
 
 
+class ConditionDirection(str, Enum):
+    ABOVE = "ABOVE"  # released when the reference trades at or above the trigger
+    BELOW = "BELOW"  # released when the reference trades at or below the trigger
+
+
+class PriceCondition(StrictModel):
+    """A broker-side price condition on a REFERENCE series (IBKR PriceCondition: conId, exchange,
+    isMore, price). The order it is attached to is held at the broker and released, as
+    ``released_order_type`` in the order's own (execution) contract, once the reference's last
+    price crosses ``trigger_price``. Additive (multi-asset mapping): an order without a condition
+    behaves exactly as before. A broker that does not implement conditions must refuse such an
+    order; the execution core checks ``supports_price_conditions`` before sending one."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    contract: ContractRef
+    direction: ConditionDirection
+    trigger_price: Decimal = Field(gt=0)
+    released_order_type: OrderType = OrderType.MKT
+
+    def met(self, last: Decimal | None) -> bool:
+        if last is None:
+            return False
+        if self.direction == ConditionDirection.ABOVE:
+            return last >= self.trigger_price
+        return last <= self.trigger_price
+
+
 class OrderIntent(StrictModel):
     """One order as the caller wants it placed. ``order_ref`` is the idempotency key: the caller
-    derives it deterministically and the broker stores and echoes it (IBKR ``Order.orderRef``)."""
+    derives it deterministically and the broker stores and echoes it (IBKR ``Order.orderRef``).
+    ``condition`` (optional, additive) holds the order at the broker until a reference series
+    crosses a level; ``order_type`` must then equal the condition's ``released_order_type``."""
 
     order_ref: str = Field(min_length=1, max_length=64)
     contract: ContractRef
@@ -150,9 +179,12 @@ class OrderIntent(StrictModel):
     parent_ref: str | None = None
     # May only reduce an existing position, never open or reverse one.
     reduce_only: bool = False
+    condition: PriceCondition | None = None
 
     @model_validator(mode="after")
     def _prices_match_type(self):
+        if self.condition is not None and self.order_type != self.condition.released_order_type:
+            raise ValueError("a conditional order's type must be its condition's released type")
         if self.order_type == OrderType.LMT and (self.limit_price is None or self.limit_price <= 0):
             raise ValueError("LMT order needs a positive limit_price")
         if self.order_type == OrderType.STP and (self.stop_price is None or self.stop_price <= 0):
@@ -176,6 +208,8 @@ class BrokerOrder(StrictModel):
     stop_price: Decimal | None = None
     tif: TimeInForce = TimeInForce.DAY
     reduce_only: bool = False
+    # The broker-side price condition the order is held on, as the broker reports it (additive).
+    condition: PriceCondition | None = None
     status: OrderStatus
     filled_quantity: int = Field(default=0, ge=0)
     avg_fill_price: Decimal | None = None
@@ -226,6 +260,39 @@ class AckLost(BrokerError):
 
 class OrderNotFound(BrokerError):
     """No working order with that order_ref (it is unknown or already terminal)."""
+
+
+@runtime_checkable
+class ConditionalOrders(Protocol):
+    """Optional broker capabilities for REFERENCE_TRIGGER families (multi-asset mapping). Kept out
+    of ``Broker`` so an implementation without them still satisfies the protocol; the helpers
+    below give each one a safe default (no conditions, no reference quote)."""
+
+    def supports_price_conditions(self) -> bool: ...
+
+    def reference_quote(self, contract: ContractRef) -> BrokerQuote: ...
+
+    def modify_condition(self, order_ref: str, *, trigger_price: Decimal) -> BrokerOrder: ...
+
+
+def supports_price_conditions(broker) -> bool:
+    """True only when the broker says it places, reports and amends price conditions."""
+    probe = getattr(broker, "supports_price_conditions", None)
+    try:
+        return bool(probe()) if callable(probe) else False
+    except BrokerError:
+        return False
+
+
+def reference_quote(broker, contract: ContractRef, now: datetime) -> BrokerQuote:
+    """The broker's quote of a reference series; UNAVAILABLE when it cannot supply one."""
+    get = getattr(broker, "reference_quote", None)
+    if not callable(get):
+        return BrokerQuote(contract=contract, received_at=now, quality=QuoteQuality.UNAVAILABLE)
+    try:
+        return get(contract)
+    except BrokerError:
+        return BrokerQuote(contract=contract, received_at=now, quality=QuoteQuality.UNAVAILABLE)
 
 
 @runtime_checkable

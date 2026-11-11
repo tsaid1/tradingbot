@@ -52,6 +52,7 @@ from tradingbot.execution.broker import (
     OrderSide,
     OrderStatus,
     OrderType,
+    PriceCondition,
     QuoteQuality,
     TimeInForce,
 )
@@ -217,6 +218,9 @@ class SimBroker:
         # Strict mode: a protective child keeps reporting PreSubmitted after its parent fills while
         # it works (IBKR holds and simulates many stops broker-side). Off by default.
         self.children_stay_presubmitted = False
+        # Broker-side price conditions on a reference series (REFERENCE_TRIGGER families). A test
+        # turns this off to model a broker that cannot place them.
+        self.conditions_supported = True
         with self._tx() as c:
             c.executescript(SCHEMA)
             cols = {r["name"] for r in c.execute("PRAGMA table_info(sim_orders)")}
@@ -230,6 +234,10 @@ class SimBroker:
                 ("pending_race", "TEXT"),
                 ("activated", "INTEGER NOT NULL DEFAULT 0"),
                 ("contract_json", "TEXT"),
+                # Multi-asset mapping: a broker-side price condition on a reference series.
+                ("condition_json", "TEXT"),
+                ("condition_released", "INTEGER NOT NULL DEFAULT 0"),
+                ("pending_trigger", "TEXT"),
             ):
                 if col not in cols:
                     c.execute(f"ALTER TABLE sim_orders ADD COLUMN {col} {kind}")
@@ -271,6 +279,11 @@ class SimBroker:
         return ContractRef(
             symbol=row["symbol"], asset_class=AssetClass(row["asset_class"]), con_id=row["con_id"]
         )
+
+    @staticmethod
+    def _condition(row: sqlite3.Row) -> PriceCondition | None:
+        raw = row["condition_json"] if "condition_json" in row.keys() else None  # noqa: SIM118
+        return PriceCondition.model_validate_json(raw) if raw else None
 
     def _quote_for(self, c: sqlite3.Connection, contract: ContractRef):
         """A quote published for this exact contract, else (stocks and ETFs only) by symbol."""
@@ -315,6 +328,7 @@ class SimBroker:
             stop_price=_d(row["stop_price"]),
             tif=TimeInForce(row["tif"]),
             reduce_only=bool(row["reduce_only"]),
+            condition=self._condition(row),
             status=OrderStatus(row["status"]),
             filled_quantity=row["filled_quantity"],
             avg_fill_price=_d(row["avg_fill_price"]),
@@ -429,11 +443,17 @@ class SimBroker:
                     "SELECT * FROM sim_contracts WHERE symbol=? AND asset_class=?",
                     (instrument.symbol, instrument.asset_class.value),
                 ).fetchall()
+            undated = (AssetClass.INDEX, AssetClass.COMMODITY, AssetClass.CFD)
             found = [
                 ContractRef.model_validate_json(r["contract_json"])
                 for r in rows
-                if month and (r["month"] or "").startswith(month)
+                if (month and (r["month"] or "").startswith(month))
+                or (instrument.asset_class in undated and not month and not r["month"])
             ]
+            if instrument.asset_class == AssetClass.OPTION:
+                right = {"CALL": "C", "PUT": "P"}.get(instrument.option_right or "")
+                strike = Decimal(instrument.strike) if instrument.strike else None
+                found = [f for f in found if f.right == right and f.strike == strike]
             if len(found) != 1:
                 raise BrokerError(
                     f"SimBroker: no single registered {instrument.asset_class.value} contract "
@@ -461,6 +481,53 @@ class SimBroker:
             quality=QuoteQuality(row["quality"]),
         )
 
+    # ------------------------------------------------------------------ conditional orders (additive)
+
+    def supports_price_conditions(self) -> bool:
+        return self.conditions_supported
+
+    def reference_quote(self, contract: ContractRef) -> BrokerQuote:
+        """The quote of a reference series (an index, a spot price or another contract), published
+        with ``set_quote(..., contract=...)``. Price conditions are evaluated on these."""
+        return self.quote(contract)
+
+    def modify_condition(self, order_ref: str, *, trigger_price: Decimal) -> BrokerOrder:
+        """Amend the trigger level of a working conditional order. Strict: the amendment is pending
+        (the order keeps its old trigger) until the next broker interaction after
+        ``pending_seconds``."""
+        behaviour = self._modify_script.popleft() if self._modify_script else "APPLY"
+        if behaviour == "LOST_ACK_NOT_APPLIED":
+            raise AckLost("simulated: modify lost before reaching the broker")
+        with self._tx() as c:
+            self._settle(c)
+            row = self._working_row(c, order_ref)
+            if behaviour == "REJECT":
+                raise BrokerError("simulated: modify rejected")
+            cond = self._condition(row)
+            if cond is None:
+                raise BrokerError(f"order {order_ref} carries no price condition")
+            if self.strict:
+                if row["status"] == OrderStatus.PENDING_CANCEL.value:
+                    raise BrokerError("simulated: cannot modify an order that is pending cancel")
+                c.execute(
+                    "UPDATE sim_orders SET pending_action='MODIFY', pending_trigger=?, "
+                    "pending_at=?, pending_race=NULL WHERE broker_order_id=?",
+                    (str(trigger_price), self._now().isoformat(), row["broker_order_id"]),
+                )
+            else:
+                new = cond.model_copy(update={"trigger_price": trigger_price})
+                c.execute(
+                    "UPDATE sim_orders SET condition_json=?, updated_at=? WHERE broker_order_id=?",
+                    (new.model_dump_json(), self._now().isoformat(), row["broker_order_id"]),
+                )
+                self._match(c)
+            out = c.execute(
+                "SELECT * FROM sim_orders WHERE broker_order_id=?", (row["broker_order_id"],)
+            ).fetchone()
+        if behaviour == "LOST_ACK_APPLIED":
+            raise AckLost("simulated: modify accepted, acknowledgement lost")
+        return self._order(out)
+
     def submit(self, order: OrderIntent, children: Sequence[OrderIntent] = ()) -> list[BrokerOrder]:
         self.submit_calls += 1
         if self.lookup_failures_after_submit:
@@ -474,6 +541,8 @@ class SimBroker:
             raise BrokerError("an entry cannot itself be a child")
         for item in (order, *children):
             self._check_rules(item, item.contract)
+            if item.condition is not None and not self.conditions_supported:
+                raise BrokerError("simulated: price conditions are not supported")
         if script.behaviour == Behaviour.LOST_ACK_NOT_PLACED:
             raise AckLost("simulated: request lost before reaching the broker")
         now = self._now().isoformat()
@@ -502,8 +571,8 @@ class SimBroker:
                     """INSERT INTO sim_orders (order_ref,parent_ref,symbol,asset_class,con_id,side,
                     quantity,
                     order_type,limit_price,stop_price,tif,reduce_only,status,reason,held,updated_at,
-                    placed_at,contract_json)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    placed_at,contract_json,condition_json)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         item.order_ref,
                         item.parent_ref,
@@ -523,6 +592,7 @@ class SimBroker:
                         now,
                         now,
                         item.contract.model_dump_json(),
+                        item.condition.model_dump_json() if item.condition else None,
                     ),
                 )
                 ids.append(cur.lastrowid)
@@ -815,10 +885,19 @@ class SimBroker:
                             "UPDATE sim_orders SET status='Filled' WHERE broker_order_id=?",
                             (oid,),
                         )
+                    cond = self._condition(cur)
+                    if row["pending_trigger"] is not None and cond is not None:
+                        new = cond.model_copy(
+                            update={"trigger_price": Decimal(row["pending_trigger"])}
+                        )
+                        c.execute(
+                            "UPDATE sim_orders SET condition_json=? WHERE broker_order_id=?",
+                            (new.model_dump_json(), oid),
+                        )
             c.execute(
                 """UPDATE sim_orders SET pending_action=NULL, pending_quantity=NULL,
-                pending_limit=NULL, pending_stop=NULL, pending_at=NULL, pending_race=NULL
-                WHERE broker_order_id=?""",
+                pending_limit=NULL, pending_stop=NULL, pending_at=NULL, pending_race=NULL,
+                pending_trigger=NULL WHERE broker_order_id=?""",
                 (oid,),
             )
         if changed:
@@ -838,6 +917,22 @@ class SimBroker:
             "ORDER BY broker_order_id"
         ).fetchall()
         for row in rows:
+            cond = self._condition(row)
+            if cond is not None and not row["condition_released"]:
+                # Held at the broker until the reference series' last price (the midpoint when
+                # it reports no last) crosses the trigger; then released in its own contract.
+                ref = self._quote_row(c, cond.contract.contract_key)
+                if ref is None or ref["quality"] == QuoteQuality.UNAVAILABLE.value:
+                    continue
+                last = _d(ref["last"])
+                if last is None and ref["bid"] is not None and ref["ask"] is not None:
+                    last = (Decimal(ref["bid"]) + Decimal(ref["ask"])) / 2
+                if not cond.met(last):
+                    continue
+                c.execute(
+                    "UPDATE sim_orders SET condition_released=1 WHERE broker_order_id=?",
+                    (row["broker_order_id"],),
+                )
             q = self._quote_for(c, self._contract(row))
             if q is None or q["quality"] == QuoteQuality.UNAVAILABLE.value or q["bid"] is None:
                 continue
