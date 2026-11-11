@@ -1,15 +1,17 @@
 """A deterministic simulated broker with durable state (SQLite), for the mock lifecycle and tests.
 
 It implements ``broker.Broker`` the way an IBKR paper account behaves in the cases that matter to
-the execution core: brackets whose children wait (PreSubmitted) until the parent fills and are then
-sized to the filled quantity, one-cancels-other children, stop and limit triggers on later quotes,
-reduce-only orders that can never open or reverse a position, and order refs echoed on every row.
+the execution core: brackets whose children wait (PreSubmitted) until the parent fills,
+one-cancels-other children, stop and limit triggers on later quotes, and order refs echoed on every
+row. ``strict=False`` keeps the older, kinder model (children sized to the parent's fills,
+reduce-only orders clamped so they never reverse a position, instant cancels and modifies, full
+execution history) for the SimBroker's own unit tests only.
 
 Failure behaviours are scripted by the test (``script_next_submit`` / ``script_next_modify`` /
 ``script_next_cancel``); the script lives in memory, everything the broker "knows" lives in SQLite
 and survives a restart. No network, no real broker, invented data only.
 
-``strict=True`` removes the kindnesses an Interactive Brokers account does not offer (safety review
+``strict=True`` (the default) removes the kindnesses an Interactive Brokers account does not offer (safety review
 "SimBroker kinder than IBKR"): no reduce-only clamp (an oversized exit really reverses the
 position), protective children keep the quantity they were submitted with (they neither grow with
 the parent's fills nor shrink when a sibling partly fills; a sibling's complete fill still cancels
@@ -172,7 +174,7 @@ class SimBroker:
         *,
         account: str = "SIM-PAPER-0001",
         clock=None,
-        strict: bool = False,
+        strict: bool = True,
         pending_seconds: float = 0.0,
     ):
         self.db_path = Path(db_path)

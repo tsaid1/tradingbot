@@ -82,7 +82,7 @@ class Harness:
     """A SimBroker, a coordinator and (optionally) a broker-backed replay, sharing one SimClock."""
 
     def __init__(
-        self, folder: Path, *, policy: MockPolicy | None = None, strict: bool = False, **config
+        self, folder: Path, *, policy: MockPolicy | None = None, strict: bool = True, **config
     ):
         self.folder = Path(folder)
         self.strict = strict

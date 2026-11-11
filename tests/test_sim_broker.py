@@ -25,7 +25,8 @@ from tradingbot.models import AssetClass, Instrument
 @pytest.fixture
 def sim(tmp_path):
     clock = SimClock(START)
-    b = SimBroker(tmp_path / "b.sqlite3", clock=clock.now)
+    # The lenient model, kept for the tests below that pin its own mechanics.
+    b = SimBroker(tmp_path / "b.sqlite3", clock=clock.now, strict=False)
     b.set_quote("ZZQ", "49.98", "50.02")
     return b
 
@@ -219,7 +220,7 @@ def test_quotes_unavailable_stale_and_frozen(sim):
 
 def test_state_survives_restart(sim, tmp_path):
     sim.submit(*bracket(sim))
-    again = SimBroker(tmp_path / "b.sqlite3", clock=sim.clock)
+    again = SimBroker(tmp_path / "b.sqlite3", clock=sim.clock, strict=False)
     assert {o.order_ref for o in again.open_orders()} == {"E1.STP", "E1.TGT"}
     assert net(again) == 4 and len(again.executions()) == 1
 
