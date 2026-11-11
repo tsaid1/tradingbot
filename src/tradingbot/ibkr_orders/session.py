@@ -49,7 +49,6 @@ from ibapi.protobuf.IdsRequest_pb2 import IdsRequest
 from ibapi.protobuf.PlaceOrderRequest_pb2 import PlaceOrderRequest
 
 from tradingbot.execution.broker import WORKING_STATUSES, OrderStatus
-from tradingbot.ibkr.environment import run_preflight
 from tradingbot.ibkr.errors import (
     CONNECTION_CODES,
     AccountIdentityError,
@@ -436,17 +435,26 @@ class PaperOrderSession(IbkrSession):
     operation re-reads the position and the working orders, runs ``order_guard`` immediately
     before each ``placeOrder`` and refuses on anything but ALLOW."""
 
-    def __init__(self, config: PaperOrderConfig, *, clock: Callable[[], datetime] | None = None,
-                 ack_timeout: float = 5.0, cancel_wait: float = 3.0,
-                 preflight: Callable = run_preflight, **timeouts: float) -> None:
+    def __init__(self, config: PaperOrderConfig, *, ack_timeout: float = 5.0,
+                 cancel_wait: float = 3.0, connect_timeout: float = 15.0,
+                 request_timeout: float = 10.0, quote_timeout: float = 20.0,
+                 stream_seconds: float = 8.0, stream_settle_seconds: float = 1.0,
+                 shutdown_timeout: float = 5.0) -> None:
+        """Only the config and timeouts: there is no parameter that replaces or skips the local
+        profile and listener checks (the read-only session's ``run_preflight``), the identity
+        gate, the order-mode config read, the guard, the counter or the clock (structural
+        test)."""
         if (not isinstance(config, PaperOrderConfig) or not config.issued
                 or EXPERIMENTS.get(config.experiment.name) is not config.experiment):
             raise SessionStateError("PaperOrderSession needs a PaperOrderConfig loaded from the "
                                     "private file, naming an experiment defined in code")
-        super().__init__(config.connection, preflight=preflight, **timeouts)
+        super().__init__(config.connection, connect_timeout=connect_timeout,
+                         request_timeout=request_timeout, quote_timeout=quote_timeout,
+                         stream_seconds=stream_seconds,
+                         stream_settle_seconds=stream_settle_seconds,
+                         shutdown_timeout=shutdown_timeout)  # preflight: always run_preflight
         self._order_cfg = config
         self._caps = config.experiment
-        self._clock = clock or (lambda: datetime.now(UTC))
         self._ack_timeout = ack_timeout
         self._cancel_wait = cancel_wait
         self._wrapper = _OrderWrapper(self)
@@ -469,6 +477,11 @@ class PaperOrderSession(IbkrSession):
         self._baseline_position: Decimal | None = None  # read once at connect
         self._baseline_exec_ids: frozenset[str] = frozenset()  # executions known at that read
         self.order_mode_status = "NOT_CHECKED"
+
+    def _now(self) -> datetime:
+        """The wall clock, aware (UTC). Not a parameter: tests replace it in a test-only
+        subclass."""
+        return datetime.now(UTC)
 
     # ------------------------------------------------------------------ properties
     def __repr__(self) -> str:
@@ -845,7 +858,7 @@ class PaperOrderSession(IbkrSession):
         done = self.completed_orders()
         execs = self.executions()
         out = []
-        now = datetime.now(UTC)
+        now = self._now()
         for e in pending:
             oid = e["order_id"]
             ref = _split_ref(e["order_ref"], self._caps.ref_prefix)[0]
@@ -911,7 +924,7 @@ class PaperOrderSession(IbkrSession):
             caps=self._caps, submissions_used=self._counter.used,
             broker_submissions=self._broker_count, contract=facts,
             expected_account=self._cfg.account, position=position[0], working=tuple(working),
-            now=self._clock(), implied_position=position[1], still_to_send=still, parent=parent,
+            now=self._now(), implied_position=position[1], still_to_send=still, parent=parent,
             original=original))
 
     def _proto(self, p: ProposedOrder) -> PlaceOrderRequest:

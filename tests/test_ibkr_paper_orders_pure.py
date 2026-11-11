@@ -619,3 +619,69 @@ def test_init_script_is_offline_and_runs_once(tmp_path, monkeypatch, capsys):
     c.open()
     assert c.used == 0
     c.close()
+
+
+# --- no public seam can disable or replace a safety check ---------------------------------------
+_SEAM_TOKENS = {"preflight", "clock", "now", "today", "guard", "counter", "journal",
+                "identity", "gate", "skip", "bypass", "disable", "check", "checks", "verify",
+                "hook", "hooks", "stub", "fake", "override", "unsafe", "force", "loader",
+                "reader", "validator", "evaluate", "permit", "policy", "transport", "factory",
+                "data"}
+# The guard's pure inputs: plain values the SESSION builds itself (from its own counter, clock,
+# reads and pinned contract) immediately before each placeOrder; they are not session seams.
+_PURE_GUARD_INPUTS = {"GuardContext", "ProposedOrder", "WorkingOrder", "ContractFacts",
+                      "order_guard", "Refusal", "Allow", "parse_hours"}
+
+
+def _public_callables():
+    import importlib
+    import inspect
+    import pkgutil
+
+    import tradingbot.ibkr_orders as pkg
+    for info in pkgutil.iter_modules(pkg.__path__):
+        try:
+            mod = importlib.import_module(f"tradingbot.ibkr_orders.{info.name}")
+        except ModuleNotFoundError as exc:  # the SDK module, when the SDK is blocked
+            if "ibapi" in str(exc):
+                continue
+            raise
+        for name, obj in vars(mod).items():
+            if name.startswith("_") or getattr(obj, "__module__", None) != mod.__name__:
+                continue
+            if name in _PURE_GUARD_INPUTS or not callable(obj):
+                continue
+            if inspect.isclass(obj) and issubclass(obj, BaseException):
+                continue
+            yield f"{info.name}.{name}", obj
+            if inspect.isclass(obj):
+                for m, f in vars(obj).items():
+                    if (not m.startswith("_") or m == "__init__") and inspect.isfunction(f):
+                        yield f"{info.name}.{name}.{m}", f
+
+
+def test_no_public_callable_accepts_a_safety_seam():
+    import inspect
+    found = []
+    for where, obj in _public_callables():
+        try:
+            params = inspect.signature(obj).parameters.values()
+        except (TypeError, ValueError):
+            continue
+        for p in params:
+            if p.kind is p.VAR_KEYWORD and (where.endswith("__init__") or "experiment" in where):
+                found.append(f"{where}(**{p.name})")  # could forward anything
+            tokens = set(p.name.lower().split("_"))
+            if tokens & _SEAM_TOKENS:
+                found.append(f"{where}({p.name})")
+    assert found == []
+
+
+def test_the_order_session_constructor_takes_only_the_config_and_timeouts():
+    pytest.importorskip("ibapi")
+    import inspect
+
+    from tradingbot.ibkr_orders.session import PaperOrderSession
+    params = inspect.signature(PaperOrderSession.__init__).parameters
+    assert list(params)[:2] == ["self", "config"]
+    assert all(n.endswith(("_timeout", "_wait", "_seconds")) for n in list(params)[2:]), params

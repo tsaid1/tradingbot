@@ -12,7 +12,7 @@ Whether anything was sent is decided from the durable submission counter, not fr
 """
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from datetime import datetime
 from decimal import Decimal
 from typing import Any
@@ -67,10 +67,9 @@ def _int_qty(value: Decimal, what: str) -> int:
 
 
 class IbkrPaperBroker:
-    def __init__(self, session: Any, *, clock: Callable[[], datetime] | None = None) -> None:
+    def __init__(self, session: Any) -> None:
         self._s = session
         self._asset_class: dict[int, AssetClass] = {}
-        self._clock = clock
 
     # ------------------------------------------------------------------ helpers
     def _contract_for(self, con_id: int, symbol: str, sec_type: str, currency: str,

@@ -23,6 +23,7 @@ from _ibkr_fake_tws_orders import (
     FakeOrderTws,
     core_ref,
 )
+from _ibkr_paper_testing import OfflineTestSession
 from execution_harness import APPROVE, action, source
 from ibapi.client import EClient
 from ibapi.common import PROTOBUF_MSG_ID
@@ -74,8 +75,6 @@ from tradingbot.models import Action, AssetClass, Instrument, MockPolicy
 D = Decimal
 
 
-def stub_preflight(cfg):
-    return {"stub": True}
 
 
 @pytest.fixture(params=[219, 226], ids=lambda v: f"sv{v}")
@@ -103,11 +102,8 @@ def make(tws, tmp_path, *, connect=True, clock=None, init=True, **kw) -> PaperOr
     cfg = load_order_config(write_cfg(tmp_path))
     if init:
         init_for(cfg)
-    opts = {"preflight": stub_preflight, "connect_timeout": 2.0, "request_timeout": 2.0,
-                "quote_timeout": 2.0, "stream_seconds": 1.0, "stream_settle_seconds": 0.05,
-                "shutdown_timeout": 3.0, "ack_timeout": 0.4, "cancel_wait": 1.0, "clock": clock}
-    opts.update(kw)
-    s = PaperOrderSession(cfg, **opts)
+    s = OfflineTestSession(cfg, **kw)
+    s.test_clock = clock
     if connect:
         s.connect()
     return s
@@ -613,9 +609,7 @@ def test_partial_fill_maps_to_partially_filled(tws, tmp_path, monkeypatch):
     monkeypatch.setattr(order_session_module, "EXPERIMENTS", reg)
     cfg = load_order_config(write_cfg(tmp_path, orders="test-two-shares"))
     init_for(cfg)
-    s = PaperOrderSession(cfg, preflight=stub_preflight, connect_timeout=2.0,
-                          request_timeout=2.0, stream_seconds=1.0, stream_settle_seconds=0.05,
-                          ack_timeout=0.4)
+    s = OfflineTestSession(cfg)
     s.connect()
     b = IbkrPaperBroker(s)
     try:
@@ -976,3 +970,17 @@ def test_a_confirmed_cancel_frees_the_second_sell_after_restart(tws, tmp_path):
         assert placed(tws) == 4
     finally:
         again.disconnect()
+
+
+def test_the_production_constructor_always_runs_the_local_checks(tws, tmp_path):
+    """No argument can skip run_preflight: on this machine the configured jts.ini does not exist,
+    so connect() refuses before any socket (the fake transport sees no frame)."""
+    cfg = load_order_config(write_cfg(tmp_path))
+    init_for(cfg)
+    s = PaperOrderSession(cfg, connect_timeout=2.0)
+    with pytest.raises(E.IbkrError):
+        s.connect()
+    assert tws.wire == [] and s.preflight_result is None
+    for hook in ("preflight", "clock"):
+        with pytest.raises(TypeError):
+            PaperOrderSession(cfg, **{hook: lambda *a: None})

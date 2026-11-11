@@ -38,7 +38,7 @@ class StateDirInvalid(ConfigError):
     pass
 
 
-_ISSUED: list = []  # every config built by validate_order_config (accident guard, not a security
+_ISSUED: list = []  # every config built by _validate_order_config (accident guard, not a security
 # boundary: in-process code can do anything)
 
 
@@ -57,7 +57,8 @@ class PaperOrderConfig:
         return any(c is self for c in _ISSUED)
 
 
-def validate_order_config(data: dict) -> PaperOrderConfig:
+def _validate_order_config(data: dict) -> PaperOrderConfig:
+    """Private: only ``load_order_config`` (which applies the file-safety rules) may issue."""
     if not isinstance(data, dict):
         raise ConfigInvalid("config must be a TOML table")
     if "orders" not in data:
@@ -92,5 +93,5 @@ def validate_order_config(data: dict) -> PaperOrderConfig:
 
 
 def load_order_config(path: str | os.PathLike | None = None) -> PaperOrderConfig:
-    return validate_order_config(read_private_toml(
+    return _validate_order_config(read_private_toml(
         path if path is not None else DEFAULT_ORDER_CONFIG_PATH))
