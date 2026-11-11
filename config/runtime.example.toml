@@ -1,0 +1,47 @@
+# Example runtime config (mock mode). Copy to ~/.config/tradingbot/runtime.toml and adjust.
+# Relative paths resolve against the directory of this file. Unknown keys refuse to start.
+
+mode = "mock"   # the only accepted value: the simulated broker
+
+[paths]
+state_dir = "~/.local/state/tradingbot/mock-runtime"
+halt_file = "~/.local/state/tradingbot/HALT"
+mapping_file = "instrument_mapping.toml"
+
+[source]
+kind = "replay"
+file = "../fixtures/runtime/mock_service_posts.jsonl"   # invented posts
+compression = 60.0        # one recorded minute per real second; omit for historical replay
+lag_seconds = 5.0         # historical replay only: decide at available_at + lag
+
+# Live polling of the publisher's X timeline (needs the subscriber's OAuth token, see RUNTIME.md):
+# [source]
+# kind = "x_timeline"
+# author_id = "<numeric X user id>"
+# token_file = "~/.config/tradingbot/g0/tokens.json"
+# client_file = "~/.config/tradingbot/g0/client.json"
+
+[service]
+cadence_seconds = 5.0
+max_backoff_seconds = 300.0
+failure_alert_after = 3
+stuck_after_seconds = 60
+
+[policy]                  # illustrative mock limits (tradingbot.models.MockPolicy)
+quantity = 2
+quantity_per_add = 2
+max_notional_usd = "2000"
+max_signal_age_seconds = 90
+
+[interpreter]
+# lexicon_path = "/path/outside/the/repo/lexicon.json"   # optional private extension
+
+[notify]
+macos = false
+
+[execution]
+max_submit_attempts = 2
+
+[mock]
+account = "SIM-PAPER-0001"
+quotes = { TLT = { bid = "88.40", ask = "88.42" } }
