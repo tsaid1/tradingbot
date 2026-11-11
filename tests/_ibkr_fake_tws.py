@@ -148,6 +148,8 @@ Handler = Callable[["FakeTws", FakeConnection, object], None]
 
 
 class FakeTws:
+    request_types = _REQUESTS  # a subclass may decode more request types
+
     def __init__(self) -> None:
         self.server_version = MAX_CLIENT_VER
         self.connection_time = "20261111 15:30:00 Greenwich Mean Time"
@@ -206,8 +208,8 @@ class FakeTws:
         body = msg[4:4 + size]
         msg_id = int.from_bytes(body[:4], "big")
         assert msg_id > PROTOBUF_MSG_ID, f"unexpected text-encoded request {msg_id}"
-        name, cls = _REQUESTS.get(msg_id - PROTOBUF_MSG_ID, (f"OUT_{msg_id - PROTOBUF_MSG_ID}",
-                                                            None))
+        name, cls = self.request_types.get(msg_id - PROTOBUF_MSG_ID,
+                                           (f"OUT_{msg_id - PROTOBUF_MSG_ID}", None))
         proto = cls.FromString(body[4:]) if cls is not None else body[4:]
         self.requests.append((name, proto))
         if name in self.fail_send:
