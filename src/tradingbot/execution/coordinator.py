@@ -8,8 +8,10 @@ acknowledgement or a restart. See docs/EXECUTION_CORE.md for the intent state ma
 
 The never-resend rule: an intent whose submission outcome is unknown (RECORDED after a restart, or
 UNRESOLVED after a lost acknowledgement) is looked up at the broker by ``order_ref`` in
-``open_orders`` and ``executions``. Whatever is found is adopted. Only a positive "no trace" leads
-to a resubmission, and that reasoning is journaled.
+``open_orders``, ``executions`` and ``completed_orders``. Whatever is found is adopted, including a
+terminal REJECTED or CANCELLED state. Only a positive "no trace" in all three leads to a
+resubmission, and an entry or add is resubmitted only while its source post is still fresh;
+otherwise it ends REFUSED with a STALE_AFTER_UNKNOWN_OUTCOME exception. The reasoning is journaled.
 """
 
 from __future__ import annotations
@@ -17,7 +19,7 @@ from __future__ import annotations
 import hashlib
 import os
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, InvalidOperation
 from pathlib import Path
 
@@ -57,11 +59,16 @@ from tradingbot.models import (
     PositionSide,
     StrictModel,
 )
-from tradingbot.validator import fill_quantity
+from tradingbot.validator import fill_quantity, source_is_fresh
 
 CENT = Decimal("0.01")
 UNPROTECTED_POSITION = "UNPROTECTED_POSITION"
 MODIFY_NOT_CONFIRMED = "MODIFY_NOT_CONFIRMED"
+# An entry or add whose first submission outcome was unknown, that the broker shows no trace of,
+# and whose source post is no longer fresh enough to act on: it is never resent.
+STALE_AFTER_UNKNOWN_OUTCOME = "STALE_AFTER_UNKNOWN_OUTCOME"
+# How far before an intent's creation the completed-orders lookup reaches (clock skew allowance).
+COMPLETED_LOOKBACK = timedelta(minutes=5)
 
 
 def default_halt_file() -> Path:
@@ -593,6 +600,7 @@ class ExecutionCoordinator:
         try:
             open_orders = self.broker.open_orders()
             fills = self.broker.executions()
+            completed = self.broker.completed_orders(since=intent.created_at - COMPLETED_LOOKBACK)
         except BrokerError as exc:
             self._mark_unresolved(intent, "LOOKUP_FAILED", str(exc))
             return
@@ -600,7 +608,10 @@ class ExecutionCoordinator:
         refs = {r.order_ref for r in rows}
         found_open = [o for o in open_orders if o.order_ref in refs]
         found_fills = [f for f in fills if f.order_ref in refs]
-        if found_open or found_fills:
+        # A ref still working wins over an older terminal row under the same ref (a resend).
+        working_refs = {o.order_ref for o in found_open}
+        found_done = [o for o in completed if o.order_ref in refs and o.order_ref not in working_refs]
+        if found_open or found_fills or found_done:
             self.store.log(
                 self.clock(),
                 "ADOPTED_FROM_BROKER",
@@ -608,9 +619,10 @@ class ExecutionCoordinator:
                 idea_id=intent.idea_id,
                 open_orders=[o.order_ref for o in found_open],
                 executions=[f.exec_id for f in found_fills],
+                completed_orders={o.order_ref: o.status.value for o in found_done},
                 rule="order found by order_ref; adopted, not resent",
             )
-            self._adopt(intent, found_open, found_fills)
+            self._adopt(intent, [*found_done, *found_open], found_fills)
             return
         if intent.attempts >= self.config.max_submit_attempts:
             self._mark_unresolved(
@@ -619,17 +631,62 @@ class ExecutionCoordinator:
                 f"{intent.attempts} submissions already made",
             )
             return
+        now = self.clock()
+        if intent.action in (Action.OPEN, Action.ADD) and not (
+            intent.source_published_at is not None
+            and source_is_fresh(intent.source_published_at, now, self.policy)
+        ):
+            self._expire(intent, sorted(refs))
+            return
         self.store.log(
-            self.clock(),
+            now,
             "NO_TRACE_AT_BROKER",
             order_ref=intent.order_ref,
             idea_id=intent.idea_id,
             checked=sorted(refs),
             attempts=intent.attempts,
-            rule="open_orders and executions show no order or fill for this ref; resubmitting",
+            rule=(
+                "open_orders, executions and completed_orders show no order or fill for this ref; "
+                "resubmitting"
+            ),
         )
         entry, children = self._rebuild(intent, rows)
         self._submit(intent, entry, children)
+
+    def _expire(self, intent: Intent, checked: list[str]) -> None:
+        """No trace anywhere at the broker, and the source post is no longer fresh: the entry is
+        never sent. The intent ends REFUSED and an exception record makes that visible."""
+        now = self.clock()
+        self.store.set_state(
+            intent.order_ref, IntentState.REFUSED, now, reasons=[STALE_AFTER_UNKNOWN_OUTCOME]
+        )
+        for row in self.store.orders(intent.order_ref):
+            self.store.update_order(row.order_ref, now, status="NotSubmitted")
+        if intent.action == Action.OPEN:
+            pos = self.store.position(intent.idea_id)
+            if pos is not None and pos.quantity == 0:
+                self.store.update_position(intent.idea_id, now, status="NOT_FILLED")
+        published = intent.source_published_at.isoformat() if intent.source_published_at else None
+        detail = (
+            f"no trace in open orders, executions or completed orders for {checked}; source "
+            f"published {published or 'at an unknown time'} is outside the freshness window"
+        )
+        self.store.raise_exception(
+            now,
+            STALE_AFTER_UNKNOWN_OUTCOME,
+            detail,
+            idea_id=intent.idea_id,
+            order_ref=intent.order_ref,
+        )
+        self.store.log(
+            now,
+            STALE_AFTER_UNKNOWN_OUTCOME,
+            order_ref=intent.order_ref,
+            idea_id=intent.idea_id,
+            checked=checked,
+            source_published_at=published,
+            rule="outcome unknown, no trace at the broker, source stale: never resent",
+        )
 
     def _adopt(self, intent: Intent, orders: list[BrokerOrder], fills) -> None:
         """Take the broker's view of the intent's orders as the truth, then apply fills."""
@@ -655,6 +712,10 @@ class ExecutionCoordinator:
         self.store.set_state(
             intent.order_ref, state, now, broker_status=broker_status, reasons=reasons
         )
+        if state == IntentState.CANCELLED and intent.action == Action.OPEN:
+            pos = self.store.position(intent.idea_id)
+            if pos is not None and pos.quantity == 0 and not fills:
+                self.store.update_position(intent.idea_id, now, status="NOT_FILLED")
         if state == IntentState.REJECTED:
             for row in rows:
                 self.store.update_order(row.order_ref, now, status=OrderStatus.REJECTED.value)
@@ -1028,6 +1089,7 @@ class ExecutionCoordinator:
             gate_reasons=list(gate.reasons),
             account=account,
             state=IntentState.RECORDED,
+            source_published_at=source.published_at,
             created_at=now,
             updated_at=now,
             **fields,

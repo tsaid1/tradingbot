@@ -224,4 +224,11 @@ class Broker(Protocol):
 
     def executions(self, since: datetime | None = None) -> list[Fill]: ...
 
+    def completed_orders(self, since: datetime | None = None) -> list[BrokerOrder]:
+        """Every order that reached a terminal state (Filled, Cancelled, Rejected, Inactive) and was
+        last updated at or after ``since``, with its ``order_ref`` and final status (IBKR
+        reqCompletedOrders). This is the only place a rejected or cancelled order is visible once it
+        has left ``open_orders()``."""
+        ...
+
     def positions(self) -> list[BrokerPosition]: ...

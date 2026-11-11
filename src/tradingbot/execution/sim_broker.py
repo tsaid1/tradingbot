@@ -24,6 +24,7 @@ from enum import Enum
 from pathlib import Path
 
 from tradingbot.execution.broker import (
+    TERMINAL_STATUSES,
     WORKING_STATUSES,
     AckLost,
     BrokerError,
@@ -118,6 +119,10 @@ class Behaviour(str, Enum):
         "CRASH_AFTER_PLACE"  # placed, then the calling process dies (SimulatedCrash)
     )
     DROP_STOP_CHILD = "DROP_STOP_CHILD"  # placed, but the protective stop child goes Inactive
+    # The request arrived and the broker rejected (or cancelled) the bracket, then the ack is lost:
+    # the order leaves no trace in open orders or executions, only in completed orders.
+    LOST_ACK_REJECTED = "LOST_ACK_REJECTED"
+    LOST_ACK_CANCELLED = "LOST_ACK_CANCELLED"
 
 
 @dataclass
@@ -313,8 +318,10 @@ class SimBroker:
             for idx, item in enumerate([order, *children]):
                 status = OrderStatus.PRE_SUBMITTED if item.parent_ref else OrderStatus.SUBMITTED
                 reason = ""
-                if script.behaviour == Behaviour.REJECT:
+                if script.behaviour in (Behaviour.REJECT, Behaviour.LOST_ACK_REJECTED):
                     status, reason = OrderStatus.REJECTED, script.reason
+                if script.behaviour == Behaviour.LOST_ACK_CANCELLED:
+                    status, reason = OrderStatus.CANCELLED, "SIMULATED_BROKER_CANCEL"
                 if (
                     script.behaviour == Behaviour.DROP_STOP_CHILD
                     and idx > 0
@@ -351,13 +358,21 @@ class SimBroker:
                 q = self._quote_row(c, order.contract.symbol)
                 price = Decimal(q["ask"] if order.side == OrderSide.BUY else q["bid"])
                 self._execute(c, ids[0], script.quantity or 1, price)
-            if script.behaviour != Behaviour.REJECT:
+            if script.behaviour not in (
+                Behaviour.REJECT,
+                Behaviour.LOST_ACK_REJECTED,
+                Behaviour.LOST_ACK_CANCELLED,
+            ):
                 self._match(c)
             rows = [
                 c.execute("SELECT * FROM sim_orders WHERE broker_order_id=?", (i,)).fetchone()
                 for i in ids
             ]
-        if script.behaviour == Behaviour.LOST_ACK_PLACED:
+        if script.behaviour in (
+            Behaviour.LOST_ACK_PLACED,
+            Behaviour.LOST_ACK_REJECTED,
+            Behaviour.LOST_ACK_CANCELLED,
+        ):
             raise AckLost("simulated: order placed, acknowledgement lost")
         if script.behaviour == Behaviour.CRASH_AFTER_PLACE:
             raise SimulatedCrash("simulated: process died after the broker accepted the order")
@@ -447,6 +462,18 @@ class SimBroker:
             for r in rows
         ]
         return [f for f in fills if since is None or f.executed_at >= since]
+
+    def completed_orders(self, since: datetime | None = None) -> list[BrokerOrder]:
+        self._maybe_fail_lookup()
+        placeholders = ",".join("?" * len(TERMINAL_STATUSES))
+        with self._tx() as c:
+            rows = c.execute(
+                f"SELECT * FROM sim_orders WHERE status IN ({placeholders}) "
+                "ORDER BY broker_order_id",
+                [s.value for s in TERMINAL_STATUSES],
+            ).fetchall()
+        orders = [self._order(r) for r in rows]
+        return [o for o in orders if since is None or o.updated_at >= since]
 
     def positions(self) -> list[BrokerPosition]:
         with self._tx() as c:

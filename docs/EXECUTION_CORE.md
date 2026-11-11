@@ -64,11 +64,14 @@ SourcePost -> PaperEventReplay.process  (gate_source, gate_action, atomic groups
      error       v
  UNRESOLVED <--+ WORKING --fills--> FILLED
      |         |    \--broker--> CANCELLED (may carry a partial fill) | REJECTED
-     | lookup by order_ref (open_orders + executions)
-     +-- found ------------------> adopt broker state (WORKING / FILLED / ...)
-     +-- positive no trace ------> journal NO_TRACE_AT_BROKER, resubmit same ref (budget 2)
+     | lookup by order_ref (open_orders + executions + completed_orders)
+     +-- found ------------------> adopt broker state (WORKING / FILLED / REJECTED / CANCELLED)
+     +-- positive no trace, -----> journal NO_TRACE_AT_BROKER, resubmit same ref (budget 2)
+     |   exit, or entry/add whose source is still fresh
+     +-- positive no trace, -----> REFUSED + open STALE_AFTER_UNKNOWN_OUTCOME exception
+     |   entry/add whose source is stale
      +-- lookup failed / budget -> stays UNRESOLVED (reconcile: INTENT_STUCK_UNRESOLVED)
- REFUSED: precondition failed before anything was recorded for the broker
+ REFUSED: precondition failed before anything was recorded for the broker, or a stale entry/add
  APPLIED: a MODIFY whose new prices were seen at the broker
 ```
 
@@ -78,11 +81,17 @@ process. `recover()` treats it exactly like `UNRESOLVED`.
 ## The never-resend rule
 
 An order whose outcome is unknown is never sent again on assumption. The coordinator first looks the
-order up at the broker by `order_ref` in `open_orders()` and `executions()`:
+order up at the broker by `order_ref` in `open_orders()`, `executions()` and `completed_orders()`
+(IBKR `reqCompletedOrders`):
 
-* If it finds the order, it adopts it (`ADOPTED_FROM_BROKER`).
-* Only when the broker positively shows no trace of the ref does it resubmit with the same ref. The
-  journal records which refs were checked (`NO_TRACE_AT_BROKER`).
+* If it finds the order, it adopts it (`ADOPTED_FROM_BROKER`). An order the broker rejected or
+  cancelled is visible only in completed orders; it is adopted as `REJECTED` / `CANCELLED` and not
+  resent.
+* Only when all three show no trace of the ref does it resubmit with the same ref. The journal
+  records which refs were checked (`NO_TRACE_AT_BROKER`). An entry or add is resubmitted only if
+  its source post still passes `validator.source_is_fresh` at that moment (the publication time is
+  stored on the intent). Otherwise it ends `REFUSED` with reason and open exception
+  `STALE_AFTER_UNKNOWN_OUTCOME`. A reduce-only exit is resubmitted regardless of age.
 * A lookup that fails leaves the intent `UNRESOLVED`.
 
 Duplicate delivery of a post revision is stopped twice:
@@ -135,15 +144,13 @@ Implement `broker.Broker`:
 * `cancel` maps to `cancelOrder`.
 * `open_orders` maps to `reqAllOpenOrders`.
 * `executions` maps to `reqExecutions`.
+* `completed_orders` maps to `reqCompletedOrders`.
 * `positions` maps to `reqPositions`.
 
 Raise `AckLost` whenever the outcome of a request is unknown, for example on a timeout or a
 disconnect after sending. Return `UNKNOWN` rather than guessing a status. The coordinator, ledger,
-recovery and reconciliation then need no change. Two known gaps for that adapter:
-
-* A submit whose acknowledgement is lost and which IBKR then rejects or cancels leaves no trace in
-  open orders or executions. IBKR's completed orders (`reqCompletedOrders`) should be checked as
-  well before a resend.
-* `open_orders()` can lag a fresh submission, so the adapter should settle before answering.
+recovery and reconciliation then need no change. `completed_orders` maps to `reqCompletedOrders`
+(apiOnly). One known gap for that adapter: `open_orders()` can lag a fresh submission, so the adapter
+should settle before answering.
 
 Run the demonstration with `PYTHONPATH=src python scripts/run_mock_lifecycle.py`.

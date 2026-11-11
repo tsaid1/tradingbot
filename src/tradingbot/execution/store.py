@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS exec_intents (
     broker_status TEXT,
     attempts INTEGER NOT NULL DEFAULT 0,
     reasons TEXT NOT NULL DEFAULT '[]',
+    source_published_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     UNIQUE (source_id, revision, action_id)
@@ -150,6 +151,8 @@ class Intent(StrictModel):
     broker_status: str | None = None
     attempts: int = 0
     reasons: list[str] = Field(default_factory=list)
+    # When the source post was published: a resend after an unknown outcome re-checks freshness.
+    source_published_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -221,6 +224,9 @@ class ExecutionStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.tx() as c:
             c.executescript(SCHEMA)
+            cols = {r["name"] for r in c.execute("PRAGMA table_info(exec_intents)")}
+            if "source_published_at" not in cols:  # a store created before this column existed
+                c.execute("ALTER TABLE exec_intents ADD COLUMN source_published_at TEXT")
 
     @contextmanager
     def tx(self) -> Iterator[sqlite3.Connection]:
