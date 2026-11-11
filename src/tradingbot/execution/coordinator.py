@@ -143,6 +143,9 @@ class ExecutionConfig(StrictModel):
     exit_no_trace_lookups: int = Field(default=3, ge=3, le=20)
     # An entry or add older than this (since its intent was recorded) is never resent.
     max_intent_age_seconds: int = Field(default=120, gt=0)
+    # An exit older than this is re-priced from a fresh quote before it is sent; with no usable
+    # quote it ends REFUSED with an EXIT_WITHOUT_QUOTE exception. Never sent at a stale price.
+    max_exit_intent_age_seconds: int = Field(default=120, gt=0)
     # How far back the broker's executions / completed-orders queries reach (IBKR: the current
     # day). An unknown outcome older than this can never be proven absent: it is never resent.
     lookup_horizon_seconds: int = Field(default=6 * 3600, gt=0)
@@ -1096,6 +1099,10 @@ class ExecutionCoordinator:
             if problems:
                 self._expire(intent, sorted(refs), problems)
                 return
+        elif (now - intent.created_at).total_seconds() > self.config.max_exit_intent_age_seconds:
+            if not self._reprice_exit(intent, now):
+                return
+            rows = self.store.orders(intent.order_ref)
         self.store.log(
             now,
             "NO_TRACE_AT_BROKER",
@@ -1190,6 +1197,48 @@ class ExecutionCoordinator:
         if intent.limit_price is not None and _dec(intent.limit_price) != limit:
             return ["RESEND_LIMIT_WOULD_DIFFER"]
         return []
+
+    def _reprice_exit(self, intent: Intent, now: datetime) -> bool:
+        """An exit older than ``max_exit_intent_age_seconds`` is re-priced from a fresh quote
+        exactly as a new exit would be. Without a usable quote it ends REFUSED with an open
+        EXIT_WITHOUT_QUOTE exception; it is never sent at its old limit. True when re-priced."""
+        pos = self.store.position(intent.idea_id)
+        contract, problem = (None, "IDEA_UNKNOWN") if pos is None or intent.side is None else (
+            self._resolve_contract(Instrument(asset_class=pos.asset_class, symbol=intent.symbol))
+        )
+        limit = None
+        if problem is None:
+            limit, problem = self._exit_limit(contract, OrderSide(intent.side), now)
+        if problem:
+            self.store.set_state(
+                intent.order_ref, IntentState.REFUSED, now, reasons=[EXIT_WITHOUT_QUOTE, problem]
+            )
+            for row in self.store.orders(intent.order_ref):
+                self.store.update_order(row.order_ref, now, status="NotSubmitted")
+            detail = (
+                f"{intent.action.value} {intent.quantity} of {intent.idea_id}, recorded "
+                f"{intent.created_at.isoformat()}, not sent: {problem}; never sent at its old "
+                "limit. The protective stop at the broker, if any, remains the protection."
+            )
+            self.store.raise_exception(
+                now, EXIT_WITHOUT_QUOTE, detail, idea_id=intent.idea_id, order_ref=intent.order_ref
+            )
+            self.store.log(
+                now, EXIT_WITHOUT_QUOTE, order_ref=intent.order_ref, idea_id=intent.idea_id,
+                problem=problem, rule="stale exit and no usable quote: not sent",
+            )
+            self.sync()  # terminal now: protection is sized back to the position
+            return False
+        old = intent.limit_price
+        self.store.set_intent_limit(intent.order_ref, str(limit), now)
+        row = self.store.order(intent.order_ref)
+        self.store.update_order(intent.order_ref, now, status=row.status, limit_price=str(limit))
+        self.store.log(
+            now, "EXIT_REPRICED", order_ref=intent.order_ref, idea_id=intent.idea_id,
+            old_limit=old, new_limit=str(limit),
+            rule="exit older than the maximum intent age: priced from a fresh quote",
+        )
+        return True
 
     def _submit_failed(self, intent: Intent, error: str) -> None:
         """A definite submit error is a known outcome: recorded, never resent."""

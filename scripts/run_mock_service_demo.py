@@ -66,6 +66,7 @@ max_submit_attempts = 2
 settle_seconds = 10
 exit_no_trace_lookups = 3
 max_intent_age_seconds = 120
+max_exit_intent_age_seconds = 120
 lookup_horizon_seconds = 21600
 confirm_attempts = 3
 confirm_wait_seconds = 0

@@ -53,6 +53,7 @@ settle_seconds = 10                   # after an unknown outcome: "no trace" nev
 exit_no_trace_lookups = 3             # an exit is resent only after this many no-trace lookups
                                       # over the settle period; an entry or add is never resent
 max_intent_age_seconds = 120          # an entry or add older than this is never sent
+max_exit_intent_age_seconds = 120     # an older exit is re-priced from a fresh quote, or refused
 lookup_horizon_seconds = 21600        # how far back the broker's executions reach (IBKR: the day)
 confirm_attempts = 3                  # cancel / resize confirmation reads before an exit
 confirm_wait_seconds = 0

@@ -93,6 +93,7 @@ class ExecutionSettings(StrictModel):
     # spread over at least settle_seconds (an entry or add is never resent).
     exit_no_trace_lookups: int = Field(ge=3, le=20)
     max_intent_age_seconds: int = Field(gt=0)
+    max_exit_intent_age_seconds: int = Field(gt=0)
     lookup_horizon_seconds: int = Field(gt=0)
     confirm_attempts: int = Field(ge=1, le=20)
     confirm_wait_seconds: float = Field(ge=0, le=5)
@@ -172,6 +173,7 @@ REQUIRED_KEYS: dict[str, tuple[tuple[str, ...], ...]] = {
         ("settle_seconds",),
         ("exit_no_trace_lookups",),
         ("max_intent_age_seconds",),
+        ("max_exit_intent_age_seconds",),
         ("lookup_horizon_seconds",),
         ("confirm_attempts",),
         ("confirm_wait_seconds",),

@@ -144,6 +144,7 @@ class RuntimeService:
                 settle_seconds=config.execution.settle_seconds,
                 exit_no_trace_lookups=config.execution.exit_no_trace_lookups,
                 max_intent_age_seconds=config.execution.max_intent_age_seconds,
+                max_exit_intent_age_seconds=config.execution.max_exit_intent_age_seconds,
                 lookup_horizon_seconds=config.execution.lookup_horizon_seconds,
                 confirm_attempts=config.execution.confirm_attempts,
                 confirm_wait_seconds=config.execution.confirm_wait_seconds,

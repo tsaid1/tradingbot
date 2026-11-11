@@ -303,3 +303,37 @@ def test_f5_an_exit_is_resent_only_after_three_no_trace_lookups_over_the_settle(
     h.coord.recover()  # lookup 3, t=12: three no-trace lookups spread over >= 10 s
     assert h.coord.intent(close.order_ref).state == IntentState.FILLED
     assert len(h.broker.orders_with_ref(close.order_ref)) == 1
+
+
+# ------------------------------------------------------------------- F8: stale recorded exit
+
+
+def _close_recorded_never_sent(h: Harness) -> str:
+    h.execute("p1", open_action())
+    ref = h.record_never_sent("p2", action("close", Action.CLOSE, idea="p1:open"))
+    h.clock.advance(3 * 24 * 3600)  # found days later
+    return ref
+
+
+def test_f8_an_old_recorded_exit_is_repriced_from_a_fresh_quote(tmp_path):
+    h = Harness(tmp_path)
+    ref = _close_recorded_never_sent(h)
+    old = h.coord.store.order(ref).limit_price
+    h.broker.set_quote(SYMBOL, "52.98", "53.02")  # today's market
+    h.coord.recover()
+    [sent] = h.broker.orders_with_ref(ref)
+    band = h.policy.max_price_deviation_pct / Decimal(100)
+    fresh = Decimal("52.98") * (1 - band)
+    assert sent.limit_price != Decimal(old)
+    assert sent.limit_price == fresh.quantize(Decimal("0.01"), rounding="ROUND_CEILING")
+    assert "EXIT_REPRICED" in h.events(ref)
+
+
+def test_f8_an_old_recorded_exit_without_a_usable_quote_becomes_an_exception(tmp_path):
+    h = Harness(tmp_path)
+    ref = _close_recorded_never_sent(h)  # the last quote is three days old
+    h.coord.recover()
+    assert h.broker.orders_with_ref(ref) == []
+    intent = h.coord.intent(ref)
+    assert intent.state == IntentState.REFUSED and "EXIT_WITHOUT_QUOTE" in intent.reasons
+    assert "EXIT_WITHOUT_QUOTE" in _open_kinds(h)
