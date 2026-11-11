@@ -657,11 +657,16 @@ class ExecutionCoordinator:
                 )
                 return
         if intent.attempts >= self.config.max_submit_attempts:
-            self._mark_unresolved(
-                intent,
-                "NO_TRACE_RESEND_BUDGET_EXHAUSTED",
-                f"{intent.attempts} submissions already made",
-            )
+            # Journaled once; the intent's age keeps counting so reconcile reports it stuck.
+            if not any(
+                e.event == "NO_TRACE_RESEND_BUDGET_EXHAUSTED"
+                for e in self.store.journal(intent.order_ref)
+            ):
+                self._mark_unresolved(
+                    intent,
+                    "NO_TRACE_RESEND_BUDGET_EXHAUSTED",
+                    f"{intent.attempts} submissions already made",
+                )
             return
         if intent.action in (Action.OPEN, Action.ADD):
             problems = self._resend_checks(intent, now)
