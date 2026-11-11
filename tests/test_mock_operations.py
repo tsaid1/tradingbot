@@ -833,3 +833,85 @@ def test_marks_never_write_a_ledger_or_a_file(tmp_path, monkeypatch):
     assert ledger_dump(ledgers) == before and non_sidecar(ledger_files(ledgers)) == non_sidecar(files_before)
     assert {p: hashlib.sha256(p.read_bytes()).hexdigest() for p in digests} == digests
     assert not (tmp_path / "data").exists()
+
+
+# ----------------------------------------------------------------------------- missing ledger evidence
+
+
+NAMES = {"journal": "Journal ledger (Sprint 1)", "replay": "Replay ledger (Sprint 1.1)"}
+
+
+def supplied_page(tmp_path, monkeypatch, ledgers: MockLedgers) -> AppTest:
+    """The page over supplied ledgers, as a restored session would carry them."""
+    at = page(tmp_path, monkeypatch)
+    at.session_state["mock_ops_scenario"] = "populated"
+    at.session_state["mock_ops_ledgers"] = ledgers.model_dump(mode="json")
+    return at.run()
+
+
+def file_bytes(*paths: Path | None) -> dict[str, bytes]:
+    return {p.name: p.read_bytes() for p in paths if p is not None}
+
+
+@pytest.mark.parametrize(("scenario", "keep"), [
+    ("empty", ("journal",)), ("empty", ()), ("populated", ("journal",)), ("populated", ("replay",)),
+], ids=["empty-journal-only", "none-configured", "populated-journal-only", "populated-replay-only"])
+def test_a_ledger_without_a_path_is_missing_evidence_never_an_empty_or_complete_run(
+    tmp_path, monkeypatch, scenario, keep
+):
+    full = ov.build_synthetic_ledgers(tmp_path / "supplied", scenario)
+    ledgers = MockLedgers(journal_path=full.journal_path if "journal" in keep else None,
+                          replay_path=full.replay_path if "replay" in keep else None, label="partial")
+    # The shared read model is unchanged: single-ledger consumers still read a complete one-ledger snapshot.
+    assert ov.build_snapshot(ledgers).reconciliation_complete is True
+    before = file_bytes(full.journal_path, full.replay_path)
+    at = supplied_page(tmp_path, monkeypatch, ledgers)
+    assert not at.exception
+    errors, shown = [e.value for e in at.error], texts(at)
+    for engine, name in NAMES.items():
+        not_configured = f"{name}: NOT CONFIGURED" in shown
+        assert not_configured is (engine not in keep), engine
+    [verdict] = [e for e in errors if e.startswith("Reconciliation is INCOMPLETE")]
+    assert "not configured (evidence missing)" in verdict
+    # Missing is never shown as empty or clean, and its totals are UNKNOWN, never zero.
+    for wrong in ("Nothing to reconcile", "both ledgers are empty", "Empty run:", "No discrepancies were detected",
+                  "recorded in either ledger"):
+        assert wrong not in shown, wrong
+    assert {m.value for m in at.metric} == {"UNKNOWN"}
+    assert "Totals are UNKNOWN" in shown
+    # The configured ledger's own evidence stays visible, with its timestamp and age.
+    for engine in keep:
+        assert f"**{NAMES[engine]}:** " in shown and "rows on record" in shown
+        if scenario == "populated":
+            assert "s before as-of" in shown
+    assert file_bytes(full.journal_path, full.replay_path) == before  # rendering never writes a ledger
+
+
+def test_control_both_configured_empty_ledgers_stay_empty_with_zero_totals(tmp_path, monkeypatch):
+    full = ov.build_synthetic_ledgers(tmp_path / "supplied", "empty")
+    at = supplied_page(tmp_path, monkeypatch, full)
+    shown = texts(at)
+    assert "Nothing to reconcile: both ledgers are empty." in shown and "NOT CONFIGURED" not in shown
+    assert {m.value for m in at.metric} == {"0"}  # a known zero stays zero
+    assert not [e for e in at.error if e.value.startswith("Reconciliation is INCOMPLETE")]
+
+
+def test_a_missing_ledger_makes_the_mark_report_incomplete(tmp_path, monkeypatch):
+    both = clean_ledgers(tmp_path / "clean")
+    at = supply(marks_page(tmp_path, monkeypatch, both), ago(1), MOCKJ=("101.00", "101.10"),
+                MOCKS=("48.00", "48.10"))
+    assert valuation(at)["MOCKJ"]["unrealized_pnl"] == "0.95"  # control: both ledgers reconcile
+    journal_only = MockLedgers(journal_path=both.journal_path, label="journal only")
+    at = supply(marks_page(tmp_path, monkeypatch, journal_only), ago(1), MOCKJ=("101.00", "101.10"))
+    row = valuation(at)["MOCKJ"]
+    assert (row["average_cost"], row["unrealized_pnl"]) == ("UNKNOWN", "UNKNOWN")
+    assert any(e.startswith("Mark report INCOMPLETE") for e in (x.value for x in at.error))
+
+
+def test_the_incomplete_verdict_names_the_actual_cause(tmp_path, monkeypatch, populated):
+    with closing(sqlite3.connect(str(populated.replay_path))) as c, c:
+        c.execute("UPDATE replay_actions SET result_json='not json' WHERE source_id='syn-r-1'")
+    at = supplied_page(tmp_path, monkeypatch, populated)
+    [verdict] = [e.value for e in at.error if e.value.startswith("Reconciliation is INCOMPLETE")]
+    assert "Replay ledger (Sprint 1.1) has 1 undecodable record(s)" in verdict
+    assert "not configured" not in verdict and "unreadable" not in verdict and "partly read" not in verdict

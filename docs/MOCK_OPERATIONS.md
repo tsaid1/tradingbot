@@ -41,6 +41,15 @@ selected from the ledgers, so paid post text cannot reach the page.
   review, that ledger's fills are **not** reconciled, and reconciliation is marked incomplete.
 * A missing or foreign ledger file is reported as a `SERIOUS` discrepancy (`LEDGER_FILE_MISSING`,
   `LEDGER_UNREADABLE`); the view never creates a database.
+* **A ledger with no configured path is missing evidence, not an empty ledger.** The page reconciles both
+  ledgers. If supplied ledgers omit one or both paths (for example a restored session that carries only the
+  journal), the page shows each as `NOT CONFIGURED`, every total as `UNKNOWN` (never `0`), and
+  reconciliation and the invented-mark report as incomplete. It never shows "Empty run", "Nothing to
+  reconcile" or "No discrepancies" for that state. The configured ledger's rows, last write and age still
+  render. The shared read model is unchanged: `build_snapshot` still reports a single configured ledger as
+  complete for the single-ledger views that use it, such as the shadow-run health page.
+* **The incomplete verdict names its causes:** each ledger that is not configured, unreadable, only partly
+  read, or has undecodable records.
 * The ledger controls are **Refresh view (read-only)**, which re-reads the same files, and the scenario
   selector. The only other control is the opt-in **invented marks** toggle (below); its inputs value
   positions and never change a ledger. There are no trade inputs, forms, or action buttons.
