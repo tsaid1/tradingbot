@@ -337,7 +337,7 @@ class ExecutionCoordinator:
         self.sync()
         return out
 
-    def sync(self) -> bool:
+    def sync(self, *, _halt_rerun: bool = True) -> bool:
         """Apply new broker fills to the ledger, refresh working orders, keep protection sized.
         Returns False when the broker could not be read (nothing is changed then)."""
         now = self.clock()
@@ -376,9 +376,9 @@ class ExecutionCoordinator:
                     ledger_quantity=pos.quantity,
                 )
         self._refresh_orders(open_orders, now)
-        if self.halted() and self._cancel_entries_for_halt(open_orders):
-            # Risk-reducing: re-read so a fill that beat the cancel is applied and covered at once.
-            return self.sync()
+        if _halt_rerun and self.halted() and self._cancel_entries_for_halt(open_orders):
+            # Risk-reducing: re-read once so a fill that beat the cancel is applied and covered.
+            return self.sync(_halt_rerun=False)
         positions = {p.idea_id: p for p in self.store.positions()}
         for idea_id in sorted(
             touched | {i for i, p in positions.items() if p.status in ("OPEN", "PENDING")}

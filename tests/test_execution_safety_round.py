@@ -545,3 +545,15 @@ def test_note_recovery_lookup_is_journaled_on_state_change_only(tmp_path):
         h.clock.advance(5)
         h.coord.recover()
     assert h.events(out.order_ref).count("RECOVERY_LOOKUP") == stuck
+
+
+def test_r7_halt_resync_is_bounded_when_the_broker_lags_the_cancel(tmp_path):
+    h = Harness(tmp_path)
+    h.broker.script_next_submit("REST")
+    opened = h.execute("p1", open_action())
+    h.halt()
+    h.broker.cancel = lambda ref: None  # accepted, but open orders keep showing it Submitted
+    assert h.coord.sync() is True  # terminates: one cancel request, one re-read
+    assert h.events(opened.order_ref).count("HALT_ENTRY_CANCELLED") == 1
+    assert h.coord.sync() is True  # and asks again on the next cycle
+    assert h.events(opened.order_ref).count("HALT_ENTRY_CANCELLED") == 2
