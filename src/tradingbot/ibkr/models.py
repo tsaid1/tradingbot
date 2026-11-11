@@ -15,6 +15,14 @@ class ContractQuery:
     exchange: str = "SMART"
     currency: str = "USD"
     primary_exchange: str = ""
+    # --- optional, for futures, indices, commodities, CFDs and options (empty / None = unset) ---
+    last_trade_date_or_contract_month: str = ""  # YYYYMM or YYYYMMDD, as the SDK field
+    multiplier: str = ""
+    trading_class: str = ""
+    local_symbol: str = ""
+    strike: float | None = None
+    right: str = ""  # "C" / "P" (options)
+    include_expired: bool = False
 
 
 TLT_QUERY = ContractQuery(symbol="TLT", sec_type="STK", exchange="SMART", currency="USD",
@@ -34,6 +42,96 @@ class ResolvedContract:
     time_zone_id: str
     trading_hours: str
     liquid_hours: str
+
+
+@dataclass(frozen=True)
+class DiscoveredContract:
+    """One contract-details row, as ibapi 1052.1 ``Contract`` + ``ContractDetails`` provide it.
+    ``None`` means the broker left the field unset (UNSET_DOUBLE / UNSET_DECIMAL)."""
+
+    con_id: int
+    symbol: str
+    local_symbol: str
+    sec_type: str
+    exchange: str
+    primary_exchange: str
+    currency: str
+    multiplier: str
+    min_tick: float
+    price_magnifier: int
+    trading_class: str
+    last_trade_date_or_contract_month: str  # Contract.lastTradeDateOrContractMonth (date part)
+    last_trade_date: str  # Contract.lastTradeDate
+    last_trade_time: str  # ContractDetails.lastTradeTime (time part split off by the SDK)
+    contract_month: str  # ContractDetails.contractMonth
+    real_expiration_date: str  # ContractDetails.realExpirationDate
+    strike: float | None
+    right: str
+    under_con_id: int
+    under_symbol: str
+    under_sec_type: str
+    long_name: str
+    market_name: str
+    stock_type: str
+    time_zone_id: str
+    trading_hours: str
+    liquid_hours: str
+    valid_exchanges: str
+    order_types: str
+    market_rule_ids: str
+    min_size: Decimal | None
+    size_increment: Decimal | None
+    suggested_size_increment: Decimal | None
+    query_match: bool  # secType and currency equal the query's
+
+
+DISCOVERY_FOUND, DISCOVERY_NOT_FOUND, DISCOVERY_ERROR = "FOUND", "NOT_FOUND", "ERROR"
+NO_SECURITY_DEFINITION = 200  # "No security definition has been found for the request"
+
+
+@dataclass(frozen=True)
+class DiscoveryResult:
+    """All contracts matching one query. ``NOT_FOUND`` (error 200, or an empty end) and ``ERROR``
+    (any other request-scoped broker error) are normal results, not exceptions. ``truncated``:
+    more than ``limit`` rows arrived; the request was then cancelled and only ``limit`` kept."""
+
+    query: ContractQuery
+    status: str
+    contracts: tuple[DiscoveredContract, ...]
+    limit: int
+    truncated: bool = False
+    error_code: int | None = None
+    error_message: str | None = None
+
+    @property
+    def count(self) -> int:
+        return len(self.contracts)
+
+
+@dataclass(frozen=True)
+class OptionChainParams:
+    """One ``securityDefinitionOptionParameter`` callback (one exchange / trading class)."""
+
+    exchange: str
+    underlying_con_id: int
+    trading_class: str
+    multiplier: str
+    expirations: tuple[str, ...]  # sorted
+    strikes: tuple[float, ...]  # sorted
+
+
+@dataclass(frozen=True)
+class OptionChainResult:
+    underlying_symbol: str
+    underlying_sec_type: str
+    underlying_con_id: int
+    fut_fop_exchange: str
+    status: str  # FOUND | NOT_FOUND | ERROR
+    params: tuple[OptionChainParams, ...]
+    limit: int
+    truncated: bool = False
+    error_code: int | None = None
+    error_message: str | None = None
 
 
 @dataclass(frozen=True)

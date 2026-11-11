@@ -40,6 +40,9 @@ from ibapi.protobuf.NextValidId_pb2 import NextValidId
 from ibapi.protobuf.Position_pb2 import Position
 from ibapi.protobuf.PositionEnd_pb2 import PositionEnd
 from ibapi.protobuf.PositionsRequest_pb2 import PositionsRequest
+from ibapi.protobuf.SecDefOptParameter_pb2 import SecDefOptParameter
+from ibapi.protobuf.SecDefOptParameterEnd_pb2 import SecDefOptParameterEnd
+from ibapi.protobuf.SecDefOptParamsRequest_pb2 import SecDefOptParamsRequest
 from ibapi.protobuf.StartApiRequest_pb2 import StartApiRequest
 from ibapi.protobuf.TickPrice_pb2 import TickPrice
 from ibapi.protobuf.TickSnapshotEnd_pb2 import TickSnapshotEnd
@@ -61,6 +64,7 @@ _REQUESTS = {
     OUT.CANCEL_MKT_DATA: ("CANCEL_MKT_DATA", CancelMarketData),
     OUT.REQ_MARKET_DATA_TYPE: ("REQ_MARKET_DATA_TYPE", MarketDataTypeRequest),
     OUT.REQ_CONFIG: ("REQ_CONFIG", ConfigRequest),
+    OUT.REQ_SEC_DEF_OPT_PARAMS: ("REQ_SEC_DEF_OPT_PARAMS", SecDefOptParamsRequest),
 }
 
 
@@ -85,6 +89,55 @@ def tlt_contract_frame(req_id: int, con_id: int = 15547841, primary: str = "NASD
                              tradingHours="20261111:0400-20261111:2000",
                              liquidHours="20261111:0930-20261111:1600")
     return frame(IN.CONTRACT_DATA, ContractData(reqId=req_id, contract=c, contractDetails=d))
+
+
+def contract_frame(req_id: int, *, con_id: int, symbol: str, sec_type: str, exchange: str,
+                   currency: str = "USD", ltd: str = "", multiplier: float | None = None,
+                   local_symbol: str = "", trading_class: str = "", min_tick: str = "0.25",
+                   contract_month: str = "", real_expiration: str = "", under_con_id: int = 0,
+                   long_name: str = "", size_rules: tuple[str, str, str] | None = None,
+                   strike: float | None = None, right: str = "") -> bytes:
+    """Generic contract-details row (synthetic values)."""
+    c = ContractProto(conId=con_id, symbol=symbol, secType=sec_type, exchange=exchange,
+                      currency=currency, localSymbol=local_symbol or symbol,
+                      tradingClass=trading_class or symbol)
+    if ltd:
+        c.lastTradeDateOrContractMonth = ltd
+    if multiplier is not None:
+        c.multiplier = multiplier
+    if strike is not None:
+        c.strike = strike
+    if right:
+        c.right = right
+    d = ContractDetailsProto(minTick=min_tick, timeZoneId="US/Central", longName=long_name,
+                             marketName=trading_class or symbol, priceMagnifier=1,
+                             validExchanges=exchange, orderTypes="LMT,MKT",
+                             tradingHours="20261111:1700-20261112:1600",
+                             liquidHours="20261112:0830-20261112:1500", marketRuleIds="67")
+    if contract_month:
+        d.contractMonth = contract_month
+    if real_expiration:
+        d.realExpirationDate = real_expiration
+    if under_con_id:
+        d.underConId = under_con_id
+    if size_rules is not None:
+        d.minSize, d.sizeIncrement, d.suggestedSizeIncrement = size_rules
+    return frame(IN.CONTRACT_DATA, ContractData(reqId=req_id, contract=c, contractDetails=d))
+
+
+def contract_end_frame(req_id: int) -> bytes:
+    return frame(IN.CONTRACT_DATA_END, ContractDataEnd(reqId=req_id))
+
+
+def opt_param_frame(req_id: int, *, exchange: str, under_con_id: int, trading_class: str,
+                    multiplier: str, expirations: list[str], strikes: list[float]) -> bytes:
+    return frame(IN.SECURITY_DEFINITION_OPTION_PARAMETER, SecDefOptParameter(
+        reqId=req_id, exchange=exchange, underlyingConId=under_con_id, tradingClass=trading_class,
+        multiplier=multiplier, expirations=expirations, strikes=strikes))
+
+
+def opt_param_end_frame(req_id: int) -> bytes:
+    return frame(IN.SECURITY_DEFINITION_OPTION_PARAMETER_END, SecDefOptParameterEnd(reqId=req_id))
 
 
 def delayed_quote_frames(req_id: int) -> list[bytes]:

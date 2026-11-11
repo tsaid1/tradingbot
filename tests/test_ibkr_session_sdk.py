@@ -584,7 +584,8 @@ def test_allowlist_is_exactly_known_and_exists_in_sdk():
         "cancelAccountSummary", "cancelAccountSummaryProtoBuf", "reqPositions",
         "reqPositionsProtoBuf", "cancelPositions", "cancelPositionsProtoBuf", "reqMktData",
         "reqMarketDataProtoBuf", "cancelMktData", "cancelMarketDataProtoBuf", "reqMarketDataType",
-        "reqMarketDataTypeProtoBuf", "reqConfigProtoBuf"}
+        "reqMarketDataTypeProtoBuf", "reqConfigProtoBuf", "reqSecDefOptParams",
+        "reqSecDefOptParamsProtoBuf"}
 
 
 def test_every_non_allowlisted_eclient_method_raises_and_sends_nothing(tws):
