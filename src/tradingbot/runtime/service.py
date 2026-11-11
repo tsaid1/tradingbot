@@ -56,6 +56,8 @@ HELD_STATUSES = frozenset(
     {"HOLD", "BLOCK", "REFUSED", "HALTED", "UNRESOLVED", "EXCEPTION", "REJECTED"}
 )
 COMPONENTS = ("source", "broker", "pipeline")
+# Bounds the arithmetic only; max_backoff_seconds still bounds the wait itself.
+MAX_BACKOFF_EXPONENT = 32
 FAILURE_KIND = {
     "source": N.SOURCE_FAILURE,
     "broker": N.BROKER_FAILURE,
@@ -564,9 +566,9 @@ class RuntimeService:
         h.last_error = _safe_error(exc)
         h.last_error_at = now.isoformat()
         cfg = self.config.service
-        backoff = min(
-            cfg.cadence_seconds * 2 ** (h.consecutive_failures - 1), cfg.max_backoff_seconds
-        )
+        # The exponent is capped (review F6): 2 ** n overflowed a float after ~1,024 failures.
+        exponent = min(h.consecutive_failures - 1, MAX_BACKOFF_EXPONENT)
+        backoff = min(cfg.cadence_seconds * 2**exponent, cfg.max_backoff_seconds)
         if retry_after is not None:
             backoff = min(max(backoff, retry_after), max(cfg.max_backoff_seconds, retry_after))
         h.next_attempt_at = (now + timedelta(seconds=backoff)).isoformat()

@@ -5,6 +5,7 @@ Invented tickers, toy prices and invented wording only. No network, no broker po
 
 from __future__ import annotations
 
+from datetime import datetime
 from decimal import Decimal
 
 import pytest
@@ -367,3 +368,17 @@ def test_f9_a_publisher_reversal_is_a_close_then_an_open(tmp_path):
     assert [o.status for o in result.outcomes] == ["EXECUTED", "EXECUTED"]
     assert [p.quantity for p in h.broker.positions()] == [-4]
     assert h.coord.reconcile().clean
+
+
+# ------------------------------------------------------------------- F6: backoff never overflows
+
+
+def test_f6_a_long_failure_run_keeps_the_backoff_bounded(tmp_path):
+    rt = Runtime(tmp_path, [])
+    now = rt.clock.now()
+    for _ in range(5000):  # far beyond the ~1,024 failures that used to overflow 2 ** n
+        rt.service._failure("broker", BrokerError("invented: still down"), now)
+    h = rt.service.health["broker"]
+    assert h.consecutive_failures == 5000
+    wait = (datetime.fromisoformat(h.next_attempt_at) - now).total_seconds()
+    assert wait == rt.config.service.max_backoff_seconds
