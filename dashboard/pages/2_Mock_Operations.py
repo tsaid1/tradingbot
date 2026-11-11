@@ -8,12 +8,16 @@ never displays source text, and has no control that submits or changes a trade.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import re
+from datetime import UTC, datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 
 import streamlit as st
 
 import tradingbot
+from tradingbot.mark_report import EXPOSURE_CONVENTION, LEVEL_NOTE, MarkReport, build_mark_report
+from tradingbot.models import MockPolicy, Quote
 from tradingbot.operations_view import (
     PROTECTION_NOTES,
     SNAPSHOT_STALE_AFTER_SECONDS,
@@ -26,6 +30,9 @@ from tradingbot.operations_view import (
 )
 
 SCENARIOS = {"Synthetic: populated run": "populated", "Synthetic: empty run": "empty"}
+MARK_PRICE_TEXT = re.compile(r"[0-9]{1,15}(\.[0-9]{1,10})?")  # plain positive decimal text, bounded
+MAX_MARK_TIME_TEXT = 40
+POLICY = MockPolicy()  # the policy build_snapshot uses by default
 
 st.set_page_config(page_title="Mock Operations", page_icon="📋", layout="wide")
 st.title("Mock Operations (read-only)")
@@ -73,6 +80,74 @@ with st.sidebar:
 ledgers = _ensure_fixture(SCENARIOS[choice])
 snapshot: OperationsSnapshot = build_snapshot(ledgers, now=datetime.now(timezone.utc))
 counts = snapshot.counts()
+
+
+class _RejectedMarkInput:
+    """Stands in for a mark whose typed input was rejected, so the accepted report records it INVALID."""
+
+    def __repr__(self) -> str:
+        return "<rejected mark input>"
+
+
+def _mark_inputs(symbols: list[str]) -> tuple[dict[str, object], dict[str, str]]:
+    """Session-only invented marks typed by the operator. Nothing is saved, defaulted or re-stamped."""
+    time_text = st.session_state.get("mock_ops_mark_time", "")
+    observed_at: datetime | None = None
+    time_problem = None
+    if not time_text:
+        time_problem = "OBSERVATION_TIME_REQUIRED"
+    elif len(time_text) > MAX_MARK_TIME_TEXT:
+        time_problem = "OBSERVATION_TIME_TOO_LONG"
+    else:
+        try:
+            observed_at = datetime.fromisoformat(time_text)
+        except ValueError:
+            time_problem = "OBSERVATION_TIME_UNPARSEABLE"
+    marks: dict[str, object] = {}
+    rejected: dict[str, str] = {}
+    for symbol in symbols:
+        bid = st.session_state.get(f"mock_ops_mark_bid_{symbol}", "")
+        ask = st.session_state.get(f"mock_ops_mark_ask_{symbol}", "")
+        if not bid and not ask:
+            continue  # no mark supplied: the report shows it as missing, never zero
+        problem = time_problem
+        if not (MARK_PRICE_TEXT.fullmatch(bid) and MARK_PRICE_TEXT.fullmatch(ask)):
+            problem = "BID_OR_ASK_NOT_A_BOUNDED_DECIMAL"
+        if problem is not None or observed_at is None:
+            marks[symbol], rejected[symbol] = _RejectedMarkInput(), problem or "OBSERVATION_TIME_REQUIRED"
+            continue
+        marks[symbol] = Quote(symbol=symbol, bid=Decimal(bid), ask=Decimal(ask), observed_at=observed_at)
+    return marks, rejected
+
+
+mark_symbols = sorted({p.symbol for p in snapshot.open_positions})
+with st.sidebar:
+    st.header("Invented marks (optional)")
+    marks_on = st.toggle(
+        "Value open positions against invented marks",
+        key="mock_ops_marks_on",
+        help="Session only. Marks are values you type for this session, not quotes from any feed or broker. "
+        "Nothing is saved.",
+    )
+    if marks_on:
+        st.caption(
+            "SUPPLIED_INVENTED: your own invented bid/ask values. They are not quotes and carry no provenance. "
+            "The observation time is never set or refreshed for you; stamp it explicitly."
+        )
+        if st.button("Stamp observation time now (UTC)", help="Sets the observation time once. Reruns keep it."):
+            st.session_state["mock_ops_mark_time"] = datetime.now(UTC).isoformat(timespec="seconds")
+        st.text_input("Observation time (ISO 8601 with timezone)", key="mock_ops_mark_time",
+                      max_chars=MAX_MARK_TIME_TEXT)
+        for symbol in mark_symbols:
+            st.text_input(f"{symbol} invented bid", key=f"mock_ops_mark_bid_{symbol}", max_chars=26)
+            st.text_input(f"{symbol} invented ask", key=f"mock_ops_mark_ask_{symbol}", max_chars=26)
+
+mark_report: MarkReport | None = None
+rejected_marks: dict[str, str] = {}
+if marks_on:
+    supplied, rejected_marks = _mark_inputs(mark_symbols)
+    mark_report = build_mark_report(snapshot, supplied, POLICY)
+pnl_shown = mark_report is not None and any(r.unrealized_pnl is not None for r in mark_report.positions)
 
 # ----------------------------------------------------------------------------- as-of
 st.subheader("As-of")
@@ -154,9 +229,15 @@ else:
         )
         + "."
     )
-st.caption(
-    "No market quote is stored in the ledgers, so valuation and P&L are unknown and are not displayed."
-)
+if pnl_shown:
+    st.caption(
+        "No market quote is stored in the ledgers. Unrealized P&L appears in the invented-mark valuation below "
+        "only where a fresh supplied mark and a provable average cost exist; every other valuation and P&L is unknown."
+    )
+else:
+    st.caption(
+        "No market quote is stored in the ledgers, so valuation and P&L are unknown and are not displayed."
+    )
 if snapshot.closed_ideas:
     with st.expander(
         f"Closed or empty replay ideas retained in the ledger ({len(snapshot.closed_ideas)})"
@@ -164,6 +245,55 @@ if snapshot.closed_ideas:
         st.dataframe(
             [p.model_dump(mode="json", exclude={"protection_note"}) for p in snapshot.closed_ideas],
             hide_index=True,
+        )
+
+# ----------------------------------------------------------------------------- invented-mark valuation
+def _shown(value: Decimal | None, status: str) -> str:
+    return status if value is None else str(value)
+
+
+if mark_report is not None:
+    st.markdown("**Invented-mark valuation (read-only, session only)**")
+    st.warning(
+        "Marks are SUPPLIED_INVENTED: values typed for this session, not quotes from any feed or broker, and not "
+        "verified provenance. Nothing is saved. This is not advice, an alert or a trade control."
+    )
+    for symbol, reason in sorted(rejected_marks.items()):
+        st.error(f"{symbol}: mark input rejected ({reason}); the report shows it as INVALID.")
+    if not mark_report.positions:
+        st.info("No open mock positions to value.")
+    else:
+        rows = []
+        for r in mark_report.positions:
+            pnl_status = "UNSUPPORTED" if "UNSUPPORTED" in (r.exposure_status, r.basis_status) else "UNKNOWN"
+            rows.append({
+                "engine": r.engine, "idea_id": r.idea_id, "symbol": r.symbol, "side": r.side, "units": r.units,
+                "mark_status": r.mark_status, "mark_reason": r.mark_reason,
+                "executable_mark": _shown(r.executable_mark, r.exposure_status),
+                "exposure_status": r.exposure_status,
+                "signed_exposure": _shown(r.signed_exposure, r.exposure_status),
+                "gross_exposure": _shown(r.gross_exposure, r.exposure_status),
+                "exposure_reasons": "; ".join(r.exposure_reasons),
+                "basis_status": r.basis_status, "average_cost": _shown(r.average_cost, r.basis_status),
+                "unrealized_pnl": _shown(r.unrealized_pnl, pnl_status),
+                "basis_reasons": "; ".join(r.basis_reasons),
+                "stop_price": r.stop_price or "NOT_RECORDED",
+                "stop_distance": _shown(r.stop_distance, "UNKNOWN" if r.stop_price else "NOT_RECORDED"),
+                "target_price": r.target_price or "NOT_RECORDED",
+                "target_distance": _shown(r.target_distance, "UNKNOWN" if r.target_price else "NOT_RECORDED"),
+                "level_reasons": "; ".join(r.level_reasons), "protection": r.protection,
+            })
+        st.dataframe(rows, hide_index=True)
+    st.caption(f"Exposure convention: {EXPOSURE_CONVENTION}.")
+    st.caption(
+        f"Stop and target distances (level minus executable mark): {LEVEL_NOTE}. Average cost is shown only "
+        "where the fill history proves it; UNKNOWN is never zero or a last-known value. No currency, multiplier "
+        "or portfolio money total is shown, and the two engines are never netted."
+    )
+    if mark_report.status != "COMPLETE":
+        st.error(
+            "Mark report INCOMPLETE: reconciliation was incomplete or the snapshot time had no timezone, so no "
+            "average cost or P&L is shown."
         )
 
 # ----------------------------------------------------------------------------- fills

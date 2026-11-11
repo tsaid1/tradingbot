@@ -1,10 +1,37 @@
-# Tradingbot — Signal-to-Execution Lab (Sprint 1)
+# Tradingbot — Signal-to-Execution Lab
 
 **A deliberately fail-closed, mock-only development foundation.**
 
 This project converts synthetic trading signals (or user-provided analysis in optional AI mode)
 into typed candidate instructions, runs deterministic validations, and records simulated orders.
 It does **not** connect to X, does **not** contact a broker, and cannot place live orders.
+
+## Current offline capabilities
+
+Everything below runs locally on synthetic or invented data. No broker is contacted and no order can be
+placed.
+
+- **Signal to mock fill:** the Sprint 1 demo parser, the deterministic validator and a SQLite journal of
+  fictional OPEN/REDUCE/CLOSE fills (this README's quickstart).
+- **Multi-action replay:** atomic OPEN/ADD/REDUCE/CLOSE/MODIFY with once-only processing
+  ([SPRINT_1_1_EVENT_REPLAY.md](docs/SPRINT_1_1_EVENT_REPLAY.md)), plus a restart-safe synthetic shadow
+  runner and soak ([SHADOW_01](docs/SHADOW_01_SYNTHETIC_SHADOW_RUNNER.md),
+  [SHADOW_02](docs/SHADOW_02_SYNTHETIC_SOAK.md)).
+- **Read-only dashboard pages:**
+  - Mock Operations, with optional valuation of fictional positions against invented marks
+    ([MOCK_OPERATIONS.md](docs/MOCK_OPERATIONS.md), [MOCK_MARK_REPORT.md](docs/MOCK_MARK_REPORT.md))
+  - Shadow Run Health ([SHADOW_RUN_HEALTH.md](docs/SHADOW_RUN_HEALTH.md))
+  - Paper Readiness ([PAPER_READINESS.md](docs/PAPER_READINESS.md))
+  - Callback Demo ([IBKR_CALLBACK_DEMO.md](docs/IBKR_CALLBACK_DEMO.md))
+  - Read Retirement ([READ_RETIREMENT_VIEW.md](docs/READ_RETIREMENT_VIEW.md))
+- **Read-only IBKR preparation, offline only:** callback normalization
+  ([IBKR_CALLBACK_NORMALIZATION.md](docs/IBKR_CALLBACK_NORMALIZATION.md)), a callback router
+  ([CALLBACK_ROUTER.md](docs/CALLBACK_ROUTER.md)), a bounded frame accumulator
+  ([READ_FRAMING.md](docs/READ_FRAMING.md)) and a contract-details facade
+  ([IBKR_CONTRACT_FACADE.md](docs/IBKR_CONTRACT_FACADE.md)). These use invented data only. The IBKR SDK is
+  not imported or run, no connection is made, and no account is read.
+
+Release gates for anything beyond this are in [SECURITY_AND_RELEASE_GATES.md](docs/SECURITY_AND_RELEASE_GATES.md).
 
 ## Quickstart (macOS / Linux)
 

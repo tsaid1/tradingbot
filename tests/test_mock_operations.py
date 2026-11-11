@@ -7,11 +7,12 @@ Synthetic data only. Covers the read-model (`tradingbot.operations_view`) and th
 from __future__ import annotations
 
 import ast
+import hashlib
 import re
 import sqlite3
 import tempfile
 from contextlib import closing, contextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -680,3 +681,155 @@ def test_untimed_ledger_activity_is_unknown_in_read_model_and_page(
     unknown = [w.value for w in at.warning if "last ledger write UNKNOWN" in w.value]
     assert len(unknown) == 2 and all("without a timezone" in w for w in unknown)
     assert {m.label: m.value for m in at.metric}["Open mock positions"] == "2"
+
+
+# ----------------------------------------------------------------------------- MARK-2: invented marks on the page
+
+
+def clean_ledgers(directory: Path) -> MockLedgers:
+    """A journal long (BUY 1 @ 100.05) and a replay short (SELL 2 @ 49.95), with no discrepancy."""
+    from tradingbot.event_models import ParsedPost
+    from tradingbot.event_replay import PaperEventReplay
+    from tradingbot.interpreters import DemoInterpreter
+    from tradingbot.models import Action, AssetClass, MockPolicy, PositionSide, SourceEvent
+    from tradingbot.pipeline import SignalPipeline
+    from tradingbot.storage import Journal
+
+    directory.mkdir(parents=True)
+    clock = datetime.now(UTC)
+    journal = Journal(directory / "journal.sqlite3")
+    SignalPipeline(journal, DemoInterpreter(), MockPolicy()).process(
+        SourceEvent(source_id="mk-j-1", text="BUY MOCKJ @ 100 STOP 95 TARGET 110", published_at=clock),
+        ov._quote("MOCKJ", "99.95", "100.05", clock))
+    replay = PaperEventReplay(directory / "replay.sqlite3", MockPolicy(quantity=2))
+    replay.process(ov._replay_source("mk-r-1", clock), ParsedPost(actions=[ov._replay_action(
+        "open", Action.OPEN, "MOCKS", AssetClass.EQUITY, side=PositionSide.SHORT, ref="50", stop="55",
+        target="40")]), quotes={"MOCKS": ov._quote("MOCKS", "49.95", "50.05", clock)}, now=clock)
+    return MockLedgers.from_engines(journal, replay, label="synthetic:marks")
+
+
+def marks_page(tmp_path, monkeypatch, ledgers: MockLedgers | None = None) -> AppTest:
+    at = page(tmp_path, monkeypatch)
+    if ledgers is not None:
+        at.session_state["mock_ops_scenario"] = "populated"
+        at.session_state["mock_ops_ledgers"] = ledgers.model_dump(mode="json")
+    at.run()
+    at.toggle(key="mock_ops_marks_on").set_value(True).run()
+    return at
+
+
+def supply(at: AppTest, when: str, **marks: tuple[str, str]) -> AppTest:
+    at.text_input(key="mock_ops_mark_time").set_value(when)
+    for symbol, (bid, ask) in marks.items():
+        at.text_input(key=f"mock_ops_mark_bid_{symbol}").set_value(bid)
+        at.text_input(key=f"mock_ops_mark_ask_{symbol}").set_value(ask)
+    return at.run()
+
+
+def valuation(at: AppTest) -> dict[str, dict]:
+    frames = [df.value for df in at.dataframe if "signed_exposure" in df.value.columns]
+    assert len(frames) == 1
+    return {row["symbol"]: row for row in frames[0].to_dict("records")}
+
+
+def ago(seconds: float) -> str:
+    return (datetime.now(UTC) - timedelta(seconds=seconds)).isoformat(timespec="seconds")
+
+
+def test_marks_are_opt_in_and_the_default_view_adds_only_the_toggle(tmp_path, monkeypatch):
+    at = page(tmp_path, monkeypatch).run()
+    assert not at.exception
+    assert [t.value for t in at.toggle] == [False]
+    assert not at.text_input and [b.label for b in at.button] == ["Refresh view (read-only)"]
+    assert "Invented-mark valuation" not in texts(at)
+    assert "valuation and P&L are unknown and are not displayed" in texts(at)
+
+
+def test_fresh_invented_marks_show_the_accepted_report_values(tmp_path, monkeypatch):
+    ledgers = clean_ledgers(tmp_path / "clean")
+    at = supply(marks_page(tmp_path, monkeypatch, ledgers), ago(1),
+                MOCKJ=("101.00", "101.10"), MOCKS=("48.00", "48.10"))
+    assert not at.exception
+    rows = valuation(at)
+    long_, short = rows["MOCKJ"], rows["MOCKS"]
+    # journal long: 1 x bid 101.00; basis 100.05; P&L (101.00 - 100.05) x 1
+    assert (long_["mark_status"], long_["signed_exposure"], long_["average_cost"], long_["unrealized_pnl"]) == (
+        "FRESH", "101.00", "100.05", "0.95")
+    assert long_["stop_distance"] == "NOT_RECORDED" and long_["protection"] == "UNKNOWN"
+    # replay short: -(2 x ask 48.10); basis 49.95; P&L (49.95 - 48.10) x 2; stop 55 - 48.10
+    assert (short["signed_exposure"], short["gross_exposure"], short["unrealized_pnl"]) == ("-96.20", "96.20", "3.70")
+    assert short["stop_distance"] == "6.90" and short["protection"] == "RECORDED_MOCK_UNVERIFIED"
+    shown = texts(at)
+    assert "SUPPLIED_INVENTED" in shown and "Exposure convention:" in shown and "not monitored" in shown
+    assert "valuation and P&L are unknown and are not displayed" not in shown
+    assert "only where a fresh supplied mark and a provable average cost exist" in shown
+
+
+def test_reconciliation_warnings_keep_the_basis_unknown_while_exposure_is_known(tmp_path, monkeypatch):
+    at = marks_page(tmp_path, monkeypatch)  # the populated fixture carries two WARNING discrepancies
+    at = supply(at, ago(1), MOCKA=("101.00", "101.10"), MOCKD=("103.00", "103.10"))
+    rows = valuation(at)
+    assert {r["exposure_status"] for r in rows.values()} == {"KNOWN"}
+    assert {r["basis_status"] for r in rows.values()} == {"UNKNOWN"}
+    assert all(r["average_cost"] == "UNKNOWN" and r["unrealized_pnl"] == "UNKNOWN" for r in rows.values())
+    assert all("ENGINE_DISCREPANCY_PRESENT" in r["basis_reasons"] for r in rows.values())
+    assert "valuation and P&L are unknown and are not displayed" in texts(at)  # no P&L shown, prose unchanged
+
+
+@pytest.mark.parametrize(("when", "bid", "ask", "status", "reason"), [
+    (None, "", "", "UNKNOWN", "MARK_MISSING"),
+    (None, "abc", "48.10", "INVALID", "MARK_NOT_A_QUOTE"),
+    (None, "48.20", "48.10", "INVALID", "MARK_BID_ASK_INVALID"),
+    ("2026-11-11T12:00:00", "48.00", "48.10", "INVALID", "MARK_TIME_NOT_TIMEZONE_AWARE"),
+    ("", "48.00", "48.10", "INVALID", "MARK_NOT_A_QUOTE"),
+    (-120, "48.00", "48.10", "STALE", "MARK_STALE"),
+    (120, "48.00", "48.10", "FUTURE", "MARK_FUTURE"),
+], ids=["missing", "text", "crossed", "naive-time", "no-time", "stale", "future"])
+def test_missing_invalid_stale_and_future_marks_value_nothing(tmp_path, monkeypatch, when, bid, ask, status,
+                                                              reason):
+    at = marks_page(tmp_path, monkeypatch, clean_ledgers(tmp_path / "clean"))
+    text = ago(1) if when is None else (when if isinstance(when, str) else ago(-when))
+    at = supply(at, text, MOCKS=(bid, ask))
+    row = valuation(at)["MOCKS"]
+    assert (row["mark_status"], row["mark_reason"]) == (status, reason)
+    assert row["signed_exposure"] == "UNKNOWN" and row["unrealized_pnl"] == "UNKNOWN"
+    assert row["average_cost"] == "49.95"  # the basis does not depend on the mark
+    if reason == "MARK_NOT_A_QUOTE":
+        assert any("MOCKS: mark input rejected" in e.value for e in at.error)
+
+
+def test_a_mark_goes_stale_on_refresh_and_is_never_retimestamped(tmp_path, monkeypatch):
+    import time
+
+    at = marks_page(tmp_path, monkeypatch, clean_ledgers(tmp_path / "clean"))
+    stamp = ago(26)  # FRESH within the 30 s window, with room for a slow first run
+    at = supply(at, stamp, MOCKS=("48.00", "48.10"))
+    assert valuation(at)["MOCKS"]["mark_status"] == "FRESH"
+    time.sleep(6)  # now at least 32 s old: STALE
+    next(b for b in at.button if b.label == "Refresh view (read-only)").click().run()
+    assert valuation(at)["MOCKS"]["mark_status"] == "STALE"
+    assert at.text_input(key="mock_ops_mark_time").value == stamp  # the page never re-stamped it
+
+
+def test_the_stamp_button_sets_the_time_once_and_reruns_keep_it(tmp_path, monkeypatch):
+    at = marks_page(tmp_path, monkeypatch, clean_ledgers(tmp_path / "clean"))
+    assert at.text_input(key="mock_ops_mark_time").value == ""  # never defaulted to now
+    next(b for b in at.button if b.label == "Stamp observation time now (UTC)").click().run()
+    stamped = at.text_input(key="mock_ops_mark_time").value
+    assert datetime.fromisoformat(stamped).tzinfo is not None
+    at.run()
+    next(b for b in at.button if b.label == "Refresh view (read-only)").click().run()
+    assert at.text_input(key="mock_ops_mark_time").value == stamped
+
+
+def test_marks_never_write_a_ledger_or_a_file(tmp_path, monkeypatch):
+    ledgers = clean_ledgers(tmp_path / "clean")
+    before, files_before = ledger_dump(ledgers), ledger_files(ledgers)
+    digests = {p: hashlib.sha256(p.read_bytes()).hexdigest() for p in (ledgers.journal_path, ledgers.replay_path)}
+    at = supply(marks_page(tmp_path, monkeypatch, ledgers), ago(1), MOCKJ=("101.00", "101.10"))
+    at.run()
+    next(b for b in at.button if b.label == "Refresh view (read-only)").click().run()
+    assert not at.exception
+    assert ledger_dump(ledgers) == before and non_sidecar(ledger_files(ledgers)) == non_sidecar(files_before)
+    assert {p: hashlib.sha256(p.read_bytes()).hexdigest() for p in digests} == digests
+    assert not (tmp_path / "data").exists()
