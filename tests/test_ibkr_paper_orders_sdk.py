@@ -798,3 +798,62 @@ def test_order_status_fill_ahead_of_its_execution_is_counted(tws, tmp_path):
         assert info.value.refusal.reason == RefusalReason.POSITION_DISAGREEMENT
     finally:
         s.disconnect()
+
+
+# --- review round 2: an own order sent but not yet visible still counts ------------------------
+def _long_one_without_stop(tws, s):
+    snaps = s.place([buy(), stop()])
+    tws.fill(snaps[0].order_id, 1, 88.11)
+    assert settle(lambda: s.positions() and s.positions()[0].quantity == 1)
+    s.cancel(snaps[1].order_id)
+    return snaps
+
+
+def _sell(ref, price="88.00"):
+    return OrderSpec(ref, "SELL", 1, "LMT", limit_price=D(price))
+
+
+def test_sell_sent_but_not_yet_visible_blocks_a_second_sell(tws, tmp_path):
+    s = make(tws, tmp_path)
+    try:
+        _long_one_without_stop(tws, s)
+        tws.invisible = True  # accepted by the broker, in no callback or lookup yet
+        with pytest.raises(OrderOutcomeUnknown):
+            s.place([_sell("TB-C1")])
+        assert s.open_orders() == []  # the broker's view does not show it
+        with pytest.raises(OrderRefused) as info:
+            s.place([_sell("TB-C2")])
+        assert info.value.refusal.reason == RefusalReason.SELL_EXCEEDS_POSITION
+        assert placed(tws) == 3
+    finally:
+        s.disconnect()
+
+
+def test_buy_sent_but_not_yet_visible_blocks_a_second_buy(tws, tmp_path):
+    s = make(tws, tmp_path)
+    try:
+        tws.invisible = True
+        with pytest.raises(OrderOutcomeUnknown):
+            s.place([buy()])
+        with pytest.raises(OrderRefused) as info:
+            s.place([buy("TB-0002")])
+        assert info.value.refusal.reason == RefusalReason.POSITION_CAP
+        assert placed(tws) == 1
+    finally:
+        s.disconnect()
+
+
+def test_a_confirmed_cancel_frees_the_second_sell(tws, tmp_path):
+    s = make(tws, tmp_path)
+    try:
+        _long_one_without_stop(tws, s)
+        tws.invisible = True
+        with pytest.raises(OrderOutcomeUnknown):
+            s.place([_sell("TB-C1")])
+        tws.invisible = False
+        first = max(s.order_ids())
+        assert s.cancel(first).status == OrderStatus.CANCELLED  # 202: confirmed terminal
+        s.place([_sell("TB-C2")])
+        assert placed(tws) == 4
+    finally:
+        s.disconnect()

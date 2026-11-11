@@ -766,6 +766,11 @@ class PaperOrderSession(IbkrSession):
         rows = self.positions()
         position = sum((r.quantity for r in rows if r.con_id == c.con_id), Decimal(0))
         snaps = self._open_snapshot()  # every row, whatever its status (an Inactive BUY counts)
+        with self._cond:  # own orders sent and not final count even if no view shows them yet
+            seen = {s.order_id for s in snaps if s.own}
+            snaps += [self._snap(t, reason="SENT_NOT_VISIBLE") for t in self._tracks.values()
+                      if t.own and t.proposed is not None and t.order_id not in seen
+                      and not t.rejected and t.status not in FINAL_STATUSES]
         working_ids = {(s.client_id, s.order_id) for s in snaps}
         # another client's order ids are not ours: give them ids that cannot collide (< 0)
         working = [WorkingOrder(order_id=s.order_id if s.own else -(n + 1),

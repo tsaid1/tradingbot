@@ -90,6 +90,7 @@ class FakeOrder:
     avg: float = 0.0
     rejected: str = ""
     completed_at: str = ""
+    hidden: bool = False  # accepted, but not yet in any callback or lookup (broker lag)
     history: list[str] = field(default_factory=list)
 
     @property
@@ -102,7 +103,8 @@ class FakeOrder:
 
     @property
     def working(self) -> bool:
-        return not self.held and self.status not in TERMINAL and not self.rejected
+        return (not self.held and self.status not in TERMINAL and not self.rejected
+                and not self.hidden)
 
 
 class FakeOrderTws(FakeTws):
@@ -129,6 +131,7 @@ class FakeOrderTws(FakeTws):
         self.foreign_open_order = False  # open-order replies include another account's order
         self.foreign_completed = False
         self.modify_error: tuple[int, str] | None = None
+        self.invisible = False  # new orders are accepted but stay hidden (lagging views)
         self.positions_lag = False  # fills do not (yet) move the position read
         self._lagged: list[tuple[ContractProto, Decimal]] = []
         self._perm = itertools.count(900001)
@@ -260,6 +263,7 @@ class FakeOrderTws(FakeTws):
         transmit = o.transmit if o.HasField("transmit") else True  # absent: pessimistic
         fo = FakeOrder(order_id=oid, client_id=s.client_id or 0, perm_id=next(s._perm),
                        contract=req.contract, order=o, transmit_present=o.HasField("transmit"))
+        fo.hidden = s.invisible
         s.orders[oid] = fo
         s.next_order_id = max(s.next_order_id, oid + 1)
         if not transmit:
@@ -282,7 +286,7 @@ class FakeOrderTws(FakeTws):
                 if not s.ack_lost:
                     conn.push(error_frame(g.order_id, code, msg))
                 continue
-            if not s.ack_lost:
+            if not s.ack_lost and not g.hidden:
                 s.announce(g)
 
     @staticmethod
@@ -297,6 +301,7 @@ class FakeOrderTws(FakeTws):
                                                     "cancellable state."))
             return
         for target in [fo, *[c for c in s.children(fo.order_id) if c.status not in TERMINAL]]:
+            target.hidden = False
             s._set(target, "Cancelled")
             conn.push(error_frame(target.order_id, 202, "Order Canceled - reason:"))
             conn.push(s._status(target))
