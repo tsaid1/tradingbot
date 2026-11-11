@@ -9,7 +9,9 @@ One cycle (``run_once``):
    source this cycle (a signal is never burned on a broker outage) and the broker backs off.
 3. Source poll. For each new post, in order: ``TklInterpreter.interpret`` ->
    ``group_linked_actions``
-   -> ``MappingPolicy.apply`` (unmapped or non-DIRECT assets are marked for HOLD) ->
+   -> ``MappingPolicy.apply`` (unmapped, unapproved or unresolved families are marked for HOLD;
+   a supported one gets its execution instrument) -> the broker's quotes (a ``MappedQuote`` with
+   both legs for a mapped family) ->
    ``BrokerEventReplay.process`` (``recover()`` first, then ``gate_source`` / ``gate_action`` and
    the ``ExecutionCoordinator``) -> ``interpreter.observe`` -> one journal transaction (signal,
    actions, held-signal exceptions, interpreter context) -> ``source.commit(post)``. A failure stops
@@ -27,9 +29,16 @@ import os
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 
 from tradingbot.event_models import ParsedPost
-from tradingbot.execution.broker import Broker, BrokerError, QuoteQuality
+from tradingbot.execution.broker import (
+    Broker,
+    BrokerError,
+    ContractRef,
+    QuoteQuality,
+    reference_quote,
+)
 from tradingbot.execution.coordinator import (
     PROTECTION_UNVERIFIED,
     ExecutionConfig,
@@ -41,21 +50,24 @@ from tradingbot.execution.coordinator import (
 from tradingbot.execution.reconcile import DiscrepancyKind, ReconciliationReport
 from tradingbot.execution.replay import BrokerEventReplay
 from tradingbot.execution.store import UNRESOLVED_STATES
-from tradingbot.models import Action, Quote
+from tradingbot.models import Action, Instrument, LegQuote, MappedQuote, Quote
 from tradingbot.runtime import notify as N
 from tradingbot.runtime.config import RuntimeConfig
-from tradingbot.runtime.mapping import MappingDecision, MappingPolicy
+from tradingbot.runtime.mapping import FamilyMapping, MappingDecision, MappingPolicy
 from tradingbot.runtime.notify import Notifier
 from tradingbot.runtime.sources import SourceAdapter, SourceError
 from tradingbot.runtime.store import RuntimeStore, write_json_atomic
 from tradingbot.source_events import SourcePost
 from tradingbot.tkl_interpreter import LexiconExtension, TklInterpreter, group_linked_actions
+from tradingbot.validator import in_roll_window
 
 # Outcomes that mean "this signal was not traded as instructed": each becomes an exception record.
 HELD_STATUSES = frozenset(
     {"HOLD", "BLOCK", "REFUSED", "HALTED", "UNRESOLVED", "EXCEPTION", "REJECTED"}
 )
 COMPONENTS = ("source", "broker", "pipeline")
+# A follower position in a futures contract inside its configured roll window (multi-asset).
+ROLL_DUE = "ROLL_DUE_FLATTEN_REQUIRED"
 # Bounds the arithmetic only; max_backoff_seconds still bounds the wait itself.
 MAX_BACKOFF_EXPONENT = 32
 FAILURE_KIND = {
@@ -215,6 +227,7 @@ class RuntimeService:
                 self._poll_and_process(now, report)
             # Read-only; skipped while the broker is unreachable (the last report stays in view).
             self._reconcile(report)
+            self._check_roll_windows(now)
         self._heartbeat(report)
         return report
 
@@ -358,8 +371,13 @@ class RuntimeService:
             self._publish_mock_quotes(decision_now)
         interpreted = self.interpreter.interpret(post)
         interpreted_at = self.clock()
-        mapped, decisions = self.mapping.apply(group_linked_actions(interpreted))
-        quotes = self._gate_quotes(mapped, decisions)
+        mapped, decisions = self.mapping.apply(
+            group_linked_actions(interpreted),
+            clauses={c.action_id: c.clause for c in interpreted.classifications},
+            now=decision_now,
+            held=self._held_contracts(),
+        )
+        quotes = self._gate_quotes(mapped, decisions, decision_now)
         self.replay.gate_stamps = {}
         result = self.replay.process(post.to_replay_source(), mapped, quotes, now=decision_now)
         decided_at = self.clock()
@@ -447,15 +465,32 @@ class RuntimeService:
         )
         return len(exceptions), result.duplicate
 
+    def _held_contracts(self) -> dict[str, ContractRef]:
+        """Each open follower idea's contract: a follow-up acts on its own idea's contract."""
+        out = {}
+        for p in self.coordinator.ledger():
+            if p.contract and p.status in ("OPEN", "PENDING"):
+                out[p.idea_id] = ContractRef.model_validate_json(p.contract)
+        return out
+
     def _gate_quotes(
-        self, parsed: ParsedPost, decisions: list[MappingDecision]
+        self, parsed: ParsedPost, decisions: list[MappingDecision], now: datetime | None = None
     ) -> dict[str, Quote]:
         """The broker's own quote for every instrument the mapping policy lets through. A missing or
-        unusable quote is simply absent; the gateway then blocks with QUOTE_UNAVAILABLE."""
-        supported = {d.action_id for d in decisions if d.status == "SUPPORTED"}
+        unusable quote is simply absent; the gateway then blocks with QUOTE_UNAVAILABLE. A mapped
+        family gets a ``MappedQuote``: its terms and both legs (the gateway decides on them)."""
+        now = now or self.clock()
+        supported = {d.action_id: d for d in decisions if d.status == "SUPPORTED"}
         quotes: dict[str, Quote] = {}
         for a in parsed.actions:
-            if a.action_id not in supported or a.instrument is None:
+            d = supported.get(a.action_id)
+            if d is None or a.instrument is None:
+                continue
+            if d.mapped:
+                key = a.instrument.quote_key
+                if key not in quotes:
+                    quotes[key] = self._mapped_quote(self.mapping.entries[d.family], a.instrument,
+                                                     now)
                 continue
             symbol = a.instrument.symbol
             if symbol in quotes:
@@ -468,6 +503,77 @@ class RuntimeService:
                 continue
             quotes[symbol] = Quote(symbol=symbol, bid=q.bid, ask=q.ask, observed_at=q.received_at)
         return quotes
+
+    def _mapped_quote(self, entry: FamilyMapping, instrument, now: datetime) -> MappedQuote:
+        """Resolve the execution and reference contracts and read both quotes. Nothing is dropped:
+        a contract that does not resolve, a missing quote or a specification that differs from the
+        approved entry is carried in the terms, and the gateway holds on it."""
+        contract = reference = None
+        problems: list[str] = []
+        try:
+            contract = self.broker.resolve(instrument)
+        except BrokerError:
+            pass
+        ref_instrument = entry.reference_instrument()
+        if entry.basis in ("BASIS_SHIFT", "REFERENCE_TRIGGER") and ref_instrument is not None:
+            try:
+                reference = self.broker.resolve(ref_instrument)
+            except BrokerError:
+                pass
+        elif entry.basis == "DIRECT":
+            reference = contract
+        terms = entry.terms(instrument, contract, reference, problems)
+        bid = ask = None
+        quality, observed = QuoteQuality.UNAVAILABLE.value, now
+        if contract is not None:
+            try:
+                q = self.broker.quote(contract)
+                bid, ask, quality, observed = q.bid, q.ask, q.quality.value, q.received_at
+            except BrokerError:
+                pass
+        if bid is None or ask is None:
+            bid = ask = Decimal(0)
+            quality = QuoteQuality.UNAVAILABLE.value
+        leg = None
+        if reference is not None and entry.basis != "DIRECT":
+            rq = reference_quote(self.broker, reference, now)
+            leg = LegQuote(contract_key=reference.contract_key, bid=rq.bid, ask=rq.ask,
+                           last=rq.last, observed_at=rq.received_at, quality=rq.quality.value)
+        return MappedQuote(symbol=instrument.symbol, bid=bid, ask=ask, observed_at=observed,
+                           quality=quality, terms=terms, reference=leg)
+
+    def _check_roll_windows(self, now: datetime) -> None:
+        """A follower position in a contract inside its roll window is flagged (alert and
+        notification) for a human to flatten or roll by a new instruction. The service never
+        sends an order the gateway did not approve from a publisher action."""
+        keep: set[str] = set()
+        for p in self.coordinator.ledger():
+            if p.quantity <= 0 or not p.contract:
+                continue
+            contract = ContractRef.model_validate_json(p.contract)
+            entry = self.mapping.entry_for_contract(contract)
+            if entry is None or entry.roll is None or not contract.expiry:
+                continue
+            month = contract.expiry[:6]
+            roll = next((c.roll_date for c in entry.contracts if c.month == month), None)
+            if roll is None:
+                continue
+            terms = entry.terms(
+                Instrument(asset_class=contract.asset_class, symbol=contract.symbol,
+                           futures_contract=month), contract, None)
+            if not in_roll_window(terms, now):
+                continue
+            key = f"ROLL:{p.idea_id}"
+            keep.add(key)
+            detail = (
+                f"{p.idea_id} holds {p.quantity} {contract.contract_key}; roll date {roll}, "
+                f"{entry.roll.business_days_before} business days before it the position must be "
+                "flattened (never held into a delivery window)"
+            )
+            if self.store.open_alert(key, ROLL_DUE, detail, now):
+                self.store.event(now, ROLL_DUE, idea_id=p.idea_id, contract=contract.contract_key)
+                self.notifier.notify(ROLL_DUE, "Contract inside its roll window", detail)
+        self.store.resolve_alerts(now, keep=keep, prefix="ROLL:")
 
     def _refresh_runtime_exceptions(self, now: datetime) -> None:
         """A signal held as UNRESOLVED is closed once its intent's outcome is known."""
