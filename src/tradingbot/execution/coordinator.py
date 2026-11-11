@@ -1442,13 +1442,29 @@ class ExecutionCoordinator:
         )
         per_cap = self.policy.max_instrument_exposure_usd or self.policy.max_notional_usd
         new = limit * qty
-        symbol_exposure, total_exposure = self._exposure(contract.symbol, exclude_ref)
+        try:
+            symbol_exposure, total_exposure = self._exposure(contract.symbol, exclude_ref, now)
+        except BrokerError:
+            return None, ["BROKER_POSITIONS_UNAVAILABLE"]
         if symbol_exposure + new > per_cap:
             return None, [f"INSTRUMENT_EXPOSURE_CAP:{symbol_exposure + new}>{per_cap}"]
         if total_exposure + new > self.policy.max_aggregate_exposure_usd:
             cap = self.policy.max_aggregate_exposure_usd
             return None, [f"AGGREGATE_EXPOSURE_CAP:{total_exposure + new}>{cap}"]
         return limit, []
+
+    def _mark(
+        self, contract: ContractRef | Instrument, fallback: Decimal | None, now: datetime
+    ) -> Decimal:
+        """The quote midpoint when a usable quote is available, otherwise the larger known cost."""
+        if isinstance(contract, Instrument):
+            contract, problem = self._resolve_contract(contract)
+            if problem:
+                return fallback or Decimal(0)
+        q, problem = self._usable_quote(contract, now)
+        if problem:
+            return fallback or Decimal(0)
+        return (q.bid + q.ask) / 2
 
     def _usable_quote(
         self, contract: ContractRef, now: datetime
@@ -1493,13 +1509,39 @@ class ExecutionCoordinator:
         }
         return any(p.symbol == symbol for p in self.store.positions() if p.idea_id in ideas)
 
-    def _exposure(self, symbol: str, exclude_ref: str | None = None) -> tuple[Decimal, Decimal]:
-        """Gross exposure at cost of every open follower idea plus every non-terminal entry or add
-        (``exclude_ref``: the intent being checked for its own resend)."""
-        per: dict[str, Decimal] = {}
+    def _exposure(
+        self, symbol: str, exclude_ref: str | None = None, now: datetime | None = None
+    ) -> tuple[Decimal, Decimal]:
+        """Gross exposure per instrument: the larger of the follower ledger's and the broker's
+        position (a broker-only position counts), valued at the current quote when a usable one is
+        available and at cost otherwise (review S3); plus every non-terminal entry or add at its
+        limit (``exclude_ref``: the intent being checked for its own resend). Raises BrokerError
+        when the broker positions cannot be read."""
+        now = now or self.clock()
+        held: dict[str, int] = {}
+        cost: dict[str, Decimal] = {}
+        contracts: dict[str, ContractRef | Instrument] = {}
         for p in self.store.positions():
-            if p.quantity > 0 and p.avg_price:
-                per[p.symbol] = per.get(p.symbol, Decimal(0)) + Decimal(p.avg_price) * p.quantity
+            if p.quantity > 0:
+                held[p.symbol] = held.get(p.symbol, 0) + p.quantity
+                if p.avg_price:
+                    cost[p.symbol] = max(cost.get(p.symbol, Decimal(0)), Decimal(p.avg_price))
+                contracts.setdefault(
+                    p.symbol, Instrument(asset_class=p.asset_class, symbol=p.symbol)
+                )
+        broker_held: dict[str, int] = {}
+        for bp in self.broker.positions():
+            sym = bp.contract.symbol
+            broker_held[sym] = broker_held.get(sym, 0) + bp.quantity
+            if bp.avg_cost:
+                cost[sym] = max(cost.get(sym, Decimal(0)), bp.avg_cost)
+            contracts[sym] = bp.contract
+        per: dict[str, Decimal] = {}
+        for sym in set(held) | set(broker_held):
+            qty = max(held.get(sym, 0), abs(broker_held.get(sym, 0)))
+            if qty == 0:
+                continue
+            per[sym] = self._mark(contracts[sym], cost.get(sym), now) * qty
         # Every entry or add that is not terminal may be live at the broker, whatever our view of
         # its order rows (recorded, ack lost, held PreSubmitted): its full intended quantity counts,
         # less what has already been applied to the ledger (counted above). Review M2.

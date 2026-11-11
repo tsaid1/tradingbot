@@ -470,3 +470,37 @@ def test_s2_no_usable_quote_means_no_exit_and_an_exception(tmp_path, quote):
     assert h.broker.submit_calls == calls
     assert "EXIT_WITHOUT_QUOTE" in [e.kind for e in h.coord.store.exceptions(open_only=True)]
     assert h.working()[f"{opened.order_ref}.STP"].remaining == 4  # the broker stop stays
+
+
+# ----------------------------------------------------------------------------------------- S3
+
+
+def test_s3_a_broker_only_position_counts_against_the_instrument_cap(tmp_path):
+    h = Harness(
+        tmp_path,
+        strict=True,
+        policy=MockPolicy(
+            quantity=4, max_notional_usd=Decimal(1000), max_instrument_exposure_usd=Decimal(600)
+        ),
+    )
+    foreign = OrderIntent(
+        order_ref="FOREIGN-1",
+        contract=h.broker.resolve(open_action().instrument),
+        side=OrderSide.BUY,
+        quantity=10,
+        order_type=OrderType.MKT,
+    )
+    h.broker.submit(foreign)  # 10 held at the broker, none of it in the ledger
+    out = h.execute("p1", open_action())
+    assert out.state == IntentState.REFUSED
+    assert out.reasons[0].startswith("INSTRUMENT_EXPOSURE_CAP")
+
+
+def test_s3_exposure_is_valued_at_the_current_quote(tmp_path):
+    h = _capped(tmp_path, cap=300)
+    h.execute("p1", open_action(target=None))  # 4 at 50.02 (cost 200.08)
+    h.broker.set_quote(SYMBOL, "59.98", "60.02")  # now worth 240
+    h.broker.set_quote("QQZ", "19.99", "20.01")
+    out = h.execute("p2", open_action(symbol="QQZ", entry="20", stop="19", target="22"))
+    assert out.state == IntentState.REFUSED  # 240 + 80.80 > 300 (at cost it would pass)
+    assert out.reasons[0].startswith("AGGREGATE_EXPOSURE_CAP")
