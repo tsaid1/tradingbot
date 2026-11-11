@@ -19,6 +19,7 @@ from tradingbot.execution.broker import (
     TERMINAL_STATUSES,
     WORKING_STATUSES,
     OrderIntent,
+    OrderNotFound,
     OrderSide,
     OrderStatus,
     OrderType,
@@ -251,3 +252,104 @@ def test_r5_a_second_coordinator_on_the_same_store_refuses_to_start(tmp_path):
     out, _ = late.communicate(timeout=30)
     assert late.returncode == 3 and "in use by another" in out
     mine.close()
+
+
+# ------------------------------------------------------------------------------------ R1 / R6
+
+
+def _exit_commitment(h: Harness, idea: str = "p1:open") -> int:
+    """Working exit quantity at the broker for one long idea: resting exits plus the protective
+    pair (one-cancels-other siblings count once, at the larger remaining)."""
+    pos = h.coord.store.position(idea)
+    working = h.working()
+    children = [working[r].remaining for r in (pos.stop_ref, pos.target_ref) if r in working]
+    exits = sum(
+        working[r.order_ref].remaining
+        for r in h.coord.store.orders()
+        if r.idea_id == idea and r.role.value == "EXIT" and r.order_ref in working
+    )
+    return exits + max(children, default=0)
+
+
+def test_r1_a_resting_reduce_is_netted_against_the_protective_children(tmp_path):
+    h = Harness(tmp_path, strict=True)
+    opened = h.execute("p1", open_action())
+    h.broker.script_next_submit("REST")  # the reduction rests (e.g. outside regular hours)
+    trim = h.execute("p2", action("trim", Action.REDUCE, idea="p1:open", fraction="0.5"))
+    assert trim.state == IntentState.WORKING
+    assert _exit_commitment(h) <= 4  # was 6: STP 4 + REDUCE 2 against 4 held
+    events = h.events()
+    assert events.index("PROTECTIVE_RESIZED") < max(
+        i for i, e in enumerate(events) if e == "SUBMIT"
+    )
+    h.broker.fill(trim.order_ref)
+    h.broker.set_quote(SYMBOL, "47.90", "47.95")  # the stop fires before any sync
+    assert sum(p.quantity for p in h.broker.positions()) == 0  # flat, never short
+    h.coord.sync()
+    assert h.coord.store.position("p1:open").status == "CLOSED"
+    assert not [e for e in h.coord.store.exceptions(open_only=True)]
+    assert opened.order_ref
+
+
+def test_r1_a_close_after_a_resting_reduce_cannot_leave_the_account_short(tmp_path):
+    h = Harness(tmp_path, strict=True)
+    h.execute("p1", open_action())
+    h.broker.script_next_submit("REST")
+    trim = h.execute("p2", action("trim", Action.REDUCE, idea="p1:open", fraction="0.5"))
+    close = h.execute("p3", action("close", Action.CLOSE, idea="p1:open"))
+    assert close.state == IntentState.FILLED and close.filled_quantity == 4
+    assert h.working() == {}
+    with pytest.raises(OrderNotFound):  # the resting reduction was cancelled before the close
+        h.broker.fill(trim.order_ref)
+    h.broker.set_quote(SYMBOL, "47.90", "47.95")
+    assert h.broker.positions() == []
+    assert h.coord.reconcile().clean
+
+
+def test_r1_an_unconfirmed_resize_means_no_exit_is_sent(tmp_path):
+    h = Harness(tmp_path, strict=True)
+    h.execute("p1", open_action())
+    h.broker.pending_seconds = 30  # cancels and amendments do not take effect in time
+    calls = h.broker.submit_calls
+    trim = h.execute("p2", action("trim", Action.REDUCE, idea="p1:open", fraction="0.5"))
+    assert trim.state == IntentState.REFUSED and trim.reasons[0] == "EXIT_NOT_NETTED"
+    assert h.broker.submit_calls == calls
+    assert "EXIT_NOT_NETTED" in [e.kind for e in h.coord.store.exceptions(open_only=True)]
+
+
+def test_r1_a_cancel_that_loses_the_race_to_the_stop_sends_no_close(tmp_path):
+    h = Harness(tmp_path, strict=True)
+    h.execute("p1", open_action())
+    h.broker.script_next_cancel("FILL_FIRST")  # the stop fills before its cancel lands
+    calls = h.broker.submit_calls
+    close = h.execute("p2", action("close", Action.CLOSE, idea="p1:open"))
+    assert close.state == IntentState.REFUSED and h.broker.submit_calls == calls
+    assert h.broker.positions() == []  # flat through the stop, not short through a close
+    assert h.coord.store.position("p1:open").status == "CLOSED"
+
+
+def test_r6_a_close_cancels_the_partly_filled_entry_first(tmp_path):
+    h = Harness(tmp_path, strict=True)
+    h.broker.script_next_submit("PARTIAL", quantity=1)
+    opened = h.execute("p1", open_action())
+    assert opened.state == IntentState.WORKING and opened.filled_quantity == 1
+    close = h.execute("p2", action("close", Action.CLOSE, idea="p1:open"))
+    assert close.state == IntentState.FILLED and close.filled_quantity == 1
+    assert opened.order_ref not in h.working()
+    with pytest.raises(OrderNotFound):  # the other 3 can no longer fill and reopen it
+        h.broker.fill(opened.order_ref)
+    h.coord.sync()
+    assert h.coord.intent(opened.order_ref).state == IntentState.CANCELLED
+    assert h.broker.positions() == [] and h.coord.reconcile().clean
+
+
+def test_r6_reconcile_flags_a_working_entry_of_a_closed_idea(tmp_path):
+    h = Harness(tmp_path, strict=True)
+    h.broker.script_next_submit("PARTIAL", quantity=1)
+    opened = h.execute("p1", open_action())
+    h.broker.set_quote(SYMBOL, "47.90", "47.95")  # the stop closes the 1 held
+    h.coord.sync()
+    assert h.coord.store.position("p1:open").status == "CLOSED"
+    kinds = [d.kind.value for d in h.coord.reconcile().discrepancies]
+    assert "WORKING_ENTRY_ON_CLOSED_IDEA" in kinds and not h.coord.reconcile().clean
+    assert opened.order_ref in h.working()

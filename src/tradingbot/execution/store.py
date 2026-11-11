@@ -306,6 +306,19 @@ class ExecutionStore:
                 ),
             )
 
+    def committed_exit_quantity(self, idea_id: str, *, exclude_ref: str | None = None) -> int:
+        """Quantity of the idea already committed to exits that may be live at the broker: every
+        REDUCE / CLOSE intent that is not terminal (recorded, unknown outcome or working), less what
+        it has filled. Protective children are sized to the position minus this (review R1)."""
+        total = 0
+        for i in self.intents(UNRESOLVED_STATES | {IntentState.WORKING}):
+            if i.idea_id != idea_id or i.order_ref == exclude_ref:
+                continue
+            if i.action not in (Action.REDUCE, Action.CLOSE):
+                continue
+            total += max(i.quantity - self.filled_quantity(i.order_ref), 0)
+        return total
+
     def mark_submitted(self, order_ref: str, at: datetime) -> None:
         with self.tx() as c:
             c.execute(

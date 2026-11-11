@@ -175,7 +175,17 @@ def test_no_trace_and_stale_add_is_not_resent(h):
 
 def test_no_trace_exit_is_resent_even_when_stale_because_it_only_reduces(h):
     _open(h)
-    _unknown_and_unlookable(h, "LOST_ACK_NOT_PLACED")
+    # The exit is netted against the protective orders before it is sent (review R1), which reads
+    # the broker; so the lookup is made to fail only after the submission itself.
+    real = h.broker.submit
+
+    def submit_then_unreadable(order, children=()):
+        h.broker.submit = real
+        h.broker.lookup_failures = 1
+        return real(order, children)
+
+    h.broker.script_next_submit("LOST_ACK_NOT_PLACED")
+    h.broker.submit = submit_then_unreadable
     close = h.execute("p3", action("close", Action.CLOSE, idea="p1:open"))
     assert close.state == IntentState.UNRESOLVED
     h.clock.advance(h.policy.max_signal_age_seconds + 30)

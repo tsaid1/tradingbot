@@ -29,6 +29,8 @@ class DiscrepancyKind(str, Enum):
     INTENT_STUCK_UNRESOLVED = "INTENT_STUCK_UNRESOLVED"
     UNAPPLIED_EXECUTION = "UNAPPLIED_EXECUTION"
     BROKER_UNREADABLE = "BROKER_UNREADABLE"
+    # A working entry or add of an idea that is closed or being closed: it would reopen it.
+    WORKING_ENTRY_ON_CLOSED_IDEA = "WORKING_ENTRY_ON_CLOSED_IDEA"
     # An approved atomic group executed only in part (an open PARTIAL_GROUP exception): never
     # explained away, it stays unclean until a human resolves the exception.
     PARTIAL_GROUP = "PARTIAL_GROUP"
@@ -106,13 +108,17 @@ def reconcile(
             kind, detail = DiscrepancyKind.QUANTITY_MISMATCH, f"ledger {ours}, broker {theirs}"
         out.append(Discrepancy(kind=kind, symbol=symbol, detail=detail))
 
-    # 2. Every open idea with a stop level needs a working stop covering exactly its quantity.
+    # 2. Every open idea with a stop level needs a working stop covering exactly its quantity less
+    #    what is committed to exits that may be live (review R1).
     open_by_ref = {o.order_ref: o for o in open_orders}
+    cover = {
+        p.idea_id: max(p.quantity - store.committed_exit_quantity(p.idea_id), 0) for p in ledger
+    }
     for p in ledger:
-        if p.quantity <= 0 or p.stop_price is None:
+        if p.quantity <= 0 or p.stop_price is None or cover[p.idea_id] == 0:
             continue
         stop = open_by_ref.get(p.stop_ref) if p.stop_ref else None
-        if stop is None or not stop.working or stop.remaining != p.quantity:
+        if stop is None or not stop.working or stop.remaining != cover[p.idea_id]:
             covered = stop.remaining if stop is not None else 0
             out.append(
                 Discrepancy(
@@ -152,14 +158,35 @@ def reconcile(
                         detail="protective order working while the follower idea is flat",
                     )
                 )
-            elif pos.quantity and o.remaining > pos.quantity:
+            elif pos.quantity and o.remaining > cover[pos.idea_id]:
                 out.append(
                     Discrepancy(
                         kind=DiscrepancyKind.ORPHAN_WORKING_ORDER,
                         symbol=o.contract.symbol,
                         idea_id=row.idea_id,
                         order_ref=o.order_ref,
-                        detail=f"protective order oversized: {o.remaining} > {pos.quantity}",
+                        detail=(
+                            f"protective order oversized: {o.remaining} > {cover[pos.idea_id]} "
+                            f"(held {pos.quantity}, less working exits)"
+                        ),
+                    )
+                )
+        if row.role == Role.ENTRY and pos is not None:
+            closing = any(
+                i.idea_id == row.idea_id
+                and i.action.value == "CLOSE"
+                and i.state.value in ("RECORDED", "UNRESOLVED", "WORKING")
+                for i in intents.values()
+            )
+            if pos.status in ("CLOSED", "REVERSED") or closing:
+                out.append(
+                    Discrepancy(
+                        kind=DiscrepancyKind.WORKING_ENTRY_ON_CLOSED_IDEA,
+                        symbol=o.contract.symbol,
+                        idea_id=row.idea_id,
+                        order_ref=o.order_ref,
+                        detail=f"entry/add working while the idea is {pos.status}"
+                        + (" and being closed" if closing else ""),
                     )
                 )
         intent = intents.get(row.intent_ref)

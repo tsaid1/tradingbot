@@ -20,6 +20,7 @@ import contextlib
 import fcntl
 import hashlib
 import os
+import time
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, InvalidOperation
@@ -79,6 +80,9 @@ COMPLETED_LOOKBACK = timedelta(minutes=5)
 SUBMIT_ERROR = "SUBMIT_ERROR"
 # An unknown outcome older than the broker's lookup horizon: only a human can settle it.
 UNKNOWN_OUTCOME_BEYOND_LOOKUP_HORIZON = "UNKNOWN_OUTCOME_BEYOND_LOOKUP_HORIZON"
+# An exit was not sent because the working entries, earlier exits or protective children could not
+# be cancelled or resized first, with the result confirmed at the broker (review R1 / R6).
+EXIT_NOT_NETTED = "EXIT_NOT_NETTED"
 
 
 def default_halt_file() -> Path:
@@ -104,6 +108,9 @@ class ExecutionConfig(StrictModel):
     # How far back the broker's executions / completed-orders queries reach (IBKR: the current
     # day). An unknown outcome older than this can never be proven absent: it is never resent.
     lookup_horizon_seconds: int = Field(default=6 * 3600, gt=0)
+    # Cancel / resize confirmation before an exit: this many broker reads, this far apart.
+    confirm_attempts: int = Field(default=3, ge=1, le=20)
+    confirm_wait_seconds: float = Field(default=0.0, ge=0, le=5)
 
 
 class ExecutionOutcome(StrictModel):
@@ -554,7 +561,7 @@ class ExecutionCoordinator:
             order_type="MKT",
         )
         self._record(intent, [order], role=Role.EXIT)
-        self._submit(intent, order, [])
+        self._submit_exit(self.store.intent(ref), order)
         return self._outcome(ref)
 
     def _modify(self, source, action, gate, ref, account, now) -> ExecutionOutcome:
@@ -632,6 +639,194 @@ class ExecutionCoordinator:
             orders={a.order_ref: a.status.value for a in acks},
         )
         self._adopt(intent, acks, [])
+
+    # ================================================================== exit netting
+
+    def _submit_exit(self, intent: Intent, order: OrderIntent) -> None:
+        """Send a REDUCE / CLOSE only once the idea's working exit quantity is netted (review R1):
+        working entry and add orders are cancelled and confirmed first (R6), a CLOSE cancels the
+        earlier resting exits, and the protective children are resized (or cancelled) so that
+        children + resting exits + this exit never exceed the position. Any step that cannot be
+        confirmed at the broker means nothing is sent and EXIT_NOT_NETTED is opened."""
+        if self._halt_blocks(intent):
+            return
+        problems = self._net_exit(intent)
+        if problems:
+            self._exit_not_netted(intent, problems)
+            return
+        self._submit(intent, order, [])
+
+    def _net_exit(self, intent: Intent) -> list[str]:
+        idea = intent.idea_id
+        pos = self.store.position(idea)
+        if pos is None or pos.quantity <= 0:
+            return ["NO_OPEN_FOLLOWER_POSITION"]
+        before = pos.quantity
+        try:
+            open_by_ref = {o.order_ref: o for o in self.broker.open_orders()}
+        except BrokerError:
+            return ["BROKER_OPEN_ORDERS_UNAVAILABLE"]
+        rows = [r for r in self.store.orders() if r.idea_id == idea]
+        for r in rows:  # R6: an entry or add still working would reopen what this exit closes
+            if (
+                r.role == Role.ENTRY
+                and r.order_ref in open_by_ref
+                and not self._cancel_confirmed(r.order_ref, idea, "working entry before an exit")
+            ):
+                return [f"ENTRY_CANCEL_UNCONFIRMED:{r.order_ref}"]
+        for r in rows:  # a CLOSE replaces every earlier resting exit of the idea
+            if (
+                intent.action == Action.CLOSE
+                and r.role == Role.EXIT
+                and r.intent_ref != intent.order_ref
+                and r.order_ref in open_by_ref
+                and not self._cancel_confirmed(r.order_ref, idea, "replaced by a close")
+            ):
+                return [f"EXIT_CANCEL_UNCONFIRMED:{r.order_ref}"]
+        # Apply anything that filled meanwhile; the children are resized to what stays uncommitted.
+        if not self.sync():
+            return ["BROKER_UNREADABLE"]
+        pos = self.store.position(idea)
+        if pos.quantity != before:
+            return [f"EXIT_NETTING_POSITION_CHANGED:{before}->{pos.quantity}"]
+        committed = self.store.committed_exit_quantity(idea, exclude_ref=intent.order_ref)
+        left = pos.quantity - committed - intent.quantity
+        if left < 0:
+            return [f"EXIT_EXCEEDS_UNCOMMITTED_POSITION:{pos.quantity}-{committed}<{intent.quantity}"]
+        try:
+            open_by_ref = {o.order_ref: o for o in self.broker.open_orders()}
+        except BrokerError:
+            return ["BROKER_OPEN_ORDERS_UNAVAILABLE"]
+        for ref in (pos.stop_ref, pos.target_ref):
+            o = open_by_ref.get(ref) if ref else None
+            if o is None:
+                continue
+            if left == 0:
+                if not self._cancel_confirmed(ref, idea, "position fully committed to exits"):
+                    return [f"PROTECTIVE_CANCEL_UNCONFIRMED:{ref}"]
+            elif o.remaining > left and not self._resize_confirmed(o, left, idea):
+                return [f"PROTECTIVE_RESIZE_UNCONFIRMED:{ref}"]
+        # A cancel or resize can lose the race with a fill: only an unchanged position may exit.
+        if not self.sync():
+            return ["BROKER_UNREADABLE"]
+        after = self.store.position(idea).quantity
+        if after != before:
+            return [f"EXIT_NETTING_POSITION_CHANGED:{before}->{after}"]
+        return self._account_exit_check(intent)
+
+    def _account_exit_check(self, intent: Intent) -> list[str]:
+        """Broker truth: every working order on the exit side of this instrument (one-cancels-other
+        siblings once, at the larger remaining), plus exits of unknown outcome, plus this exit,
+        within the broker position. Never relies on a broker-side reduce-only clamp."""
+        try:
+            held = sum(
+                p.quantity for p in self.broker.positions() if p.contract.symbol == intent.symbol
+            )
+            working = [
+                o for o in self.broker.open_orders()
+                if o.contract.symbol == intent.symbol and o.side.value == intent.side
+            ]
+        except BrokerError:
+            return ["BROKER_POSITIONS_UNAVAILABLE"]
+        reducible = held if intent.side == OrderSide.SELL.value else -held
+        groups: dict[str, int] = {}
+        for o in working:
+            key = o.parent_ref or o.order_ref
+            groups[key] = max(groups.get(key, 0), o.remaining)
+        visible = {o.order_ref for o in working}
+        unknown = sum(
+            max(i.quantity - self.store.filled_quantity(i.order_ref), 0)
+            for i in self.store.intents(UNRESOLVED_STATES)
+            if i.action in (Action.REDUCE, Action.CLOSE)
+            and i.symbol == intent.symbol
+            and i.order_ref not in visible
+            and i.order_ref != intent.order_ref
+        )
+        committed = sum(groups.values()) + unknown
+        if committed + intent.quantity > reducible:
+            return [f"EXIT_WOULD_OVERCOMMIT:{committed}+{intent.quantity}>{reducible}"]
+        return []
+
+    def _confirm(self, predicate) -> bool:
+        for attempt in range(self.config.confirm_attempts):
+            if attempt and self.config.confirm_wait_seconds:
+                time.sleep(self.config.confirm_wait_seconds)
+            try:
+                if predicate({o.order_ref: o for o in self.broker.open_orders()}):
+                    return True
+            except BrokerError:
+                continue
+        return False
+
+    def _cancel_confirmed(self, ref: str, idea_id: str, reason: str) -> bool:
+        """Cancel a working order and confirm it has left the broker's working orders and reached a
+        terminal state (cancelled, or filled if the cancel lost the race)."""
+        now = self.clock()
+        try:
+            self.broker.cancel(ref)
+        except OrderNotFound:
+            pass  # no longer working: confirmed below
+        except BrokerError as exc:
+            self.store.log(now, "CANCEL_FAILED", order_ref=ref, idea_id=idea_id, error=str(exc))
+            return False
+
+        def gone(open_by_ref) -> bool:
+            if ref in open_by_ref:
+                return False
+            return any(o.order_ref == ref for o in self.broker.completed_orders())
+
+        if self._confirm(gone):
+            self.store.log(self.clock(), "CANCEL_CONFIRMED", order_ref=ref, idea_id=idea_id,
+                           reason=reason)
+            return True
+        self.store.log(self.clock(), "CANCEL_UNCONFIRMED", order_ref=ref, idea_id=idea_id,
+                       reason=reason)
+        return False
+
+    def _resize_confirmed(self, o: BrokerOrder, left: int, idea_id: str) -> bool:
+        try:
+            self.broker.modify(o.order_ref, quantity=o.filled_quantity + left)
+        except BrokerError as exc:
+            self.store.log(self.clock(), "PROTECTIVE_RESIZE_FAILED", order_ref=o.order_ref,
+                           idea_id=idea_id, error=str(exc))
+            return False
+
+        def sized(open_by_ref) -> bool:
+            x = open_by_ref.get(o.order_ref)
+            return (
+                x is not None and x.remaining == left and x.status != OrderStatus.PENDING_CANCEL
+            )
+
+        if self._confirm(sized):
+            self.store.log(self.clock(), "PROTECTIVE_RESIZED", order_ref=o.order_ref,
+                           idea_id=idea_id, before=o.remaining, after=left, confirmed=True)
+            return True
+        self.store.log(self.clock(), "PROTECTIVE_RESIZE_UNCONFIRMED", order_ref=o.order_ref,
+                       idea_id=idea_id, wanted=left)
+        return False
+
+    def _exit_not_netted(self, intent: Intent, problems: list[str]) -> None:
+        now = self.clock()
+        self.store.set_state(
+            intent.order_ref, IntentState.REFUSED, now, reasons=[EXIT_NOT_NETTED, *problems]
+        )
+        for row in self.store.orders(intent.order_ref):
+            self.store.update_order(row.order_ref, now, status="NotSubmitted")
+        detail = f"{intent.action.value} {intent.quantity} not sent: {problems}"
+        self.store.raise_exception(
+            now, EXIT_NOT_NETTED, detail, idea_id=intent.idea_id, order_ref=intent.order_ref
+        )
+        self.store.log(
+            now,
+            EXIT_NOT_NETTED,
+            order_ref=intent.order_ref,
+            idea_id=intent.idea_id,
+            problems=problems,
+            rule="working exits could not be netted against the position: nothing sent",
+        )
+        self.sync()  # the intent is terminal now: children are sized back to the position
+
+    # ================================================================== submission helpers
 
     def _mark_unresolved(self, intent: Intent, event: str, error: str) -> None:
         self.store.set_state(
@@ -728,7 +923,10 @@ class ExecutionCoordinator:
             ),
         )
         entry, children = self._rebuild(intent, rows)
-        self._submit(intent, entry, children)
+        if intent.action in (Action.REDUCE, Action.CLOSE):
+            self._submit_exit(intent, entry)
+        else:
+            self._submit(intent, entry, children)
 
     def _resend_checks(self, intent: Intent, now: datetime) -> list[str]:
         """Everything an entry or add must pass at the moment of a resend, exactly as if it were
@@ -939,9 +1137,9 @@ class ExecutionCoordinator:
     # ================================================================== protective orders
 
     def _maintain_protection(self, idea_id: str) -> None:
-        """Size the idea's working stop/target to the ledger quantity (cancel when flat), then
-        confirm
-        at the broker that a working stop covers exactly that quantity. Raises UNPROTECTED_POSITION
+        """Size the idea's working stop/target to the ledger quantity less what is committed to
+        exits that may be live (cancel when that is zero or the idea is flat), then confirm at the
+        broker that a working stop covers exactly that quantity. Raises UNPROTECTED_POSITION
         otherwise. Never reports protection it has not seen."""
         pos = self.store.position(idea_id)
         if pos is None:
@@ -969,12 +1167,23 @@ class ExecutionCoordinator:
             self.store.resolve_exceptions(now, UNPROTECTED_POSITION, idea_id=idea_id)
             self.store.resolve_exceptions(now, PROTECTION_UNVERIFIED, idea_id=idea_id)
             return
+        cover = max(pos.quantity - self.store.committed_exit_quantity(idea_id), 0)
         changed = False
         for ref in refs:
             o = open_by_ref.get(ref)
-            if o is None:
+            if o is None or o.status == OrderStatus.PENDING_CANCEL:
                 continue
-            if o.remaining != pos.quantity:
+            if cover == 0:
+                # Everything held is committed to working exits: a child would over-commit.
+                changed |= self._try(
+                    lambda r=ref: self.broker.cancel(r),
+                    "PROTECTIVE_CANCELLED",
+                    idea_id,
+                    ref,
+                    reason="position fully committed to working exits",
+                )
+                continue
+            if o.remaining != cover:
                 if self.halted():
                     self.store.log(
                         now,
@@ -986,14 +1195,12 @@ class ExecutionCoordinator:
                     )
                     continue
                 if self._try(
-                    lambda o=o: self.broker.modify(
-                        o.order_ref, quantity=o.filled_quantity + pos.quantity
-                    ),
+                    lambda o=o: self.broker.modify(o.order_ref, quantity=o.filled_quantity + cover),
                     "PROTECTIVE_RESIZED",
                     idea_id,
                     ref,
                     before=o.remaining,
-                    after=pos.quantity,
+                    after=cover,
                 ):
                     changed = True
         if changed:
@@ -1010,11 +1217,16 @@ class ExecutionCoordinator:
             return
         # This check succeeded after every fill applied so far: its verdict is the protection.
         self.store.resolve_exceptions(now, PROTECTION_UNVERIFIED, idea_id=idea_id)
+        if cover == 0:
+            # Fully committed to working exits; no stop may work beside them (never CONFIRMED).
+            self.store.update_position(idea_id, now, protection="EXITING")
+            return
         stop = open_by_ref.get(pos.stop_ref) if pos.stop_ref else None
         if (
             stop is not None
             and stop.working
-            and stop.remaining == pos.quantity
+            and stop.status != OrderStatus.PENDING_CANCEL
+            and stop.remaining == cover
             and stop.order_type == OrderType.STP
         ):
             self.store.update_position(idea_id, now, protection="CONFIRMED")
@@ -1023,7 +1235,7 @@ class ExecutionCoordinator:
             return
         self.store.update_position(idea_id, now, protection="UNPROTECTED")
         detail = (
-            f"ledger holds {pos.quantity}; working stop covers "
+            f"ledger holds {pos.quantity} ({cover} not committed to exits); working stop covers "
             f"{stop.remaining if stop else 0} ({stop.status.value if stop else 'absent'})"
         )
         if self.store.raise_exception(
@@ -1061,7 +1273,9 @@ class ExecutionCoordinator:
             return "UNPROTECTED"
         if pos.quantity == 0:
             return "PENDING" if pos.status == "PENDING" else "NOT_REQUIRED"
-        return "CONFIRMED" if pos.protection == "CONFIRMED" else "UNKNOWN"
+        if pos.protection in ("CONFIRMED", "EXITING"):
+            return pos.protection
+        return "UNKNOWN"
 
     def _apply_modify(self, intent: Intent, *, recovering: bool = False) -> None:
         """Amend the working stop/target to absolute prices, then confirm them at the broker.
