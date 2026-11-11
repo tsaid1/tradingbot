@@ -66,10 +66,13 @@ SourcePost -> PaperEventReplay.process  (gate_source, gate_action, atomic groups
      |         |    \--broker--> CANCELLED (may carry a partial fill) | REJECTED
      | lookup by order_ref (open_orders + executions + completed_orders)
      +-- found ------------------> adopt broker state (WORKING / FILLED / REJECTED / CANCELLED)
+     +-- not yet settled --------> stays UNRESOLVED, looked up again later
+     +-- older than horizon -----> stays UNRESOLVED + open UNKNOWN_OUTCOME_BEYOND_LOOKUP_HORIZON
      +-- positive no trace, -----> journal NO_TRACE_AT_BROKER, resubmit same ref (budget 2)
-     |   exit, or entry/add whose source is still fresh
+     |   exit, or entry/add that passes the entry checks again now
      +-- positive no trace, -----> REFUSED + open STALE_AFTER_UNKNOWN_OUTCOME exception
-     |   entry/add whose source is stale
+     |   entry/add that fails them (stale source, old intent, quote, collar, caps)
+ definite submit error ---------> REJECTED (SUBMIT_ERROR), never resent
      +-- lookup failed / budget -> stays UNRESOLVED (reconcile: INTENT_STUCK_UNRESOLVED)
  REFUSED: precondition failed before anything was recorded for the broker, or a stale entry/add
  APPLIED: a MODIFY whose new prices were seen at the broker
@@ -92,6 +95,19 @@ order up at the broker by `order_ref` in `open_orders()`, `executions()` and `co
   its source post still passes `validator.source_is_fresh` at that moment (the publication time is
   stored on the intent). Otherwise it ends `REFUSED` with reason and open exception
   `STALE_AFTER_UNKNOWN_OUTCOME`. A reduce-only exit is resubmitted regardless of age.
+* "No trace" is concluded only once `ExecutionConfig.settle_seconds` (default 10 s) have passed
+  since the request: before that the intent stays `UNRESOLVED` (`LOOKUP_NOT_SETTLED`) and is looked
+  up again on a later `recover()`, because open orders can lag a fresh submission.
+* Before any resend of an entry or add, the entry checks run again at that moment: source
+  freshness, `max_intent_age_seconds` (default 120 s), broker-quote sanity, the collar, the exposure
+  caps, and the halt in `_submit`. Any failure ends it `REFUSED` with reasons
+  `[STALE_AFTER_UNKNOWN_OUTCOME, <specific reason>]` and an open exception; nothing is sent. The
+  redelivery path (`PRIOR_INTENT`) goes through the same `_resolve`.
+* An unknown outcome older than `lookup_horizon_seconds` (default 6 h; IBKR executions cover the
+  current day) can never be proven absent: it stays `UNRESOLVED` with an open
+  `UNKNOWN_OUTCOME_BEYOND_LOOKUP_HORIZON` exception for a human, and is never resent.
+* A definite submit error (a `BrokerError` that is not `AckLost`) is a known outcome: the intent
+  ends `REJECTED` with reason `SUBMIT_ERROR` and is never resent.
 * A lookup that fails leaves the intent `UNRESOLVED`.
 
 Duplicate delivery of a post revision is stopped twice:

@@ -44,6 +44,8 @@ CREATE TABLE IF NOT EXISTS exec_intents (
     attempts INTEGER NOT NULL DEFAULT 0,
     reasons TEXT NOT NULL DEFAULT '[]',
     source_published_at TEXT,
+    entry_reference TEXT,
+    submitted_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     UNIQUE (source_id, revision, action_id)
@@ -153,6 +155,10 @@ class Intent(StrictModel):
     reasons: list[str] = Field(default_factory=list)
     # When the source post was published: a resend after an unknown outcome re-checks freshness.
     source_published_at: datetime | None = None
+    # The source's entry level (OPEN / ADD), so a resend can re-run the entry checks around it.
+    entry_reference: str | None = None
+    # When the last submission request was made: the no-trace settle period counts from here.
+    submitted_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -225,8 +231,9 @@ class ExecutionStore:
         with self.tx() as c:
             c.executescript(SCHEMA)
             cols = {r["name"] for r in c.execute("PRAGMA table_info(exec_intents)")}
-            if "source_published_at" not in cols:  # a store created before this column existed
-                c.execute("ALTER TABLE exec_intents ADD COLUMN source_published_at TEXT")
+            for col in ("source_published_at", "entry_reference", "submitted_at"):
+                if col not in cols:  # a store created before this column existed
+                    c.execute(f"ALTER TABLE exec_intents ADD COLUMN {col} TEXT")
 
     @contextmanager
     def tx(self) -> Iterator[sqlite3.Connection]:
@@ -287,6 +294,14 @@ class ExecutionStore:
                     at.isoformat(),
                     order_ref,
                 ),
+            )
+
+    def mark_submitted(self, order_ref: str, at: datetime) -> None:
+        with self.tx() as c:
+            c.execute(
+                "UPDATE exec_intents SET attempts=attempts+1, submitted_at=?, updated_at=? "
+                "WHERE order_ref=?",
+                (at.isoformat(), at.isoformat(), order_ref),
             )
 
     # ------------------------------------------------------------------ orders

@@ -178,6 +178,10 @@ def test_lost_ack_with_order_placed_is_adopted_not_resent(h):
 def test_lost_ack_without_order_is_resubmitted_once_with_journaled_reason(h):
     h.broker.script_next_submit("LOST_ACK_NOT_PLACED")
     out, _ = opened(h)
+    assert out.state == IntentState.UNRESOLVED  # "no trace" is not concluded before the settle
+    assert h.broker.submit_calls == 1
+    h.clock.advance(h.config.settle_seconds + 1)
+    [out] = h.coord.recover()
     assert out.state == IntentState.FILLED
     assert h.broker.submit_calls == 2 and len(h.broker.orders_with_ref(out.order_ref)) == 1
     [no_trace] = [
@@ -192,7 +196,10 @@ def test_resend_budget_exhausted_stays_unresolved_and_is_reported_stuck(h):
     h.broker.script_next_submit("LOST_ACK_NOT_PLACED")
     out, _ = opened(h)
     assert out.state == IntentState.UNRESOLVED and out.replay_status == "UNRESOLVED"
+    h.clock.advance(h.config.settle_seconds + 1)
+    h.coord.recover()  # settled, no trace: the one resend (also lost)
     assert h.broker.submit_calls == 2
+    h.clock.advance(h.config.settle_seconds + 1)
     h.coord.recover()  # still no trace, budget spent: no third send
     assert h.broker.submit_calls == 2
     h.clock.advance(120)
@@ -235,6 +242,7 @@ def test_restart_before_the_request_left_resubmits_after_positive_no_trace(h):
     with pytest.raises(SimulatedCrash):
         opened(h)
     h.restart()
+    h.clock.advance(h.config.settle_seconds + 1)
     [recovered] = h.coord.recover()
     ref = order_ref_for("p1", 1, "open")
     assert recovered.state == IntentState.FILLED
@@ -259,6 +267,7 @@ def test_halt_also_blocks_a_recovery_resubmission(h):
     out, _ = opened(h)
     assert out.state == IntentState.UNRESOLVED
     h.halt()
+    h.clock.advance(h.config.settle_seconds + 1)
     h.coord.recover()
     assert h.coord.intent(out.order_ref).state == IntentState.HALTED
     assert h.broker.submit_calls == 1

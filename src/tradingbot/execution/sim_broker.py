@@ -63,6 +63,7 @@ CREATE TABLE IF NOT EXISTS sim_orders (
     avg_fill_price TEXT,
     reason TEXT NOT NULL DEFAULT '',
     held INTEGER NOT NULL DEFAULT 0,
+    placed_at TEXT,
     updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS sim_orders_ref ON sim_orders(order_ref);
@@ -122,6 +123,8 @@ class Behaviour(str, Enum):
     # The request arrived and the broker rejected (or cancelled) the bracket, then the ack is lost:
     # the order leaves no trace in open orders or executions, only in completed orders.
     LOST_ACK_REJECTED = "LOST_ACK_REJECTED"
+    # Placed and resting (no fill), then the ack is lost: visible only through open orders.
+    LOST_ACK_PLACED_RESTING = "LOST_ACK_PLACED_RESTING"
     LOST_ACK_CANCELLED = "LOST_ACK_CANCELLED"
 
 
@@ -156,8 +159,15 @@ class SimBroker:
         self._modify_script: deque[str] = deque()
         self.lookup_failures = 0  # next N open_orders()/executions() calls raise BrokerError
         self.submit_calls = 0
+        # IBKR realism, off by default: a freshly placed order is invisible to open_orders() for
+        # this long, and executions / completed orders reach back only this far (IBKR: one day).
+        self.open_orders_lag_seconds = 0.0
+        self.history_seconds: float | None = None
         with self._tx() as c:
             c.executescript(SCHEMA)
+            cols = {r["name"] for r in c.execute("PRAGMA table_info(sim_orders)")}
+            if "placed_at" not in cols:
+                c.execute("ALTER TABLE sim_orders ADD COLUMN placed_at TEXT")
 
     # ------------------------------------------------------------------ plumbing
 
@@ -328,12 +338,17 @@ class SimBroker:
                     and item.order_type == OrderType.STP
                 ):
                     status, reason = OrderStatus.INACTIVE, "SIMULATED_CHILD_INACTIVE"
-                held = int(idx == 0 and script.behaviour in (Behaviour.REST, Behaviour.PARTIAL))
+                held = int(
+                    idx == 0
+                    and script.behaviour
+                    in (Behaviour.REST, Behaviour.PARTIAL, Behaviour.LOST_ACK_PLACED_RESTING)
+                )
                 cur = c.execute(
                     """INSERT INTO sim_orders (order_ref,parent_ref,symbol,asset_class,con_id,side,
                     quantity,
-                    order_type,limit_price,stop_price,tif,reduce_only,status,reason,held,updated_at)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    order_type,limit_price,stop_price,tif,reduce_only,status,reason,held,updated_at,
+                    placed_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         item.order_ref,
                         item.parent_ref,
@@ -350,6 +365,7 @@ class SimBroker:
                         status.value,
                         reason,
                         held,
+                        now,
                         now,
                     ),
                 )
@@ -370,6 +386,7 @@ class SimBroker:
             ]
         if script.behaviour in (
             Behaviour.LOST_ACK_PLACED,
+            Behaviour.LOST_ACK_PLACED_RESTING,
             Behaviour.LOST_ACK_REJECTED,
             Behaviour.LOST_ACK_CANCELLED,
         ):
@@ -439,7 +456,17 @@ class SimBroker:
                 "ORDER BY broker_order_id",
                 [s.value for s in WORKING_STATUSES],
             ).fetchall()
+        if self.open_orders_lag_seconds:
+            cutoff = self._now() - timedelta(seconds=self.open_orders_lag_seconds)
+            rows = [r for r in rows if not r["placed_at"]
+                    or datetime.fromisoformat(r["placed_at"]) <= cutoff]
         return [self._order(r) for r in rows]
+
+    def _history_cutoff(self, since: datetime | None) -> datetime | None:
+        if self.history_seconds is None:
+            return since
+        floor = self._now() - timedelta(seconds=self.history_seconds)
+        return floor if since is None or since < floor else since
 
     def executions(self, since: datetime | None = None) -> list[Fill]:
         self._maybe_fail_lookup()
@@ -461,6 +488,7 @@ class SimBroker:
             )
             for r in rows
         ]
+        since = self._history_cutoff(since)
         return [f for f in fills if since is None or f.executed_at >= since]
 
     def completed_orders(self, since: datetime | None = None) -> list[BrokerOrder]:
@@ -473,6 +501,7 @@ class SimBroker:
                 [s.value for s in TERMINAL_STATUSES],
             ).fetchall()
         orders = [self._order(r) for r in rows]
+        since = self._history_cutoff(since)
         return [o for o in orders if since is None or o.updated_at >= since]
 
     def positions(self) -> list[BrokerPosition]:

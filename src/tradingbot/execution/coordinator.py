@@ -69,6 +69,10 @@ MODIFY_NOT_CONFIRMED = "MODIFY_NOT_CONFIRMED"
 STALE_AFTER_UNKNOWN_OUTCOME = "STALE_AFTER_UNKNOWN_OUTCOME"
 # How far before an intent's creation the completed-orders lookup reaches (clock skew allowance).
 COMPLETED_LOOKBACK = timedelta(minutes=5)
+# A submit that failed with a definite error (not a lost acknowledgement): never resent.
+SUBMIT_ERROR = "SUBMIT_ERROR"
+# An unknown outcome older than the broker's lookup horizon: only a human can settle it.
+UNKNOWN_OUTCOME_BEYOND_LOOKUP_HORIZON = "UNKNOWN_OUTCOME_BEYOND_LOOKUP_HORIZON"
 
 
 def default_halt_file() -> Path:
@@ -86,6 +90,14 @@ class ExecutionConfig(StrictModel):
     max_submit_attempts: int = Field(default=2, ge=1, le=5)
     # Reconciliation reports an unresolved intent older than this as stuck.
     stuck_after_seconds: int = Field(default=60, gt=0)
+    # After an unknown submit outcome, "no trace at the broker" may be concluded only once this long
+    # has passed since the request (open orders can lag a fresh submission at the broker).
+    settle_seconds: float = Field(default=10.0, ge=0)
+    # An entry or add older than this (since its intent was recorded) is never resent.
+    max_intent_age_seconds: int = Field(default=120, gt=0)
+    # How far back the broker's executions / completed-orders queries reach (IBKR: the current
+    # day). An unknown outcome older than this can never be proven absent: it is never resent.
+    lookup_horizon_seconds: int = Field(default=6 * 3600, gt=0)
 
 
 class ExecutionOutcome(StrictModel):
@@ -551,7 +563,7 @@ class ExecutionCoordinator:
         if self._halt_blocks(intent):
             return
         attempt = self.store.intent(intent.order_ref).attempts + 1
-        self.store.set_state(intent.order_ref, intent.state, self.clock(), attempts_delta=1)
+        self.store.mark_submitted(intent.order_ref, self.clock())
         self.store.log(
             self.clock(),
             "SUBMIT",
@@ -563,12 +575,12 @@ class ExecutionCoordinator:
         try:
             acks = self.broker.submit(entry, children)
         except AckLost as exc:
+            # Unknown outcome: look up now (adopt if visible); "no trace" waits for the settle.
             self._mark_unresolved(intent, "ACK_LOST", str(exc))
             self._resolve(self.store.intent(intent.order_ref))
             return
         except BrokerError as exc:
-            self._mark_unresolved(intent, "SUBMIT_ERROR", str(exc))
-            self._resolve(self.store.intent(intent.order_ref))
+            self._submit_failed(intent, str(exc))
             return
         self.store.log(
             self.clock(),
@@ -610,7 +622,9 @@ class ExecutionCoordinator:
         found_fills = [f for f in fills if f.order_ref in refs]
         # A ref still working wins over an older terminal row under the same ref (a resend).
         working_refs = {o.order_ref for o in found_open}
-        found_done = [o for o in completed if o.order_ref in refs and o.order_ref not in working_refs]
+        found_done = [
+            o for o in completed if o.order_ref in refs and o.order_ref not in working_refs
+        ]
         if found_open or found_fills or found_done:
             self.store.log(
                 self.clock(),
@@ -624,6 +638,24 @@ class ExecutionCoordinator:
             )
             self._adopt(intent, [*found_done, *found_open], found_fills)
             return
+        now = self.clock()
+        if intent.attempts > 0 and intent.submitted_at is not None:
+            since = (now - intent.submitted_at).total_seconds()
+            if since > self.config.lookup_horizon_seconds:
+                self._beyond_horizon(intent, sorted(refs), since)
+                return
+            if since < self.config.settle_seconds:
+                # Not visible yet proves nothing: the order may still be settling at the broker.
+                self.store.log(
+                    now,
+                    "LOOKUP_NOT_SETTLED",
+                    order_ref=intent.order_ref,
+                    idea_id=intent.idea_id,
+                    seconds_since_submit=round(since, 3),
+                    settle_seconds=self.config.settle_seconds,
+                    rule="no trace yet; stays UNRESOLVED and is looked up again later",
+                )
+                return
         if intent.attempts >= self.config.max_submit_attempts:
             self._mark_unresolved(
                 intent,
@@ -631,13 +663,11 @@ class ExecutionCoordinator:
                 f"{intent.attempts} submissions already made",
             )
             return
-        now = self.clock()
-        if intent.action in (Action.OPEN, Action.ADD) and not (
-            intent.source_published_at is not None
-            and source_is_fresh(intent.source_published_at, now, self.policy)
-        ):
-            self._expire(intent, sorted(refs))
-            return
+        if intent.action in (Action.OPEN, Action.ADD):
+            problems = self._resend_checks(intent, now)
+            if problems:
+                self._expire(intent, sorted(refs), problems)
+                return
         self.store.log(
             now,
             "NO_TRACE_AT_BROKER",
@@ -653,12 +683,92 @@ class ExecutionCoordinator:
         entry, children = self._rebuild(intent, rows)
         self._submit(intent, entry, children)
 
-    def _expire(self, intent: Intent, checked: list[str]) -> None:
-        """No trace anywhere at the broker, and the source post is no longer fresh: the entry is
-        never sent. The intent ends REFUSED and an exception record makes that visible."""
+    def _resend_checks(self, intent: Intent, now: datetime) -> list[str]:
+        """Everything an entry or add must pass at the moment of a resend, exactly as if it were
+        new: source freshness, intent age, then the broker-quote sanity, collar and exposure caps
+        of ``_entry_checks`` (the halt is checked in ``_submit``). Empty means it may be resent."""
+        problems = []
+        if intent.source_published_at is None or not source_is_fresh(
+            intent.source_published_at, now, self.policy
+        ):
+            problems.append("SOURCE_NOT_FRESH")
+        if (now - intent.created_at).total_seconds() > self.config.max_intent_age_seconds:
+            problems.append("INTENT_TOO_OLD")
+        if problems:
+            return problems
+        pos = self.store.position(intent.idea_id)
+        if pos is None or intent.side is None:
+            return ["IDEA_UNKNOWN"]
+        contract, problem = self._resolve_contract(
+            Instrument(asset_class=pos.asset_class, symbol=intent.symbol)
+        )
+        if problem:
+            return [problem]
+        limit, reasons = self._entry_checks(
+            contract, OrderSide(intent.side), intent.quantity, intent.entry_reference,
+            intent.idea_id, now,
+        )
+        if reasons:
+            return reasons
+        if intent.limit_price is not None and _dec(intent.limit_price) != limit:
+            return ["RESEND_LIMIT_WOULD_DIFFER"]
+        return []
+
+    def _submit_failed(self, intent: Intent, error: str) -> None:
+        """A definite submit error is a known outcome: recorded, never resent."""
         now = self.clock()
         self.store.set_state(
-            intent.order_ref, IntentState.REFUSED, now, reasons=[STALE_AFTER_UNKNOWN_OUTCOME]
+            intent.order_ref, IntentState.REJECTED, now, broker_status="SubmitError",
+            reasons=[SUBMIT_ERROR],
+        )
+        for row in self.store.orders(intent.order_ref):
+            self.store.update_order(row.order_ref, now, status="NotSubmitted")
+        if intent.action == Action.OPEN:
+            pos = self.store.position(intent.idea_id)
+            if pos is not None and pos.quantity == 0:
+                self.store.update_position(intent.idea_id, now, status="NOT_FILLED")
+        self.store.log(
+            now,
+            SUBMIT_ERROR,
+            order_ref=intent.order_ref,
+            idea_id=intent.idea_id,
+            error=error,
+            rule="definite submit error: outcome known, recorded, never resent",
+        )
+
+    def _beyond_horizon(self, intent: Intent, checked: list[str], since: float) -> None:
+        """Older than the broker's lookup history: absence cannot be proven. Never resent; it stays
+        UNRESOLVED with an open exception for a human."""
+        now = self.clock()
+        detail = (
+            f"submitted {since:.0f} s ago, beyond the {self.config.lookup_horizon_seconds} s "
+            f"lookup horizon; no trace of {checked} proves nothing. Resolve at the broker by hand."
+        )
+        if self.store.raise_exception(
+            now,
+            UNKNOWN_OUTCOME_BEYOND_LOOKUP_HORIZON,
+            detail,
+            idea_id=intent.idea_id,
+            order_ref=intent.order_ref,
+        ):
+            self.store.log(
+                now,
+                UNKNOWN_OUTCOME_BEYOND_LOOKUP_HORIZON,
+                order_ref=intent.order_ref,
+                idea_id=intent.idea_id,
+                checked=checked,
+                rule="outcome unknown beyond the lookup horizon: never resent",
+            )
+
+    def _expire(self, intent: Intent, checked: list[str], problems: list[str]) -> None:
+        """No trace anywhere at the broker, and a resend would not pass the entry checks now: the
+        entry is never sent. The intent ends REFUSED and an exception record makes it visible."""
+        now = self.clock()
+        self.store.set_state(
+            intent.order_ref,
+            IntentState.REFUSED,
+            now,
+            reasons=[STALE_AFTER_UNKNOWN_OUTCOME, *problems],
         )
         for row in self.store.orders(intent.order_ref):
             self.store.update_order(row.order_ref, now, status="NotSubmitted")
@@ -668,8 +778,8 @@ class ExecutionCoordinator:
                 self.store.update_position(intent.idea_id, now, status="NOT_FILLED")
         published = intent.source_published_at.isoformat() if intent.source_published_at else None
         detail = (
-            f"no trace in open orders, executions or completed orders for {checked}; source "
-            f"published {published or 'at an unknown time'} is outside the freshness window"
+            f"no trace in open orders, executions or completed orders for {checked}; a resend "
+            f"now fails {problems} (source published {published or 'at an unknown time'})"
         )
         self.store.raise_exception(
             now,
@@ -684,8 +794,9 @@ class ExecutionCoordinator:
             order_ref=intent.order_ref,
             idea_id=intent.idea_id,
             checked=checked,
+            problems=problems,
             source_published_at=published,
-            rule="outcome unknown, no trace at the broker, source stale: never resent",
+            rule="outcome unknown, no trace at the broker, resend checks fail: never resent",
         )
 
     def _adopt(self, intent: Intent, orders: list[BrokerOrder], fills) -> None:
@@ -919,6 +1030,7 @@ class ExecutionCoordinator:
                 return
             self.store.set_state(intent.order_ref, IntentState.RECORDED, now, attempts_delta=1)
             for ref, field, price in pending:
+                self.store.log(self.clock(), "AMEND_SUBMIT", order_ref=ref, idea_id=intent.idea_id)
                 try:
                     self.broker.modify(ref, **{field: price})
                     self.store.log(
@@ -959,7 +1071,11 @@ class ExecutionCoordinator:
         self.store.update_position(intent.idea_id, now, **fields)
         self.store.set_state(intent.order_ref, IntentState.APPLIED, now)
         self.store.log(
-            now, "AMENDMENT_CONFIRMED", order_ref=intent.order_ref, idea_id=intent.idea_id, **fields
+            self.clock(),
+            "AMENDMENT_CONFIRMED",
+            order_ref=intent.order_ref,
+            idea_id=intent.idea_id,
+            **fields,
         )
 
     def _modify_failed(self, intent: Intent, detail: str) -> None:
@@ -1090,6 +1206,7 @@ class ExecutionCoordinator:
             account=account,
             state=IntentState.RECORDED,
             source_published_at=source.published_at,
+            entry_reference=action.entry_reference,
             created_at=now,
             updated_at=now,
             **fields,
