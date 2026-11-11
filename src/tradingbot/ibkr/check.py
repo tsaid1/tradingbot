@@ -1,0 +1,220 @@
+"""Read-only paper connectivity check: the logic behind ``scripts/ibkr_paper_check.py``.
+
+SDK-free at import time (the real session is imported lazily), so the step/verdict/report logic is
+tested offline with a fake session. Overall ``PASS`` requires every step, including both
+disconnects, to pass.
+"""
+from __future__ import annotations
+
+import json
+import os
+import stat
+import time
+from collections.abc import Callable
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+from tradingbot.ibkr.config import PaperConnectionConfig, load_config
+from tradingbot.ibkr.models import TLT_QUERY, QuoteQuality, to_jsonable
+from tradingbot.ibkr.redact import redact_accounts
+
+REPORT_SCHEMA = "tradingbot.ibkr.paper_check/1"
+PASS, FAIL, SKIPPED = "PASS", "FAIL", "SKIPPED"
+
+
+def _default_session_factory(config: PaperConnectionConfig) -> Any:
+    from tradingbot.ibkr.session import IbkrSession  # imports ibapi
+
+    return IbkrSession(config)
+
+
+def _err(exc: BaseException) -> str:
+    text = f"{type(exc).__name__}: {exc}"
+    for note in getattr(exc, "__notes__", ()):
+        text += f" [{note}]"
+    return redact_accounts(text)
+
+
+class _Steps:
+    def __init__(self) -> None:
+        self.steps: list[dict] = []
+
+    def run(self, name: str, fn: Callable[[], Any], detail: Callable[[Any], dict] | None = None,
+            ) -> tuple[bool, Any]:
+        t0 = time.monotonic()
+        try:
+            value = fn()
+        except Exception as exc:  # noqa: BLE001 - every failure becomes a FAIL step
+            self.steps.append({"name": name, "status": FAIL, "duration_ms": _ms(t0),
+                               "error": _err(exc)})
+            return False, exc
+        entry = {"name": name, "status": PASS, "duration_ms": _ms(t0)}
+        if detail is not None:
+            entry["detail"] = to_jsonable(detail(value))
+        self.steps.append(entry)
+        return True, value
+
+    def fail(self, name: str, error: str) -> None:
+        self.steps.append({"name": name, "status": FAIL, "duration_ms": 0, "error": error})
+
+    def skip(self, name: str, why: str) -> None:
+        self.steps.append({"name": name, "status": SKIPPED, "duration_ms": 0, "reason": why})
+
+
+def _ms(t0: float) -> int:
+    return int((time.monotonic() - t0) * 1000)
+
+
+def _session_facts(s: Any) -> dict:
+    return {
+        "server_version": getattr(s, "server_version", None),
+        "tws_connection_time": getattr(s, "connection_time", None),
+        "connected_at": getattr(s, "connected_at", None),
+        "notices": [{"reqId": r, "code": c, "message": m} for r, c, m in s.notices],
+        "connection_events": [{"reqId": r, "code": c, "message": m}
+                              for r, c, m in s.connection_events],
+        "unrouted_errors": [{"reqId": r, "code": c, "message": m} for r, c, m in s.unrouted_errors],
+        "cleanup_failures": list(s.cleanup_failures),
+        "internal_errors": list(s.internal_errors),
+        "poisoned": bool(s.poisoned),
+    }
+
+
+def run_check(config_path: str | os.PathLike | None = None, *,
+              session_factory: Callable[[PaperConnectionConfig], Any] | None = None,
+              loader: Callable[[Any], PaperConnectionConfig] = load_config) -> dict:
+    """Run every step and return the report dict (never raises for broker/config failures)."""
+    factory = session_factory or _default_session_factory
+    started = datetime.now(UTC).isoformat(timespec="seconds")
+    steps = _Steps()
+    report: dict[str, Any] = {"schema": REPORT_SCHEMA, "started_at": started, "read_only": True}
+    warnings: list[str] = []
+
+    ok, cfg = steps.run("load_config", lambda: loader(config_path))
+    if not ok:
+        return _finish(report, steps, warnings, None)
+    report.update(account=cfg.masked_account(), mode=cfg.mode, host=cfg.host, port=cfg.port,
+                  client_id=cfg.client_id)
+
+    ok, session = steps.run("create_session", lambda: factory(cfg))
+    if not ok:
+        return _finish(report, steps, warnings, cfg)
+    report["sdk_version"] = getattr(session, "sdk_version", None)
+
+    connected, _ = steps.run("connect_identity_gate", session.connect)
+    report["session"] = _session_facts(session)
+    if connected:
+        _data_steps(session, steps, warnings)
+    else:
+        for name in ("resolve_contract", "account_summary", "positions", "quote_snapshot"):
+            steps.skip(name, "identity gate did not pass")
+
+    clean, _ = steps.run("disconnect", session.disconnect)
+    report["session"] = _session_facts(session)
+    if clean and session.threads_alive():
+        steps.fail("threads_joined", f"threads still alive: {session.threads_alive()}")
+    if session.cleanup_failures:
+        steps.fail("request_cleanup", "; ".join(session.cleanup_failures))
+
+    if connected and clean:
+        _reconnect(cfg, factory, steps, report)
+    else:
+        steps.skip("reconnect_identity_gate", "first connection did not complete cleanly")
+        steps.skip("reconnect_disconnect", "first connection did not complete cleanly")
+    return _finish(report, steps, warnings, cfg)
+
+
+def _data_steps(s: Any, steps: _Steps, warnings: list[str]) -> None:
+    ok, contract = steps.run("resolve_contract", lambda: s.resolve_contract(TLT_QUERY),
+                             lambda c: c)
+
+    def check_summary() -> Any:
+        summary = s.account_summary()
+        if summary.missing_tags:
+            raise ValueError(f"account summary missing tags {list(summary.missing_tags)}")
+        return summary
+
+    steps.run("account_summary", check_summary, lambda summary: summary)
+    steps.run("positions", s.positions, lambda rows: {"count": len(rows), "rows": rows})
+    if not ok:
+        steps.skip("quote_snapshot", "contract not resolved")
+        return
+    ok, quote = steps.run("quote_snapshot", lambda: s.quote_snapshot(contract), lambda q: q)
+    if ok:
+        if quote.quality is not QuoteQuality.LIVE:
+            warnings.append(f"TLT quote quality is {quote.quality.value} "
+                            f"(delivered market data type {quote.market_data_type_name})")
+        if not quote.two_sided_valid:
+            warnings.append(f"TLT quote flags: {list(quote.flags)}")
+
+
+def _reconnect(cfg: PaperConnectionConfig, factory: Callable, steps: _Steps, report: dict) -> None:
+    ok, s2 = steps.run("reconnect_create_session", lambda: factory(cfg))
+    if not ok:
+        steps.skip("reconnect_identity_gate", "session not created")
+        return
+    steps.run("reconnect_identity_gate", s2.connect)
+    steps.run("reconnect_disconnect", s2.disconnect)
+    report["reconnect_session"] = _session_facts(s2)
+    if s2.cleanup_failures:
+        steps.fail("reconnect_cleanup", "; ".join(s2.cleanup_failures))
+
+
+def _finish(report: dict, steps: _Steps, warnings: list[str],
+            cfg: PaperConnectionConfig | None) -> dict:
+    report["steps"] = steps.steps
+    report["warnings"] = warnings
+    report["finished_at"] = datetime.now(UTC).isoformat(timespec="seconds")
+    failed = any(st["status"] == FAIL for st in steps.steps)
+    expected = ["load_config", "create_session", "connect_identity_gate", "resolve_contract",
+                "account_summary", "positions", "quote_snapshot", "disconnect",
+                "reconnect_identity_gate", "reconnect_disconnect"]
+    passed = {st["name"] for st in steps.steps if st["status"] == PASS}
+    report["overall"] = PASS if not failed and all(n in passed for n in expected) else FAIL
+    if cfg is not None:  # belt and braces: the full account ID must never be in the report
+        text = json.dumps(report, default=str)
+        if cfg.account in text:
+            report = json.loads(text.replace(cfg.account, cfg.masked_account()))
+            report["steps"].append({"name": "redaction_guard", "status": FAIL, "duration_ms": 0,
+                                    "error": "full account ID found in report and masked"})
+            report["overall"] = FAIL
+    return report
+
+
+def write_report(report: dict, report_dir: str | os.PathLike) -> Path:
+    """Write ``ibkr_paper_check_<UTC>.json`` (0600) into an owner-only (0700) directory."""
+    d = Path(report_dir).expanduser()
+    d.mkdir(mode=0o700, parents=True, exist_ok=True)
+    st = os.lstat(d)
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+        raise PermissionError(f"report dir must be a real directory owned by you: {d}")
+    if stat.S_IMODE(st.st_mode) & 0o077:
+        os.chmod(d, 0o700)
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    for n in range(100):
+        path = d / f"ibkr_paper_check_{stamp}{'' if n == 0 else f'_{n}'}.json"
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                         0o600)
+        except FileExistsError:
+            continue
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(report, fh, indent=2, sort_keys=False, default=str)
+            fh.write("\n")
+        return path
+    raise FileExistsError(f"could not create a unique report file in {d}")
+
+
+def summarize(report: dict) -> str:
+    head = (f"IBKR paper check: {report['overall']}  account={report.get('account', '?')}  "
+            f"sdk={report.get('sdk_version')}  server_version="
+            f"{report.get('session', {}).get('server_version')}")
+    lines = [head]
+    for st in report["steps"]:
+        extra = st.get("error") or st.get("reason") or ""
+        lines.append(f"  {st['status']:<7} {st['name']:<26} {st['duration_ms']:>6} ms  {extra}")
+    for w in report.get("warnings", []):
+        lines.append(f"  WARNING {w}")
+    return "\n".join(lines)
+
