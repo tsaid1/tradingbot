@@ -46,8 +46,8 @@ class NonLoopbackHost(ConfigError):
     pass
 
 
-class LivePortRejected(ConfigError):
-    pass
+class PortNotAllowed(ConfigError):
+    """Only the paper defaults (7497 TWS, 4002 Gateway) are allowed."""
 
 
 class NonPaperAccount(ConfigError):
@@ -58,9 +58,45 @@ class ModeNotPaper(ConfigError):
     pass
 
 
+# --- local environment preflight (before any socket is opened) ------------------------------------
+class PaperModeNotConfirmed(IbkrError):
+    """The TWS profile's jts.ini does not positively say paper mode (``[Logon] tradingMode=p``)."""
+
+    def __init__(self, message: str, *, reason: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
+class ListenerNotConfirmed(IbkrError):
+    """The process listening on host:port is not (provably) owned by the configured macOS user."""
+
+    def __init__(self, message: str, *, reason: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
+class ListenerOwnerUndeterminable(ListenerNotConfirmed):
+    """netstat/ps could not attribute the listener to a user (reason UNDETERMINABLE)."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, reason="UNDETERMINABLE")
+
+
 # --- session -------------------------------------------------------------------------------------
-class IbkrConnectionError(IbkrError):
-    """Socket/handshake failure or a connection lost while a request was outstanding."""
+class ReadOnlyViolation(BaseException):
+    """A non-allowlisted EClient method or outgoing message was attempted.
+
+    Deliberately a ``BaseException``: every ibapi request method wraps its send in
+    ``except Exception`` and turns failures into an error callback, which would hide this.
+    """
+
+
+class UnsupportedServerVersion(IbkrError):
+    pass
+
+
+class ReadOnlyNotVerified(IbkrError):
+    """Base: config-read mode could not positively verify the TWS API is read-only."""
 
 
 class AccountIdentityError(IbkrError):
@@ -106,6 +142,34 @@ class CleanupError(IbkrError):
         super().__init__(f"{message}: {'; '.join(failures)}")
         self.failures = [redact_accounts(f) for f in failures]
         self.result = result
+
+
+# --- config-read refusals (each followed by a clean disconnect) ----------------------------------
+class ConfigReadUnsupported(ReadOnlyNotVerified):
+    """TWS server version is below the one supporting reqConfigProtoBuf."""
+
+
+class ConfigReadTimeout(ReadOnlyNotVerified, IbkrTimeout):
+    """No configResponse arrived for our request in time."""
+
+
+class ConfigReadRejected(ReadOnlyNotVerified):
+    """TWS answered the config request with an error callback."""
+
+    def __init__(self, code: int, message: str) -> None:
+        super().__init__(f"config read rejected by TWS: {code} {message}")
+        self.code = code
+
+
+class ConfigReadUncorrelated(ReadOnlyNotVerified):
+    """A configResponse whose reqId is missing or differs from the one we sent."""
+
+
+class ReadOnlySettingRefused(ReadOnlyNotVerified):
+    """The response's readOnlyApi / socketPort / allowLocalhostOnly is absent or wrong."""
+
+class IbkrConnectionError(IbkrError):
+    """Socket/handshake failure or a connection lost while a request was outstanding."""
 
 
 # --- broker error-code classification ------------------------------------------------------------

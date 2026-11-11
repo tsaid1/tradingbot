@@ -2,14 +2,19 @@
 
 File format (``~/.config/tradingbot/ibkr/paper.toml``, mode 0600)::
 
+    mode = "paper"
     host = "127.0.0.1"
     port = 7497
     client_id = 17
     account = "DU0000000"
-    mode = "paper"
+    tws_profile_ini = "/Users/<user>/Jts/jts.ini"   # no default: set per run
+    tws_os_user = "<user>"                          # no default: set per run
+    read_only_check = "config-read"   # or "owner-attested"
 
-The ``D`` prefix check on ``account`` is defence in depth only. The primary control is the session's
-identity gate: the broker's own ``managedAccounts`` must be exactly this one account.
+The ``D`` prefix check on ``account`` is defence in depth only. Paper identity is established by
+agreement of independent checks: the TWS profile (owned by ``tws_os_user``) says paper mode, the
+process listening on ``port`` belongs to ``tws_os_user`` (both before any socket is opened), and the
+broker's own ``managedAccounts`` is exactly this one account (the primary control).
 """
 from __future__ import annotations
 
@@ -28,16 +33,19 @@ from tradingbot.ibkr.errors import (
     ConfigNotRegularFile,
     ConfigPermissionsTooOpen,
     ConfigWrongOwner,
-    LivePortRejected,
     ModeNotPaper,
     NonLoopbackHost,
     NonPaperAccount,
+    PortNotAllowed,
 )
 from tradingbot.ibkr.redact import mask_account
 
 DEFAULT_CONFIG_PATH = Path("~/.config/tradingbot/ibkr/paper.toml")
-LIVE_DEFAULT_PORTS = frozenset({7496, 4001})
-_KEYS = frozenset({"host", "port", "client_id", "account", "mode"})
+PAPER_PORTS = frozenset({7497, 4002})  # paper TWS, paper IB Gateway
+READ_ONLY_CHECKS = frozenset({"config-read", "owner-attested"})
+_KEYS = frozenset({"mode", "host", "port", "client_id", "account", "tws_profile_ini", "tws_os_user",
+                   "read_only_check"})
+_OS_USER = re.compile(r"^[a-z_][a-z0-9_.-]{0,31}$")
 _ACCOUNT_FORMAT = re.compile(r"^[A-Z]{1,3}\d{4,12}$")
 
 
@@ -47,6 +55,9 @@ class PaperConnectionConfig:
     port: int
     client_id: int
     account: str = field(repr=False)
+    tws_profile_ini: str
+    tws_os_user: str
+    read_only_check: str
     mode: str = "paper"
 
     def masked_account(self) -> str:
@@ -54,7 +65,8 @@ class PaperConnectionConfig:
 
     def __repr__(self) -> str:
         return (f"PaperConnectionConfig(host={self.host!r}, port={self.port}, "
-                f"client_id={self.client_id}, account={self.masked_account()!r}, mode={self.mode!r})")
+                f"client_id={self.client_id}, account={self.masked_account()!r}, mode={self.mode!r}, "
+                f"tws_os_user={self.tws_os_user!r}, read_only_check={self.read_only_check!r})")
 
     __str__ = __repr__
 
@@ -89,8 +101,8 @@ def validate_config(data: dict) -> PaperConnectionConfig:
     port = data["port"]
     if not _is_int(port) or not 1 <= port <= 65535:
         raise ConfigInvalid("port must be an integer in 1..65535")
-    if port in LIVE_DEFAULT_PORTS:
-        raise LivePortRejected(f"port {port} is a live TWS/Gateway default; paper uses 7497/4002")
+    if port not in PAPER_PORTS:
+        raise PortNotAllowed(f"port {port} is not a paper default; allowed: {sorted(PAPER_PORTS)}")
 
     client_id = data["client_id"]
     if not _is_int(client_id) or not 1 <= client_id <= 2**31 - 1:
@@ -103,8 +115,18 @@ def validate_config(data: dict) -> PaperConnectionConfig:
     if not account.startswith("D"):
         raise NonPaperAccount(f"account {mask_account(account)} is not a paper-style ID (must start "
                               "with 'D'); live IDs start with U/F/I")
+    profile = data["tws_profile_ini"]
+    if not isinstance(profile, str) or not os.path.isabs(profile):
+        raise ConfigInvalid("tws_profile_ini must be an absolute path to the TWS profile's jts.ini")
+    os_user = data["tws_os_user"]
+    if not isinstance(os_user, str) or not _OS_USER.match(os_user):
+        raise ConfigInvalid("tws_os_user must be a macOS short user name")
+    check = data["read_only_check"]
+    if check not in READ_ONLY_CHECKS:
+        raise ConfigInvalid(f"read_only_check must be one of {sorted(READ_ONLY_CHECKS)}")
     return PaperConnectionConfig(host=host, port=port, client_id=client_id, account=account,
-                                 mode=mode)
+                                 tws_profile_ini=profile, tws_os_user=os_user,
+                                 read_only_check=check, mode=mode)
 
 
 def load_config(path: str | os.PathLike | None = None) -> PaperConnectionConfig:
