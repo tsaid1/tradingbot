@@ -41,8 +41,9 @@ selected from the ledgers, so paid post text cannot reach the page.
   review, that ledger's fills are **not** reconciled, and reconciliation is marked incomplete.
 * A missing or foreign ledger file is reported as a `SERIOUS` discrepancy (`LEDGER_FILE_MISSING`,
   `LEDGER_UNREADABLE`); the view never creates a database.
-* The only control is **Refresh view (read-only)**, which re-reads the same files. There are no trade
-  inputs, forms, or action buttons.
+* The ledger controls are **Refresh view (read-only)**, which re-reads the same files, and the scenario
+  selector. The only other control is the opt-in **invented marks** toggle (below); its inputs value
+  positions and never change a ledger. There are no trade inputs, forms, or action buttons.
 * `tests/test_mock_operations.py` verifies all of this: write attempts through the view's connection raise,
   the module's SQL strings are read-only, three snapshot builds and repeated page reruns (including refresh
   clicks) leave the logical content of both ledgers identical, and the page never touches a `data/`
@@ -81,7 +82,43 @@ on a corrupted copy; the page offers no selector for real ledgers.
 | `NOT_RECORDED` | The replay ledger tracks levels but none is recorded for this idea. |
 | `RECORDED_MOCK_UNVERIFIED` | A level exists in the mock ledger only; no broker-native protection exists or was verified. |
 
-No market quote is stored in either ledger, so valuation and P&L are unknown and not displayed.
+No market quote is stored in either ledger, so valuation and P&L are unknown and not displayed unless the
+operator supplies invented marks, and then only where the accepted mark report can prove a value.
+
+## Invented marks (MARK-2, optional)
+
+The sidebar toggle **Value open positions against invented marks** is off by default; with it off, the
+page is unchanged apart from the toggle itself. Turned on, it shows:
+
+* An **observation time** text field (ISO 8601 with a timezone). It starts empty and is never set,
+  defaulted or refreshed by the page. **Stamp observation time now (UTC)** sets it once, explicitly.
+* An invented **bid** and **ask** text field for each open position's symbol. Each must be plain positive
+  decimal text (at most 15 integer and 10 fractional digits).
+* An **Invented-mark valuation** table, computed only by the accepted `mark_report.build_mark_report`
+  ([MOCK_MARK_REPORT.md](MOCK_MARK_REPORT.md)). The page renders its statuses and reasons and does no
+  valuation arithmetic of its own.
+
+The rules are the report's:
+
+* **Marks are `SUPPLIED_INVENTED`.** They are values typed for this session, not quotes from any feed or
+  broker, and not verified provenance.
+* **Freshness is judged at each rerun's snapshot as-of.** A mark that was fresh becomes `STALE` after
+  `MockPolicy.max_quote_age_seconds` (30 s), including after **Refresh**, because the observation time is
+  never re-stamped.
+* **Unknown values say why.** A symbol with no bid or ask is `UNKNOWN` (`MARK_MISSING`). Typed input the
+  page cannot parse, or a missing observation time, is shown as a rejected input and reported `INVALID`.
+  Crossed, non-positive, timezone-less, stale or future marks are `INVALID`/`STALE`/`FUTURE` with the
+  report's reason. Any value the report cannot prove reads as that status (`UNKNOWN`/`UNSUPPORTED`),
+  never zero or a last-known value.
+* **Average cost and P&L appear only where the fill history proves them.** Any discrepancy for an engine,
+  or an incomplete reconciliation, keeps them unknown while exposure can still be known. So the populated
+  synthetic scenario, which carries two WARNING discrepancies, shows exposure but no P&L.
+* **The exposure convention is printed.** Units times bid (long) or ask (short), in price units, signed
+  and gross. No currency, multiplier or portfolio money total is shown, and the engines are never netted.
+* **Stop and target distances are informational.** No level is monitored and no protection is active;
+  the protection status is carried unchanged.
+* **Session-only.** Marks and settings live in the Streamlit session; nothing is saved to disk or a
+  database and no quote is persisted.
 
 **Freshness** (`FRESH` / `STALE` / `FUTURE` / `UNKNOWN`): a source timestamp's age at as-of against
 `MockPolicy.max_signal_age_seconds` (the gateway's window, with its 5 s future tolerance), or the
@@ -123,8 +160,9 @@ checkout's code and not another editable install.
 
 ## Limitations
 
-* Observability only: no quotes, valuation, P&L, exposure netting across the two independent ledgers, or
-  broker reconciliation (no broker exists in this repository).
+* Observability only: no stored quotes, no exposure netting across the two independent ledgers, and no
+  broker reconciliation (no broker exists in this repository). Valuation and P&L exist only against
+  invented session marks, and only where the mark report proves them.
 * Replay outcomes are read from the latest evaluation attempt of each post revision, matching
   `PaperEventReplay.outcomes()`; earlier attempts of a truncated post only ever recorded `HOLD`.
 * The journal read is capped at `JOURNAL_EVENT_LIMIT` (1000) events; beyond that the page reports
