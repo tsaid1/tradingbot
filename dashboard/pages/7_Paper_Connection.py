@@ -157,7 +157,10 @@ def _count(value: object, code: str) -> int:
 def _number(value: object, code: str, *, optional: bool = True) -> float | None:
     if value is None and optional:
         return None
-    if type(value) not in (int, float) or not math.isfinite(value) or abs(value) > 10**9:
+    if type(value) is int:  # magnitude first: converting a huge JSON integer to float would overflow
+        if abs(value) > 10**9:
+            raise Refused(code)
+    elif type(value) is not float or not math.isfinite(value) or abs(value) > 10**9:
         raise Refused(code)
     return float(value)
 

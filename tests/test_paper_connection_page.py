@@ -279,6 +279,21 @@ def test_every_unrecognised_or_malformed_report_is_refused_whole_without_echo(ca
         assert marker not in text.replace("REPORT REFUSED", ""), marker
 
 
+@pytest.mark.parametrize("field", ["age_s", "max_age_s"])
+@pytest.mark.parametrize("sign", ["", "-"], ids=["positive", "negative"])
+def test_a_huge_json_integer_is_a_fixed_refusal_not_a_crash(field, sign):
+    """Review P2: an integer too large for a float must be refused before any float conversion."""
+    text = encode(invented_pass()).decode()
+    stamp = '"age_s": 8.0' if field == "age_s" else '"max_age_s": 30.0'
+    assert text.count(stamp) == 1
+    data = text.replace(stamp, f'"{field}": {sign}1{"0" * 400}').encode()
+    at = upload(data)
+    assert not at.exception
+    assert [e.value for e in at.error if e.value.startswith("REPORT REFUSED")] == [
+        "REPORT REFUSED: QUOTE_TIMING_INVALID. Nothing from the file is shown."]
+    assert not at.metric  # no verdict is displayed
+
+
 def test_an_oversize_upload_is_refused_before_parsing_and_never_digested():
     data = encode(invented_pass())
     data += b" " * (64 * 1024 + 1 - len(data))
