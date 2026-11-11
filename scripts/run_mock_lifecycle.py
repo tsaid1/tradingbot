@@ -54,7 +54,10 @@ class Demo:
             self.broker.set_quote(symbol, bid, ask)
 
     def start(self) -> None:
-        """(Re)start the process: new objects over the same SQLite files."""
+        """(Re)start the process: new objects over the same SQLite files. The old process's store
+        lock is released first, as the OS would on its exit."""
+        if getattr(self, "coord", None) is not None:
+            self.coord.close()
         self.broker = SimBroker(self.folder / "broker.sqlite3", clock=self.clock.now)
         self.coord = ExecutionCoordinator(
             self.broker,

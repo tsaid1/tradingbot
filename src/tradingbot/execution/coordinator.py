@@ -16,6 +16,8 @@ otherwise it ends REFUSED with a STALE_AFTER_UNKNOWN_OUTCOME exception. The reas
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import hashlib
 import os
 from collections.abc import Callable
@@ -170,6 +172,30 @@ def _intent_state(status: OrderStatus, filled: int, quantity: int) -> IntentStat
     return IntentState.WORKING
 
 
+class ExecutionStoreLocked(RuntimeError):
+    """Another live coordinator holds this execution store (safety review R5)."""
+
+
+def _lock_store(store_path: Path) -> int:
+    """Take an exclusive, non-blocking lock beside the store for the life of the coordinator.
+    The OS releases it when the process dies, so a crash never leaves a stale lock."""
+    lock_path = store_path.with_name(store_path.name + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        holder = os.pread(fd, 64, 0).decode(errors="replace").strip() or "unknown"
+        os.close(fd)
+        raise ExecutionStoreLocked(
+            f"execution store {store_path} is in use by another coordinator (pid {holder}); "
+            "refusing to start a second one on it"
+        ) from None
+    os.ftruncate(fd, 0)
+    os.pwrite(fd, str(os.getpid()).encode(), 0)
+    return fd
+
+
 class ExecutionRefused(ValueError):
     """Raised when a caller tries to execute something the gateway did not approve."""
 
@@ -184,12 +210,24 @@ class ExecutionCoordinator:
         clock: Callable[[], datetime] | None = None,
     ):
         self.broker = broker
+        self._lock_fd: int | None = _lock_store(Path(store_path))
         self.store = ExecutionStore(store_path)
         self.policy = policy or MockPolicy()
         self.config = config or ExecutionConfig()
         self.clock = clock or (lambda: datetime.now(UTC))
 
     # ================================================================== public API
+
+    def close(self) -> None:
+        """Release the store lock (process exit releases it too)."""
+        if self._lock_fd is not None:
+            fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
+            os.close(self._lock_fd)
+            self._lock_fd = None
+
+    def __del__(self):
+        with contextlib.suppress(Exception):  # interpreter shutdown
+            self.close()
 
     def halted(self) -> bool:
         return self.config.halt_file.exists()

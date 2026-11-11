@@ -143,11 +143,15 @@ class RuntimeService:
             ),
             clock=self.clock,
         )
-        self.replay = _StampingReplay(config.replay_db, self.coordinator, self.clock)
-        lexicon = None
-        if config.interpreter.lexicon_path is not None:
-            lexicon = LexiconExtension.from_json(config.interpreter.lexicon_path)
-        self.interpreter = TklInterpreter(context=self.store.load_context(), lexicon=lexicon)
+        try:
+            self.replay = _StampingReplay(config.replay_db, self.coordinator, self.clock)
+            lexicon = None
+            if config.interpreter.lexicon_path is not None:
+                lexicon = LexiconExtension.from_json(config.interpreter.lexicon_path)
+            self.interpreter = TklInterpreter(context=self.store.load_context(), lexicon=lexicon)
+        except BaseException:
+            self.coordinator.close()
+            raise
         saved = self.store.get("health", {}) or {}
         self.health = {c: Health(**saved.get(c, {})) for c in COMPONENTS}
         self.cycles = int(self.store.get("cycles", 0) or 0)
@@ -163,6 +167,10 @@ class RuntimeService:
         )
 
     # ================================================================== cycle
+
+    def close(self) -> None:
+        """Release the execution store lock (one live coordinator per store)."""
+        self.coordinator.close()
 
     @property
     def halted(self) -> bool:

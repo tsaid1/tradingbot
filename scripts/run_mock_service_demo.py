@@ -90,6 +90,7 @@ def main(argv: list[str] | None = None) -> int:
         except SimulatedCrash:
             crashed = True
             print("  KILLED: the broker accepted the add, then the process died before commit")
+            service.close()  # a dead process holds no lock: the OS would release it
             del service
             service = build_service(config)  # a new process on the same files
             phase = "after kill"
@@ -100,6 +101,7 @@ def main(argv: list[str] | None = None) -> int:
             service.broker.script_next_submit("CRASH_AFTER_PLACE")
             armed = True
         if crashed and not restarted_clean and n >= 6:
+            service.close()
             del service
             service = build_service(config)
             restarted_clean = True

@@ -115,6 +115,8 @@ class Runtime:
         self.restart()
 
     def restart(self, *, source=None) -> RuntimeService:
+        if getattr(self, "service", None) is not None:
+            self.service.close()  # the old process is gone: the OS would release its store lock
         self.store = RuntimeStore(self.config.runtime_db)
         self.broker = SimBroker(self.config.broker_db, clock=self.clock.now)
         self.source = source or ReplayFileSource(

@@ -16,6 +16,7 @@ import json
 import signal
 import sys
 
+from tradingbot.execution.coordinator import ExecutionStoreLocked
 from tradingbot.runtime.app import build_service, with_replay_source
 from tradingbot.runtime.config import DEFAULT_CONFIG_PATH, ConfigError, load_config
 
@@ -40,7 +41,7 @@ def main(argv: list[str] | None = None) -> int:
                 raise ConfigError("--source must be replay:<file>")
             config = with_replay_source(config, value)
         service = build_service(config)
-    except ConfigError as exc:
+    except (ConfigError, ExecutionStoreLocked) as exc:
         print(f"refusing to start: {exc}", file=sys.stderr)
         return 2
 

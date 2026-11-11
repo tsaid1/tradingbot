@@ -95,7 +95,10 @@ class Harness:
         self.broker.set_quote(SYMBOL, "49.98", "50.02")
 
     def restart(self) -> None:
-        """New process: fresh objects on the same SQLite files (in-memory scripts are lost)."""
+        """New process: fresh objects on the same SQLite files (in-memory scripts are lost). The old
+        process is gone, so its store lock is released first, as the OS would on exit."""
+        if getattr(self, "coord", None) is not None:
+            self.coord.close()
         self.broker = SimBroker(
             self.folder / "broker.sqlite3", clock=self.clock.now, strict=self.strict
         )

@@ -5,8 +5,13 @@ Invented tickers, toy prices and invented wording only. No network, no broker po
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 from decimal import Decimal
+from pathlib import Path
 
+import pytest
 from execution_harness import SYMBOL, Harness, action, open_action, source
 
 from tradingbot.event_models import ParsedPost
@@ -18,7 +23,13 @@ from tradingbot.execution.broker import (
     OrderStatus,
     OrderType,
 )
-from tradingbot.execution.coordinator import PROTECTION_UNVERIFIED, _intent_state
+from tradingbot.execution.coordinator import (
+    PROTECTION_UNVERIFIED,
+    ExecutionCoordinator,
+    ExecutionStoreLocked,
+    _intent_state,
+)
+from tradingbot.execution.sim_broker import SimBroker
 from tradingbot.execution.store import IntentState
 from tradingbot.models import Action, MockPolicy
 
@@ -191,3 +202,52 @@ def test_r2_a_reversing_fill_is_recorded_and_blocks_only_that_instrument(tmp_pat
     )
     assert [o.status for o in r.outcomes] == ["EXECUTED"]
     assert "UNEXPLAINED_BROKER_POSITION" in [d.kind.value for d in h.coord.reconcile().discrepancies]
+
+
+# ----------------------------------------------------------------------------------------- R5
+
+_HOLDER = """
+import sys
+from tradingbot.execution.coordinator import ExecutionCoordinator
+from tradingbot.execution.sim_broker import SimBroker
+folder = sys.argv[1]
+try:
+    coord = ExecutionCoordinator(SimBroker(folder + "/b2.sqlite3"), folder + "/exec.sqlite3")
+except Exception as exc:
+    print("REFUSED", type(exc).__name__, exc, flush=True)
+    sys.exit(3)
+print("HOLDING", flush=True)
+sys.stdin.readline()
+"""
+
+
+def _child(folder: Path) -> subprocess.Popen:
+    env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src")}
+    return subprocess.Popen(
+        [sys.executable, "-c", _HOLDER, str(folder)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+        env=env,
+    )
+
+
+def test_r5_a_second_coordinator_on_the_same_store_refuses_to_start(tmp_path):
+    holder = _child(tmp_path)
+    try:
+        assert holder.stdout.readline().strip() == "HOLDING"
+        # This process cannot start a coordinator on the store the other process holds ...
+        with pytest.raises(ExecutionStoreLocked, match="in use by another"):
+            ExecutionCoordinator(SimBroker(tmp_path / "b.sqlite3"), tmp_path / "exec.sqlite3")
+        # ... nor can a third process.
+        third = _child(tmp_path)
+        out, _ = third.communicate(timeout=30)
+        assert third.returncode == 3 and out.startswith("REFUSED ExecutionStoreLocked")
+    finally:
+        holder.communicate("\n", timeout=30)
+    # Once the holder has gone, the store can be taken; and this process then keeps it.
+    mine = ExecutionCoordinator(SimBroker(tmp_path / "b.sqlite3"), tmp_path / "exec.sqlite3")
+    late = _child(tmp_path)
+    out, _ = late.communicate(timeout=30)
+    assert late.returncode == 3 and "in use by another" in out
+    mine.close()

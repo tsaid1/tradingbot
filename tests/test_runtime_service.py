@@ -466,6 +466,7 @@ def test_build_service_refuses_a_missing_lexicon_and_loads_a_present_one(tmp_pat
     lex = tmp_path / "lexicon.json"
     lex.write_text(json.dumps({"open_present": [r"\binvented entry verb\b"]}))
     rt = Runtime(tmp_path, [], interpreter={"lexicon_path": str(lex)})
+    rt.service.close()  # one live coordinator per execution store (safety review R5)
     svc = build_service(rt.config)
     assert svc.interpreter.lexicon.open_present == [r"\binvented entry verb\b"]
     missing = rt.config.model_copy(
