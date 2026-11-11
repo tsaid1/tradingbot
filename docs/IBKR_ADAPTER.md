@@ -14,6 +14,7 @@ positions, and samples a quote.
 | `models.py` | no | result dataclasses, tick-type map, quote-quality assessment |
 | `errors.py`, `redact.py` | no | typed exceptions, error-code classification, account masking |
 | `check.py` | no (lazy) | step runner, verdict and report for the check script |
+| `report_view.py` | no | load, validate and redact the latest report for the dashboard page |
 | `session.py` | **yes** | `IbkrSession` over a deny-by-default `_ReadOnlyClient(EClient)` |
 
 ## 1. Install the SDK (not on PyPI, never committed)
@@ -260,3 +261,32 @@ The exit code is 0 for `PASS` and `PASS_WITH_WARNINGS`, otherwise 1.
 
 The default report directory is `$TRADINGBOT_IBKR_REPORT_DIR`. If that is unset, it is
 `private/ibkr_reports` in the parent or grandparent directory of the checkout.
+
+## 6. Dashboard page: latest report (read-only)
+
+`dashboard/pages/7_IBKR_Paper_Check.py` shows the newest `ibkr_paper_check_*.json` in the report
+directory. The directory default is the script's (`tradingbot.ibkr.check.default_report_dir`:
+`$TRADINGBOT_IBKR_REPORT_DIR`, else `private/ibkr_reports` in the workspace), and a sidebar text
+input overrides it.
+
+```sh
+PYTHONPATH=src streamlit run dashboard/app.py        # then open "IBKR Paper Check"
+PYTHONPATH=src python -m pytest tests/test_ibkr_paper_check_page.py
+```
+
+- It shows the verdict, the run time and the report's age, the pre-socket checks, the Read-Only
+  API status and the three settings TWS reported, the masked account, the SDK and server versions,
+  the TLT contract, the account summary, positions, and the quote. For the quote it shows the data
+  type, quality, flags, last-trade time and age, and each attempt's evidence. It also shows every
+  step with its status and duration, and the warnings.
+- A red stale banner appears when the report finished longer ago than the sidebar threshold (60
+  minutes by default).
+- The page shows a file only if it is valid JSON of schema `tradingbot.ibkr.paper_check/1` with
+  the structure the script writes (`tradingbot.ibkr.report_view.validate_report`). Anything else,
+  including NaN, a naive timestamp, an unknown verdict or step status, or invalid UTF-8, gets one
+  fixed message and nothing from the file.
+- Every string, dict keys included, passes through `redact_accounts` before rendering. The
+  redaction pattern is bounded by any non-alphanumeric character, so `_DU1234567` is masked too.
+- The page imports no SDK and no session, opens no socket, writes nothing, and has no button or
+  other control that connects to the broker. Its tests use invented reports in a temporary
+  directory.
