@@ -165,6 +165,10 @@ class ConfigReadUncorrelated(ReadOnlyNotVerified):
     """A configResponse whose reqId is missing or differs from the one we sent."""
 
 
+class ConfigResponseChanged(ReadOnlyNotVerified):
+    """A later config response differs from the verified first one: the session is poisoned."""
+
+
 class ReadOnlySettingRefused(ReadOnlyNotVerified):
     """The response's readOnlyApi / socketPort / allowLocalhostOnly is absent or wrong."""
 

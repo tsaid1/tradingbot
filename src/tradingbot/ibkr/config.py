@@ -9,7 +9,7 @@ File format (``~/.config/tradingbot/ibkr/paper.toml``, mode 0600)::
     account = "DU0000000"
     tws_profile_ini = "/Users/<user>/Jts/jts.ini"   # no default: set per run
     tws_os_user = "<user>"                          # no default: set per run
-    read_only_check = "config-read"   # or "owner-attested"
+    read_only_check = "config-read"   # the only legal value
 
 The ``D`` prefix check on ``account`` is defence in depth only. Paper identity is established by
 agreement of independent checks: the TWS profile (owned by ``tws_os_user``) says paper mode, the
@@ -42,7 +42,7 @@ from tradingbot.ibkr.redact import mask_account
 
 DEFAULT_CONFIG_PATH = Path("~/.config/tradingbot/ibkr/paper.toml")
 PAPER_PORTS = frozenset({7497, 4002})  # paper TWS, paper IB Gateway
-READ_ONLY_CHECKS = frozenset({"config-read", "owner-attested"})
+READ_ONLY_CHECKS = frozenset({"config-read"})  # fail closed: read-only must be verified
 _KEYS = frozenset({"mode", "host", "port", "client_id", "account", "tws_profile_ini", "tws_os_user",
                    "read_only_check"})
 _OS_USER = re.compile(r"^[a-z_][a-z0-9_.-]{0,31}$")
