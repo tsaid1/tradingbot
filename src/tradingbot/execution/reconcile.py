@@ -5,17 +5,20 @@ typed discrepancies. It never submits, amends, cancels or writes anything: resol
 is the operator's decision (or a later, separately reviewed automation).
 
 A discrepancy is *explained* when an open exception record already covers it (for example an
-``UNPROTECTED_POSITION`` the coordinator raised itself); anything else is unexplained.
+``UNPROTECTED_POSITION`` the coordinator raised itself); anything else is unexplained. A safety
+discrepancy (``SAFETY_KINDS``: a position without valid confirmed protection, a working entry of a
+closed idea, a half-executed group) keeps the report unclean even when explained (review S1).
 """
 
 from __future__ import annotations
 
 from datetime import datetime
+from decimal import Decimal
 from enum import Enum
 
 from pydantic import Field
 
-from tradingbot.execution.broker import Broker, BrokerError
+from tradingbot.execution.broker import Broker, BrokerError, OrderSide, OrderStatus, OrderType
 from tradingbot.execution.store import UNRESOLVED_STATES, ExecutionStore, Role
 from tradingbot.models import PositionSide, StrictModel
 
@@ -34,6 +37,20 @@ class DiscrepancyKind(str, Enum):
     # An approved atomic group executed only in part (an open PARTIAL_GROUP exception): never
     # explained away, it stays unclean until a human resolves the exception.
     PARTIAL_GROUP = "PARTIAL_GROUP"
+    # The working stop is not a sell-stop below the average entry (long) / a buy-stop above it
+    # (short): wrong side, wrong type, or a price on the wrong side of the entry.
+    PROTECTIVE_STOP_INVALID = "PROTECTIVE_STOP_INVALID"
+
+
+# Never explained away: while any of these is present the report is not clean.
+SAFETY_KINDS = frozenset(
+    {
+        DiscrepancyKind.POSITION_WITHOUT_PROTECTIVE_STOP,
+        DiscrepancyKind.PROTECTIVE_STOP_INVALID,
+        DiscrepancyKind.WORKING_ENTRY_ON_CLOSED_IDEA,
+        DiscrepancyKind.PARTIAL_GROUP,
+    }
+)
 
 
 class Discrepancy(StrictModel):
@@ -58,8 +75,32 @@ class ReconciliationReport(StrictModel):
         return [d for d in self.discrepancies if d.explained_by is None]
 
     @property
+    def blocking(self) -> list[Discrepancy]:
+        """Everything that keeps the report unclean: unexplained, or a safety discrepancy."""
+        return [
+            d for d in self.discrepancies if d.explained_by is None or d.kind in SAFETY_KINDS
+        ]
+
+    @property
     def clean(self) -> bool:
-        return not self.unexplained
+        return not self.blocking
+
+
+def _stop_problem(stop, p) -> str:
+    long = p.position_side == PositionSide.LONG
+    want_side = OrderSide.SELL if long else OrderSide.BUY
+    if stop.order_type != OrderType.STP:
+        return f"protective order is {stop.order_type.value}, not a stop"
+    if stop.side != want_side:
+        return f"stop side {stop.side.value} would add to a {p.position_side.value} position"
+    if p.avg_price and stop.stop_price is not None:
+        avg = Decimal(p.avg_price)
+        if (long and stop.stop_price >= avg) or (not long and stop.stop_price <= avg):
+            return (
+                f"stop {stop.stop_price} is on the wrong side of the average entry {avg} for a "
+                f"{p.position_side.value} position"
+            )
+    return ""
 
 
 def reconcile(
@@ -115,10 +156,40 @@ def reconcile(
         p.idea_id: max(p.quantity - store.committed_exit_quantity(p.idea_id), 0) for p in ledger
     }
     for p in ledger:
-        if p.quantity <= 0 or p.stop_price is None or cover[p.idea_id] == 0:
+        if p.quantity <= 0 or p.stop_price is None:
+            continue
+        if cover[p.idea_id] == 0:
+            # Everything held is committed to working exits: no stop may work beside them, so the
+            # position has no stop until those exits fill.
+            out.append(
+                Discrepancy(
+                    kind=DiscrepancyKind.POSITION_WITHOUT_PROTECTIVE_STOP,
+                    symbol=p.symbol,
+                    idea_id=p.idea_id,
+                    order_ref=p.stop_ref,
+                    detail=f"ledger {p.quantity}, fully committed to working exits; no stop",
+                )
+            )
             continue
         stop = open_by_ref.get(p.stop_ref) if p.stop_ref else None
-        if stop is None or not stop.working or stop.remaining != cover[p.idea_id]:
+        if stop is not None and stop.working:
+            problem = _stop_problem(stop, p)
+            if problem:
+                out.append(
+                    Discrepancy(
+                        kind=DiscrepancyKind.PROTECTIVE_STOP_INVALID,
+                        symbol=p.symbol,
+                        idea_id=p.idea_id,
+                        order_ref=p.stop_ref,
+                        detail=problem,
+                    )
+                )
+        if (
+            stop is None
+            or not stop.working
+            or stop.status == OrderStatus.PENDING_CANCEL
+            or stop.remaining != cover[p.idea_id]
+        ):
             covered = stop.remaining if stop is not None else 0
             out.append(
                 Discrepancy(

@@ -132,8 +132,8 @@ class Demo:
                 if w is not None:
                     prot.append(f"{tag} {w.remaining}@{w.stop_price or w.limit_price}")
         report = self.coord.reconcile()
-        self.unexplained += len(report.unexplained)
-        recon = "clean" if report.clean else ",".join(d.kind.value for d in report.unexplained)
+        self.unexplained += len(report.blocking)
+        recon = "clean" if report.clean else ",".join(d.kind.value for d in report.blocking)
         broker_state = next(
             (r[len("BROKER_") :] for r in o.reasons if r.startswith("BROKER_")), "-"
         )
@@ -243,7 +243,7 @@ def main() -> int:
                 f"   - {item.kind.value} {item.symbol} {item.detail} "
                 f"explained_by={item.explained_by}"
             )
-        bad = d.unexplained + len(final.unexplained)
+        bad = d.unexplained + len(final.blocking)
         print(f"\nRESULT: {'OK' if bad == 0 else 'FAIL'} ({bad} unexplained discrepancies)")
         return 0 if bad == 0 else 1
 

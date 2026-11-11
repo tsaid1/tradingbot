@@ -442,8 +442,9 @@ class RuntimeService:
             detail = next(d.detail for d in rec.discrepancies)
             self._failure("broker", BrokerError(detail), now)
         report.reconciliation_clean = rec.clean
-        report.unexplained = [d.kind.value for d in rec.unexplained]
+        report.unexplained = [d.kind.value for d in rec.blocking]
         keep_recon: set[str] = set()
+        # An explained safety discrepancy already alerts through its exception (below).
         for d in rec.unexplained:
             if d.kind == DiscrepancyKind.BROKER_UNREADABLE:
                 continue
@@ -531,8 +532,8 @@ class RuntimeService:
             "reconciliation": {
                 "at": rec.checked_at.isoformat() if rec else None,
                 "clean": rec.clean if rec else None,
-                "unexplained": [d.kind.value for d in rec.unexplained] if rec else [],
-                "explained": (len(rec.discrepancies) - len(rec.unexplained)) if rec else 0,
+                "unexplained": [d.kind.value for d in rec.blocking] if rec else [],
+                "explained": (len(rec.discrepancies) - len(rec.blocking)) if rec else 0,
             },
         }
         self.store.put("health", {c: asdict(h) for c, h in self.health.items()}, now)

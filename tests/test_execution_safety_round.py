@@ -388,3 +388,48 @@ def test_r7_halt_cancels_a_resting_entry_without_a_fill(tmp_path):
     assert h.coord.intent(opened.order_ref).state == IntentState.CANCELLED
     assert h.working()[f"{opened.order_ref}.STP"].remaining == 1
     assert "HALT_ENTRY_CANCELLED" in h.events(opened.order_ref)
+
+
+# ----------------------------------------------------------------------------------------- S1
+
+
+def test_s1_an_explained_unprotected_position_is_never_clean(tmp_path):
+    h = Harness(tmp_path, strict=True)
+    h.broker.script_next_submit("DROP_STOP_CHILD")
+    h.execute("p1", open_action())
+    report = h.coord.reconcile()
+    [d] = [d for d in report.discrepancies if d.kind.value == "POSITION_WITHOUT_PROTECTIVE_STOP"]
+    assert d.explained_by is not None  # the open UNPROTECTED_POSITION exception covers it ...
+    assert not report.clean  # ... but a position without confirmed protection is never clean
+
+
+def _stop_view(h: Harness, ref: str, **update):
+    real = h.broker.open_orders
+
+    def view():
+        return [o.model_copy(update=update) if o.order_ref == ref else o for o in real()]
+
+    h.broker.open_orders = view
+
+
+@pytest.mark.parametrize(
+    "update",
+    [{"side": OrderSide.BUY}, {"order_type": OrderType.LMT, "limit_price": Decimal(48)}],
+)
+def test_s1_a_stop_of_the_wrong_side_or_type_is_flagged(tmp_path, update):
+    h = Harness(tmp_path, strict=True)
+    out = h.execute("p1", open_action())
+    _stop_view(h, f"{out.order_ref}.STP", **update)
+    report = h.coord.reconcile()
+    assert "PROTECTIVE_STOP_INVALID" in [d.kind.value for d in report.discrepancies]
+    assert not report.clean
+
+
+def test_s1_a_stop_on_the_wrong_side_of_the_average_entry_is_flagged(tmp_path):
+    h = Harness(tmp_path, strict=True)
+    out = h.execute("p1", open_action())  # long 4 at 50.02, stop 48
+    h.broker.set_quote(SYMBOL, "52.98", "53.02")
+    h.broker.modify(f"{out.order_ref}.STP", stop_price=Decimal(51))  # changed at the broker
+    report = h.coord.reconcile()
+    [d] = [d for d in report.discrepancies if d.kind.value == "PROTECTIVE_STOP_INVALID"]
+    assert "51" in d.detail and not report.clean

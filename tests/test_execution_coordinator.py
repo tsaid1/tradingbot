@@ -110,7 +110,9 @@ def test_missing_stop_child_raises_unprotected_position(h):
     report = h.coord.reconcile()
     [d] = report.discrepancies
     assert d.kind.value == "POSITION_WITHOUT_PROTECTIVE_STOP" and d.explained_by == exc.id
-    assert report.clean  # explained by the open exception, not silently passed
+    # Explained by the open exception, yet never clean: a position without confirmed protection is
+    # a safety discrepancy (safety review S1).
+    assert not report.clean
 
 
 def test_partial_entry_fill_is_working_and_protected_for_the_filled_quantity(h):
