@@ -66,6 +66,11 @@ ORDER_REQUESTS = {
 }
 
 
+def core_ref(order_ref: str) -> str:
+    """The execution core's reference inside an experiment-prefixed orderRef."""
+    return order_ref.split(":", 1)[1] if ":" in order_ref else order_ref
+
+
 def all_day_hours(now: datetime | None = None) -> str:
     """Liquid hours covering yesterday, today and tomorrow (US/Eastern), current IBKR format."""
     today = (now or datetime.now(UTC)).astimezone(ET).date()
@@ -279,8 +284,8 @@ class FakeOrderTws(FakeTws):
             is_child = bool(g.order.parentId)
             parent_open = is_child and s.orders[g.order.parentId].status != "Filled"
             s._set(g, "PreSubmitted" if parent_open else "Submitted")
-            if g.order.orderRef in s.reject_refs:
-                code, msg = s.reject_refs[g.order.orderRef]
+            if core_ref(g.order.orderRef) in s.reject_refs:
+                code, msg = s.reject_refs[core_ref(g.order.orderRef)]
                 g.rejected = f"{code} {msg}"
                 s._set(g, "Cancelled")
                 if not s.ack_lost:

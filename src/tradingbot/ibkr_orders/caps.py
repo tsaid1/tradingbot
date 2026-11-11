@@ -27,6 +27,12 @@ class ExperimentCaps:
     outside_rth_allowed: bool = False
     primary_exchange: str = ""  # used only to resolve the one contract (SMART routing)
 
+    @property
+    def ref_prefix(self) -> str:
+        """Every order of the experiment carries this before the execution core's own reference
+        in ``orderRef``, so the broker's own history can be counted for the experiment."""
+        return f"{self.name}:"
+
 
 PAPER_TEST_1 = ExperimentCaps(
     name="paper-test-1",

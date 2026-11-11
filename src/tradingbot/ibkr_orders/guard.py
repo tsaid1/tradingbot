@@ -25,6 +25,7 @@ class RefusalReason(str, Enum):
     EXPERIMENT_FINISHED = "EXPERIMENT_FINISHED"  # the submission cap is already used up
     SUBMISSION_CAP = "SUBMISSION_CAP"  # this order (or the rest of its bracket) would exceed it
     SUBMISSION_COUNT_UNKNOWN = "SUBMISSION_COUNT_UNKNOWN"
+    SUBMISSION_COUNT_MISMATCH = "SUBMISSION_COUNT_MISMATCH"  # the broker shows more than the journal
     WRONG_ACCOUNT = "WRONG_ACCOUNT"
     WRONG_SYMBOL = "WRONG_SYMBOL"
     WRONG_SEC_TYPE = "WRONG_SEC_TYPE"
@@ -137,6 +138,9 @@ class GuardContext:
     # the position implied by the session's baseline read plus every fill it has received since
     # (executions and order statuses, the larger per order); None = unknown
     implied_position: Decimal | None
+    # distinct orders of this experiment (orderRef prefix) the broker itself shows in open orders,
+    # executions and completed orders, counted once per session before its first submission
+    broker_submissions: int | None
     still_to_send: int = 0  # further placeOrder calls of the same bracket after this one
     parent: ProposedOrder | None = None  # set for a child of a bracket being placed now
     original: ProposedOrder | None = None  # set for a modification: the order as it stands
@@ -235,6 +239,13 @@ def order_guard(order: ProposedOrder, ctx: GuardContext) -> Allow | Refusal:
     used = ctx.submissions_used
     if not isinstance(used, int) or isinstance(used, bool) or used < 0:
         return _refuse(RefusalReason.SUBMISSION_COUNT_UNKNOWN)
+    broker = ctx.broker_submissions
+    if not isinstance(broker, int) or isinstance(broker, bool) or broker < 0:
+        return _refuse(RefusalReason.SUBMISSION_COUNT_UNKNOWN, "the broker's count is unknown")
+    if broker > used:
+        return _refuse(RefusalReason.SUBMISSION_COUNT_MISMATCH,
+                       f"the broker shows {broker} orders of this experiment, the journal {used}")
+    used = max(used, broker)
     if used >= caps.max_submissions:
         return _refuse(RefusalReason.EXPERIMENT_FINISHED,
                        f"{used} of {caps.max_submissions} submissions used")

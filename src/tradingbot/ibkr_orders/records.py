@@ -49,6 +49,7 @@ class OrderSnapshot:
     reason: str
     updated_at: datetime
     own: bool  # placed by this API client id
+    experiment: bool = False  # the broker's orderRef carries the experiment prefix
 
 
 @dataclass(frozen=True)
@@ -67,6 +68,7 @@ class ExecRecord:
     price: Decimal
     time: str  # the broker's execution time string, unparsed
     received_at: datetime
+    experiment: bool = False  # the broker's orderRef carries the experiment prefix
 
 
 # --- errors --------------------------------------------------------------------------------------

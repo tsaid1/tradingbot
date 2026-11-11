@@ -75,7 +75,7 @@ from tradingbot.ibkr.session import (
 )
 from tradingbot.ibkr_orders.caps import EXPERIMENTS, ExperimentCaps
 from tradingbot.ibkr_orders.config import PaperOrderConfig
-from tradingbot.ibkr_orders.counter import SubmissionCounter
+from tradingbot.ibkr_orders.counter import CounterCorrupt, SubmissionCounter
 from tradingbot.ibkr_orders.guard import (
     ContractFacts,
     GuardContext,
@@ -120,6 +120,8 @@ ORDER_MODE_CLIENT_METHODS = ALLOWED_CLIENT_METHODS | frozenset({
     "cancelOrderProtoBuf", "reqAllOpenOrdersProtoBuf", "reqExecutionsProtoBuf",
     "reqCompletedOrdersProtoBuf", "reqIdsProtoBuf",
 })
+# An earlier session's submission found in no lookup counts as possibly live for this long.
+JOURNAL_SETTLE_SECONDS = 120.0
 REQ_ID_BASE = 1_900_000_000  # request ids live above every order id, so error routing is exact
 
 # Order-proto fields this session sets itself; every other field must equal the SDK default.
@@ -161,7 +163,8 @@ def _wire_check(req: PlaceOrderRequest, policy: tuple[str, int, ExperimentCaps])
         problems.append("a BUY must be a limit order")
     if not (o.HasField("outsideRth") and o.outsideRth is False) and not caps.outside_rth_allowed:
         problems.append("outsideRth must be explicitly false")
-    if not o.HasField("transmit") or not o.orderRef or o.action not in ("BUY", "SELL"):
+    if (not o.HasField("transmit") or not o.orderRef.startswith(caps.ref_prefix)
+            or len(o.orderRef) <= len(caps.ref_prefix) or o.action not in ("BUY", "SELL")):
         problems.append("transmit / orderRef / action")
     try:
         qty = Decimal(o.totalQuantity)
@@ -322,6 +325,13 @@ class _OrderWrapper(_Wrapper):
 
 
 # --- order tracking ------------------------------------------------------------------------------
+def _split_ref(raw: str, prefix: str) -> tuple[str, bool]:
+    """(the execution core's reference, carries the experiment prefix?)"""
+    if prefix and raw.startswith(prefix) and len(raw) > len(prefix):
+        return raw[len(prefix):], True
+    return raw, False
+
+
 def _dec(value) -> Decimal | None:
     if value is None or value == UNSET_DECIMAL:
         return None
@@ -345,7 +355,8 @@ class _Track:
     own: bool
     client_id: int = 0
     perm_id: int = 0
-    order_ref: str = ""
+    order_ref: str = ""  # the execution core's reference (the experiment prefix removed)
+    experiment: bool = False  # the broker's orderRef carries this experiment's prefix
     parent_id: int = 0
     con_id: int = 0
     symbol: str = ""
@@ -378,10 +389,11 @@ class _Track:
     error_seq: int = 0
     updated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
-    def fill_from_order(self, contract, order, state_status: str | None) -> None:
+    def fill_from_order(self, contract, order, state_status: str | None,
+                        prefix: str = "") -> None:
         self.client_id = int(order.clientId) if order.clientId != UNSET_INTEGER else 0
         self.perm_id = int(order.permId) if order.permId not in (None, UNSET_INTEGER) else 0
-        self.order_ref = order.orderRef or ""
+        self.order_ref, self.experiment = _split_ref(order.orderRef or "", prefix)
         self.parent_id = int(order.parentId or 0)
         self.con_id = int(contract.conId or 0)
         self.symbol, self.sec_type, self.currency = contract.symbol, contract.secType, \
@@ -440,8 +452,11 @@ class PaperOrderSession(IbkrSession):
         self._wrapper = _OrderWrapper(self)
         self._client = _OrderClient(self._wrapper)  # the read-only client is discarded unused
         self._next_req_id = REQ_ID_BASE
-        self._counter = SubmissionCounter(config.state_dir, config.experiment.name,
-                                          config.experiment.max_submissions)
+        self._counter = SubmissionCounter(config.state_dir, config.experiment,
+                                          config.connection.masked_account())
+        self.count_problem = ""  # why the submission count is unknown, if it is
+        self._broker_count: int | None = None  # taken once, before the first submission
+        self._journal_resolved: dict[int, str] = {}  # earlier sessions' orders seen final
         self._order_lock = threading.RLock()
         self._tracks: dict[int, _Track] = {}
         self._status_cache: dict[int, tuple] = {}
@@ -489,7 +504,10 @@ class PaperOrderSession(IbkrSession):
 
     # ------------------------------------------------------------------ lifecycle
     def connect(self) -> None:
-        self._counter.open()  # local, before any socket: a locked or corrupt counter refuses
+        try:  # local, before any socket. A locked counter refuses to connect; a missing or
+            self._counter.open()  # broken one leaves the count unknown: nothing can be placed
+        except CounterCorrupt as exc:  # (SUBMISSION_COUNT_UNKNOWN), cancels stay possible
+            self.count_problem = str(exc)
         try:
             super().connect()
             caps = self._caps
@@ -717,7 +735,8 @@ class PaperOrderSession(IbkrSession):
         if self._contract is None or self.order_mode_status != "VERIFIED":
             raise SessionStateError("order mode is not verified")
         if self._counter.used is None:
-            raise SessionStateError("submission counter is not open")
+            raise OrderRefused(Refusal(RefusalReason.SUBMISSION_COUNT_UNKNOWN,
+                                       self.count_problem or "submission counter is not open"))
 
     def _take_baseline(self) -> None:
         """The executions known so far, then the position read: from here on the session's own
@@ -778,7 +797,79 @@ class PaperOrderSession(IbkrSession):
                                 parent_id=s.parent_id if s.own else 0,
                                 parent_working=(s.client_id, s.parent_id) in working_ids)
                    for n, s in enumerate(snaps)]
+        journal = self._journal_working({s.order_id for s in snaps if s.own})
+        ids = {w.order_id for w in working} | {w.order_id for w in journal}
+        working += [replace(w, parent_working=w.parent_id in ids) for w in journal]
+        if self._broker_count is None:
+            self._broker_count = self._count_at_broker()
         return facts, (position, self._implied_position(c.con_id)), working
+
+    def _count_at_broker(self) -> int:
+        """Distinct orders of this experiment (orderRef prefix) that the broker itself shows in
+        open orders (every client), executions and completed orders. Raises if a read fails."""
+        keys: set[tuple] = set()
+
+        def key(perm: int, client: int, oid: int) -> tuple:
+            return ("perm", perm) if perm else ("id", client, oid)
+
+        for row in [*self._open_snapshot(), *self.completed_orders()]:
+            if row.experiment:
+                keys.add(key(row.perm_id, row.client_id, row.order_id))
+        for e in self.executions():
+            if e.experiment:
+                keys.add(key(e.perm_id, e.client_id, e.order_id))
+        return len(keys)
+
+    def _journal_working(self, seen_own: set[int]) -> list[WorkingOrder]:
+        """Submissions recorded by EARLIER sessions with no terminal evidence yet: counted as
+        working at their full size. Evidence: a final status for the order, a completed-orders
+        row (by order id or reference), executions covering its quantity, or absence from every
+        lookup once the submission is older than ``JOURNAL_SETTLE_SECONDS``."""
+        latest: dict[int, dict] = {}
+        for e in self._counter.entries:
+            latest[e["order_id"]] = e  # an amendment's line carries the current size
+        pending = []
+        with self._cond:
+            for oid, e in latest.items():
+                t = self._tracks.get(oid)
+                if oid in self._journal_resolved or oid in seen_own:
+                    continue
+                if t is not None and t.own and t.proposed is not None:
+                    continue  # placed or amended in this session: tracked as SENT_NOT_VISIBLE
+                if t is not None and t.own and t.status in FINAL_STATUSES:
+                    self._journal_resolved[oid] = t.status.value
+                    continue
+                pending.append(e)
+        if not pending:
+            return []
+        done = self.completed_orders()
+        execs = self.executions()
+        out = []
+        now = datetime.now(UTC)
+        for e in pending:
+            oid = e["order_id"]
+            ref = _split_ref(e["order_ref"], self._caps.ref_prefix)[0]
+            if any(d.status in FINAL_STATUSES and d.experiment and (
+                    (d.own and d.order_id == oid) or d.order_ref == ref) for d in done):
+                self._journal_resolved[oid] = "COMPLETED"
+                continue
+            filled = sum((x.shares for x in execs if x.client_id == self._cfg.client_id
+                          and x.order_id == oid), Decimal(0))
+            qty = Decimal(e["quantity"])
+            if filled >= qty:
+                self._journal_resolved[oid] = "FILLED"
+                continue
+            try:
+                age = (now - datetime.fromisoformat(e["at"])).total_seconds()
+            except ValueError:
+                age = 0.0
+            if age > JOURNAL_SETTLE_SECONDS:
+                self._journal_resolved[oid] = "ABSENT_FROM_EVERY_LOOKUP"
+                continue
+            out.append(WorkingOrder(order_id=oid, con_id=self.contract.con_id,
+                                    action=e["action"], remaining=qty - filled,
+                                    parent_id=e["parent_id"]))
+        return out
 
     def _allocate_ids(self, n: int) -> list[int]:
         """``reqIds`` then ``nextValidId``; ids are never reused (above every id this session or
@@ -817,7 +908,8 @@ class PaperOrderSession(IbkrSession):
                   position: tuple[Decimal | None, Decimal | None], working: list[WorkingOrder], still: int, *, parent: ProposedOrder | None = None,
                   original: ProposedOrder | None = None) -> object:
         return order_guard(p, GuardContext(
-            caps=self._caps, submissions_used=self._counter.used, contract=facts,
+            caps=self._caps, submissions_used=self._counter.used,
+            broker_submissions=self._broker_count, contract=facts,
             expected_account=self._cfg.account, position=position[0], working=tuple(working),
             now=self._clock(), implied_position=position[1], still_to_send=still, parent=parent,
             original=original))
@@ -829,7 +921,8 @@ class PaperOrderSession(IbkrSession):
         c.primaryExchange = self.contract.primary_exchange
         o = Order()
         o.action, o.totalQuantity, o.orderType, o.tif = p.action, p.quantity, p.order_type, p.tif
-        o.account, o.orderRef, o.parentId = p.account, p.order_ref, p.parent_id
+        o.account, o.orderRef, o.parentId = p.account, self._caps.ref_prefix + p.order_ref, \
+            p.parent_id
         if p.limit_price is not None:
             o.lmtPrice = float(p.limit_price)
         if p.stop_price is not None:
@@ -854,7 +947,10 @@ class PaperOrderSession(IbkrSession):
                 raise OrderRefused(decision)
             req = self._proto(p)
             body = req.SerializeToString()
-            self._counter.record(order_id=p.order_id, order_ref=p.order_ref, kind=kind)  # fsync
+            self._counter.record(  # fsync'd before the wire
+                order_id=p.order_id, order_ref=req.order.orderRef, kind=kind, action=p.action,
+                quantity=p.quantity, order_type=p.order_type, limit_price=p.limit_price,
+                stop_price=p.stop_price, parent_id=p.parent_id)
             t = self._tracks.get(p.order_id)
             if t is None:
                 t = self._tracks[p.order_id] = _Track(order_id=p.order_id, own=True,
@@ -869,6 +965,7 @@ class PaperOrderSession(IbkrSession):
     def _apply_proposed(t: _Track, p: ProposedOrder) -> None:
         t.proposed = p
         t.order_ref, t.parent_id, t.con_id = p.order_ref, p.parent_id, p.con_id
+        t.experiment = True
         t.symbol, t.sec_type, t.currency, t.account = p.symbol, p.sec_type, p.currency, p.account
         t.action, t.order_type, t.tif, t.oca_group = p.action, p.order_type, p.tif, p.oca_group
         if t.status is None:  # a new order: the original fields until the broker echoes them
@@ -952,7 +1049,7 @@ class PaperOrderSession(IbkrSession):
         parent = self._tracks.get(t.parent_id) if t.parent_id else None
         return OrderSnapshot(
             order_id=t.order_id, client_id=t.client_id, perm_id=t.perm_id,
-            order_ref=t.order_ref, parent_id=t.parent_id,
+            order_ref=t.order_ref, experiment=t.experiment, parent_id=t.parent_id,
             parent_ref=parent.order_ref if parent is not None and t.own else None,
             con_id=t.con_id, symbol=t.symbol, sec_type=t.sec_type, currency=t.currency,
             action=t.action, total_quantity=t.total, order_type=t.order_type,
@@ -992,7 +1089,7 @@ class PaperOrderSession(IbkrSession):
                 if t is None:
                     t = self._tracks[int(order_id)] = _Track(order_id=int(order_id), own=True)
                 cached = self._status_cache.pop(int(order_id), None)
-                t.fill_from_order(contract, order, state.status)
+                t.fill_from_order(contract, order, state.status, self._caps.ref_prefix)
                 if cached is not None:
                     self._apply_status(t, *cached)
                 t.open_seq += 1
@@ -1000,7 +1097,7 @@ class PaperOrderSession(IbkrSession):
                 row: tuple = ("own", t.order_id)
             else:
                 t = _Track(order_id=int(order_id), own=False)
-                t.fill_from_order(contract, order, state.status)
+                t.fill_from_order(contract, order, state.status, self._caps.ref_prefix)
                 t.remaining = t.total  # nothing known filled: counted at full size (conservative)
                 row = ("foreign", t)
             for p in self._pending.values():
@@ -1046,7 +1143,9 @@ class PaperOrderSession(IbkrSession):
         rec = ExecRecord(
             exec_id=execution.execId, order_id=int(execution.orderId or 0),
             client_id=int(execution.clientId or 0), perm_id=int(execution.permId or 0),
-            order_ref=execution.orderRef or "", con_id=int(contract.conId or 0),
+            order_ref=_split_ref(execution.orderRef or "", self._caps.ref_prefix)[0],
+            experiment=_split_ref(execution.orderRef or "", self._caps.ref_prefix)[1],
+            con_id=int(contract.conId or 0),
             symbol=contract.symbol, sec_type=contract.secType, currency=contract.currency,
             side=side, shares=_dec(execution.shares) or Decimal(0),
             price=_dec(execution.price) or Decimal(0), time=execution.time,
@@ -1068,7 +1167,7 @@ class PaperOrderSession(IbkrSession):
         with self._cond:
             t = _Track(order_id=int(order.orderId or 0) if order.orderId != UNSET_INTEGER else 0,
                        own=order.clientId == self._cfg.client_id)
-            t.fill_from_order(contract, order, None)
+            t.fill_from_order(contract, order, None, self._caps.ref_prefix)
             known = self._tracks.get(t.order_id) if t.own else None
             status = map_status(state.status)
             if known is not None and known.rejected and status in (

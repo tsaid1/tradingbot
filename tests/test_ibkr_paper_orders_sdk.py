@@ -21,6 +21,7 @@ from _ibkr_fake_tws_orders import (
     READ_ONLY_REJECTION,
     TLT_CON_ID,
     FakeOrderTws,
+    core_ref,
 )
 from execution_harness import APPROVE, action, source
 from ibapi.client import EClient
@@ -53,6 +54,7 @@ from tradingbot.ibkr_orders import config as order_config_module
 from tradingbot.ibkr_orders import session as order_session_module
 from tradingbot.ibkr_orders.broker import IbkrPaperBroker, PartialBracket
 from tradingbot.ibkr_orders.config import PaperOrderConfig, load_order_config
+from tradingbot.ibkr_orders.counter import init_journal, journal_paths
 from tradingbot.ibkr_orders.guard import RefusalReason
 from tradingbot.ibkr_orders.records import (
     OrderModeSettingRefused,
@@ -90,8 +92,17 @@ def tws(monkeypatch, request):
     return server
 
 
-def make(tws, tmp_path, *, connect=True, clock=None, **kw) -> PaperOrderSession:
+def init_for(cfg) -> None:
+    """The owner's one-time initialisation (scripts/ibkr_paper_init_journal.py)."""
+    path, _ = journal_paths(cfg.state_dir, cfg.experiment.name)
+    if not path.exists():
+        init_journal(cfg.state_dir, cfg.experiment, cfg.connection.masked_account())
+
+
+def make(tws, tmp_path, *, connect=True, clock=None, init=True, **kw) -> PaperOrderSession:
     cfg = load_order_config(write_cfg(tmp_path))
+    if init:
+        init_for(cfg)
     opts = {"preflight": stub_preflight, "connect_timeout": 2.0, "request_timeout": 2.0,
                 "quote_timeout": 2.0, "stream_seconds": 1.0, "stream_settle_seconds": 0.05,
                 "shutdown_timeout": 3.0, "ack_timeout": 0.4, "cancel_wait": 1.0, "clock": clock}
@@ -216,7 +227,9 @@ def test_connect_order_and_explicit_bracket_flags(tws, tmp_path):
             assert p.order.HasField("outsideRth") and p.order.outsideRth is False
             assert p.order.account == PAPER and p.order.tif == "DAY"
             assert p.contract.conId == TLT_CON_ID
-        assert parent.order.orderRef == "TB-0001" and child.order.orderRef == "TB-0001.STP"
+        assert parent.order.orderRef == "paper-test-1:TB-0001"  # experiment prefix + core ref
+        assert child.order.orderRef == "paper-test-1:TB-0001.STP"
+        assert [x.order_ref for x in snaps] == ["TB-0001", "TB-0001.STP"]  # lookups by core ref
         assert child.order.parentId == parent.orderId == snaps[0].order_id
         assert [x.status for x in snaps] == [OrderStatus.SUBMITTED, OrderStatus.PRE_SUBMITTED]
         assert s.submissions_used == 2
@@ -465,7 +478,7 @@ def tlt_open(**kw):
 
 
 def fake_id(tws, ref):
-    return max(o.order_id for o in tws.orders.values() if o.order.orderRef == ref)
+    return max(o.order_id for o in tws.orders.values() if core_ref(o.order.orderRef) == ref)
 
 
 def test_full_lifecycle_within_the_six_submission_cap(tws, tmp_path):
@@ -599,6 +612,7 @@ def test_partial_fill_maps_to_partially_filled(tws, tmp_path, monkeypatch):
     monkeypatch.setattr(order_config_module, "EXPERIMENTS", reg)
     monkeypatch.setattr(order_session_module, "EXPERIMENTS", reg)
     cfg = load_order_config(write_cfg(tmp_path, orders="test-two-shares"))
+    init_for(cfg)
     s = PaperOrderSession(cfg, preflight=stub_preflight, connect_timeout=2.0,
                           request_timeout=2.0, stream_seconds=1.0, stream_settle_seconds=0.05,
                           ack_timeout=0.4)
@@ -857,3 +871,108 @@ def test_a_confirmed_cancel_frees_the_second_sell(tws, tmp_path):
         assert placed(tws) == 4
     finally:
         s.disconnect()
+
+
+# --- review round 2: the submission budget cannot be reset -------------------------------------
+def _journal(tmp_path):
+    return tmp_path / "state" / "ibkr_paper_orders" / "paper-test-1.submissions"
+
+
+def test_deleting_the_journal_never_gives_a_fresh_budget(tws, tmp_path):
+    s = make(tws, tmp_path)
+    try:
+        s.place([buy(), stop()])
+    finally:
+        s.disconnect()
+    _journal(tmp_path).unlink()
+    again = make(tws, tmp_path, init=False)
+    try:
+        with pytest.raises(OrderRefused) as info:
+            again.place([buy("TB-0009")])
+        assert info.value.refusal.reason == RefusalReason.SUBMISSION_COUNT_UNKNOWN
+        assert not _journal(tmp_path).exists()  # the session never creates it
+        assert placed(tws) == 2
+    finally:
+        again.disconnect()
+
+
+def test_truncating_the_journal_refuses_everything(tws, tmp_path):
+    s = make(tws, tmp_path)
+    try:
+        snaps = s.place([buy(), stop()])
+        for price in ("87.10", "87.20", "87.30"):
+            s.modify(snaps[1].order_id, stop_price=D(price))
+    finally:
+        s.disconnect()
+    lines = _journal(tmp_path).read_bytes().splitlines(keepends=True)
+    _journal(tmp_path).write_bytes(b"".join(lines[:2]))  # the reviewer's 5 -> 1 cut
+    again = make(tws, tmp_path)
+    try:
+        with pytest.raises(OrderRefused) as info:
+            again.place([buy("TB-0009")])
+        assert info.value.refusal.reason == RefusalReason.SUBMISSION_COUNT_UNKNOWN
+        assert placed(tws) == 5
+    finally:
+        again.disconnect()
+
+
+def test_a_new_journal_while_the_broker_shows_more_is_a_mismatch(tws, tmp_path):
+    """Journal and head deleted, a new journal initialised: the broker's own history (orderRef
+    prefix) shows 2 orders of the experiment, the journal 0."""
+    s = make(tws, tmp_path)
+    try:
+        snaps = s.place([buy(), stop()])
+        s.cancel(snaps[0].order_id)
+    finally:
+        s.disconnect()
+    path, head = journal_paths(tmp_path / "state", "paper-test-1")
+    path.unlink()
+    head.unlink()
+    again = make(tws, tmp_path)  # re-initialised
+    try:
+        assert again.submissions_used == 0
+        with pytest.raises(OrderRefused) as info:
+            again.place([buy("TB-0009")])
+        assert info.value.refusal.reason == RefusalReason.SUBMISSION_COUNT_MISMATCH
+        assert placed(tws) == 2
+    finally:
+        again.disconnect()
+
+
+def test_an_unconfirmed_sell_from_the_journal_blocks_a_second_sell_after_restart(tws, tmp_path):
+    s = make(tws, tmp_path)
+    try:
+        _long_one_without_stop(tws, s)
+        tws.invisible = True
+        with pytest.raises(OrderOutcomeUnknown):
+            s.place([_sell("TB-C1")])
+    finally:
+        s.disconnect()
+    again = make(tws, tmp_path)  # a new process: only the journal knows about TB-C1
+    try:
+        assert again.open_orders() == []
+        with pytest.raises(OrderRefused) as info:
+            again.place([_sell("TB-C2")])
+        assert info.value.refusal.reason == RefusalReason.SELL_EXCEEDS_POSITION
+        assert placed(tws) == 3
+    finally:
+        again.disconnect()
+
+
+def test_a_confirmed_cancel_frees_the_second_sell_after_restart(tws, tmp_path):
+    s = make(tws, tmp_path)
+    try:
+        _long_one_without_stop(tws, s)
+        tws.invisible = True
+        with pytest.raises(OrderOutcomeUnknown):
+            s.place([_sell("TB-C1")])
+        tws.invisible = False
+        assert s.cancel(max(s.order_ids())).status == OrderStatus.CANCELLED
+    finally:
+        s.disconnect()
+    again = make(tws, tmp_path)
+    try:
+        again.place([_sell("TB-C2")])  # completed orders show TB-C1 cancelled
+        assert placed(tws) == 4
+    finally:
+        again.disconnect()

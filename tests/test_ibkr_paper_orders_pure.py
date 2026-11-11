@@ -28,7 +28,11 @@ from tradingbot.ibkr_orders.counter import (
     CapReached,
     CounterCorrupt,
     CounterLocked,
+    CounterMissing,
+    JournalExists,
     SubmissionCounter,
+    caps_digest,
+    init_journal,
 )
 from tradingbot.ibkr_orders.guard import (
     ALLOW,
@@ -213,6 +217,7 @@ def ctx(**over) -> GuardContext:
                 "position": Decimal(0), "working": (), "now": OPEN_NOW}
     base.update(over)
     base.setdefault("implied_position", base["position"])  # the session's own fills agree
+    base.setdefault("broker_submissions", 0)
     return GuardContext(**base)
 
 
@@ -370,35 +375,111 @@ def test_parse_hours_accepts_both_ibkr_formats():
 
 
 # --- the durable counter --------------------------------------------------------------------------
-def test_counter_is_durable_locked_and_capped(tmp_path):
-    c = SubmissionCounter(tmp_path, "paper-test-1", 6)
+MASKED = "DU****001"
+
+
+def rec(c: SubmissionCounter, oid: int, kind: str = "SINGLE") -> int:
+    return c.record(order_id=oid, order_ref=f"paper-test-1:TB-{oid}", kind=kind, action="BUY",
+                    quantity=Decimal(1), order_type="LMT", limit_price=Decimal("88.12"),
+                    stop_price=None, parent_id=0)
+
+
+def opened(tmp_path, account=MASKED, caps=C.PAPER_TEST_1) -> SubmissionCounter:
+    c = SubmissionCounter(tmp_path, caps, account)
     c.open()
+    return c
+
+
+def test_counter_is_durable_locked_and_capped(tmp_path):
+    init_journal(tmp_path, C.PAPER_TEST_1, MASKED)
+    c = opened(tmp_path)
     assert c.used == 0
     for i in range(6):
-        assert c.record(order_id=100 + i, order_ref=f"TB-{i}", kind="SINGLE") == i + 1
+        assert rec(c, 100 + i) == i + 1
     with pytest.raises(CapReached):
-        c.record(order_id=200, order_ref="TB-x", kind="SINGLE")
-    second = SubmissionCounter(tmp_path, "paper-test-1", 6)
+        rec(c, 200)
+    second = SubmissionCounter(tmp_path, C.PAPER_TEST_1, MASKED)
     with pytest.raises(CounterLocked):
         second.open()
     c.close()
     second.open()  # a restart: the count survives
     assert second.used == 6 and second.max_order_id == 105
+    assert [e["action"] for e in second.entries] == ["BUY"] * 6
     with pytest.raises(CapReached):
-        second.record(order_id=201, order_ref="TB-y", kind="SINGLE")
+        rec(second, 201)
     second.close()
     assert oct(os.stat(c.path).st_mode & 0o777) == "0o600"
 
 
-@pytest.mark.parametrize("content", [b'{"n": 1}', b"garbage\n",
-                                     b'{"n": 2, "experiment": "paper-test-1", "order_id": 1}\n',
-                                     b'{"n": 1, "experiment": "other", "order_id": 1}\n'])
-def test_counter_refuses_a_journal_it_cannot_read_exactly(tmp_path, content):
-    c = SubmissionCounter(tmp_path, "paper-test-1", 6)
-    c.dir.mkdir(mode=0o700)
-    c.path.write_bytes(content)
-    with pytest.raises(CounterCorrupt):
+def test_the_counter_never_creates_the_journal(tmp_path):
+    c = SubmissionCounter(tmp_path, C.PAPER_TEST_1, MASKED)
+    with pytest.raises(CounterMissing):
         c.open()
+    assert not c.path.exists() and c.used is None
+
+
+def test_init_journal_runs_once_and_records_the_header(tmp_path):
+    path = init_journal(tmp_path, C.PAPER_TEST_1, MASKED)
+    with pytest.raises(JournalExists):
+        init_journal(tmp_path, C.PAPER_TEST_1, MASKED)
+    import json
+    header = json.loads(path.read_bytes().splitlines()[0])
+    assert header["experiment"] == "paper-test-1" and header["account_masked"] == MASKED
+    assert header["caps_digest"] == caps_digest(C.PAPER_TEST_1) and header["created_at"]
+    assert PAPER not in path.read_text()
+
+
+@pytest.mark.parametrize("which", ["account", "caps"])
+def test_a_header_for_another_account_or_caps_refuses(tmp_path, which):
+    init_journal(tmp_path, C.PAPER_TEST_1, MASKED)
+    with pytest.raises(CounterCorrupt):
+        if which == "account":
+            opened(tmp_path, account="DU****002")
+        else:
+            opened(tmp_path, caps=replace(C.PAPER_TEST_1, max_submissions=60))
+
+
+def _five(tmp_path) -> SubmissionCounter:
+    init_journal(tmp_path, C.PAPER_TEST_1, MASKED)
+    c = opened(tmp_path)
+    for i in range(5):
+        rec(c, 100 + i)
+    c.close()
+    return c
+
+
+@pytest.mark.parametrize("damage", ["truncate_tail", "drop_middle", "edit_field", "torn",
+                                    "swap", "delete_head", "delete_journal", "garbage"])
+def test_truncation_and_tampering_are_detected(tmp_path, damage):
+    c = _five(tmp_path)
+    lines = c.path.read_bytes().splitlines(keepends=True)
+    if damage == "truncate_tail":  # the reviewer's probe: 5 -> 1 used to parse
+        c.path.write_bytes(b"".join(lines[:2]))
+    elif damage == "drop_middle":
+        c.path.write_bytes(b"".join(lines[:2] + lines[3:]))
+    elif damage == "edit_field":
+        c.path.write_bytes(b"".join(lines[:3] + [lines[3].replace(b'"BUY"', b'"SELL"')]
+                                    + lines[4:]))
+    elif damage == "torn":
+        c.path.write_bytes(b"".join(lines)[:-5])
+    elif damage == "swap":
+        c.path.write_bytes(b"".join([lines[0], lines[2], lines[1], *lines[3:]]))
+    elif damage == "delete_head":
+        c.head.unlink()
+    elif damage == "delete_journal":
+        c.path.unlink()
+    else:
+        c.path.write_bytes(b"garbage\n")
+    with pytest.raises(CounterCorrupt):
+        opened(tmp_path)
+
+
+def test_a_crash_between_the_append_and_the_head_anchor_is_tolerated(tmp_path):
+    c = _five(tmp_path)
+    import json
+    lines = c.path.read_bytes().splitlines()
+    c.head.write_bytes(json.dumps({"seq": 4, "hash": json.loads(lines[4])["hash"]}).encode())
+    assert opened(tmp_path).used == 5
 
 
 # --- status mapping -------------------------------------------------------------------------------
@@ -503,3 +584,38 @@ def test_disagreement_also_stops_children_and_amendments_and_unknown_own_fills_r
         RefusalReason.POSITION_DISAGREEMENT
     assert refused(order(), ctx(implied_position=None)) == RefusalReason.POSITION_UNKNOWN
     assert order_guard(order(), ctx(position=Decimal(0), implied_position=Decimal(0))) is ALLOW
+
+
+def test_guard_refuses_when_the_broker_shows_more_than_the_journal():
+    assert refused(order(), ctx(submissions_used=0, broker_submissions=2)) == \
+        RefusalReason.SUBMISSION_COUNT_MISMATCH
+    assert refused(order(), ctx(broker_submissions=None)) == \
+        RefusalReason.SUBMISSION_COUNT_UNKNOWN
+    assert order_guard(order(), ctx(submissions_used=3, broker_submissions=2)) is ALLOW
+
+
+def _load_script(name: str):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(name, ROOT / "scripts" / f"{name}.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_init_script_is_offline_and_runs_once(tmp_path, monkeypatch, capsys):
+    import socket
+
+    def no_network(*a, **k):
+        raise AssertionError("the init script must not open a socket")
+
+    monkeypatch.setattr(socket.socket, "connect", no_network)
+    monkeypatch.setattr(socket, "create_connection", no_network)
+    script = _load_script("ibkr_paper_init_journal")
+    cfg_path = write_cfg(tmp_path)
+    assert script.main(["--config", str(cfg_path)]) == 0
+    assert PAPER not in capsys.readouterr().out
+    assert script.main(["--config", str(cfg_path)]) == 1  # never twice
+    c = SubmissionCounter(tmp_path / "state", C.PAPER_TEST_1, "DU…01")
+    c.open()
+    assert c.used == 0
+    c.close()
