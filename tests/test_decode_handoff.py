@@ -5,6 +5,10 @@ Every case composes the actual FrameAccumulator, the closed InventedDecoder, the
 callbacks routed directly. Each failure case is tied to a known way a decoder can return without delivery or
 a handoff can fail acceptance: zero, multiple, raising, late, refused and unsupported callbacks, version
 mismatch, overflow, foreign queued work and retained ownership.
+
+The opt-in framed managedAccounts path composes the same parts with the handoff's internally built
+ManagedAccountsInput: invented frame -> input -> explicit owner-mode registration -> router producers and
+consumer. Every refusal is paired with the control, including refusals the router never sees.
 """
 from __future__ import annotations
 
@@ -16,7 +20,7 @@ from decimal import Decimal
 import pytest
 
 from tradingbot.ibkr_read_facade import ReadCallbackFacade
-from tradingbot.paper_readiness.callback_router import CallbackRouter
+from tradingbot.paper_readiness.callback_router import CallbackRouter, StreamKind
 from tradingbot.paper_readiness.decode_handoff import (
     MAX_CALLBACKS_PER_FRAME,
     DecodeHandoff,
@@ -27,8 +31,9 @@ from tradingbot.paper_readiness.decode_handoff import (
     Step,
     StepKind,
 )
+from tradingbot.paper_readiness.managed_accounts_input import Arrival, Invalidation, Registration
 from tradingbot.paper_readiness.read_framing import FramingLimits, FramingOutcome
-from tradingbot.paper_readiness.transport import FakeClock
+from tradingbot.paper_readiness.transport import FORBIDDEN_NAME_RE, FakeClock
 
 NOW = datetime(2026, 3, 4, 16, 0, tzinfo=UTC)
 LAST = str(int((NOW - timedelta(seconds=10)).timestamp()))
@@ -466,3 +471,302 @@ def test_a_failed_record_counts_every_record_its_frame_admitted(script, failure,
     assert (record.records_admitted, record.records_dispatched) == (admitted, 0)
     assert router.report().queued_records == admitted  # the record matches the router's own evidence
     assert handoff._held.frame.payload == b"INV-quote"  # and the frame stays owned
+
+
+# ----------------------------------------------------------------------------- opt-in framed managed accounts
+
+KEY = b"INVENTED-DECODE-KEY-0001"  # invented per-run keys, 24 bytes each
+OTHER_KEY = b"INVENTED-DECODE-KEY-0002"
+FOREIGN = "SYNTH-DECODEFRN1"
+ACCOUNTS = (call(Entry.MANAGED_ACCOUNTS, ACCOUNT),)
+FOREIGN_SUMMARY = tuple(call(st.entry, *(FOREIGN if a == ACCOUNT else a for a in st.args)) for st in SUMMARY)
+WIRED = {**CONTROL, b"INV-accounts": ACCOUNTS, b"INV-accounts-again": ACCOUNTS,
+         b"INV-summary-foreign": FOREIGN_SUMMARY,
+         b"INV-accounts-malformed": (call(Entry.MANAGED_ACCOUNTS, ACCOUNT + ","),),
+         b"INV-accounts-empty": (call(Entry.MANAGED_ACCOUNTS, ""),),
+         b"INV-accounts-arity": (call(Entry.MANAGED_ACCOUNTS, ACCOUNT, ACCOUNT),),
+         b"INV-accounts-ambiguous": (call(Entry.MANAGED_ACCOUNTS, f"SYNTH-DECODEOTH1,{ACCOUNT}"),),
+         b"INV-error": (call(Entry.ERROR, SRID, 1772640000000, 321, "INVENTED error", ""),)}
+READS = (b"INV-summary", b"INV-positions")
+
+
+def account_router() -> CallbackRouter:
+    """Started, with no read registered: owner-mode reads open only through explicit registration."""
+    router = CallbackRouter(Client(), _Lock(), FakeClock(NOW))
+    router.start()
+    return router
+
+
+def wired(router=None, *, expected=ACCOUNT, key=KEY):
+    router = router if router is not None else account_router()
+    handoff = DecodeHandoff(router, InventedDecoder(VERSION, WIRED), server_version=VERSION,
+                            expected_account=expected, account_key=key)
+    return router, handoff
+
+
+def drive(handoff: DecodeHandoff, *payloads: bytes) -> int:
+    feed_fragmented(handoff, payloads)
+    return handoff.process_available()
+
+
+def end(router: CallbackRouter, handoff: DecodeHandoff) -> None:
+    handoff.finish()
+    router.shutdown(join_timeout=0.01)
+    handoff.close_accounts()
+
+
+def references(router: CallbackRouter) -> set[str]:
+    rows = {e.account_summary.account_id for e in router.account_summary_envelopes() if e.account_summary}
+    return rows | {e.position.account_id for e in router.position_envelopes() if e.position}
+
+
+def streams(router: CallbackRouter) -> dict:
+    return {st.stream: (st.completed, st.issue_codes) for st in router.stream_status()}
+
+
+def wired_control():
+    router, handoff = wired()
+    assert drive(handoff, b"INV-accounts") == 1
+    handoff.register_reads(SRID, PRID)
+    assert drive(handoff, *READS) == 2
+    end(router, handoff)
+    return router, handoff
+
+
+def test_control_a_framed_snapshot_registers_owner_reads_and_the_input_report_joins_completion():
+    router, handoff = account_router(), None
+    router, handoff = wired(router)
+    assert drive(handoff, b"INV-accounts") == 1
+    # The frame settled with no router record, and no read opened: registration is never automatic.
+    first = handoff.report()
+    assert first.handoffs[0].status is HandoffStatus.SETTLED
+    assert (first.handoffs[0].callbacks, first.handoffs[0].records_admitted) == (1, 0)
+    assert router.report().adapter.ledger.slots == ()
+    assert first.managed_accounts.registration is Registration.NOT_ATTEMPTED and not first.completed
+    handoff.register_reads(SRID, PRID)
+    assert {s.slot for s in router.report().adapter.ledger.slots} == {"ACCOUNT_SUMMARY", "POSITIONS"}
+    assert drive(handoff, *READS) == 2
+    end(router, handoff)
+    report = handoff.report()
+    accounts = report.managed_accounts
+    assert (accounts.arrival, accounts.registration, accounts.invalidation) == (
+        Arrival.EXACT, Registration.REGISTERED, None)
+    assert accounts.completed and accounts.router_completed and accounts.closed
+    assert report.failure is None and report.completed is True and router.report().faults == ()
+    status = streams(router)
+    assert status[StreamKind.ACCOUNT_SUMMARY] == status[StreamKind.POSITIONS] == (True, ())
+    # Owner mode: every row carries the run's one keyed reference, never the invented identifier.
+    [reference] = references(router)
+    assert reference.startswith("acctref-v1:") and ACCOUNT not in reference
+
+
+@pytest.mark.parametrize(("payload", "arrival"), [
+    (b"INV-accounts-malformed", Arrival.MALFORMED), (b"INV-accounts-empty", Arrival.MALFORMED),
+    (b"INV-accounts-arity", Arrival.MALFORMED), (b"INV-accounts-ambiguous", Arrival.AMBIGUOUS),
+], ids=["trailing-separator", "empty", "arity", "ambiguous"])
+def test_a_refused_snapshot_latches_before_registration_although_the_router_sees_nothing(payload, arrival):
+    router, handoff = wired()
+    assert drive(handoff, payload, *READS) == 0
+    report = handoff.report()
+    assert report.failure is Failure.ACCOUNTS_REFUSED and report.held_sequence == 1
+    assert report.handoffs[0].status is HandoffStatus.FAILED
+    assert router.report().faults == ()  # no router-fault delta: only the input's own report shows it
+    assert report.managed_accounts.arrival is arrival
+    handoff.register_reads(SRID, PRID)  # still explicit, and still refused: the router is not called
+    assert handoff.report().managed_accounts.registration is Registration.NOT_READY
+    assert router.report().adapter.ledger.slots == ()
+    assert handoff.report().framing.frames_queued == 2  # later frames are never taken
+    end(router, handoff)
+    assert handoff.report().failure is Failure.ACCOUNTS_REFUSED and not handoff.report().completed
+
+
+def test_a_mismatched_snapshot_never_registers_and_a_registration_before_arrival_is_refused():
+    router, handoff = wired(expected="SYNTH-DECODENOT1")
+    drive(handoff, b"INV-accounts")
+    assert handoff.report().managed_accounts.arrival is Arrival.MISMATCH
+    assert handoff.report().failure is Failure.ACCOUNTS_REFUSED and router.report().faults == ()
+    early_router, early = wired()
+    early.register_reads(SRID, PRID)  # before any arrival
+    report = early.report()
+    assert report.failure is Failure.ACCOUNTS_REFUSED
+    assert report.managed_accounts.registration is Registration.NOT_READY
+    assert early_router.report().adapter.ledger.slots == () and early_router.report().faults == ()
+
+
+def test_a_duplicate_snapshot_before_registration_is_refused_without_a_router_fault():
+    router, handoff = wired()
+    assert drive(handoff, b"INV-accounts", b"INV-accounts-again") == 1
+    report = handoff.report()
+    assert (report.failure, report.held_sequence) == (Failure.ACCOUNTS_REFUSED, 2)
+    assert report.managed_accounts.invalidation is Invalidation.DUPLICATE and router.report().faults == ()
+    handoff.register_reads(SRID, PRID)
+    assert handoff.report().managed_accounts.registration is Registration.NOT_READY
+
+
+def test_a_duplicate_snapshot_after_every_end_invalidates_and_revokes_completion():
+    router, control = wired_control()
+    assert control.report().completed
+    router, handoff = wired()
+    drive(handoff, b"INV-accounts")
+    handoff.register_reads(SRID, PRID)
+    assert drive(handoff, *READS, b"INV-accounts-again") == 2  # both ENDs delivered, then the duplicate
+    end(router, handoff)
+    report = handoff.report()
+    assert (report.failure, report.held_sequence) == (Failure.ACCOUNTS_REFUSED, 4)
+    assert [r.status for r in report.handoffs] == [HandoffStatus.SETTLED] * 3 + [HandoffStatus.FAILED]
+    assert report.managed_accounts.invalidation is Invalidation.DUPLICATE
+    # The invalidation reaches the router as a persistent fault, after END too.
+    assert router.report().faults == ("UNSUPPORTED_CALLBACK",) and not router.report().completed
+    status = streams(router)
+    assert status[StreamKind.ACCOUNT_SUMMARY] == (False, ("UNSUPPORTED_CALLBACK",))
+    assert status[StreamKind.POSITIONS] == (False, ("UNSUPPORTED_CALLBACK",))
+    assert not report.completed and not report.managed_accounts.completed
+
+
+def test_a_snapshot_after_the_input_closed_is_late():
+    router, handoff = wired()
+    drive(handoff, b"INV-accounts")
+    handoff.register_reads(SRID, PRID)
+    drive(handoff, *READS)
+    router.shutdown(join_timeout=0.01)
+    handoff.close_accounts()  # the normal close, after shutdown: not an invalidation
+    assert handoff.report().managed_accounts.invalidation is None
+    drive(handoff, b"INV-accounts-again")  # framing input is still open; the input is not
+    handoff.finish()
+    report = handoff.report()
+    assert report.failure is Failure.ACCOUNTS_REFUSED
+    assert report.managed_accounts.invalidation is Invalidation.LATE and not report.completed
+    assert router.report().faults == ("ARRIVAL_AFTER_CLOSE",)  # the router is shut down: still a fault
+
+
+def test_the_owner_lives_only_as_long_as_the_input_on_the_same_router():
+    router, handoff = wired()
+    drive(handoff, b"INV-accounts")
+    handoff.register_reads(SRID, PRID)
+    drive(handoff, b"INV-summary")
+    handoff.close_accounts()  # too early: the owner closes, so later rows cannot be projected
+    drive(handoff, b"INV-positions")
+    handoff.finish()
+    router.shutdown(join_timeout=0.01)
+    status = streams(router)
+    assert status[StreamKind.ACCOUNT_SUMMARY] == (True, ())
+    assert status[StreamKind.POSITIONS] == (False, ("MALFORMED_CALLBACK",) * 2)  # each closed-owner row
+    assert "POSITION_END" not in {e.kind.value for e in router.position_envelopes()}  # END withheld
+    # Delivery still settled: the closed owner shows as the stream's own failure, not a handoff failure.
+    report = handoff.report()
+    assert report.failure is None and all(r.status is HandoffStatus.SETTLED for r in report.handoffs)
+
+
+def test_foreign_rows_and_another_run_never_share_the_runs_reference():
+    control_router, _ = wired_control()
+    [binding] = references(control_router)
+    router, handoff = wired()
+    drive(handoff, b"INV-accounts")
+    handoff.register_reads(SRID, PRID)
+    drive(handoff, b"INV-summary-foreign", b"INV-positions")
+    end(router, handoff)
+    summary_refs = {e.account_summary.account_id for e in router.account_summary_envelopes()
+                    if e.account_summary}
+    assert binding not in summary_refs and len(summary_refs) == 1  # a foreign row keeps its own reference
+    other_router, other = wired(key=OTHER_KEY)  # another run: same invented identity, another key
+    drive(other, b"INV-accounts")
+    other.register_reads(SRID, PRID)
+    drive(other, *READS)
+    end(other_router, other)
+    assert other.report().completed and binding not in references(other_router)
+    # Nothing crosses handoffs: a fresh handoff cannot register on another's exact snapshot.
+    _fresh_router, fresh = wired()
+    fresh.register_reads(SRID, PRID)
+    assert fresh.report().managed_accounts.registration is Registration.NOT_READY
+
+
+def test_a_partial_registration_is_kept_invalidates_and_is_never_retried_or_replaced():
+    router = account_router()
+    router.register_positions(PRID)  # a read opened separately, outside the input
+    router, handoff = wired(router)
+    drive(handoff, b"INV-accounts")
+    handoff.register_reads(SRID, PRID)
+    report = handoff.report()
+    assert report.failure is Failure.ACCOUNTS_REFUSED
+    accounts = report.managed_accounts
+    assert (accounts.registration, accounts.invalidation) == (
+        Registration.PARTIAL, Invalidation.REGISTRATION_INCOMPLETE)
+    assert set(router.report().faults) == {"POSITIONS_WINDOW_REOPENED", "UNSUPPORTED_CALLBACK"}
+    handoff.register_reads(SRID, PRID)  # no retry
+    accounts = handoff.report().managed_accounts
+    assert accounts.registration is Registration.PARTIAL and accounts.invalidating_events == 2
+    assert accounts.invalidation is Invalidation.REGISTRATION_INCOMPLETE  # the first stays latched
+    end(router, handoff)
+    assert not handoff.report().completed
+
+
+def test_defaults_are_unchanged_without_the_opt_in():
+    router = registered_router()
+    handoff = DecodeHandoff(router, InventedDecoder(VERSION, WIRED), server_version=VERSION)
+    drive(handoff, b"INV-accounts")
+    report = handoff.report()
+    # The facade's fixed refusal, exactly as a direct call: a router fault and ROUTER_REFUSED.
+    direct = registered_router()
+    ReadCallbackFacade(direct).managedAccounts(ACCOUNT)
+    assert router.report().faults == direct.report().faults == ("UNSUPPORTED_CALLBACK",)
+    assert (report.failure, report.held_sequence, report.managed_accounts) == (Failure.ROUTER_REFUSED, 1, None)
+    unwired_router = account_router()
+    unwired = DecodeHandoff(unwired_router, InventedDecoder(VERSION, WIRED), server_version=VERSION)
+    unwired.register_reads(SRID, PRID)  # nothing is wired: never a no-owner registration
+    assert unwired.report().failure is Failure.ACCOUNTS_REFUSED
+    assert unwired_router.report().adapter.ledger.slots == () and unwired_router.report().faults == ()
+    unwired.close_accounts()  # harmless without the opt-in
+    assert unwired.report().managed_accounts is None
+
+
+def test_errors_and_ends_behave_the_same_with_or_without_the_opt_in():
+    plain_router = registered_router()
+    plain = DecodeHandoff(plain_router, InventedDecoder(VERSION, WIRED), server_version=VERSION)
+    drive(plain, b"INV-error", *READS)
+    wired_router = account_router()
+    wired_router.register_contract(CRID)
+    wired_router.register_quote(QRID, CON_ID)
+    wired_router, handoff = wired(wired_router)
+    drive(handoff, b"INV-accounts")
+    handoff.register_reads(SRID, PRID)
+    drive(handoff, b"INV-error", *READS)
+    a, b = plain.report(), handoff.report()
+    assert a.failure == b.failure and a.failure is not Failure.ACCOUNTS_REFUSED
+    assert [r.status for r in a.handoffs] == [r.status for r in b.handoffs[1:]]
+    assert plain_router.report().faults == wired_router.report().faults
+    assert streams(plain_router)[StreamKind.ACCOUNT_SUMMARY] == streams(wired_router)[StreamKind.ACCOUNT_SUMMARY]
+
+
+@pytest.mark.parametrize(("expected", "key"), [
+    (ACCOUNT, None), (None, KEY), (ACCOUNT, b"short"), ("", KEY), (ACCOUNT, "not-bytes"),
+], ids=["no-key", "no-identifier", "short-key", "empty-identifier", "str-key"])
+def test_the_opt_in_takes_both_exact_values_or_neither(expected, key):
+    with pytest.raises(ValueError):
+        DecodeHandoff(account_router(), InventedDecoder(VERSION, WIRED), server_version=VERSION,
+                      expected_account=expected, account_key=key)
+
+
+def test_the_input_is_never_exposed_and_registration_during_a_call_is_reentry():
+    router, handoff = wired()
+    public = {name for name in dir(handoff) if not name.startswith("_")}
+    assert public == {"close_accounts", "feed", "finish", "process_available", "process_one", "register_reads",
+                      "report"}
+    for name in public:
+        assert not FORBIDDEN_NAME_RE.search(name), name
+    drive(handoff, b"INV-accounts")
+    handoff._busy = True  # simulate a registration arriving while another call of this handoff runs
+    handoff.register_reads(SRID, PRID)
+    handoff._busy = False
+    report = handoff.report()
+    assert report.failure is Failure.REENTERED
+    assert report.managed_accounts.registration is Registration.NOT_ATTEMPTED  # the input was not called
+    assert router.report().adapter.ledger.slots == ()
+
+
+def test_wired_reports_and_reprs_carry_no_identifier_or_key():
+    router, handoff = wired_control()
+    text = repr(handoff) + repr(handoff.report()) + repr(router.report())
+    for secret in (ACCOUNT, KEY.decode(), FOREIGN):
+        assert secret not in text
+    with pytest.raises(TypeError):
+        pickle.dumps(handoff)

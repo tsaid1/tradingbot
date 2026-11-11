@@ -33,7 +33,8 @@ handoff.report()
 at most 256 scripts of at most 128 steps. A step is one of:
 
 - `CALL` with a fixed `Entry`, a router entry reached through the facade (contract details, quote ticks
-  and snapshot end, account summary, positions, the 1052-order `error`, or `UNSUPPORTED`)
+  and snapshot end, account summary, positions, the 1052-order `error`, `MANAGED_ACCOUNTS` or
+  `UNSUPPORTED`)
 - `RAISE`, the decoder raising at that point
 - `RETAIN_SINK`, the decoder keeping the frame's sink so it can call it after returning
 - `CLEAR_VERSION`, the decoder's version being cleared, as a reset would
@@ -87,10 +88,46 @@ after router completion.
 | `TAKE_FAILED` | The accumulator had a queued frame but `take()` returned none |
 | `LATE_CALLBACK` | A sink called after its frame's decoding returned |
 | `REENTERED` | A call while another call of this handoff ran |
+| `ACCOUNTS_REFUSED` | With managed accounts wired: the input refused or invalidated (see below), or `register_reads` did not end `REGISTERED`. Without them: `register_reads` was called |
 
 Unsupported, refused and late callbacks also reach the router as its persistent `unsupported_callback`
 refusal, so its own completion fails too. After a failure, the frame's remaining callbacks are not
 forwarded.
+
+## Opt-in framed managed accounts
+
+```python
+handoff = DecodeHandoff(router, decoder, server_version=v,
+                        expected_account=expected, account_key=key)  # both, or neither
+handoff.process_available()               # a frame decodes to managedAccounts(accountsList)
+handoff.register_reads(summary_request_id, positions_snapshot_id)   # explicit and separate
+# ... read frames, handoff.finish(), router.shutdown(join_timeout)
+handoff.close_accounts()                  # after shutdown
+handoff.report().managed_accounts         # the input's own report
+```
+
+- **Opt-in only.** With both keyword values the handoff builds one `ManagedAccountsInput`
+  ([MANAGED_ACCOUNTS_INPUT.md](MANAGED_ACCOUNTS_INPUT.md)) for its own router. The input is never exposed,
+  and nothing else can be attached. With neither, nothing changes: a `MANAGED_ACCOUNTS` callback reaches the
+  facade's fixed refusal, a router fault, so the frame fails as `ROUTER_REFUSED`. Exactly one value, or an
+  invalid one, raises `ValueError`.
+- **Framed delivery.** A decoded `managedAccounts` callback goes to the input, not the facade. It admits no
+  router record. Around it the handoff compares the input's **own report**: anything but an exact,
+  uninvalidated snapshot, or any new invalidating event, latches `ACCOUNTS_REFUSED`. A malformed,
+  ambiguous or mismatched snapshot, or a duplicate before registration, touches no router state, so a
+  router-fault delta alone would miss it.
+- **Explicit registration.** Reads are never registered automatically. `register_reads` forwards once to
+  the input, which opens the owner-mode summary and positions reads only after an exact match. Anything but
+  `REGISTERED` (`NOT_READY`, `PARTIAL`, `FAILED`, a second call) latches `ACCOUNTS_REFUSED`. A partial
+  registration is kept, with no retry and no fallback to no-owner reads. Without the opt-in,
+  `register_reads` latches `ACCOUNTS_REFUSED` and calls nothing.
+- **After END.** A duplicate, or an arrival after `close_accounts`, invalidates the input. Once
+  registration was attempted, the input also raises the router's persistent fault, so completion is revoked
+  even after every END. The failing frame stays held; earlier settled records remain.
+- **Owner lifetime.** The owner lives as long as the input. Closing it before rows arrive makes those rows
+  malformed, so their stream withholds END. That is the stream's own failure; delivery still settles.
+- **Invented only.** Identifiers and keys in tests are invented. A real identifier, a real
+  managed-accounts list and real admission remain separately gated.
 
 ## Completion
 
@@ -99,6 +136,7 @@ forwarded.
 - every handoff `SETTLED`, none held and no record dropped
 - no failure
 - the router's own `completed`
+- when managed accounts are wired, the input's own `completed`
 
 None alone is enough.
 
@@ -106,7 +144,9 @@ None alone is enough.
 
 - **One owning execution context.** Nothing is thread-safe. Reentry is refused.
 - **Invented only.** No real decoder, wire selection, SDK object, socket or connection. Real SDK binding
-  and reader ownership remain separately gated.
+  and reader ownership remain separately gated. A real loader is not implemented: session-generation
+  version ownership, raw-to-converted correspondence, synchronous frame attribution and the SDK's
+  wrapper parameter discovery remain unresolved.
 - **Local only.** `completed` is never broker-side retirement, PAPER-READ-1 or trading permission.
 - **Payload-free.** Reports, reprs and errors carry fixed codes and counts only; the handoff cannot be
   serialized.

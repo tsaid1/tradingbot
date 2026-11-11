@@ -20,11 +20,18 @@ proven from public report evidence.
   foreign queued work, a late callback or reentry latches one fixed failure. The failing frame stays held,
   processing stops, and the failure persists after END. Unsupported, refused and late callbacks also reach
   the router as its persistent refusal.
+* **Opt-in framed managed accounts.** Only when constructed with both ``expected_account`` and
+  ``account_key`` does the handoff build one ``ManagedAccountsInput`` for its own router, internally; the
+  input is never exposed. A decoded ``managedAccounts`` callback then goes to that input instead of the
+  facade, and its own report is checked around the callback, so a refusal before any registration latches
+  ``ACCOUNTS_REFUSED`` even though the router saw nothing. Registration stays a separate explicit call,
+  ``register_reads``, never automatic. Without the opt-in the facade's fixed refusal is unchanged.
 * **Reaching a normalizer is not stream completion.** A settled handoff means its callbacks were dispatched.
   Whether a stream completed is the normalizers' and router's verdict. Contract details stay outside ledger
   accounting.
 
-``completed`` needs clean framing, every handoff settled, no failure and the router's own completion. One
+``completed`` needs clean framing, every handoff settled, no failure, the router's own completion and,
+when managed accounts are wired, that input's own completion. One
 owning execution context only; nothing is thread-safe. Reports, reprs and errors never carry payloads.
 Shutdown stays with the caller, through the router's public ``shutdown``. Nothing here establishes broker
 retirement, SDK compatibility or a connection. See docs/DECODE_HANDOFF.md.
@@ -36,6 +43,12 @@ from enum import Enum
 
 from tradingbot.ibkr_read_facade import ReadCallbackFacade
 from tradingbot.paper_readiness.callback_router import CallbackRouter, RouterReport
+from tradingbot.paper_readiness.managed_accounts_input import (
+    Arrival,
+    ManagedAccountsInput,
+    ManagedAccountsReport,
+    Registration,
+)
 from tradingbot.paper_readiness.read_framing import (
     FeedResult,
     Frame,
@@ -85,6 +98,7 @@ class Entry(str, Enum):
     ACCOUNT_SUMMARY_END = "accountSummaryEnd"
     POSITION = "position"
     POSITION_END = "positionEnd"
+    MANAGED_ACCOUNTS = "managedAccounts"  # the facade's fixed refusal unless managed accounts are wired
     ERROR = "error"              # the explicitly selected 1052-order error
     UNSUPPORTED = "unsupported"  # a callback the bridge does not convert, such as a raw protobuf callback
 
@@ -167,6 +181,7 @@ class Failure(str, Enum):
     TAKE_FAILED = "TAKE_FAILED"
     LATE_CALLBACK = "LATE_CALLBACK"
     REENTERED = "REENTERED"
+    ACCOUNTS_REFUSED = "ACCOUNTS_REFUSED"        # the wired managed-accounts input refused or invalidated
 
 
 class HandoffStatus(str, Enum):
@@ -197,6 +212,7 @@ class DecodeHandoffReport:
     failure: Failure | None
     router_completed: bool
     completed: bool
+    managed_accounts: ManagedAccountsReport | None = None  # None unless managed accounts are wired
     authority: str = "NON_AUTHORITATIVE"
 
 
@@ -231,12 +247,16 @@ class _FrameSink:
         if handoff._failure is not None:
             return  # after a latched failure the frame's remaining callbacks are not forwarded
         router = handoff._router
+        accounts = handoff._accounts if entry is Entry.MANAGED_ACCOUNTS else None
+        prior = accounts.report() if accounts is not None else None
         before = router.report()
         handoff._forward(entry, args)
         after = router.report()
         held = handoff._held
         if held is not None:
             held.admitted = after.queued_records  # current before any failure record can freeze
+        if accounts is not None and _accounts_refused(prior, accounts.report()):
+            handoff._latch(Failure.ACCOUNTS_REFUSED)  # the input's own report: no router fault is needed
         if _evidence(after) != _evidence(before):
             handoff._latch(Failure.ROUTER_REFUSED)  # before another step can forward
 
@@ -249,20 +269,32 @@ def _evidence(report: RouterReport) -> tuple:
             report.adapter.failures_dropped)
 
 
+def _accounts_refused(prior: ManagedAccountsReport, now: ManagedAccountsReport) -> bool:
+    """Anything but an exact, uninvalidated snapshot, or any new invalidating event."""
+    return (now.arrival is not Arrival.EXACT or now.invalidation is not None
+            or now.invalidating_events != prior.invalidating_events)
+
+
 class DecodeHandoff:
     """Owned frames -> closed invented decoding -> one router's consumer, one frame at a time."""
 
-    __slots__ = ("_accumulator", "_busy", "_decoder", "_dropped", "_facade", "_failure", "_held",
-                 "_records", "_router", "_server_version")
+    __slots__ = ("_accounts", "_accumulator", "_busy", "_decoder", "_dropped", "_facade", "_failure",
+                 "_held", "_records", "_router", "_server_version")
 
     def __init__(self, router: CallbackRouter, decoder: InventedDecoder, *, server_version: int,
-                 limits: FramingLimits | None = None) -> None:
+                 limits: FramingLimits | None = None, expected_account: str | None = None,
+                 account_key: bytes | None = None) -> None:
         if type(router) is not CallbackRouter:
             raise TypeError("router must be a CallbackRouter")
         if type(decoder) is not InventedDecoder:
             raise TypeError("decoder must be an InventedDecoder")
         if type(server_version) is not int or server_version <= 0:
             raise ValueError("server_version must be a positive int")
+        if (expected_account is None) != (account_key is None):
+            raise ValueError("expected_account and account_key are wired together or not at all")
+        # Opt-in only: the input is built here, for this same router, and never handed out.
+        self._accounts = (None if expected_account is None
+                          else ManagedAccountsInput(router, expected_account, account_key))
         self._router = router
         self._facade = ReadCallbackFacade(router)
         self._decoder = decoder
@@ -300,6 +332,35 @@ class DecodeHandoff:
             return self._process()
         finally:
             self._busy = False
+
+    # ------------------------------------------------------------------ wired managed accounts
+
+    def register_reads(self, summary_request_id: int, positions_snapshot_id: int) -> None:
+        """The explicit, separate registration of the wired input's owner-mode reads, at most once. Any
+        outcome but ``REGISTERED`` latches ``ACCOUNTS_REFUSED``; there is no retry and no fallback."""
+        if self._busy:
+            self._latch(Failure.REENTERED)
+            return
+        accounts = self._accounts
+        if accounts is None:
+            self._latch(Failure.ACCOUNTS_REFUSED)  # nothing is wired: never a no-owner registration
+            return
+        self._busy = True
+        try:
+            accounts.register_reads(summary_request_id, positions_snapshot_id)
+        finally:
+            self._busy = False
+            now = accounts.report()
+            if now.registration is not Registration.REGISTERED or now.invalidation is not None:
+                self._latch(Failure.ACCOUNTS_REFUSED)
+
+    def close_accounts(self) -> None:
+        """Close the wired input after the router's shutdown; a later arrival is ``LATE``. Idempotent."""
+        if self._busy:
+            self._latch(Failure.REENTERED)
+            return
+        if self._accounts is not None:
+            self._accounts.close()
 
     def process_available(self) -> int:
         """Process frames until none is queued or one does not settle. Returns how many settled."""
@@ -387,6 +448,11 @@ class DecodeHandoff:
             f.position(*args)
         elif entry is Entry.POSITION_END:
             f.positionEnd(*args)
+        elif entry is Entry.MANAGED_ACCOUNTS:
+            if self._accounts is None:
+                f.managedAccounts(*args)  # the facade's unchanged fixed refusal
+            else:
+                self._accounts.managedAccounts(*args)
         else:
             f.error(*args)
 
@@ -416,14 +482,15 @@ class DecodeHandoff:
         framing = self._accumulator.report()
         router_completed = self._router.report().completed
         settled = all(r.status is HandoffStatus.SETTLED for r in self._records)
+        accounts = self._accounts.report() if self._accounts is not None else None
         completed = (framing.outcome is FramingOutcome.COMPLETE and framing.clean and settled
                      and not self._dropped and self._held is None and self._failure is None
-                     and router_completed)
+                     and router_completed and (accounts is None or accounts.completed))
         held = self._held
         return DecodeHandoffReport(
             framing=framing, handoffs=tuple(self._records), handoffs_dropped=self._dropped,
             held_sequence=held.sequence if held is not None else None, failure=self._failure,
-            router_completed=router_completed, completed=completed)
+            router_completed=router_completed, completed=completed, managed_accounts=accounts)
 
     def __repr__(self) -> str:
         return (f"DecodeHandoff(handoffs={len(self._records)}, held={self._held is not None}, "
