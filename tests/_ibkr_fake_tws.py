@@ -127,6 +127,7 @@ class FakeConnection:
     def sendMsg(self, msg: bytes) -> int:
         if not self._open:
             return 0
+        self.server.wire.append(bytes(msg))  # every byte string that reached the "socket"
         self.server.receive(self, msg)
         return len(msg)
 
@@ -162,6 +163,7 @@ class FakeTws:
                                    "allowLocalhostOnly": True}
         self.extra_after_start: list[bytes] = []  # raw frames pushed right after START_API
         self.connections: list[FakeConnection] = []
+        self.wire: list[bytes] = []
         self.requests: list[tuple[str, object]] = []
         self._handshaken: set[int] = set()
         self.on: dict[str, Handler] = {

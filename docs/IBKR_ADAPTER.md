@@ -143,7 +143,36 @@ Other protections:
     `cancelOrder`, `reqGlobalCancel` and `updateConfigProtoBuf` on every attribute of a connected
     session, two levels deep, and also as unbound base-class calls. Every attempt is refused and
     nothing reaches the transport. An AST test forbids those names anywhere in the package.
-  - What remains: in-process code can still write raw bytes to the socket object itself.
+  - **No attribute path to an unfiltered send.** `_GuardedConnection` has `__slots__`, exposes
+    exactly the five methods the SDK uses (`connect`, `disconnect`, `isConnected`, `recvMsg`,
+    `sendMsg`) and does not forward other attributes, so `conn.socket` and `conn.lock` no longer
+    exist. It holds no reference to the SDK `Connection`. That object lives only in the
+    module-private `session._RAW_CONNECTIONS` (a `WeakKeyDictionary` keyed by the guard), and
+    `_raw_call` never binds it to a local. An exception raised inside the transport leaves the
+    guard with its traceback, context and cause cut, so a handed-out exception's frames cannot lead
+    back to it either.
+  - A permanent test (`test_object_graph_of_connected_session_reaches_no_unfiltered_send`) walks
+    the object graph of a connected session, plus an exception the session raised, breadth-first
+    to depth 16 with cycle protection. It follows container items, `__dict__` entries, `__slots__`,
+    every non-dunder attribute and property, and `__self__`, `__func__`, `__closure__` cells,
+    `__wrapped__`, `__defaults__`, `__traceback__`/`tb_next`/`tb_frame`/`f_locals`, `__context__`,
+    `__cause__` and weak references. It asserts that no fake connection or `socket.socket` is
+    reachable. It then calls every reachable callable named like a send or write with
+    PLACE_ORDER and UPDATE_CONFIG, in each argument shape the SDK's send primitives take, and
+    asserts that not one byte reached the fake wire and that the session still reads.
+    - It deliberately does not follow classes, modules, `__globals__`, `f_globals`, builtins or the
+      caller's own stack (`f_back`), and it skips stdio streams and code objects.
+  - **What remains, and is out of scope for an in-process filter.** Code running in the same
+    Python process can still:
+    - open its own socket to the TWS port;
+    - reach the raw connection or socket through module globals (`import`, a function's
+      `__globals__`, `session._RAW_CONNECTIONS`), `gc.get_objects()`/`gc.get_referents()`,
+      `sys._current_frames()` or the `socket` module.
+
+    The filter stops mistakes and stray calls inside the adapter's own object graph, not
+    deliberate in-process code. The real controls for that are TWS's own **Read-Only API**
+    setting, which the adapter verifies on every connect (step 5 above), and process isolation
+    (run nothing untrusted in the process that holds the session).
 - **Logging.** The `ibapi` logger is disabled, has `propagate = False` and a `NullHandler`. Without
   this, the SDK's field-count-mismatch path would log raw fields, account included, to stderr.
   Exception text is masked by `redact_accounts`. The report never contains the full account ID.

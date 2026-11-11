@@ -2,16 +2,23 @@
 transport (``tests/_ibkr_fake_tws.py``). No socket is opened: ``socket.socket.connect`` raises."""
 from __future__ import annotations
 
+import collections
 import inspect
+import io
 import json
 import os
+import re
 import socket
 import time
+import types
+import weakref
+from decimal import Decimal
 
 import pytest
 
 pytest.importorskip("ibapi")
 
+import _ibkr_fake_tws
 import ibapi.client
 from _ibkr_fake_tws import (
     OTHER_PAPER,
@@ -938,4 +945,172 @@ def test_malformed_frames_are_refused(tws):
         with pytest.raises(ReadOnlyViolation):
             s._client.conn.sendMsg(bad)
     assert tws.requests == before
+    s.disconnect()
+
+
+# --- no attribute path from a session reaches an unfiltered send ----------------------------------
+SEND_LIKE = re.compile(r"(?:^|_)(?:send|write)|Send|Write")  # not "contractDetailsEnd"
+_LEAVES = (str, bytes, bytearray, int, float, complex, bool, type(None), Decimal, memoryview)
+# Not followed: classes and modules (anything in them is reachable by ``import`` anyway, as are
+# ``socket`` and ``gc``), function/frame globals and builtins (the same thing by another name), and
+# the process's stdio streams (``Thread._stderr`` is ``sys.stderr``, not a broker socket). Code
+# objects hold only constants.
+_NOT_FOLLOWED_TYPES = (type, types.ModuleType, io.IOBase, types.CodeType)
+# ``f_back`` climbs from a handed-out traceback into the CALLER's own stack (here: pytest and the
+# test, which holds the fake server); the package's frames are reached through ``tb_next``.
+_NOT_FOLLOWED_ATTRS = {"f_globals", "f_builtins", "f_back"}
+# Dunder attributes that hold references (the rest are slot wrappers of the type's protocol).
+_DUNDERS = ("__self__", "__func__", "__closure__", "__wrapped__", "__defaults__", "__kwdefaults__",
+            "__traceback__", "__context__", "__cause__", "__notes__", "__args__")
+MAX_DEPTH = 16
+
+
+def _children(obj):
+    """(edge, child) for every reference reachable by attribute traversal from ``obj``."""
+    if isinstance(obj, dict):
+        for k, v in list(obj.items()):
+            yield f"[{k!r}]", v
+            yield f"<key {k!r}>", k
+    elif isinstance(obj, (list, tuple, set, frozenset, collections.deque)):
+        for i, v in enumerate(list(obj)):
+            yield f"[{i}]", v
+    try:
+        d = object.__getattribute__(obj, "__dict__")
+    except Exception:  # noqa: BLE001
+        d = None
+    if isinstance(d, dict):
+        for k, v in list(d.items()):
+            yield f".__dict__[{k!r}]", v
+    for klass in type(obj).__mro__:
+        slots = klass.__dict__.get("__slots__", ())
+        for slot in (slots,) if isinstance(slots, str) else slots:
+            try:
+                yield f".<slot {slot}>", object.__getattribute__(obj, slot)
+            except Exception:  # noqa: BLE001, S112 - unset slot
+                continue
+    if isinstance(obj, types.CellType):
+        try:
+            yield ".cell_contents", obj.cell_contents
+        except ValueError:
+            pass
+    if isinstance(obj, weakref.ref):
+        yield "()", obj()
+    for name in dir(obj):
+        if name in _NOT_FOLLOWED_ATTRS or (name.startswith("__") and name not in _DUNDERS):
+            continue
+        try:
+            yield f".{name}", getattr(obj, name)  # properties, bound methods, __self__, __func__,
+        except Exception:  # noqa: BLE001, S112   # __closure__, __wrapped__, __traceback__, f_locals
+            continue
+
+
+def _walk(*roots):
+    """Breadth-first over the attribute graph, with cycle protection (objects are kept alive so
+    ``id`` is never reused during the walk)."""
+    seen, keep, out = set(), [], []
+    frontier = [(f"root{i}", r) for i, r in enumerate(roots)]
+    for _depth in range(MAX_DEPTH):
+        nxt = []
+        for path, obj in frontier:
+            if id(obj) in seen:
+                continue
+            seen.add(id(obj))
+            keep.append(obj)
+            out.append((path, obj))
+            if isinstance(obj, (*_LEAVES, *_NOT_FOLLOWED_TYPES)):
+                continue
+            nxt.extend((path + edge, child) for edge, child in _children(obj))
+        frontier = nxt
+    return out
+
+
+def _hostile_frames():
+    from ibapi.client_utils import createPlaceOrderRequestProto
+    from ibapi.contract import Contract
+    from ibapi.order import Order
+    from ibapi.protobuf.UpdateConfigRequest_pb2 import UpdateConfigRequest
+
+    place = createPlaceOrderRequestProto(1, Contract(), Order()).SerializeToString()
+    update = UpdateConfigRequest(reqId=1).SerializeToString()
+    calls = []
+    for mid, payload in ((OUT.PLACE_ORDER, place), (OUT.UPDATE_CONFIG, update)):
+        framed = comm.make_msg_proto(mid + PROTOBUF_MSG_ID, payload)
+        calls += [(framed,), (mid + PROTOBUF_MSG_ID, payload), (mid, "1\0"),
+                  (comm.make_msg(mid, True, "1\0"),)]
+    return calls
+
+
+def _fire_send_like(reachable):
+    """Call every reachable callable whose name looks like a send or write with each hostile
+    frame, in each argument shape the SDK's send primitives take. Returns (path, callable) pairs."""
+    called = []
+    for path, obj in reachable:
+        if isinstance(obj, _NOT_FOLLOWED_TYPES) or not callable(obj):
+            continue
+        last = re.split(r"[.\[]", path)[-1]
+        if not (SEND_LIKE.search(last) or SEND_LIKE.search(getattr(obj, "__name__", "") or "")):
+            continue
+        called.append((path, obj))
+        for args in _hostile_frames():
+            try:
+                obj(*args)
+            except KeyboardInterrupt:
+                raise
+            except BaseException:  # noqa: BLE001, S110 - refused, wrong shape: all fine
+                pass
+    return called
+
+
+def _assert_no_raw_transport(reachable):
+    from tradingbot.ibkr.session import _GuardedConnection
+
+    raw = [p for p, o in reachable if isinstance(o, (_ibkr_fake_tws.FakeConnection,
+                                                      socket.socket))]
+    assert raw == [], f"raw transport reachable: {raw[:5]}"
+    assert any(isinstance(o, _GuardedConnection) for _, o in reachable), "walk never hit the guard"
+
+
+def _caught(fn):
+    """The exception ``fn`` raises, caught here so its traceback starts in package code (a
+    ``pytest.raises`` traceback would include this test's own frame and its ``tws`` fixture)."""
+    try:
+        fn()
+    except BaseException as exc:  # noqa: BLE001
+        return exc
+    raise AssertionError("expected an exception")
+
+
+def test_object_graph_of_connected_session_reaches_no_unfiltered_send(tws):
+    s = session()
+    s.connect()
+    tws.fail_send = {"REQ_POSITIONS"}  # also walk an exception the package hands out
+    exc = _caught(s.positions)
+    tws.fail_send = set()
+    assert isinstance(exc, E.IbkrRequestError)
+    reachable = _walk(s, exc)
+    assert len(reachable) > 1000
+    _assert_no_raw_transport(reachable)
+    wire, requests = list(tws.wire), list(tws.requests)
+    owners = {id(s._client): "client", id(s._client.conn): "conn"}
+    called = {(owners.get(id(getattr(fn, "__self__", None))), fn.__name__)
+              for _, fn in _fire_send_like(reachable)}
+    assert {("client", "sendMsg"), ("client", "sendMsgProtoBuf"), ("conn", "sendMsg")} <= called
+    assert s._client.reader.conn is s._client.conn
+    assert tws.wire == wire and tws.requests == requests
+    assert s._client.isConnected() and len(s.positions()) == 1  # still a working read session
+    s.disconnect()
+    assert_closed(s)
+
+
+def test_exception_from_raw_send_carries_no_raw_frame(tws):
+    """An error raised inside the transport's send surfaces with its traceback and context cut at
+    the guard, so its frames' locals cannot lead to the raw connection."""
+    s = session()
+    s.connect()
+    tws.fail_send = {"REQ_POSITIONS"}
+    frame_ = comm.make_msg_proto(OUT.REQ_POSITIONS + PROTOBUF_MSG_ID, b"")
+    exc = _caught(lambda: s._client.conn.sendMsg(frame_))
+    tws.fail_send = set()
+    assert isinstance(exc, OSError) and exc.__context__ is None
+    _assert_no_raw_transport(_walk(exc, s))
     s.disconnect()

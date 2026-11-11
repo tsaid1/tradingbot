@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+import weakref
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -149,32 +150,74 @@ def _outgoing_msg_id(frame: bytes, server_version: int | None) -> int | None:
         return None
 
 
+# The SDK ``Connection`` (and through it the socket) behind each ``_GuardedConnection``. It is held
+# ONLY here, never as an attribute, closure cell or default of anything the session reaches, so no
+# attribute path from a session leads to an unfiltered send. Reaching this dict needs module globals
+# (``import`` or a function's ``__globals__``): the same in-process power as ``import socket`` or
+# ``gc``, which an in-process filter cannot stop (docs/IBKR_ADAPTER.md, section 4).
+_RAW_CONNECTIONS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+_RAW_METHODS = frozenset({"connect", "disconnect", "isConnected", "recvMsg", "sendMsg"})
+
+
+def _raw_call(guard: _GuardedConnection, name: str, *args: Any) -> Any:
+    """Call ``name`` on the raw connection. The raw object is never bound to a local name, and an
+    exception from it leaves with its traceback, context and cause cut, so no frame's locals in a
+    handed-out exception lead back to it."""
+    if name not in _RAW_METHODS:
+        raise ReadOnlyViolation(f"connection method {name!r} is not exposed")
+    err: BaseException | None = None
+    try:
+        return getattr(_RAW_CONNECTIONS[guard], name)(*args)
+    except BaseException as exc:  # noqa: BLE001 - re-raised below, stripped
+        err = exc
+    err.__traceback__ = None
+    err.__context__ = err.__cause__ = None
+    raise err
+
+
 class _GuardedConnection:
-    """Wraps the SDK ``Connection``. Every SDK send path (bound or unbound, base or subclass,
-    text or protobuf) ends in ``self.conn.sendMsg(frame)``, so this is the lowest shared choke
-    point: it allows the one initial ``API\\0`` handshake, then only ``ALLOWED_OUT_MESSAGES``."""
+    """Stands in for the SDK ``Connection``. Every SDK send path (bound or unbound, base or
+    subclass, text or protobuf) ends in ``self.conn.sendMsg(frame)``, so this is the lowest shared
+    choke point: it allows the one initial ``API\\0`` handshake, then only ``ALLOWED_OUT_MESSAGES``.
+
+    It exposes exactly the five methods the SDK uses (no ``__getattr__`` forwarding, no ``socket``,
+    no ``lock``) and holds no reference to the raw connection (see ``_RAW_CONNECTIONS``)."""
+
+    __slots__ = ("__weakref__", "_client", "_handshake_sent")
 
     def __init__(self, raw, client: EClient) -> None:
-        self._raw = raw
+        _RAW_CONNECTIONS[self] = raw
         self._client = client
         self._handshake_sent = False
 
     def sendMsg(self, msg: bytes):
+        if not isinstance(msg, (bytes, bytearray)):
+            raise ReadOnlyViolation("outgoing frame must be bytes")
+        msg = bytes(msg)
         if msg.startswith(b"API\0"):
             if self._handshake_sent:
                 raise ReadOnlyViolation("a second API handshake frame is refused")
             self._handshake_sent = True
-            return self._raw.sendMsg(msg)
+            return _raw_call(self, "sendMsg", msg)
         if (not self._handshake_sent or len(msg) < 8
                 or int.from_bytes(msg[:4], "big") != len(msg) - 4):
             raise ReadOnlyViolation("malformed or out-of-order outgoing frame refused")
         mid = _outgoing_msg_id(msg, self._client.serverVersion())
         if mid not in ALLOWED_OUT_MESSAGES:
             raise ReadOnlyViolation(f"outgoing message id {mid} refused at the connection")
-        return self._raw.sendMsg(msg)
+        return _raw_call(self, "sendMsg", msg)
 
-    def __getattr__(self, name: str):  # isConnected, recvMsg, disconnect, lock, ...
-        return getattr(self._raw, name)
+    def connect(self):
+        return _raw_call(self, "connect")
+
+    def disconnect(self):
+        return _raw_call(self, "disconnect")
+
+    def isConnected(self) -> bool:
+        return bool(_raw_call(self, "isConnected"))
+
+    def recvMsg(self) -> bytes:
+        return _raw_call(self, "recvMsg")
 
 
 class _ReadOnlyClient(EClient):
