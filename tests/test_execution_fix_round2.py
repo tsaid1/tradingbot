@@ -337,3 +337,33 @@ def test_f8_an_old_recorded_exit_without_a_usable_quote_becomes_an_exception(tmp
     intent = h.coord.intent(ref)
     assert intent.state == IntentState.REFUSED and "EXIT_WITHOUT_QUOTE" in intent.reasons
     assert "EXIT_WITHOUT_QUOTE" in _open_kinds(h)
+
+
+# ------------------------------------------------------------- F9: one net position per contract
+
+
+def _short_open(action_id: str = "open"):
+    from tradingbot.models import PositionSide
+
+    return open_action(action_id, side=PositionSide.SHORT, entry="50", stop="52", target="45")
+
+
+def test_f9_an_opposite_open_in_the_same_contract_is_held(tmp_path):
+    h = Harness(tmp_path)
+    h.post("p1", open_action())  # long 4
+    result = h.post("p2", _short_open())
+    [o] = result.outcomes
+    assert o.status == "HOLD" and "OPPOSITE_IDEA_IN_SAME_CONTRACT" in o.reasons
+    assert [p.quantity for p in h.broker.positions()] == [4]
+    direct = h.execute("p3", _short_open())  # the coordinator refuses it as well
+    assert direct.state == IntentState.REFUSED
+    assert direct.reasons == ["OPPOSITE_IDEA_IN_SAME_CONTRACT"]
+
+
+def test_f9_a_publisher_reversal_is_a_close_then_an_open(tmp_path):
+    h = Harness(tmp_path)
+    h.post("p1", open_action())
+    result = h.post("p2", action("close", Action.CLOSE, idea="p1:open"), _short_open("open2"))
+    assert [o.status for o in result.outcomes] == ["EXECUTED", "EXECUTED"]
+    assert [p.quantity for p in h.broker.positions()] == [-4]
+    assert h.coord.reconcile().clean

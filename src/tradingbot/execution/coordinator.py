@@ -105,6 +105,9 @@ BROKER_UNREADABLE = "BROKER_UNREADABLE"
 # An idea was stopped out (or closed) while part of its entry or add was still working, and the
 # cancel of that remainder could not be confirmed at the broker (review F2).
 ENTRY_REMAINDER_NOT_CANCELLED = "ENTRY_REMAINDER_NOT_CANCELLED"
+# The broker nets one position per contract: an idea on the opposite side of an open idea in the
+# same contract is never opened beside it. A publisher reversal is a close followed by an open.
+OPPOSITE_IDEA_IN_SAME_CONTRACT = "OPPOSITE_IDEA_IN_SAME_CONTRACT"
 
 
 class BrokerUnreadable(BrokerError):
@@ -285,6 +288,30 @@ class ExecutionCoordinator:
 
     def intent(self, order_ref: str) -> Intent | None:
         return self.store.intent(order_ref)
+
+    def opposite_idea(
+        self, instrument: Instrument, side: PositionSide, staged=()
+    ) -> str | None:
+        """The id of an open (or pending) idea on the other side of ``side`` in the same contract,
+        from the follower ledger and from ``staged`` replay ideas; None when there is none."""
+        ideas = [
+            (p.idea_id, p.symbol, p.asset_class, p.position_side)
+            for p in self.store.positions()
+            if p.quantity > 0 or p.status == "PENDING"
+        ]
+        ideas += [
+            (i.idea_id, i.symbol, i.asset_class, i.position_side)
+            for i in staged
+            if i.quantity > 0 and i.status not in ("CLOSED", "REVERSED", "NOT_FILLED")
+        ]
+        for idea_id, symbol, asset_class, idea_side in ideas:
+            if (
+                symbol == instrument.symbol
+                and asset_class == instrument.asset_class
+                and idea_side != side
+            ):
+                return idea_id
+        return None
 
     def intent_for(self, source: ReplaySource, action: TradeAction) -> Intent | None:
         return self.store.intent(order_ref_for(source.source_id, source.revision, action.action_id))
@@ -522,6 +549,10 @@ class ExecutionCoordinator:
         idea_id = f"{source.source_id}:{action.action_id}"
         if self.store.position(idea_id) is not None:
             return self._refuse(source, action, gate, ref, account, ["IDEA_ALREADY_EXISTS"], now)
+        if self.opposite_idea(action.instrument, action.position_side):
+            return self._refuse(
+                source, action, gate, ref, account, [OPPOSITE_IDEA_IN_SAME_CONTRACT], now
+            )
         contract, problem = self._resolve_contract(action.instrument)
         if problem:
             return self._refuse(source, action, gate, ref, account, [problem], now)
