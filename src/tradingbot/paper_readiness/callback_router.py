@@ -20,6 +20,10 @@ is a later, separately reviewed task.
   Unknown ids and session errors follow fixed rules, keep their original ids and are never dropped
   silently. Contract and quote errors use ``error_1052``; account and position errors are fixed
   unsupported refusals plus a lifecycle ERROR. No version is inferred.
+* **Direct and refused callbacks.** ``connectAck`` and ``connectionClosed`` are recorded by the adapter
+  as direct observations, never socket or broker evidence. Every unsupported callback is a persistent
+  router fault, even before any stream registers. An applicable error inside a stop hook is also
+  reported to the adapter, which settles that stop UNKNOWN.
 
 ``completed`` is local only and never broker-side retirement, PAPER-READ-1 acceptance or trading
 permission. See docs/CALLBACK_ROUTER.md.
@@ -39,7 +43,7 @@ from tradingbot.paper_readiness.diagnostics import SESSION_OK_CODES
 from tradingbot.paper_readiness.ibkr_callbacks import CallbackRequest, IbkrCallbackNormalizer
 from tradingbot.paper_readiness.observations import ResponseEnvelope
 from tradingbot.paper_readiness.read_retirement import CallbackKind, ReadSlot
-from tradingbot.paper_readiness.sdk_lifecycle import AdapterReport, LifecycleAdapter
+from tradingbot.paper_readiness.sdk_lifecycle import AdapterReport, DirectCallback, LifecycleAdapter
 
 __all__ = [
     "MAX_FAULTS",
@@ -70,6 +74,7 @@ class RouterFault(str, Enum):
     POSITIONS_WINDOW_ABSENT = "POSITIONS_WINDOW_ABSENT"
     UNKNOWN_REQUEST_ID = "UNKNOWN_REQUEST_ID"
     UNROUTABLE_CALLBACK = "UNROUTABLE_CALLBACK"
+    UNSUPPORTED_CALLBACK = "UNSUPPORTED_CALLBACK"
     SESSION_ERROR = "SESSION_ERROR"
     SESSION_ERROR_MALFORMED = "SESSION_ERROR_MALFORMED"
     ADMISSION_REFUSED = "ADMISSION_REFUSED"
@@ -262,7 +267,14 @@ class _Boundary:
                           self._router._queue)
 
     def stop_read(self, slot: ReadSlot) -> None:
-        self._client.stop_read(slot)
+        # The stop window: an applicable error arriving synchronously inside this hook is also
+        # reported to the adapter, which settles the attempt UNKNOWN.
+        router = self._router
+        router._stopping = slot
+        try:
+            self._client.stop_read(slot)
+        finally:
+            router._stopping = None
 
     def disconnect(self) -> None:
         self._client.disconnect()
@@ -291,7 +303,7 @@ class CallbackRouter:
 
     __slots__ = ("_account", "_adapter", "_arriving", "_bytes", "_clock", "_closed", "_contract",
                  "_dispatching", "_faults", "_faults_dropped", "_fetched", "_fifo", "_next_id",
-                 "_positions", "_positions_opened", "_queue", "_quote")
+                 "_positions", "_positions_opened", "_queue", "_quote", "_stopping")
 
     def __init__(self, client: object, lock: object, clock: object) -> None:
         self._queue = _Queue(self)
@@ -311,6 +323,7 @@ class CallbackRouter:
         self._arriving = False
         self._dispatching = False
         self._closed = False
+        self._stopping: ReadSlot | None = None
 
     # ------------------------------------------------------------------ lifecycle and registration
 
@@ -592,6 +605,8 @@ class CallbackRouter:
     def _route_error(self, *args: object) -> None:
         copied = tuple(_value(v) for v in args[:3]) + tuple(_MALFORMED for _ in args[3:])
         rid = copied[0] if copied else _MALFORMED
+        if self._stopping is not None and self._stop_error_applies(rid, copied):
+            self._adapter.on_direct_callback(DirectCallback.ERROR)  # in addition to the routing below
         if self._quote is not None and rid == self._quote.request_id:
             self._admit(_Method.QUOTE_ERROR, copied)
         elif self._account is not None and rid == self._account.request_id:
@@ -610,6 +625,19 @@ class CallbackRouter:
                 if normalizer is not None:
                     normalizer.error_1052(*copied)
 
+    def _stop_error_applies(self, rid: object, copied: tuple) -> bool:
+        """Whether an error arriving inside the stop hook bears on that stop: an error for the stopped
+        read's own request, or a session error that is not an exempt well-formed OK code. Errors for
+        another request and informational session codes do not."""
+        stopping = self._stopping
+        if stopping is ReadSlot.QUOTE_SNAPSHOT and self._quote is not None and rid == self._quote.request_id:
+            return True
+        if stopping is ReadSlot.ACCOUNT_SUMMARY and self._account is not None and rid == self._account.request_id:
+            return True
+        if rid == SESSION_REQUEST_ID:
+            return not (_well_formed_session_error(copied) and copied[2] in SESSION_OK_CODES)
+        return False
+
     def _session_error(self, copied: tuple) -> None:
         """A session-level error reaches every stream directly. Only a well-formed 1052 call with an OK
         code is exempt; a malformed call or a non-OK code fails each stream."""
@@ -624,11 +652,24 @@ class CallbackRouter:
             if stream is not None:
                 stream.unsupported_callback("error")
 
+    def connectAck(self) -> None:
+        """Recorded by the adapter as a direct callback. An observation only: never socket state,
+        session validity or broker acknowledgement."""
+        self._arrive(self._adapter.on_direct_callback, DirectCallback.CONNECT_ACK)
+
+    def connectionClosed(self) -> None:
+        """Recorded by the adapter as a direct callback. An observation only: the socket is observed
+        separately at shutdown, and this never shows closure or broker-side retirement."""
+        self._arrive(self._adapter.on_direct_callback, DirectCallback.CONNECTION_CLOSED)
+
     def unsupported_callback(self, name: object, reqId: object = None) -> None:
-        """Any other callback. Routed to its owner when the id is registered, otherwise to every stream."""
+        """Any other callback, including excluded protobuf variants. Always a router fault, so it blocks
+        completion even before any stream registers. Also routed to its owner when the id is registered,
+        otherwise to every registered stream. The name is never retained."""
         self._arrive(self._route_unsupported, name, reqId)
 
     def _route_unsupported(self, name: object, req_id: object) -> None:
+        self._fault(RouterFault.UNSUPPORTED_CALLBACK)
         label = name if type(name) is str and len(name) <= 64 else "INVALID_NAME"
         owners = [n for n in (self._contract, self._quote, self._account)
                   if n is not None and req_id == n.request_id]

@@ -75,7 +75,10 @@ fault survives. Text arguments of errors and the tick attribute are never retain
 | `error_1052` for another valid id | The contract stream, as a stray with its original id (`UNKNOWN_REQUEST_ID`) |
 | `error_1052` with an id that is not a valid request id | Latches both `error_1052` streams (`UNKNOWN_REQUEST_ID`) |
 | A quote or account callback for another id | Its own stream, as a stray with its original id, outside lifecycle accounting (`UNKNOWN_REQUEST_ID`) |
-| `unsupported_callback(name, reqId)` | Its owner, or every stream when the id is not registered |
+| `unsupported_callback(name, reqId)` | Always an `UNSUPPORTED_CALLBACK` router fault, so completion fails even when no stream has registered yet. Also routed to its owner, or to every registered stream when the id is not registered. Excluded protobuf variants use this same fixed refusal. The name is never retained |
+| `connectAck()`, `connectionClosed()` | The adapter's direct-callback record (`CONNECT_ACK`, `CONNECTION_CLOSED`), under the same arrival guard. Accepted during the connect and disconnect hooks; refused after closure or when nested |
+
+**Stop window.** While the adapter's stop hook runs, an `error_1052` arriving synchronously inside it is also reported to the adapter as a direct `ERROR`, which settles that attempt `UNKNOWN` (`ERROR_DURING_STOP`). This applies only to an error for the stopped read's own request, or to a session error that is not an exempt well-formed OK code. Positions have no request id, so only session errors apply to them. Errors for another request and informational session codes do not taint the stop. The normal routing above is unchanged, and errors outside a stop hook are never reported as direct errors.
 
 Nothing is dropped silently or relabelled. Evidence of duplicates, post-END input, missing currencies and
 oversized quantities is preserved by the unchanged normalizers. No version is inferred: a legacy-order
@@ -88,5 +91,7 @@ error sent as `error_1052` is indistinguishable and is not detected.
 - **No secrecy.** Encapsulation guards against ordinary misuse, not hostile code in the same process.
 - **Contract details** are outside lifecycle accounting, so local cleanup covers only the three lifecycle
   reads, never all streams.
+- **Direct callbacks are observations only.** `connectAck` and `connectionClosed` never establish socket
+  closure, session validity or broker acknowledgement. The socket is observed separately at shutdown.
 - **Not connected.** It is exercised only with invented doubles. Connected use, SDK import and real-use
   admission remain separately gated.

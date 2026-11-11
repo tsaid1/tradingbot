@@ -21,6 +21,7 @@ from tradingbot.paper_readiness.account_position_callbacks import (
 from tradingbot.paper_readiness.callback_router import CallbackRouter
 from tradingbot.paper_readiness.ibkr_callbacks import CallbackRequest, IbkrCallbackNormalizer
 from tradingbot.paper_readiness.observations import ResponseKind
+from tradingbot.paper_readiness.read_retirement import ReadSlot
 from tradingbot.paper_readiness.transport import FORBIDDEN_NAME_RE, FakeClock
 
 NOW = datetime(2026, 3, 4, 16, 0, tzinfo=UTC)
@@ -471,3 +472,200 @@ def test_surface_has_no_forbidden_names_and_no_payload_repr():
     with pytest.raises(TypeError):
         import pickle
         pickle.dumps(r)
+
+
+# ----------------------------------------------------------------------------- direct callbacks and hooks
+
+
+class HookClient(Client):
+    """A client double that calls back into the router from inside its connect, stop or disconnect hook."""
+
+    def __init__(self, on_connect=None, on_stop=None, on_disconnect=None) -> None:
+        super().__init__()
+        self.router: CallbackRouter | None = None
+        self.on_connect, self.on_stop, self.on_disconnect = on_connect, on_stop, on_disconnect
+
+    def connect(self):
+        if self.on_connect is not None:
+            self.on_connect(self.router)
+        return self
+
+    def stop_read(self, slot):
+        super().stop_read(slot)
+        if self.on_stop is not None:
+            self.on_stop(self.router, slot)
+
+    def disconnect(self):
+        super().disconnect()
+        if self.on_disconnect is not None:
+            self.on_disconnect(self.router)
+
+
+def hooked(**hooks) -> tuple[CallbackRouter, HookClient]:
+    client = HookClient(**hooks)
+    r = CallbackRouter(client, _Lock(), FakeClock(NOW))
+    client.router = r
+    r.start()
+    r.register_contract(CRID)
+    r.register_quote(QRID, CON_ID)
+    r.register_account_summary(SRID)
+    r.register_positions(PRID)
+    return r, client
+
+
+def full_run(r: CallbackRouter):
+    everything(r)
+    drain(r)
+    r.shutdown(join_timeout=0.01)
+    return r.report()
+
+
+def slot_view(report, slot: ReadSlot):
+    return next(s for s in report.adapter.ledger.slots if s.slot == slot.value)
+
+
+@pytest.mark.parametrize("name", ["inventedAuxiliaryCallback", "inventedProtoVariant"])
+def test_an_unsupported_callback_before_any_registration_is_a_persistent_failure(name):
+    """Review: with no stream registered, the old route reached no normalizer and left no fault."""
+    client = Client()
+    r = CallbackRouter(client, _Lock(), FakeClock(NOW))
+    r.start()
+    r.unsupported_callback(name)
+    r.register_contract(CRID)
+    r.register_quote(QRID, CON_ID)
+    r.register_account_summary(SRID)
+    r.register_positions(PRID)
+    report = full_run(r)
+    assert "UNSUPPORTED_CALLBACK" in report.faults and report.completed is False
+    assert name not in repr(report)
+
+
+def test_an_owned_error_raised_inside_its_stop_hook_settles_the_attempt_unknown():
+    """Review: the error was only queued for the normalizer, so the stop settled as a clean return."""
+    def on_stop(r, slot):
+        if slot is ReadSlot.ACCOUNT_SUMMARY:
+            r.error_1052(SRID, 0, 300, CANARY)
+
+    r, client = hooked(on_stop=on_stop)
+    report = full_run(r)
+    assert client.stops == [ReadSlot.ACCOUNT_SUMMARY, ReadSlot.POSITIONS]
+    assert "ERROR_DURING_STOP" in report.adapter.failures
+    assert slot_view(report, ReadSlot.ACCOUNT_SUMMARY).retirement_attempt == "UNKNOWN"
+    assert report.completed is False and CANARY not in repr(report)
+
+
+def test_control_connect_and_disconnect_hook_notifications_are_recorded_and_complete():
+    r, _ = hooked(on_connect=lambda r: r.connectAck(), on_disconnect=lambda r: r.connectionClosed())
+    report = full_run(r)
+    assert report.adapter.direct_callbacks == ("CONNECT_ACK", "CONNECTION_CLOSED")
+    assert report.faults == () and report.completed is True
+
+
+def test_connection_closed_is_an_observation_never_socket_closure():
+    r, client = hooked(on_connect=lambda r: r.connectAck(), on_disconnect=lambda r: r.connectionClosed())
+    client.connection.closed = False  # the socket observation disagrees with the callback
+    report = full_run(r)
+    assert "CONNECTION_CLOSED" in report.adapter.direct_callbacks
+    assert "SOCKET_NOT_CLOSED" in report.adapter.failures and report.completed is False
+
+
+def test_direct_callbacks_after_closure_are_refused_and_not_recorded():
+    r, _ = router()
+    full_run(r)
+    r.connectAck()
+    r.connectionClosed()
+    report = r.report()
+    assert report.adapter.direct_callbacks == ()
+    assert report.faults.count("ARRIVAL_AFTER_CLOSE") == 2 and report.completed is False
+
+
+class AckingContract(Contract):
+    """A contract whose field getter calls a direct callback while the router is snapshotting it."""
+
+    def __init__(self, con_id: int, router: CallbackRouter) -> None:
+        super().__init__(con_id)
+        self._router = router
+
+    def __getattribute__(self, name):
+        if name == "conId":
+            object.__getattribute__(self, "_router").connectAck()
+        return object.__getattribute__(self, name)
+
+
+class ClosingClock:
+    """A clock whose now() calls connectionClosed while quote END is being dispatched."""
+
+    def __init__(self) -> None:
+        self.router: CallbackRouter | None = None
+
+    def now(self):
+        if self.router is not None:
+            self.router.connectionClosed()
+        return NOW
+
+
+def test_a_direct_callback_nested_in_an_arrival_or_a_dispatch_is_refused():
+    r, _ = router()
+    r.position(ACCOUNT, AckingContract(840009, r), Decimal(1), 1.0)
+    assert r.report().faults == ("ARRIVAL_REENTERED",) and r.report().adapter.direct_callbacks == ()
+
+    clock = ClosingClock()
+    r2 = CallbackRouter(Client(), _Lock(), clock)
+    r2.start()
+    r2.register_quote(QRID, CON_ID)
+    quote_feed(r2)
+    clock.router = r2
+    drain(r2)
+    assert "ARRIVAL_REENTERED" in r2.report().faults and r2.report().adapter.direct_callbacks == ()
+
+
+def test_an_unsupported_callback_for_a_registered_owner_keeps_the_owner_refusal():
+    r, _ = router()
+    r.unsupported_callback("inventedAuxiliaryCallback", QRID)
+    report = full_run(r)
+    assert ResponseKind.TICK_SNAPSHOT_END not in kinds(r.quote_envelopes())  # the normalizer refusal
+    assert ResponseKind.CONTRACT_DETAILS_END in kinds(r.contract_envelopes())  # only the owner
+    assert "UNSUPPORTED_CALLBACK" in report.faults and report.completed is False
+
+
+def test_control_a_stop_hook_that_returns_normally_settles_returned():
+    r, client = hooked()
+    report = full_run(r)
+    assert client.stops == [ReadSlot.ACCOUNT_SUMMARY, ReadSlot.POSITIONS]
+    assert slot_view(report, ReadSlot.ACCOUNT_SUMMARY).retirement_attempt == "RETURNED"
+    assert report.completed is True
+
+
+@pytest.mark.parametrize(("slot", "args"), [
+    (ReadSlot.POSITIONS, (-1, 0, 1100, CANARY)),
+    (ReadSlot.POSITIONS, (-1, "bad-time", 2104, CANARY)),
+], ids=["session-non-ok", "session-malformed"])
+def test_a_session_error_inside_any_stop_hook_settles_that_attempt_unknown(slot, args):
+    def on_stop(r, stopped):
+        if stopped is slot:
+            r.error_1052(*args)
+
+    r, _ = hooked(on_stop=on_stop)
+    report = full_run(r)
+    assert "ERROR_DURING_STOP" in report.adapter.failures
+    assert slot_view(report, slot).retirement_attempt == "UNKNOWN" and report.completed is False
+
+
+@pytest.mark.parametrize("args", [(-1, 0, 2104, "ignored"), (CRID, 0, 200, "ignored")],
+                         ids=["informational-session-code", "another-request"])
+def test_an_inapplicable_error_inside_a_stop_hook_does_not_taint_the_stop(args):
+    def on_stop(r, slot):
+        if slot is ReadSlot.ACCOUNT_SUMMARY:
+            r.error_1052(*args)
+
+    r, _ = hooked(on_stop=on_stop)
+    report = full_run(r)
+    assert "ERROR_DURING_STOP" not in report.adapter.failures
+    assert slot_view(report, ReadSlot.ACCOUNT_SUMMARY).retirement_attempt == "RETURNED"
+
+
+def test_an_error_outside_any_stop_hook_is_not_reported_as_a_direct_error():
+    r, _ = router()
+    r.error_1052(SRID, 0, 321, CANARY)
+    drain(r)
+    assert "DIRECT_ERROR" not in r.report().adapter.failures
