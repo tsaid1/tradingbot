@@ -197,14 +197,15 @@ def _basis(side: str, symbol: str, units: int, fills: list[FillRow],
         if f.side != expected_side:
             reasons.append("FILL_DIRECTION_MISMATCH")
             continue
+        # Every fill's price is validated, exits included, although only entry prices enter the average.
+        price = _price_text(f.price)
+        if price is None:
+            reasons.append("FILL_PRICE_INVALID")
+            continue
         if f.action in _EXITS:
             if f.action == Action.CLOSE.value:
                 reasons.append("CLOSE_FILL_ON_OPEN_POSITION")
             exit_units += f.quantity
-            continue
-        price = _price_text(f.price)
-        if price is None:
-            reasons.append("FILL_PRICE_INVALID")
             continue
         opens += f.action == Action.OPEN.value
         entries.append((f.quantity, price))

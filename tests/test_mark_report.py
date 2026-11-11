@@ -373,3 +373,28 @@ def test_fills_join_by_engine_and_idea_so_another_engine_or_an_orphan_never_cont
     report = build_mark_report(amended(s, fills=s.fills + [other_engine, orphan]), MARKS, POLICY)
     row = only(report)
     assert (row.engine, row.average_cost, row.unrealized_pnl) == ("replay", Decimal("101.05"), Decimal("7.80"))
+
+
+@pytest.fixture
+def long_with_reduce(tmp_path):
+    """OPEN 2 @ 100.05, then REDUCE 1 @ 100.95: one entry price, so the basis is order-invariant."""
+    r = Replay(tmp_path)
+    idea = open_long(r)
+    reduce_half(r, idea, "100.95", "101.05", "r2")
+    return r
+
+
+@pytest.mark.parametrize("price", [None, "abc", "-1", "0", "1e3"], ids=["none", "text", "negative", "zero", "exponent"])
+def test_an_unparseable_exit_price_leaves_the_basis_unknown(long_with_reduce, price):
+    """Review P2: exit prices are validated even though they never enter the average."""
+    s = long_with_reduce.snapshot()
+    changed = amended(s, fills=[f.model_copy(update={"price": price}) if f.action == "REDUCE" else f
+                                for f in s.fills])
+    row = only(build_mark_report(changed, {"MOCKL": mark("MOCKL", "102.00", "102.10")}, POLICY))
+    assert row.basis_status == "UNKNOWN" and "FILL_PRICE_INVALID" in row.basis_reasons
+    assert (row.average_cost, row.unrealized_pnl) == (None, None)
+
+
+def test_control_a_valid_exit_price_keeps_the_basis_at_the_entry_average(long_with_reduce):
+    row = only(build_mark_report(long_with_reduce.snapshot(), {"MOCKL": mark("MOCKL", "102.00", "102.10")}, POLICY))
+    assert (row.basis_status, row.average_cost, row.unrealized_pnl) == ("KNOWN", Decimal("100.05"), Decimal("1.95"))

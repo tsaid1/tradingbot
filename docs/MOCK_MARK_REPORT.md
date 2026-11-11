@@ -64,7 +64,7 @@ The basis is `UNKNOWN` whenever the evidence does not support it:
 | `DUPLICATE_ORDER_ID` | An order id repeats within the engine |
 | `FILL_SYMBOL_MISMATCH`, `FILL_DIRECTION_MISMATCH` | A fill names another symbol, or moves the wrong way for the position's side |
 | `FILL_RECORD_INVALID`, `AMENDMENT_RECORD_INVALID` | A fill status or amendment does not match its action |
-| `FILL_QUANTITY_INVALID`, `FILL_PRICE_INVALID` | Units are not positive and bounded, or the price is not plain positive decimal text (at most 15 integer and 10 fractional digits) |
+| `FILL_QUANTITY_INVALID`, `FILL_PRICE_INVALID` | Units are not positive and bounded, or any fill's price, exits included, is not plain positive decimal text (at most 15 integer and 10 fractional digits). Exit prices are validated but never enter the average |
 | `OPEN_FILL_MISSING`, `REPEATED_OPEN_FILL`, `CLOSE_FILL_ON_OPEN_POSITION` | The lifecycle is inconsistent |
 | `FILL_QUANTITY_DISAGREES_WITH_POSITION` | Entries minus exits do not equal the position's units |
 | `ORDER_DEPENDENT_BASIS_UNPROVEN` | See below |
