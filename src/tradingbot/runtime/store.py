@@ -9,18 +9,21 @@ interpreter context holds asset codes, sides, price levels and times, never word
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import sqlite3
 import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import asdict
 from datetime import datetime
+from enum import Enum
 from pathlib import Path
 
-from tradingbot.models import Action, PositionSide
-from tradingbot.tkl_interpreter import IdeaView, PendingIntent, PointInTimeContext
+from pydantic import BaseModel
+
+import tradingbot.tkl_interpreter as tki
+from tradingbot.tkl_interpreter import PointInTimeContext
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS source_state (
@@ -111,59 +114,101 @@ def _dt(value: str | None) -> datetime | None:
 
 
 # ----------------------------------------------------------------------------- context codec
+#
+# The interpreter's point-in-time context is a tree of dataclasses (tkl_interpreter) holding asset
+# codes, sides, price levels, times and event histories. The codec is generic over those
+# dataclasses (so a richer context keeps round-tripping) and refuses anything that could carry post
+# text: a pydantic model (SourcePost) is never serialized, and context fields that hold posts are
+# left out and come back empty.
+
+EXCLUDED_FIELDS = {("PointInTimeContext", "posts")}
+
+
+def _enum_types() -> dict[str, type[Enum]]:
+    from tradingbot import models
+
+    out: dict[str, type[Enum]] = {}
+    for module in (models, tki):
+        for name in dir(module):
+            obj = getattr(module, name)
+            if isinstance(obj, type) and issubclass(obj, Enum):
+                out[name] = obj
+    return out
+
+
+def _encode(value):
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, datetime):
+        return {"$dt": value.isoformat()}
+    if isinstance(value, Enum):
+        return {"$enum": [type(value).__name__, value.value]}
+    if isinstance(value, BaseModel):
+        raise TypeError("refusing to persist a model (it may carry post text)")
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        name = type(value).__name__
+        return {
+            "$dc": name,
+            "f": {
+                f.name: _encode(getattr(value, f.name))
+                for f in dataclasses.fields(value)
+                if (name, f.name) not in EXCLUDED_FIELDS
+            },
+        }
+    if isinstance(value, tuple):
+        return {"$t": [_encode(v) for v in value]}
+    if isinstance(value, (set, frozenset)):
+        return {"$s": sorted((_encode(v) for v in value), key=lambda x: json.dumps(x))}
+    if isinstance(value, list):
+        return [_encode(v) for v in value]
+    if isinstance(value, dict):
+        return {"$d": [[_encode(k), _encode(v)] for k, v in value.items()]}
+    raise TypeError(f"cannot persist {type(value).__name__} in the interpreter context")
+
+
+def _decode(value, enums: dict[str, type[Enum]]):
+    if isinstance(value, list):
+        return [_decode(v, enums) for v in value]
+    if not isinstance(value, dict):
+        return value
+    if "$dt" in value:
+        return datetime.fromisoformat(value["$dt"])
+    if "$enum" in value:
+        name, raw = value["$enum"]
+        return enums[name](raw)
+    if "$t" in value:
+        return tuple(_decode(v, enums) for v in value["$t"])
+    if "$s" in value:
+        return {_decode(v, enums) for v in value["$s"]}
+    if "$d" in value:
+        return {_decode(k, enums): _decode(v, enums) for k, v in value["$d"]}
+    if "$dc" in value:
+        cls = getattr(tki, value["$dc"], None)
+        if cls is None or not dataclasses.is_dataclass(cls):
+            raise ValueError(f"unknown context type {value['$dc']}")
+        obj = cls.__new__(cls)
+        stored = value["f"]
+        for f in dataclasses.fields(cls):
+            if f.name in stored:
+                setattr(obj, f.name, _decode(stored[f.name], enums))
+            elif f.default is not dataclasses.MISSING:
+                setattr(obj, f.name, f.default)
+            elif f.default_factory is not dataclasses.MISSING:
+                setattr(obj, f.name, f.default_factory())
+            else:
+                raise ValueError(f"context field {value['$dc']}.{f.name} missing")
+        return obj
+    raise ValueError("unrecognised context value")
 
 
 def context_to_json(ctx: PointInTimeContext) -> str:
-    def idea(i: IdeaView) -> dict:
-        d = asdict(i)
-        d["side"] = i.side.value
-        d["opened_at"] = _iso(i.opened_at)
-        d["closed_at"] = _iso(i.closed_at)
-        return d
-
-    def intent(p: PendingIntent) -> dict:
-        d = asdict(p)
-        d["action"] = p.action.value
-        d["created_at"] = _iso(p.created_at)
-        d["cancelled_at"] = _iso(p.cancelled_at)
-        return d
-
-    return json.dumps(
-        {
-            "ideas": [idea(i) for i in ctx.ideas.values()],
-            "intents": [intent(p) for p in ctx.intents.values()],
-            "observed_posts": sorted([list(k) for k in ctx.observed_posts]),
-            "seen_posts": sorted([list(k) for k in ctx.seen_posts]),
-        },
-        sort_keys=True,
-    )
+    return json.dumps(_encode(ctx), sort_keys=True)
 
 
 def context_from_json(text: str) -> PointInTimeContext:
-    raw = json.loads(text)
-    ctx = PointInTimeContext()
-    for d in raw.get("ideas", []):
-        ctx.ideas[d["idea_id"]] = IdeaView(
-            idea_id=d["idea_id"],
-            source_id=d["source_id"],
-            asset=d["asset"],
-            side=PositionSide(d["side"]),
-            opened_at=_dt(d["opened_at"]),
-            closed_at=_dt(d["closed_at"]),
-            stop_price=d.get("stop_price"),
-            target_price=d.get("target_price"),
-        )
-    for d in raw.get("intents", []):
-        ctx.intents[d["intent_id"]] = PendingIntent(
-            intent_id=d["intent_id"],
-            asset=d["asset"],
-            action=Action(d["action"]),
-            trigger=d.get("trigger"),
-            created_at=_dt(d["created_at"]),
-            cancelled_at=_dt(d["cancelled_at"]),
-        )
-    ctx.observed_posts = {(s, int(r)) for s, r in raw.get("observed_posts", [])}
-    ctx.seen_posts = {(s, int(r)) for s, r in raw.get("seen_posts", [])}
+    ctx = _decode(json.loads(text), _enum_types())
+    if not isinstance(ctx, PointInTimeContext):
+        raise TypeError("stored interpreter context has the wrong type")
     return ctx
 
 

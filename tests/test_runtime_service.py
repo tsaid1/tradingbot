@@ -473,3 +473,18 @@ def test_build_service_refuses_a_missing_lexicon_and_loads_a_present_one(tmp_pat
     )
     with pytest.raises(ConfigError, match="lexicon"):
         build_service(missing)
+
+
+def test_interpreter_context_round_trips_and_never_carries_post_text():
+    from tradingbot.runtime.store import _encode, context_from_json, context_to_json
+    from tradingbot.tkl_interpreter import TklInterpreter
+
+    it = TklInterpreter()
+    for p in (post("1", 0, ENTRY), post("2", 60, ADD), post("3", 120, RAISE_STOP)):
+        it.observe(p, it.interpret(p))
+    text = context_to_json(it.context)
+    assert ENTRY not in text and ADD not in text
+    back = context_from_json(text)
+    assert back.ideas == it.context.ideas and back.observed_posts == it.context.observed_posts
+    with pytest.raises(TypeError):
+        _encode(post("4", 0, ENTRY))
