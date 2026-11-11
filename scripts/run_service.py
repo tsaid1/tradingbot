@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+"""Run the TradingBot runtime service (mock mode only: the simulated broker).
+
+    PYTHONPATH=src python scripts/run_service.py --config path/to/runtime.toml
+    PYTHONPATH=src python scripts/run_service.py --config runtime.toml --once
+    PYTHONPATH=src python scripts/run_service.py --config runtime.toml --source replay:posts.jsonl
+
+Exit codes: 0 after a clean stop (or one cycle with --once), 2 when the config is refused,
+1 on an unhandled fault. See docs/RUNTIME.md.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import signal
+import sys
+
+from tradingbot.runtime.app import build_service, with_replay_source
+from tradingbot.runtime.config import DEFAULT_CONFIG_PATH, ConfigError, load_config
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        "--config",
+        default=str(DEFAULT_CONFIG_PATH),
+        help=f"runtime TOML (default {DEFAULT_CONFIG_PATH})",
+    )
+    parser.add_argument("--once", action="store_true", help="run one cycle and exit")
+    parser.add_argument("--source", help="override the source: replay:<file.jsonl>")
+    args = parser.parse_args(argv)
+    try:
+        config = load_config(args.config)
+        if args.source:
+            kind, _, value = args.source.partition(":")
+            if kind != "replay" or not value:
+                raise ConfigError("--source must be replay:<file>")
+            config = with_replay_source(config, value)
+        service = build_service(config)
+    except ConfigError as exc:
+        print(f"refusing to start: {exc}", file=sys.stderr)
+        return 2
+
+    stopping = {"flag": False}
+
+    def stop(signum, _frame):
+        stopping["flag"] = True
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    try:
+        if args.once:
+            report = service.run_once()
+            print(
+                json.dumps(
+                    {
+                        "posts_processed": report.posts_processed,
+                        "held_actions": report.held_actions,
+                        "duplicates": report.duplicates,
+                        "skipped": report.skipped,
+                        "faults": report.faults,
+                        "reconciliation_clean": report.reconciliation_clean,
+                        "unexplained": report.unexplained,
+                        "halted": report.halted,
+                    },
+                    indent=2,
+                )
+            )
+        else:
+            print(f"service running (mock mode); heartbeat at {config.heartbeat_file}", flush=True)
+            service.run_forever(stop=lambda: stopping["flag"])
+    except Exception as exc:  # noqa: BLE001 - an unhandled fault exits non-zero
+        print(f"unhandled fault: {type(exc).__name__}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
