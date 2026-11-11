@@ -18,10 +18,14 @@ from ibapi.message import IN, OUT
 from ibapi.protobuf.AccountSummary_pb2 import AccountSummary
 from ibapi.protobuf.AccountSummaryEnd_pb2 import AccountSummaryEnd
 from ibapi.protobuf.AccountSummaryRequest_pb2 import AccountSummaryRequest
+from ibapi.protobuf.ApiConfig_pb2 import ApiConfig
+from ibapi.protobuf.ApiSettingsConfig_pb2 import ApiSettingsConfig
 from ibapi.protobuf.CancelAccountSummary_pb2 import CancelAccountSummary
 from ibapi.protobuf.CancelContractData_pb2 import CancelContractData
 from ibapi.protobuf.CancelMarketData_pb2 import CancelMarketData
 from ibapi.protobuf.CancelPositions_pb2 import CancelPositions
+from ibapi.protobuf.ConfigRequest_pb2 import ConfigRequest
+from ibapi.protobuf.ConfigResponse_pb2 import ConfigResponse
 from ibapi.protobuf.Contract_pb2 import Contract as ContractProto
 from ibapi.protobuf.ContractData_pb2 import ContractData
 from ibapi.protobuf.ContractDataEnd_pb2 import ContractDataEnd
@@ -56,11 +60,18 @@ _REQUESTS = {
     OUT.REQ_MKT_DATA: ("REQ_MKT_DATA", MarketDataRequest),
     OUT.CANCEL_MKT_DATA: ("CANCEL_MKT_DATA", CancelMarketData),
     OUT.REQ_MARKET_DATA_TYPE: ("REQ_MARKET_DATA_TYPE", MarketDataTypeRequest),
+    OUT.REQ_CONFIG: ("REQ_CONFIG", ConfigRequest),
 }
 
 
 def frame(in_id: int, proto) -> bytes:
     return comm.make_msg_proto(in_id + PROTOBUF_MSG_ID, proto.SerializeToString())
+
+
+def text_frame(in_id: int, *fields: str) -> bytes:
+    """Legacy text-encoded message (raw 4-byte id, NUL-separated fields), as TWS >= 201 frames it."""
+    body = in_id.to_bytes(4, "big") + "".join(f"{f}\0" for f in fields).encode()
+    return struct.pack("!I", len(body)) + body
 
 
 def error_frame(req_id: int, code: int, msg: str) -> bytes:
@@ -141,11 +152,15 @@ class FakeTws:
         self.connection_time = "20261111 15:30:00 Greenwich Mean Time"
         self.handshake = True
         self.refuse = False
-        self.managed_accounts: str | None = PAPER
+        self.managed_accounts: str | list[str] | None = PAPER  # a list sends several callbacks
         self.send_next_valid_id = True
         self.summary_account = PAPER
         self.positions = [(PAPER, "TLT", 15547841, "10")]
         self.fail_send: set[str] = set()  # request names whose send raises OSError
+        # ApiSettingsConfig fields returned to reqConfigProtoBuf (None = field absent)
+        self.api_settings: dict = {"readOnlyApi": True, "socketPort": 7497,
+                                   "allowLocalhostOnly": True}
+        self.extra_after_start: list[bytes] = []  # raw frames pushed right after START_API
         self.connections: list[FakeConnection] = []
         self.requests: list[tuple[str, object]] = []
         self._handshaken: set[int] = set()
@@ -157,6 +172,7 @@ class FakeTws:
             "REQ_ACCOUNT_SUMMARY": FakeTws.account_summary,
             "REQ_POSITIONS": FakeTws.positions_handler,
             "REQ_MKT_DATA": lambda s, c, r: [c.push(f) for f in delayed_quote_frames(r.reqId)],
+            "REQ_CONFIG": FakeTws.config_handler,
         }
 
     # Connection factory with the signature EClient.connect uses: Connection(host, port)
@@ -206,8 +222,12 @@ class FakeTws:
                            (2106, "HMDS data farm connection is OK:ushmds"),
                            (2158, "Sec-def data farm connection is OK:secdefnj")):
             conn.push(error_frame(-1, code, text))
-        if s.managed_accounts is not None:
-            conn.push(frame(IN.MANAGED_ACCTS, ManagedAccounts(accountsList=s.managed_accounts)))
+        for raw in s.extra_after_start:
+            conn.push(raw)
+        accounts = s.managed_accounts
+        for value in accounts if isinstance(accounts, list) else [accounts]:
+            if value is not None:
+                conn.push(frame(IN.MANAGED_ACCTS, ManagedAccounts(accountsList=value)))
 
     @staticmethod
     def account_summary(s: FakeTws, conn: FakeConnection, req) -> None:
@@ -228,3 +248,9 @@ class FakeTws:
             conn.push(frame(IN.POSITION_DATA, Position(account=account, contract=c, position=qty,
                                                        avgCost=87.5)))
         conn.push(frame(IN.POSITION_END, PositionEnd()))
+
+    @staticmethod
+    def config_handler(s: FakeTws, conn: FakeConnection, req) -> None:
+        settings = ApiSettingsConfig(**{k: v for k, v in s.api_settings.items() if v is not None})
+        conn.push(frame(IN.CONFIG_RESPONSE, ConfigResponse(
+            reqId=req.reqId, api=ApiConfig(settings=settings))))

@@ -13,8 +13,18 @@ import pytest
 pytest.importorskip("ibapi")
 
 import ibapi.client
-from _ibkr_fake_tws import OTHER_PAPER, PAPER, FakeTws, error_frame, frame, tlt_contract_frame
-from ibapi.message import IN
+from _ibkr_fake_tws import (
+    OTHER_PAPER,
+    PAPER,
+    FakeTws,
+    error_frame,
+    frame,
+    text_frame,
+    tlt_contract_frame,
+)
+from ibapi.client import EClient
+from ibapi.common import PROTOBUF_MSG_ID
+from ibapi.message import IN, OUT
 from ibapi.protobuf.ContractDataEnd_pb2 import ContractDataEnd
 from ibapi.protobuf.TickPrice_pb2 import TickPrice
 from ibapi.protobuf.TickSnapshotEnd_pb2 import TickSnapshotEnd
@@ -26,20 +36,35 @@ from tradingbot.ibkr import errors as E
 from tradingbot.ibkr import models
 from tradingbot.ibkr.check import run_check
 from tradingbot.ibkr.config import validate_config
+from tradingbot.ibkr.errors import ReadOnlyViolation
 from tradingbot.ibkr.models import TLT_QUERY, QuoteQuality
+from tradingbot.ibkr.session import (
+    ALLOWED_CLIENT_METHODS,
+    ALLOWED_OUT_MESSAGES,
+    IbkrSession,
+    SessionState,
+    _Wrapper,
+)
 from tradingbot.ibkr.session import (
     MIN_SERVER_VER_CANCEL_CONTRACT_DATA as OUR_MIN_CANCEL,
 )
-from tradingbot.ibkr.session import IbkrSession, SessionState, _Wrapper
 
-CFG = validate_config({"host": "127.0.0.1", "port": 7497, "client_id": 7, "account": PAPER,
-                       "mode": "paper"})
+CFG_DATA = {"mode": "paper", "host": "127.0.0.1", "port": 7497, "client_id": 7, "account": PAPER,
+            "tws_profile_ini": "/Users/someone/Jts/jts.ini", "tws_os_user": "someone",
+            "read_only_check": "config-read"}  # synthetic
+CFG = validate_config(CFG_DATA)
+ATTESTED = validate_config({**CFG_DATA, "read_only_check": "owner-attested"})
+
+
+def stub_preflight(cfg):  # the real preflight reads the local socket table; tested elsewhere
+    return {"stub": True}
 DATA_REQUESTS = {"REQ_CONTRACT_DATA", "REQ_ACCOUNT_SUMMARY", "REQ_POSITIONS", "REQ_MKT_DATA",
                  "REQ_MARKET_DATA_TYPE"}
+SERVER_VERSIONS = [219, 226]  # lowest accepted (MIN_SERVER_VERSION) and this SDK's maximum
 
 
-@pytest.fixture
-def tws(monkeypatch):
+@pytest.fixture(params=SERVER_VERSIONS, ids=lambda v: f"sv{v}")
+def tws(monkeypatch, request):
     def no_network(*args, **kwargs):
         raise AssertionError("network access attempted in an offline test")
 
@@ -47,15 +72,16 @@ def tws(monkeypatch):
     monkeypatch.setattr(socket.socket, "connect_ex", no_network)
     monkeypatch.setattr(socket, "create_connection", no_network)
     server = FakeTws()
+    server.server_version = request.param
     monkeypatch.setattr(ibapi.client, "Connection", server.connection_factory)
     return server
 
 
-def session(**kw) -> IbkrSession:
+def session(cfg=CFG, **kw) -> IbkrSession:
     opts = {"connect_timeout": 2.0, "request_timeout": 2.0, "quote_timeout": 2.0,
-            "shutdown_timeout": 3.0}
+            "shutdown_timeout": 3.0, "preflight": stub_preflight}
     opts.update(kw)
-    return IbkrSession(CFG, **opts)
+    return IbkrSession(cfg, **opts)
 
 
 def assert_closed(s: IbkrSession) -> None:
@@ -107,7 +133,10 @@ def test_happy_path(tws):
         assert repr(s) == "IbkrSession(state=READY, account='DU…01')"
     assert_closed(s)
     names = tws.names()
-    assert names[0] == "START_API"
+    assert names[:2] == ["START_API", "REQ_CONFIG"]  # config read before any data request
+    assert s.read_only_status == "VERIFIED"
+    assert s.read_only_settings == {"readOnlyApi": True, "socketPort": 7497,
+                                    "allowLocalhostOnly": True}
     assert "CANCEL_ACCOUNT_SUMMARY" in names and "CANCEL_POSITIONS" in names
     assert "CANCEL_MKT_DATA" not in names  # snapshot ended by itself
     assert {code for _, code, _ in s.notices} >= {2104, 2106, 2158}
@@ -340,13 +369,347 @@ def test_connectivity_lost_code_1100_fails_pending(tws):
 # --- end-to-end check runner over the real SDK + fake transport ---------------------------------
 def test_check_runner_end_to_end(tws, tmp_path):
     cfg_path = tmp_path / "paper.toml"
-    cfg_path.write_text(f'host = "127.0.0.1"\nport = 7497\nclient_id = 7\naccount = "{PAPER}"\n'
-                        'mode = "paper"\n')
+    cfg_path.write_text("".join(f"{k} = {json.dumps(v)}\n" for k, v in CFG_DATA.items()))
     os.chmod(cfg_path, 0o600)
     report = run_check(cfg_path, session_factory=lambda cfg: session())
     assert report["overall"] == "PASS", report
-    assert report["sdk_version"] == "1052.1" and report["session"]["server_version"] == 226
+    assert report["sdk_version"] == "1052.1"
+    assert report["session"]["server_version"] == tws.server_version
+    assert report["session"]["reader_joined"] and report["reconnect_session"]["reader_joined"]
     assert report["session"]["tws_connection_time"] == tws.connection_time
     assert PAPER not in json.dumps(report)
     assert tws.names().count("START_API") == 2
-    assert any("DELAYED" in w for w in report["warnings"])
+    assert any("DELAYED" in n for n in report["notes"]) and report["warnings"] == []
+
+
+# --- review round: preflight, server version, read-only verification ----------------------------
+def test_preflight_failure_opens_no_connection(tws):
+    def refuse(cfg):
+        raise E.PaperModeNotConfirmed("paper mode not confirmed: test", reason="NOT_PAPER")
+
+    s = session(preflight=refuse)
+    with pytest.raises(E.PaperModeNotConfirmed):
+        s.connect()
+    assert tws.connections == [] and tws.requests == []
+    assert_closed(s)
+
+
+def test_listener_preflight_failure_opens_no_connection(tws):
+    def refuse(cfg):
+        raise E.ListenerNotConfirmed("port 7497 listener owned by x", reason="WRONG_USER")
+
+    with pytest.raises(E.ListenerNotConfirmed):
+        session(preflight=refuse).connect()
+    assert tws.connections == []
+
+
+def test_default_preflight_is_the_real_one():
+    from tradingbot.ibkr.environment import run_preflight
+
+    assert inspect.signature(IbkrSession).parameters["preflight"].default is run_preflight
+
+
+@pytest.mark.parametrize("version", [150, 218])
+def test_old_server_version_refused(tws, version):
+    tws.server_version = version
+    s = session()
+    with pytest.raises(E.UnsupportedServerVersion):
+        s.connect()
+    assert_closed(s)
+    assert not DATA_REQUESTS & set(tws.names()) and "REQ_CONFIG" not in tws.names()
+
+
+@pytest.mark.parametrize("settings,needle", [
+    ({"readOnlyApi": False}, "readOnlyApi=False"),
+    ({"readOnlyApi": None}, "readOnlyApi=None"),
+    ({"socketPort": 7496}, "socketPort=7496"),
+    ({"socketPort": None}, "socketPort=None"),
+    ({"allowLocalhostOnly": False}, "allowLocalhostOnly=False"),
+    ({"allowLocalhostOnly": None}, "allowLocalhostOnly=None"),
+])
+def test_config_read_refusals(tws, settings, needle):
+    tws.api_settings = {**tws.api_settings, **settings}
+    s = session()
+    with pytest.raises(E.ReadOnlySettingRefused, match=needle):
+        s.connect()
+    assert_closed(s)
+    assert not DATA_REQUESTS & set(tws.names())
+
+
+def test_config_read_without_api_section_refused(tws):
+    from ibapi.protobuf.ConfigResponse_pb2 import ConfigResponse
+
+    tws.on["REQ_CONFIG"] = lambda srv, c, r: c.push(
+        frame(IN.CONFIG_RESPONSE, ConfigResponse(reqId=r.reqId)))
+    with pytest.raises(E.ReadOnlySettingRefused):
+        session().connect()
+
+
+def _config_response(req_id):
+    from ibapi.protobuf.ApiConfig_pb2 import ApiConfig
+    from ibapi.protobuf.ApiSettingsConfig_pb2 import ApiSettingsConfig
+    from ibapi.protobuf.ConfigResponse_pb2 import ConfigResponse
+
+    settings = ApiSettingsConfig(readOnlyApi=True, socketPort=7497, allowLocalhostOnly=True)
+    resp = ConfigResponse(api=ApiConfig(settings=settings))
+    if req_id is not None:
+        resp.reqId = req_id
+    return frame(IN.CONFIG_RESPONSE, resp)
+
+
+@pytest.mark.parametrize("handler,exc", [
+    (lambda srv, c, r: None, "ConfigReadTimeout"),
+    (lambda srv, c, r: c.push(error_frame(r.reqId, 10999, "config not allowed")),
+     "ConfigReadRejected"),
+    (lambda srv, c, r: c.push(_config_response(r.reqId + 1)), "ConfigReadUncorrelated"),
+    (lambda srv, c, r: c.push(_config_response(None)), "ConfigReadUncorrelated"),
+])
+def test_config_read_failure_modes_have_distinct_types(tws, handler, exc):
+    tws.on["REQ_CONFIG"] = handler
+    s = session(request_timeout=0.5)
+    with pytest.raises(getattr(E, exc)) as ei:
+        s.connect()
+    assert type(ei.value).__name__ == exc and isinstance(ei.value, E.ReadOnlyNotVerified)
+    assert_closed(s)
+    assert not DATA_REQUESTS & set(tws.names())
+
+
+def test_config_read_unsupported_server_version_is_distinct(tws, monkeypatch):
+    import tradingbot.ibkr.session as sess
+
+    monkeypatch.setattr(sess, "MIN_SERVER_VER_CONFIG", tws.server_version + 1)
+    s = session()
+    with pytest.raises(E.ConfigReadUnsupported):
+        s.connect()
+    assert_closed(s)
+    assert "REQ_CONFIG" not in tws.names() and not DATA_REQUESTS & set(tws.names())
+
+
+def test_owner_attested_sends_no_config_request(tws):
+    with session(ATTESTED) as s:
+        assert s.read_only_status == "OWNER_ATTESTED_NOT_VERIFIED"
+        s.positions()
+    assert "REQ_CONFIG" not in tws.names()
+
+
+def test_owner_attested_check_is_pass_with_warnings(tws, tmp_path):
+    cfg_path = tmp_path / "paper.toml"
+    data = {**CFG_DATA, "read_only_check": "owner-attested"}
+    cfg_path.write_text("".join(f"{k} = {json.dumps(v)}\n" for k, v in data.items()))
+    os.chmod(cfg_path, 0o600)
+    report = run_check(cfg_path, session_factory=lambda cfg: session(cfg))
+    assert report["overall"] == "PASS_WITH_WARNINGS"
+
+
+def test_unavailable_quote_check_is_pass_with_warnings(tws, tmp_path):
+    tws.on["REQ_MKT_DATA"] = lambda srv, c, r: c.push(error_frame(r.reqId, 354, "not subscribed"))
+    cfg_path = tmp_path / "paper.toml"
+    cfg_path.write_text("".join(f"{k} = {json.dumps(v)}\n" for k, v in CFG_DATA.items()))
+    os.chmod(cfg_path, 0o600)
+    from tradingbot.ibkr.check import summarize
+
+    report = run_check(cfg_path, session_factory=lambda cfg: session())
+    assert report["overall"] == "PASS_WITH_WARNINGS"
+    assert "no market data delivered" in summarize(report).splitlines()[0]
+
+
+# --- managedAccounts: every value, from the first on ---------------------------------------------
+@pytest.mark.parametrize("sequence", [["U1234567", PAPER], [PAPER, OTHER_PAPER],
+                                      [PAPER, f"{PAPER},{OTHER_PAPER}"], [PAPER, ""]])
+def test_any_bad_managed_accounts_fails_gate_permanently(tws, sequence):
+    tws.managed_accounts = sequence
+    s = session()
+    with pytest.raises(E.AccountIdentityError):
+        s.connect()
+    assert_closed(s)
+    assert not DATA_REQUESTS & set(tws.names())
+    assert "U1234567" not in repr(s) and PAPER not in repr(s)
+
+
+def test_repeated_identical_managed_accounts_is_fine(tws):
+    tws.managed_accounts = [PAPER, PAPER]
+    with session() as s:
+        assert s.state is SessionState.READY
+
+
+def test_bad_managed_accounts_after_ready_poisons(tws):
+    from ibapi.protobuf.ManagedAccounts_pb2 import ManagedAccounts
+
+    tws.on["REQ_POSITIONS"] = lambda srv, c, r: c.push(
+        frame(IN.MANAGED_ACCTS, ManagedAccounts(accountsList=OTHER_PAPER)))
+    s = session()
+    s.connect()
+    with pytest.raises(E.AccountIdentityError):
+        s.positions(timeout=2)
+    assert s.poisoned
+    assert_closed(s)
+
+
+def test_poison_between_check_and_send_sends_nothing(tws, monkeypatch):
+    s = session()
+    s.connect()
+    real = s._require_ready
+    calls = {"n": 0}
+
+    def racing(gate=False):
+        real(gate)
+        calls["n"] += 1
+        if calls["n"] == 1:  # poison arrives right after the first check passed
+            s._poisoned = E.AccountIdentityError("foreign row", reason="FOREIGN_ROW")
+
+    monkeypatch.setattr(s, "_require_ready", racing)
+    with pytest.raises(E.AccountIdentityError):
+        s.positions()
+    assert "REQ_POSITIONS" not in tws.names()
+    s._poisoned = None
+    s.disconnect()
+
+
+# --- deny-by-default client surface ----------------------------------------------------------------
+def _public_callables() -> list[str]:
+    return [n for n in dir(EClient) if not n.startswith("_") and callable(getattr(EClient, n))]
+
+
+def test_allowlist_is_exactly_known_and_exists_in_sdk():
+    assert ALLOWED_CLIENT_METHODS <= set(_public_callables())
+    assert {"placeOrder", "cancelOrder", "reqGlobalCancel", "exerciseOptions",
+            "updateConfigProtoBuf", "replaceFA", "replaceFAProtoBuf"}.isdisjoint(
+        ALLOWED_CLIENT_METHODS)
+    sends = {n for n in ALLOWED_CLIENT_METHODS if n.startswith(("req", "cancel"))}
+    assert sends == {
+        "reqContractDetails", "reqContractDataProtoBuf", "cancelContractData",
+        "cancelContractDataProtoBuf", "reqAccountSummary", "reqAccountSummaryProtoBuf",
+        "cancelAccountSummary", "cancelAccountSummaryProtoBuf", "reqPositions",
+        "reqPositionsProtoBuf", "cancelPositions", "cancelPositionsProtoBuf", "reqMktData",
+        "reqMarketDataProtoBuf", "cancelMktData", "cancelMarketDataProtoBuf", "reqMarketDataType",
+        "reqMarketDataTypeProtoBuf", "reqConfigProtoBuf"}
+
+
+def test_every_non_allowlisted_eclient_method_raises_and_sends_nothing(tws):
+    s = session()
+    s.connect()
+    before = list(tws.requests)
+    denied = [n for n in _public_callables() if n not in ALLOWED_CLIENT_METHODS]
+    assert len(denied) > 100
+    for name in denied:
+        with pytest.raises(ReadOnlyViolation):
+            getattr(s._client, name)(1, 2, 3)
+    assert tws.requests == before and s._client.isConnected()
+    s.disconnect()
+    assert_closed(s)
+
+
+def test_wire_allowlist_refuses_other_message_ids(tws):
+    s = session()
+    s.connect()
+    before = list(tws.requests)
+    out_ids = {v for k, v in vars(OUT).items() if not k.startswith("_") and isinstance(v, int)}
+    refused = sorted(out_ids - ALLOWED_OUT_MESSAGES)
+    assert OUT.PLACE_ORDER in refused and OUT.UPDATE_CONFIG in refused
+    for msg_id in refused:
+        with pytest.raises(ReadOnlyViolation):
+            s._client.sendMsgProtoBuf(msg_id + PROTOBUF_MSG_ID, b"")
+        with pytest.raises(ReadOnlyViolation):
+            s._client.sendMsg(msg_id, "")
+    assert tws.requests == before
+    s.disconnect()
+
+
+# --- SDK logging never reaches a handler or stderr ------------------------------------------------
+def test_sdk_field_mismatch_log_never_leaks_account(tws, capfd, caplog, monkeypatch):
+    import logging
+
+    from ibapi.decoder import Decoder
+
+    seen = []
+    real = Decoder.interpretWithSignature
+
+    def spy(self, fields, handleInfo):
+        seen.append(list(fields))
+        return real(self, fields, handleInfo)
+
+    monkeypatch.setattr(Decoder, "interpretWithSignature", spy)
+    caplog.set_level(logging.DEBUG)
+    # legacy text managedAccounts with one field too many -> decoder logs raw fields at ERROR
+    tws.extra_after_start = [text_frame(IN.MANAGED_ACCTS, "1", PAPER, "extra-field")]
+    with session() as s:
+        assert s.state is SessionState.READY
+    assert any(PAPER.encode() in fields for fields in seen), "mismatch path was not exercised"
+    out, err = capfd.readouterr()
+    assert PAPER not in out and PAPER not in err
+    assert PAPER not in caplog.text
+    assert all(PAPER not in r.getMessage() for r in caplog.records)
+    sdk = logging.getLogger("ibapi")
+    assert sdk.propagate is False and any(isinstance(h, logging.NullHandler) for h in sdk.handlers)
+
+
+# --- no reachable object can submit orders or change config --------------------------------------
+ORDER_LIKE = ("placeOrder", "cancelOrder", "reqGlobalCancel", "updateConfigProtoBuf")
+
+
+def _order_args(name):
+    from ibapi.contract import Contract
+    from ibapi.order import Order
+    from ibapi.order_cancel import OrderCancel
+    from ibapi.protobuf.UpdateConfigRequest_pb2 import UpdateConfigRequest
+
+    return {"placeOrder": (1, Contract(), Order()), "cancelOrder": (1, OrderCancel()),
+            "reqGlobalCancel": (OrderCancel(),),
+            "updateConfigProtoBuf": (UpdateConfigRequest(reqId=1),)}[name]
+
+
+def _attrs(obj):
+    for name in dir(obj):
+        if name.startswith("__"):
+            continue
+        try:
+            yield name, getattr(obj, name)
+        except Exception:  # noqa: BLE001, S112 - a property that refuses is fine
+            continue
+
+
+def _reachable(s):
+    """Every public and single-underscore attribute of the session, and of each of those."""
+    seen, out = {id(s)}, []
+    for name, value in _attrs(s):
+        if id(value) not in seen:
+            seen.add(id(value))
+            out.append((name, value))
+            for sub, v in _attrs(value):
+                if id(v) not in seen:
+                    seen.add(id(v))
+                    out.append((f"{name}.{sub}", v))
+    return out
+
+
+def test_no_attribute_of_a_connected_session_can_submit_orders(tws):
+    s = session()
+    s.connect()
+    before = list(tws.requests)
+    hits = []
+    for path, obj in _reachable(s):
+        for meth in ORDER_LIKE:
+            fn = getattr(obj, meth, None)
+            if fn is None or isinstance(obj, type):
+                continue
+            hits.append(f"{path}.{meth}")
+            with pytest.raises(ReadOnlyViolation):
+                fn(*_order_args(meth))
+    assert "_client.placeOrder" in hits and "_client.updateConfigProtoBuf" in hits
+    assert tws.requests == before and s._client.isConnected()
+    s.disconnect()
+
+
+@pytest.mark.parametrize("meth", ORDER_LIKE)
+def test_unbound_base_class_calls_send_nothing(tws, meth):
+    """Even bypassing the subclass (EClient.<meth>(client, ...)), the wire allowlist refuses the
+    message; where the SDK itself refuses first (version gate), nothing is sent either."""
+    s = session()
+    s.connect()
+    before = list(tws.requests)
+    try:
+        getattr(EClient, meth)(s._client, *_order_args(meth))
+    except ReadOnlyViolation:
+        pass
+    assert tws.requests == before
+    s.disconnect()

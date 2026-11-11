@@ -5,8 +5,13 @@ SDK's own ``EReader`` thread reads the socket and ``EClient.run()`` decodes mess
 thread, calling our ``EWrapper`` subclass. Callers block on a condition variable with explicit
 timeouts. The session is single-use: to reconnect, create a new ``IbkrSession``.
 
-No method here places, modifies or cancels orders. An order module, when it exists, should be a
-separate class that is handed a READY session explicitly; it must not be added to this file.
+Deny by default: the session talks to TWS only through ``_ReadOnlyClient``, which raises
+``ReadOnlyViolation`` from every public EClient method not in ``ALLOWED_CLIENT_METHODS`` and refuses
+any outgoing message id not in ``ALLOWED_OUT_MESSAGES``. An order module, when it exists, must be a
+separate, separately reviewed class; it must not be added to this file.
+
+Connect order: local preflight (paper profile + listener owner, no socket) -> handshake -> server
+version >= MIN_SERVER_VERSION -> identity gate -> read-only check -> READY.
 """
 from __future__ import annotations
 
@@ -22,23 +27,35 @@ from typing import Any, Self, TypeVar
 
 import ibapi
 from ibapi.client import EClient
+from ibapi.common import PROTOBUF_MSG_ID
 from ibapi.const import UNSET_DECIMAL, UNSET_DOUBLE
 from ibapi.contract import Contract
+from ibapi.message import OUT
+from ibapi.protobuf.ConfigRequest_pb2 import ConfigRequest
 from ibapi.wrapper import EWrapper
 
 from tradingbot.ibkr.config import PaperConnectionConfig
+from tradingbot.ibkr.environment import run_preflight
 from tradingbot.ibkr.errors import (
     CONNECTION_LOSS_CODES,
     AccountIdentityError,
     AmbiguousContract,
     CleanupError,
+    ConfigReadRejected,
+    ConfigReadTimeout,
+    ConfigReadUncorrelated,
+    ConfigReadUnsupported,
     ContractNotFound,
     ErrorClass,
     IbkrConnectionError,
     IbkrError,
     IbkrRequestError,
     IbkrTimeout,
+    ReadOnlyNotVerified,
+    ReadOnlySettingRefused,
+    ReadOnlyViolation,
     SessionStateError,
+    UnsupportedServerVersion,
     classify_error,
 )
 from tradingbot.ibkr.identity import check_managed_accounts, check_row_account
@@ -60,10 +77,78 @@ from tradingbot.ibkr.redact import mask_account, redact_accounts
 log = logging.getLogger(__name__)
 T = TypeVar("T")
 
+
+def _silence_sdk_logging() -> None:
+    """The SDK logs raw messages (incl. account IDs), and on a field-count mismatch logs the raw
+    fields at ERROR. No ibapi record may reach any handler or Python's lastResort (stderr)."""
+    sdk = logging.getLogger("ibapi")
+    sdk.setLevel(logging.CRITICAL + 10)
+    sdk.propagate = False
+    if not any(isinstance(h, logging.NullHandler) for h in sdk.handlers):
+        sdk.addHandler(logging.NullHandler())
+
+
+_silence_sdk_logging()
+
 ACCOUNT_SUMMARY_TAGS = ("AccountType", "NetLiquidation", "TotalCashValue", "BuyingPower",
                         "AvailableFunds")
 MIN_SERVER_VER_CANCEL_CONTRACT_DATA = 215  # ibapi.server_versions, 1052.1
+MIN_SERVER_VER_CONFIG = 219  # ibapi.server_versions, 1052.1: reqConfigProtoBuf
+# Lowest TWS server version this adapter accepts: the lowest one the test suite exercises.
+MIN_SERVER_VERSION = 219
 SDK_VERSION = ibapi.__version__
+
+# Every public EClient callable the session (or the SDK internally, on those paths) may use.
+ALLOWED_CLIENT_METHODS = frozenset({
+    # lifecycle / internals used by connect(), run(), disconnect() and the send path
+    "connect", "disconnect", "isConnected", "run", "reset", "setConnState", "checkConnected",
+    "validateInvalidSymbols", "useProtoBuf", "serverVersion", "twsConnectionTime", "logRequest",
+    "msgLoopTmo", "msgLoopRec", "keyboardInterrupt", "keyboardInterruptHard", "sendMsg",
+    "sendMsgProtoBuf", "startApi", "startApiProtoBuf",
+    # the read requests and their cancels
+    "reqContractDetails", "reqContractDataProtoBuf", "cancelContractData",
+    "cancelContractDataProtoBuf", "reqAccountSummary", "reqAccountSummaryProtoBuf",
+    "cancelAccountSummary", "cancelAccountSummaryProtoBuf", "reqPositions", "reqPositionsProtoBuf",
+    "cancelPositions", "cancelPositionsProtoBuf", "reqMktData", "reqMarketDataProtoBuf",
+    "cancelMktData", "cancelMarketDataProtoBuf", "reqMarketDataType", "reqMarketDataTypeProtoBuf",
+    # read-only API configuration read (read_only_check = "config-read")
+    "reqConfigProtoBuf",
+})
+ALLOWED_OUT_MESSAGES = frozenset({
+    OUT.START_API, OUT.REQ_CONTRACT_DATA, OUT.CANCEL_CONTRACT_DATA, OUT.REQ_ACCOUNT_SUMMARY,
+    OUT.CANCEL_ACCOUNT_SUMMARY, OUT.REQ_POSITIONS, OUT.CANCEL_POSITIONS, OUT.REQ_MKT_DATA,
+    OUT.CANCEL_MKT_DATA, OUT.REQ_MARKET_DATA_TYPE, OUT.REQ_CONFIG,
+})
+
+
+def _denied(name: str) -> Callable[..., None]:
+    def method(self, *args: Any, **kwargs: Any) -> None:
+        raise ReadOnlyViolation(f"EClient.{name} is not allowed by the read-only adapter")
+
+    method.__name__ = name
+    return method
+
+
+class _ReadOnlyClient(EClient):
+    """``EClient`` with every non-allowlisted public method replaced by one that raises, and the
+    two send primitives refusing any message id outside ``ALLOWED_OUT_MESSAGES``."""
+
+    def sendMsg(self, msgId: int, msg: str):
+        if msgId not in ALLOWED_OUT_MESSAGES:
+            raise ReadOnlyViolation(f"outgoing message id {msgId} is not allowed")
+        return super().sendMsg(msgId, msg)
+
+    def sendMsgProtoBuf(self, msgId: int, msg: bytes):
+        if msgId - PROTOBUF_MSG_ID not in ALLOWED_OUT_MESSAGES:
+            raise ReadOnlyViolation(f"outgoing protobuf message id {msgId} is not allowed")
+        return super().sendMsgProtoBuf(msgId, msg)
+
+
+for _name in dir(EClient):
+    if (not _name.startswith("_") and callable(getattr(EClient, _name))
+            and _name not in ALLOWED_CLIENT_METHODS):
+        setattr(_ReadOnlyClient, _name, _denied(_name))
+del _name
 
 
 class SessionState(str, Enum):
@@ -172,6 +257,9 @@ class _Wrapper(EWrapper):
     def tickSnapshotEnd(self, reqId):
         self._call(self._s._on_end, reqId)
 
+    def configResponseProtoBuf(self, configResponseProto):
+        self._call(self._s._on_config_response, configResponseProto)
+
 
 class IbkrSession:
     """Read-only paper session. Use as a context manager::
@@ -184,12 +272,13 @@ class IbkrSession:
 
     def __init__(self, config: PaperConnectionConfig, *, connect_timeout: float = 15.0,
                  request_timeout: float = 10.0, quote_timeout: float = 15.0,
-                 shutdown_timeout: float = 5.0, quiet_sdk_logging: bool = True) -> None:
+                 shutdown_timeout: float = 5.0,
+                 preflight: Callable[[PaperConnectionConfig], dict] = run_preflight) -> None:
         if not isinstance(config, PaperConnectionConfig) or config.mode != "paper":
             raise SessionStateError("IbkrSession requires a validated PaperConnectionConfig")
-        if quiet_sdk_logging:  # the SDK logs raw messages (incl. account IDs) at INFO/DEBUG
-            logging.getLogger("ibapi").setLevel(logging.WARNING)
+        _silence_sdk_logging()  # again, in case something reconfigured logging since import
         self._cfg = config
+        self._preflight = preflight
         self._connect_timeout = connect_timeout
         self._request_timeout = request_timeout
         self._quote_timeout = quote_timeout
@@ -199,7 +288,7 @@ class IbkrSession:
         self._state = SessionState.DISCONNECTED
         self._used = False
         self._wrapper = _Wrapper(self)
-        self._client = EClient(self._wrapper)
+        self._client = _ReadOnlyClient(self._wrapper)
         self._handshake_thread: threading.Thread | None = None
         self._handshake_exc: BaseException | None = None
         self._run_thread: threading.Thread | None = None
@@ -209,6 +298,7 @@ class IbkrSession:
         self._next_valid_id_seen = False
         self._managed_accounts: str | None = None
         self._connect_failure: BaseException | None = None
+        self._identity_failure: AccountIdentityError | None = None
         self._connection_lost: str | None = None
         self._connectivity_interrupted = False
         self._poisoned: AccountIdentityError | None = None
@@ -224,6 +314,9 @@ class IbkrSession:
         self.server_version: int | None = None
         self.connection_time: str | None = None
         self.connected_at: str | None = None
+        self.preflight_result: dict | None = None
+        self.read_only_status = "NOT_CHECKED"  # VERIFIED | OWNER_ATTESTED_NOT_VERIFIED
+        self.read_only_settings: dict | None = None
 
     # ------------------------------------------------------------------ public properties
     @property
@@ -240,6 +333,11 @@ class IbkrSession:
 
     def __repr__(self) -> str:
         return f"IbkrSession(state={self._state.value}, account={self.masked_account!r})"
+
+    @property
+    def reader_joined(self) -> bool:
+        """True only if an EReader thread existed and has exited."""
+        return self._reader is not None and not self._reader.is_alive()
 
     def threads_alive(self) -> list[str]:
         return [t.name for t in (self._handshake_thread, self._run_thread, self._reader)
@@ -267,6 +365,12 @@ class IbkrSession:
                 raise SessionStateError("IbkrSession is single-use; create a new one to reconnect")
             self._used = True
             self._state = SessionState.CONNECTING
+        try:  # local checks; no socket has been opened yet
+            self.preflight_result = self._preflight(self._cfg)
+        except BaseException:
+            with self._cond:
+                self._state = SessionState.DISCONNECTED
+            raise
         deadline = time.monotonic() + self._connect_timeout
 
         self._handshake_thread = threading.Thread(target=self._handshake, name="ibkr-handshake",
@@ -294,6 +398,10 @@ class IbkrSession:
                                 if isinstance(conn_time, bytes) else conn_time)
         self.connected_at = _now_iso()
         self._reader = self._client.reader
+        if not isinstance(self.server_version, int) or self.server_version < MIN_SERVER_VERSION:
+            self._abort_connect(UnsupportedServerVersion(
+                f"TWS server version {self.server_version} is below the minimum "
+                f"{MIN_SERVER_VERSION} this adapter supports"))
         self._run_thread = threading.Thread(target=self._run_loop, name="ibkr-run", daemon=True)
         self._run_thread.start()
 
@@ -315,10 +423,75 @@ class IbkrSession:
             check_managed_accounts(accounts, self._cfg.account)
         except AccountIdentityError as exc:
             self._abort_connect(exc)
-        with self._cond:
-            if self._connect_failure is not None:
-                self._abort_connect(self._connect_failure)
-            self._state = SessionState.READY
+        try:
+            self._check_read_only()
+        except BaseException as exc:  # noqa: BLE001 - always disconnect, then re-raise
+            self._abort_connect(exc)
+        with self._cond:  # final re-compare under the lock, then READY
+            failure = self._identity_failure or self._poisoned or self._connect_failure
+            if failure is None:
+                try:
+                    check_managed_accounts(self._managed_accounts, self._cfg.account)
+                except AccountIdentityError as exc:
+                    failure = exc
+            if failure is None:
+                self._state = SessionState.READY
+                return
+        self._abort_connect(failure)
+
+    def _check_read_only(self) -> None:
+        """After the identity gate, before READY (so before any data request).
+
+        config-read: ``reqConfigProtoBuf(ConfigRequest(reqId))`` and require, from the correlated
+        ``ConfigResponse``, ``api.settings.readOnlyApi`` explicitly present and True,
+        ``socketPort`` present and equal to the configured port, ``allowLocalhostOnly`` present and
+        True. Presence is checked with ``HasField`` (these are proto3 ``optional`` fields with
+        explicit presence), so an unset field is never read as a value. Each failure mode has its
+        own type; the caller disconnects.
+        """
+        if self._cfg.read_only_check == "owner-attested":
+            self.read_only_status = "OWNER_ATTESTED_NOT_VERIFIED"
+            return
+        if self._cfg.read_only_check != "config-read":
+            raise ReadOnlyNotVerified(f"unknown read_only_check {self._cfg.read_only_check!r}")
+        if self.server_version is None or self.server_version < MIN_SERVER_VER_CONFIG:
+            raise ConfigReadUnsupported(
+                f"config read needs server version >= {MIN_SERVER_VER_CONFIG}, TWS reports "
+                f"{self.server_version}")
+
+        def build(p: _Pending) -> object:
+            return p.rows[0]
+
+        try:
+            resp = self._request(
+                "config", lambda rid: self._client.reqConfigProtoBuf(ConfigRequest(reqId=rid)),
+                None, self._request_timeout, cancel_always=False, build=build, gate=True)
+        except IbkrTimeout as exc:
+            raise ConfigReadTimeout(f"no config response: {exc}") from exc
+        except IbkrRequestError as exc:
+            raise ConfigReadRejected(exc.code, exc.broker_message) from exc
+
+        settings = resp.api.settings if resp.HasField("api") and resp.api.HasField("settings") \
+            else None
+
+        def get(name: str) -> object:
+            return getattr(settings, name) if settings is not None and settings.HasField(name) \
+                else None
+
+        fields = {"readOnlyApi": get("readOnlyApi"), "socketPort": get("socketPort"),
+                  "allowLocalhostOnly": get("allowLocalhostOnly")}
+        self.read_only_settings = fields
+        problems = []
+        if fields["readOnlyApi"] is not True:
+            problems.append(f"readOnlyApi={fields['readOnlyApi']}")
+        if fields["socketPort"] != self._cfg.port:
+            problems.append(f"socketPort={fields['socketPort']} (configured {self._cfg.port})")
+        if fields["allowLocalhostOnly"] is not True:
+            problems.append(f"allowLocalhostOnly={fields['allowLocalhostOnly']}")
+        if problems:
+            raise ReadOnlySettingRefused("TWS API settings refused (None = absent): "
+                                         + ", ".join(problems))
+        self.read_only_status = "VERIFIED"
 
     def disconnect(self) -> None:
         """Bounded shutdown: close the socket, join every thread, state DISCONNECTED.
@@ -456,21 +629,25 @@ class IbkrSession:
             timeout or self._quote_timeout, cancel_always=False, build=build)
 
     # ------------------------------------------------------------------ request machinery
-    def _require_ready(self) -> None:
+    def _require_ready(self, gate: bool = False) -> None:
+        if self._identity_failure is not None:
+            raise AccountIdentityError(f"identity failed: {self._identity_failure}",
+                                       reason="IDENTITY_FAILED")
         if self._poisoned is not None:
             raise AccountIdentityError(f"session poisoned: {self._poisoned}", reason="POISONED")
         if self._connection_lost is not None:
             raise IbkrConnectionError(f"connection lost: {self._connection_lost}")
         if self._connectivity_interrupted:
             raise IbkrConnectionError("TWS reports its server connectivity is interrupted")
-        if self._state is not SessionState.READY:
+        allowed = (SessionState.CONNECTING,) if gate else (SessionState.READY,)
+        if self._state not in allowed:
             raise SessionStateError(f"session is {self._state.value}, not READY")
 
     def _request(self, kind: str, send: Callable[[int], None],
                  cancel: Callable[[int], None] | None, timeout: float, *, cancel_always: bool,
-                 build: Callable[[_Pending], T]) -> T:
+                 build: Callable[[_Pending], T], gate: bool = False) -> T:
         with self._cond:
-            self._require_ready()
+            self._require_ready(gate)
             self._next_req_id += 1
             p = _Pending(kind, self._next_req_id)
             if kind == "positions":
@@ -482,7 +659,10 @@ class IbkrSession:
         primary: BaseException | None = None
         failures: list[str] = []
         try:
-            send(p.req_id)
+            with self._cond:
+                # Re-check and send under the lock: no poison/loss callback can interleave.
+                self._require_ready(gate)
+                send(p.req_id)
             with self._cond:
                 completed = self._cond.wait_for(lambda: p.done, timeout)
             if not completed:
@@ -600,16 +780,40 @@ class IbkrSession:
             self._cond.notify_all()
 
     def _on_managed_accounts(self, accounts_list: str) -> None:
+        """Every managedAccounts, from the first one on, must be exactly the allowlisted account;
+        one bad value fails the gate permanently (e.g. a live account first, paper second)."""
+        try:
+            check_managed_accounts(accounts_list, self._cfg.account)
+            exc = None
+        except AccountIdentityError as e:
+            exc = e
         with self._cond:
-            first = self._managed_accounts is None
             self._managed_accounts = accounts_list
-            self._cond.notify_all()
+            if exc is not None:
+                self._identity_failure = self._identity_failure or exc
+                if self._state is SessionState.CONNECTING:
+                    self._connect_failure = self._connect_failure or exc
             ready = self._state is SessionState.READY
-        if not first and ready:
-            try:  # a later managedAccounts must still be exactly the configured account
-                check_managed_accounts(accounts_list, self._cfg.account)
-            except AccountIdentityError as exc:
-                self._poison(exc)
+            self._cond.notify_all()
+        if exc is not None and ready:
+            self._poison(exc)
+
+    def _on_config_response(self, proto) -> None:
+        """Correlate strictly: a response without our reqId fails the outstanding config read."""
+        rid = proto.reqId if proto.HasField("reqId") else None
+        with self._cond:
+            waiting = [p for p in self._pending.values() if p.kind == "config" and not p.done]
+            for p in waiting:
+                if rid == p.req_id:
+                    p.rows.append(proto)
+                    p.ended = p.done = True
+                else:
+                    p.fail(ConfigReadUncorrelated(
+                        f"config response reqId {rid} does not match request {p.req_id}"))
+            if not waiting:
+                self.unrouted_errors.append((rid if rid is not None else -1, 0,
+                                             "unsolicited config response ignored"))
+            self._cond.notify_all()
 
     def _on_error(self, req_id: int, code: int, message: str) -> None:
         msg = redact_accounts(message)
