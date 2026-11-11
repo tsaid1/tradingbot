@@ -237,8 +237,9 @@ def default_report_dir(repo_root: str | os.PathLike | None = None) -> Path | Non
     return None
 
 
-def write_report(report: dict, report_dir: str | os.PathLike) -> Path:
-    """Write ``ibkr_paper_check_<UTC>.json`` (0600) into an owner-only (0700) directory."""
+def write_report(report: dict, report_dir: str | os.PathLike, *,
+                 prefix: str = "ibkr_paper_check") -> Path:
+    """Write ``<prefix>_<UTC>.json`` (0600) into an owner-only (0700) directory."""
     d = Path(report_dir).expanduser()
     d.mkdir(mode=0o700, parents=True, exist_ok=True)
     st = os.lstat(d)
@@ -248,7 +249,7 @@ def write_report(report: dict, report_dir: str | os.PathLike) -> Path:
         os.chmod(d, 0o700)
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     for n in range(100):
-        path = d / f"ibkr_paper_check_{stamp}{'' if n == 0 else f'_{n}'}.json"
+        path = d / f"{prefix}_{stamp}{'' if n == 0 else f'_{n}'}.json"
         try:
             fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
                          0o600)

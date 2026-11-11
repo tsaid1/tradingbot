@@ -295,6 +295,7 @@ FORBIDDEN = {"placeOrder", "cancelOrder", "reqGlobalCancel", "exerciseOptions", 
 def _adapter_sources() -> list[Path]:
     files = sorted((ROOT / "src" / "tradingbot" / "ibkr").glob("*.py"))
     files.append(ROOT / "scripts" / "ibkr_paper_check.py")
+    files.append(ROOT / "scripts" / "ibkr_contract_discovery.py")
     assert len(files) >= 8
     return files
 
@@ -330,7 +331,7 @@ def test_no_order_methods_referenced(path):
 def test_pure_modules_do_not_import_ibapi():
     code = ("import sys; import tradingbot.ibkr.config, tradingbot.ibkr.models, "
             "tradingbot.ibkr.errors, tradingbot.ibkr.identity, tradingbot.ibkr.redact, "
-            "tradingbot.ibkr.check, tradingbot.ibkr.environment; "
+            "tradingbot.ibkr.check, tradingbot.ibkr.environment, tradingbot.ibkr.discovery; "
             "bad = [m for m in sys.modules if m.split('.')[0] == 'ibapi']; "
             "assert not bad, bad")
     env = {**os.environ, "PYTHONPATH": str(ROOT / "src")}
