@@ -35,6 +35,19 @@ REDUCE 50% ABC IDEA <original-source-id>
 The demo grammar is intentionally narrow and recognizes **neither arbitrary prose nor charts**.
 That is a safety feature, not a claim of NLP quality.
 
+### Mock TLT lifecycle demo (synthetic, mock-only)
+
+A complete fictional lifecycle (entry with stop and target, add and stop raise, a held conditional,
+commentary, half off, close, past-tense reconciliation, position summary, an unverified-author block,
+and a duplicate replay) through the existing interpreter, gateway and paper coordinator:
+
+```bash
+python scripts/run_mock_tlt_demo.py          # text audit, exit 0 on PASS
+streamlit run dashboard/app.py               # then open "Mock TLT Lifecycle" in the sidebar
+```
+
+See `docs/MOCK_TLT_LIFECYCLE_DEMO.md`. Every post, level and date is invented.
+
 ### Optional LLM + chart mode
 
 Set `OPENAI_API_KEY` and optionally `OPENAI_MODEL` in `.env` (not in source control).
@@ -64,6 +77,7 @@ Check publisher terms and source/API permissions before protected-feed ingestion
 - `src/tradingbot/storage.py`: durable source IDs, atomic fictional fills and idea positions
 - `src/tradingbot/pipeline.py`: orchestration (dedupe before parsing)
 - `dashboard/app.py`: signal console
+- `src/tradingbot/demo_lifecycle.py`, `dashboard/pages/`, `scripts/run_mock_tlt_demo.py`: synthetic mock TLT lifecycle demo
 - `tests/`: safety regression suite
 - `docs/`: scope, architecture decisions, agent coordination
 
