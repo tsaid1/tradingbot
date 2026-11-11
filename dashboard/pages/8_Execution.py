@@ -59,7 +59,7 @@ halt_file = config.paths.halt_file
 # ------------------------------------------------------------------ halt control
 st.subheader("Emergency halt")
 if view["halted"]:
-    st.error(f"HALT ENGAGED: nothing is submitted, amended or resized. Halt file `{halt_file}`.")
+    st.error(f"HALT ENGAGED: no new order or amendment; working entries are cancelled. Halt file `{halt_file}`.")
     typed = st.text_input(f"Type {CONFIRM_WORD} to clear the halt", key="halt_confirm")
     if st.button("Clear halt", key="halt_clear"):
         if typed.strip() == CONFIRM_WORD:
@@ -72,7 +72,7 @@ else:
     if st.button("ENGAGE EMERGENCY HALT", key="halt_engage", type="primary"):
         halt_file.parent.mkdir(parents=True, exist_ok=True)
         halt_file.write_text(f"engaged from dashboard at {datetime.now(UTC).isoformat()}\n")
-        st.error("HALT ENGAGED. No order will be submitted, amended or resized.")
+        st.error("HALT ENGAGED. No new order or amendment; protective orders still follow the position.")
 
 # ------------------------------------------------------------------ health
 st.subheader("Source and broker health")

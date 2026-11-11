@@ -28,7 +28,7 @@ class ConfigError(ValueError):
 class PathsConfig(StrictModel):
     # Holds runtime.sqlite3, execution.sqlite3, replay.sqlite3, sim_broker.sqlite3, heartbeat.json.
     state_dir: Path
-    # Emergency halt: while this file exists nothing is submitted, amended or resized.
+    # Emergency halt: no new order or amendment; working entries are cancelled, protection sized.
     halt_file: Path
     # The source-series-to-broker-contract mapping policy (config/instrument_mapping.toml).
     mapping_file: Path

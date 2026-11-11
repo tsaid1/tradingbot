@@ -97,7 +97,8 @@ def default_halt_file() -> Path:
 
 
 class ExecutionConfig(StrictModel):
-    # Emergency halt: while this file exists nothing is submitted, amended or resized.
+    # Emergency halt: while this file exists nothing that could add exposure is submitted or
+    # amended; working entries are cancelled and protective orders are still sized (review R7).
     halt_file: Path = Field(default_factory=default_halt_file)
     accepted_quote_qualities: frozenset[QuoteQuality] = frozenset({QuoteQuality.LIVE})
     # When set, the coordinator refuses to trade against any other broker account.

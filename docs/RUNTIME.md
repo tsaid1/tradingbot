@@ -70,8 +70,10 @@ Commentary (`NO_TRADE`) and recaps (`RECONCILE`) are journaled, not held. Nothin
 A broker that cannot be read stops the cycle before the source is touched, so no signal is consumed
 during an outage. Source, broker and processing failures back off exponentially (bounded) and never
 move the cursor. Unknown order outcomes are looked up again every cycle (see
-`docs/EXECUTION_CORE.md`). While the halt file exists nothing is submitted or amended; posts are
-still journaled (`HALTED`). Notifications (log file, optional macOS): reconciliation discrepancy,
+`docs/EXECUTION_CORE.md`). While the halt file exists, nothing that could add exposure is
+submitted or amended, and posts are still journaled (`HALTED`). Working entry and add orders are
+cancelled, and protective orders are still resized to the position. A second service on the same
+state directory refuses to start: the execution store is locked. Notifications (log file, optional macOS): reconciliation discrepancy,
 unprotected position, halt engaged, repeated source or broker failure, stuck intent; each once per
 occurrence. Post text is never stored; the journal keeps hashes, identities, reason codes and
 timestamps for every stage (published, received, interpreted, gate decided, submitted,

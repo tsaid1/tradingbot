@@ -3,7 +3,8 @@
 One cycle (``run_once``):
 
 1. Halt switch: read and, on a change, journal and notify. While it is engaged the coordinator
-   refuses every submit or amendment (intents end HALTED); posts are still read and journaled.
+   refuses every submit or amendment (intents end HALTED), cancels working entries and still
+   sizes protective orders; posts are still read and journaled.
 2. Broker probe: account and open orders must be readable, otherwise nothing is consumed from the
    source this cycle (a signal is never burned on a broker outage) and the broker backs off.
 3. Source poll. For each new post, in order: ``TklInterpreter.interpret`` ->
@@ -243,7 +244,8 @@ class RuntimeService:
                 self.notifier.notify(
                     N.HALT_ENGAGED,
                     "Emergency halt engaged",
-                    "Halt file present: no order will be submitted, amended or resized.",
+                    "Halt file present: no new order or amendment; working entries are "
+                    "cancelled and protective orders still follow the position.",
                 )
         elif self.store.resolve_alerts(now, keep=set(), prefix="HALT"):
             self.store.event(now, "HALT_CLEARED")
