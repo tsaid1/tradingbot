@@ -81,8 +81,11 @@ def open_action(action_id: str = "open", **kw) -> TradeAction:
 class Harness:
     """A SimBroker, a coordinator and (optionally) a broker-backed replay, sharing one SimClock."""
 
-    def __init__(self, folder: Path, *, policy: MockPolicy | None = None, **config):
+    def __init__(
+        self, folder: Path, *, policy: MockPolicy | None = None, strict: bool = False, **config
+    ):
         self.folder = Path(folder)
+        self.strict = strict
         self.clock = SimClock(START)
         self.policy = policy or MockPolicy(
             quantity=4, quantity_per_add=2, max_notional_usd=Decimal(1000)
@@ -93,7 +96,9 @@ class Harness:
 
     def restart(self) -> None:
         """New process: fresh objects on the same SQLite files (in-memory scripts are lost)."""
-        self.broker = SimBroker(self.folder / "broker.sqlite3", clock=self.clock.now)
+        self.broker = SimBroker(
+            self.folder / "broker.sqlite3", clock=self.clock.now, strict=self.strict
+        )
         self.coord = ExecutionCoordinator(
             self.broker,
             self.folder / "exec.sqlite3",

@@ -242,7 +242,8 @@ def load(config: RuntimeConfig) -> dict:
     open_unprotected = {
         e["idea_id"]
         for e in exec_exceptions
-        if e["kind"] == "UNPROTECTED_POSITION" and e["resolved_at"] is None
+        if e["kind"] in ("UNPROTECTED_POSITION", "PROTECTION_UNVERIFIED")
+        and e["resolved_at"] is None
     }
     protection = []
     for p in ledger:

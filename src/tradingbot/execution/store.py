@@ -88,6 +88,7 @@ CREATE TABLE IF NOT EXISTS exec_positions (
     stop_ref TEXT,
     target_ref TEXT,
     status TEXT NOT NULL,
+    protection TEXT,
     updated_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS exec_journal (
@@ -195,6 +196,9 @@ class LedgerPosition(StrictModel):
     stop_ref: str | None = None
     target_ref: str | None = None
     status: str
+    # CONFIRMED only after a successful broker check made after the last applied fill; every
+    # applied fill resets it to UNKNOWN (safety review M1). UNPROTECTED when the check saw no cover.
+    protection: str | None = None
     updated_at: datetime
 
 
@@ -234,6 +238,9 @@ class ExecutionStore:
             for col in ("source_published_at", "entry_reference", "submitted_at"):
                 if col not in cols:  # a store created before this column existed
                     c.execute(f"ALTER TABLE exec_intents ADD COLUMN {col} TEXT")
+            pcols = {r["name"] for r in c.execute("PRAGMA table_info(exec_positions)")}
+            if "protection" not in pcols:
+                c.execute("ALTER TABLE exec_positions ADD COLUMN protection TEXT")
 
     @contextmanager
     def tx(self) -> Iterator[sqlite3.Connection]:
@@ -422,8 +429,8 @@ class ExecutionStore:
                     raise RuntimeError(f"reduce-only fill would reverse idea {order.idea_id}")
             status = "OPEN" if new_qty > 0 else "CLOSED"
             c.execute(
-                "UPDATE exec_positions SET quantity=?, avg_price=?, status=?, updated_at=? "
-                "WHERE idea_id=?",
+                "UPDATE exec_positions SET quantity=?, avg_price=?, status=?, "
+                "protection='UNKNOWN', updated_at=? WHERE idea_id=?",
                 (
                     new_qty,
                     str(avg.quantize(Decimal("0.0001"))) if avg is not None else None,
@@ -455,7 +462,7 @@ class ExecutionStore:
         return [_row(LedgerPosition, r) for r in rows]
 
     def update_position(self, idea_id: str, at: datetime, **fields) -> None:
-        allowed = {"status", "stop_price", "target_price"}
+        allowed = {"status", "stop_price", "target_price", "protection"}
         if not fields or set(fields) - allowed:
             raise ValueError(f"only {allowed} may be set directly; quantities change through fills")
         sets = ",".join(f"{k}=?" for k in fields)

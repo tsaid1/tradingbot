@@ -64,6 +64,8 @@ from tradingbot.validator import fill_quantity, source_is_fresh
 
 CENT = Decimal("0.01")
 UNPROTECTED_POSITION = "UNPROTECTED_POSITION"
+# The broker could not be read after a fill: protection is unknown, never assumed (review M1).
+PROTECTION_UNVERIFIED = "PROTECTION_UNVERIFIED"
 MODIFY_NOT_CONFIRMED = "MODIFY_NOT_CONFIRMED"
 # An entry or add whose first submission outcome was unknown, that the broker shows no trace of,
 # and whose source post is no longer fresh enough to act on: it is never resent.
@@ -110,7 +112,7 @@ class ExecutionOutcome(StrictModel):
     state: IntentState
     filled_quantity: int = 0
     avg_fill_price: str | None = None
-    protection: str = "NOT_REQUIRED"  # CONFIRMED | UNPROTECTED | PENDING | NOT_REQUIRED
+    protection: str = "NOT_REQUIRED"  # CONFIRMED | UNPROTECTED | UNKNOWN | PENDING | NOT_REQUIRED
     duplicate: bool = False
     gate_reasons: list[str] = Field(
         default_factory=list
@@ -120,7 +122,7 @@ class ExecutionOutcome(StrictModel):
     @property
     def replay_status(self) -> str:
         """The outcome in the replay journal's vocabulary (event_models.ActionOutcome.status)."""
-        if self.protection == "UNPROTECTED":
+        if self.protection in ("UNPROTECTED", "UNKNOWN"):
             return "EXCEPTION"
         if self.state in (IntentState.FILLED, IntentState.APPLIED):
             return "EXECUTED"
@@ -909,7 +911,7 @@ class ExecutionCoordinator:
         try:
             open_by_ref = {o.order_ref: o for o in self.broker.open_orders()}
         except BrokerError as exc:
-            self.store.log(now, "PROTECTION_CHECK_FAILED", idea_id=idea_id, error=str(exc))
+            self._protection_unverified(pos, str(exc))
             return
         refs = [r for r in (pos.stop_ref, pos.target_ref) if r]
         if pos.quantity == 0:
@@ -926,6 +928,7 @@ class ExecutionCoordinator:
                         reason="follower position is flat",
                     )
             self.store.resolve_exceptions(now, UNPROTECTED_POSITION, idea_id=idea_id)
+            self.store.resolve_exceptions(now, PROTECTION_UNVERIFIED, idea_id=idea_id)
             return
         changed = False
         for ref in refs:
@@ -958,7 +961,7 @@ class ExecutionCoordinator:
             try:
                 open_by_ref = {o.order_ref: o for o in self.broker.open_orders()}
             except BrokerError as exc:
-                self.store.log(now, "PROTECTION_CHECK_FAILED", idea_id=idea_id, error=str(exc))
+                self._protection_unverified(pos, str(exc))
                 return
         for ref in refs:
             o = open_by_ref.get(ref)
@@ -966,6 +969,8 @@ class ExecutionCoordinator:
                 self.store.update_order(ref, now, status=o.status.value, quantity=o.quantity)
         if pos.stop_price is None:
             return
+        # This check succeeded after every fill applied so far: its verdict is the protection.
+        self.store.resolve_exceptions(now, PROTECTION_UNVERIFIED, idea_id=idea_id)
         stop = open_by_ref.get(pos.stop_ref) if pos.stop_ref else None
         if (
             stop is not None
@@ -973,9 +978,11 @@ class ExecutionCoordinator:
             and stop.remaining == pos.quantity
             and stop.order_type == OrderType.STP
         ):
+            self.store.update_position(idea_id, now, protection="CONFIRMED")
             if self.store.resolve_exceptions(now, UNPROTECTED_POSITION, idea_id=idea_id):
                 self.store.log(now, "PROTECTION_RESTORED", order_ref=pos.stop_ref, idea_id=idea_id)
             return
+        self.store.update_position(idea_id, now, protection="UNPROTECTED")
         detail = (
             f"ledger holds {pos.quantity}; working stop covers "
             f"{stop.remaining if stop else 0} ({stop.status.value if stop else 'absent'})"
@@ -987,7 +994,24 @@ class ExecutionCoordinator:
                 now, UNPROTECTED_POSITION, order_ref=pos.stop_ref, idea_id=idea_id, detail=detail
             )
 
+    def _protection_unverified(self, pos: LedgerPosition, error: str) -> None:
+        """The broker could not be read: protection is UNKNOWN until a later check succeeds."""
+        now = self.clock()
+        self.store.log(now, "PROTECTION_CHECK_FAILED", idea_id=pos.idea_id, error=error)
+        if pos.quantity == 0 or pos.stop_price is None:
+            return
+        self.store.update_position(pos.idea_id, now, protection="UNKNOWN")
+        detail = f"ledger holds {pos.quantity}; open orders unreadable after the last fill: {error}"
+        if self.store.raise_exception(
+            now, PROTECTION_UNVERIFIED, detail, idea_id=pos.idea_id, order_ref=pos.stop_ref
+        ):
+            self.store.log(
+                now, PROTECTION_UNVERIFIED, order_ref=pos.stop_ref, idea_id=pos.idea_id,
+                detail=detail,
+            )
+
     def _protection(self, idea_id: str) -> str:
+        """CONFIRMED only when a successful broker check after the last fill saw the stop."""
         pos = self.store.position(idea_id)
         if pos is None or pos.stop_price is None:
             return "NOT_REQUIRED"
@@ -998,7 +1022,7 @@ class ExecutionCoordinator:
             return "UNPROTECTED"
         if pos.quantity == 0:
             return "PENDING" if pos.status == "PENDING" else "NOT_REQUIRED"
-        return "CONFIRMED"
+        return "CONFIRMED" if pos.protection == "CONFIRMED" else "UNKNOWN"
 
     def _apply_modify(self, intent: Intent, *, recovering: bool = False) -> None:
         """Amend the working stop/target to absolute prices, then confirm them at the broker.

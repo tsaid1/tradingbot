@@ -30,11 +30,12 @@ from datetime import UTC, datetime, timedelta
 from tradingbot.event_models import ParsedPost
 from tradingbot.execution.broker import Broker, BrokerError, QuoteQuality
 from tradingbot.execution.coordinator import (
-    UNPROTECTED_POSITION as EXEC_UNPROTECTED,
-)
-from tradingbot.execution.coordinator import (
+    PROTECTION_UNVERIFIED,
     ExecutionConfig,
     ExecutionCoordinator,
+)
+from tradingbot.execution.coordinator import (
+    UNPROTECTED_POSITION as EXEC_UNPROTECTED,
 )
 from tradingbot.execution.reconcile import DiscrepancyKind, ReconciliationReport
 from tradingbot.execution.replay import BrokerEventReplay
@@ -455,7 +456,7 @@ class RuntimeService:
             self.store.resolve_alerts(now, keep=keep_recon, prefix="RECON:")
         keep_unprot: set[str] = set()
         for e in self.coordinator.store.exceptions(open_only=True):
-            if e.kind != EXEC_UNPROTECTED:
+            if e.kind not in (EXEC_UNPROTECTED, PROTECTION_UNVERIFIED):
                 continue
             key = f"UNPROTECTED:{e.idea_id}"
             keep_unprot.add(key)
