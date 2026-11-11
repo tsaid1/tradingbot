@@ -446,3 +446,23 @@ def test_f7_a_live_post_older_than_the_first_start_is_never_acted_on(tmp_path):
     assert stub.committed == [old]  # consumed, so it never comes back
     assert rt.signals() == [] and rt.broker.all_orders() == []
     assert "POST_BEFORE_FIRST_START" in [e["event"] for e in rt.store.events()]
+
+
+# ------------------------------------------------------------- F12: refused exits are notified
+
+
+def test_f12_an_exit_refused_by_the_halt_is_notified_by_identifier(tmp_path):
+    from runtime_harness import CLOSE
+
+    rt = Runtime(tmp_path, [post("1", 0, ENTRY), post("2", 30, CLOSE)])
+    rt.run(2)
+    assert [a["status"] for a in rt.actions()] == ["EXECUTED"]
+    rt.halt()
+    rt.run(10)
+    close = [a for a in rt.actions() if a["action"] == "CLOSE"]
+    assert [a["status"] for a in close] == ["HALTED"]
+    sent = [s for s in rt.notifier.sent if s[0] == "HALTED_ACTION_REFUSED"]
+    assert len(sent) == 1
+    _, _, message = sent[0]
+    assert "CLOSE" in message and "HALT_SWITCH_PRESENT" in message and close[0]["order_ref"] in message
+    assert CLOSE not in message and "Closing" not in message  # identifiers only, never post text

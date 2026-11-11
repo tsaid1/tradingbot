@@ -41,7 +41,7 @@ from tradingbot.execution.coordinator import (
 from tradingbot.execution.reconcile import DiscrepancyKind, ReconciliationReport
 from tradingbot.execution.replay import BrokerEventReplay
 from tradingbot.execution.store import UNRESOLVED_STATES
-from tradingbot.models import Quote
+from tradingbot.models import Action, Quote
 from tradingbot.runtime import notify as N
 from tradingbot.runtime.config import RuntimeConfig
 from tradingbot.runtime.mapping import MappingDecision, MappingPolicy
@@ -392,6 +392,19 @@ class RuntimeService:
                     "gate_decided_at": stamp.isoformat() if stamp else None,
                 }
             )
+            if (
+                o.status == "HALTED"
+                and a is not None
+                and a.action in (Action.REDUCE, Action.CLOSE, Action.MODIFY)
+                and not result.duplicate
+            ):
+                # Review F12: the stop at the broker stays; a human must know the exit was refused.
+                self.notifier.notify(
+                    N.HALTED_ACTION_REFUSED,
+                    "Exit or amendment refused: halt engaged",
+                    f"idea {a.idea_reference or '-'} action {a.action.value} ({o.action_id}) "
+                    f"ref {o.order_ref or '-'}: {', '.join(o.reasons)}",
+                )
             if o.status in HELD_STATUSES and (not result.duplicate or source_block):
                 exceptions.append(
                     {

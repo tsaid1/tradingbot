@@ -22,6 +22,8 @@ HALT_ENGAGED = "HALT_ENGAGED"
 SOURCE_FAILURE = "SOURCE_FAILURE"
 BROKER_FAILURE = "BROKER_FAILURE"
 STUCK_INTENT = "STUCK_INTENT"
+# A publisher-driven exit or amendment refused because the emergency halt is engaged (review F12).
+HALTED_ACTION_REFUSED = "HALTED_ACTION_REFUSED"
 
 
 @runtime_checkable
