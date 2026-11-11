@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import itertools
 import threading
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -477,6 +478,15 @@ class PaperOrderSession(IbkrSession):
         self._baseline_position: Decimal | None = None  # read once at connect
         self._baseline_exec_ids: frozenset[str] = frozenset()  # executions known at that read
         self.order_mode_status = "NOT_CHECKED"
+        self.order_frames_sent = 0  # PLACE_ORDER and CANCEL_ORDER frames handed to the SDK
+        # this session's own order events with receipt times (evidence; no account in it)
+        self.order_events: list[dict] = []
+
+    def _event(self, event: str, order_id: int, **detail) -> None:
+        """Caller holds the lock (or is the only writer). Receipt times for the evidence."""
+        self.order_events.append({"at": datetime.now(UTC).isoformat(timespec="microseconds"),
+                                  "mono": time.monotonic(), "event": event,
+                                  "order_id": order_id, **detail})
 
     def _now(self) -> datetime:
         """The wall clock, aware (UTC). Not a parameter: tests replace it in a test-only
@@ -972,7 +982,9 @@ class PaperOrderSession(IbkrSession):
             if kind != "MODIFY":
                 t.placed_here = True
             _issue_permit(self._client.conn, OUT.PLACE_ORDER, body)
+            self._event("SENT_PLACE", p.order_id, kind=kind, transmit=bool(p.transmit))
             self._client.placeOrderProtoBuf(req)
+            self.order_frames_sent += 1
 
     @staticmethod
     def _apply_proposed(t: _Track, p: ProposedOrder) -> None:
@@ -992,7 +1004,9 @@ class PaperOrderSession(IbkrSession):
             if t.status is not None:
                 t.status = merge_status(t.status, OrderStatus.PENDING_CANCEL, filled=t.filled,
                                         total=t.total)
+            self._event("SENT_CANCEL", t.order_id)
             self._client.cancelOrderProtoBuf(req)
+            self.order_frames_sent += 1
 
     def _cancel_quietly(self, order_id: int) -> None:
         try:
@@ -1098,6 +1112,7 @@ class PaperOrderSession(IbkrSession):
         with self._cond:
             own = (order.clientId == self._cfg.client_id and int(order_id) > 0)
             if own:
+                self._event("openOrder", int(order_id), status=state.status)
                 t = self._tracks.get(int(order_id))
                 if t is None:
                     t = self._tracks[int(order_id)] = _Track(order_id=int(order_id), own=True)
@@ -1142,6 +1157,8 @@ class PaperOrderSession(IbkrSession):
         with self._cond:
             if client_id not in (self._cfg.client_id, UNSET_INTEGER):
                 return
+            self._event("orderStatus", int(order_id), status=status, filled=str(filled),
+                        remaining=str(remaining))
             t = self._tracks.get(int(order_id))
             if t is None:
                 self._status_cache[int(order_id)] = (status, filled, remaining, avg, perm_id)
@@ -1164,6 +1181,8 @@ class PaperOrderSession(IbkrSession):
             price=_dec(execution.price) or Decimal(0), time=execution.time,
             received_at=datetime.now(UTC))
         with self._cond:
+            if rec.client_id == self._cfg.client_id and rec.exec_id not in self._execs:
+                self._event("execDetails", rec.order_id, shares=str(rec.shares))
             if rec.exec_id and rec.exec_id not in self._execs:
                 self._execs[rec.exec_id] = rec  # first report wins; repeats are ignored
             p = self._pending.get(req_id)
@@ -1222,6 +1241,7 @@ class PaperOrderSession(IbkrSession):
 
     def _on_order_error(self, t: _Track, code: int, msg: str) -> None:
         cls = classify_order_error(code)
+        self._event("error", t.order_id, code=code, cls=cls)
         t.errors.append((code, msg, cls))
         t.event_seq += 1
         t.error_seq += 1

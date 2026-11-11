@@ -136,6 +136,7 @@ class FakeOrderTws(FakeTws):
         self.foreign_open_order = False  # open-order replies include another account's order
         self.foreign_completed = False
         self.modify_error: tuple[int, str] | None = None
+        self.autofill = False  # a transmitted marketable LMT fills at once (bid/ask)
         self.invisible = False  # new orders are accepted but stay hidden (lagging views)
         self.positions_lag = False  # fills do not (yet) move the position read
         self._lagged: list[tuple[ContractProto, Decimal]] = []
@@ -293,6 +294,11 @@ class FakeOrderTws(FakeTws):
                 continue
             if not s.ack_lost and not g.hidden:
                 s.announce(g)
+            if s.autofill and g.order.orderType == "LMT" and (
+                    (g.order.action == "BUY" and g.order.lmtPrice >= s.ask)
+                    or (g.order.action == "SELL" and g.order.lmtPrice <= s.bid)):
+                s.fill(g.order_id, g.order.totalQuantity,
+                       s.ask if g.order.action == "BUY" else s.bid)
 
     @staticmethod
     def cancel(s: FakeOrderTws, conn: FakeConnection, req) -> None:
