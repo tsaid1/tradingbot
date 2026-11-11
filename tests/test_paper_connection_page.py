@@ -101,13 +101,33 @@ def page() -> AppTest:
     return AppTest.from_file(str(PAGE), default_timeout=60)
 
 
-# Driving an upload needs AppTest file-uploader support; without it these cases are skipped, never faked.
+# Newer AppTest drives st.file_uploader directly. Older Streamlit, including the declared minimum 1.36, cannot,
+# so there the widget call alone is replaced: it returns Streamlit's own UploadedFile holding these bytes, with
+# the 1.36 signature. Everything after the widget call is the page's real path.
 CAN_UPLOAD = hasattr(AppTest, "file_uploader")
+
+
+def _legacy_upload(data: bytes, name: str) -> AppTest:
+    from streamlit.proto.Common_pb2 import FileURLs
+    from streamlit.runtime.uploaded_file_manager import UploadedFile, UploadedFileRec
+
+    real = streamlit.file_uploader
+
+    def uploader_1_36(label, type=None, accept_multiple_files=False, key=None, help=None, on_change=None,
+                      args=None, kwargs=None, *, disabled=False, label_visibility="visible"):
+        return UploadedFile(UploadedFileRec(file_id="invented", name=name, type="application/json", data=data),
+                            FileURLs())
+
+    streamlit.file_uploader = uploader_1_36
+    try:
+        return page().run()
+    finally:
+        streamlit.file_uploader = real
 
 
 def upload(data: bytes, name: str = "result.json") -> AppTest:
     if not CAN_UPLOAD:
-        pytest.skip("this Streamlit's AppTest cannot drive st.file_uploader")
+        return _legacy_upload(data, name)
     at = page().run()
     at.file_uploader[0].set_value((name, data, "application/json"))
     return at.run()

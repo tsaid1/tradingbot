@@ -21,8 +21,9 @@ for the session and never saved.
 The upload is checked before anything is shown:
 - **Size:** at most 64 KiB, checked against the declared size before reading and again after a bounded read.
   Larger files are refused before parsing, and no digest is computed for them. Where the installed
-  Streamlit supports it, the uploader's own transport limit is 1 MB, the smallest allowed. The supported
-  minimum, 1.36, has no such limit and uses the server default instead. Neither is the acceptance cap.
+  Streamlit's uploader accepts `max_upload_size`, its transport limit is set to 1 MB, the smallest allowed.
+  On releases without that argument, including the declared minimum 1.36, only the server's global
+  `server.maxUploadSize` applies. Neither is the acceptance cap.
 - **Parsing:** strict UTF-8 JSON, with no duplicate keys or `NaN`/`Infinity`, at most 16 levels deep and
   20 000 values, and a top-level object.
 - **Closed shape:** every top-level field must belong to the diagnostic's accepted result shape (head
@@ -85,7 +86,11 @@ The page recognises these sections and **never displays them**; it lists only th
   needs review.
 - The page cannot tell an edited or fabricated file from a genuine one; only the digest comparison can.
 - Nothing is persisted; reloading the page clears the upload.
-- **Streamlit versions:** the page runs on the declared `streamlit>=1.36`. The test that opens it with the
-  1.36 uploader signature simulates that signature in the installed version; it was not run on a 1.36
-  install. Upload-driven tests need AppTest file-uploader support. Where that is missing they are skipped,
-  never faked.
+- **Streamlit versions:** the page runs on the declared `streamlit>=1.36`. It was verified on an isolated
+  Streamlit 1.36.0 install and on the current release.
+  - **1.36 has no per-widget upload limit.** The transport bound there is the server's global
+    `server.maxUploadSize`, 200 MB by default. The page's 64 KiB cap is what accepts or refuses a report on
+    every version.
+  - **Uploads in tests on 1.36:** its AppTest cannot drive uploads, so the tests replace only the widget
+    call. It returns Streamlit's own `UploadedFile` holding the invented bytes; everything after that call
+    is the page's real path.
