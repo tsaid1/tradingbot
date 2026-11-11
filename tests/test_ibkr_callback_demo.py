@@ -4,12 +4,13 @@ Covers the complete path (invented callbacks -> the accepted callback normalizer
 ResponseEnvelope -> FAKE transport -> unchanged runner -> NON_AUTHORITATIVE report) for all four
 readiness streams, the successful control, the two failure scenarios tied to the PR #25 review
 defects, the two account and position failure classes from the PR #35 review, and the stable CLI
-and report semantics. It also covers the composed local lifecycle: quote callbacks delivered only
-by the merged LifecycleAdapter's consumer, and the CLI-only unknown-cleanup counterpart, which
-stays incomplete beside CONTROL_COMPLETE. Finally it covers the frame-to-callback path: each quote
-callback travels in one owned invented frame through the accepted DecodeHandoff, closed
-InventedDecoder, ReadCallbackFacade and CallbackRouter consumer, with complete, partial, refused,
-untaken and handoff-failure controls, and quote evidence read through CallbackRouter.stream_status().
+and report semantics. It also covers the composed local lifecycle: quote, account-summary and
+position callbacks delivered only by the merged LifecycleAdapter's consumer, and the CLI-only
+unknown-cleanup counterpart, which stays incomplete beside CONTROL_COMPLETE. Finally it covers the
+frame-to-callback path: each of those read callbacks travels in one owned invented frame through the
+accepted DecodeHandoff, closed InventedDecoder, ReadCallbackFacade and CallbackRouter consumer, with
+complete, partial, refused, untaken and handoff-failure controls, direct-normalizer envelope parity,
+and every read stream's evidence read through CallbackRouter.stream_status().
 """
 from __future__ import annotations
 
@@ -61,32 +62,49 @@ def stage_codes(result, stage: str) -> list[str]:
     return [f.code for f in result.report.findings if f.stage.value == stage]
 
 
+CASES = {s.name: s for s in (*demo.SCENARIOS.values(), demo.UNKNOWN_CLEANUP,
+                             *demo.ACCOUNT_POSITION_FAILURES, *demo.READER_FRAMING_CASES,
+                             *demo.HANDOFF_FAILURE_CASES)}
+
+
 def captured(monkeypatch, name: str):
-    """Run one case and capture the account and position normalizers and the script they fed."""
-    made, scripts = {}, []
-
-    class Summary(AccountSummaryCallbacks):
-        def __init__(self, request_id):
-            super().__init__(request_id)
-            made["summary"] = self
-
-    class Positions(PositionSnapshotCallbacks):
-        def __init__(self, snapshot_id):
-            super().__init__(snapshot_id)
-            made["positions"] = self
-
+    """Run one case and capture the script the demo fed to the unchanged runner."""
+    scripts = []
     real_script = demo.FakeScript
 
     def script(**fields):
         scripts.append(real_script(**fields))
         return scripts[-1]
 
-    monkeypatch.setattr(demo, "AccountSummaryCallbacks", Summary)
-    monkeypatch.setattr(demo, "PositionSnapshotCallbacks", Positions)
     monkeypatch.setattr(demo, "FakeScript", script)
     result = demo.run_demo(name)
     [fed] = scripts
-    return result, made["summary"], made["positions"], fed
+    return result, fed
+
+
+def direct(name: str):
+    """The parity reference only: the case's same invented callbacks fed straight into fresh accepted
+    normalizers, with no frame, decoder, facade, router or consumer in between."""
+    case = CASES[name]
+    contract = IbkrCallbackNormalizer(REQUEST_IDS["request_contract_details"],
+                                      CallbackRequest.CONTRACT_DETAILS)
+    quote = IbkrCallbackNormalizer(REQUEST_IDS["request_quote_snapshot"], CallbackRequest.QUOTE_SNAPSHOT,
+                                   con_id=700001, clock=FakeClock(demo.DEMO_CLOCK))
+    summary = AccountSummaryCallbacks(REQUEST_IDS["request_account_summary"])
+    positions = PositionSnapshotCallbacks(REQUEST_IDS["request_positions"])
+    case.summary_feed(summary)
+    case.positions_feed(positions)
+    case.feed(contract, quote)
+    return contract, quote, summary, positions
+
+
+def issue_codes(normalizer) -> tuple[str, ...]:
+    return tuple(issue.code.value for issue in normalizer.issues)
+
+
+def slot(result, name: str):
+    [found] = [s for s in result.lifecycle.ledger.slots if s.slot == name]
+    return found
 
 
 def test_callback_control_completes_through_the_unchanged_runner():
@@ -105,28 +123,49 @@ def test_callback_control_completes_through_the_unchanged_runner():
 
 
 # Requirement: all four streams come from the accepted callback normalizers; none is preassembled.
+# The three read streams reach theirs only through owned frames and the router's consumer, and what
+# reaches the runner is exactly what feeding the same callbacks directly would produce.
 
 @pytest.mark.parametrize("name", ALL_NAMES)
-def test_account_and_position_envelopes_are_exactly_the_normalizers_output(monkeypatch, name):
-    result, summary, positions, fed = captured(monkeypatch, name)
+def test_every_stream_reaches_the_runner_exactly_as_direct_normalizers_produce_it(monkeypatch, name):
+    result, fed = captured(monkeypatch, name)
+    contract, quote, summary, positions = direct(name)
+    assert fed.contract_details == contract.envelopes()
+    assert fed.quote_snapshot == quote.envelopes()
     assert fed.account_summary == summary.envelopes() and fed.positions == positions.envelopes()
-    assert fed.account_summary and fed.positions
-    # The summary keeps its broker request id; positions carry only the local snapshot id.
-    assert summary.request_id == REQUEST_IDS["request_account_summary"]
-    assert {e.request_id for e in fed.account_summary} == {summary.request_id}
-    assert positions.request_id == REQUEST_IDS["request_positions"]
-    assert {e.request_id for e in fed.positions} == {positions.request_id}
-    assert (result.account_summary_completed, result.positions_completed) == (
-        summary.completed, positions.completed)
+    assert fed.account_summary and fed.positions and fed.quote_snapshot
+    # The summary keeps its broker-style synthetic request id; positions carry only the local id.
+    assert {e.request_id for e in fed.account_summary} == {REQUEST_IDS["request_account_summary"]}
+    assert {e.request_id for e in fed.positions} == {REQUEST_IDS["request_positions"]}
+    # The router's own normalizer evidence, read through stream_status(), equals the direct verdict.
+    assert (result.quote_completed, result.quote_issues) == (quote.completed, issue_codes(quote))
+    assert (result.account_summary_completed, result.account_summary_issues) == (
+        summary.completed, issue_codes(summary))
+    assert (result.positions_completed, result.positions_issues) == (
+        positions.completed, issue_codes(positions))
+
+
+def test_the_demo_builds_no_read_normalizer_of_its_own():
+    """One owning path: only the contract normalizer is the demo's; the read ones are the router's."""
+    source = Path(demo.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    called = [node.func.id for node in ast.walk(tree)
+              if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)]
+    assert "AccountSummaryCallbacks" not in called and "PositionSnapshotCallbacks" not in called
+    assert called.count("IbkrCallbackNormalizer") == 1  # the contract-details normalizer only
+    assert called.count("CallbackRouter") == called.count("DecodeHandoff") == 1
+    for registration in ("register_quote", "register_account_summary", "register_positions"):
+        assert source.count(f"router.{registration}(") == 1, registration
+    assert "owner=" not in source and "managedAccounts" not in source  # no owner or account override
 
 
 def test_fractional_and_negative_positions_reach_the_script_exactly(monkeypatch):
-    _, _, positions, fed = captured(monkeypatch, "callback_control")
+    result, fed = captured(monkeypatch, "callback_control")
     lines = [e.position for e in fed.positions if e.kind == ResponseKind.POSITION]
     assert [(line.con_id, line.position) for line in lines] == [(700011, "-12.5"),
                                                                 (700012, "300.25")]
     assert [Decimal(line.position) for line in lines] == [Decimal("-12.5"), Decimal("300.25")]
-    assert fed.positions[-1].kind == ResponseKind.POSITION_END and positions.completed
+    assert fed.positions[-1].kind == ResponseKind.POSITION_END and result.positions_completed
 
 
 def test_no_preassembled_envelope_or_observation_is_built_in_the_demo():
@@ -143,23 +182,27 @@ def test_no_preassembled_envelope_or_observation_is_built_in_the_demo():
 
 def test_a_monetary_row_without_currency_cannot_reach_success(monkeypatch):
     control = demo.run_demo("callback_control")
-    result, summary, _, fed = captured(monkeypatch, CURRENCY_MISSING)
+    result, fed = captured(monkeypatch, CURRENCY_MISSING)
     assert result.report.outcome == ReadinessOutcome.NOT_READY and result.matches_expectation
     assert "ACCOUNT_CURRENCY_MISSING" in codes(result)
     assert "ACCOUNT_SNAPSHOT_CONTROL" not in codes(result)
     [row] = [e.account_summary for e in fed.account_summary
              if e.kind == ResponseKind.ACCOUNT_SUMMARY]
     assert row.currency is None  # one row's currency never vouches for another
-    assert summary.completed and result.account_summary_issues == ()  # the existing check decides
+    # Delivered and settled through the real path; the existing readiness check decides.
+    assert result.account_summary_completed and result.account_summary_issues == ()
+    assert result.handoff.completed and slot(result, "ACCOUNT_SUMMARY").data_callbacks == 4
     # Paired with the control, only the account stage differs; the lifecycle report is unmodified.
     for stage in (s.value for s in Stage if s is not Stage.ACCOUNT):
         assert stage_codes(result, stage) == stage_codes(control, stage), stage
     assert asdict(result.lifecycle) == asdict(control.lifecycle)
+    # Every local component completes, so the readiness verdict alone blocks the aggregate.
+    assert result.local_components_complete and not result.aggregate_complete
 
 
 def test_a_malformed_quantity_then_repeated_end_cannot_reach_success(monkeypatch):
     control = demo.run_demo("callback_control")
-    result, _, positions, fed = captured(monkeypatch, MALFORMED_POSITION)
+    result, fed = captured(monkeypatch, MALFORMED_POSITION)
     assert result.report.outcome == ReadinessOutcome.NOT_READY and result.matches_expectation
     assert result.positions_issues == ("MALFORMED_CALLBACK",) and not result.positions_completed
     assert ResponseKind.POSITION_END not in [e.kind for e in fed.positions]  # neither END survives
@@ -167,10 +210,20 @@ def test_a_malformed_quantity_then_repeated_end_cannot_reach_success(monkeypatch
     assert "POSITIONS_SNAPSHOT_CONTROL" not in codes(result)
     # The two valid rows stay visible records; the malformed one was never stored.
     assert [e.position.con_id for e in fed.positions] == [700011, 700012]
-    assert not positions.completed
     for stage in (s.value for s in Stage if s is not Stage.POSITIONS):
         assert stage_codes(result, stage) == stage_codes(control, stage), stage
-    assert asdict(result.lifecycle) == asdict(control.lifecycle)
+    # Through the real path every frame settles, and the ledger counts three position DATA callbacks
+    # and the first END; the repeated END is a post-END event, so the lifecycle cannot complete.
+    assert result.handoff.failure is None and len(result.handoff.handoffs) == 18
+    assert all(r.status is HandoffStatus.SETTLED for r in result.handoff.handoffs)
+    positions_slot = slot(result, "POSITIONS")
+    assert (positions_slot.data_callbacks, positions_slot.end_marker_seen) == (3, True)
+    assert result.lifecycle.ledger.faults == ("POST_END_EVENT",) and not result.lifecycle.completed
+    assert result.scenario.expected_lifecycle_completed is False and result.matches_expectation
+    # Cross-stream success never clears the failed stream.
+    assert result.quote_completed and result.account_summary_completed and result.contract_completed
+    assert not result.streams_completed and not result.local_components_complete
+    assert not result.aggregate_complete and not result.handoff.completed
 
 
 def test_delayed_size_mixed_with_live_ticks_cannot_become_a_live_control():
@@ -203,32 +256,40 @@ def test_control_reports_readiness_beside_observed_local_lifecycle_completion():
     assert life.reader_partial_bytes == "NONE" and ledger.disconnect_attempt == "RETURNED"
     assert ledger.admission_closed
     assert (ledger.queued_callbacks, ledger.in_flight_callbacks) == (0, 0)
-    # Only the quote read is modelled: seven data callbacks, then its END; no stop was needed.
-    [slot] = ledger.slots
-    assert (slot.slot, slot.end_marker_seen, slot.read_complete) == ("QUOTE_SNAPSHOT", True, True)
-    assert (slot.data_callbacks, slot.retirement_attempt) == (7, "NOT_RESERVED")
+    # Three read slots, each delivered and ended. The snapshot needs no stop; the continuing summary
+    # and positions reads end with the invented client's returned stop hook, never an SDK cancellation.
+    assert [(s.slot, s.data_callbacks, s.end_marker_seen, s.read_complete, s.retirement_attempt)
+            for s in ledger.slots] == [("ACCOUNT_SUMMARY", 4, True, True, "RETURNED"),
+                                       ("POSITIONS", 2, True, True, "RETURNED"),
+                                       ("QUOTE_SNAPSHOT", 7, True, True, "NOT_RESERVED")]
+    assert ledger.faults == () and result.streams_completed and result.aggregate_complete
 
 
 def test_lifecycle_counts_follow_the_modelled_quote_callbacks():
     """The extra delayed-size callback is one more dispatched DATA; only readiness differs."""
     result = demo.run_demo("delayed_size_mixed_with_live")
     assert result.report.outcome == ReadinessOutcome.NOT_READY and result.lifecycle.completed
-    assert result.lifecycle.ledger.slots[0].data_callbacks == 8
+    assert slot(result, "QUOTE_SNAPSHOT").data_callbacks == 8
 
 
-def test_quote_envelopes_come_only_from_callbacks_the_adapter_consumer_dispatched(monkeypatch):
+def test_read_envelopes_come_only_from_callbacks_the_adapter_consumer_dispatched(monkeypatch):
     monkeypatch.setattr(LifecycleAdapter, "consume_one", lambda self: False)
     result = demo.run_demo("callback_control")
-    assert not result.quote_completed and result.report.outcome == ReadinessOutcome.NOT_READY
-    assert "TICK_SNAPSHOT_END_MISSING" in codes(result)
-    # The first frame's callback was admitted but never dispatched, so the handoff holds it and
+    assert not (result.quote_completed or result.account_summary_completed
+                or result.positions_completed)
+    assert result.report.outcome == ReadinessOutcome.NOT_READY
+    assert {"TICK_SNAPSHOT_END_MISSING", "ACCOUNT_SUMMARY_END_MISSING",
+            "POSITIONS_END_MISSING"} <= set(codes(result))
+    # The first frame's summary row was admitted but never dispatched, so the handoff holds it and
     # takes no further frame: settlement, not admission, releases a frame.
     assert (result.handoff.failure, result.handoff.held_sequence) == (Failure.SETTLEMENT_INCOMPLETE, 1)
     life, ledger = result.lifecycle, result.lifecycle.ledger
     assert life.completed is False and "QUEUE_NOT_EMPTY" in life.failures
     assert ledger.queued_callbacks == 1 and ledger.consumer == "UNKNOWN"
-    # The stop for the unended snapshot returned, and that alone clears nothing.
-    assert ledger.slots[0].retirement_attempt == "RETURNED" and not result.matches_expectation
+    # Every read's stop returned, and that alone clears nothing.
+    assert [(s.data_callbacks, s.end_marker_seen, s.retirement_attempt) for s in ledger.slots] == [
+        (0, False, "RETURNED")] * 3
+    assert not result.matches_expectation and not result.aggregate_complete
 
 
 def test_unknown_socket_closure_keeps_the_lifecycle_incomplete_beside_control_complete():
@@ -298,7 +359,8 @@ def test_the_reader_observation_reads_the_accumulators_retained_bytes(monkeypatc
         assert "PARTIAL_BYTES_UNRESOLVED" in life.failures
     # Shutdown only ends input: finish() runs once, last, and nothing is fed or taken after it.
     assert accumulator.calls.count("finish") == 1 and accumulator.calls[-1] == "finish"
-    assert result.local_components_complete is (life.completed and report.clean)
+    assert result.local_components_complete is (life.completed and report.clean
+                                                 and result.handoff.completed and result.streams_completed)
     assert result.matches_expectation
 
 
@@ -306,33 +368,39 @@ def test_the_control_buffer_is_complete_and_every_frame_is_handed_off():
     result = demo.run_demo(CONTROL)
     framing = result.framing
     assert framing.outcome is FramingOutcome.COMPLETE and framing.clean
-    # Eight owned frames, one per quote callback (marketDataType, six ticks, tickSnapshotEnd), each of
-    # a 4-byte header and a 28-byte invented key, arriving fragmented in 13-byte chunks.
-    assert (framing.chunks_accepted, framing.bytes_accepted, framing.bytes_retained) == (20, 256, 0)
-    assert (framing.frames_extracted, framing.zero_length_frames) == (8, 0)
-    assert (framing.frames_handed_off, framing.frames_queued) == (8, 0)
+    # Sixteen owned frames, one per read callback: four summary rows and their END, two positions and
+    # their END, then the quote's marketDataType, six ticks and tickSnapshotEnd. Each is a 4-byte
+    # header and a 27-byte invented key, arriving fragmented in 13-byte chunks.
+    assert (framing.chunks_accepted, framing.bytes_accepted, framing.bytes_retained) == (39, 496, 0)
+    assert (framing.frames_extracted, framing.zero_length_frames) == (16, 0)
+    assert (framing.frames_handed_off, framing.frames_queued) == (16, 0)
     assert framing.downstream_retirement == "NOT_ESTABLISHED"
     records = result.handoff.handoffs
-    assert [r.sequence for r in records] == list(range(1, 9))
+    assert [r.sequence for r in records] == list(range(1, 17))
     assert all(r.status is HandoffStatus.SETTLED and (r.callbacks, r.records_admitted,
                r.records_dispatched) == (1, 1, 1) for r in records)
     assert result.handoff.completed and result.router.faults == ()
-
-
-def test_owned_frames_produce_exactly_the_quote_envelopes_direct_feeding_produces(monkeypatch):
-    """The quote callbacks reach the router's normalizer only through decoded, settled frames."""
-    _result, _summary, _positions, fed = captured(monkeypatch, CONTROL)
-    direct = IbkrCallbackNormalizer(REQUEST_IDS["request_quote_snapshot"], CallbackRequest.QUOTE_SNAPSHOT,
-                                    con_id=700001, clock=FakeClock(demo.DEMO_CLOCK))
-    contract = IbkrCallbackNormalizer(REQUEST_IDS["request_contract_details"], CallbackRequest.CONTRACT_DETAILS)
-    demo.SCENARIOS[CONTROL].feed(contract, direct)  # the same invented callbacks, fed directly
-    assert fed.quote_snapshot == direct.envelopes() and fed.contract_details == contract.envelopes()
 
 
 def test_quote_evidence_is_the_router_normalizers_status():
     result = demo.run_demo("delayed_size_mixed_with_live")
     assert result.quote_issues == ("NON_LIVE_TICK_UNREPRESENTED",) and result.quote_completed is False
     assert result.handoff.completed  # every frame settled: delivery is not stream validity
+    # The summary and positions succeed beside it, and that never clears the failed quote stream.
+    assert result.account_summary_completed and result.positions_completed
+    assert not result.streams_completed and not result.local_components_complete
+
+
+@pytest.mark.parametrize("name", ALL_NAMES)
+def test_no_stream_failure_is_cleared_by_another_streams_success(name):
+    result = demo.run_demo(name)
+    failed = not (result.contract_completed and result.quote_completed
+                  and result.account_summary_completed and result.positions_completed)
+    assert result.streams_completed is not failed
+    if failed:
+        assert not result.local_components_complete and not result.aggregate_complete
+    assert result.aggregate_complete is (result.local_components_complete
+                                         and result.report.outcome == ReadinessOutcome.CONTROL_COMPLETE)
 
 
 def test_a_decoder_failure_after_a_complete_frame_blocks_local_completion_even_after_end():
@@ -340,18 +408,21 @@ def test_a_decoder_failure_after_a_complete_frame_blocks_local_completion_even_a
     # Framing is complete and clean: the failure lies between a complete frame and its settlement.
     assert failed.framing.outcome is FramingOutcome.COMPLETE and failed.framing.clean
     handoff = failed.handoff
-    assert (handoff.failure, handoff.held_sequence, handoff.completed) == (Failure.DECODER_RAISED, 8, False)
+    assert (handoff.failure, handoff.held_sequence, handoff.completed) == (Failure.DECODER_RAISED, 16, False)
     *settled, last = handoff.handoffs
-    assert len(settled) == 7 and all(r.status is HandoffStatus.SETTLED for r in settled)
+    assert len(settled) == 15 and all(r.status is HandoffStatus.SETTLED for r in settled)
     assert (last.status, last.callbacks, last.records_admitted, last.records_dispatched) == (
         HandoffStatus.FAILED, 1, 1, 0)
     # Shutdown later drains the admitted END, so the stream completes and readiness is unchanged, but
     # the END arrived after the stop attempt: the lifecycle records it late and stays incomplete.
     assert failed.quote_completed and failed.report.outcome == control.report.outcome
-    slot = failed.lifecycle.ledger.slots[0]
-    assert (slot.end_marker_seen, slot.read_complete, slot.retirement_attempt) == (False, False, "RETURNED")
+    quote = slot(failed, "QUOTE_SNAPSHOT")
+    assert (quote.end_marker_seen, quote.read_complete, quote.retirement_attempt) == (False, False, "RETURNED")
     assert failed.lifecycle.ledger.faults == ("LATE_CALLBACK",) and not failed.lifecycle.completed
-    assert not failed.local_components_complete and failed.matches_expectation
+    # The summary and positions slots completed earlier; their success does not clear the failure.
+    assert slot(failed, "ACCOUNT_SUMMARY").read_complete and slot(failed, "POSITIONS").read_complete
+    assert failed.streams_completed and not failed.local_components_complete
+    assert not failed.aggregate_complete and failed.matches_expectation
 
 
 @pytest.mark.parametrize("name, outcome, retained", [
@@ -370,8 +441,8 @@ def test_a_retained_partial_frame_keeps_lifecycle_and_framing_incomplete(name, o
         "label": f"callback-demo:{name}"}
     framing = partial.framing
     assert framing.outcome is outcome and framing.bytes_retained == retained and not framing.clean
-    assert framing.frames_handed_off == control.framing.frames_handed_off == 8
-    assert partial.handoff.failure is None and len(partial.handoff.handoffs) == 8
+    assert framing.frames_handed_off == control.framing.frames_handed_off == 16
+    assert partial.handoff.failure is None and len(partial.handoff.handoffs) == 16
     life = partial.lifecycle
     assert life.completed is False and life.failures == ("PARTIAL_BYTES_UNRESOLVED",)
     a, b = asdict(control.lifecycle), asdict(life)
@@ -389,7 +460,7 @@ def test_an_oversized_declared_length_is_refused_and_its_header_stays_retained()
     assert framing.first_refusal.value == "DECLARED_LENGTH_TOO_LARGE"
     assert [(code.value, count) for code, count in framing.refusals] == [
         ("DECLARED_LENGTH_TOO_LARGE", 1)]
-    assert framing.bytes_retained == 4 and framing.frames_handed_off == 8
+    assert framing.bytes_retained == 4 and framing.frames_handed_off == 16
     assert result.lifecycle.completed is False
     assert result.lifecycle.reader_partial_bytes == "UNRESOLVED"
     assert result.report.outcome == ReadinessOutcome.CONTROL_COMPLETE
@@ -400,7 +471,7 @@ def test_untaken_frames_show_only_in_the_framing_report_and_the_aggregate():
     control, untaken = demo.run_demo(CONTROL), demo.run_demo(UNTAKEN)
     framing = untaken.framing
     assert framing.outcome is FramingOutcome.UNTAKEN_FRAMES and not framing.clean
-    assert (framing.bytes_retained, framing.frames_handed_off, framing.frames_queued) == (0, 8, 1)
+    assert (framing.bytes_retained, framing.frames_handed_off, framing.frames_queued) == (0, 16, 1)
     assert untaken.handoff.failure is None and not untaken.handoff.completed
     # Nothing is retained, so the lifecycle model, which cannot express untaken frames, completes.
     assert asdict(untaken.lifecycle) == asdict(control.lifecycle)
@@ -429,11 +500,11 @@ def test_reports_and_the_aggregate_carry_codes_and_counts_but_never_payload_byte
     results = [demo.run_demo(name) for name in ALL_NAMES]
     text, payload = demo.render_demo_text(results), json.loads(demo.render_demo_json(results))
     assert payload["framing_notice"] == demo.FRAMING_NOTICE and demo.FRAMING_NOTICE in text
-    for phrase in ("closed InventedDecoder", "no SDK message format",
-                   "requires the lifecycle, the framing and every handoff"):
+    for phrase in ("each read callback", "closed InventedDecoder", "no SDK message format",
+                   "requires the lifecycle, the framing, every handoff and every stream's own completion"):
         assert phrase in demo.FRAMING_NOTICE, phrase
     for rendered in (text, json.dumps(payload)):
-        assert "invented-demo-quote-frame" not in rendered and "invented trailing frame" not in rendered
+        assert "invented-demo-read-frame" not in rendered and "invented trailing frame" not in rendered
     for entry, result in zip(payload["scenarios"], results):
         framing = entry["framing_report"]
         assert framing["outcome"] == result.framing.outcome.value
@@ -441,8 +512,13 @@ def test_reports_and_the_aggregate_carry_codes_and_counts_but_never_payload_byte
         assert framing["downstream_retirement"] == "NOT_ESTABLISHED"
         assert framing["authority"] == "NON_AUTHORITATIVE"
         local = entry["local_components"]
-        assert local["all_complete"] is (local["lifecycle_completed"] and local["framing_clean"]
-                                         and local["handoff_completed"])
+        assert local["local_components_complete"] is (
+            local["lifecycle_completed"] and local["framing_clean"] and local["handoff_completed"]
+            and local["streams_completed"])
+        assert local["streams_completed"] is all(
+            stream["completed"] for stream in entry["callback_ingestion"].values())
+        assert local["all_complete"] is (local["local_components_complete"]
+                                         and entry["outcome"] == "CONTROL_COMPLETE")
         assert entry["decode_handoff"]["failure"] == (
             None if result.handoff.failure is None else result.handoff.failure.value)
         assert (local["authority"], local["trading_permission"], local["paper_read_1"]) == (
@@ -457,7 +533,8 @@ def test_the_extra_cases_are_cli_only_and_the_three_scenarios_are_unchanged():
     assert len(demo.ACCOUNT_POSITION_FAILURES) == 2 and len(demo.READER_FRAMING_CASES) == 4
     assert len(demo.HANDOFF_FAILURE_CASES) == 1 and HANDOFF_RAISED not in demo.SCENARIOS
     assert all(s.expected_lifecycle_completed for s in demo.SCENARIOS.values())
-    assert all(s.expected_lifecycle_completed for s in demo.ACCOUNT_POSITION_FAILURES)
+    # The currency case's lifecycle completes; the repeated position END is a post-END ledger fault.
+    assert [s.expected_lifecycle_completed for s in demo.ACCOUNT_POSITION_FAILURES] == [True, False]
     assert demo.UNKNOWN_CLEANUP.expected_lifecycle_completed is False
     # Each failure case keeps the control's contract and quote callbacks.
     control = demo.SCENARIOS["callback_control"]
@@ -488,15 +565,20 @@ def test_every_stream_is_labelled_with_its_callback_source_and_lifecycle_coverag
         assert normalizer in demo.SIMULATION_NOTICE, normalizer
     assert payload["notice"] == demo.SIMULATION_NOTICE and demo.SIMULATION_NOTICE in text
     assert payload["lifecycle_notice"] == demo.LIFECYCLE_NOTICE and demo.LIFECYCLE_NOTICE in text
-    assert "outside the lifecycle model" in demo.LIFECYCLE_NOTICE
+    for phrase in ("quote-snapshot, account-summary and position callbacks", "returned stop hook",
+                   "never an SDK cancellation", "contract-details callbacks go to their normalizer",
+                   "directly and are outside the lifecycle model"):
+        assert phrase in demo.LIFECYCLE_NOTICE, phrase
     sources = demo.STREAM_SOURCES
     assert list(sources) == STREAMS
-    for phrase in ("owned invented frames", "not an SDK wire format", "DecodeHandoff", "adapter consumer"):
-        assert phrase in sources["quote_snapshot"], phrase
-    assert "broker request id kept" in sources["account_summary"]
+    for stream in ("quote_snapshot", "account_summary", "positions"):
+        for phrase in ("owned invented frames", "not an SDK wire format", "DecodeHandoff",
+                       "adapter consumer", "local lifecycle only"):
+            assert phrase in sources[stream], (stream, phrase)
+        assert "outside the lifecycle model" not in sources[stream], stream
+    assert "broker-style synthetic request id kept" in sources["account_summary"]
     assert "never a broker request id" in sources["positions"]
-    for stream in ("contract_details", "account_summary", "positions"):
-        assert "outside the lifecycle model" in sources[stream], stream
+    assert "outside the lifecycle model" in sources["contract_details"]
     for stream, source in sources.items():
         assert f"   {stream}: completed=" in text and f"      source: {source}" in text, stream
     for entry, result in zip(payload["scenarios"], results):
@@ -510,11 +592,10 @@ def test_every_stream_is_labelled_with_its_callback_source_and_lifecycle_coverag
             "issues": list(result.account_summary_issues)}
         assert entry["report"]["trading_permission"] is False
         lifecycle = entry["local_lifecycle"]
-        assert lifecycle["modelled_streams"] == ["quote_snapshot"]
-        assert set(lifecycle["outside_lifecycle_model"]) == {"contract_details", "account_summary",
-                                                             "positions"}
+        assert lifecycle["modelled_streams"] == ["quote_snapshot", "account_summary", "positions"]
+        assert set(lifecycle["outside_lifecycle_model"]) == {"contract_details"}
         slots = entry["lifecycle_report"]["ledger"]["slots"]
-        assert [s["slot"] for s in slots] == ["QUOTE_SNAPSHOT"]
+        assert [s["slot"] for s in slots] == ["ACCOUNT_SUMMARY", "POSITIONS", "QUOTE_SNAPSHOT"]
         # The summary reads the adapter report itself, which the JSON carries unmodified.
         assert entry["lifecycle_report"] == json.loads(json.dumps(asdict(result.lifecycle)))
         assert lifecycle["completed"] is entry["lifecycle_report"]["completed"]
@@ -554,12 +635,15 @@ def test_module_cli_runs_all_scenarios_deterministically_and_exits_zero():
     assert order == sorted(order)  # the three scenarios first, then the CLI-only cases
     assert "expected_completed=False completed=False local_quiescence_established=False" in out
     assert "socket=UNKNOWN" in out and "failures=SOCKET_NOT_CLOSED" in out
-    assert out.count("completed=True local_quiescence_established=True") == 6
+    assert out.count("completed=True local_quiescence_established=True") == 5
     assert out.count("failures=PARTIAL_BYTES_UNRESOLVED") == 3
     for outcome in ("PARTIAL_HEADER", "PARTIAL_PAYLOAD", "REFUSED", "UNTAKEN_FRAMES"):
         assert f"expected={outcome} outcome={outcome} clean=False" in out, outcome
-    assert out.count("all_complete=True") == 5 and out.count("all_complete=False") == 6
-    assert "failure=DECODER_RAISED held=8 settled=7/8" in out
+    # The control alone is complete overall; the currency case completes locally but not in readiness.
+    assert out.count("all_complete=True") == 1 and out.count("all_complete=False") == 10
+    assert out.count("local_components_complete=True") == 2
+    assert "failure=DECODER_RAISED held=16 settled=15/16" in out
+    assert out.count("ledger_faults=POST_END_EVENT") == out.count("ledger_faults=LATE_CALLBACK") == 1
     assert "MISSING:ACCOUNT_CURRENCY_MISSING" in out and "INCOMPLETE:POSITIONS_END_MISSING" in out
     assert "positions: completed=False issues=MALFORMED_CALLBACK" in out
     assert runs[0].stderr == ""

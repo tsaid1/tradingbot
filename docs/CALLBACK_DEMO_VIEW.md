@@ -30,12 +30,21 @@ For the chosen scenario it shows:
 - Callback ingestion: completion and issue codes for all four streams. Each stream's envelope source
   and lifecycle coverage come from the demonstration's `STREAM_SOURCES`:
   - contract details: `IbkrCallbackNormalizer`, called directly
-  - quote snapshot: `IbkrCallbackNormalizer`, reached only through the local lifecycle adapter's consumer
-  - account summary: `AccountSummaryCallbacks`, called directly, with its broker request id kept
-  - positions: `PositionSnapshotCallbacks`, called directly; one local snapshot, whose id is local and
-    never a broker request id
+  - quote snapshot: `IbkrCallbackNormalizer`
+  - account summary: `AccountSummaryCallbacks`, with its broker-style synthetic request id kept
+  - positions: `PositionSnapshotCallbacks`; one local snapshot window, whose id is local and never a
+    broker request id
 
-  Contract details, account summary and positions are labelled outside the lifecycle model.
+  The quote, account-summary and position callbacks reach their normalizers only in owned invented
+  frames, through the decode handoff and the router's lifecycle-adapter consumer. Contract details are
+  labelled outside the lifecycle model.
+- Local read composition, from the demonstration's own reports:
+  - one row per lifecycle read slot (`ACCOUNT_SUMMARY`, `POSITIONS`, `QUOTE_SNAPSHOT`), with its data
+    callbacks, END seen, read complete and stop attempt. The continuing summary and positions reads end
+    with the invented client's returned stop hook, never an SDK cancellation.
+  - the aggregate's parts: lifecycle (with its ledger faults), framing, decode handoff (settled frames
+    and failure), every stream, local components and `all_complete`. `all_complete` also requires
+    `CONTROL_COMPLETE`, so in the bundled scenarios only `callback_control` shows it.
 - The request sequence in dispatch order, with request id, stage, rows kept, END seen and envelope
   source. Any read that was not dispatched is listed as unknown, not passed.
 - Every non-INFO finding by stage, with its code and documented detail.
@@ -55,5 +64,7 @@ success.
   reference, codes, counts and digests.
 - The page reads no file, environment variable, wall clock or network, and writes nothing.
 - It has no free-form input and no broker, order, cancel, replace, reset, settings or credential path.
-- Shared contracts, the runner, the normalizers, the lifecycle adapter and the other dashboard pages are
-  unchanged.
+- The composition rows are local and `NON_AUTHORITATIVE`. They are never broker-side retirement,
+  PAPER-READ-1 or trading permission.
+- Shared contracts, the runner, the normalizers, the router, the decode handoff, the lifecycle adapter
+  and the other dashboard pages are unchanged.
