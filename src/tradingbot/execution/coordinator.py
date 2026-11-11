@@ -1416,12 +1416,17 @@ class ExecutionCoordinator:
             )
             return
         stop = open_by_ref.get(pos.stop_ref) if pos.stop_ref else None
+        exit_side = OrderSide.SELL if pos.position_side == PositionSide.LONG else OrderSide.BUY
+        # Review F3: type, side, quantity AND price against the ledger's confirmed stop.
+        price_ok = stop is not None and stop.stop_price == _dec(pos.stop_price)
         if (
             stop is not None
             and stop.working
             and stop.status != OrderStatus.PENDING_CANCEL
             and stop.remaining == cover
             and stop.order_type == OrderType.STP
+            and stop.side == exit_side
+            and price_ok
         ):
             self.store.update_position(idea_id, now, protection="CONFIRMED")
             if self.store.resolve_exceptions(now, UNPROTECTED_POSITION, idea_id=idea_id):
@@ -1432,6 +1437,10 @@ class ExecutionCoordinator:
             f"ledger holds {pos.quantity} ({cover} not committed to exits); working stop covers "
             f"{stop.remaining if stop else 0} ({stop.status.value if stop else 'absent'})"
         )
+        if stop is not None and not price_ok:
+            detail += (
+                f"; STOP_PRICE_MISMATCH: working stop {stop.stop_price}, ledger {pos.stop_price}"
+            )
         if self.store.raise_exception(
             now, UNPROTECTED_POSITION, detail, idea_id=idea_id, order_ref=pos.stop_ref
         ):

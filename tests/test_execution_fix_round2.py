@@ -142,3 +142,44 @@ def test_f2_a_resize_that_cannot_be_confirmed_blocks_new_exposure(tmp_path):
     again = h.execute("p2", open_action())
     assert again.state == IntentState.REFUSED
     assert again.reasons[0].startswith("INSTRUMENT_BLOCKED")
+
+
+# ----------------------------------------------------------------------------------------- F3
+
+
+def _kinds(report) -> list[str]:
+    return [d.kind.value for d in report.discrepancies]
+
+
+def test_f3_a_stop_price_changed_at_the_broker_is_never_confirmed_or_clean(tmp_path):
+    h = Harness(tmp_path)
+    out = h.execute("p1", open_action())  # long 4, ledger stop 48
+    h.broker.modify(f"{out.order_ref}.STP", stop_price=Decimal(45))  # changed at the broker
+    h.coord.sync()
+    assert h.coord._outcome(out.order_ref).protection == "UNPROTECTED"
+    report = h.coord.reconcile()
+    assert "STOP_PRICE_MISMATCH" in _kinds(report) and not report.clean
+
+
+def test_f3_a_break_even_stop_above_the_average_entry_is_valid(tmp_path):
+    h = Harness(tmp_path)
+    h.execute("p1", open_action())  # long 4 at 50.02
+    h.broker.set_quote(SYMBOL, "52.98", "53.02")
+    raised = h.execute("p2", action("raise", Action.MODIFY, idea="p1:open", stop="50.50"))
+    assert raised.state == IntentState.APPLIED and raised.protection == "CONFIRMED"
+    report = h.coord.reconcile()
+    assert report.clean, report.discrepancies
+
+
+def test_f3_a_stop_on_the_wrong_side_of_the_market_is_flagged(tmp_path):
+    h = Harness(tmp_path)
+    h.execute("p1", open_action())  # stop 48
+    real = h.broker.quote
+
+    def gapped(contract):  # the reconciliation's quote only; the simulated market is untouched
+        return real(contract).model_copy(update={"bid": Decimal("47.50"), "ask": Decimal("47.54")})
+
+    h.broker.quote = gapped
+    report = h.coord.reconcile()
+    [d] = [d for d in report.discrepancies if d.kind.value == "PROTECTIVE_STOP_INVALID"]
+    assert "bid" in d.detail and not report.clean

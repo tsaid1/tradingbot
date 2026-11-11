@@ -18,7 +18,14 @@ from enum import Enum
 
 from pydantic import Field
 
-from tradingbot.execution.broker import Broker, BrokerError, OrderSide, OrderStatus, OrderType
+from tradingbot.execution.broker import (
+    Broker,
+    BrokerError,
+    OrderSide,
+    OrderStatus,
+    OrderType,
+    QuoteQuality,
+)
 from tradingbot.execution.store import UNRESOLVED_STATES, ExecutionStore, Role
 from tradingbot.models import PositionSide, StrictModel
 
@@ -37,9 +44,11 @@ class DiscrepancyKind(str, Enum):
     # An approved atomic group executed only in part (an open PARTIAL_GROUP exception): never
     # explained away, it stays unclean until a human resolves the exception.
     PARTIAL_GROUP = "PARTIAL_GROUP"
-    # The working stop is not a sell-stop below the average entry (long) / a buy-stop above it
-    # (short): wrong side, wrong type, or a price on the wrong side of the entry.
+    # The working stop is not a protective stop: wrong type, wrong side, or (when a quote is
+    # available) not below the bid for a long / above the ask for a short.
     PROTECTIVE_STOP_INVALID = "PROTECTIVE_STOP_INVALID"
+    # The working stop's price differs from the ledger's confirmed stop for the idea (review F3).
+    STOP_PRICE_MISMATCH = "STOP_PRICE_MISMATCH"
 
 
 # Never explained away: while any of these is present the report is not clean.
@@ -47,6 +56,7 @@ SAFETY_KINDS = frozenset(
     {
         DiscrepancyKind.POSITION_WITHOUT_PROTECTIVE_STOP,
         DiscrepancyKind.PROTECTIVE_STOP_INVALID,
+        DiscrepancyKind.STOP_PRICE_MISMATCH,
         DiscrepancyKind.WORKING_ENTRY_ON_CLOSED_IDEA,
         DiscrepancyKind.PARTIAL_GROUP,
     }
@@ -86,21 +96,41 @@ class ReconciliationReport(StrictModel):
         return not self.blocking
 
 
-def _stop_problem(stop, p) -> str:
+def _stop_problem(stop, p, quote) -> tuple[DiscrepancyKind | None, str]:
+    """Type, side and price against the ledger's confirmed stop, then the market side. The average
+    entry is deliberately not used: break-even and profit-locking stops are legitimate (F3)."""
     long = p.position_side == PositionSide.LONG
     want_side = OrderSide.SELL if long else OrderSide.BUY
     if stop.order_type != OrderType.STP:
-        return f"protective order is {stop.order_type.value}, not a stop"
+        return DiscrepancyKind.PROTECTIVE_STOP_INVALID, (
+            f"protective order is {stop.order_type.value}, not a stop"
+        )
     if stop.side != want_side:
-        return f"stop side {stop.side.value} would add to a {p.position_side.value} position"
-    if p.avg_price and stop.stop_price is not None:
-        avg = Decimal(p.avg_price)
-        if (long and stop.stop_price >= avg) or (not long and stop.stop_price <= avg):
-            return (
-                f"stop {stop.stop_price} is on the wrong side of the average entry {avg} for a "
-                f"{p.position_side.value} position"
+        return DiscrepancyKind.PROTECTIVE_STOP_INVALID, (
+            f"stop side {stop.side.value} would add to a {p.position_side.value} position"
+        )
+    ledger = Decimal(p.stop_price) if p.stop_price else None
+    if ledger is None or stop.stop_price is None or stop.stop_price != ledger:
+        return DiscrepancyKind.STOP_PRICE_MISMATCH, (
+            f"working stop {stop.stop_price} differs from the ledger's stop {ledger}"
+        )
+    if quote is not None and quote.quality != QuoteQuality.UNAVAILABLE:
+        if long and quote.bid is not None and stop.stop_price >= quote.bid:
+            return DiscrepancyKind.PROTECTIVE_STOP_INVALID, (
+                f"sell stop {stop.stop_price} is not below the bid {quote.bid}"
             )
-    return ""
+        if not long and quote.ask is not None and stop.stop_price <= quote.ask:
+            return DiscrepancyKind.PROTECTIVE_STOP_INVALID, (
+                f"buy stop {stop.stop_price} is not above the ask {quote.ask}"
+            )
+    return None, ""
+
+
+def _quote(broker: Broker, contract):
+    try:
+        return broker.quote(contract)
+    except BrokerError:
+        return None
 
 
 def reconcile(
@@ -173,11 +203,11 @@ def reconcile(
             continue
         stop = open_by_ref.get(p.stop_ref) if p.stop_ref else None
         if stop is not None and stop.working:
-            problem = _stop_problem(stop, p)
-            if problem:
+            kind, problem = _stop_problem(stop, p, _quote(broker, stop.contract))
+            if kind is not None:
                 out.append(
                     Discrepancy(
-                        kind=DiscrepancyKind.PROTECTIVE_STOP_INVALID,
+                        kind=kind,
                         symbol=p.symbol,
                         idea_id=p.idea_id,
                         order_ref=p.stop_ref,

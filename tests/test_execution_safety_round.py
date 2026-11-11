@@ -428,13 +428,14 @@ def test_s1_a_stop_of_the_wrong_side_or_type_is_flagged(tmp_path, update):
     assert not report.clean
 
 
-def test_s1_a_stop_on_the_wrong_side_of_the_average_entry_is_flagged(tmp_path):
+def test_s1_a_stop_moved_at_the_broker_is_flagged(tmp_path):
+    # Round 2 (F3): the stop is checked against the ledger's stop price, not the average entry.
     h = Harness(tmp_path, strict=True)
     out = h.execute("p1", open_action())  # long 4 at 50.02, stop 48
     h.broker.set_quote(SYMBOL, "52.98", "53.02")
     h.broker.modify(f"{out.order_ref}.STP", stop_price=Decimal(51))  # changed at the broker
     report = h.coord.reconcile()
-    [d] = [d for d in report.discrepancies if d.kind.value == "PROTECTIVE_STOP_INVALID"]
+    [d] = [d for d in report.discrepancies if d.kind.value == "STOP_PRICE_MISMATCH"]
     assert "51" in d.detail and not report.clean
 
 
