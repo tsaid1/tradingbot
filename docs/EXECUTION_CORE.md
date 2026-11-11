@@ -29,13 +29,25 @@ SourcePost -> PaperEventReplay.process  (gate_source, gate_action, atomic groups
     inside the policy collar `max_price_deviation_pct` around the action's entry reference. The
     entry is a limit order at the collar bound.
   * exposure caps: `MockPolicy.max_instrument_exposure_usd`, which defaults to `max_notional_usd`,
-    and `max_aggregate_exposure_usd`. Per instrument the larger of the ledger's and the broker's
-    position counts (a broker-only position counts too), valued at the usable quote's midpoint, at
-    cost when there is none. Every entry or add that is not terminal (recorded, of unknown outcome,
-    PreSubmitted or working) adds its full intended quantity at its limit, less what it has
-    already filled into the ledger. Unreadable broker positions refuse the entry.
-  * no open `LEDGER_REVERSAL` exception in the instrument (`INSTRUMENT_BLOCKED_LEDGER_REVERSAL`).
-  * the account identity, when `ExecutionConfig.expected_account` is set.
+    and `max_aggregate_exposure_usd`. Per contract the larger of the ledger's and the broker's
+    position counts (a broker-only position counts too), valued at quantity x the usable quote's
+    midpoint x the contract multiplier, at cost when there is none. Every entry or add that is not
+    terminal (recorded, of unknown outcome, PreSubmitted or working) adds its full intended
+    quantity at its limit x multiplier, less what it has already filled into the ledger. The
+    per-idea `max_notional_usd` is enforced again with the multiplier (`NOTIONAL_LIMIT`), which
+    the gateway cannot see. Unreadable broker positions refuse the entry.
+  * no open exception in the instrument of a blocking kind (`INSTRUMENT_BLOCKED_<KIND>`):
+    `LEDGER_REVERSAL`, `ENTRY_REMAINDER_NOT_CANCELLED`, `UNPROTECTED_POSITION`,
+    `PROTECTION_UNVERIFIED`, `ENTRY_STATE_UNKNOWN`; and no entry or add of unknown outcome in the
+    instrument (`UNRESOLVED_ENTRY_IN_INSTRUMENT`).
+  * no open `BROKER_STATE_UNKNOWN` (see Broker reads below): OPEN and ADD refuse with
+    `BROKER_UNREADABLE`.
+  * one net position per contract: an OPEN on the opposite side of an open or pending idea in the
+    same contract is held by `BrokerEventReplay` (`HOLD`, `OPPOSITE_IDEA_IN_SAME_CONTRACT`) and
+    refused by the coordinator. A publisher reversal is a CLOSE followed by an OPEN.
+  * the contract's tick and size rules (see Instruments).
+  * the account identity, when `ExecutionConfig.expected_account` is set (the runtime service
+    requires it).
   * the halt file, checked right before every submit or amend. It defaults to
     `~/.local/state/tradingbot/HALT` and can be overridden with `TRADINGBOT_HALT_FILE`.
 * **One coordinator per store.** The coordinator takes an exclusive `flock` on
@@ -53,24 +65,68 @@ SourcePost -> PaperEventReplay.process  (gate_source, gate_action, atomic groups
   stops at zero, the idea becomes `REVERSED`, and a `LEDGER_REVERSAL` exception opens in the same
   transaction. `sync()`, `execute()` and `process()` keep working; new exposure in that instrument
   is refused until a human resolves the exception.
+* **Broker reads (review F1).** `sync()` reads executions, open orders, completed orders and
+  positions. If any read fails (there, in a lookup, a protection check or an exposure check), every
+  open position's protection becomes `UNKNOWN`, a `BROKER_STATE_UNKNOWN` exception opens, and
+  OPEN / ADD are refused until a full sync succeeds, which resolves it. `recover()` raises
+  `BrokerUnreadable` instead of swallowing a failed sync. The service's broker probe exercises all
+  four reads before it touches the source.
 * **Protection is confirmed, not assumed.** After every fill, `sync()` sizes the idea's working
   stop and target to the *cover*: the ledger quantity less every non-terminal REDUCE / CLOSE
   (recorded, unknown outcome or working, less what it filled). It cancels them when the cover is
-  zero or the idea is flat. It then reads `open_orders()`. Every applied fill resets the idea's
-  protection to `UNKNOWN`. It becomes `CONFIRMED` only when a broker read that succeeded after
-  the last fill shows a working (not PendingCancel) STP covering exactly the cover. A read that
-  fails opens `PROTECTION_UNVERIFIED`. A read that shows no such stop opens `UNPROTECTED_POSITION`.
-  Either way the outcome is `EXCEPTION`, not `EXECUTED`. `EXITING` means everything held is
-  committed to working exits and no stop works beside them.
+  zero or the idea is flat. Every applied fill resets the idea's protection to `UNKNOWN`. It
+  becomes `CONFIRMED` only when (1) a successful `open_orders()` read shows a working (not
+  PendingCancel) STP on the protective side covering exactly the cover at exactly the ledger's
+  stop price, and (2) a successful `executions()` read made after it shows no fill on the idea's
+  orders that the ledger has not applied. A PreSubmitted stop counts only once its parent's own
+  fills are applied. A read that fails opens `PROTECTION_UNVERIFIED`. A stop that is missing,
+  short, on the wrong side or at another price (`STOP_PRICE_MISMATCH` in the detail) opens
+  `UNPROTECTED_POSITION`. Either way the outcome is `EXCEPTION`, not `EXECUTED`, and new exposure
+  in the instrument is blocked. `EXITING` means everything held is committed to working exits and
+  no stop works beside them.
+* **Stop-outs (review F2).** Once a protective stop has filled for an idea, or the idea is closed,
+  every working remainder of its entry and add orders is cancelled and the cancel confirmed
+  (`ENTRY_REMAINDER_CANCELLED`). An unconfirmed cancel opens `ENTRY_REMAINDER_NOT_CANCELLED`, which
+  blocks new exposure in the instrument. Further entry fills resize protection to the full position
+  before it can be `CONFIRMED`; a resize that cannot be confirmed leaves `UNPROTECTED_POSITION`.
+* **An entry's fill is never inferred from a child.** At IBKR a bracket child is PreSubmitted before
+  its parent fills and may stay PreSubmitted afterwards (stops held broker-side). An entry's state is
+  decided only from its own row in open or completed orders and its own executions. When those are
+  missing or incomplete the intent is `UNRESOLVED` with an `ENTRY_STATE_UNKNOWN` exception and new
+  exposure in the instrument is blocked; it is never adopted FILLED or CANCELLED on inference. An
+  order that leaves the working set takes its final state from its completed-orders row.
+* **Protective time in force.** `ExecutionConfig.protective_tif` (default `GTC`) sets the TIF of
+  stop and target children. With `DAY` the stop expires at the session end and reconciliation then
+  reports the open position `POSITION_WITHOUT_PROTECTIVE_STOP` until a human acts.
 * **Follow-ups.**
   * ADD is a plain limit entry. Its fill is covered by resizing the existing children.
   * REDUCE and CLOSE are marketable limits: the bid (sell) or ask (buy) of a usable broker quote,
-    moved by `max_price_deviation_pct` and rounded to the cent. With no usable quote nothing is
+    moved by `max_price_deviation_pct` and snapped to the contract tick inside the collar. With no usable quote nothing is
     sent and `EXIT_WITHOUT_QUOTE` opens; the broker-side stop stays the protection. They are
     refused if they exceed the ledger or the broker position. Before one is sent, it is netted
     (next section).
   * MODIFY amends the working stop or target to an absolute price, then confirms the new price at
     the broker.
+
+## Instruments
+
+One execution core serves stocks, ETFs, futures and options; asset-specific behaviour belongs in
+policies, not in separate engines. An instrument is identified by `ContractRef.contract_key`
+(security type, symbol, expiry or contract month, strike, right and broker contract id), never by
+symbol alone: two months of one future are two instruments, and a stock and a future sharing a
+symbol never net. Intents, ledger positions and order rows persist the contract and its key;
+positions, caps, netting, exit checks, reconciliation and the journal use it.
+
+`ContractRef` carries optional fields whose defaults describe a stock, so a stock behaves exactly
+as before: `multiplier` 1, `min_tick` 0.01, `size_increment` 1, `expiry` / `strike` / `right` /
+`local_symbol` None. Notional and exposure are quantity x price x multiplier. Before an order is
+built, stop and target prices must be multiples of `min_tick` (`STOP_PRICE_OFF_TICK`,
+`TARGET_PRICE_OFF_TICK`) and quantities multiples of `size_increment` (`QUANTITY_OFF_INCREMENT`).
+Those are refused, never rounded, so a protective stop is never loosened. Only collar-bounded
+limits are snapped, always inside the collar: a buy limit down, a sell limit up. Sessions, rollover,
+margin and option chains are future asset policies and are not implemented. `BrokerPosition.avg_cost`
+is per unit, before the multiplier. The gateway still quotes by symbol and accepts stocks and ETFs
+only, so a future reaches the coordinator only in tests.
 
 ## Exit netting
 
@@ -121,10 +177,15 @@ While the halt file exists:
      +-- found ------------------> adopt broker state (WORKING / FILLED / REJECTED / CANCELLED)
      +-- not yet settled --------> stays UNRESOLVED, looked up again later
      +-- older than horizon -----> stays UNRESOLVED + open UNKNOWN_OUTCOME_BEYOND_LOOKUP_HORIZON
-     +-- positive no trace, -----> journal NO_TRACE_AT_BROKER, resubmit same ref (budget 2)
-     |   exit, or entry/add that passes the entry checks again now
-     +-- positive no trace, -----> REFUSED + open STALE_AFTER_UNKNOWN_OUTCOME exception
-     |   entry/add that fails them (stale source, old intent, quote, collar, caps)
+     +-- submitted entry/add, ---> stays UNRESOLVED, looked up every cycle; after the settle
+     |   no trace                  + open UNKNOWN_OUTCOME_ENTRY_NOT_RESENT, instrument blocked
+     +-- submitted exit, no -----> journal NO_TRACE_AT_BROKER, resubmit same ref (budget 2),
+     |   trace in N lookups        re-priced first if older than max_exit_intent_age_seconds
+     |   over the settle
+     +-- never submitted --------> sent once, if an entry/add passes the entry checks again now;
+     |   (attempts 0)              else REFUSED + open STALE_AFTER_UNKNOWN_OUTCOME
+     +-- entry's own row/fills --> stays UNRESOLVED + open ENTRY_STATE_UNKNOWN
+         missing or incomplete
  definite submit error ---------> REJECTED (SUBMIT_ERROR), never resent
      +-- lookup failed / budget -> stays UNRESOLVED (reconcile: INTENT_STUCK_UNRESOLVED)
  REFUSED: precondition failed before anything was recorded for the broker, or a stale entry/add,
@@ -132,8 +193,7 @@ While the halt file exists:
  APPLIED: a MODIFY whose new prices were seen at the broker
  RECORDED --halt file--> HALTED, for every action
  RECORDED exit --netting not confirmed--> REFUSED (EXIT_NOT_NETTED), nothing sent
- found: entry gone from open orders and history, but its child is active --> FILLED
-          + open ENTRY_FILL_NOT_IN_EXECUTIONS (the ledger cannot apply fills it cannot see)
+ WORKING --left open orders, no completed row, not fully filled--> UNRESOLVED + ENTRY_STATE_UNKNOWN
 ```
 
 A RECORDED, UNRESOLVED or WORKING exit counts against the idea's cover (see Protection). A
@@ -152,15 +212,25 @@ order up at the broker by `order_ref` in `open_orders()`, `executions()` and `co
 * If it finds the order, it adopts it (`ADOPTED_FROM_BROKER`). An order the broker rejected or
   cancelled is visible only in completed orders; it is adopted as `REJECTED` / `CANCELLED` and not
   resent.
-* Only when all three show no trace of the ref does it resubmit with the same ref. The journal
-  records which refs were checked (`NO_TRACE_AT_BROKER`). An entry or add is resubmitted only if
-  its source post still passes `validator.source_is_fresh` at that moment (the publication time is
-  stored on the intent). Otherwise it ends `REFUSED` with reason and open exception
-  `STALE_AFTER_UNKNOWN_OUTCOME`. A reduce-only exit is resubmitted regardless of age.
-* "No trace" is concluded only once `ExecutionConfig.settle_seconds` (default 10 s) have passed
-  since the request: before that the intent stays `UNRESOLVED` (`LOOKUP_NOT_SETTLED`) and is looked
-  up again on a later `recover()`, because open orders can lag a fresh submission.
-* Before any resend of an entry or add, the entry checks run again at that moment: source
+* **A submitted entry or add of unknown outcome is never resent automatically (review F5).**
+  Duplicate prevention must not depend on a fixed wait being longer than the broker's visibility
+  lag. The intent stays `UNRESOLVED`, is looked up on every cycle and adopted if it appears. Once
+  `settle_seconds` have passed it opens `UNKNOWN_OUTCOME_ENTRY_NOT_RESENT` for a human, and new
+  exposure in the instrument is refused (`UNRESOLVED_ENTRY_IN_INSTRUMENT`) while it is unresolved.
+  If it appears later it is adopted and the exception is resolved (`UNKNOWN_OUTCOME_SETTLED`).
+* **An exit** is resubmitted with the same ref only after `settle_seconds` and at least
+  `exit_no_trace_lookups` (minimum 3) consecutive lookups, spread over at least `settle_seconds`,
+  in which open orders, executions and completed orders all show no trace (`NO_TRACE_LOOKUP`,
+  then `NO_TRACE_AT_BROKER`). A failed lookup restarts the count. An exit older than
+  `max_exit_intent_age_seconds` is re-priced from a fresh quote first (`EXIT_REPRICED`); with no
+  usable quote it ends `REFUSED` with an open `EXIT_WITHOUT_QUOTE`. It is never sent at a stale
+  price. The safety of an exit resend still depends on the broker showing a new order within
+  the settle period: the IBKR adapter must confirm visibility.
+* **An intent recorded but never submitted** (the process died between the write-ahead record and
+  the request, `attempts` 0) is sent once its checks pass. An entry or add must still pass
+  `validator.source_is_fresh` (the publication time is stored on the intent); otherwise it ends
+  `REFUSED` with reason and open exception `STALE_AFTER_UNKNOWN_OUTCOME`.
+* Before such a send of an entry or add, the entry checks run again at that moment: source
   freshness, `max_intent_age_seconds` (default 120 s), broker-quote sanity, the collar, the exposure
   caps, and the halt in `_submit`. Any failure ends it `REFUSED` with reasons
   `[STALE_AFTER_UNKNOWN_OUTCOME, <specific reason>]` and an open exception; nothing is sent. The
@@ -210,9 +280,13 @@ only for a group whose every action the gateway approved. The default mock path 
 * `BROKER_UNREADABLE`
 * `WORKING_ENTRY_ON_CLOSED_IDEA` (an entry or add still working while its idea is closed,
   reversed, or has a CLOSE in flight)
-* `PROTECTIVE_STOP_INVALID` (the stop is not a STP, is on the wrong side, or its price is not
-  below the average entry for a long, or above it for a short)
+* `PROTECTIVE_STOP_INVALID` (the stop is not a STP, is on the wrong side, or, when a quote is
+  available, is not below the bid for a long or above the ask for a short; break-even and
+  profit-locking stops are valid)
+* `STOP_PRICE_MISMATCH` (the working stop's price differs from the ledger's confirmed stop)
 * `PARTIAL_GROUP` (an open `PARTIAL_GROUP` exception)
+
+Quantities are compared per contract (`Discrepancy.contract_key`), never per symbol.
 
 The stop is expected to cover the idea's cover, which is its quantity less the working exits. A
 position fully committed to working exits is reported `POSITION_WITHOUT_PROTECTIVE_STOP`.
@@ -220,7 +294,7 @@ position fully committed to working exits is reported `POSITION_WITHOUT_PROTECTI
 A discrepancy counts as explained when an open exception record covers it. `report.clean` is
 `False` while any discrepancy is unexplained, and also while a safety discrepancy exists even if it
 is explained: `POSITION_WITHOUT_PROTECTIVE_STOP`, `PROTECTIVE_STOP_INVALID`,
-`WORKING_ENTRY_ON_CLOSED_IDEA` or `PARTIAL_GROUP`. These are listed in `report.blocking`.
+`STOP_PRICE_MISMATCH`, `WORKING_ENTRY_ON_CLOSED_IDEA` or `PARTIAL_GROUP`. These are listed in `report.blocking`.
 
 ## The simulated broker
 
@@ -233,7 +307,12 @@ tests, the mock service and both demos all use it. In strict mode:
 * `cancel` and `modify` pass through a pending state. They take effect after `pending_seconds`, at
   the next broker interaction. Until then the order can still fill; `script_next_cancel` /
   `script_next_modify("FILL_FIRST")` make the fill win;
-* `open_orders_lag_seconds` can hide fresh orders.
+* `open_orders_lag_seconds` can hide fresh orders;
+* bracket children are PreSubmitted until the parent fills; with `children_stay_presubmitted` they
+  stay PreSubmitted while working afterwards (and still trigger);
+* positions and quotes are keyed by contract; `register_contract` makes a derivative resolvable;
+  orders off the contract's tick or size increment are refused; `expire_day_orders()` ends a
+  session.
 
 `strict=False` keeps the old, kinder model for the SimBroker's own unit tests.
 
@@ -259,6 +338,9 @@ Raise `AckLost` whenever the outcome of a request is unknown, for example on a t
 disconnect after sending. Return `UNKNOWN` rather than guessing a status. The coordinator, ledger,
 recovery and reconciliation then need no change. `completed_orders` maps to `reqCompletedOrders`
 (apiOnly). One known gap for that adapter: `open_orders()` can lag a fresh submission, so the adapter
-should settle before answering.
+should settle before answering. Entries are never resent after an unknown outcome; exits are, after
+the lookups described above. Fill `ContractRef.multiplier`, `min_tick` (IBKR `minTick`),
+`size_increment`, `expiry` (`lastTradeDateOrContractMonth`), `strike`, `right` and `con_id` from
+`reqContractDetails`, and report `BrokerPosition.avg_cost` per unit (IBKR multiplies it).
 
 Run the demonstration with `PYTHONPATH=src python scripts/run_mock_lifecycle.py`.

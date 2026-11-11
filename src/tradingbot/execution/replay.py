@@ -21,7 +21,7 @@ from tradingbot.event_models import (
     TradeAction,
 )
 from tradingbot.event_replay import Idea, PaperEventReplay
-from tradingbot.execution.coordinator import ExecutionCoordinator
+from tradingbot.execution.coordinator import OPPOSITE_IDEA_IN_SAME_CONTRACT, ExecutionCoordinator
 from tradingbot.execution.store import LedgerPosition
 from tradingbot.models import Action, GateDecision, Quote
 
@@ -74,6 +74,16 @@ class BrokerEventReplay(PaperEventReplay):
         # Its gate decision is on the intent; the coordinator adopts it rather than ordering again.
         if self.coordinator.intent_for(source, a) is not None:
             return ActionOutcome(action_id=a.action_id, status="SIMULATED", reasons=[PRIOR_INTENT])
+        if a.action == Action.OPEN and a.instrument is not None and a.position_side is not None:
+            # Review F9: the broker nets one position per contract; never open against an open
+            # idea on the other side (a reversal is a CLOSE, then the OPEN).
+            clash = self.coordinator.opposite_idea(a.instrument, a.position_side, ideas.values())
+            if clash is not None:
+                return ActionOutcome(
+                    action_id=a.action_id,
+                    status="HOLD",
+                    reasons=[OPPOSITE_IDEA_IN_SAME_CONTRACT, f"OPEN_IDEA:{clash}"],
+                )
         return super()._simulate(source, a, quotes, ideas, now)
 
     def _execute_group(self, source, group, outcomes, ideas, now) -> list[ActionOutcome]:

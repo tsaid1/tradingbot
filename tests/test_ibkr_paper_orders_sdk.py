@@ -984,3 +984,27 @@ def test_the_production_constructor_always_runs_the_local_checks(tws, tmp_path):
     for hook in ("preflight", "clock"):
         with pytest.raises(TypeError):
             PaperOrderSession(cfg, **{hook: lambda *a: None})
+
+
+def test_contract_refs_carry_mains_contract_fields_and_key(tws, tmp_path):
+    s = make(tws, tmp_path)
+    b = IbkrPaperBroker(s)
+    try:
+        ref = b.resolve(Instrument(asset_class=AssetClass.ETF, symbol="TLT"))
+        assert (ref.con_id, ref.sec_type, ref.local_symbol) == (TLT_CON_ID, "STK", "TLT")
+        assert (ref.multiplier, ref.min_tick, ref.size_increment) == (D(1), D("0.01"), 1)
+        assert (ref.expiry, ref.strike, ref.right) == (None, None, None)
+        assert ref.contract_key == f"STK:TLT:-:-:-:{TLT_CON_ID}"
+        snaps = s.place([buy(), stop()])
+        tws.fill(snaps[0].order_id, 1, 88.11)
+        assert settle(lambda: b.positions() and b.positions()[0].quantity == 1)
+        keys = {p.contract.contract_key for p in b.positions()}
+        keys |= {o.contract.contract_key for o in b.open_orders()}
+        keys |= {f.contract.contract_key for f in b.executions()}
+        assert keys == {ref.contract_key}
+        assert b.positions()[0].contract.local_symbol == "TLT"
+        o = b.open_orders()[0]  # each order's own status and quantities, never inferred
+        assert (o.status, o.quantity, o.filled_quantity, o.remaining) == \
+            (OrderStatus.SUBMITTED, 1, 0, 1)
+    finally:
+        s.disconnect()

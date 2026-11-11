@@ -164,6 +164,10 @@ class Intent(StrictModel):
     submitted_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
+    # The resolved contract (ContractRef JSON) and its identity; None on a refusal before resolve
+    # and on intents recorded before round 2.
+    contract_key: str | None = None
+    contract: str | None = None
 
 
 class OrderRow(StrictModel):
@@ -181,6 +185,7 @@ class OrderRow(StrictModel):
     status: str
     filled_quantity: int = 0
     updated_at: datetime
+    contract_key: str | None = None
 
 
 class LedgerPosition(StrictModel):
@@ -203,6 +208,10 @@ class LedgerPosition(StrictModel):
     # applied fill resets it to UNKNOWN (safety review M1). UNPROTECTED when the check saw no cover.
     protection: str | None = None
     updated_at: datetime
+    # The idea's contract (ContractRef JSON) and identity: positions, caps, netting and
+    # reconciliation key on this, never on the symbol alone.
+    contract_key: str | None = None
+    contract: str | None = None
 
 
 class JournalEntry(StrictModel):
@@ -241,9 +250,16 @@ class ExecutionStore:
             for col in ("source_published_at", "entry_reference", "submitted_at"):
                 if col not in cols:  # a store created before this column existed
                     c.execute(f"ALTER TABLE exec_intents ADD COLUMN {col} TEXT")
+            for col in ("contract_key", "contract"):  # round 2, Part B: contract identity
+                if col not in cols:
+                    c.execute(f"ALTER TABLE exec_intents ADD COLUMN {col} TEXT")
             pcols = {r["name"] for r in c.execute("PRAGMA table_info(exec_positions)")}
-            if "protection" not in pcols:
-                c.execute("ALTER TABLE exec_positions ADD COLUMN protection TEXT")
+            for col in ("protection", "contract_key", "contract"):
+                if col not in pcols:
+                    c.execute(f"ALTER TABLE exec_positions ADD COLUMN {col} TEXT")
+            ocols = {r["name"] for r in c.execute("PRAGMA table_info(exec_orders)")}
+            if "contract_key" not in ocols:
+                c.execute("ALTER TABLE exec_orders ADD COLUMN contract_key TEXT")
 
     @contextmanager
     def tx(self) -> Iterator[sqlite3.Connection]:
@@ -318,6 +334,14 @@ class ExecutionStore:
                 continue
             total += max(i.quantity - self.filled_quantity(i.order_ref), 0)
         return total
+
+    def set_intent_limit(self, order_ref: str, limit_price: str, at: datetime) -> None:
+        """Re-price an exit that was never sent (review F8); nothing else changes a limit."""
+        with self.tx() as c:
+            c.execute(
+                "UPDATE exec_intents SET limit_price=?, updated_at=? WHERE order_ref=?",
+                (limit_price, at.isoformat(), order_ref),
+            )
 
     def mark_submitted(self, order_ref: str, at: datetime) -> None:
         with self.tx() as c:
@@ -584,14 +608,21 @@ class ExecutionStore:
             )
         return True
 
-    def resolve_exceptions(self, at: datetime, kind: str, *, idea_id: str | None = None) -> int:
+    def resolve_exceptions(
+        self, at: datetime, kind: str, *, idea_id: str | None = None, order_ref: str | None = None
+    ) -> int:
+        """Resolve the open exceptions of ``kind`` for ``idea_id`` (and, when given, only those
+        recorded against ``order_ref``)."""
+        sql = (
+            "UPDATE exec_exceptions SET resolved_at=? WHERE kind=? AND idea_id IS ? "
+            "AND resolved_at IS NULL"
+        )
+        args: list = [at.isoformat(), kind, idea_id]
+        if order_ref is not None:
+            sql += " AND order_ref=?"
+            args.append(order_ref)
         with self.tx() as c:
-            cur = c.execute(
-                "UPDATE exec_exceptions SET resolved_at=? WHERE kind=? AND idea_id IS ? "
-                "AND resolved_at IS NULL",
-                (at.isoformat(), kind, idea_id),
-            )
-            return cur.rowcount
+            return c.execute(sql, args).rowcount
 
     def exceptions(self, *, open_only: bool = False) -> list[ExceptionRecord]:
         with self.tx() as c:

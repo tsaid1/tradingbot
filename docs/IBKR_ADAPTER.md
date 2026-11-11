@@ -15,6 +15,7 @@ positions, and samples a quote.
 | `errors.py`, `redact.py` | no | typed exceptions, error-code classification, account masking |
 | `check.py` | no (lazy) | step runner, verdict and report for the check script |
 | `report_view.py` | no | load, validate and redact the latest report for the dashboard page |
+| `discovery.py` | no (lazy) | query file, batch runner, catalog and table for contract discovery |
 | `session.py` | **yes** | `IbkrSession` over a deny-by-default `_ReadOnlyClient(EClient)` |
 
 ## 1. Install the SDK (not on PyPI, never committed)
@@ -291,3 +292,66 @@ PYTHONPATH=src python -m pytest tests/test_ibkr_paper_check_page.py
 - The page imports no SDK and no session, opens no socket, writes nothing, and has no button or
   other control that connects to the broker. Its tests use invented reports in a temporary
   directory.
+
+## 7. Contract discovery (read-only)
+
+`IbkrSession.discover_contracts(query, *, limit=50, timeout=None)` sends one `reqContractDetails`
+(outgoing id `REQ_CONTRACT_DATA` = 9, already allowlisted) and returns **every** matching contract,
+unlike `resolve_contract`, which insists on exactly one.
+
+- `ContractQuery` gained optional fields (all default to unset): `last_trade_date_or_contract_month`
+  (`YYYYMM` or `YYYYMMDD`), `multiplier`, `trading_class`, `local_symbol`, `strike`, `right`,
+  `include_expired` (default false). A FUT query with no month returns every unexpired month.
+- Each row is a `DiscoveredContract` taken from the 1052.1 `Contract` and `ContractDetails`
+  objects: conId, symbol, local symbol, secType, exchange, primary exchange, currency, multiplier,
+  `minTick`, `priceMagnifier`, trading class, `lastTradeDateOrContractMonth` (date part; the SDK
+  splits a time part into `lastTradeTime`), `lastTradeDate`, `contractMonth`,
+  `realExpirationDate`, strike, right, `underConId`, `underSymbol`, `underSecType`, `longName`,
+  `marketName`, `stockType`, `timeZoneId`, `tradingHours`, `liquidHours`, `validExchanges`,
+  `orderTypes`, `marketRuleIds`, and the size rules `minSize`, `sizeIncrement`,
+  `suggestedSizeIncrement` (`None` when TWS leaves them unset). `query_match` says whether secType
+  and currency equal the query's. Rows are sorted by last trade date or month, strike, right,
+  conId.
+- Results: `FOUND`; `NOT_FOUND` (error 200, or an empty end) and `ERROR` (any other request-scoped
+  broker error) carry the broker's code and message and are **not** exceptions. If more than
+  `limit` rows arrive (1..1000), the wait ends, `cancelContractData` is sent and the result is
+  `truncated`. Identity, poison, connection, cleanup and timeout failures raise, exactly as for
+  every other request (same `_request` path: READY and poison re-checked under the lock before the
+  send, the same cleanup rules).
+
+`IbkrSession.option_chain_params(underlying, *, fut_fop_exchange="", limit=100)` sends
+`reqSecDefOptParams` (outgoing id `REQ_SEC_DEF_OPT_PARAMS` = 78, protobuf path from server version
+212) and returns one `OptionChainParams` per exchange / trading class: exchange, underlying conId,
+trading class, multiplier, sorted expirations and strikes (`securityDefinitionOptionParameter`,
+then `securityDefinitionOptionParameterEnd`). It is a pure security-definition read: it takes only
+the underlying's symbol, secType and conId, touches no account, order or setting, and the SDK
+defines no cancel for it (so a timeout raises and nothing is cancelled). It is the only new id on
+`ALLOWED_OUT_MESSAGES`; `reqSecDefOptParams` and `reqSecDefOptParamsProtoBuf` are the only new
+entries on `ALLOWED_CLIENT_METHODS`. Every deny-by-default test (all other EClient methods, all
+other ids, unbound base-class sends, object-graph walk) still runs over the larger allowlist.
+
+### Run it (only with the owner's approval and paper TWS running)
+
+```sh
+cd <worktree>
+PYTHONPATH="$PWD/src" ~/.venvs/tradingbot/bin/python scripts/ibkr_contract_discovery.py \
+    [--config ~/.config/tradingbot/ibkr/paper.toml] [--report-dir <workspace>/private/ibkr_reports] \
+    [--queries config/contract_discovery.toml] [--pace 1.0] [--limit 50]
+```
+
+- The query file (`config/contract_discovery.toml`, schema
+  `tradingbot.ibkr.contract_discovery_queries/1`) is validated strictly **before** the private
+  config is read or any socket opens; unknown keys or wrong types exit 2.
+- The script loads the private config exactly as the check script does; preflight, identity gate
+  and read-only verification all apply. It runs the queries one at a time with a fixed pause
+  (`pace_seconds`, default 1 s) before every request but the first, then disconnects.
+- `[[option_chain]]` entries first discover the underlying (it must match exactly one contract,
+  otherwise the row is `NOT_FOUND` or `AMBIGUOUS_UNDERLYING` and no option request is sent).
+- It writes `contract_catalog_<UTC>.json` (schema `tradingbot.ibkr.contract_catalog/1`, file 0600,
+  directory 0700, masked account only) to the check script's report directory, and prints a table:
+  query, status, count, and for futures the nearest three unexpired months (by UTC date) with
+  conId, multiplier and minimum tick.
+- `NOT_FOUND`, `ERROR` and `TIMEOUT` rows do not stop the batch. A connection, identity, poison,
+  read-only, cleanup or redaction failure stops it (remaining rows `SKIPPED`), makes the catalog
+  `FAILED` and the exit code 1. Otherwise the catalog is `COMPLETE` and the exit code 0.
+- Bond contracts (`BOND`) arrive on a different callback and are not handled; bond ETFs are `STK`.

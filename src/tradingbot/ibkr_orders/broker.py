@@ -77,9 +77,12 @@ class IbkrPaperBroker:
         pinned = self._s.contract
         extra: dict[str, Any] = {}
         if con_id == pinned.con_id:
+            # the experiment's one contract is a stock (caps): multiplier 1, whole shares; no
+            # expiry, strike or right. Min tick and local symbol come from its contract details.
             primary = primary or pinned.primary_exchange or None
-            extra = {"broker_contract_id": pinned.con_id, "multiplier": 1,
-                     "min_tick": Decimal(str(pinned.min_tick)), "size_increment": 1}
+            extra = {"broker_contract_id": pinned.con_id, "multiplier": Decimal(1),
+                     "min_tick": Decimal(str(pinned.min_tick)), "size_increment": 1,
+                     "local_symbol": pinned.local_symbol or None}
         return _contract_ref(
             symbol=symbol, asset_class=self._asset_class.get(con_id, AssetClass.EQUITY),
             sec_type=sec_type or "STK", exchange=exchange or "SMART", currency=currency or "USD",
@@ -271,9 +274,13 @@ class IbkrPaperBroker:
             rows = self._s.positions()
         except IbkrError as exc:
             raise BrokerError(f"positions unreadable: {exc}") from exc
-        return [BrokerPosition(
-            account=self._s.account_id,
-            contract=self._contract_for(r.con_id, r.symbol, r.sec_type, r.currency,
-                                        r.exchange or "SMART"),
-            quantity=_int_qty(r.quantity, "position"),
-            avg_cost=Decimal(str(r.avg_cost)) if r.avg_cost else None) for r in rows]
+        out = []
+        for r in rows:
+            contract = self._contract_for(r.con_id, r.symbol, r.sec_type, r.currency,
+                                          r.exchange or "SMART")
+            # IBKR's avgCost is multiplied by the contract multiplier; BrokerPosition.avg_cost is
+            # per unit BEFORE the multiplier, so divide (1 for this experiment's stock).
+            avg = (Decimal(str(r.avg_cost)) / contract.multiplier) if r.avg_cost else None
+            out.append(BrokerPosition(account=self._s.account_id, contract=contract,
+                                      quantity=_int_qty(r.quantity, "position"), avg_cost=avg))
+        return out

@@ -108,7 +108,7 @@ def _capped(tmp_path, cap: int = 250) -> Harness:
 def test_m2_an_entry_whose_ack_was_lost_still_counts_against_the_caps(tmp_path):
     h = _capped(tmp_path)
     h.broker.script_next_submit("LOST_ACK_PLACED_RESTING")  # live at the broker, ack lost
-    h.broker.lookup_failures = 2  # the pre-trade sync and the follow-up lookup both fail
+    h.broker.lookup_failures_after_submit = 1  # the post-submit lookup fails (the pre-trade sync must succeed, F1)
     first = h.execute("p1", open_action())
     assert first.state == IntentState.UNRESOLVED
     h.broker.set_quote("QQZ", "19.99", "20.01")
@@ -119,15 +119,12 @@ def test_m2_an_entry_whose_ack_was_lost_still_counts_against_the_caps(tmp_path):
 
 def test_m2_a_recorded_entry_counts_and_does_not_count_against_its_own_resend(tmp_path):
     h = _capped(tmp_path)
-    h.broker.script_next_submit("LOST_ACK_NOT_PLACED")
-    h.broker.lookup_failures = 2
-    first = h.execute("p1", open_action())
-    assert first.state == IntentState.UNRESOLVED
-    _, total = h.coord._exposure("ZZQ")
+    ref = h.record_never_sent("p1", open_action())  # round 2 (F5): the only late-sent entry case
+    assert h.coord.intent(ref).state == IntentState.RECORDED
+    _, total = h.coord._exposure(h.broker.resolve(open_action().instrument))
     assert total == Decimal("50.50") * 4  # the full intended quantity at its limit
-    h.clock.advance(h.config.settle_seconds + 1)
     h.coord.recover()  # no trace: the resend is not refused by its own exposure
-    assert h.coord.intent(first.order_ref).state == IntentState.FILLED
+    assert h.coord.intent(ref).state == IntentState.FILLED
 
 
 # ----------------------------------------------------------------------------------------- M3
@@ -349,6 +346,8 @@ def test_r6_reconcile_flags_a_working_entry_of_a_closed_idea(tmp_path):
     h.broker.script_next_submit("PARTIAL", quantity=1)
     opened = h.execute("p1", open_action())
     h.broker.set_quote(SYMBOL, "47.90", "47.95")  # the stop closes the 1 held
+    for _ in range(2):  # round 2 (F2) cancels the remainder: here that cancel fails
+        h.broker.script_next_cancel("REJECT")
     h.coord.sync()
     assert h.coord.store.position("p1:open").status == "CLOSED"
     kinds = [d.kind.value for d in h.coord.reconcile().discrepancies]
@@ -426,13 +425,14 @@ def test_s1_a_stop_of_the_wrong_side_or_type_is_flagged(tmp_path, update):
     assert not report.clean
 
 
-def test_s1_a_stop_on_the_wrong_side_of_the_average_entry_is_flagged(tmp_path):
+def test_s1_a_stop_moved_at_the_broker_is_flagged(tmp_path):
+    # Round 2 (F3): the stop is checked against the ledger's stop price, not the average entry.
     h = Harness(tmp_path, strict=True)
     out = h.execute("p1", open_action())  # long 4 at 50.02, stop 48
     h.broker.set_quote(SYMBOL, "52.98", "53.02")
     h.broker.modify(f"{out.order_ref}.STP", stop_price=Decimal(51))  # changed at the broker
     report = h.coord.reconcile()
-    [d] = [d for d in report.discrepancies if d.kind.value == "PROTECTIVE_STOP_INVALID"]
+    [d] = [d for d in report.discrepancies if d.kind.value == "STOP_PRICE_MISMATCH"]
     assert "51" in d.detail and not report.clean
 
 
@@ -509,10 +509,13 @@ def test_s3_exposure_is_valued_at_the_current_quote(tmp_path):
 # ------------------------------------------------------------- previous engineer's open notes
 
 
-def test_note_a_visible_child_means_the_entry_filled_even_without_its_execution(tmp_path):
+def test_note_a_visible_child_does_not_decide_the_entry_without_its_own_evidence(tmp_path):
+    # Round 2 (IBKR binding): a bracket child is PreSubmitted before the parent fills and may stay
+    # so after it, so child visibility never proves the entry filled. Without the entry's own row
+    # or executions the state is UNKNOWN: UNRESOLVED, an exception, new exposure blocked.
     h = Harness(tmp_path, strict=True)
     h.broker.script_next_submit("LOST_ACK_PLACED")  # placed and filled, the ack is lost
-    h.broker.lookup_failures = 2  # and the lookups fail until the next day
+    h.broker.lookup_failures_after_submit = 1  # the post-submit lookup fails
     out = h.execute("p1", open_action())
     assert out.state == IntentState.UNRESOLVED
     h.broker.history_seconds = 3600  # yesterday's fill and completed entry are out of history
@@ -521,13 +524,11 @@ def test_note_a_visible_child_means_the_entry_filled_even_without_its_execution(
     assert h.broker.executions() == []
     h.coord.recover()
     intent = h.coord.intent(out.order_ref)
-    assert intent.state == IntentState.FILLED  # not CANCELLED
+    assert intent.state == IntentState.UNRESOLVED  # neither FILLED nor CANCELLED on inference
     assert h.coord.store.position("p1:open").status != "NOT_FILLED"
     working = h.working()
     assert f"{out.order_ref}.STP" in working  # the protection at the broker is left alone
-    assert "ENTRY_FILL_NOT_IN_EXECUTIONS" in [
-        e.kind for e in h.coord.store.exceptions(open_only=True)
-    ]
+    assert "ENTRY_STATE_UNKNOWN" in [e.kind for e in h.coord.store.exceptions(open_only=True)]
     assert not h.coord.reconcile().clean  # the broker holds 4 the ledger cannot see
 
 

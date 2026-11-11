@@ -65,13 +65,21 @@ from tradingbot.ibkr.identity import check_managed_accounts, check_row_account
 from tradingbot.ibkr.models import (
     CLOSE_TICKS,
     DELAYED_TICK_IDS,
+    DISCOVERY_ERROR,
+    DISCOVERY_FOUND,
+    DISCOVERY_NOT_FOUND,
     LAST_TIMESTAMP_TICKS,
     MARKET_DATA_TYPE_NAMES,
+    NO_SECURITY_DEFINITION,
     PRICE_TICKS,
     SIZE_TICKS,
     AccountSummary,
     AccountValue,
     ContractQuery,
+    DiscoveredContract,
+    DiscoveryResult,
+    OptionChainParams,
+    OptionChainResult,
     PositionRow,
     QuoteReport,
     QuoteSnapshot,
@@ -121,12 +129,15 @@ ALLOWED_CLIENT_METHODS = frozenset({
     "cancelMktData", "cancelMarketDataProtoBuf", "reqMarketDataType", "reqMarketDataTypeProtoBuf",
     # read-only API configuration read (read_only_check = "config-read")
     "reqConfigProtoBuf",
+    # option-chain parameters (expirations, strikes, exchanges, trading classes, multiplier)
+    "reqSecDefOptParams", "reqSecDefOptParamsProtoBuf",
 })
 ALLOWED_OUT_MESSAGES = frozenset({
     OUT.START_API, OUT.REQ_CONTRACT_DATA, OUT.CANCEL_CONTRACT_DATA, OUT.REQ_ACCOUNT_SUMMARY,
     OUT.CANCEL_ACCOUNT_SUMMARY, OUT.REQ_POSITIONS, OUT.CANCEL_POSITIONS, OUT.REQ_MKT_DATA,
-    OUT.CANCEL_MKT_DATA, OUT.REQ_MARKET_DATA_TYPE, OUT.REQ_CONFIG,
+    OUT.CANCEL_MKT_DATA, OUT.REQ_MARKET_DATA_TYPE, OUT.REQ_CONFIG, OUT.REQ_SEC_DEF_OPT_PARAMS,
 })
+MAX_DISCOVERY_LIMIT = 1000  # upper bound on rows kept per discovery / option-chain request
 
 
 def _denied(name: str) -> Callable[..., None]:
@@ -259,6 +270,53 @@ for _name in dir(EClient):
 del _name
 
 
+def _query_contract(query: ContractQuery) -> Contract:
+    """SDK ``Contract`` for a query; unset optional fields keep the SDK defaults."""
+    c = Contract()
+    c.symbol, c.secType, c.exchange = query.symbol, query.sec_type, query.exchange
+    c.currency, c.primaryExchange = query.currency, query.primary_exchange
+    c.lastTradeDateOrContractMonth = query.last_trade_date_or_contract_month
+    c.multiplier, c.tradingClass = query.multiplier, query.trading_class
+    c.localSymbol, c.right = query.local_symbol, query.right
+    if query.strike is not None:
+        c.strike = float(query.strike)
+    c.includeExpired = bool(query.include_expired)
+    return c
+
+
+def _check_limit(limit: int) -> int:
+    if (isinstance(limit, bool) or not isinstance(limit, int)
+            or not 1 <= limit <= MAX_DISCOVERY_LIMIT):
+        raise ValueError(f"limit must be an int in 1..{MAX_DISCOVERY_LIMIT}")
+    return limit
+
+
+def _decimal_or_none(value: Any) -> Decimal | None:
+    return None if value is None or value == UNSET_DECIMAL else Decimal(value)
+
+
+def _discovered(cd: Any, query: ContractQuery) -> DiscoveredContract:
+    """Map an SDK ``ContractDetails`` (1052.1 attribute names) to ``DiscoveredContract``."""
+    k = cd.contract
+    return DiscoveredContract(
+        con_id=int(k.conId), symbol=k.symbol, local_symbol=k.localSymbol, sec_type=k.secType,
+        exchange=k.exchange, primary_exchange=k.primaryExchange, currency=k.currency,
+        multiplier=str(k.multiplier or ""), min_tick=float(cd.minTick),
+        price_magnifier=int(cd.priceMagnifier), trading_class=k.tradingClass,
+        last_trade_date_or_contract_month=k.lastTradeDateOrContractMonth,
+        last_trade_date=k.lastTradeDate, last_trade_time=cd.lastTradeTime,
+        contract_month=cd.contractMonth, real_expiration_date=cd.realExpirationDate,
+        strike=None if k.strike == UNSET_DOUBLE else float(k.strike), right=k.right,
+        under_con_id=int(cd.underConId), under_symbol=cd.underSymbol,
+        under_sec_type=cd.underSecType, long_name=cd.longName, market_name=cd.marketName,
+        stock_type=cd.stockType, time_zone_id=cd.timeZoneId, trading_hours=cd.tradingHours,
+        liquid_hours=cd.liquidHours, valid_exchanges=cd.validExchanges,
+        order_types=cd.orderTypes, market_rule_ids=cd.marketRuleIds,
+        min_size=_decimal_or_none(cd.minSize), size_increment=_decimal_or_none(cd.sizeIncrement),
+        suggested_size_increment=_decimal_or_none(cd.suggestedSizeIncrement),
+        query_match=(k.secType, k.currency) == (query.sec_type, query.currency))
+
+
 class SessionState(str, Enum):
     DISCONNECTED = "DISCONNECTED"
     CONNECTING = "CONNECTING"
@@ -275,6 +333,8 @@ class _Pending:
     error: BaseException | None = None
     rows: list = field(default_factory=list)
     notices: list[int] = field(default_factory=list)
+    max_rows: int | None = None  # rows beyond this are counted in ``overflow``, not kept
+    overflow: int = 0
     # quote-only
     prices: dict[str, float | None] = field(default_factory=dict)
     sizes: dict[str, Decimal | None] = field(default_factory=dict)
@@ -343,6 +403,14 @@ class _Wrapper(EWrapper):
         self._call(self._s._on_row, reqId, contractDetails)
 
     def contractDetailsEnd(self, reqId):
+        self._call(self._s._on_end, reqId)
+
+    def securityDefinitionOptionParameter(self, reqId, exchange, underlyingConId, tradingClass,
+                                          multiplier, expirations, strikes):
+        self._call(self._s._on_row, reqId, (exchange, underlyingConId, tradingClass, multiplier,
+                                            expirations, strikes))
+
+    def securityDefinitionOptionParameterEnd(self, reqId):
         self._call(self._s._on_end, reqId)
 
     def accountSummary(self, reqId, account, tag, value, currency):
@@ -661,9 +729,7 @@ class IbkrSession:
     # ------------------------------------------------------------------ read requests
     def resolve_contract(self, query: ContractQuery, *, timeout: float | None = None,
                          ) -> ResolvedContract:
-        c = Contract()
-        c.symbol, c.secType, c.exchange = query.symbol, query.sec_type, query.exchange
-        c.currency, c.primaryExchange = query.currency, query.primary_exchange
+        c = _query_contract(query)
         can_cancel = (self.server_version or 0) >= MIN_SERVER_VER_CANCEL_CONTRACT_DATA
 
         def build(p: _Pending) -> list:
@@ -692,6 +758,71 @@ class IbkrSession:
             exchange=k.exchange, primary_exchange=k.primaryExchange, local_symbol=k.localSymbol,
             min_tick=float(cd.minTick), time_zone_id=cd.timeZoneId, trading_hours=cd.tradingHours,
             liquid_hours=cd.liquidHours)
+
+    def discover_contracts(self, query: ContractQuery, *, limit: int = 50,
+                           timeout: float | None = None) -> DiscoveryResult:
+        """``reqContractDetails`` returning EVERY matching contract (sorted by last trade date or
+        contract month, then strike, right, conId), at most ``limit`` of them. If more arrive, the
+        wait ends early, the request is cancelled (``cancelContractData``) and the result is
+        ``truncated``. Error 200 or an empty end -> ``NOT_FOUND``; any other request-scoped broker
+        error -> ``ERROR`` (both carry the broker's code and message). Identity, poison, connection,
+        cleanup and timeout failures raise, exactly as for every other request."""
+        limit = _check_limit(limit)
+        c = _query_contract(query)
+
+        def build(p: _Pending) -> tuple[list, bool]:
+            return list(p.rows), p.overflow > 0
+
+        try:
+            rows, truncated = self._request(
+                "contract", lambda rid: self._client.reqContractDetails(rid, c),
+                lambda rid: self._client.cancelContractData(rid),
+                timeout or self._request_timeout, cancel_always=False, build=build,
+                max_rows=limit, early=lambda p: p.overflow > 0)
+        except IbkrRequestError as exc:
+            status = DISCOVERY_NOT_FOUND if exc.code == NO_SECURITY_DEFINITION else DISCOVERY_ERROR
+            return DiscoveryResult(query=query, status=status, contracts=(), limit=limit,
+                                   error_code=exc.code, error_message=exc.broker_message)
+        found = sorted((_discovered(cd, query) for cd in rows), key=lambda d: (
+            d.last_trade_date_or_contract_month, d.strike or 0.0, d.right, d.con_id))
+        status = DISCOVERY_FOUND if found else DISCOVERY_NOT_FOUND
+        return DiscoveryResult(query=query, status=status, contracts=tuple(found), limit=limit,
+                               truncated=truncated)
+
+    def option_chain_params(self, underlying: Any, *, fut_fop_exchange: str = "",
+                            limit: int = 100, timeout: float | None = None) -> OptionChainResult:
+        """``reqSecDefOptParams`` for an underlying (anything with ``con_id``, ``symbol`` and
+        ``sec_type``, e.g. a ``DiscoveredContract``): one row per exchange / trading class with
+        its expirations, strikes and multiplier. Read-only; the SDK has no cancel for it, so the
+        request always waits for its end (rows beyond ``limit`` are counted, not kept)."""
+        limit = _check_limit(limit)
+        symbol, sec_type = str(underlying.symbol), str(underlying.sec_type)
+        con_id = int(underlying.con_id)
+
+        def build(p: _Pending) -> tuple[list, bool]:
+            return list(p.rows), p.overflow > 0
+
+        common = {"underlying_symbol": symbol, "underlying_sec_type": sec_type,
+                  "underlying_con_id": con_id, "fut_fop_exchange": fut_fop_exchange,
+                  "limit": limit}
+        try:
+            rows, truncated = self._request(
+                "option_params", lambda rid: self._client.reqSecDefOptParams(
+                    rid, symbol, fut_fop_exchange, sec_type, con_id),
+                None, timeout or self._request_timeout, cancel_always=False, build=build,
+                max_rows=limit)
+        except IbkrRequestError as exc:
+            status = DISCOVERY_NOT_FOUND if exc.code == NO_SECURITY_DEFINITION else DISCOVERY_ERROR
+            return OptionChainResult(status=status, params=(), error_code=exc.code,
+                                     error_message=exc.broker_message, **common)
+        params = sorted((OptionChainParams(
+            exchange=str(ex), underlying_con_id=int(ucid), trading_class=str(tc),
+            multiplier=str(mult), expirations=tuple(sorted(str(e) for e in exps)),
+            strikes=tuple(sorted(float(k) for k in strikes)))
+            for ex, ucid, tc, mult, exps, strikes in rows),
+            key=lambda o: (o.exchange, o.trading_class))
+        return OptionChainResult(status=DISCOVERY_FOUND if params else DISCOVERY_NOT_FOUND,
+                                 params=tuple(params), truncated=truncated, **common)
 
     def account_summary(self, *, timeout: float | None = None) -> AccountSummary:
         tags = ",".join(ACCOUNT_SUMMARY_TAGS)
@@ -833,14 +964,15 @@ class IbkrSession:
     def _request(self, kind: str, send: Callable[[int], None],
                  cancel: Callable[[int], None] | None, timeout: float, *, cancel_always: bool,
                  build: Callable[[_Pending], T], gate: bool = False, soft: bool = False,
-                 early: Callable[[_Pending], bool] | None = None) -> T:
+                 early: Callable[[_Pending], bool] | None = None,
+                 max_rows: int | None = None) -> T:
         """``soft`` (quotes): a timeout or a request-scoped broker error does not raise; the
         result is built from what arrived. Connection loss and poisoning always raise.
         ``early`` (streaming quotes): polled under the lock; True ends the wait as complete."""
         with self._cond:
             self._require_ready(gate)
             self._next_req_id += 1
-            p = _Pending(kind, self._next_req_id)
+            p = _Pending(kind, self._next_req_id, max_rows=max_rows)
             if kind == "positions":
                 if self._positions is not None:
                     raise SessionStateError("a positions request is already outstanding")
@@ -1096,7 +1228,10 @@ class IbkrSession:
         with self._cond:
             p = self._pending.get(req_id)
             if p is not None:
-                p.rows.append(row)
+                if p.max_rows is not None and len(p.rows) >= p.max_rows:
+                    p.overflow += 1
+                else:
+                    p.rows.append(row)
 
     def _on_end(self, req_id: int) -> None:
         with self._cond:

@@ -26,17 +26,28 @@ by `TRADINGBOT_RUNTIME_CONFIG` (default `~/.config/tradingbot/runtime.toml`).
 ## Config
 
 One TOML file; `config/runtime.example.toml` documents every key. Unknown keys, a missing required
-table (`paths`, `source`, `service`, `policy`) or any mode other than `mock` refuse to start.
-Relative paths resolve against the config file.
+table (`paths`, `source`, `service`, `policy`, `execution`) or any mode other than `mock` refuse to
+start. **The config fails closed (review F4):** every size, cap, collar, freshness and timing value
+the service uses must be written out, or the service refuses to start and names each missing key
+(`config.REQUIRED_KEYS`). Nothing that sizes or bounds an order runs on a default. Relative paths
+resolve against the config file.
 
 * `[paths]`: `state_dir` (runtime, execution, replay and SimBroker SQLite files, `heartbeat.json`,
   `notifications.log`), `halt_file`, `mapping_file`.
 * `[source]`: `kind = "replay"` (`file`, optional `compression`, `lag_seconds`,
   `expected_author_id` for G0 archive records) or `kind = "x_timeline"` (`author_id`, `token_file`,
   `client_file`; both private files, mode 0600 in a 0700 directory outside cloud storage).
-* `[service]`: `cadence_seconds` (5), `max_backoff_seconds`, `failure_alert_after`,
-  `stuck_after_seconds`. `[policy]`: `MockPolicy`. `[execution]`, `[interpreter] lexicon_path`,
-  `[notify] macos`, `[mock] account, quotes` (a static simulated market).
+* `[service]` (all required): `cadence_seconds`, `max_backoff_seconds`, `failure_alert_after`,
+  `stuck_after_seconds`.
+* `[policy]` (`MockPolicy`; required): `quantity`, `quantity_per_add`, `max_price_deviation_pct`,
+  `max_spread_pct`, `max_notional_usd`, `max_signal_age_seconds`, `max_quote_age_seconds`,
+  `max_instrument_exposure_usd`, `max_aggregate_exposure_usd`.
+* `[execution]` (required): `expected_account` (the coordinator refuses any other account),
+  `max_submit_attempts`, `settle_seconds`, `exit_no_trace_lookups` (at least 3),
+  `max_intent_age_seconds`, `max_exit_intent_age_seconds`, `lookup_horizon_seconds`,
+  `confirm_attempts`, `confirm_wait_seconds`.
+* Optional: `[interpreter] lexicon_path`, `[notify] macos`, `[mock] account, quotes` (a static
+  simulated market).
 
 ## Sources and the cursor
 
@@ -44,9 +55,12 @@ Relative paths resolve against the config file.
 post only after it is processed and journaled. A restart re-polls exactly the uncommitted posts.
 A post processed but not committed before a crash is replayed as a recorded duplicate: no second
 order. `XTimelineSource` starts with a baseline (posts that existed before the first run are never
-acted on), reads every page since `since_id` (more than `max_pages` raises `SourceGap`), marks a
+acted on; an empty first page still sets a baseline time, used as `start_time`, never id "0"),
+reads every page since `since_id` (more than `max_pages` raises `SourceGap`), marks a
 note-less ellipsis-terminated body incomplete, maps edits to revision N of the original post,
-marks posts by any other author unverified, and backs off on 429 until the reset.
+marks posts by any other author unverified, and backs off on 429 until the reset. The service also
+records its first-start time and never acts on a live post published before it
+(`POST_BEFORE_FIRST_START`: consumed and journaled by identity, not processed).
 
 ## Mapping policy
 
@@ -68,13 +82,17 @@ Commentary (`NO_TRADE`) and recaps (`RECONCILE`) are journaled, not held. Nothin
 ## Failures, halt, notifications
 
 A broker that cannot be read stops the cycle before the source is touched, so no signal is consumed
-during an outage. Source, broker and processing failures back off exponentially (bounded) and never
-move the cursor. Unknown order outcomes are looked up again every cycle (see
-`docs/EXECUTION_CORE.md`). While the halt file exists, nothing that could add exposure is
+during an outage. The probe reads the account, open orders, executions, completed orders and
+positions: every read the coordinator depends on. A failed sync inside recovery fails the cycle
+too. Source, broker and processing failures back off exponentially, bounded by
+`max_backoff_seconds` (the exponent is capped, so a long outage cannot overflow). They never move
+the cursor. Unknown order outcomes are looked up again every cycle; an entry or add of unknown
+outcome is never resent (see `docs/EXECUTION_CORE.md`). While the halt file exists, nothing that could add exposure is
 submitted or amended, and posts are still journaled (`HALTED`). Working entry and add orders are
 cancelled, and protective orders are still resized to the position. A second service on the same
 state directory refuses to start: the execution store is locked. Notifications (log file, optional macOS): reconciliation discrepancy,
 unprotected position, halt engaged, repeated source or broker failure, stuck intent; each once per
-occurrence. Post text is never stored; the journal keeps hashes, identities, reason codes and
+occurrence. Every publisher-driven REDUCE, CLOSE or MODIFY refused because the halt is engaged sends
+`HALTED_ACTION_REFUSED` naming the idea, action and order ref (identifiers and reason codes only). Post text is never stored; the journal keeps hashes, identities, reason codes and
 timestamps for every stage (published, received, interpreted, gate decided, submitted,
 acknowledged, filled).

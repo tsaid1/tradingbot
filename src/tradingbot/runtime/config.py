@@ -1,7 +1,9 @@
 """Runtime configuration: one TOML file, validated strictly, failing closed.
 
 Only ``mode = "mock"`` is accepted (the simulated broker). Every table and key is checked: an
-unknown key, a missing required value or a wrong type refuses to start. Relative paths resolve
+unknown key, a missing required value or a wrong type refuses to start. Every size, cap, collar,
+freshness and timing value the service uses, and the expected broker account, must be written out
+explicitly (``REQUIRED_KEYS``): nothing that sizes or bounds an order runs on a default (review F4). Relative paths resolve
 against the directory of the config file. Credentials are never stored here, only the *paths* of
 the private files that hold them.
 """
@@ -80,8 +82,21 @@ class NotifyConfig(StrictModel):
 
 
 class ExecutionSettings(StrictModel):
-    expected_account: str | None = None
-    max_submit_attempts: int = Field(default=2, ge=1, le=5)
+    """All required (see ``REQUIRED_KEYS``); the ranges are those of ``ExecutionConfig``."""
+
+    # The coordinator refuses to trade against any other broker account.
+    expected_account: str = Field(min_length=1)
+    max_submit_attempts: int = Field(ge=1, le=5)
+    # After an unknown submission outcome, "no trace at the broker" is never concluded sooner.
+    settle_seconds: float = Field(ge=0)
+    # An exit of unknown outcome is resent only after this many consecutive no-trace lookups
+    # spread over at least settle_seconds (an entry or add is never resent).
+    exit_no_trace_lookups: int = Field(ge=3, le=20)
+    max_intent_age_seconds: int = Field(gt=0)
+    max_exit_intent_age_seconds: int = Field(gt=0)
+    lookup_horizon_seconds: int = Field(gt=0)
+    confirm_attempts: int = Field(ge=1, le=20)
+    confirm_wait_seconds: float = Field(ge=0, le=5)
 
 
 class MockQuote(StrictModel):
@@ -103,7 +118,7 @@ class RuntimeConfig(StrictModel):
     policy: MockPolicy
     interpreter: InterpreterConfig = Field(default_factory=InterpreterConfig)
     notify: NotifyConfig = Field(default_factory=NotifyConfig)
-    execution: ExecutionSettings = Field(default_factory=ExecutionSettings)
+    execution: ExecutionSettings
     mock: MockConfig = Field(default_factory=MockConfig)
 
     @property
@@ -131,7 +146,48 @@ class RuntimeConfig(StrictModel):
         return self.notify.log_file or self.paths.state_dir / "notifications.log"
 
 
-REQUIRED_TABLES = ("paths", "source", "service", "policy")
+REQUIRED_TABLES = ("paths", "source", "service", "policy", "execution")
+# Keys that must be present even where the model has a default; alternatives are accepted
+# spellings (MockPolicy's validation aliases).
+REQUIRED_KEYS: dict[str, tuple[tuple[str, ...], ...]] = {
+    "service": (
+        ("cadence_seconds",),
+        ("max_backoff_seconds",),
+        ("failure_alert_after",),
+        ("stuck_after_seconds",),
+    ),
+    "policy": (
+        ("quantity", "quantity_per_open"),
+        ("quantity_per_add",),
+        ("max_price_deviation_pct", "max_deviation_pct"),
+        ("max_spread_pct",),
+        ("max_notional_usd",),
+        ("max_signal_age_seconds", "max_source_age_seconds"),
+        ("max_quote_age_seconds",),
+        ("max_instrument_exposure_usd",),
+        ("max_aggregate_exposure_usd",),
+    ),
+    "execution": (
+        ("expected_account",),
+        ("max_submit_attempts",),
+        ("settle_seconds",),
+        ("exit_no_trace_lookups",),
+        ("max_intent_age_seconds",),
+        ("max_exit_intent_age_seconds",),
+        ("lookup_horizon_seconds",),
+        ("confirm_attempts",),
+        ("confirm_wait_seconds",),
+    ),
+}
+
+
+def _missing_keys(raw: dict) -> list[str]:
+    missing = []
+    for table, keys in REQUIRED_KEYS.items():
+        values = raw.get(table)
+        values = values if isinstance(values, dict) else {}
+        missing += [f"{table}.{names[0]}" for names in keys if not any(n in values for n in names)]
+    return missing
 
 
 def _resolve_paths(raw: dict, base: Path) -> None:
@@ -160,6 +216,12 @@ def parse_config(raw: dict, *, base: Path) -> RuntimeConfig:
     missing = [t for t in REQUIRED_TABLES if t not in raw]
     if missing:
         raise ConfigError(f"config is missing required table(s): {', '.join(missing)}")
+    missing = _missing_keys(raw)
+    if missing:
+        raise ConfigError(
+            "config must set every size, cap, collar, freshness and timing value explicitly; "
+            f"missing: {', '.join(missing)}"
+        )
     raw = {k: (dict(v) if isinstance(v, dict) else v) for k, v in raw.items()}
     _resolve_paths(raw, base)
     try:

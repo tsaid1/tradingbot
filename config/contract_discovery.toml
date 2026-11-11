@@ -1,0 +1,128 @@
+# Default query list for scripts/ibkr_contract_discovery.py (read-only contract discovery).
+# Editable. A symbol IBKR does not know is harmless: it comes back as a NOT_FOUND row (with the
+# broker's code and message) and the batch goes on. Research on the exact products is still in
+# progress; entries marked UNCONFIRMED are candidates, not verified IBKR listings.
+#
+# [[contract]] keys (only name and symbol are required): symbol, sec_type (default STK),
+#   exchange (SMART), currency (USD), primary_exchange, last_trade_date_or_contract_month
+#   (YYYYMM or YYYYMMDD), multiplier, trading_class, local_symbol, strike, right ("C"/"P"),
+#   include_expired (false).
+# Leaving the contract month empty on a FUT query returns every unexpired month (up to `limit`).
+# [[option_chain]] keys: name, symbol, sec_type, exchange, currency, primary_exchange (the
+#   underlying, which must resolve to exactly one contract), fut_fop_exchange ("" = all).
+
+schema = "tradingbot.ibkr.contract_discovery_queries/1"
+pace_seconds = 1.0      # fixed pause between requests
+limit = 50              # contracts kept per query; more -> cancelled and marked truncated
+request_timeout = 15.0  # seconds per request
+
+# --- stocks / ETFs -------------------------------------------------------------------------------
+[[contract]]
+name = "TLT"
+symbol = "TLT"
+
+[[contract]]
+name = "SPY"
+symbol = "SPY"
+
+[[contract]]
+name = "GLD"
+symbol = "GLD"
+
+[[contract]]
+name = "USO"
+symbol = "USO"
+
+[[contract]]
+name = "UNG"
+symbol = "UNG"
+
+# --- index ---------------------------------------------------------------------------------------
+[[contract]]
+name = "SPX index"
+symbol = "SPX"
+sec_type = "IND"
+exchange = "CBOE"
+
+# --- futures (every unexpired month) -------------------------------------------------------------
+[[contract]]
+name = "ES fut"
+symbol = "ES"
+sec_type = "FUT"
+exchange = "CME"
+
+[[contract]]
+name = "MES fut"
+symbol = "MES"
+sec_type = "FUT"
+exchange = "CME"
+
+[[contract]]
+name = "CL fut"
+symbol = "CL"
+sec_type = "FUT"
+exchange = "NYMEX"
+
+[[contract]]
+name = "MCL fut"
+symbol = "MCL"
+sec_type = "FUT"
+exchange = "NYMEX"
+
+[[contract]]
+name = "NG fut"
+symbol = "NG"
+sec_type = "FUT"
+exchange = "NYMEX"
+
+# UNCONFIRMED on IBKR: E-mini Henry Hub natural gas (2,500 MMBtu); exchange code QG on NYMEX.
+[[contract]]
+name = "QG fut (e-mini NG)"
+symbol = "QG"
+sec_type = "FUT"
+exchange = "NYMEX"
+
+# UNCONFIRMED on IBKR: Micro Henry Hub natural gas (1,000 MMBtu); exchange code MNG on NYMEX.
+[[contract]]
+name = "MNG fut (micro NG)"
+symbol = "MNG"
+sec_type = "FUT"
+exchange = "NYMEX"
+
+[[contract]]
+name = "MHNG fut (micro Henry Hub, symbol as reported by IBKR product search; UNCONFIRMED)"
+symbol = "MHNG"
+sec_type = "FUT"
+exchange = "NYMEX"
+
+[[contract]]
+name = "GC fut"
+symbol = "GC"
+sec_type = "FUT"
+exchange = "COMEX"
+
+[[contract]]
+name = "MGC fut"
+symbol = "MGC"
+sec_type = "FUT"
+exchange = "COMEX"
+
+# --- spot gold (commodity) and the US 500 index CFD ----------------------------------------------
+[[contract]]
+name = "XAUUSD spot gold"
+symbol = "XAUUSD"
+sec_type = "CMDTY"
+exchange = "SMART"
+
+[[contract]]
+name = "IBUS500 CFD"
+symbol = "IBUS500"
+sec_type = "CFD"
+exchange = "SMART"
+
+# --- option chain parameters (expirations, strikes, exchanges, trading classes, multiplier) -----
+[[option_chain]]
+name = "SPY option chain"
+symbol = "SPY"
+sec_type = "STK"
+exchange = "SMART"

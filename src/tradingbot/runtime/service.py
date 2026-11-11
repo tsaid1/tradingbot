@@ -41,7 +41,7 @@ from tradingbot.execution.coordinator import (
 from tradingbot.execution.reconcile import DiscrepancyKind, ReconciliationReport
 from tradingbot.execution.replay import BrokerEventReplay
 from tradingbot.execution.store import UNRESOLVED_STATES
-from tradingbot.models import Quote
+from tradingbot.models import Action, Quote
 from tradingbot.runtime import notify as N
 from tradingbot.runtime.config import RuntimeConfig
 from tradingbot.runtime.mapping import MappingDecision, MappingPolicy
@@ -56,6 +56,8 @@ HELD_STATUSES = frozenset(
     {"HOLD", "BLOCK", "REFUSED", "HALTED", "UNRESOLVED", "EXCEPTION", "REJECTED"}
 )
 COMPONENTS = ("source", "broker", "pipeline")
+# Bounds the arithmetic only; max_backoff_seconds still bounds the wait itself.
+MAX_BACKOFF_EXPONENT = 32
 FAILURE_KIND = {
     "source": N.SOURCE_FAILURE,
     "broker": N.BROKER_FAILURE,
@@ -141,6 +143,13 @@ class RuntimeService:
                 expected_account=config.execution.expected_account,
                 max_submit_attempts=config.execution.max_submit_attempts,
                 stuck_after_seconds=config.service.stuck_after_seconds,
+                settle_seconds=config.execution.settle_seconds,
+                exit_no_trace_lookups=config.execution.exit_no_trace_lookups,
+                max_intent_age_seconds=config.execution.max_intent_age_seconds,
+                max_exit_intent_age_seconds=config.execution.max_exit_intent_age_seconds,
+                lookup_horizon_seconds=config.execution.lookup_horizon_seconds,
+                confirm_attempts=config.execution.confirm_attempts,
+                confirm_wait_seconds=config.execution.confirm_wait_seconds,
             ),
             clock=self.clock,
         )
@@ -158,6 +167,11 @@ class RuntimeService:
         self.cycles = int(self.store.get("cycles", 0) or 0)
         self.last_reconciliation: ReconciliationReport | None = None
         now = self.clock()
+        # Review F7: a live post published before the service first ever started is never acted on.
+        first = self.store.get("first_start_at")
+        if first is None:
+            self.store.put("first_start_at", now.isoformat(), now)
+        self.first_start_at = datetime.fromisoformat(first) if first else now
         self.store.event(
             now,
             "SERVICE_START",
@@ -253,8 +267,12 @@ class RuntimeService:
 
     def _probe_broker(self, now: datetime) -> bool:
         try:
+            # Every read the coordinator depends on (review F1), not only open orders.
             self.broker.account_id()
             self.broker.open_orders()
+            self.broker.executions()
+            self.broker.completed_orders(since=now)
+            self.broker.positions()
             if self.source.realtime:
                 self._publish_mock_quotes(now)
         except Exception as exc:  # noqa: BLE001 - any broker fault is a broker failure
@@ -318,6 +336,18 @@ class RuntimeService:
 
     def _handle(self, post: SourcePost) -> tuple[int, bool]:
         """One post through the whole pipeline. Returns (held action count, duplicate)."""
+        if post.is_live and post.published_at < self.first_start_at:
+            # Existed before the first run: consumed and journaled by identity, never acted on.
+            self.store.event(
+                self.clock(),
+                "POST_BEFORE_FIRST_START",
+                source_id=post.source_id,
+                post_id=post.post_id,
+                revision=post.revision,
+                published_at=post.published_at.isoformat(),
+                first_start_at=self.first_start_at.isoformat(),
+            )
+            return 0, False
         if self.source.realtime or post.is_live:
             decision_now = self.clock()
         else:
@@ -362,6 +392,19 @@ class RuntimeService:
                     "gate_decided_at": stamp.isoformat() if stamp else None,
                 }
             )
+            if (
+                o.status == "HALTED"
+                and a is not None
+                and a.action in (Action.REDUCE, Action.CLOSE, Action.MODIFY)
+                and not result.duplicate
+            ):
+                # Review F12: the stop at the broker stays; a human must know the exit was refused.
+                self.notifier.notify(
+                    N.HALTED_ACTION_REFUSED,
+                    "Exit or amendment refused: halt engaged",
+                    f"idea {a.idea_reference or '-'} action {a.action.value} ({o.action_id}) "
+                    f"ref {o.order_ref or '-'}: {', '.join(o.reasons)}",
+                )
             if o.status in HELD_STATUSES and (not result.duplicate or source_block):
                 exceptions.append(
                     {
@@ -553,9 +596,9 @@ class RuntimeService:
         h.last_error = _safe_error(exc)
         h.last_error_at = now.isoformat()
         cfg = self.config.service
-        backoff = min(
-            cfg.cadence_seconds * 2 ** (h.consecutive_failures - 1), cfg.max_backoff_seconds
-        )
+        # The exponent is capped (review F6): 2 ** n overflowed a float after ~1,024 failures.
+        exponent = min(h.consecutive_failures - 1, MAX_BACKOFF_EXPONENT)
+        backoff = min(cfg.cadence_seconds * 2**exponent, cfg.max_backoff_seconds)
         if retry_after is not None:
             backoff = min(max(backoff, retry_after), max(cfg.max_backoff_seconds, retry_after))
         h.next_attempt_at = (now + timedelta(seconds=backoff)).isoformat()

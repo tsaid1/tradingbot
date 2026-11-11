@@ -18,9 +18,16 @@ from enum import Enum
 
 from pydantic import Field
 
-from tradingbot.execution.broker import Broker, BrokerError, OrderSide, OrderStatus, OrderType
+from tradingbot.execution.broker import (
+    Broker,
+    BrokerError,
+    OrderSide,
+    OrderStatus,
+    OrderType,
+    QuoteQuality,
+)
 from tradingbot.execution.store import UNRESOLVED_STATES, ExecutionStore, Role
-from tradingbot.models import PositionSide, StrictModel
+from tradingbot.models import Instrument, PositionSide, StrictModel
 
 
 class DiscrepancyKind(str, Enum):
@@ -37,9 +44,11 @@ class DiscrepancyKind(str, Enum):
     # An approved atomic group executed only in part (an open PARTIAL_GROUP exception): never
     # explained away, it stays unclean until a human resolves the exception.
     PARTIAL_GROUP = "PARTIAL_GROUP"
-    # The working stop is not a sell-stop below the average entry (long) / a buy-stop above it
-    # (short): wrong side, wrong type, or a price on the wrong side of the entry.
+    # The working stop is not a protective stop: wrong type, wrong side, or (when a quote is
+    # available) not below the bid for a long / above the ask for a short.
     PROTECTIVE_STOP_INVALID = "PROTECTIVE_STOP_INVALID"
+    # The working stop's price differs from the ledger's confirmed stop for the idea (review F3).
+    STOP_PRICE_MISMATCH = "STOP_PRICE_MISMATCH"
 
 
 # Never explained away: while any of these is present the report is not clean.
@@ -47,6 +56,7 @@ SAFETY_KINDS = frozenset(
     {
         DiscrepancyKind.POSITION_WITHOUT_PROTECTIVE_STOP,
         DiscrepancyKind.PROTECTIVE_STOP_INVALID,
+        DiscrepancyKind.STOP_PRICE_MISMATCH,
         DiscrepancyKind.WORKING_ENTRY_ON_CLOSED_IDEA,
         DiscrepancyKind.PARTIAL_GROUP,
     }
@@ -56,6 +66,8 @@ SAFETY_KINDS = frozenset(
 class Discrepancy(StrictModel):
     kind: DiscrepancyKind
     symbol: str | None = None
+    # The instrument's identity (ContractRef.contract_key) where the discrepancy is per contract.
+    contract_key: str | None = None
     idea_id: str | None = None
     order_ref: str | None = None
     detail: str = ""
@@ -86,21 +98,51 @@ class ReconciliationReport(StrictModel):
         return not self.blocking
 
 
-def _stop_problem(stop, p) -> str:
+def _stop_problem(stop, p, quote) -> tuple[DiscrepancyKind | None, str]:
+    """Type, side and price against the ledger's confirmed stop, then the market side. The average
+    entry is deliberately not used: break-even and profit-locking stops are legitimate (F3)."""
     long = p.position_side == PositionSide.LONG
     want_side = OrderSide.SELL if long else OrderSide.BUY
     if stop.order_type != OrderType.STP:
-        return f"protective order is {stop.order_type.value}, not a stop"
+        return DiscrepancyKind.PROTECTIVE_STOP_INVALID, (
+            f"protective order is {stop.order_type.value}, not a stop"
+        )
     if stop.side != want_side:
-        return f"stop side {stop.side.value} would add to a {p.position_side.value} position"
-    if p.avg_price and stop.stop_price is not None:
-        avg = Decimal(p.avg_price)
-        if (long and stop.stop_price >= avg) or (not long and stop.stop_price <= avg):
-            return (
-                f"stop {stop.stop_price} is on the wrong side of the average entry {avg} for a "
-                f"{p.position_side.value} position"
+        return DiscrepancyKind.PROTECTIVE_STOP_INVALID, (
+            f"stop side {stop.side.value} would add to a {p.position_side.value} position"
+        )
+    ledger = Decimal(p.stop_price) if p.stop_price else None
+    if ledger is None or stop.stop_price is None or stop.stop_price != ledger:
+        return DiscrepancyKind.STOP_PRICE_MISMATCH, (
+            f"working stop {stop.stop_price} differs from the ledger's stop {ledger}"
+        )
+    if quote is not None and quote.quality != QuoteQuality.UNAVAILABLE:
+        if long and quote.bid is not None and stop.stop_price >= quote.bid:
+            return DiscrepancyKind.PROTECTIVE_STOP_INVALID, (
+                f"sell stop {stop.stop_price} is not below the bid {quote.bid}"
             )
-    return ""
+        if not long and quote.ask is not None and stop.stop_price <= quote.ask:
+            return DiscrepancyKind.PROTECTIVE_STOP_INVALID, (
+                f"buy stop {stop.stop_price} is not above the ask {quote.ask}"
+            )
+    return None, ""
+
+
+def _ledger_key(broker: Broker, p) -> str:
+    """The idea's contract key; a row written before round 2 is resolved by symbol."""
+    if p.contract_key:
+        return p.contract_key
+    try:
+        return broker.resolve(Instrument(asset_class=p.asset_class, symbol=p.symbol)).contract_key
+    except BrokerError:
+        return f"SYMBOL:{p.symbol}"
+
+
+def _quote(broker: Broker, contract):
+    try:
+        return broker.quote(contract)
+    except BrokerError:
+        return None
 
 
 def reconcile(
@@ -128,17 +170,23 @@ def reconcile(
             (e.id for e in open_exceptions if e.kind == kind and e.idea_id == idea_id), None
         )
 
-    # 1. Net quantity per symbol: ledger (signed by idea side) versus broker.
+    # 1. Net quantity per contract (never per symbol: two months of a future, or a stock and a
+    #    future sharing a symbol, are different instruments): ledger (signed) versus broker.
     ledger_net: dict[str, int] = {}
+    symbols: dict[str, str] = {}
     for p in ledger:
         if p.quantity > 0:
+            key = _ledger_key(broker, p)
             sign = 1 if p.position_side == PositionSide.LONG else -1
-            ledger_net[p.symbol] = ledger_net.get(p.symbol, 0) + sign * p.quantity
+            ledger_net[key] = ledger_net.get(key, 0) + sign * p.quantity
+            symbols[key] = p.symbol
     broker_net: dict[str, int] = {}
     for bp in broker_positions:
-        broker_net[bp.contract.symbol] = broker_net.get(bp.contract.symbol, 0) + bp.quantity
-    for symbol in sorted(set(ledger_net) | set(broker_net)):
-        ours, theirs = ledger_net.get(symbol, 0), broker_net.get(symbol, 0)
+        key = bp.contract.contract_key
+        broker_net[key] = broker_net.get(key, 0) + bp.quantity
+        symbols[key] = bp.contract.symbol
+    for key in sorted(set(ledger_net) | set(broker_net)):
+        ours, theirs = ledger_net.get(key, 0), broker_net.get(key, 0)
         if ours == theirs:
             continue
         if ours == 0:
@@ -147,7 +195,7 @@ def reconcile(
             kind, detail = DiscrepancyKind.LEDGER_POSITION_MISSING_AT_BROKER, f"ledger holds {ours}"
         else:
             kind, detail = DiscrepancyKind.QUANTITY_MISMATCH, f"ledger {ours}, broker {theirs}"
-        out.append(Discrepancy(kind=kind, symbol=symbol, detail=detail))
+        out.append(Discrepancy(kind=kind, symbol=symbols[key], contract_key=key, detail=detail))
 
     # 2. Every open idea with a stop level needs a working stop covering exactly its quantity less
     #    what is committed to exits that may be live (review R1).
@@ -165,6 +213,7 @@ def reconcile(
                 Discrepancy(
                     kind=DiscrepancyKind.POSITION_WITHOUT_PROTECTIVE_STOP,
                     symbol=p.symbol,
+                    contract_key=p.contract_key,
                     idea_id=p.idea_id,
                     order_ref=p.stop_ref,
                     detail=f"ledger {p.quantity}, fully committed to working exits; no stop",
@@ -173,20 +222,28 @@ def reconcile(
             continue
         stop = open_by_ref.get(p.stop_ref) if p.stop_ref else None
         if stop is not None and stop.working:
-            problem = _stop_problem(stop, p)
-            if problem:
+            kind, problem = _stop_problem(stop, p, _quote(broker, stop.contract))
+            if kind is not None:
                 out.append(
                     Discrepancy(
-                        kind=DiscrepancyKind.PROTECTIVE_STOP_INVALID,
+                        kind=kind,
                         symbol=p.symbol,
+                        contract_key=p.contract_key,
                         idea_id=p.idea_id,
                         order_ref=p.stop_ref,
                         detail=problem,
                     )
                 )
+        # A PreSubmitted stop counts only once its parent's own fills are applied (never inferred).
+        unproven = (
+            stop is not None
+            and stop.status == OrderStatus.PRE_SUBMITTED
+            and store.filled_quantity(stop.parent_ref or p.stop_ref.rsplit(".", 1)[0]) == 0
+        )
         if (
             stop is None
             or not stop.working
+            or unproven
             or stop.status == OrderStatus.PENDING_CANCEL
             or stop.remaining != cover[p.idea_id]
         ):
@@ -195,6 +252,7 @@ def reconcile(
                 Discrepancy(
                     kind=DiscrepancyKind.POSITION_WITHOUT_PROTECTIVE_STOP,
                     symbol=p.symbol,
+                    contract_key=p.contract_key,
                     idea_id=p.idea_id,
                     order_ref=p.stop_ref,
                     detail=f"ledger {p.quantity}, working stop covers {covered}",
@@ -211,6 +269,7 @@ def reconcile(
                 Discrepancy(
                     kind=DiscrepancyKind.ORPHAN_WORKING_ORDER,
                     symbol=o.contract.symbol,
+                    contract_key=o.contract.contract_key,
                     order_ref=o.order_ref,
                     detail="working order not placed by this ledger",
                 )
@@ -224,6 +283,7 @@ def reconcile(
                     Discrepancy(
                         kind=DiscrepancyKind.ORPHAN_WORKING_ORDER,
                         symbol=o.contract.symbol,
+                        contract_key=o.contract.contract_key,
                         idea_id=row.idea_id,
                         order_ref=o.order_ref,
                         detail="protective order working while the follower idea is flat",
@@ -234,6 +294,7 @@ def reconcile(
                     Discrepancy(
                         kind=DiscrepancyKind.ORPHAN_WORKING_ORDER,
                         symbol=o.contract.symbol,
+                        contract_key=o.contract.contract_key,
                         idea_id=row.idea_id,
                         order_ref=o.order_ref,
                         detail=(
@@ -254,6 +315,7 @@ def reconcile(
                     Discrepancy(
                         kind=DiscrepancyKind.WORKING_ENTRY_ON_CLOSED_IDEA,
                         symbol=o.contract.symbol,
+                        contract_key=o.contract.contract_key,
                         idea_id=row.idea_id,
                         order_ref=o.order_ref,
                         detail=f"entry/add working while the idea is {pos.status}"
@@ -266,6 +328,7 @@ def reconcile(
                 Discrepancy(
                     kind=DiscrepancyKind.ORPHAN_WORKING_ORDER,
                     symbol=o.contract.symbol,
+                    contract_key=o.contract.contract_key,
                     idea_id=row.idea_id,
                     order_ref=o.order_ref,
                     detail=f"working although its intent is {intent.state.value}",

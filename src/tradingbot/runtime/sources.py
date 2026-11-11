@@ -568,7 +568,13 @@ class XTimelineSource:
 
     # ------------------------------------------------------------------ HTTP
 
-    def _params(self, since_id: str | None, max_results: int, pagination: str | None) -> dict:
+    def _params(
+        self,
+        since_id: str | None,
+        max_results: int,
+        pagination: str | None,
+        start_time: datetime | None = None,
+    ) -> dict:
         scheme = FIELD_NAMING[self.naming]
         params = {
             "max_results": str(max_results),
@@ -578,6 +584,8 @@ class XTimelineSource:
         }
         if since_id:
             params["since_id"] = since_id
+        if start_time is not None:
+            params["start_time"] = start_time.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         if pagination:
             params["pagination_token"] = pagination
         return params
@@ -629,11 +637,17 @@ class XTimelineSource:
             )
         self.blocked_until = None
         token = self._access_token()
+        state = self.store.source_state(self.name)
         since_id = self.cursor()
-        if since_id is None:
+        if since_id == "0":
+            since_id = None  # a store written before round 2 (F7): the empty baseline marker
+        if since_id is None and not state.get("baseline_at"):
             self._baseline(token)
             self._pending.reset([])
             return []
+        # Review F7: after an empty baseline there is no id to read from; the baseline time bounds
+        # the read instead, so nothing that existed before the first run is ever passed on.
+        floor = datetime.fromisoformat(state["baseline_at"]) if since_id is None else None
         raw_posts: list[dict] = []
         media_by_key: dict[str, dict] = {}
         pagination: str | None = None
@@ -641,7 +655,7 @@ class XTimelineSource:
         pages = 0
         while True:
             status, headers, body = self._get(
-                lambda p=pagination: self._params(since_id, self.max_results, p), token
+                lambda p=pagination: self._params(since_id, self.max_results, p, floor), token
             )
             if status == 401 and not refreshed:
                 refreshed = True  # an access token revoked early: refresh once, then retry
@@ -665,9 +679,12 @@ class XTimelineSource:
         posts: dict[str, SourcePost] = {}
         for raw in raw_posts:
             pid = str(raw.get("id", ""))
-            if not pid.isdigit() or int(pid) <= int(since_id) or pid in posts:
+            if not pid.isdigit() or (since_id and int(pid) <= int(since_id)) or pid in posts:
                 continue  # defensive: never re-deliver at or before the cursor, never twice
-            posts[pid] = self._to_post(raw, media_by_key, received)
+            post = self._to_post(raw, media_by_key, received)
+            if floor is not None and post.published_at < floor:
+                continue  # existed before the baseline
+            posts[pid] = post
         ordered = sorted(posts.values(), key=lambda p: int(p.post_id))
         self._pending.reset([(p, {}) for p in ordered])
         return list(ordered)
@@ -677,8 +694,9 @@ class XTimelineSource:
         self._check(status, headers)
         ids = [str(p.get("id")) for p in body.get("data") or [] if p.get("id")]
         state = self.store.source_state(self.name)
-        # An account with no posts yet starts from id 0: every later post is new.
-        state["since_id"] = newest_id(None, ids) or "0"
+        # An account with no posts yet has no id to start from: the baseline time is the floor
+        # (review F7; "0" used to let every older post through to the freshness rule).
+        state["since_id"] = newest_id(None, ids)
         state["baseline_at"] = self.clock().isoformat()
         self.store.put_source_state(self.name, state, self.clock())
 

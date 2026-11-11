@@ -141,3 +141,23 @@ class Harness:
 
     def working(self) -> dict[str, object]:
         return {o.order_ref: o for o in self.broker.open_orders()}
+
+    def record_never_sent(self, source_id: str, act: TradeAction) -> str:
+        """Write-ahead recorded, then the process died before the request was made (attempts 0).
+        Since round 2 (F5) this is the only unknown-outcome case in which an entry or add may still
+        be sent, after its entry checks pass again. Returns the intent's order_ref."""
+        from tradingbot.execution.coordinator import order_ref_for
+        from tradingbot.execution.sim_broker import SimulatedCrash
+
+        def die(*_a, **_k):
+            raise SimulatedCrash("invented: died before the request was made")
+
+        self.coord.store.mark_submitted = die
+        try:
+            self.execute(source_id, act)
+        except SimulatedCrash:
+            pass
+        self.restart()
+        ref = order_ref_for(source_id, 1, act.action_id)
+        assert self.coord.intent(ref).attempts == 0
+        return ref
