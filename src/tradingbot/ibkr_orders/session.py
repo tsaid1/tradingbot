@@ -48,7 +48,7 @@ from ibapi.protobuf.ConfigRequest_pb2 import ConfigRequest
 from ibapi.protobuf.IdsRequest_pb2 import IdsRequest
 from ibapi.protobuf.PlaceOrderRequest_pb2 import PlaceOrderRequest
 
-from tradingbot.execution.broker import TERMINAL_STATUSES, WORKING_STATUSES, OrderStatus
+from tradingbot.execution.broker import WORKING_STATUSES, OrderStatus
 from tradingbot.ibkr.environment import run_preflight
 from tradingbot.ibkr.errors import (
     CONNECTION_CODES,
@@ -85,7 +85,13 @@ from tradingbot.ibkr_orders.guard import (
     WorkingOrder,
     order_guard,
 )
-from tradingbot.ibkr_orders.mapping import classify_order_error, map_status, merge_status
+from tradingbot.ibkr_orders.mapping import (
+    FINAL_STATUSES,
+    OPEN_STATUSES,
+    classify_order_error,
+    map_status,
+    merge_status,
+)
 from tradingbot.ibkr_orders.records import (
     AmendRejected,
     CancelFailed,
@@ -406,7 +412,8 @@ class _Track:
 
     @property
     def working(self) -> bool:
-        return self.status is not None and self.status in WORKING_STATUSES
+        """Not final. Includes INACTIVE: at IBKR an inactive order can still become active."""
+        return self.status is not None and self.status in OPEN_STATUSES
 
 
 
@@ -635,16 +642,16 @@ class PaperOrderSession(IbkrSession):
             self._require_ready()
             with self._cond:
                 t = self._tracks.get(order_id)
-                if t is None or not t.own or (t.status in TERMINAL_STATUSES):
+                if t is None or not t.own or (t.status in FINAL_STATUSES):
                     raise OrderNotWorking(f"order {order_id} is not a working order of this "
                                           "client")
                 before = t.error_seq
                 t.cancel_error = ""
             self._send_cancel(t)
             with self._cond:
-                self._wait(lambda: t.status in TERMINAL_STATUSES or (
+                self._wait(lambda: t.status in FINAL_STATUSES or (
                     t.error_seq > before and bool(t.cancel_error)), self._cancel_wait)
-                if t.cancel_error and t.status not in TERMINAL_STATUSES:
+                if t.cancel_error and t.status not in FINAL_STATUSES:
                     raise CancelFailed(f"cancel of order {order_id} refused: {t.cancel_error}")
                 return self._snap(t)
 
@@ -652,7 +659,13 @@ class PaperOrderSession(IbkrSession):
     def open_orders(self, *, timeout: float | None = None) -> list[OrderSnapshot]:
         """``reqAllOpenOrders`` (every client and TWS) until ``openOrderEnd``. Raises on failure.
         Orders of this client that the snapshot does not show but whose latest callback says
-        working are added (open orders can lag a fresh submission)."""
+        working are added (open orders can lag a fresh submission). Final orders are left out;
+        INACTIVE orders are kept (not final at this broker)."""
+        return [s for s in self._open_snapshot(timeout) if s.status not in FINAL_STATUSES]
+
+    def _open_snapshot(self, timeout: float | None = None) -> list[OrderSnapshot]:
+        """Every row of the broker's open-orders answer, whatever its status, plus this client's
+        orders that are not final but not (yet) in the answer."""
         rows = self._request(
             "open_orders", lambda rid: self._client.reqAllOpenOrdersProtoBuf(
                 AllOpenOrdersRequest()), None, timeout or self._request_timeout,
@@ -668,7 +681,7 @@ class PaperOrderSession(IbkrSession):
                 if t.own and t.working and t.order_id not in seen_own and t.order_type:
                     out[(True, t.order_id)] = self._snap(
                         t, reason="LOCAL_STATE_NOT_IN_SNAPSHOT")
-            return [s for s in out.values() if s.status not in TERMINAL_STATUSES]
+            return list(out.values())
 
     def executions(self, *, timeout: float | None = None) -> list[ExecRecord]:
         """``reqExecutions`` filtered to the account. TWS returns the current day's executions
@@ -709,7 +722,7 @@ class PaperOrderSession(IbkrSession):
                               time_zone_id=c.time_zone_id, liquid_hours=c.liquid_hours)
         rows = self.positions()
         position = sum((r.quantity for r in rows if r.con_id == c.con_id), Decimal(0))
-        snaps = self.open_orders()
+        snaps = self._open_snapshot()  # every row, whatever its status (an Inactive BUY counts)
         working_ids = {(s.client_id, s.order_id) for s in snaps}
         # another client's order ids are not ours: give them ids that cannot collide (< 0)
         working = [WorkingOrder(order_id=s.order_id if s.own else -(n + 1),
@@ -823,7 +836,7 @@ class PaperOrderSession(IbkrSession):
     def _cancel_quietly(self, order_id: int) -> None:
         try:
             t = self._tracks.get(order_id)
-            if t is not None and t.status not in TERMINAL_STATUSES:
+            if t is not None and t.status not in FINAL_STATUSES:
                 self._send_cancel(t)
         except Exception as exc:  # noqa: BLE001 - recorded; the caller reports an unknown outcome
             self.internal_errors.append(redact_accounts(f"parent cancel failed: {exc}"))
@@ -831,7 +844,7 @@ class PaperOrderSession(IbkrSession):
     def _own_working(self, order_id: int) -> _Track:
         with self._cond:
             t = self._tracks.get(order_id)
-            if (t is None or not t.own or not t.working
+            if (t is None or not t.own or t.status not in WORKING_STATUSES
                     or t.status == OrderStatus.PENDING_CANCEL or not t.order_type):
                 raise OrderNotWorking(f"order {order_id} is not a working order of this client")
             return t
@@ -1015,8 +1028,8 @@ class PaperOrderSession(IbkrSession):
                         else known.filled if known is not None else Decimal(0))
             t.remaining = Decimal(0)
             t.updated_at = parse_broker_time(state.completedTime) or datetime.now(UTC)
-            if known is not None and known.status not in TERMINAL_STATUSES and \
-                    status in TERMINAL_STATUSES:
+            if known is not None and known.status not in FINAL_STATUSES and \
+                    status in FINAL_STATUSES:
                 known.status = merge_status(known.status, status, filled=known.filled,
                                             total=known.total)
             reason = state.completedStatus or (known.rejected if known is not None else "")
@@ -1061,8 +1074,8 @@ class PaperOrderSession(IbkrSession):
             t.send_failed = True
         elif t.modify_pending:
             t.modify_error = text  # the original order stands
-        elif t.status is None or t.status == OrderStatus.PENDING_SUBMIT:
-            t.rejected = text
+        elif t.status in (None, OrderStatus.PENDING_SUBMIT, OrderStatus.INACTIVE):
+            t.rejected = text  # an explicit rejection makes an Inactive order final
             t.status = OrderStatus.REJECTED
         else:
             t.rejected = t.rejected or text  # an error on a live order: recorded, not guessed

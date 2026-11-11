@@ -458,3 +458,13 @@ def test_a_stop_is_allowed_only_as_a_protective_or_reducing_sell():
     assert order_guard(sell_stop, ctx(position=Decimal(1))) is ALLOW  # reduces a held long
     child = replace(sell_stop, order_id=101, parent_id=100)
     assert order_guard(child, ctx(parent=order())) is ALLOW  # protects a bracketed long
+
+
+def test_inactive_is_not_sticky():
+    one = Decimal(1)
+    assert merge_status(OrderStatus.INACTIVE, OrderStatus.SUBMITTED, filled=Decimal(0),
+                        total=one) == OrderStatus.SUBMITTED
+    assert merge_status(OrderStatus.INACTIVE, OrderStatus.CANCELLED, filled=Decimal(0),
+                        total=one) == OrderStatus.CANCELLED
+    assert merge_status(OrderStatus.CANCELLED, OrderStatus.INACTIVE, filled=Decimal(0),
+                        total=one) == OrderStatus.CANCELLED

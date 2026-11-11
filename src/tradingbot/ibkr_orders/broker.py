@@ -96,6 +96,13 @@ class IbkrPaperBroker:
             # refusing to read is safer than hiding it from exit netting
             raise BrokerError(f"unmappable order {s.order_id}: {s.order_type}/{s.tif}/{s.action}"
                               ) from None
+        status, reason = s.status, s.reason
+        if status == OrderStatus.INACTIVE:
+            # At IBKR Inactive is not final (held, or rejected): never handed to the core as
+            # INACTIVE, which it records as rejected. UNKNOWN keeps it unresolved, unprotected.
+            status = OrderStatus.UNKNOWN
+            reason = "IBKR_INACTIVE: held or rejected, not final" + (f"; {reason}" if reason
+                                                                       else "")
         return BrokerOrder(
             broker_order_id=str(s.order_id if s.own else f"perm:{s.perm_id}"),
             order_ref=s.order_ref or f"UNREF:{s.perm_id or s.order_id}",
@@ -104,8 +111,8 @@ class IbkrPaperBroker:
             side=side, quantity=_int_qty(s.total_quantity, "order"), order_type=order_type,
             limit_price=s.limit_price if order_type == OrderType.LMT else None,
             stop_price=s.stop_price if order_type == OrderType.STP else None,
-            tif=tif, status=s.status, filled_quantity=_int_qty(s.filled, "filled"),
-            avg_fill_price=s.avg_fill_price, reason=s.reason, updated_at=s.updated_at,
+            tif=tif, status=status, filled_quantity=_int_qty(s.filled, "filled"),
+            avg_fill_price=s.avg_fill_price, reason=reason, updated_at=s.updated_at,
         )
 
     def _find(self, order_ref: str) -> int:

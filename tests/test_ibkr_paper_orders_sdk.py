@@ -700,3 +700,41 @@ def test_delayed_quote_is_not_upgraded(tws, tmp_path):
         assert q.quality.value == "DELAYED"
     finally:
         s.disconnect()
+
+
+# --- review round 2: Inactive is not final at this broker -------------------------------------
+def test_inactive_order_still_counts_as_working_and_can_be_cancelled(tws, tmp_path):
+    s = make(tws, tmp_path)
+    b = IbkrPaperBroker(s)
+    try:
+        snaps = s.place([buy(), stop()])
+        tws.set_status(snaps[0].order_id, "Inactive")
+        assert settle(lambda: s._tracks[snaps[0].order_id].raw_status == "Inactive")
+        with pytest.raises(OrderRefused) as info:  # the inactive BUY can still become live
+            s.place([buy("TB-0002")])
+        assert info.value.refusal.reason == RefusalReason.POSITION_CAP
+        surfaced = {o.order_ref: o for o in b.open_orders()}["TB-0001"]
+        assert surfaced.status not in (OrderStatus.REJECTED, OrderStatus.INACTIVE)
+        assert surfaced.status == OrderStatus.UNKNOWN and "INACTIVE" in surfaced.reason
+        assert s.cancel(snaps[0].order_id).status == OrderStatus.CANCELLED
+        assert placed(tws) == 2
+    finally:
+        s.disconnect()
+
+
+def test_inactive_order_can_become_active_again_or_be_rejected(tws, tmp_path):
+    s = make(tws, tmp_path)
+    try:
+        snaps = s.place([buy(), stop()])
+        parent, child = snaps[0].order_id, snaps[1].order_id
+        tws.set_status(parent, "Inactive")
+        assert settle(lambda: s._tracks[parent].raw_status == "Inactive")
+        tws.set_status(parent, "Submitted")  # merely held: active again
+        assert settle(lambda: s._tracks[parent].status == OrderStatus.SUBMITTED)
+        tws.set_status(child, "Inactive")
+        assert settle(lambda: s._tracks[child].raw_status == "Inactive")
+        from _ibkr_fake_tws import error_frame
+        tws.push(error_frame(child, 201, "Order rejected - reason: invented"))
+        assert settle(lambda: s._tracks[child].status == OrderStatus.REJECTED)
+    finally:
+        s.disconnect()

@@ -9,7 +9,14 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from tradingbot.execution.broker import TERMINAL_STATUSES, OrderStatus
+from tradingbot.execution.broker import TERMINAL_STATUSES, WORKING_STATUSES, OrderStatus
+
+# At IBKR "Inactive" is not final: an inactive order may be rejected, or merely held and able to
+# become active again. Here it is therefore NOT sticky, it still counts as a working order for
+# netting and the position cap, and it can be cancelled. (The execution core lists INACTIVE among
+# its terminal statuses; the broker adapter never hands it INACTIVE, see ``broker._order``.)
+FINAL_STATUSES = TERMINAL_STATUSES - {OrderStatus.INACTIVE}
+OPEN_STATUSES = WORKING_STATUSES | {OrderStatus.INACTIVE}
 
 _BY_NAME = {
     "ApiPending": OrderStatus.PENDING_SUBMIT,
@@ -37,14 +44,15 @@ def map_status(status: str | None, filled: Decimal | None = None,
 
 def merge_status(current: OrderStatus | None, new: OrderStatus, *, filled: Decimal,
                  total: Decimal) -> OrderStatus:
-    """Tolerate duplicate and out-of-order callbacks: a terminal status is sticky (a late
-    'Submitted' after 'Filled' is ignored), except that FILLED replaces another terminal state
-    when everything is in fact filled. UNKNOWN never overwrites a known state."""
+    """Tolerate duplicate and out-of-order callbacks: a final status is sticky (a late
+    'Submitted' after 'Filled' is ignored), except that FILLED replaces another final state
+    when everything is in fact filled. UNKNOWN never overwrites a known state. INACTIVE is not
+    final (see ``FINAL_STATUSES``)."""
     if current is None:
         return new
     if new == OrderStatus.UNKNOWN:
         return current
-    if current in TERMINAL_STATUSES:
+    if current in FINAL_STATUSES:
         if new == OrderStatus.FILLED and current != OrderStatus.FILLED and filled >= total > 0:
             return OrderStatus.FILLED
         return current

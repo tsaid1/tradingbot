@@ -49,7 +49,9 @@ from ibapi.protobuf.TickString_pb2 import TickString
 
 TLT_CON_ID = 15547841
 ET = ZoneInfo("US/Eastern")
-TERMINAL = {"Filled", "Cancelled", "ApiCancelled", "Inactive"}
+# "Inactive" is NOT final at this broker: an inactive order may be rejected, or merely held and
+# later become active. The fake keeps it open (listed, cancellable) until a final state.
+TERMINAL = {"Filled", "Cancelled", "ApiCancelled"}
 READ_ONLY_REJECTION = (321, ("Error validating request.-'bW' : cause - The API interface is "
                             "currently in Read-Only mode."))
 
@@ -336,6 +338,13 @@ class FakeOrderTws(FakeTws):
                         self._set(c, "Cancelled")
                         self.push(self._status(c))
         return exec_id
+
+    def set_status(self, order_id: int, status: str) -> None:
+        """Push a broker-originated status change (e.g. Inactive, then Submitted again)."""
+        fo = self.orders[order_id]
+        self._set(fo, status)
+        self.push(self._open(fo))
+        self.push(self._status(fo))
 
     def _move_position(self, contract: ContractProto, delta: Decimal) -> None:
         for i, (acct, sym, con, qty) in enumerate(self.positions):
