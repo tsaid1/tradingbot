@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import dataclasses
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from decimal import Decimal
 from enum import Enum
 
@@ -83,6 +84,15 @@ DELAYED_TICK_IDS = frozenset({66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 88, 90
 
 @dataclass(frozen=True)
 class QuoteSnapshot:
+    """One quote attempt and its evidence.
+
+    ``quote_age_seconds``: local receipt time (``received_at``) minus the exchange last-trade
+    timestamp (tick 45/88), in seconds, when TWS delivered that timestamp; otherwise ``None`` and
+    the flag ``QUOTE_AGE_UNKNOWN``. It describes the LAST TRADE ONLY. It says nothing about how
+    fresh the bid or ask is (TWS sends no time for those), and nothing here infers bid/ask
+    freshness from it. It also includes any local clock offset.
+    """
+
     con_id: int
     symbol: str
     bid: float | None
@@ -112,6 +122,9 @@ class QuoteSnapshot:
     request_error: str | None = None
     first_tick_ms: int | None = None  # after the request was sent
     last_tick_ms: int | None = None
+    quote_age_seconds: float | None = None  # receipt minus last-trade time; LAST TRADE ONLY
+    ended_early: bool = False  # stream ended once complete and settled, before its window
+    window_ms: int = 0  # the bounded wait for this attempt
 
     @property
     def ticks_received(self) -> int:
@@ -178,6 +191,14 @@ def assess_quote(*, bid: float | None, ask: float | None, last: float | None,
     return QuoteQuality.FROZEN, tuple(flags)
 
 
+def quote_age_seconds(received_at: datetime, last_trade_epoch: int | None) -> float | None:
+    """Receipt time minus the exchange last-trade timestamp (unix seconds), or ``None`` when no
+    timestamp was delivered. Dates the last trade only, never the bid or ask."""
+    if last_trade_epoch is None:
+        return None
+    return round((received_at - datetime.fromtimestamp(last_trade_epoch, UTC)).total_seconds(), 3)
+
+
 def to_jsonable(obj: object) -> object:
     """Dataclass/enum/Decimal -> plain JSON types."""
     if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
@@ -199,7 +220,8 @@ QUOTE_PASS, QUOTE_WARN, QUOTE_FAIL = "PASS", "PASS_WITH_WARNINGS", "FAIL"
 
 @dataclass(frozen=True)
 class QuoteReport:
-    """All quote attempts (snapshot, then at most one streaming sample) and the step verdict."""
+    """All quote attempts (a streaming sample, then at most one snapshot if the caller asked for
+    it) and the step verdict."""
     attempts: tuple[QuoteSnapshot, ...]
     status: str
     reason: str

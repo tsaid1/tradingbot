@@ -504,13 +504,14 @@ def test_unentitled_quote_on_both_routes_check_fails_with_evidence(tws, tmp_path
     os.chmod(cfg_path, 0o600)
     from tradingbot.ibkr.check import summarize
 
-    report = run_check(cfg_path, session_factory=lambda cfg: session(stream_seconds=0.3))
+    report = run_check(cfg_path, session_factory=lambda cfg: session(stream_seconds=0.3),
+                       quote_snapshot_fallback=True)
     assert report["overall"] == "FAIL"
     assert "no market data delivered" in summarize(report).splitlines()[0]
     step = next(st for st in report["steps"] if st["name"] == "quote")
     assert step["status"] == "FAIL"
     attempts = step["detail"]["attempts"]
-    assert [a["route"] for a in attempts] == ["snapshot", "stream"]
+    assert [a["route"] for a in attempts] == ["stream", "snapshot"]
     assert all(a["request_events"][0][0] == 354 for a in attempts)
 
 
@@ -750,10 +751,9 @@ def test_snapshot_with_ticks_but_no_end_returns_evidence(tws):
 
     tws.on["REQ_MKT_DATA"] = handler
     with session() as s:
-        report = s.quote(_resolve(s), snapshot_timeout=0.5, stream_seconds=0.3)
-    assert len(report.attempts) == 1  # bid/ask arrived: no streaming fallback
-    q = report.attempts[0]
-    assert q.snapshot_end_missing and "SNAPSHOT_END_MISSING" in q.flags
+        q = s.quote_snapshot(_resolve(s), timeout=0.5)
+    status, reason = models.assess_quote_attempts((q,))
+    assert q.route == "snapshot" and q.snapshot_end_missing and "SNAPSHOT_END_MISSING" in q.flags
     assert (q.bid, q.ask) == (88.10, 88.12) and q.quality is QuoteQuality.DELAYED
     assert q.tick_counts == {"DELAYED_BID": 1, "DELAYED_BID_SIZE": 1, "DELAYED_ASK": 1,
                              "DELAYED_ASK_SIZE": 1}
@@ -761,38 +761,98 @@ def test_snapshot_with_ticks_but_no_end_returns_evidence(tws):
     assert q.tick_req_params == {"minTick": 0.01, "bboExchange": "9c0001",
                                  "snapshotPermissions": 3}
     assert q.first_tick_ms is not None and q.last_tick_ms >= q.first_tick_ms
-    assert report.status == "PASS_WITH_WARNINGS" and "DELAYED" in report.reason
+    assert status == "PASS_WITH_WARNINGS" and "DELAYED" in reason
+    assert "QUOTE_AGE_UNKNOWN" in q.flags and q.quote_age_seconds is None
     assert tws.names().count("CANCEL_MKT_DATA") == 1  # unended snapshot cancelled
 
 
-def test_empty_snapshot_then_streaming_success(tws):
+def _live_stream(srv, c, r, last_ts=None):
+    c.push(_mdt(r.reqId, 1))
+    c.push(_tick(r.reqId, 1, 88.00))
+    c.push(_tick(r.reqId, 2, 88.02))
+    c.push(_tick(r.reqId, 4, 88.01))
+    if last_ts is not None:
+        c.push(frame(IN.TICK_STRING, TickString(reqId=r.reqId, tickType=45, value=str(last_ts))))
+
+
+def test_default_quote_is_one_stream_that_ends_early_once_complete(tws):
+    last_ts = int(time.time()) - 90
+    tws.on["REQ_MKT_DATA"] = lambda srv, c, r: _live_stream(srv, c, r, last_ts)
+    with session(stream_seconds=5.0, stream_settle_seconds=0.3) as s:
+        contract = _resolve(s)
+        t0 = time.monotonic()
+        report = s.quote(contract)
+        elapsed = time.monotonic() - t0
+    (q,) = report.attempts
+    assert q.route == "stream" and q.ended_early and q.window_ms == 5000
+    assert 0.3 <= elapsed < 2.0 and q.waited_ms < 2000
+    assert q.quality is QuoteQuality.LIVE and report.status == "PASS"
+    assert 89 <= q.quote_age_seconds < 95 and "QUOTE_AGE_UNKNOWN" not in q.flags
+    assert [r.snapshot for n, r in tws.requests if n == "REQ_MKT_DATA"] == [False]
+    assert tws.names().count("CANCEL_MKT_DATA") == 1  # a stream is always cancelled
+
+
+def test_stream_without_last_waits_its_window_and_age_is_unknown(tws):
     def handler(srv, c, r):
-        if r.snapshot:
-            c.push(frame(IN.TICK_SNAPSHOT_END, TickSnapshotEnd(reqId=r.reqId)))
+        c.push(_mdt(r.reqId, 3))
+        c.push(_tick(r.reqId, 66, 88.10))
+        c.push(_tick(r.reqId, 67, 88.12))  # no last, no last timestamp
+
+    tws.on["REQ_MKT_DATA"] = handler
+    with session(stream_settle_seconds=0.1) as s:
+        report = s.quote(_resolve(s), stream_seconds=0.6)
+    (q,) = report.attempts
+    assert not q.ended_early and q.waited_ms >= 600
+    assert q.quote_age_seconds is None and "QUOTE_AGE_UNKNOWN" in q.flags
+    assert report.status == "PASS_WITH_WARNINGS" and "CANCEL_MKT_DATA" in tws.names()
+
+
+def test_stream_without_market_data_type_does_not_end_early(tws):
+    def handler(srv, c, r):
+        for tick, price in ((1, 88.0), (2, 88.02), (4, 88.01)):
+            c.push(_tick(r.reqId, tick, price))
+
+    tws.on["REQ_MKT_DATA"] = handler
+    with session(stream_settle_seconds=0.1) as s:
+        q = s.quote_stream_sample(_resolve(s), seconds=0.5)
+    assert not q.ended_early and q.waited_ms >= 500
+
+
+def test_empty_stream_then_requested_snapshot_success(tws):
+    def handler(srv, c, r):
+        if not r.snapshot:
             return
-        c.push(_mdt(r.reqId, 1))
-        c.push(_tick(r.reqId, 1, 88.00))
-        c.push(_tick(r.reqId, 2, 88.02))
-        c.push(_tick(r.reqId, 4, 88.01))
+        _live_stream(srv, c, r)
+        c.push(frame(IN.TICK_SNAPSHOT_END, TickSnapshotEnd(reqId=r.reqId)))
 
     tws.on["REQ_MKT_DATA"] = handler
     with session() as s:
-        report = s.quote(_resolve(s), stream_seconds=0.4)
-    snap, stream = report.attempts
-    assert snap.route == "snapshot" and not snap.snapshot_end_missing and snap.ticks_received == 0
-    assert stream.route == "stream" and stream.quality is QuoteQuality.LIVE
-    assert report.status == "PASS" and "stream" in report.reason
+        report = s.quote(_resolve(s), stream_seconds=0.4, snapshot_fallback=True)
+    stream, snap = report.attempts
+    assert stream.route == "stream" and stream.ticks_received == 0 and not stream.ended_early
+    assert snap.route == "snapshot" and not snap.snapshot_end_missing
+    assert snap.quality is QuoteQuality.LIVE
+    assert report.status == "PASS" and "snapshot" in report.reason
     reqs = [r for n, r in tws.requests if n == "REQ_MKT_DATA"]
-    assert [r.snapshot for r in reqs] == [True, False]
+    assert [r.snapshot for r in reqs] == [False, True]
     assert tws.names().count("CANCEL_MKT_DATA") == 1  # stream always cancelled; ended snapshot not
+
+
+def test_snapshot_is_not_tried_unless_asked(tws):
+    tws.on["REQ_MKT_DATA"] = lambda srv, c, r: None
+    with session() as s:
+        report = s.quote(_resolve(s), stream_seconds=0.3)
+    assert [a.route for a in report.attempts] == ["stream"] and report.status == "FAIL"
+    assert [r.snapshot for n, r in tws.requests if n == "REQ_MKT_DATA"] == [False]
 
 
 def test_nothing_on_both_routes(tws):
     tws.on["REQ_MKT_DATA"] = lambda srv, c, r: None
     with session() as s:
-        report = s.quote(_resolve(s), snapshot_timeout=0.3, stream_seconds=0.3)
+        report = s.quote(_resolve(s), snapshot_timeout=0.3, stream_seconds=0.3,
+                         snapshot_fallback=True)
     assert report.status == "FAIL" and "no market data delivered" in report.reason
-    snap, stream = report.attempts
+    stream, snap = report.attempts
     assert snap.snapshot_end_missing and not stream.snapshot_end_missing
     assert snap.ticks_received == stream.ticks_received == 0
     assert snap.waited_ms >= 300 and stream.waited_ms >= 300

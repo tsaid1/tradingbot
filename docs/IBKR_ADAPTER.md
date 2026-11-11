@@ -4,7 +4,7 @@ A thin adapter over the **official** Interactive Brokers TWS API for Python (`ib
 `EClient`/`EWrapper`/`EReader`). This phase is **read-only and paper-only**. The adapter checks the
 local paper environment, connects, checks the account identity, verifies
 that the API is in read-only mode, then resolves a contract, reads the account summary and
-positions, and takes a quote snapshot.
+positions, and samples a quote.
 
 | Module | Imports `ibapi`? | Purpose |
 |---|---|---|
@@ -185,10 +185,19 @@ Other protections:
   - The poisoned and connection state is re-checked under the lock immediately before every send.
   - `disconnect()` joins the handshake, `EClient.run` and `EReader` threads within a bound.
 - **Quotes.** `quote()` makes up to two attempts, each with `reqMarketDataType(3)` first:
-  1. A snapshot `reqMktData`, waiting up to 20 s.
-  2. Only if the snapshot delivered no bid, ask or last price: one streaming sample
-     (`snapshot=False`) for a bounded window (8 s by default, configurable), always followed by
-     `cancelMktData`.
+  1. One streaming sample (`reqMktData`, `snapshot=False`) for a bounded window (`stream_seconds`,
+     8 s by default), always followed by `cancelMktData`. It ends early (`ended_early`) once bid,
+     ask, last and the market-data type have all arrived and `stream_settle_seconds` (1 s) have
+     passed with no new tick type.
+  2. Only if the caller asks (`snapshot_fallback=True`; the script's
+     `--quote-snapshot-fallback`) and the stream delivered no valid two-sided quote: one snapshot
+     `reqMktData`, waiting up to `quote_timeout` (20 s).
+
+  Why this order: in the first real paper run (type 3 requested) the snapshot delivered nothing
+  at all in 20 s, with no tick, no market-data-type callback, no error and no snapshot end. The
+  stream delivered a complete DELAYED two-sided quote (delayed bid, ask, last, sizes, last
+  timestamp, open, high, low, close, volume; type 3; first tick after about 5.3 s), and
+  `tickReqParams` reported `snapshotPermissions` 4.
 
   Nothing collected is ever discarded. A snapshot that does not end is returned with what arrived
   and flagged `SNAPSHOT_END_MISSING`. Each attempt records:
@@ -196,7 +205,10 @@ Other protections:
   - every `marketDataType` value delivered;
   - `tickReqParams` (including `snapshotPermissions`);
   - every error and notice carrying its reqId;
-  - the first and last tick times, and the time waited.
+  - the first and last tick times, the window (`window_ms`), the time waited and `ended_early`;
+  - `quote_age_seconds`: receipt time minus the exchange last-trade timestamp (tick 45/88), when
+    TWS delivered one; otherwise `None` and the flag `QUOTE_AGE_UNKNOWN`. It dates the last trade
+    only and includes any local clock offset. Nothing infers bid/ask freshness from it.
 
   The SDK decodes delayed tick types (66–76, 88) exactly like live ones, and the adapter maps
   delayed bid, ask, last, their sizes, close and the last timestamp. The verdict is:
@@ -218,15 +230,16 @@ Other protections:
 ```sh
 cd <worktree>
 PYTHONPATH="$PWD/src" ~/.venvs/tradingbot/bin/python scripts/ibkr_paper_check.py \
-    [--config ~/.config/tradingbot/ibkr/paper.toml] [--report-dir <workspace>/private/ibkr_reports]
+    [--config ~/.config/tradingbot/ibkr/paper.toml] [--report-dir <workspace>/private/ibkr_reports] \
+    [--quote-snapshot-fallback]
 ```
 
 The check runs these steps in order:
 
 1. Preflight and connect: profile, listener, version, identity gate and read-only check.
 2. Resolve TLT (STK/SMART/USD, primary NASDAQ).
-3. Account summary, then positions, then the TLT quote (snapshot, plus streaming fallback if
-   needed).
+3. Account summary, then positions, then the TLT quote (a streaming sample; a snapshot as a second
+   attempt only with `--quote-snapshot-fallback`).
 4. Disconnect, then reconnect once and disconnect again (recovery proof, with reader-thread join
    verified each time).
 

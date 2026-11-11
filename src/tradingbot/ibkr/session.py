@@ -78,6 +78,7 @@ from tradingbot.ibkr.models import (
     ResolvedContract,
     assess_quote,
     assess_quote_attempts,
+    quote_age_seconds,
 )
 from tradingbot.ibkr.redact import mask_account, redact_accounts
 
@@ -276,6 +277,7 @@ class _Pending:
     delayed_ticks: bool = False
     live_ticks: bool = False
     last_trade_time: str | None = None
+    last_trade_epoch: int | None = None
     unavailable_code: int | None = None
     close: float | None = None
     tick_counts: dict[str, int] = field(default_factory=dict)
@@ -285,6 +287,8 @@ class _Pending:
     t0: float = 0.0
     first_tick: float | None = None
     last_tick: float | None = None
+    last_new_tick_type: float | None = None  # when a tick type not seen before last arrived
+    ended_early: bool = False
     timed_out: bool = False
     request_error: str | None = None
 
@@ -385,7 +389,7 @@ class IbkrSession:
 
     def __init__(self, config: PaperConnectionConfig, *, connect_timeout: float = 15.0,
                  request_timeout: float = 10.0, quote_timeout: float = 20.0,
-                 stream_seconds: float = 8.0,
+                 stream_seconds: float = 8.0, stream_settle_seconds: float = 1.0,
                  shutdown_timeout: float = 5.0,
                  preflight: Callable[[PaperConnectionConfig], dict] = run_preflight) -> None:
         if not isinstance(config, PaperConnectionConfig) or config.mode != "paper":
@@ -397,6 +401,7 @@ class IbkrSession:
         self._request_timeout = request_timeout
         self._quote_timeout = quote_timeout
         self._stream_seconds = stream_seconds
+        self._stream_settle_seconds = stream_settle_seconds
         self._shutdown_timeout = shutdown_timeout
 
         self._cond = threading.Condition(threading.RLock())
@@ -708,15 +713,20 @@ class IbkrSession:
             cancel_always=True, build=build)
 
     def quote(self, contract: ResolvedContract, *, market_data_type: int = 3,
-              snapshot_timeout: float | None = None,
-              stream_seconds: float | None = None) -> QuoteReport:
-        """Snapshot first; if it delivers no bid/ask/last price, ONE bounded streaming sample.
-        Every attempt is kept as evidence; the verdict comes from ``assess_quote_attempts``."""
-        attempts = [self.quote_snapshot(contract, market_data_type=market_data_type,
-                                        timeout=snapshot_timeout)]
-        if not attempts[0].has_price:
-            attempts.append(self.quote_stream_sample(contract, market_data_type=market_data_type,
-                                                     seconds=stream_seconds))
+              stream_seconds: float | None = None, snapshot_fallback: bool = False,
+              snapshot_timeout: float | None = None) -> QuoteReport:
+        """ONE bounded streaming sample first (it ends early once the quote is complete, see
+        ``quote_stream_sample``). Only if the caller asks (``snapshot_fallback``) and the stream
+        did not deliver a valid two-sided quote: one snapshot as a second attempt. Every attempt is
+        kept as evidence; the verdict comes from ``assess_quote_attempts``.
+
+        Why stream first: on the paper account the snapshot delivered nothing at all in 20 s (no
+        tick, no type, no error, no end) while the stream delivered a full delayed quote."""
+        attempts = [self.quote_stream_sample(contract, market_data_type=market_data_type,
+                                             seconds=stream_seconds)]
+        if snapshot_fallback and not attempts[0].two_sided_valid:
+            attempts.append(self.quote_snapshot(contract, market_data_type=market_data_type,
+                                                timeout=snapshot_timeout))
         status, reason = assess_quote_attempts(tuple(attempts))
         return QuoteReport(attempts=tuple(attempts), status=status, reason=reason)
 
@@ -731,12 +741,23 @@ class IbkrSession:
 
     def quote_stream_sample(self, contract: ResolvedContract, *, market_data_type: int = 3,
                             seconds: float | None = None) -> QuoteSnapshot:
-        """Streaming ``reqMktData`` for a bounded window, then always ``cancelMktData``."""
+        """Streaming ``reqMktData`` for a bounded window (default ``stream_seconds``, 8 s), then
+        always ``cancelMktData``. Ends early (``ended_early``) once bid, ask, last and the
+        market-data type have all arrived and ``stream_settle_seconds`` (1 s) have passed with
+        no new tick type."""
+        settle = self._stream_settle_seconds
+
+        def complete(p: _Pending) -> bool:
+            return (all(k in p.prices for k in ("bid", "ask", "last"))
+                    and p.market_data_type is not None and p.last_new_tick_type is not None
+                    and time.monotonic() - p.last_new_tick_type >= settle)
+
         return self._quote_attempt(contract, market_data_type, snapshot=False,
-                                   wait=seconds or self._stream_seconds)
+                                   wait=seconds or self._stream_seconds, early=complete)
 
     def _quote_attempt(self, contract: ResolvedContract, market_data_type: int, *,
-                       snapshot: bool, wait: float) -> QuoteSnapshot:
+                       snapshot: bool, wait: float,
+                       early: Callable[[_Pending], bool] | None = None) -> QuoteSnapshot:
         if market_data_type not in MARKET_DATA_TYPE_NAMES:
             raise ValueError("market_data_type must be 1, 2, 3 or 4")
         c = Contract()
@@ -758,6 +779,10 @@ class IbkrSession:
                 delayed_ticks_seen=p.delayed_ticks, live_ticks_seen=p.live_ticks,
                 unavailable_code=p.unavailable_code)
             end_missing = snapshot and not p.ended
+            received = datetime.now(UTC)
+            age = quote_age_seconds(received, p.last_trade_epoch)
+            if age is None:
+                flags = (*flags, "QUOTE_AGE_UNKNOWN")
             if end_missing:
                 flags = (*flags, "SNAPSHOT_END_MISSING")
             if p.request_error:
@@ -767,7 +792,8 @@ class IbkrSession:
                 bid_size=p.sizes.get("bid"), ask=ask, ask_size=p.sizes.get("ask"), last=last,
                 last_size=p.sizes.get("last"), market_data_type=p.market_data_type,
                 market_data_type_name=MARKET_DATA_TYPE_NAMES.get(p.market_data_type, "UNREPORTED"),
-                requested_market_data_type=market_data_type, received_at=_now_iso(),
+                requested_market_data_type=market_data_type,
+                received_at=received.isoformat(timespec="milliseconds"),
                 last_trade_time=p.last_trade_time, quality=quality, flags=flags,
                 notices=tuple(p.notices), unavailable_code=p.unavailable_code,
                 route="snapshot" if snapshot else "stream", close=p.close,
@@ -775,11 +801,12 @@ class IbkrSession:
                 tick_counts=dict(p.tick_counts), market_data_types_delivered=tuple(p.mdt_values),
                 tick_req_params=p.tick_req_params, request_events=tuple(p.events),
                 request_error=p.request_error, first_tick_ms=ms(p.first_tick, p),
-                last_tick_ms=ms(p.last_tick, p))
+                last_tick_ms=ms(p.last_tick, p), quote_age_seconds=age,
+                ended_early=p.ended_early, window_ms=int(wait * 1000))
 
         return self._request(
             "quote", send, lambda rid: self._client.cancelMktData(rid), wait,
-            cancel_always=not snapshot, build=build, soft=True)
+            cancel_always=not snapshot, build=build, soft=True, early=early)
 
     # ------------------------------------------------------------------ request machinery
     def _require_ready(self, gate: bool = False) -> None:
@@ -800,9 +827,11 @@ class IbkrSession:
 
     def _request(self, kind: str, send: Callable[[int], None],
                  cancel: Callable[[int], None] | None, timeout: float, *, cancel_always: bool,
-                 build: Callable[[_Pending], T], gate: bool = False, soft: bool = False) -> T:
+                 build: Callable[[_Pending], T], gate: bool = False, soft: bool = False,
+                 early: Callable[[_Pending], bool] | None = None) -> T:
         """``soft`` (quotes): a timeout or a request-scoped broker error does not raise; the
-        result is built from what arrived. Connection loss and poisoning always raise."""
+        result is built from what arrived. Connection loss and poisoning always raise.
+        ``early`` (streaming quotes): polled under the lock; True ends the wait as complete."""
         with self._cond:
             self._require_ready(gate)
             self._next_req_id += 1
@@ -822,7 +851,10 @@ class IbkrSession:
                 p.t0 = time.monotonic()
                 send(p.req_id)
             with self._cond:
-                completed = self._cond.wait_for(lambda: p.done, timeout)
+                if early is None:
+                    completed = self._cond.wait_for(lambda: p.done, timeout)
+                else:
+                    completed = self._wait_or_early(p, timeout, early)
             if not completed:
                 if soft:
                     p.timed_out = True
@@ -859,6 +891,20 @@ class IbkrSession:
         if failures:
             raise CleanupError(f"{kind} cleanup failed", failures=failures, result=result)
         return result
+
+    def _wait_or_early(self, p: _Pending, timeout: float,
+                       early: Callable[[_Pending], bool]) -> bool:
+        """Caller holds the lock. Tick callbacks do not notify, so poll every 50 ms."""
+        deadline = time.monotonic() + timeout
+        while not p.done:
+            if early(p):
+                p.ended_early = True
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            self._cond.wait(min(remaining, 0.05))
+        return True
 
     def _cancel(self, kind: str, req_id: int, cancel: Callable[[int], None]) -> list[str]:
         """Send a cancel. TWS does not acknowledge cancels, so 'clean' means: the connection was up
@@ -1095,8 +1141,10 @@ class IbkrSession:
             name = TickTypeEnum.toStr(int(tick_type))
         except Exception:  # noqa: BLE001 - unknown id: count it by number
             name = f"TICK_{tick_type}"
-        p.tick_counts[name] = p.tick_counts.get(name, 0) + 1
         now = time.monotonic()
+        if name not in p.tick_counts:
+            p.last_new_tick_type = now
+        p.tick_counts[name] = p.tick_counts.get(name, 0) + 1
         p.first_tick = p.first_tick if p.first_tick is not None else now
         p.last_tick = now
         if int(tick_type) in DELAYED_TICK_IDS:
@@ -1159,6 +1207,9 @@ class IbkrSession:
             if int(tick_type) not in LAST_TIMESTAMP_TICKS:
                 return
             try:
-                p.last_trade_time = datetime.fromtimestamp(int(value), UTC).isoformat()
+                epoch = int(value)
+                p.last_trade_time = datetime.fromtimestamp(epoch, UTC).isoformat()
+                p.last_trade_epoch = epoch
             except (TypeError, ValueError, OverflowError, OSError):
                 p.last_trade_time = f"unparsed:{value!r}"
+                p.last_trade_epoch = None

@@ -378,12 +378,15 @@ class FakeSession:
         self._maybe("positions")
         return ()
 
-    def quote(self, c):
+    def quote(self, c, *, snapshot_fallback=False):
         self._maybe("quote")
-        q = {QuoteQuality.LIVE: _quote(), QuoteQuality.DELAYED: _quote(mdt=3),
-             QuoteQuality.UNAVAILABLE: _quote(None, None, None, counts={})}[self.quality]
-        attempts = (q,) if q.has_price else (q, _quote(None, None, None, counts={},
-                                                       route="stream"))
+        self.snapshot_fallback = snapshot_fallback
+        q = {QuoteQuality.LIVE: _quote(route="stream"),
+             QuoteQuality.DELAYED: _quote(mdt=3, route="stream"),
+             QuoteQuality.UNAVAILABLE: _quote(None, None, None, counts={}, route="stream"),
+             }[self.quality]
+        attempts = (q,) if q.two_sided_valid or not snapshot_fallback else (
+            q, _quote(None, None, None, counts={}, route="snapshot"))
         status, reason = assess_quote_attempts(attempts)
         return QuoteReport(attempts, status, reason)
 
@@ -436,13 +439,41 @@ def test_delayed_two_sided_quote_is_pass_with_warnings(tmp_path):
     assert step["status"] == "PASS_WITH_WARNINGS" and "DELAYED" in step["detail"]["reason"]
 
 
-def test_nothing_on_both_routes_is_fail_with_evidence(tmp_path):
+def test_nothing_on_the_stream_is_fail_with_evidence(tmp_path):
     report, _ = _run(tmp_path, quality=QuoteQuality.UNAVAILABLE)
     assert report["overall"] == "FAIL"
     step = next(st for st in report["steps"] if st["name"] == "quote")
-    assert step["status"] == "FAIL" and len(step["detail"]["attempts"]) == 2
-    assert [a["route"] for a in step["detail"]["attempts"]] == ["snapshot", "stream"]
+    assert step["status"] == "FAIL" and step["detail"]["routes"] == ["stream"]
+    assert step["detail"]["snapshot_fallback"] is False
     assert "no market data delivered" in summarize(report).splitlines()[0]
+
+
+def test_nothing_on_both_routes_with_snapshot_fallback_is_fail_with_evidence(tmp_path):
+    made = []
+
+    def factory(cfg):
+        made.append(FakeSession(cfg, quality=QuoteQuality.UNAVAILABLE))
+        return made[-1]
+
+    report = run_check(_write(tmp_path), session_factory=factory, quote_snapshot_fallback=True)
+    assert report["overall"] == "FAIL" and made[0].snapshot_fallback is True
+    step = next(st for st in report["steps"] if st["name"] == "quote")
+    assert step["status"] == "FAIL" and len(step["detail"]["attempts"]) == 2
+    assert [a["route"] for a in step["detail"]["attempts"]] == ["stream", "snapshot"]
+    assert "no market data delivered" in summarize(report).splitlines()[0]
+
+
+def test_quote_age_is_receipt_minus_last_trade_and_unknown_without_it():
+    from datetime import UTC, datetime
+
+    from tradingbot.ibkr.models import quote_age_seconds
+
+    received = datetime(2026, 11, 11, 21, 45, 13, 310000, tzinfo=UTC)
+    last_trade = int(datetime(2026, 11, 11, 21, 30, 10, tzinfo=UTC).timestamp())
+    assert quote_age_seconds(received, last_trade) == 903.31
+    assert quote_age_seconds(received, None) is None
+    doc = QuoteSnapshot.__doc__
+    assert "LAST TRADE ONLY" in doc and "bid or ask" in doc
 
 
 @pytest.mark.parametrize("value", ["owner-attested", "none", "config_read"])
@@ -509,7 +540,8 @@ def test_script_exit_codes(tmp_path, monkeypatch):
         sys.path.pop(0)
     for overall, code in (("PASS", 0), ("PASS_WITH_WARNINGS", 0), ("FAIL", 1)):
         monkeypatch.setattr(ibkr_paper_check, "run_check",
-                            lambda path, o=overall: {"overall": o, "steps": [], "warnings": []})
+                            lambda path, o=overall, **kw: {"overall": o, "steps": [],
+                                                           "warnings": []})
         assert ibkr_paper_check.main(["--report-dir", str(tmp_path)]) == code
 
 
@@ -538,5 +570,28 @@ def test_script_report_dir_env(monkeypatch, tmp_path):
         sys.path.pop(0)
     monkeypatch.setenv("TRADINGBOT_IBKR_REPORT_DIR", str(tmp_path))
     assert ibkr_paper_check.default_report_dir() == tmp_path
+    from tradingbot.ibkr.check import default_report_dir
+
+    assert default_report_dir() == tmp_path  # the dashboard page uses the same function
+    monkeypatch.delenv("TRADINGBOT_IBKR_REPORT_DIR")
+    (tmp_path / "ws" / "private").mkdir(parents=True)
+    assert default_report_dir(tmp_path / "ws" / "repo") == tmp_path / "ws" / "private" / \
+        "ibkr_reports"
+    assert default_report_dir(tmp_path / "ws" / "a" / "repo") == tmp_path / "ws" / "private" / \
+        "ibkr_reports"
+
+
+def test_script_passes_snapshot_fallback_flag(tmp_path, monkeypatch):
+    sys.path.insert(0, str(ROOT / "scripts"))
+    try:
+        import ibkr_paper_check
+    finally:
+        sys.path.pop(0)
+    seen = []
+    monkeypatch.setattr(ibkr_paper_check, "run_check", lambda path, **kw: (
+        seen.append(kw), {"overall": "PASS", "steps": [], "warnings": []})[1])
+    ibkr_paper_check.main(["--report-dir", str(tmp_path)])
+    ibkr_paper_check.main(["--report-dir", str(tmp_path), "--quote-snapshot-fallback"])
+    assert seen == [{"quote_snapshot_fallback": False}, {"quote_snapshot_fallback": True}]
 
 

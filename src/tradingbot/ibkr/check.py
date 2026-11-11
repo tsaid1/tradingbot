@@ -91,8 +91,11 @@ def _session_facts(s: Any) -> dict:
 
 def run_check(config_path: str | os.PathLike | None = None, *,
               session_factory: Callable[[PaperConnectionConfig], Any] | None = None,
-              loader: Callable[[Any], PaperConnectionConfig] = load_config) -> dict:
-    """Run every step and return the report dict (never raises for broker/config failures)."""
+              loader: Callable[[Any], PaperConnectionConfig] = load_config,
+              quote_snapshot_fallback: bool = False) -> dict:
+    """Run every step and return the report dict (never raises for broker/config failures).
+    The quote is a bounded streaming sample; ``quote_snapshot_fallback`` adds one snapshot
+    attempt when the stream delivered no valid two-sided quote."""
     factory = session_factory or _default_session_factory
     started = datetime.now(UTC).isoformat(timespec="seconds")
     steps = _Steps()
@@ -117,7 +120,7 @@ def run_check(config_path: str | os.PathLike | None = None, *,
     if connected:
         if session.read_only_status != "VERIFIED":  # cannot happen after connect(); fail closed
             steps.fail("read_only_verified", f"read-only status {session.read_only_status}")
-        _data_steps(session, steps, warnings, report["notes"])
+        _data_steps(session, steps, warnings, report["notes"], quote_snapshot_fallback)
     else:
         for name in ("resolve_contract", "account_summary", "positions", "quote"):
             steps.skip(name, "identity gate did not pass")
@@ -143,7 +146,8 @@ def _check_joined(s: Any, connected: bool, steps: _Steps, name: str) -> None:
         steps.fail(name, "EReader thread was not observed to exit")
 
 
-def _data_steps(s: Any, steps: _Steps, warnings: list[str], notes: list[str]) -> None:
+def _data_steps(s: Any, steps: _Steps, warnings: list[str], notes: list[str],
+                snapshot_fallback: bool = False) -> None:
     ok, contract = steps.run("resolve_contract", lambda: s.resolve_contract(TLT_QUERY),
                              lambda c: c)
 
@@ -158,8 +162,11 @@ def _data_steps(s: Any, steps: _Steps, warnings: list[str], notes: list[str]) ->
     if not ok:
         steps.skip("quote", "contract not resolved")
         return
-    ok, report = steps.run("quote", lambda: s.quote(contract), lambda r: {
-        "verdict": r.status, "reason": r.reason, "attempts": r.attempts})
+    ok, report = steps.run(
+        "quote", lambda: s.quote(contract, snapshot_fallback=snapshot_fallback), lambda r: {
+            "verdict": r.status, "reason": r.reason, "snapshot_fallback": snapshot_fallback,
+            "routes": [a.route for a in r.attempts], "best_route": r.best.route,
+            "attempts": r.attempts})
     if ok:
         entry = steps.steps[-1]
         entry["status"] = report.status  # PASS | PASS_WITH_WARNINGS | FAIL (with evidence)
@@ -210,6 +217,24 @@ def _finish(report: dict, steps: _Steps, warnings: list[str],
                                     "error": "full account ID found in report and masked"})
             report["overall"] = FAIL
     return report
+
+
+REPORT_DIR_ENV = "TRADINGBOT_IBKR_REPORT_DIR"
+REPORT_GLOB = "ibkr_paper_check_*.json"
+
+
+def default_report_dir(repo_root: str | os.PathLike | None = None) -> Path | None:
+    """``$TRADINGBOT_IBKR_REPORT_DIR``, else ``private/ibkr_reports`` in the workspace that holds
+    this checkout (the parent or grandparent of the repo root); ``None`` if neither exists.
+    Shared by the check script and the dashboard page."""
+    env = os.environ.get(REPORT_DIR_ENV)
+    if env:
+        return Path(env)
+    repo = Path(repo_root) if repo_root is not None else Path(__file__).resolve().parents[3]
+    for base in (repo.parent, repo.parent.parent):
+        if base != Path(base.anchor) and (base / "private").is_dir():
+            return base / "private" / "ibkr_reports"
+    return None
 
 
 def write_report(report: dict, report_dir: str | os.PathLike) -> Path:
