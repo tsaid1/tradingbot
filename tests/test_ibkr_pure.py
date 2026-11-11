@@ -19,9 +19,11 @@ from tradingbot.ibkr.models import (
     AccountSummary,
     AccountValue,
     QuoteQuality,
+    QuoteReport,
     QuoteSnapshot,
     ResolvedContract,
     assess_quote,
+    assess_quote_attempts,
 )
 from tradingbot.ibkr.redact import mask_account, redact_accounts
 
@@ -342,8 +344,7 @@ class FakeSession:
         self.poisoned = False
         self.calls: list[str] = []
         self.preflight_result = {"stub": True}
-        self.read_only_status = "VERIFIED" if cfg.read_only_check == "config-read" else \
-            "OWNER_ATTESTED_NOT_VERIFIED"
+        self.read_only_status = "VERIFIED"
         self.read_only_settings = None
         self.reader_joined = True
 
@@ -377,10 +378,14 @@ class FakeSession:
         self._maybe("positions")
         return ()
 
-    def quote_snapshot(self, c):
-        self._maybe("quote_snapshot")
-        return QuoteSnapshot(1, "TLT", 1.0, None, 1.1, None, None, None, 3, "DELAYED", 3, "t",
-                             None, self.quality, ())
+    def quote(self, c):
+        self._maybe("quote")
+        q = {QuoteQuality.LIVE: _quote(), QuoteQuality.DELAYED: _quote(mdt=3),
+             QuoteQuality.UNAVAILABLE: _quote(None, None, None, counts={})}[self.quality]
+        attempts = (q,) if q.has_price else (q, _quote(None, None, None, counts={},
+                                                       route="stream"))
+        status, reason = assess_quote_attempts(attempts)
+        return QuoteReport(attempts, status, reason)
 
 
 def _run(tmp_path, **kw):
@@ -408,7 +413,7 @@ def test_check_pass_and_report_is_masked(tmp_path):
 
 
 @pytest.mark.parametrize("step", ["connect", "resolve_contract", "account_summary", "positions",
-                                  "quote_snapshot", "disconnect"])
+                                  "quote", "disconnect"])
 def test_any_failure_including_cleanup_is_fail(tmp_path, step):
     report, _ = _run(tmp_path, fail=step)
     assert report["overall"] == "FAIL"
@@ -424,23 +429,60 @@ def test_cleanup_failure_recorded_on_session_is_fail(tmp_path):
     assert report["overall"] == "FAIL"
 
 
-def test_delayed_quote_passes_with_note(tmp_path):
+def test_delayed_two_sided_quote_is_pass_with_warnings(tmp_path):
     report, _ = _run(tmp_path, quality=QuoteQuality.DELAYED)
-    assert report["overall"] == "PASS" and any("DELAYED" in n for n in report["notes"])
-
-
-def test_unavailable_quote_is_pass_with_warnings(tmp_path):
-    report, _ = _run(tmp_path, quality=QuoteQuality.UNAVAILABLE)
     assert report["overall"] == "PASS_WITH_WARNINGS"
+    step = next(st for st in report["steps"] if st["name"] == "quote")
+    assert step["status"] == "PASS_WITH_WARNINGS" and "DELAYED" in step["detail"]["reason"]
+
+
+def test_nothing_on_both_routes_is_fail_with_evidence(tmp_path):
+    report, _ = _run(tmp_path, quality=QuoteQuality.UNAVAILABLE)
+    assert report["overall"] == "FAIL"
+    step = next(st for st in report["steps"] if st["name"] == "quote")
+    assert step["status"] == "FAIL" and len(step["detail"]["attempts"]) == 2
+    assert [a["route"] for a in step["detail"]["attempts"]] == ["snapshot", "stream"]
     assert "no market data delivered" in summarize(report).splitlines()[0]
 
 
-def test_owner_attested_read_only_is_at_best_pass_with_warnings(tmp_path):
-    report = run_check(_write(tmp_path, {**GOOD, "read_only_check": "owner-attested"}),
-                       session_factory=FakeSession)
-    assert report["overall"] == "PASS_WITH_WARNINGS"
-    assert report["session"]["read_only_status"] == "OWNER_ATTESTED_NOT_VERIFIED"
-    assert "read-only API not verified" in summarize(report).splitlines()[0]
+@pytest.mark.parametrize("value", ["owner-attested", "none", "config_read"])
+def test_read_only_check_has_exactly_one_legal_value(value):
+    with pytest.raises(E.ConfigInvalid):
+        validate_config({**GOOD, "read_only_check": value})
+
+
+def test_unverified_read_only_status_fails(tmp_path):
+    def factory(cfg):
+        s = FakeSession(cfg)
+        s.read_only_status = "NOT_CHECKED"
+        return s
+
+    assert run_check(_write(tmp_path), session_factory=factory)["overall"] == "FAIL"
+
+
+def _quote(bid=88.10, ask=88.12, last=88.11, mdt=1, counts=None, route="snapshot", flags=()):
+    from tradingbot.ibkr.models import MARKET_DATA_TYPE_NAMES
+    quality, f = assess_quote(bid=bid, ask=ask, last=last, market_data_type=mdt,
+                              delayed_ticks_seen=mdt in (3, 4), live_ticks_seen=mdt in (1, 2))
+    return QuoteSnapshot(1, "TLT", bid, None, ask, None, last, None, mdt,
+                         MARKET_DATA_TYPE_NAMES.get(mdt, "UNREPORTED"), 3, "t", None, quality,
+                         (*f, *flags), route=route, waited_ms=8000 if route == "stream" else 20000,
+                         tick_counts={"BID": 1} if counts is None else counts)
+
+
+def test_quote_attempt_verdicts():
+    assert assess_quote_attempts((_quote(),))[0] == "PASS"
+    status, reason = assess_quote_attempts((_quote(mdt=3),))
+    assert status == "PASS_WITH_WARNINGS" and "DELAYED" in reason
+    status, reason = assess_quote_attempts((_quote(bid=None, ask=None),))
+    assert status == "PASS_WITH_WARNINGS" and "partial" in reason and "last" in reason
+    nothing = _quote(bid=None, ask=None, last=None, counts={})
+    status, reason = assess_quote_attempts((nothing, _quote(None, None, None, counts={},
+                                                            route="stream")))
+    assert status == "FAIL" and "snapshot 20000 ms" in reason and "stream 8000 ms" in reason
+    assert assess_quote_attempts((nothing, _quote(route="stream")))[0] == "PASS"
+    no_type = _quote(mdt=None)
+    assert assess_quote_attempts((no_type,))[0] == "PASS_WITH_WARNINGS"  # no delivered type
 
 
 def test_reader_not_joined_is_fail_for_both_sessions(tmp_path):
@@ -498,10 +540,3 @@ def test_script_report_dir_env(monkeypatch, tmp_path):
     assert ibkr_paper_check.default_report_dir() == tmp_path
 
 
-def test_plain_pass_needs_verified_config_read(tmp_path):
-    def factory(cfg):
-        s = FakeSession(cfg)
-        s.read_only_status = "NOT_CHECKED"  # config-read configured but not verified
-        return s
-
-    assert run_check(_write(tmp_path), session_factory=factory)["overall"] == "PASS_WITH_WARNINGS"

@@ -2,9 +2,9 @@
 
 SDK-free at import time (the real session is imported lazily), so the step/verdict/report logic is
 tested offline with a fake session. Overall ``PASS`` requires every step, including both
-disconnects, to pass with no warning. ``PASS_WITH_WARNINGS`` (exit 0) means every step passed but
-something must be read by a human: read-only API only owner-attested, no market data delivered, or
-an invalid two-sided quote. Anything else is ``FAIL``.
+disconnects, to pass with no warning (read-only verified by the config read). ``PASS_WITH_WARNINGS``
+(exit 0) means every step passed but the quote step delivered only delayed/frozen or partial data.
+Anything else is ``FAIL``, including a quote step where nothing arrived on either route.
 """
 from __future__ import annotations
 
@@ -18,14 +18,13 @@ from pathlib import Path
 from typing import Any
 
 from tradingbot.ibkr.config import PaperConnectionConfig, load_config
-from tradingbot.ibkr.models import TLT_QUERY, QuoteQuality, to_jsonable
+from tradingbot.ibkr.models import TLT_QUERY, to_jsonable
 from tradingbot.ibkr.redact import redact_accounts
 
 REPORT_SCHEMA = "tradingbot.ibkr.paper_check/1"
 PASS, FAIL, SKIPPED = "PASS", "FAIL", "SKIPPED"
 PASS_WITH_WARNINGS = "PASS_WITH_WARNINGS"
 NO_MARKET_DATA = "no market data delivered"
-READ_ONLY_NOT_VERIFIED = "read-only API NOT verified (OWNER_ATTESTED_NOT_VERIFIED)"
 
 
 def _default_session_factory(config: PaperConnectionConfig) -> Any:
@@ -116,11 +115,11 @@ def run_check(config_path: str | os.PathLike | None = None, *,
     connected, _ = steps.run("connect_identity_gate", session.connect)
     report["session"] = _session_facts(session)
     if connected:
-        if session.read_only_status != "VERIFIED":
-            warnings.append(READ_ONLY_NOT_VERIFIED)
+        if session.read_only_status != "VERIFIED":  # cannot happen after connect(); fail closed
+            steps.fail("read_only_verified", f"read-only status {session.read_only_status}")
         _data_steps(session, steps, warnings, report["notes"])
     else:
-        for name in ("resolve_contract", "account_summary", "positions", "quote_snapshot"):
+        for name in ("resolve_contract", "account_summary", "positions", "quote"):
             steps.skip(name, "identity gate did not pass")
 
     clean, _ = steps.run("disconnect", session.disconnect)
@@ -157,18 +156,19 @@ def _data_steps(s: Any, steps: _Steps, warnings: list[str], notes: list[str]) ->
     steps.run("account_summary", check_summary, lambda summary: summary)
     steps.run("positions", s.positions, lambda rows: {"count": len(rows), "rows": rows})
     if not ok:
-        steps.skip("quote_snapshot", "contract not resolved")
+        steps.skip("quote", "contract not resolved")
         return
-    ok, quote = steps.run("quote_snapshot", lambda: s.quote_snapshot(contract), lambda q: q)
+    ok, report = steps.run("quote", lambda: s.quote(contract), lambda r: {
+        "verdict": r.status, "reason": r.reason, "attempts": r.attempts})
     if ok:
-        if quote.quality is QuoteQuality.UNAVAILABLE:
-            warnings.append(f"{NO_MARKET_DATA} for TLT (code {quote.unavailable_code}, "
-                            f"flags {list(quote.flags)})")
-        elif not quote.two_sided_valid:
-            warnings.append(f"TLT quote not two-sided valid: flags {list(quote.flags)}")
-        if quote.quality not in (QuoteQuality.LIVE, QuoteQuality.UNAVAILABLE):
-            notes.append(f"TLT quote quality is {quote.quality.value} "
-                         f"(delivered market data type {quote.market_data_type_name})")
+        entry = steps.steps[-1]
+        entry["status"] = report.status  # PASS | PASS_WITH_WARNINGS | FAIL (with evidence)
+        if report.status == FAIL:
+            entry["error"] = report.reason
+        elif report.status == PASS_WITH_WARNINGS:
+            warnings.append(f"TLT quote: {report.reason}")
+        if report.status == FAIL or not report.best.has_price:
+            warnings.append(f"{NO_MARKET_DATA} for TLT")
 
 
 def _reconnect(cfg: PaperConnectionConfig, factory: Callable, steps: _Steps, report: dict) -> None:
@@ -191,15 +191,17 @@ def _finish(report: dict, steps: _Steps, warnings: list[str],
     report["finished_at"] = datetime.now(UTC).isoformat(timespec="seconds")
     failed = any(st["status"] == FAIL for st in steps.steps)
     expected = ["load_config", "create_session", "connect_identity_gate", "resolve_contract",
-                "account_summary", "positions", "quote_snapshot", "disconnect",
+                "account_summary", "positions", "quote", "disconnect",
                 "reconnect_identity_gate", "reconnect_disconnect"]
-    passed = {st["name"] for st in steps.steps if st["status"] == PASS}
+    passed = {st["name"] for st in steps.steps if st["status"] in (PASS, PASS_WITH_WARNINGS)}
     if failed or not all(n in passed for n in expected):
         report["overall"] = FAIL
     else:
         verified = report.get("session", {}).get("read_only_status") == "VERIFIED"
-        clean = not warnings and report.get("read_only_check") == "config-read" and verified
-        report["overall"] = PASS if clean else PASS_WITH_WARNINGS
+        if not verified or report.get("read_only_check") != "config-read":
+            report["overall"] = FAIL
+        else:
+            report["overall"] = PASS_WITH_WARNINGS if warnings else PASS
     if cfg is not None:  # belt and braces: the full account ID must never be in the report
         text = json.dumps(report, default=str)
         if cfg.account in text:
@@ -241,8 +243,6 @@ def summarize(report: dict) -> str:
             f"read_only_check={report.get('read_only_check', '?')}")
     if any(w.startswith(NO_MARKET_DATA) for w in report.get("warnings", [])):
         head += f"  [{NO_MARKET_DATA}]"
-    if READ_ONLY_NOT_VERIFIED in report.get("warnings", []):
-        head += "  [read-only API not verified]"
     lines = [head]
     for st in report["steps"]:
         extra = st.get("error") or st.get("reason") or ""

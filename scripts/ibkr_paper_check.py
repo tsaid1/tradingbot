@@ -6,7 +6,7 @@ the paper TWS and approved the run).
 Steps: load config -> connect + identity gate -> resolve TLT -> account summary -> positions ->
 TLT quote snapshot -> disconnect -> reconnect once + disconnect (recovery proof). Writes a JSON report
 (masked account only) and prints a summary. Exit 0 only for PASS or PASS_WITH_WARNINGS (every step,
-including cleanup, passed; warnings such as an owner-attested read-only API need human review).
+including cleanup, passed; PASS_WITH_WARNINGS means the quote was only delayed, frozen or partial).
 
 Default report dir: $TRADINGBOT_IBKR_REPORT_DIR, else ``private/ibkr_reports`` in the workspace that
 contains this checkout (the parent or grandparent of the repo root). See docs/IBKR_ADAPTER.md.
