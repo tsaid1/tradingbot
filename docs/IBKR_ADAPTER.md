@@ -2,7 +2,7 @@
 
 A thin adapter over the **official** Interactive Brokers TWS API for Python (`ibapi`,
 `EClient`/`EWrapper`/`EReader`). This phase is **read-only and paper-only**. The adapter checks the
-local paper environment, connects, checks the account identity, verifies (or records as attested)
+local paper environment, connects, checks the account identity, verifies
 that the API is in read-only mode, then resolves a contract, reads the account summary and
 positions, and takes a quote snapshot.
 
@@ -42,7 +42,7 @@ client_id = 17                                # 1..2^31-1; 0 refused (TWS's manu
 account = "DU0000000"                         # the one allowlisted paper account (placeholder)
 tws_profile_ini = "/Users/<user>/Jts/jts.ini" # jts.ini of the TWS profile the owner starts
 tws_os_user = "<user>"                        # macOS user that runs that TWS and owns that file
-read_only_check = "config-read"               # or "owner-attested" (see section 4)
+read_only_check = "config-read"               # the only legal value (see section 4)
 ```
 
 Fill `tws_profile_ini` and `tws_os_user` in for each run. The code has no default for either. For
@@ -98,9 +98,10 @@ The `connect()` order is: preflight → handshake → server version → identit
      disconnects the session.
    - The `D` prefix in config is defence in depth only. The expected account always comes from the
      config.
-5. **Read-only API**, set by `read_only_check`. There is no default.
-   - `"config-read"` (owner-approved; the mode for the first real connection): after the gate and
-     before READY, the session sends `reqConfigProtoBuf(ConfigRequest(reqId))`. The answer arrives
+5. **Read-only API.** `read_only_check` has exactly one legal value, `"config-read"`. Any other
+   value is a config error raised before any socket opens. The adapter fails closed whenever
+   read-only cannot be verified.
+   - After the gate and before READY, the session sends `reqConfigProtoBuf(ConfigRequest(reqId))`. The answer arrives
      on `EWrapper.configResponseProtoBuf(ConfigResponse)`.
      - Field path: `ConfigResponse.api` (`ApiConfig`) `.settings` (`ApiSettingsConfig`) with the
        fields `.readOnlyApi` (bool), `.socketPort` (int32) and `.allowLocalhostOnly` (bool).
@@ -118,9 +119,10 @@ The `connect()` order is: preflight → handshake → server version → identit
        | error callback for this request | `ConfigReadRejected` |
        | response `reqId` missing or different from the one sent | `ConfigReadUncorrelated` |
        | a field absent or wrong | `ReadOnlySettingRefused` |
+       | a later config response (same or other `reqId`) whose `api` section differs from the first | `ConfigResponseChanged`; poisons the session |
+
+       An identical repeat is ignored.
      - `updateConfigProtoBuf` is never used, and the deny-by-default client makes it unreachable.
-   - `"owner-attested"`: no request is sent. The status `OWNER_ATTESTED_NOT_VERIFIED` is recorded,
-     and the check can reach at best `PASS_WITH_WARNINGS`.
 
 Other protections:
 
@@ -128,16 +130,20 @@ Other protections:
   - Every public `EClient` method not in `ALLOWED_CLIENT_METHODS` raises `ReadOnlyViolation`. That
     covers orders, cancels of orders, global cancel, option exercise, `updateConfigProtoBuf`, FA
     replace, display groups, and any method a future SDK adds.
-  - Both send primitives refuse any outgoing message id outside `ALLOWED_OUT_MESSAGES`.
+  - Outgoing message ids are filtered at the lowest shared choke point. `_ReadOnlyClient.conn`
+    always wraps the SDK `Connection` in `_GuardedConnection`, and every SDK send path ends in
+    `self.conn.sendMsg(frame)`: bound or unbound, base or subclass, text or protobuf. The guard
+    allows the single initial `API\0` handshake. After that it passes only well-formed frames
+    whose message id is in `ALLOWED_OUT_MESSAGES`. A test runs the reviewer's probe,
+    `EClient.sendMsgProtoBuf(session._client, PLACE_ORDER/UPDATE_CONFIG, ...)`, and checks that
+    nothing reaches the wire.
   - `ReadOnlyViolation` is a `BaseException`, so the SDK's `except Exception` send wrappers cannot
     swallow it.
   - An SDK test walks every public callable of `EClient`. Another test tries `placeOrder`,
     `cancelOrder`, `reqGlobalCancel` and `updateConfigProtoBuf` on every attribute of a connected
     session, two levels deep, and also as unbound base-class calls. Every attempt is refused and
     nothing reaches the transport. An AST test forbids those names anywhere in the package.
-  - Residual risk: in-process Python can still write raw bytes to the socket object itself
-    (`_client.conn`). The boundary guards against misuse of the API, not against hostile code in
-    the same process.
+  - What remains: in-process code can still write raw bytes to the socket object itself.
 - **Logging.** The `ibapi` logger is disabled, has `propagate = False` and a `NullHandler`. Without
   this, the SDK's field-count-mismatch path would log raw fields, account included, to stderr.
   Exception text is masked by `redact_accounts`. The report never contains the full account ID.
@@ -149,7 +155,28 @@ Other protections:
   - A failed cancel raises `CleanupError`. It is never reported as success.
   - The poisoned and connection state is re-checked under the lock immediately before every send.
   - `disconnect()` joins the handshake, `EClient.run` and `EReader` threads within a bound.
-- **Quotes.** The session asks for market-data type 3 and reports the type actually delivered.
+- **Quotes.** `quote()` makes up to two attempts, each with `reqMarketDataType(3)` first:
+  1. A snapshot `reqMktData`, waiting up to 20 s.
+  2. Only if the snapshot delivered no bid, ask or last price: one streaming sample
+     (`snapshot=False`) for a bounded window (8 s by default, configurable), always followed by
+     `cancelMktData`.
+
+  Nothing collected is ever discarded. A snapshot that does not end is returned with what arrived
+  and flagged `SNAPSHOT_END_MISSING`. Each attempt records:
+  - tick counts by tick-type name;
+  - every `marketDataType` value delivered;
+  - `tickReqParams` (including `snapshotPermissions`);
+  - every error and notice carrying its reqId;
+  - the first and last tick times, and the time waited.
+
+  The SDK decodes delayed tick types (66–76, 88) exactly like live ones, and the adapter maps
+  delayed bid, ask, last, their sizes, close and the last timestamp. The verdict is:
+  - `PASS`: a LIVE two-sided quote with a broker-reported type, by either route;
+  - `PASS_WITH_WARNINGS`: only delayed or frozen two-sided data, or only partial data (the report
+    says which);
+  - `FAIL`: nothing at all arrived on either route.
+
+  Further rules:
   - `LIVE` is reported only when TWS reports type 1.
   - `received_at` is the only time available for bid/ask. `last_trade_time` dates the last trade
     only.
@@ -169,7 +196,8 @@ The check runs these steps in order:
 
 1. Preflight and connect: profile, listener, version, identity gate and read-only check.
 2. Resolve TLT (STK/SMART/USD, primary NASDAQ).
-3. Account summary, then positions, then a TLT snapshot.
+3. Account summary, then positions, then the TLT quote (snapshot, plus streaming fallback if
+   needed).
 4. Disconnect, then reconnect once and disconnect again (recovery proof, with reader-thread join
    verified each time).
 
@@ -179,15 +207,14 @@ The report contains the masked account, the SDK version, the server version and 
 reported by TWS, the preflight facts, the read-only status and fields, and per-step status with
 timings. The verdict is one of:
 
-- `PASS`: every step and cleanup passed, nothing needs a human, and `read_only_check` was
-  `"config-read"` with the API verified read-only. The summary line always prints
-  `read_only_check=...`.
-- `PASS_WITH_WARNINGS`: everything passed, but something needs a human. Examples: the read-only API
-  was owner-attested, or the quote was not two-sided valid. When no market data was delivered, the
-  summary line includes `no market data delivered`.
-- `FAIL`: anything else.
+- `PASS`: every step and cleanup passed, read-only was verified by the config read, and the quote
+  step was PASS. The summary line always prints `read_only_check=...`.
+- `PASS_WITH_WARNINGS`: everything passed, but the quote was delayed, frozen or partial.
+- `FAIL`: anything else. This includes a quote step where nothing arrived on either route; its
+  detail still carries both attempts' evidence. When no market data was delivered, the summary
+  line includes `no market data delivered`.
 
-The exit code is 0 for `PASS` and `PASS_WITH_WARNINGS`, otherwise 1. A delayed quote is only a note.
+The exit code is 0 for `PASS` and `PASS_WITH_WARNINGS`, otherwise 1.
 
 The default report directory is `$TRADINGBOT_IBKR_REPORT_DIR`. If that is unset, it is
 `private/ibkr_reports` in the parent or grandparent directory of the checkout.
