@@ -30,6 +30,50 @@ INDEX_SHORT = "We are now short the S&P 500 at 6,700. Stop 6,760."
 COMMENTARY = "We expect bonds to stay choppy this week."
 
 
+# Every size, cap, collar, freshness and timing value must be explicit (review F4): these are the
+# invented test values, equal to the old defaults.
+REQUIRED_SERVICE = {
+    "cadence_seconds": 5,
+    "max_backoff_seconds": 60,
+    "failure_alert_after": 3,
+    "stuck_after_seconds": 60,
+}
+REQUIRED_POLICY = {
+    "quantity": 2,
+    "quantity_per_add": 2,
+    "max_price_deviation_pct": "1.0",
+    "max_spread_pct": "1.0",
+    "max_notional_usd": "2000",
+    "max_signal_age_seconds": 90,
+    "max_quote_age_seconds": 30,
+    "max_instrument_exposure_usd": "2000",
+    "max_aggregate_exposure_usd": "10000",
+}
+REQUIRED_EXECUTION = {
+    "expected_account": "SIM-PAPER-0001",
+    "max_submit_attempts": 2,
+    "settle_seconds": 10,
+    "max_intent_age_seconds": 120,
+    "lookup_horizon_seconds": 21600,
+    "confirm_attempts": 3,
+    "confirm_wait_seconds": 0,
+}
+
+
+def required_toml(**tables: dict) -> str:
+    """The [service], [policy] and [execution] tables with every required value (overridable)."""
+    out = []
+    for name, base in (
+        ("service", REQUIRED_SERVICE),
+        ("policy", REQUIRED_POLICY),
+        ("execution", REQUIRED_EXECUTION),
+    ):
+        values = {**base, **tables.get(name, {})}
+        out.append(f"[{name}]")
+        out += [f"{k} = {v!r}" if isinstance(v, str) else f"{k} = {v}" for k, v in values.items()]
+    return "\n".join(out).replace("'", '"') + "\n"
+
+
 def post(
     pid: str,
     offset: float,
@@ -99,8 +143,9 @@ class Runtime:
                 "mapping_file": str(mapping_file),
             },
             "source": {"kind": "replay", "file": str(self.posts_file)},
-            "service": {"cadence_seconds": 5, "max_backoff_seconds": 60, "failure_alert_after": 3},
-            "policy": {"quantity": 2, "quantity_per_add": 2},
+            "service": dict(REQUIRED_SERVICE),
+            "policy": dict(REQUIRED_POLICY),
+            "execution": dict(REQUIRED_EXECUTION),
             "mock": {"quotes": {"TLT": {"bid": "88.40", "ask": "88.42"}}},
         }
         if compression is not None:

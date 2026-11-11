@@ -3,7 +3,14 @@
 from __future__ import annotations
 
 import pytest
-from runtime_harness import MAPPING, REPO
+from runtime_harness import (
+    MAPPING,
+    REPO,
+    REQUIRED_EXECUTION,
+    REQUIRED_POLICY,
+    REQUIRED_SERVICE,
+    required_toml,
+)
 
 from tradingbot.event_models import ParsedPost, PriceBasis, Timing, TradeAction
 from tradingbot.models import Action, AssetClass, Instrument, PositionSide
@@ -25,9 +32,7 @@ mapping_file = "{mapping}"
 [source]
 kind = "replay"
 file = "posts.jsonl"
-[service]
-[policy]
-"""
+""" + required_toml().replace("{", "{{").replace("}", "}}")
 
 
 def write(tmp_path, text: str):
@@ -59,7 +64,7 @@ def test_missing_mode_refuses(tmp_path):
         load_config(write(tmp_path, MINIMAL.replace('mode = "mock"', "")))
 
 
-@pytest.mark.parametrize("table", ["[paths]", "[source]", "[service]", "[policy]"])
+@pytest.mark.parametrize("table", ["[paths]", "[source]", "[service]", "[policy]", "[execution]"])
 def test_missing_required_table_refuses(tmp_path, table):
     text = MINIMAL
     start = text.index(table)
@@ -74,7 +79,7 @@ def test_missing_required_table_refuses(tmp_path, table):
     [
         (lambda t: "unknown_top = 1\n" + t, "unknown_top"),
         (lambda t: t.replace("[service]\n", "[service]\ncadence = 5\n"), "cadence"),  # misspelled
-        (lambda t: t.replace("[policy]\n", "[policy]\nquantity = 0\n"), "quantity"),  # range
+        (lambda t: t.replace("quantity = 2\n", "quantity = 0\n"), "quantity"),  # range
         (lambda t: t + "[notify]\nslack = true\n", "slack"),
         (lambda t: t.replace("[policy]\n", "[policy]\npaper_only = false\n"), "paper_only"),
     ],
@@ -97,8 +102,9 @@ def test_x_source_needs_numeric_author_and_credential_paths(tmp_path):
     raw = {
         "mode": "mock",
         "paths": {"state_dir": "s", "halt_file": "h", "mapping_file": str(MAPPING)},
-        "service": {},
-        "policy": {},
+        "service": dict(REQUIRED_SERVICE),
+        "policy": dict(REQUIRED_POLICY),
+        "execution": dict(REQUIRED_EXECUTION),
         "source": {
             "kind": "x_timeline",
             "author_id": "not-a-number",

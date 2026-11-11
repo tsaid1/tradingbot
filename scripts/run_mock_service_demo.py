@@ -48,9 +48,26 @@ compression = 60.0
 [service]
 cadence_seconds = 0.1
 max_backoff_seconds = 2.0
+failure_alert_after = 3
+stuck_after_seconds = 60
 [policy]
 quantity = 2
 quantity_per_add = 2
+max_price_deviation_pct = "1.0"
+max_spread_pct = "1.0"
+max_notional_usd = "2000"
+max_signal_age_seconds = 90
+max_quote_age_seconds = 30
+max_instrument_exposure_usd = "2000"
+max_aggregate_exposure_usd = "10000"
+[execution]
+expected_account = "SIM-PAPER-0001"
+max_submit_attempts = 2
+settle_seconds = 10
+max_intent_age_seconds = 120
+lookup_horizon_seconds = 21600
+confirm_attempts = 3
+confirm_wait_seconds = 0
 [mock]
 quotes = {{ TLT = {{ bid = "88.40", ask = "88.42" }} }}
 """

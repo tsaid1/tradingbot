@@ -11,7 +11,7 @@ import tomllib
 from pathlib import Path
 
 import pytest
-from runtime_harness import DEMO_FIXTURE, MAPPING, Runtime
+from runtime_harness import DEMO_FIXTURE, MAPPING, Runtime, required_toml
 from streamlit.testing.v1 import AppTest
 
 REPO = Path(__file__).resolve().parents[1]
@@ -23,7 +23,7 @@ def write_config(rt: Runtime, path: Path) -> Path:
     path.write_text(
         f'mode = "mock"\n[paths]\nstate_dir = "{c.paths.state_dir}"\n'
         f'halt_file = "{c.paths.halt_file}"\nmapping_file = "{MAPPING}"\n'
-        f'[source]\nkind = "replay"\nfile = "{c.source.file}"\n[service]\n[policy]\n'
+        f'[source]\nkind = "replay"\nfile = "{c.source.file}"\n' + required_toml()
     )
     tomllib.loads(path.read_text())
     return path

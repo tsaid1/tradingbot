@@ -141,6 +141,11 @@ class RuntimeService:
                 expected_account=config.execution.expected_account,
                 max_submit_attempts=config.execution.max_submit_attempts,
                 stuck_after_seconds=config.service.stuck_after_seconds,
+                settle_seconds=config.execution.settle_seconds,
+                max_intent_age_seconds=config.execution.max_intent_age_seconds,
+                lookup_horizon_seconds=config.execution.lookup_horizon_seconds,
+                confirm_attempts=config.execution.confirm_attempts,
+                confirm_wait_seconds=config.execution.confirm_wait_seconds,
             ),
             clock=self.clock,
         )

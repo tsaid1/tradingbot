@@ -183,3 +183,55 @@ def test_f3_a_stop_on_the_wrong_side_of_the_market_is_flagged(tmp_path):
     report = h.coord.reconcile()
     [d] = [d for d in report.discrepancies if d.kind.value == "PROTECTIVE_STOP_INVALID"]
     assert "bid" in d.detail and not report.clean
+
+
+# ----------------------------------------------------------------------------------------- F4
+
+
+def _full_raw(tmp_path) -> dict:
+    from runtime_harness import MAPPING, REQUIRED_EXECUTION, REQUIRED_POLICY, REQUIRED_SERVICE
+
+    return {
+        "mode": "mock",
+        "paths": {"state_dir": "s", "halt_file": "h", "mapping_file": str(MAPPING)},
+        "source": {"kind": "replay", "file": "p.jsonl"},
+        "service": dict(REQUIRED_SERVICE),
+        "policy": dict(REQUIRED_POLICY),
+        "execution": dict(REQUIRED_EXECUTION),
+    }
+
+
+def test_f4_an_empty_policy_table_refuses_and_names_every_missing_value(tmp_path):
+    from tradingbot.runtime.config import ConfigError, parse_config
+
+    raw = _full_raw(tmp_path)
+    raw["policy"] = {}
+    with pytest.raises(ConfigError) as err:
+        parse_config(raw, base=tmp_path)
+    for key in ("quantity", "max_notional_usd", "max_aggregate_exposure_usd",
+                "max_price_deviation_pct", "max_signal_age_seconds", "max_quote_age_seconds"):
+        assert f"policy.{key}" in str(err.value)
+
+
+@pytest.mark.parametrize(
+    "table,key",
+    [
+        ("policy", "max_instrument_exposure_usd"),
+        ("execution", "expected_account"),
+        ("execution", "settle_seconds"),
+        ("service", "stuck_after_seconds"),
+    ],
+)
+def test_f4_a_partial_config_refuses_naming_the_missing_value(tmp_path, table, key):
+    from tradingbot.runtime.config import ConfigError, parse_config
+
+    raw = _full_raw(tmp_path)
+    del raw[table][key]
+    with pytest.raises(ConfigError, match=rf"{table}\.{key}"):
+        parse_config(raw, base=tmp_path)
+
+
+def test_f4_the_service_runs_on_the_configured_values(tmp_path):
+    rt = Runtime(tmp_path, [], execution={"settle_seconds": 17, "expected_account": "SIM-PAPER-0001"})
+    cfg = rt.service.coordinator.config
+    assert cfg.settle_seconds == 17 and cfg.expected_account == "SIM-PAPER-0001"

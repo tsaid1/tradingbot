@@ -27,11 +27,18 @@ max_backoff_seconds = 300.0
 failure_alert_after = 3
 stuck_after_seconds = 60
 
+# Every size, cap, collar, freshness and timing value below is required: a missing one refuses to
+# start, naming it. Nothing that sizes or bounds an order runs on a default.
 [policy]                  # illustrative mock limits (tradingbot.models.MockPolicy)
 quantity = 2
 quantity_per_add = 2
-max_notional_usd = "2000"
-max_signal_age_seconds = 90
+max_price_deviation_pct = "1.0"     # entry/exit price collar around the reference, percent
+max_spread_pct = "1.0"
+max_notional_usd = "2000"           # per idea: quantity x price x contract multiplier
+max_signal_age_seconds = 90         # source freshness
+max_quote_age_seconds = 30          # broker quote freshness
+max_instrument_exposure_usd = "2000"
+max_aggregate_exposure_usd = "10000"
 
 [interpreter]
 # lexicon_path = "/path/outside/the/repo/lexicon.json"   # optional private extension
@@ -40,7 +47,13 @@ max_signal_age_seconds = 90
 macos = false
 
 [execution]
+expected_account = "SIM-PAPER-0001"   # required: the coordinator refuses any other broker account
 max_submit_attempts = 2
+settle_seconds = 10                   # after an unknown outcome: "no trace" never concluded sooner
+max_intent_age_seconds = 120          # an entry or add older than this is never sent
+lookup_horizon_seconds = 21600        # how far back the broker's executions reach (IBKR: the day)
+confirm_attempts = 3                  # cancel / resize confirmation reads before an exit
+confirm_wait_seconds = 0
 
 [mock]
 account = "SIM-PAPER-0001"

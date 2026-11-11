@@ -8,7 +8,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from runtime_harness import DEMO_FIXTURE, MAPPING
+from runtime_harness import DEMO_FIXTURE, MAPPING, required_toml
 
 REPO = Path(__file__).resolve().parents[1]
 ENV = {**os.environ, "PYTHONPATH": str(REPO / "src")}
@@ -19,7 +19,8 @@ def config(tmp_path: Path, mode: str = "mock", extra: str = "") -> Path:
     p.write_text(
         f'mode = "{mode}"\n{extra}[paths]\nstate_dir = "state"\nhalt_file = "HALT"\n'
         f'mapping_file = "{MAPPING}"\n[source]\nkind = "replay"\nfile = "{DEMO_FIXTURE}"\n'
-        "[service]\n[policy]\nquantity = 2\nquantity_per_add = 2\n"
+        + required_toml()
+        +
         '[mock]\nquotes = { TLT = { bid = "88.40", ask = "88.42" } }\n'
     )
     return p
