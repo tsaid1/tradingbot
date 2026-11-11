@@ -177,36 +177,43 @@ def test_lost_ack_with_order_placed_is_adopted_not_resent(h):
     assert pos.quantity == 4
 
 
-def test_lost_ack_without_order_is_resubmitted_once_with_journaled_reason(h):
+def test_lost_ack_without_order_is_never_resent_and_opens_an_exception(h):
+    # Round 2 (F5): a submitted entry of unknown outcome is never resent automatically.
     h.broker.script_next_submit("LOST_ACK_NOT_PLACED")
     out, _ = opened(h)
     assert out.state == IntentState.UNRESOLVED  # "no trace" is not concluded before the settle
     assert h.broker.submit_calls == 1
     h.clock.advance(h.config.settle_seconds + 1)
     [out] = h.coord.recover()
-    assert out.state == IntentState.FILLED
-    assert h.broker.submit_calls == 2 and len(h.broker.orders_with_ref(out.order_ref)) == 1
-    [no_trace] = [
-        e for e in h.coord.store.journal(out.order_ref) if e.event == "NO_TRACE_AT_BROKER"
-    ]
-    assert "resubmitting" in no_trace.detail["rule"]
-    assert h.coord.intent(out.order_ref).attempts == 2
+    assert out.state == IntentState.UNRESOLVED
+    assert h.broker.submit_calls == 1 and h.broker.orders_with_ref(out.order_ref) == []
+    assert "UNKNOWN_OUTCOME_ENTRY_NOT_RESENT" in h.events(out.order_ref)
+    assert "NO_TRACE_AT_BROKER" not in h.events(out.order_ref)
+
+
+def _three_lookups(h):
+    for _ in range(3):
+        h.clock.advance(h.config.settle_seconds / 2 + 1)
+        h.broker.set_quote("ZZQ", "49.98", "50.02")
+        h.coord.recover()
 
 
 def test_resend_budget_exhausted_stays_unresolved_and_is_reported_stuck(h):
+    # The budget now bounds exit resends only (entries are never resent, F5).
+    opened(h)
     h.broker.script_next_submit("LOST_ACK_NOT_PLACED")
     h.broker.script_next_submit("LOST_ACK_NOT_PLACED")
-    out, _ = opened(h)
-    assert out.state == IntentState.UNRESOLVED and out.replay_status == "UNRESOLVED"
-    h.clock.advance(h.config.settle_seconds + 1)
-    h.coord.recover()  # settled, no trace: the one resend (also lost)
-    assert h.broker.submit_calls == 2
-    h.clock.advance(h.config.settle_seconds + 1)
-    h.coord.recover()  # still no trace, budget spent: no third send
-    assert h.broker.submit_calls == 2
+    close = h.execute("p2", action("close", Action.CLOSE, idea="p1:open"))
+    assert close.state == IntentState.UNRESOLVED and close.replay_status == "UNRESOLVED"
+    calls = h.broker.submit_calls
+    _three_lookups(h)  # settled, no trace in enough lookups: the one resend (also lost)
+    assert h.broker.submit_calls == calls + 1
+    _three_lookups(h)
+    _three_lookups(h)  # still no trace, budget spent: no third send
+    assert h.broker.submit_calls == calls + 1
     h.clock.advance(120)
     kinds = [d.kind.value for d in h.coord.reconcile().unexplained]
-    assert kinds == ["INTENT_STUCK_UNRESOLVED"]
+    assert "INTENT_STUCK_UNRESOLVED" in kinds
 
 
 def test_failed_lookup_keeps_intent_unresolved_until_the_broker_answers(h):
@@ -236,9 +243,10 @@ def test_restart_after_broker_accepted_adopts_the_order(h):
     assert h.coord.reconcile().clean
 
 
-def test_restart_before_the_request_left_resubmits_after_positive_no_trace(h):
+def test_restart_inside_the_submit_call_is_an_unknown_outcome_never_resent(h):
+    # Dying inside broker.submit cannot be told apart from dying after the request left (F5).
     def dying_submit(order, children=()):
-        raise SimulatedCrash("died before the request was sent")
+        raise SimulatedCrash("died inside the submit call")
 
     h.broker.submit = dying_submit
     with pytest.raises(SimulatedCrash):
@@ -247,6 +255,13 @@ def test_restart_before_the_request_left_resubmits_after_positive_no_trace(h):
     h.clock.advance(h.config.settle_seconds + 1)
     [recovered] = h.coord.recover()
     ref = order_ref_for("p1", 1, "open")
+    assert recovered.state == IntentState.RECORDED and h.broker.orders_with_ref(ref) == []
+    assert "UNKNOWN_OUTCOME_ENTRY_NOT_RESENT" in h.events(ref)
+
+
+def test_restart_before_the_request_was_made_sends_it_after_positive_no_trace(h):
+    ref = h.record_never_sent("p1", open_action())
+    [recovered] = h.coord.recover()
     assert recovered.state == IntentState.FILLED
     assert "NO_TRACE_AT_BROKER" in h.events(ref) and len(h.broker.orders_with_ref(ref)) == 1
 
@@ -264,15 +279,11 @@ def test_halt_switch_blocks_submission_and_is_journaled(h):
 
 
 def test_halt_also_blocks_a_recovery_resubmission(h):
-    h.broker.script_next_submit("LOST_ACK_NOT_PLACED")
-    h.broker.lookup_failures_after_submit = 1  # the post-submit lookup fails (the pre-trade sync must succeed, F1)
-    out, _ = opened(h)
-    assert out.state == IntentState.UNRESOLVED
+    ref = h.record_never_sent("p1", open_action())
     h.halt()
-    h.clock.advance(h.config.settle_seconds + 1)
     h.coord.recover()
-    assert h.coord.intent(out.order_ref).state == IntentState.HALTED
-    assert h.broker.submit_calls == 1
+    assert h.coord.intent(ref).state == IntentState.HALTED
+    assert h.broker.submit_calls == 0
 
 
 def test_default_halt_file_location(monkeypatch):

@@ -584,14 +584,21 @@ class ExecutionStore:
             )
         return True
 
-    def resolve_exceptions(self, at: datetime, kind: str, *, idea_id: str | None = None) -> int:
+    def resolve_exceptions(
+        self, at: datetime, kind: str, *, idea_id: str | None = None, order_ref: str | None = None
+    ) -> int:
+        """Resolve the open exceptions of ``kind`` for ``idea_id`` (and, when given, only those
+        recorded against ``order_ref``)."""
+        sql = (
+            "UPDATE exec_exceptions SET resolved_at=? WHERE kind=? AND idea_id IS ? "
+            "AND resolved_at IS NULL"
+        )
+        args: list = [at.isoformat(), kind, idea_id]
+        if order_ref is not None:
+            sql += " AND order_ref=?"
+            args.append(order_ref)
         with self.tx() as c:
-            cur = c.execute(
-                "UPDATE exec_exceptions SET resolved_at=? WHERE kind=? AND idea_id IS ? "
-                "AND resolved_at IS NULL",
-                (at.isoformat(), kind, idea_id),
-            )
-            return cur.rowcount
+            return c.execute(sql, args).rowcount
 
     def exceptions(self, *, open_only: bool = False) -> list[ExceptionRecord]:
         with self.tx() as c:

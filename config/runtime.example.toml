@@ -50,6 +50,8 @@ macos = false
 expected_account = "SIM-PAPER-0001"   # required: the coordinator refuses any other broker account
 max_submit_attempts = 2
 settle_seconds = 10                   # after an unknown outcome: "no trace" never concluded sooner
+exit_no_trace_lookups = 3             # an exit is resent only after this many no-trace lookups
+                                      # over the settle period; an entry or add is never resent
 max_intent_age_seconds = 120          # an entry or add older than this is never sent
 lookup_horizon_seconds = 21600        # how far back the broker's executions reach (IBKR: the day)
 confirm_attempts = 3                  # cancel / resize confirmation reads before an exit

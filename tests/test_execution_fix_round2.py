@@ -219,6 +219,7 @@ def test_f4_an_empty_policy_table_refuses_and_names_every_missing_value(tmp_path
         ("policy", "max_instrument_exposure_usd"),
         ("execution", "expected_account"),
         ("execution", "settle_seconds"),
+        ("execution", "exit_no_trace_lookups"),
         ("service", "stuck_after_seconds"),
     ],
 )
@@ -235,3 +236,70 @@ def test_f4_the_service_runs_on_the_configured_values(tmp_path):
     rt = Runtime(tmp_path, [], execution={"settle_seconds": 17, "expected_account": "SIM-PAPER-0001"})
     cfg = rt.service.coordinator.config
     assert cfg.settle_seconds == 17 and cfg.expected_account == "SIM-PAPER-0001"
+
+
+# ----------------------------------------------------------------------------------------- F5
+
+UNKNOWN_OUTCOME_ENTRY_NOT_RESENT = "UNKNOWN_OUTCOME_ENTRY_NOT_RESENT"
+
+
+def test_f5_late_visibility_probe_gives_one_order_not_two(tmp_path):
+    """The reviewer's probe: open orders show a fresh order 30 s late, settle is 10 s."""
+    h = Harness(tmp_path, settle_seconds=10)
+    h.broker.open_orders_lag_seconds = 30
+    h.broker.script_next_submit("LOST_ACK_PLACED_RESTING")  # live at the broker, ack lost
+    out = h.execute("p1", open_action())
+    assert out.state == IntentState.UNRESOLVED
+    for _ in range(4):  # 20 s: past the settle period, still invisible at the broker
+        h.clock.advance(5)
+        h.broker.set_quote(SYMBOL, "49.98", "50.02")
+        h.coord.recover()
+    assert len(h.broker.orders_with_ref(out.order_ref)) == 1  # never resent
+    assert h.coord.intent(out.order_ref).state == IntentState.UNRESOLVED
+    assert UNKNOWN_OUTCOME_ENTRY_NOT_RESENT in _open_kinds(h)
+    blocked = h.execute("p2", open_action())  # new exposure in the instrument is blocked
+    assert blocked.state == IntentState.REFUSED
+    assert "UNRESOLVED_ENTRY_IN_INSTRUMENT" in blocked.reasons
+    h.clock.advance(15)  # now visible: adopted, still one order
+    h.broker.set_quote(SYMBOL, "49.98", "50.02")
+    h.coord.recover()
+    assert h.coord.intent(out.order_ref).state == IntentState.WORKING
+    assert len(h.broker.orders_with_ref(out.order_ref)) == 1
+    assert UNKNOWN_OUTCOME_ENTRY_NOT_RESENT not in _open_kinds(h)
+
+
+def test_f5_an_entry_with_no_trace_is_never_resent(tmp_path):
+    h = Harness(tmp_path)
+    h.broker.script_next_submit("LOST_ACK_NOT_PLACED")
+    out = h.execute("p1", open_action())
+    for _ in range(5):
+        h.clock.advance(h.config.settle_seconds)
+        h.broker.set_quote(SYMBOL, "49.98", "50.02")
+        h.coord.recover()
+    assert h.broker.submit_calls == 1
+    assert h.coord.intent(out.order_ref).state == IntentState.UNRESOLVED
+    assert UNKNOWN_OUTCOME_ENTRY_NOT_RESENT in _open_kinds(h)
+
+
+def test_f5_an_exit_is_resent_only_after_three_no_trace_lookups_over_the_settle(tmp_path):
+    h = Harness(tmp_path, settle_seconds=10)
+    h.execute("p1", open_action())
+    real = h.broker.submit
+
+    def lost_then_restore(order, children=()):
+        h.broker.submit = real
+        h.broker.script_next_submit("LOST_ACK_NOT_PLACED")
+        return real(order, children)
+
+    h.broker.submit = lost_then_restore
+    close = h.execute("p2", action("close", Action.CLOSE, idea="p1:open"))  # lookup 1, t=0
+    assert close.state == IntentState.UNRESOLVED
+    h.clock.advance(11)
+    h.broker.set_quote(SYMBOL, "49.98", "50.02")
+    h.coord.recover()  # lookup 2, t=11: past the settle, but only two lookups
+    assert h.broker.submit_calls == 2 and close.order_ref not in h.working()
+    h.clock.advance(1)
+    h.broker.set_quote(SYMBOL, "49.98", "50.02")
+    h.coord.recover()  # lookup 3, t=12: three no-trace lookups spread over >= 10 s
+    assert h.coord.intent(close.order_ref).state == IntentState.FILLED
+    assert len(h.broker.orders_with_ref(close.order_ref)) == 1

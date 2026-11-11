@@ -119,15 +119,12 @@ def test_m2_an_entry_whose_ack_was_lost_still_counts_against_the_caps(tmp_path):
 
 def test_m2_a_recorded_entry_counts_and_does_not_count_against_its_own_resend(tmp_path):
     h = _capped(tmp_path)
-    h.broker.script_next_submit("LOST_ACK_NOT_PLACED")
-    h.broker.lookup_failures_after_submit = 1  # the post-submit lookup fails (the pre-trade sync must succeed, F1)
-    first = h.execute("p1", open_action())
-    assert first.state == IntentState.UNRESOLVED
+    ref = h.record_never_sent("p1", open_action())  # round 2 (F5): the only late-sent entry case
+    assert h.coord.intent(ref).state == IntentState.RECORDED
     _, total = h.coord._exposure("ZZQ")
     assert total == Decimal("50.50") * 4  # the full intended quantity at its limit
-    h.clock.advance(h.config.settle_seconds + 1)
     h.coord.recover()  # no trace: the resend is not refused by its own exposure
-    assert h.coord.intent(first.order_ref).state == IntentState.FILLED
+    assert h.coord.intent(ref).state == IntentState.FILLED
 
 
 # ----------------------------------------------------------------------------------------- M3

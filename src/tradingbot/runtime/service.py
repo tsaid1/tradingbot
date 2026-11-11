@@ -142,6 +142,7 @@ class RuntimeService:
                 max_submit_attempts=config.execution.max_submit_attempts,
                 stuck_after_seconds=config.service.stuck_after_seconds,
                 settle_seconds=config.execution.settle_seconds,
+                exit_no_trace_lookups=config.execution.exit_no_trace_lookups,
                 max_intent_age_seconds=config.execution.max_intent_age_seconds,
                 lookup_horizon_seconds=config.execution.lookup_horizon_seconds,
                 confirm_attempts=config.execution.confirm_attempts,

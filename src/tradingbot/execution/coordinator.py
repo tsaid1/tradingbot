@@ -9,9 +9,13 @@ acknowledgement or a restart. See docs/EXECUTION_CORE.md for the intent state ma
 The never-resend rule: an intent whose submission outcome is unknown (RECORDED after a restart, or
 UNRESOLVED after a lost acknowledgement) is looked up at the broker by ``order_ref`` in
 ``open_orders``, ``executions`` and ``completed_orders``. Whatever is found is adopted, including a
-terminal REJECTED or CANCELLED state. Only a positive "no trace" in all three leads to a
-resubmission, and an entry or add is resubmitted only while its source post is still fresh;
-otherwise it ends REFUSED with a STALE_AFTER_UNKNOWN_OUTCOME exception. The reasoning is journaled.
+terminal REJECTED or CANCELLED state. An entry or add that was submitted is never resent: it stays
+UNRESOLVED, is looked up on every cycle and, after the settle period, opens
+UNKNOWN_OUTCOME_ENTRY_NOT_RESENT for a human while new exposure in its instrument is blocked (review
+F5). An exit is resent only after the settle period and ``exit_no_trace_lookups`` consecutive
+no-trace lookups spread over at least that period. An intent recorded but never submitted (the
+process died before the request) is sent once its entry checks pass again. The reasoning is
+journaled.
 """
 
 from __future__ import annotations
@@ -80,6 +84,10 @@ COMPLETED_LOOKBACK = timedelta(minutes=5)
 SUBMIT_ERROR = "SUBMIT_ERROR"
 # An unknown outcome older than the broker's lookup horizon: only a human can settle it.
 UNKNOWN_OUTCOME_BEYOND_LOOKUP_HORIZON = "UNKNOWN_OUTCOME_BEYOND_LOOKUP_HORIZON"
+# An entry or add whose submission outcome is unknown and that the broker still shows no trace of
+# after the settle period: it is never resent automatically; a human must settle it (review F5).
+UNKNOWN_OUTCOME_ENTRY_NOT_RESENT = "UNKNOWN_OUTCOME_ENTRY_NOT_RESENT"
+UNRESOLVED_ENTRY_IN_INSTRUMENT = "UNRESOLVED_ENTRY_IN_INSTRUMENT"
 # An exit was not sent because the working entries, earlier exits or protective children could not
 # be cancelled or resized first, with the result confirmed at the broker (review R1 / R6).
 EXIT_NOT_NETTED = "EXIT_NOT_NETTED"
@@ -130,6 +138,9 @@ class ExecutionConfig(StrictModel):
     # After an unknown submit outcome, "no trace at the broker" may be concluded only once this long
     # has passed since the request (open orders can lag a fresh submission at the broker).
     settle_seconds: float = Field(default=10.0, ge=0)
+    # An exit of unknown outcome is resent only after at least this many consecutive lookups that
+    # all show no trace, spread over at least ``settle_seconds`` (review F5).
+    exit_no_trace_lookups: int = Field(default=3, ge=3, le=20)
     # An entry or add older than this (since its intent was recorded) is never resent.
     max_intent_age_seconds: int = Field(default=120, gt=0)
     # How far back the broker's executions / completed-orders queries reach (IBKR: the current
@@ -1017,6 +1028,14 @@ class ExecutionCoordinator:
             o for o in completed if o.order_ref in refs and o.order_ref not in working_refs
         ]
         if found_open or found_fills or found_done:
+            if self.store.resolve_exceptions(
+                self.clock(), UNKNOWN_OUTCOME_ENTRY_NOT_RESENT, idea_id=intent.idea_id,
+                order_ref=intent.order_ref,
+            ):
+                self.store.log(
+                    self.clock(), "UNKNOWN_OUTCOME_SETTLED", order_ref=intent.order_ref,
+                    idea_id=intent.idea_id, rule="the order appeared at the broker: adopted",
+                )
             self.store.log(
                 self.clock(),
                 "ADOPTED_FROM_BROKER",
@@ -1035,8 +1054,16 @@ class ExecutionCoordinator:
             if since > self.config.lookup_horizon_seconds:
                 self._beyond_horizon(intent, sorted(refs), since)
                 return
-            if since < self.config.settle_seconds:
-                # Not visible yet proves nothing: the order may still be settling at the broker.
+            if intent.action in (Action.OPEN, Action.ADD):
+                self._entry_not_resent(intent, sorted(refs), since)
+                return
+            lookups = self._no_trace_lookups(intent, now, since)
+            span = (lookups[-1] - lookups[0]).total_seconds()
+            if (
+                since < self.config.settle_seconds
+                or len(lookups) < self.config.exit_no_trace_lookups
+                or span < self.config.settle_seconds
+            ):
                 self.store.log(
                     now,
                     "LOOKUP_NOT_SETTLED",
@@ -1044,7 +1071,12 @@ class ExecutionCoordinator:
                     idea_id=intent.idea_id,
                     seconds_since_submit=round(since, 3),
                     settle_seconds=self.config.settle_seconds,
-                    rule="no trace yet; stays UNRESOLVED and is looked up again later",
+                    no_trace_lookups=len(lookups),
+                    needed=self.config.exit_no_trace_lookups,
+                    rule=(
+                        "exit: resent only after the settle period and enough consecutive "
+                        "no-trace lookups spread over it"
+                    ),
                 )
                 return
         if intent.attempts >= self.config.max_submit_attempts:
@@ -1081,6 +1113,52 @@ class ExecutionCoordinator:
             self._submit_exit(intent, entry)
         else:
             self._submit(intent, entry, children)
+
+    def _no_trace_lookups(self, intent: Intent, now: datetime, since: float) -> list[datetime]:
+        """Journal this no-trace lookup and return the times of the consecutive no-trace lookups
+        since the last submission (a failed lookup breaks the run)."""
+        self.store.log(
+            now, "NO_TRACE_LOOKUP", order_ref=intent.order_ref, idea_id=intent.idea_id,
+            seconds_since_submit=round(since, 3),
+        )
+        times = []
+        for e in reversed(self.store.journal(intent.order_ref)):
+            if e.event in ("SUBMIT", "LOOKUP_FAILED"):
+                break
+            if e.event == "NO_TRACE_LOOKUP":
+                times.append(e.at)
+        return sorted(times)
+
+    def _entry_not_resent(self, intent: Intent, checked: list[str], since: float) -> None:
+        """Review F5: a submitted entry or add of unknown outcome is never resent. It stays
+        UNRESOLVED and is looked up again on every cycle; after the settle period an exception asks
+        a human to settle it, and new exposure in its instrument stays blocked meanwhile."""
+        now = self.clock()
+        if since < self.config.settle_seconds:
+            self.store.log(
+                now,
+                "LOOKUP_NOT_SETTLED",
+                order_ref=intent.order_ref,
+                idea_id=intent.idea_id,
+                seconds_since_submit=round(since, 3),
+                settle_seconds=self.config.settle_seconds,
+                rule="no trace yet; stays UNRESOLVED and is looked up again later",
+            )
+            return
+        detail = (
+            f"submitted {since:.0f} s ago, outcome unknown, no trace of {checked} yet; an entry or "
+            "add is never resent automatically. It is looked up every cycle and adopted if it "
+            "appears; new exposure in this instrument is blocked until then."
+        )
+        if self.store.raise_exception(
+            now, UNKNOWN_OUTCOME_ENTRY_NOT_RESENT, detail, idea_id=intent.idea_id,
+            order_ref=intent.order_ref,
+        ):
+            self.store.log(
+                now, UNKNOWN_OUTCOME_ENTRY_NOT_RESENT, order_ref=intent.order_ref,
+                idea_id=intent.idea_id, checked=checked,
+                rule="unknown outcome: an entry or add is never resent",
+            )
 
     def _resend_checks(self, intent: Intent, now: datetime) -> list[str]:
         """Everything an entry or add must pass at the moment of a resend, exactly as if it were
@@ -1597,6 +1675,14 @@ class ExecutionCoordinator:
         blocked = self._instrument_block(contract.symbol)
         if blocked:
             return None, [f"INSTRUMENT_BLOCKED_{blocked}"]
+        if any(
+            i.action in (Action.OPEN, Action.ADD)
+            and i.symbol == contract.symbol
+            and i.order_ref != exclude_ref
+            for i in self.store.intents(UNRESOLVED_STATES)
+        ):
+            # Review F5: while an entry or add of unknown outcome may be live, nothing is added.
+            return None, [UNRESOLVED_ENTRY_IN_INSTRUMENT]
         q, problem = self._usable_quote(contract, now)
         if problem:
             return None, [problem]

@@ -89,6 +89,9 @@ class ExecutionSettings(StrictModel):
     max_submit_attempts: int = Field(ge=1, le=5)
     # After an unknown submission outcome, "no trace at the broker" is never concluded sooner.
     settle_seconds: float = Field(ge=0)
+    # An exit of unknown outcome is resent only after this many consecutive no-trace lookups
+    # spread over at least settle_seconds (an entry or add is never resent).
+    exit_no_trace_lookups: int = Field(ge=3, le=20)
     max_intent_age_seconds: int = Field(gt=0)
     lookup_horizon_seconds: int = Field(gt=0)
     confirm_attempts: int = Field(ge=1, le=20)
@@ -167,6 +170,7 @@ REQUIRED_KEYS: dict[str, tuple[tuple[str, ...], ...]] = {
         ("expected_account",),
         ("max_submit_attempts",),
         ("settle_seconds",),
+        ("exit_no_trace_lookups",),
         ("max_intent_age_seconds",),
         ("lookup_horizon_seconds",),
         ("confirm_attempts",),

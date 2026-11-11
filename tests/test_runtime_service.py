@@ -406,8 +406,8 @@ def test_stuck_intent_is_notified_once_and_its_held_signal_stays_open(tmp_path):
     rt.step(5)
     [a] = rt.actions()
     assert a["status"] == "UNRESOLVED"
-    rt.run(20, 5)  # one settled resend (also lost), then the budget is spent
-    assert rt.broker.submit_calls == 2
+    rt.run(20, 5)  # round 2 (F5): an entry of unknown outcome is never resent
+    assert rt.broker.submit_calls == 1
     assert rt.notifier.kinds().count(N.STUCK_INTENT) == 1
     [exc] = rt.store.exceptions(open_only=True)
     assert exc["kind"] == "SIGNAL_UNRESOLVED"
@@ -415,13 +415,14 @@ def test_stuck_intent_is_notified_once_and_its_held_signal_stays_open(tmp_path):
 
 def test_unknown_outcome_is_settled_on_a_later_cycle_without_a_new_post(tmp_path):
     rt = Runtime(tmp_path, [post("1", 0, ENTRY)])
-    rt.broker.script_next_submit("LOST_ACK_NOT_PLACED")
+    rt.broker.script_next_submit("LOST_ACK_PLACED")  # placed and filled, the ack is lost
+    rt.broker.lookup_failures_after_submit = 1  # and the first lookup fails
     rt.step(5)
     [a] = rt.actions()
     assert a["status"] == "UNRESOLVED" and rt.broker.submit_calls == 1
     rt.run(3, 5)  # no new post; the service keeps looking the intent up
     intent = rt.service.coordinator.intent(a["order_ref"])
-    assert intent.state == IntentState.FILLED and rt.broker.submit_calls == 2
+    assert intent.state == IntentState.FILLED and rt.broker.submit_calls == 1
     assert rt.store.exceptions(open_only=True) == []  # the held UNRESOLVED signal was closed
     assert rt.service.last_reconciliation.clean
 

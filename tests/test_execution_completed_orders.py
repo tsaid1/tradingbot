@@ -128,13 +128,11 @@ def test_no_trace_in_all_three_sources_and_fresh_resubmits(h):
         seen.append(since)
         return real(since)
 
+    h.record_never_sent("p1", open_action())  # round 2 (F5): the only entry case ever sent late
     h.broker.completed_orders = spy
-    h.broker.script_next_submit("LOST_ACK_NOT_PLACED")
-    _open(h)
-    h.clock.advance(h.config.settle_seconds + 1)
     [out] = h.coord.recover()
     assert seen, "completed orders were not consulted before the resend"
-    assert out.state == IntentState.FILLED and h.broker.submit_calls == 2
+    assert out.state == IntentState.FILLED and h.broker.submit_calls == 1
     [no_trace] = [
         e for e in h.coord.store.journal(out.order_ref) if e.event == "NO_TRACE_AT_BROKER"
     ]
@@ -142,34 +140,33 @@ def test_no_trace_in_all_three_sources_and_fresh_resubmits(h):
 
 
 def test_no_trace_and_stale_entry_ends_in_explicit_exception_never_resent(h):
-    _unknown_and_unlookable(h, "LOST_ACK_NOT_PLACED")
-    out = _open(h)
+    ref = h.record_never_sent("p1", open_action())
     h.clock.advance(h.policy.max_signal_age_seconds + 30)
+    h.broker.set_quote("ZZQ", "49.98", "50.02")
     h.coord.recover()
-    intent = h.coord.intent(out.order_ref)
+    intent = h.coord.intent(ref)
     assert intent.state == IntentState.REFUSED
     assert intent.reasons == [STALE_AFTER_UNKNOWN_OUTCOME, "SOURCE_NOT_FRESH"]
-    assert h.broker.submit_calls == 1 and h.broker.orders_with_ref(out.order_ref) == []
+    assert h.broker.submit_calls == 0 and h.broker.orders_with_ref(ref) == []
     [exc] = [e for e in h.coord.store.exceptions(open_only=True)]
-    assert exc.kind == STALE_AFTER_UNKNOWN_OUTCOME and exc.order_ref == out.order_ref
-    assert STALE_AFTER_UNKNOWN_OUTCOME in h.events(out.order_ref)
-    assert "NO_TRACE_AT_BROKER" not in h.events(out.order_ref)
+    assert exc.kind == STALE_AFTER_UNKNOWN_OUTCOME and exc.order_ref == ref
+    assert STALE_AFTER_UNKNOWN_OUTCOME in h.events(ref)
+    assert "NO_TRACE_AT_BROKER" not in h.events(ref)
     assert h.coord.store.position("p1:open").status == "NOT_FILLED"
     h.coord.recover()  # terminal: a later recovery leaves it alone
-    assert h.broker.submit_calls == 1
+    assert h.broker.submit_calls == 0
     assert h.coord.reconcile().clean
 
 
 def test_no_trace_and_stale_add_is_not_resent(h):
     opened = _open(h)
     assert opened.state == IntentState.FILLED
-    _unknown_and_unlookable(h, "LOST_ACK_NOT_PLACED")
-    add = h.execute("p2", action("add", Action.ADD, idea="p1:open", entry="50"))
-    assert add.state == IntentState.UNRESOLVED
+    ref = h.record_never_sent("p2", action("add", Action.ADD, idea="p1:open", entry="50"))
     calls = h.broker.submit_calls
     h.clock.advance(h.policy.max_signal_age_seconds + 30)
+    h.broker.set_quote("ZZQ", "49.98", "50.02")
     h.coord.recover()
-    assert h.coord.intent(add.order_ref).state == IntentState.REFUSED
+    assert h.coord.intent(ref).state == IntentState.REFUSED
     assert h.broker.submit_calls == calls
     assert h.coord.store.position("p1:open").quantity == 4
 
@@ -190,23 +187,22 @@ def test_no_trace_exit_is_resent_even_when_stale_because_it_only_reduces(h):
     close = h.execute("p3", action("close", Action.CLOSE, idea="p1:open"))
     assert close.state == IntentState.UNRESOLVED
     h.clock.advance(h.policy.max_signal_age_seconds + 30)
-    h.coord.recover()
+    for _ in range(h.config.exit_no_trace_lookups):  # F5: enough no-trace lookups over the settle
+        h.broker.set_quote("ZZQ", "49.98", "50.02")
+        h.coord.recover()
+        h.clock.advance(h.config.settle_seconds / 2)
     assert h.coord.intent(close.order_ref).state == IntentState.FILLED
     assert h.coord.store.position("p1:open").quantity == 0
     assert h.coord.reconcile().clean
 
 
 def test_intent_without_a_recorded_publication_time_is_treated_as_stale(h):
-    _unknown_and_unlookable(h, "LOST_ACK_NOT_PLACED")
-    out = _open(h)
+    ref = h.record_never_sent("p1", open_action())
     with h.coord.store.tx() as c:
-        c.execute(
-            "UPDATE exec_intents SET source_published_at=NULL WHERE order_ref=?", (out.order_ref,)
-        )
-    h.clock.advance(h.config.settle_seconds + 1)
+        c.execute("UPDATE exec_intents SET source_published_at=NULL WHERE order_ref=?", (ref,))
     h.coord.recover()
-    assert h.coord.intent(out.order_ref).state == IntentState.REFUSED
-    assert h.broker.submit_calls == 1
+    assert h.coord.intent(ref).state == IntentState.REFUSED
+    assert h.broker.submit_calls == 0
 
 
 def test_intent_records_the_source_publication_time(h):
@@ -239,14 +235,21 @@ def test_r3_ack_lost_monday_is_not_resent_on_wednesday_at_mondays_limit(h):
     assert kinds == [UNKNOWN_OUTCOME_BEYOND_LOOKUP_HORIZON]
 
 
+def _never_sent_for(h: Harness, seconds: float) -> str:
+    """Recorded, never submitted (the only entry case ever sent late, F5), ``seconds`` ago."""
+    ref = h.record_never_sent("p1", open_action())
+    h.clock.advance(seconds)
+    return ref
+
+
 def test_r3_redelivery_of_an_old_unresolved_entry_does_not_bypass_the_checks(h):
-    out = _lost_then_unlookable_for(h, h.config.settle_seconds + 1)
+    ref = _never_sent_for(h, h.config.settle_seconds + 1)
     h.broker.set_quote("ZZQ", "52.00", "52.04")  # the market moved outside the collar
     again = h.execute("p1", open_action())  # redelivery (the PRIOR_INTENT path)
     assert again.duplicate and again.state == IntentState.REFUSED
-    intent = h.coord.intent(out.order_ref)
+    intent = h.coord.intent(ref)
     assert intent.reasons == [STALE_AFTER_UNKNOWN_OUTCOME, "BROKER_QUOTE_OUTSIDE_COLLAR"]
-    assert h.broker.submit_calls == 1
+    assert h.broker.submit_calls == 0
 
 
 @pytest.mark.parametrize(
@@ -269,29 +272,30 @@ def test_r3_redelivery_of_an_old_unresolved_entry_does_not_bypass_the_checks(h):
     ],
 )
 def test_r3_resend_reruns_quote_sanity_and_exposure_caps(h, setup, reason):
-    out = _lost_then_unlookable_for(h, h.config.settle_seconds + 1)
+    ref = _never_sent_for(h, h.config.settle_seconds + 1)
+    h.broker.set_quote("ZZQ", "49.98", "50.02")
     setup(h)
     h.coord.recover()
-    intent = h.coord.intent(out.order_ref)
+    intent = h.coord.intent(ref)
     assert intent.state == IntentState.REFUSED and intent.reasons[0] == STALE_AFTER_UNKNOWN_OUTCOME
     assert intent.reasons[1].startswith(reason)
-    assert h.broker.submit_calls == 1
+    assert h.broker.submit_calls == 0
 
 
 def test_r3_intent_older_than_the_maximum_age_is_not_resent_even_if_the_source_is_fresh(tmp_path):
     h = Harness(tmp_path, max_intent_age_seconds=30)
-    out = _lost_then_unlookable_for(h, 40)  # source still fresh (90 s), intent too old (30 s)
+    ref = _never_sent_for(h, 40)  # source still fresh (90 s), intent too old (30 s)
     h.coord.recover()
-    assert h.coord.intent(out.order_ref).reasons == [STALE_AFTER_UNKNOWN_OUTCOME, "INTENT_TOO_OLD"]
-    assert h.broker.submit_calls == 1
+    assert h.coord.intent(ref).reasons == [STALE_AFTER_UNKNOWN_OUTCOME, "INTENT_TOO_OLD"]
+    assert h.broker.submit_calls == 0
 
 
 def test_r3_resend_is_still_blocked_by_the_halt(h):
-    out = _lost_then_unlookable_for(h, h.config.settle_seconds + 1)
+    ref = _never_sent_for(h, h.config.settle_seconds + 1)
     h.halt()
     h.coord.recover()
-    assert h.coord.intent(out.order_ref).state == IntentState.HALTED
-    assert h.broker.submit_calls == 1
+    assert h.coord.intent(ref).state == IntentState.HALTED
+    assert h.broker.submit_calls == 0
 
 
 # --------------------------------------------- safety review R4: no premature "no trace"
@@ -333,14 +337,14 @@ def test_r4_open_order_lag_does_not_cause_a_duplicate(h):
     assert "NO_TRACE_AT_BROKER" not in h.events(out.order_ref)
 
 
-def test_r4_without_the_settle_the_same_lag_would_have_duplicated(tmp_path):
-    """Control for the test above: with settle 0 the lagging order is resent. This proves the lag
-    is real in the SimBroker, so it is the settle that prevents the duplicate."""
+def test_r4_even_with_no_settle_the_lagging_entry_is_not_duplicated(tmp_path):
+    """Control for the test above. Before round 2 a settle of 0 resent the lagging order (two
+    orders); since F5 an entry of unknown outcome is never resent, whatever the settle."""
     h = Harness(tmp_path, settle_seconds=0)
     h.broker.open_orders_lag_seconds = 5
     h.broker.script_next_submit("LOST_ACK_PLACED_RESTING")
     out = _open(h)
-    assert len(h.broker.orders_with_ref(out.order_ref)) == 2
+    assert len(h.broker.orders_with_ref(out.order_ref)) == 1
 
 
 def test_r4_filled_order_outside_the_executions_window_is_never_resent(h):
