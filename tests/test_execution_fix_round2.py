@@ -466,3 +466,29 @@ def test_f12_an_exit_refused_by_the_halt_is_notified_by_identifier(tmp_path):
     _, _, message = sent[0]
     assert "CLOSE" in message and "HALT_SWITCH_PRESENT" in message and close[0]["order_ref"] in message
     assert CLOSE not in message and "Closing" not in message  # identifiers only, never post text
+
+
+# ------------------------------------------------- addition 2: protective children time in force
+
+
+def test_add2_protective_children_are_gtc_by_default(tmp_path):
+    from tradingbot.execution.broker import TimeInForce
+
+    h = Harness(tmp_path)
+    out = h.execute("p1", open_action())
+    for ref in (f"{out.order_ref}.STP", f"{out.order_ref}.TGT"):
+        assert h.working()[ref].tif == TimeInForce.GTC
+
+
+def test_add2_a_day_setting_gives_day_children_and_an_expired_stop_is_flagged(tmp_path):
+    from tradingbot.execution.broker import TimeInForce
+
+    h = Harness(tmp_path, protective_tif=TimeInForce.DAY)
+    out = h.execute("p1", open_action())
+    for ref in (f"{out.order_ref}.STP", f"{out.order_ref}.TGT"):
+        assert h.working()[ref].tif == TimeInForce.DAY
+    assert h.coord.reconcile().clean
+    h.broker.expire_day_orders()  # the session ends: DAY orders expire, the position stays
+    assert [p.quantity for p in h.broker.positions()] == [4]
+    report = h.coord.reconcile()
+    assert "POSITION_WITHOUT_PROTECTIVE_STOP" in _kinds(report) and not report.clean
