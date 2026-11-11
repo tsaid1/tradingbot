@@ -94,10 +94,21 @@ ENTRY_FILL_NOT_IN_EXECUTIONS = "ENTRY_FILL_NOT_IN_EXECUTIONS"
 # sent until a full sync succeeds (review F1).
 BROKER_STATE_UNKNOWN = "BROKER_STATE_UNKNOWN"
 BROKER_UNREADABLE = "BROKER_UNREADABLE"
+# An idea was stopped out (or closed) while part of its entry or add was still working, and the
+# cancel of that remainder could not be confirmed at the broker (review F2).
+ENTRY_REMAINDER_NOT_CANCELLED = "ENTRY_REMAINDER_NOT_CANCELLED"
 
 
 class BrokerUnreadable(BrokerError):
     """A full broker sync failed: the coordinator cannot tell what the account holds."""
+
+# An open exception of one of these kinds on any idea blocks new exposure in that instrument.
+INSTRUMENT_BLOCKING_KINDS = (
+    LEDGER_REVERSAL,
+    ENTRY_REMAINDER_NOT_CANCELLED,
+    UNPROTECTED_POSITION,
+    PROTECTION_UNVERIFIED,
+)
 
 
 def default_halt_file() -> Path:
@@ -353,7 +364,7 @@ class ExecutionCoordinator:
             raise BrokerUnreadable("broker state could not be read; recovery incomplete")
         return out
 
-    def sync(self, *, _halt_rerun: bool = True) -> bool:
+    def sync(self, *, _rerun: bool = True) -> bool:
         """Apply new broker fills to the ledger, refresh working orders, keep protection sized.
         Returns False when the broker could not be read (nothing is changed then)."""
         now = self.clock()
@@ -397,15 +408,59 @@ class ExecutionCoordinator:
                     ledger_quantity=pos.quantity,
                 )
         self._refresh_orders(open_orders, now)
-        if _halt_rerun and self.halted() and self._cancel_entries_for_halt(open_orders):
+        asked = self._cancel_stopped_out_entries(open_orders)
+        if _rerun and self.halted() and self._cancel_entries_for_halt(open_orders):
+            asked = True
+        if asked and _rerun:
             # Risk-reducing: re-read once so a fill that beat the cancel is applied and covered.
-            return self.sync(_halt_rerun=False)
+            return self.sync(_rerun=False)
         positions = {p.idea_id: p for p in self.store.positions()}
         for idea_id in sorted(
             touched | {i for i, p in positions.items() if p.status in ("OPEN", "PENDING")}
         ):
             self._maintain_protection(idea_id)
         return True
+
+    def _cancel_stopped_out_entries(self, open_orders: list[BrokerOrder]) -> bool:
+        """Review F2: once a protective stop has filled for an idea, or the idea is closed, no
+        remainder of its entry or add orders may keep working (it would later fill with no stop).
+        Each is cancelled and the cancel confirmed at the broker; an unconfirmed cancel opens
+        ENTRY_REMAINDER_NOT_CANCELLED, which blocks new exposure in the instrument. Returns True
+        when a cancel was requested."""
+        stopped = {f["idea_id"] for f in self.store.fills() if f["role"] == Role.STOP.value}
+        stopped |= {
+            p.idea_id for p in self.store.positions() if p.status in ("CLOSED", "REVERSED")
+        }
+        if not stopped:
+            return False
+        working = {o.order_ref for o in open_orders}
+        remainder: dict[str, list[str]] = {}
+        for r in self.store.orders():
+            if r.role == Role.ENTRY and r.idea_id in stopped and r.order_ref in working:
+                remainder.setdefault(r.idea_id, []).append(r.order_ref)
+        now = self.clock()
+        for idea in sorted(stopped - set(remainder)):
+            self.store.resolve_exceptions(now, ENTRY_REMAINDER_NOT_CANCELLED, idea_id=idea)
+        for idea, refs in sorted(remainder.items()):
+            for ref in refs:
+                if self._cancel_confirmed(ref, idea, "idea stopped out: entry remainder"):
+                    self.store.log(
+                        self.clock(), "ENTRY_REMAINDER_CANCELLED", order_ref=ref, idea_id=idea,
+                        rule="a stopped-out or closed idea keeps no working entry or add",
+                    )
+                    continue
+                detail = (
+                    f"{ref} is still working after {idea} was stopped out or closed and its "
+                    "cancel was not confirmed; new exposure in this instrument is blocked"
+                )
+                if self.store.raise_exception(
+                    self.clock(), ENTRY_REMAINDER_NOT_CANCELLED, detail, idea_id=idea,
+                    order_ref=ref,
+                ):
+                    self.store.log(
+                        self.clock(), ENTRY_REMAINDER_NOT_CANCELLED, order_ref=ref, idea_id=idea
+                    )
+        return bool(remainder)
 
     def _cancel_entries_for_halt(self, open_orders: list[BrokerOrder]) -> bool:
         """Under the halt no entry or add may keep working (it could fill while nothing else may
@@ -1530,8 +1585,9 @@ class ExecutionCoordinator:
     ) -> tuple[Decimal | None, list[str]]:
         """Broker-quote sanity, the price collar and exposure caps, before any entry or add.
         Returns the collar-bounded limit price, or the reasons to refuse."""
-        if self._reversal_blocks(contract.symbol):
-            return None, ["INSTRUMENT_BLOCKED_LEDGER_REVERSAL"]
+        blocked = self._instrument_block(contract.symbol)
+        if blocked:
+            return None, [f"INSTRUMENT_BLOCKED_{blocked}"]
         q, problem = self._usable_quote(contract, now)
         if problem:
             return None, [problem]
@@ -1609,14 +1665,17 @@ class ExecutionCoordinator:
             return (q.bid * (1 - band)).quantize(CENT, ROUND_CEILING), None
         return (q.ask * (1 + band)).quantize(CENT, ROUND_FLOOR), None
 
-    def _reversal_blocks(self, symbol: str) -> bool:
-        """An open LEDGER_REVERSAL on any idea in this instrument blocks all new exposure in it."""
-        ideas = {
-            e.idea_id
-            for e in self.store.exceptions(open_only=True)
-            if e.kind == LEDGER_REVERSAL
-        }
-        return any(p.symbol == symbol for p in self.store.positions() if p.idea_id in ideas)
+    def _instrument_block(self, symbol: str) -> str | None:
+        """The first open exception, of a kind in ``INSTRUMENT_BLOCKING_KINDS``, on any idea in this
+        instrument: while it is open no new exposure is taken in that instrument (review R2, F2)."""
+        in_instrument = {p.idea_id for p in self.store.positions() if p.symbol == symbol}
+        open_ = [
+            e for e in self.store.exceptions(open_only=True) if e.idea_id in in_instrument
+        ]
+        for kind in INSTRUMENT_BLOCKING_KINDS:
+            if any(e.kind == kind for e in open_):
+                return kind
+        return None
 
     def _exposure(
         self, symbol: str, exclude_ref: str | None = None, now: datetime | None = None

@@ -91,3 +91,54 @@ def test_f1_the_service_broker_check_exercises_every_read(tmp_path, read):
     report = rt.step()
     assert report.skipped == "broker_unavailable"
     assert rt.signals() == []  # no signal consumed while a broker read fails
+
+
+# ----------------------------------------------------------------------------------------- F2
+
+
+def _partial_then_stopped(h: Harness):
+    h.broker.script_next_submit("PARTIAL", quantity=1)  # entry fills 1 of 4, 3 keep working
+    out = h.execute("p1", open_action())
+    assert h.coord.store.position("p1:open").quantity == 1
+    assert h.working()[f"{out.order_ref}.STP"].remaining == 1
+    return out
+
+
+def test_f2_a_stop_out_cancels_the_working_entry_remainder(tmp_path):
+    h = Harness(tmp_path)
+    out = _partial_then_stopped(h)
+    h.broker.set_quote(SYMBOL, "47.90", "47.94")  # the stop fires on the 1 held
+    h.coord.sync()
+    assert h.coord.store.position("p1:open").status == "CLOSED"
+    assert out.order_ref not in h.working()  # the 3 left can no longer fill unprotected
+    assert "ENTRY_REMAINDER_CANCELLED" in h.events(out.order_ref)
+    h.broker.set_quote(SYMBOL, "49.98", "50.02")
+    assert h.broker.positions() == []
+    assert h.coord.reconcile().clean
+
+
+def test_f2_an_unconfirmed_remainder_cancel_blocks_new_exposure_in_the_instrument(tmp_path):
+    h = Harness(tmp_path)
+    _partial_then_stopped(h)
+    h.broker.set_quote(SYMBOL, "47.90", "47.94")
+    for _ in range(4):  # every retry fails: this sync, its re-read, then the next pre-trade sync
+        h.broker.script_next_cancel("REJECT")
+    h.coord.sync()
+    assert "ENTRY_REMAINDER_NOT_CANCELLED" in _open_kinds(h)
+    h.broker.set_quote(SYMBOL, "49.98", "50.02")
+    again = h.execute("p2", open_action())
+    assert again.state == IntentState.REFUSED
+    assert again.reasons[0].startswith("INSTRUMENT_BLOCKED")
+
+
+def test_f2_a_resize_that_cannot_be_confirmed_blocks_new_exposure(tmp_path):
+    h = Harness(tmp_path)
+    out = _partial_then_stopped(h)
+    for _ in range(3):  # this sync and the pre-trade sync of the next open both fail to resize
+        h.broker.script_next_modify("REJECT")
+    h.broker.fill(out.order_ref)  # the other 3 fill: the stop must grow from 1 to 4
+    h.coord.sync()
+    assert h.coord._outcome(out.order_ref).protection == "UNPROTECTED"
+    again = h.execute("p2", open_action())
+    assert again.state == IntentState.REFUSED
+    assert again.reasons[0].startswith("INSTRUMENT_BLOCKED")

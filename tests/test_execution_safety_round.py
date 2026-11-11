@@ -349,6 +349,8 @@ def test_r6_reconcile_flags_a_working_entry_of_a_closed_idea(tmp_path):
     h.broker.script_next_submit("PARTIAL", quantity=1)
     opened = h.execute("p1", open_action())
     h.broker.set_quote(SYMBOL, "47.90", "47.95")  # the stop closes the 1 held
+    for _ in range(2):  # round 2 (F2) cancels the remainder: here that cancel fails
+        h.broker.script_next_cancel("REJECT")
     h.coord.sync()
     assert h.coord.store.position("p1:open").status == "CLOSED"
     kinds = [d.kind.value for d in h.coord.reconcile().discrepancies]
