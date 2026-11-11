@@ -5,6 +5,8 @@ Invented tickers, toy prices and invented wording only. No network, no broker po
 
 from __future__ import annotations
 
+from decimal import Decimal
+
 from execution_harness import Harness, action, open_action
 
 from tradingbot.execution.broker import (
@@ -14,7 +16,7 @@ from tradingbot.execution.broker import (
 )
 from tradingbot.execution.coordinator import PROTECTION_UNVERIFIED, _intent_state
 from tradingbot.execution.store import IntentState
-from tradingbot.models import Action
+from tradingbot.models import Action, MockPolicy
 
 # ----------------------------------------------------------------------------------------- N1
 
@@ -71,3 +73,41 @@ def test_m1_protection_is_not_confirmed_when_the_post_fill_check_failed(tmp_path
     assert h.coord._outcome(add.order_ref).protection == "CONFIRMED"
     assert h.working()[f"{opened.order_ref}.STP"].remaining == 6
     assert h.coord.store.exceptions(open_only=True) == []
+
+
+# ----------------------------------------------------------------------------------------- M2
+
+
+def _capped(tmp_path, cap: int = 250) -> Harness:
+    return Harness(
+        tmp_path,
+        strict=True,
+        policy=MockPolicy(
+            quantity=4, max_notional_usd=Decimal(1000), max_aggregate_exposure_usd=Decimal(cap)
+        ),
+    )
+
+
+def test_m2_an_entry_whose_ack_was_lost_still_counts_against_the_caps(tmp_path):
+    h = _capped(tmp_path)
+    h.broker.script_next_submit("LOST_ACK_PLACED_RESTING")  # live at the broker, ack lost
+    h.broker.lookup_failures = 2  # the pre-trade sync and the follow-up lookup both fail
+    first = h.execute("p1", open_action())
+    assert first.state == IntentState.UNRESOLVED
+    h.broker.set_quote("QQZ", "19.99", "20.01")
+    second = h.execute("p2", open_action(symbol="QQZ", entry="20", stop="19", target="22"))
+    assert second.state == IntentState.REFUSED
+    assert second.reasons[0].startswith("AGGREGATE_EXPOSURE_CAP")
+
+
+def test_m2_a_recorded_entry_counts_and_does_not_count_against_its_own_resend(tmp_path):
+    h = _capped(tmp_path)
+    h.broker.script_next_submit("LOST_ACK_NOT_PLACED")
+    h.broker.lookup_failures = 2
+    first = h.execute("p1", open_action())
+    assert first.state == IntentState.UNRESOLVED
+    _, total = h.coord._exposure("ZZQ")
+    assert total == Decimal("50.50") * 4  # the full intended quantity at its limit
+    h.clock.advance(h.config.settle_seconds + 1)
+    h.coord.recover()  # no trace: the resend is not refused by its own exposure
+    assert h.coord.intent(first.order_ref).state == IntentState.FILLED

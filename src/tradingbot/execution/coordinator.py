@@ -714,7 +714,7 @@ class ExecutionCoordinator:
             return [problem]
         limit, reasons = self._entry_checks(
             contract, OrderSide(intent.side), intent.quantity, intent.entry_reference,
-            intent.idea_id, now,
+            intent.idea_id, now, exclude_ref=intent.order_ref,
         )
         if reasons:
             return reasons
@@ -1134,6 +1134,7 @@ class ExecutionCoordinator:
         reference: str | None,
         idea_id: str,
         now: datetime,
+        exclude_ref: str | None = None,
     ) -> tuple[Decimal | None, list[str]]:
         """Broker-quote sanity, the price collar and exposure caps, before any entry or add.
         Returns the collar-bounded limit price, or the reasons to refuse."""
@@ -1167,7 +1168,7 @@ class ExecutionCoordinator:
         )
         per_cap = self.policy.max_instrument_exposure_usd or self.policy.max_notional_usd
         new = limit * qty
-        symbol_exposure, total_exposure = self._exposure(contract.symbol)
+        symbol_exposure, total_exposure = self._exposure(contract.symbol, exclude_ref)
         if symbol_exposure + new > per_cap:
             return None, [f"INSTRUMENT_EXPOSURE_CAP:{symbol_exposure + new}>{per_cap}"]
         if total_exposure + new > self.policy.max_aggregate_exposure_usd:
@@ -1175,28 +1176,25 @@ class ExecutionCoordinator:
             return None, [f"AGGREGATE_EXPOSURE_CAP:{total_exposure + new}>{cap}"]
         return limit, []
 
-    def _exposure(self, symbol: str) -> tuple[Decimal, Decimal]:
-        """Gross exposure at cost of every open follower idea plus unfilled working entries."""
+    def _exposure(self, symbol: str, exclude_ref: str | None = None) -> tuple[Decimal, Decimal]:
+        """Gross exposure at cost of every open follower idea plus every non-terminal entry or add
+        (``exclude_ref``: the intent being checked for its own resend)."""
         per: dict[str, Decimal] = {}
         for p in self.store.positions():
             if p.quantity > 0 and p.avg_price:
                 per[p.symbol] = per.get(p.symbol, Decimal(0)) + Decimal(p.avg_price) * p.quantity
-        for row in self.store.orders():
-            if (
-                row.role == Role.ENTRY
-                and row.status
-                in {
-                    s.value
-                    for s in (
-                        OrderStatus.PENDING_SUBMIT,
-                        OrderStatus.SUBMITTED,
-                        OrderStatus.PARTIALLY_FILLED,
-                    )
-                }
-                and row.limit_price
-            ):
-                left = row.quantity - row.filled_quantity
-                per[row.symbol] = per.get(row.symbol, Decimal(0)) + Decimal(row.limit_price) * left
+        # Every entry or add that is not terminal may be live at the broker, whatever our view of
+        # its order rows (recorded, ack lost, held PreSubmitted): its full intended quantity counts,
+        # less what has already been applied to the ledger (counted above). Review M2.
+        for intent in self.store.intents(UNRESOLVED_STATES | {IntentState.WORKING}):
+            if intent.action not in (Action.OPEN, Action.ADD) or intent.order_ref == exclude_ref:
+                continue
+            price = _dec(intent.limit_price)
+            if price is None:
+                continue
+            left = intent.quantity - self.store.filled_quantity(intent.order_ref)
+            if left > 0:
+                per[intent.symbol] = per.get(intent.symbol, Decimal(0)) + price * left
         return per.get(symbol, Decimal(0)), sum(per.values(), Decimal(0))
 
     def _resolve_contract(self, instrument: Instrument) -> tuple[ContractRef | None, str | None]:
