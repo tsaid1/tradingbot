@@ -100,9 +100,15 @@ class PaperOrder(StrictModel):
 
 class ActionOutcome(StrictModel):
     action_id: str
-    status: Literal["SIMULATED", "HOLD", "BLOCK", "NO_TRADE", "RECONCILE"]
+    status: Literal[
+        "SIMULATED", "HOLD", "BLOCK", "NO_TRADE", "RECONCILE",
+        # Broker-backed execution (tradingbot.execution); never produced by the mock ledger.
+        "EXECUTED", "WORKING", "REJECTED", "CANCELLED", "HALTED", "REFUSED", "UNRESOLVED", "EXCEPTION",
+    ]
     reasons: list[str] = Field(default_factory=list)
     order: PaperOrder | None = None
+    # The broker idempotency key of the order this action produced (broker-backed execution only).
+    order_ref: str | None = None
 
 
 class ReplayResult(StrictModel):

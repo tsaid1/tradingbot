@@ -1,0 +1,50 @@
+# Source-series-to-broker-contract mapping policy (tradingbot.runtime.mapping).
+#
+# Each [[mapping]] entry names the asset the publisher quotes (source_asset), the broker contract
+# an order would be placed in (broker_symbol, broker_asset_class, optional broker_exchange) and how
+# the publisher's price levels relate to that contract's price (basis):
+#
+#   DIRECT         levels are the traded instrument's own price            -> may execute
+#   INDEX_LEVEL    levels are index points, not the instrument's price     -> HOLD
+#   SPOT_LEVEL     levels are a spot rate or commodity price               -> HOLD
+#   FUTURES_LEVEL  levels are a futures contract's price                   -> HOLD
+#   PROXY          a related instrument with a different price             -> HOLD
+#   UNKNOWN        not established                                         -> HOLD
+#
+# Anything not listed here is also HELD with reason UNSUPPORTED_INSTRUMENT_MAPPING and never reaches
+# the broker. A DIRECT entry must use the same symbol on both sides. An index or spot level is never
+# interchangeable with an ETF or futures price: do not mark such a pair DIRECT.
+
+version = 1
+
+[[mapping]]
+source_asset = "TLT"
+broker_symbol = "TLT"
+broker_asset_class = "ETF"
+basis = "DIRECT"
+note = "Publisher levels for TLT are quoted in the ETF's own share price."
+
+# ------------------------------------------------------------------ templates (not active)
+# Uncomment only after the relationship has been reviewed. These bases never execute; listing them
+# documents why the asset is held.
+#
+# [[mapping]]
+# source_asset = "SPX"            # S&P 500 index points
+# broker_symbol = "SPY"
+# broker_asset_class = "ETF"
+# basis = "INDEX_LEVEL"
+# note = "Index points are not the ETF's price (ratio, dividends, tracking error)."
+#
+# [[mapping]]
+# source_asset = "GOLD"           # spot gold
+# broker_symbol = "GLD"
+# broker_asset_class = "ETF"
+# basis = "SPOT_LEVEL"
+# note = "Spot price per ounce is not the ETF's share price."
+#
+# [[mapping]]
+# source_asset = "WTI"            # crude oil futures level
+# broker_symbol = "USO"
+# broker_asset_class = "ETF"
+# basis = "FUTURES_LEVEL"
+# note = "Front-month futures level is not the ETF's price (roll, contango)."

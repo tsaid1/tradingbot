@@ -97,6 +97,18 @@ def gate_source(source: ReplaySource, now: datetime, *, is_edit: bool = False) -
     return None
 
 
+# ----------------------------------------------------------------------------- freshness
+
+def source_is_fresh(published_at: datetime, now: datetime, policy: MockPolicy) -> bool:
+    """The one source-freshness rule: published no more than ``max_signal_age_seconds`` ago and not
+    more than 5 s in the future. ``gate_action`` applies it; the execution core re-applies it before
+    re-sending an entry whose first submission outcome was unknown."""
+    if published_at.tzinfo is None or now.tzinfo is None:
+        return False
+    age = (now - published_at).total_seconds()
+    return -5 <= age <= policy.max_signal_age_seconds
+
+
 # ----------------------------------------------------------------------------- per-action preflight
 
 def gate_action(
@@ -147,8 +159,7 @@ def gate_action(
     # 4. Freshness of source and quote; quote integrity.
     if published_at.tzinfo is None:
         return _gate("BLOCK", "SOURCE_TIMEZONE_MISSING")
-    age = (now - published_at).total_seconds()
-    if age < -5 or age > policy.max_signal_age_seconds:
+    if not source_is_fresh(published_at, now, policy):
         return _gate("BLOCK", "SOURCE_STALE_OR_FUTURE")
     if quote is None or quote.observed_at.tzinfo is None:
         return _gate("BLOCK", "QUOTE_UNAVAILABLE")

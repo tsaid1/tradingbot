@@ -17,6 +17,9 @@ placed.
   ([SPRINT_1_1_EVENT_REPLAY.md](docs/SPRINT_1_1_EVENT_REPLAY.md)), plus a restart-safe synthetic shadow
   runner and soak ([SHADOW_01](docs/SHADOW_01_SYNTHETIC_SHADOW_RUNNER.md),
   [SHADOW_02](docs/SHADOW_02_SYNTHETIC_SOAK.md)).
+- **Execution core against a simulated broker:** a `Broker` protocol, a durable `SimBroker`, write-ahead
+  order intents, lost-acknowledgement recovery, confirmed protective stops and read-only reconciliation
+  ([EXECUTION_CORE.md](docs/EXECUTION_CORE.md); demo: `scripts/run_mock_lifecycle.py`). No real broker.
 - **Read-only dashboard pages:**
   - Mock Operations, with optional valuation of fictional positions against invented marks
     ([MOCK_OPERATIONS.md](docs/MOCK_OPERATIONS.md), [MOCK_MARK_REPORT.md](docs/MOCK_MARK_REPORT.md))

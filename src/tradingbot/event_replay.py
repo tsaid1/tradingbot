@@ -244,6 +244,7 @@ class PaperEventReplay:
                     staged = deepcopy(committed)
                     group_outcomes = [self._simulate(source, a, quotes, staged, now) for a in group]
                     if all(o.status == "SIMULATED" for o in group_outcomes):
+                        group_outcomes = self._execute_group(source, group, group_outcomes, staged, now)
                         committed = staged
                     elif len(group) > 1:
                         # A partial ADD + MODIFY would misrepresent risk; do neither.
@@ -261,6 +262,14 @@ class PaperEventReplay:
                 )
         return ReplayResult(source_id=source.source_id, revision=source.revision,
                             hydrated=hydrated, outcomes=outcomes)
+
+    def _execute_group(self, source: ReplaySource, group: list[TradeAction],
+                       outcomes: list[ActionOutcome], ideas: dict[str, Idea],
+                       now: datetime) -> list[ActionOutcome]:
+        """Execution seam, called only for a group the gateway approved in full. The mock ledger keeps
+        its fictional fills as they are; a broker-backed subclass (execution.replay.BrokerEventReplay)
+        executes the group and replaces outcomes and staged ideas with what the broker actually did."""
+        return outcomes
 
     def _simulate(self, source: ReplaySource, a: TradeAction, quotes: dict[str, Quote],
                   ideas: dict[str, Idea], now: datetime) -> ActionOutcome:
