@@ -15,15 +15,16 @@ PYTHONPATH=src python -m tradingbot.paper_readiness.callback_demo
 ```
 
 It takes no arguments. The package admits only pure standard-library imports, so the module has no `sys`
-or `argparse`. It prints the three scenarios in `SCENARIOS`, then seven CLI-only cases: `UNKNOWN_CLEANUP`,
-the two `ACCOUNT_POSITION_FAILURES` and the four `READER_FRAMING_CASES`. The exit status is 0 only when
-every case reaches its expected readiness outcome, lifecycle completion and framing outcome, and 1
-otherwise. A match means only that. It checks the demonstration itself and is never a verdict on any real
+or `argparse`. It prints the three scenarios in `SCENARIOS`, then eight CLI-only cases: `UNKNOWN_CLEANUP`,
+the two `ACCOUNT_POSITION_FAILURES`, the four `READER_FRAMING_CASES` and the one `HANDOFF_FAILURE_CASES`.
+The exit status is 0 only when every case reaches its expected readiness outcome, lifecycle completion,
+framing outcome and handoff failure, and 1 otherwise. A match means only that. It checks the demonstration itself and is never a verdict on any real
 broker, account, retirement or readiness. For JSON from Python:
 
 ```python
 from tradingbot.paper_readiness import callback_demo as demo
-extra = [demo.UNKNOWN_CLEANUP, *demo.ACCOUNT_POSITION_FAILURES, *demo.READER_FRAMING_CASES]
+extra = [demo.UNKNOWN_CLEANUP, *demo.ACCOUNT_POSITION_FAILURES, *demo.READER_FRAMING_CASES,
+         *demo.HANDOFF_FAILURE_CASES]
 names = [*demo.SCENARIOS, *(s.name for s in extra)]
 print(demo.render_demo_json([demo.run_demo(name) for name in names]))
 ```
@@ -38,7 +39,7 @@ print(demo.render_demo_json([demo.run_demo(name) for name in names]))
    | Stream | Normalizer | Correlation |
    |---|---|---|
    | contract details | `IbkrCallbackNormalizer` ([IBKR_CALLBACK_NORMALIZATION.md](IBKR_CALLBACK_NORMALIZATION.md)), called directly | the contract-details request id |
-   | quote snapshot | `IbkrCallbackNormalizer`, reached only through the lifecycle adapter's consumer | the quote request id |
+   | quote snapshot | The router's own `IbkrCallbackNormalizer`, reached only through owned frames, `DecodeHandoff` and the router's consumer; its evidence is read through `CallbackRouter.stream_status()` | the quote request id |
    | account summary | `AccountSummaryCallbacks` ([ACCOUNT_POSITION_CALLBACKS.md](ACCOUNT_POSITION_CALLBACKS.md)), called directly | its broker request id, kept on every row and END |
    | positions | `PositionSnapshotCallbacks`, called directly | one local snapshot; its id (the runner's positions id) is local, never a broker request id |
 
@@ -58,21 +59,21 @@ quantity, which the normalizer keeps exactly.
 
 ## Local lifecycle
 
-Each run composes one merged `LifecycleAdapter` and its `RetirementLedger`
-([SDK_LIFECYCLE_ADAPTER.md](SDK_LIFECYCLE_ADAPTER.md), [READ_ONLY_RETIREMENT.md](READ_ONLY_RETIREMENT.md)).
-It uses invented SDK-free doubles for the client, connection, reader, queue and lock.
+Each run composes one `CallbackRouter` ([CALLBACK_ROUTER.md](CALLBACK_ROUTER.md)), whose `LifecycleAdapter`
+and `RetirementLedger` ([SDK_LIFECYCLE_ADAPTER.md](SDK_LIFECYCLE_ADAPTER.md),
+[READ_ONLY_RETIREMENT.md](READ_ONLY_RETIREMENT.md)) account for the quote read. It uses invented SDK-free
+doubles for the client, connection, reader and lock; the router supplies the queue and dispatch.
 
-1. The adapter opens the `QUOTE_SNAPSHOT` read.
-2. A reader double queues each invented quote callback. Only the adapter's consumer takes it from the
-   queue and delivers it to the quote normalizer, so the readiness quote envelopes come only from callbacks
-   the adapter dispatched.
+1. The router starts and registers the `QUOTE_SNAPSHOT` read.
+2. The quote callbacks reach it only through owned frames and the decode handoff (below), and only the
+   router's consumer delivers them to the quote normalizer.
 3. `shutdown` disconnects, closes admission and drains. It then observes the reader, the socket and the
-   consumer separately. The adapter makes no stop attempt for a snapshot whose END it delivered.
-4. The adapter's own `report()`, with its ledger report, goes unmodified into `DemoResult.lifecycle` and
-   the JSON `lifecycle_report`. Text and JSON summaries read their fields from it.
+   consumer separately. No stop attempt is made for a snapshot whose END was delivered.
+4. The router's adapter report, with its ledger report, goes unmodified into `DemoResult.lifecycle` and the
+   JSON `lifecycle_report`. The router report is in `DemoResult.router`.
 
 **Outside the lifecycle model.** The contract-details, account-summary and position callbacks reach their
-normalizers directly, not through the adapter. The ledger has no read slot for contract details. It does
+normalizers directly, not through the router. The ledger has no read slot for contract details. It does
 model account-summary and position reads, but this demonstration does not route them through it. The output
 labels all three, and no lifecycle, retirement or cancellation coverage is claimed for them.
 
@@ -80,32 +81,37 @@ A completed lifecycle is local only. Every adapter and ledger report stays `NON_
 `trading_permission` false, broker-side retirement `NOT_ESTABLISHED_BY_INSPECTED_SOURCES` and PAPER-READ-1
 `NOT_ASSESSED`.
 
-## Reader framing
+## Frames and the decode handoff
 
-The quote reader double's buffer is the accepted `FrameAccumulator` ([READ_FRAMING.md](READ_FRAMING.md)),
-with its default limits.
+Each quote callback travels in **one owned invented frame**. Its payload is a whole invented key, not an SDK
+message: the closed `InventedDecoder` ([DECODE_HANDOFF.md](DECODE_HANDOFF.md)) maps it to exactly that
+callback. No message id, protobuf or wire-format selection is modelled.
 
-1. Each case gives the reader fixed invented opaque byte chunks in the accumulator's documented frame shape:
-   a four-byte length, then the payload. The control's chunks hold three complete frames, one of them
-   zero-length, and split headers and a payload across chunk boundaries.
-2. Normal processing feeds each chunk, then hands off with `take()` every frame that chunk completed. The
-   reader double holds handed-off frames unprocessed. Nothing decodes a payload. The bytes are not SDK
-   messages, do not carry the quote callbacks and do not affect callback routing.
-3. When the adapter joins the reader, the reader only calls `finish()`. Nothing is drained, taken,
-   discarded or decoded at shutdown.
-4. The adapter's reader observation reads `partial_bytes()`, which returns the accumulator's observed
-   `bytes_retained`. A retained partial frame therefore makes the lifecycle reader `FAILED` with
-   `PARTIAL_BYTES_UNRESOLVED`. No byte count is invented.
-5. The accumulator's own report goes unmodified into `DemoResult.framing` and the JSON `framing_report`.
-   Only enum members are written as their values.
+1. The frames' bytes arrive fragmented in 13-byte chunks, so headers and payloads cross chunk boundaries.
+   The control has eight frames: `marketDataType`, six ticks and `tickSnapshotEnd`.
+2. Each chunk goes into the accepted `DecodeHandoff`'s own `FrameAccumulator`
+   ([READ_FRAMING.md](READ_FRAMING.md)), at its default limits.
+3. After each chunk, every complete frame is reserved, taken, decoded into the `ReadCallbackFacade`, and
+   settled through the router's own consumer before it is released. A frame whose delivery is not proven
+   stays held, and no later frame is taken.
+4. When the router joins the reader double, the reader only calls the handoff's `finish()`. Its
+   `partial_bytes()` reads the handoff framing report's `bytes_retained`, so a retained partial frame makes
+   the lifecycle reader `FAILED` with `PARTIAL_BYTES_UNRESOLVED`. No byte count is invented.
+5. The handoff's framing report goes unmodified into `DemoResult.framing` and the JSON `framing_report`; its
+   handoff report into `DemoResult.handoff`, summarized in `decode_handoff` with its per-frame records.
 
-**Two reports, one aggregate.** The lifecycle model has no state for a refusal without retained bytes or
-for untaken frames, so those appear only in the framing report. `DemoResult.local_components_complete`
-(JSON `local_components.both_complete`) is true only when the lifecycle completed **and** the framing
-outcome is `COMPLETE`. It is local and `NON_AUTHORITATIVE`. It never changes the readiness outcome, and
-it is never PAPER-READ-1, broker-side retirement or trading permission. A handed-off frame is local buffer
-accounting only (`downstream_retirement` stays `NOT_ESTABLISHED`); it is not consumer processing or
-retirement.
+The quote stream's completion and issue codes come from the router's own normalizer through
+`CallbackRouter.stream_status()`. They are normalizer evidence, not a delivery or lifecycle verdict.
+
+**One aggregate.** `DemoResult.local_components_complete` (JSON `local_components.all_complete`) is true only
+when the lifecycle completed, the framing outcome is `COMPLETE` **and** the handoff completed, which itself
+needs every frame settled and the router's own completion. It is local and `NON_AUTHORITATIVE`. It never
+changes the readiness outcome, and it is never PAPER-READ-1, broker-side retirement or trading permission.
+
+**Changed from the earlier demonstration.** The reader previously buffered three unrelated opaque frames
+while the quote callbacks were delivered separately. The readiness outcomes, lifecycle completions, slots
+and socket observations of every existing scenario are unchanged, but the framing counts now describe the
+eight callback-carrying frames.
 
 ## Scenarios
 
@@ -121,20 +127,28 @@ Every scenario uses the control's account-summary and position callbacks unless 
 | `summary_monetary_currency_missing` (CLI only) | As the control, but `BuyingPower` arrives with an empty currency (PR #35 review P2) | `NOT_READY`: `ACCOUNT_CURRENCY_MISSING`, so no `ACCOUNT_SNAPSHOT_CONTROL` | Completed; the account read is outside the model |
 | `malformed_position_then_repeated_end` (CLI only) | As the control, then an oversized position quantity and `positionEnd` twice (PR #35 review P2) | `NOT_READY`: `MALFORMED_CALLBACK` withholds every END, so `POSITIONS_END_MISSING` | Completed; the position read is outside the model |
 
-Every scenario above uses the control's reader bytes, so its framing outcome is `COMPLETE`. The four
-reader-framing cases (`READER_FRAMING_CASES`, CLI only) keep every callback of the control, so readiness
-stays `CONTROL_COMPLETE`. Each differs from the control only in the reader's bytes, or in whether the
-reader hands off its final frames:
+Every scenario above carries its quote callbacks in owned frames with no trailing bytes, so its framing
+outcome is `COMPLETE` and every frame settles. The four reader-framing cases (`READER_FRAMING_CASES`, CLI
+only) keep every callback of the control, all delivered, so readiness stays `CONTROL_COMPLETE`. Each differs
+from the control only in trailing bytes after the eight quote frames, or in whether the final chunk's frame
+is handed to decoding:
 
 | Case | Reader input | Framing outcome | Local lifecycle | Both local components |
 |---|---|---|---|---|
-| `framing_partial_header` | The control's chunks, then two header bytes of a further frame | `PARTIAL_HEADER`, 2 bytes retained | **Not completed**: reader `FAILED`, `PARTIAL_BYTES_UNRESOLVED` | No |
-| `framing_partial_payload` | The control's chunks, then a further frame's header and six payload bytes | `PARTIAL_PAYLOAD`, 10 bytes retained | **Not completed**: reader `FAILED`, `PARTIAL_BYTES_UNRESOLVED` | No |
-| `framing_declared_length_refused` | The control's chunks, then a header declaring a length beyond the payload limit | `REFUSED` (`DECLARED_LENGTH_TOO_LARGE`), its 4 header bytes retained | **Not completed**: reader `FAILED`, `PARTIAL_BYTES_UNRESOLVED` | No |
-| `framing_untaken_frames` | The control's chunks; the frames the last chunk completes are never handed off | `UNTAKEN_FRAMES`, nothing retained | Completed: the lifecycle model cannot express untaken frames | No |
+| `framing_partial_header` | The control's frames, then two header bytes of a further frame | `PARTIAL_HEADER`, 2 bytes retained | **Not completed**: reader `FAILED`, `PARTIAL_BYTES_UNRESOLVED` | No |
+| `framing_partial_payload` | The control's frames, then a further frame's header and six payload bytes | `PARTIAL_PAYLOAD`, 10 bytes retained | **Not completed**: reader `FAILED`, `PARTIAL_BYTES_UNRESOLVED` | No |
+| `framing_declared_length_refused` | The control's frames, then a header declaring a length beyond the payload limit | `REFUSED` (`DECLARED_LENGTH_TOO_LARGE`), its 4 header bytes retained | **Not completed**: reader `FAILED`, `PARTIAL_BYTES_UNRESOLVED` | No |
+| `framing_untaken_frames` | The control's frames, then one further complete frame in a final chunk that is never handed to decoding | `UNTAKEN_FRAMES`, nothing retained | Completed: the lifecycle model cannot express untaken frames | No |
 
-The unknown-socket counterpart keeps its incomplete lifecycle, with framing `COMPLETE`, so it is not
-complete on both components either.
+The unknown-socket counterpart keeps its incomplete lifecycle, with framing `COMPLETE`, so its aggregate is
+incomplete too.
+
+The handoff-failure case (`HANDOFF_FAILURE_CASES`, CLI only) shows a failure **after a complete frame but
+before its settlement**:
+
+| Case | What happens | Readiness | Local lifecycle and handoff |
+|---|---|---|---|
+| `handoff_decoder_raised_after_snapshot_end` | The control's frames; the invented decoder raises right after delivering `tickSnapshotEnd`, so that frame's admitted END is never settled by the handoff | `CONTROL_COMPLETE`: shutdown later drains the admitted END and the stream completes | **Not completed**: handoff `DECODER_RAISED`, frame 8 held (1 admitted, 0 dispatched), 7 of 8 settled; the END arrived after the stop attempt, so the ledger records `LATE_CALLBACK` and the quote read is not complete. The failure persists after END |
 
 In the counterpart, the disconnect returned, `CONNECTION_CLOSED` was recorded, the queue is empty and the
 reader stopped. None of these clears the unknown socket closure, so readiness `CONTROL_COMPLETE` sits next
@@ -147,15 +161,14 @@ to an incomplete lifecycle.
   stop is exercised here, because the ended snapshot needs none; the lifecycle's own tests cover stops.
 - Only exact `SYNTH-` account identities are representable, as in the accepted account normalizer. The two
   account and position failure cases are fixed; there is no free-form callback input.
-- The lifecycle doubles run on one thread with a fixed schedule: every queued callback is delivered before
-  shutdown. This adds no timing, tick, risk or retirement policy.
-- The reader bytes are fixed invented opaque controls, unrelated to the callbacks. This is not a reader of
-  any real socket or SDK stream. It does not resolve which component owns a real reader buffer, and it
-  makes no protocol, decoding or SDK-admission claim. The accumulator's limits are its documented
-  defaults, chosen as model policy.
-- The normalizers, the accumulator, the lifecycle adapter and ledger, and the shared contracts are
-  unchanged. The dashboard page and its three-scenario input are unchanged; its JSON view now also carries
-  the framing report.
+- The doubles run on one thread with a fixed schedule: each frame is decoded and settled as its chunk
+  completes it. This adds no timing, tick, risk or retirement policy.
+- The frames are invented: whole invented keys mapped by a closed decoder to fixed callbacks. This is not a
+  reader of any real socket or SDK stream, and it makes no protocol, message-id, protobuf, decoding or
+  SDK-admission claim. The accumulator's limits are its documented defaults, chosen as model policy.
+- The normalizers, the accumulator, the decode handoff, the router, the lifecycle adapter and ledger, and
+  the shared contracts are unchanged. The dashboard page and its three-scenario input are unchanged; its
+  JSON view now also carries the handoff summary and records.
 - The fake transport, runner and diagnostics are unchanged. This adds no connected path, and connected checks
   stay blocked as described in [PAPER_READINESS.md](PAPER_READINESS.md).
 - There is no order, cancel, replace, reset, settings, subscription or credential interface.

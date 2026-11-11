@@ -13,22 +13,23 @@ with ``trading_permission: false``. No envelope is preassembled. No installed SD
 connection, account or network is involved, and nothing here authorizes paper readiness or
 trading.
 
-Each run also composes one ``LifecycleAdapter`` and its ``RetirementLedger`` over invented SDK-free
-doubles. Only the quote-snapshot callbacks pass through it: a reader double queues each one, and
-only the adapter's consumer delivers it to the quote normalizer. The adapter then retires the
-connection and observes the reader, socket and consumer separately. The contract-details,
+Each run also composes one ``CallbackRouter``, with its ``LifecycleAdapter`` and ``RetirementLedger``,
+over invented SDK-free doubles. Only the quote-snapshot callbacks pass through it, and they travel in
+owned invented frames: each callback is one frame whose payload is a whole invented key, not an SDK
+message. The accepted ``DecodeHandoff`` buffers the fragmented chunks in its ``FrameAccumulator``,
+decodes each complete frame with a closed ``InventedDecoder`` into the ``ReadCallbackFacade``, and
+settles the delivery through the router's own consumer before releasing the frame. The router then
+retires the connection and observes the reader, socket and consumer separately. The quote stream's
+completion and issue codes are read through ``CallbackRouter.stream_status()``. The contract-details,
 account-summary and position callbacks are passed to their normalizers directly, so all three are
 reported as outside the lifecycle model, with no lifecycle, retirement or cancellation coverage
 claimed. A completed lifecycle is local only: broker-side retirement stays not established and
 PAPER-READ-1 stays not assessed.
 
-The quote reader double's buffer is the accepted ``FrameAccumulator``, fed fixed invented opaque
-byte chunks. Normal processing hands each complete frame off to the reader double, which holds it
-unprocessed; no payload is decoded, and nothing claims the bytes are SDK messages or carry the
-quote callbacks. When the adapter joins the reader, it only ends input with ``finish()``: nothing is
-drained or discarded. The adapter's reader observation reads the accumulator's retained byte count.
-Refusals and untaken frames, which the lifecycle model cannot express, appear only in the unchanged
-framing report. The local-components aggregate requires both reports and grants nothing.
+The reader double's partial-byte observation reads the handoff's framing report. Refusals, untaken
+frames and handoff failures appear in the unchanged framing and handoff reports. The local-components
+aggregate requires the lifecycle, the framing and every handoff together, and grants nothing. No
+message-id, protobuf or wire-format selection is modelled.
 
 Every fixture value is invented for this demonstration only, under one fixed ``FakeClock``.
 """
@@ -45,6 +46,16 @@ from tradingbot.paper_readiness.account_position_callbacks import (
     AccountSummaryCallbacks,
     PositionSnapshotCallbacks,
 )
+from tradingbot.paper_readiness.callback_router import CallbackRouter, RouterReport, StreamKind
+from tradingbot.paper_readiness.decode_handoff import (
+    DecodeHandoff,
+    DecodeHandoffReport,
+    Entry,
+    Failure,
+    InventedDecoder,
+    Step,
+    StepKind,
+)
 from tradingbot.paper_readiness.diagnostics import ReadinessOutcome, ReadinessReport
 from tradingbot.paper_readiness.ibkr_callbacks import CallbackRequest, IbkrCallbackNormalizer
 from tradingbot.paper_readiness.observations import (
@@ -53,16 +64,10 @@ from tradingbot.paper_readiness.observations import (
     SessionAttestation,
     TargetContract,
 )
-from tradingbot.paper_readiness.read_framing import (
-    HEADER_BYTES,
-    Frame,
-    FrameAccumulator,
-    FramingOutcome,
-    FramingReport,
-)
-from tradingbot.paper_readiness.read_retirement import CallbackKind, ReadSlot
+from tradingbot.paper_readiness.read_framing import HEADER_BYTES, FramingOutcome, FramingReport
+from tradingbot.paper_readiness.read_retirement import ReadSlot
 from tradingbot.paper_readiness.runner import REQUEST_IDS, render_text, run_readiness_check
-from tradingbot.paper_readiness.sdk_lifecycle import AdapterReport, DirectCallback, LifecycleAdapter
+from tradingbot.paper_readiness.sdk_lifecycle import AdapterReport
 from tradingbot.paper_readiness.transport import FakeClock, FakeReadOnlyTransport, FakeScript
 
 __all__ = [
@@ -70,6 +75,7 @@ __all__ = [
     "DEMO_CLOCK",
     "DEMO_EXPECTATION",
     "FRAMING_NOTICE",
+    "HANDOFF_FAILURE_CASES",
     "LIFECYCLE_NOTICE",
     "READER_FRAMING_CASES",
     "SCENARIOS",
@@ -94,8 +100,10 @@ SIMULATION_NOTICE = (
 STREAM_SOURCES = {
     "contract_details": "invented callbacks via IbkrCallbackNormalizer, called directly; outside "
                         "the lifecycle model",
-    "quote_snapshot": "invented callbacks delivered by the LifecycleAdapter consumer to "
-                      "IbkrCallbackNormalizer; local lifecycle only",
+    "quote_snapshot": "invented callbacks carried by owned invented frames (not an SDK wire "
+                      "format) through DecodeHandoff, a closed InventedDecoder and the "
+                      "ReadCallbackFacade to the CallbackRouter, whose adapter consumer delivers "
+                      "them to IbkrCallbackNormalizer; local lifecycle only",
     "account_summary": "invented callbacks via AccountSummaryCallbacks, called directly; broker "
                        "request id kept; outside the lifecycle model",
     "positions": "invented callbacks via PositionSnapshotCallbacks, called directly; one local "
@@ -104,19 +112,22 @@ STREAM_SOURCES = {
 }
 LIFECYCLE_NOTICE = (
     "LOCAL LIFECYCLE, SIMULATED: only the quote-snapshot callbacks pass through the SDK-free "
-    "LifecycleAdapter and its RetirementLedger, over invented doubles. The contract-details, "
+    "CallbackRouter's LifecycleAdapter and its RetirementLedger, over invented doubles, after "
+    "DecodeHandoff settles each owned frame. The contract-details, "
     "account-summary and position callbacks go to their normalizers directly and are outside the "
     "lifecycle model; no lifecycle, retirement or cancellation coverage is claimed for them. A "
     "completed lifecycle is local only: broker-side retirement is not established, PAPER-READ-1 is "
     "not assessed and trading_permission is False."
 )
 FRAMING_NOTICE = (
-    "READER FRAMING, SIMULATED: the quote reader double buffers fixed INVENTED opaque byte chunks "
-    "in the accepted FrameAccumulator. Payloads are never decoded and are not SDK messages or the "
-    "quote callbacks. Its retained byte count feeds the lifecycle's reader observation; refusals "
-    "and untaken frames appear only in the framing report. Local completion requires both reports. "
-    "Handed-off frames are not processed or retired downstream. Nothing here is readiness, "
-    "PAPER-READ-1, broker-side retirement or trading permission."
+    "READER FRAMING AND DECODE HANDOFF, SIMULATED: each quote callback travels in one owned "
+    "INVENTED frame. DecodeHandoff buffers the chunks in its FrameAccumulator, decodes each frame "
+    "with a closed InventedDecoder that maps whole invented payloads to fixed callbacks (no SDK "
+    "message format, message id or protobuf selection), and settles the delivery through the "
+    "router's consumer before releasing the frame. Its retained byte count feeds the lifecycle's "
+    "reader observation; refusals, untaken frames and handoff failures appear in the framing and "
+    "handoff reports. Local completion requires the lifecycle, the framing and every handoff. "
+    "Nothing here is readiness, PAPER-READ-1, broker-side retirement or trading permission."
 )
 # The one stream whose callbacks pass through the lifecycle adapter, and why the others do not.
 _LIFECYCLE_STREAMS = ("quote_snapshot",)
@@ -189,15 +200,17 @@ def _length_prefixed(payload: bytes) -> bytes:
     return len(payload).to_bytes(HEADER_BYTES, "big") + payload
 
 
-# Three invented opaque frames of 29, 4 (zero-length) and 29 bytes. They are not SDK messages and
-# are unrelated to the quote callbacks. Headers cross chunk boundaries at bytes 2 and 31 and the
-# first payload at byte 20, so frames complete in the third and fourth chunks.
-_OPAQUE = (_length_prefixed(b"invented opaque control A") + _length_prefixed(b"")
-           + _length_prefixed(b"invented opaque control C"))
-_COMPLETE_BYTES = (_OPAQUE[:2], _OPAQUE[2:20], _OPAQUE[20:31], _OPAQUE[31:])
+# Each quote callback travels in one owned invented frame whose payload is a whole invented key, not
+# an SDK message: the closed InventedDecoder maps it to that one callback. The frames' bytes arrive
+# fragmented across fixed-size chunks, so headers and payloads cross chunk boundaries.
+_DEMO_SERVER_VERSION = 1  # invented version provenance for the closed decoder; no wire meaning
+_QUOTE_FRAME_KEY = b"invented-demo-quote-frame-%02d"
+_CHUNK_BYTES = 13
+# Trailing reader bytes for the framing cases, after every quote frame.
 _PARTIAL_HEADER = b"\x00\x00"  # two of a further frame's four header bytes
-_PARTIAL_PAYLOAD = _length_prefixed(b"invented opaque control D")[:10]  # header plus six bytes
+_PARTIAL_PAYLOAD = _length_prefixed(b"invented trailing frame D")[:10]  # header plus six bytes
 _OVERSIZED_HEADER = (2**32 - 1).to_bytes(HEADER_BYTES, "big")  # beyond the default payload limit
+_UNTAKEN_FRAME = _length_prefixed(b"invented trailing frame E")  # complete, but never handed off
 
 
 # ----------------------------------------------------------------------------- callback sequences
@@ -247,7 +260,7 @@ def _contract_callbacks(n: IbkrCallbackNormalizer) -> None:
     n.contractDetailsEnd(_CRID)
 
 
-def _live_ticks(n: _QuoteReader) -> None:
+def _live_ticks(n: _QuoteRecorder) -> None:
     attrib = _NoAttrib()
     n.marketDataType(_QRID, 1)
     n.tickPrice(_QRID, 1, 48.25, attrib)
@@ -258,13 +271,13 @@ def _live_ticks(n: _QuoteReader) -> None:
     n.tickString(_QRID, 45, _LAST_TRADE)
 
 
-def _control(contract: IbkrCallbackNormalizer, quote: _QuoteReader) -> None:
+def _control(contract: IbkrCallbackNormalizer, quote: _QuoteRecorder) -> None:
     _contract_callbacks(contract)
     _live_ticks(quote)
     quote.tickSnapshotEnd(_QRID)
 
 
-def _delayed_size_mixed_with_live(contract: IbkrCallbackNormalizer, quote: _QuoteReader) -> None:
+def _delayed_size_mixed_with_live(contract: IbkrCallbackNormalizer, quote: _QuoteRecorder) -> None:
     """PR #25 review P2: delayed bid size (tick 69) among otherwise live ticks."""
     _contract_callbacks(contract)
     _live_ticks(quote)
@@ -272,7 +285,7 @@ def _delayed_size_mixed_with_live(contract: IbkrCallbackNormalizer, quote: _Quot
     quote.tickSnapshotEnd(_QRID)
 
 
-def _issue_with_repeated_end(contract: IbkrCallbackNormalizer, quote: _QuoteReader) -> None:
+def _issue_with_repeated_end(contract: IbkrCallbackNormalizer, quote: _QuoteRecorder) -> None:
     """PR #25 review P1: a valid row, an unsupported callback, then contractDetailsEnd twice."""
     contract.contractDetails(_CRID, _details())
     contract.unsupported_callback("connectionClosed")
@@ -294,11 +307,15 @@ class DemoScenario:
     # The invented account-summary and position callbacks, passed to their normalizers directly.
     summary_feed: object = _summary_callbacks
     positions_feed: object = _position_callbacks
-    # The fixed opaque chunks the quote reader double buffers, and whether it hands off the frames
-    # that its final chunk completes.
-    reader_bytes: tuple[bytes, ...] = _COMPLETE_BYTES
+    # Reader bytes after every quote frame, and whether the frames the final chunk completes are
+    # handed to decoding.
+    trailing_bytes: tuple[bytes, ...] = ()
     takes_final_frames: bool = True
     expected_framing_outcome: FramingOutcome = FramingOutcome.COMPLETE
+    # Whether the invented decoder raises right after delivering the snapshot END, before the
+    # handoff settles that frame, and the handoff failure the scenario expects.
+    decoder_raises_after_end: bool = False
+    expected_handoff_failure: Failure | None = None
 
 
 SCENARIOS = {
@@ -337,39 +354,47 @@ ACCOUNT_POSITION_FAILURES = (
                  ReadinessOutcome.NOT_READY, _control,
                  positions_feed=_malformed_position_then_repeated_end),
 )
-# The CLI's four reader-framing cases, also kept out of SCENARIOS. Every callback is the control's,
-# so readiness stays CONTROL_COMPLETE; only the reader double's fixed opaque bytes, or whether it
-# hands off its final frames, differ from the control.
+# The CLI's four reader-framing cases, also kept out of SCENARIOS. Every callback is the control's and
+# is delivered, so readiness stays CONTROL_COMPLETE; only trailing reader bytes after the quote
+# frames, or whether the final chunk's frame is handed to decoding, differ from the control.
 READER_FRAMING_CASES = (
     DemoScenario("framing_partial_header",
                  "Control callbacks; the reader keeps two header bytes of a further frame.",
                  ReadinessOutcome.CONTROL_COMPLETE, _control, expected_lifecycle_completed=False,
-                 reader_bytes=(*_COMPLETE_BYTES, _PARTIAL_HEADER),
+                 trailing_bytes=(_PARTIAL_HEADER,),
                  expected_framing_outcome=FramingOutcome.PARTIAL_HEADER),
     DemoScenario("framing_partial_payload",
                  "Control callbacks; the reader keeps a further frame's header and part payload.",
                  ReadinessOutcome.CONTROL_COMPLETE, _control, expected_lifecycle_completed=False,
-                 reader_bytes=(*_COMPLETE_BYTES, _PARTIAL_PAYLOAD),
+                 trailing_bytes=(_PARTIAL_PAYLOAD,),
                  expected_framing_outcome=FramingOutcome.PARTIAL_PAYLOAD),
     DemoScenario("framing_declared_length_refused",
                  "Control callbacks; a further header declares an oversized length and is refused.",
                  ReadinessOutcome.CONTROL_COMPLETE, _control, expected_lifecycle_completed=False,
-                 reader_bytes=(*_COMPLETE_BYTES, _OVERSIZED_HEADER),
+                 trailing_bytes=(_OVERSIZED_HEADER,),
                  expected_framing_outcome=FramingOutcome.REFUSED),
     # Nothing is retained, so the lifecycle's reader observation completes: the lifecycle model
     # cannot express untaken frames, and only the framing report and the aggregate show them.
     DemoScenario("framing_untaken_frames",
                  "Control callbacks; the reader never hands off the frames its last chunk "
                  "completes.",
-                 ReadinessOutcome.CONTROL_COMPLETE, _control, takes_final_frames=False,
-                 expected_framing_outcome=FramingOutcome.UNTAKEN_FRAMES),
+                 ReadinessOutcome.CONTROL_COMPLETE, _control, trailing_bytes=(_UNTAKEN_FRAME,),
+                 takes_final_frames=False, expected_framing_outcome=FramingOutcome.UNTAKEN_FRAMES),
+)
+# The CLI's decode-handoff failure case, also kept out of SCENARIOS. Every frame is complete, but the
+# invented decoder raises right after delivering the snapshot END, so the handoff never settles that
+# frame: the failure stays held and blocks local completion, even though shutdown later drains the
+# admitted END and the stream itself completes.
+HANDOFF_FAILURE_CASES = (
+    DemoScenario("handoff_decoder_raised_after_snapshot_end",
+                 "Control callbacks; the invented decoder raises after delivering tickSnapshotEnd, "
+                 "before the handoff settles that frame.",
+                 ReadinessOutcome.CONTROL_COMPLETE, _control, expected_lifecycle_completed=False,
+                 decoder_raises_after_end=True, expected_handoff_failure=Failure.DECODER_RAISED),
 )
 
 
 # ----------------------------------------------------------------------------- lifecycle doubles
-
-_QueueItem = tuple[ReadSlot, CallbackKind]
-_Callback = tuple[str, tuple]  # a quote-normalizer method name and its invented arguments
 
 
 class _SingleThreadLock:
@@ -400,129 +425,106 @@ class _Connection:
         return self.closed  # None: closure unknown
 
 
-class _Queue:
-    """FIFO between the reader double and the adapter's consumer. Each item keeps its callback."""
+class _QuoteRecorder:
+    """Records a scenario's invented quote callbacks, in order, as fixed decoder steps. Nothing is
+    delivered here: each step becomes the decoding of one owned invented frame."""
 
     def __init__(self) -> None:
-        self._items: list[tuple[_QueueItem, _Callback]] = []
-        self.fetched: tuple[_QueueItem, _Callback] | None = None
+        self.steps: list[Step] = []
 
-    def put(self, item: _QueueItem, callback: _Callback) -> None:
-        self._items.append((item, callback))
-
-    def get_nowait(self) -> _QueueItem | None:
-        if not self._items:
-            return None
-        self.fetched = self._items.pop(0)
-        return self.fetched[0]
-
-    def size(self) -> int:
-        return len(self._items)
-
-
-class _QuoteReader:
-    """Stands in for the reader thread on the quote read. Each invented quote callback it receives
-    is queued whole; only the adapter's consumer delivers it to the quote normalizer.
-
-    Its buffer is the accepted ``FrameAccumulator``, fed fixed opaque chunks that are unrelated to
-    the callbacks. Normal processing hands complete frames off to ``handed_off``, where they stay
-    unprocessed. Joining only ends input with ``finish()``; ``partial_bytes`` reports the
-    accumulator's retained byte count."""
-
-    def __init__(self, adapter: LifecycleAdapter, queue: _Queue, framing: FrameAccumulator) -> None:
-        self._adapter = adapter
-        self._queue = queue
-        self._framing = framing
-        self._alive = True
-        self.handed_off: list[Frame] = []  # the downstream owner; nothing processes or retires them
-
-    def receive_bytes(self, chunks: tuple[bytes, ...], *, takes_final_frames: bool) -> None:
-        """Normal processing: buffer each chunk, then hand off every frame it completed."""
-        for index, chunk in enumerate(chunks):
-            self._framing.feed(chunk)
-            if index < len(chunks) - 1 or takes_final_frames:
-                while (frame := self._framing.take()) is not None:
-                    self.handed_off.append(frame)
-
-    def _receive(self, kind: CallbackKind, name: str, *args: object) -> None:
-        item = (ReadSlot.QUOTE_SNAPSHOT, kind)
-        self._queue.put(item, (name, args))
-        self._adapter.on_enqueued(*item)
+    def _add(self, entry: Entry, *args: object) -> None:
+        self.steps.append(Step(StepKind.CALL, entry, args))
 
     # Only the documented quote callbacks these scenarios use; no other read type is modelled here.
     def marketDataType(self, reqId: int, marketDataType: int) -> None:
-        self._receive(CallbackKind.DATA, "marketDataType", reqId, marketDataType)
+        self._add(Entry.MARKET_DATA_TYPE, reqId, marketDataType)
 
     def tickPrice(self, reqId: int, tickType: int, price: float, attrib: object) -> None:
-        self._receive(CallbackKind.DATA, "tickPrice", reqId, tickType, price, attrib)
+        self._add(Entry.TICK_PRICE, reqId, tickType, price, attrib)
 
     def tickSize(self, reqId: int, tickType: int, size: object) -> None:
-        self._receive(CallbackKind.DATA, "tickSize", reqId, tickType, size)
+        self._add(Entry.TICK_SIZE, reqId, tickType, size)
 
     def tickString(self, reqId: int, tickType: int, value: str) -> None:
-        self._receive(CallbackKind.DATA, "tickString", reqId, tickType, value)
+        self._add(Entry.TICK_STRING, reqId, tickType, value)
 
     def tickSnapshotEnd(self, reqId: int) -> None:
-        self._receive(CallbackKind.END, "tickSnapshotEnd", reqId)
+        self._add(Entry.TICK_SNAPSHOT_END, reqId)
+
+
+class _HandoffReader:
+    """Stands in for the reader thread on the quote read. Its buffer is the handoff's own accumulator,
+    read only through the handoff's public report. Joining only ends input with ``finish()``."""
+
+    def __init__(self) -> None:
+        self.handoff: DecodeHandoff | None = None
+        self._alive = True
 
     def join(self, timeout: float) -> None:
-        self._framing.finish()  # ends input only: retained bytes and queued frames stay as they are
+        self.handoff.finish()  # ends input only: retained bytes and queued frames stay as they are
         self._alive = False
 
     def is_alive(self) -> bool:
         return self._alive
 
     def partial_bytes(self) -> int:
-        return self._framing.report().bytes_retained  # observed, never set to force a status
+        return self.handoff.report().framing.bytes_retained  # observed, never set to force a status
 
 
-class _QuoteBoundary:
-    """Invented SDK-free client double for one local connection carrying the quote read."""
+class _QuoteClient:
+    """Invented SDK-free client double for one local connection carrying the quote read. The router
+    supplies the queue and dispatch; this double supplies only connect, stop and disconnect."""
 
-    def __init__(self, quote: IbkrCallbackNormalizer, socket_closure_known: bool) -> None:
-        self._quote = quote
+    def __init__(self, socket_closure_known: bool) -> None:
         self._socket_closure_known = socket_closure_known
-        self.adapter: LifecycleAdapter | None = None
-        self.connection, self.queue = _Connection(), _Queue()
-        self.reader: _QuoteReader | None = None
+        self.connection, self.reader = _Connection(), _HandoffReader()
+        self.router: CallbackRouter | None = None
 
-    def connect(self) -> _QuoteBoundary:
-        return self  # the adapter retains .connection, .reader and .queue
+    def connect(self) -> _QuoteClient:
+        return self  # the router keeps .connection and .reader
 
     def stop_read(self, slot: ReadSlot) -> None:
-        """Not reached here: the adapter makes no attempt for a snapshot whose END it delivered."""
+        """Reached only for a snapshot whose END was not delivered; it returns, which clears nothing."""
 
     def disconnect(self) -> None:
         self.connection.connected = False
         self.connection.closed = True if self._socket_closure_known else None
-        self.adapter.on_direct_callback(DirectCallback.CONNECTION_CLOSED)  # not evidence of closure
+        self.router.connectionClosed()  # an observation only, never evidence of closure
 
-    def dispatch(self, slot: ReadSlot, kind: CallbackKind) -> None:
-        fetched, self.queue.fetched = self.queue.fetched, None
-        if fetched is None or fetched[0] != (slot, kind):
-            raise RuntimeError("dispatched item is not the fetched one")
-        name, args = fetched[1]
-        getattr(self._quote, name)(*args)
+
+def _quote_frames(scenario: DemoScenario, steps: list[Step]) -> tuple[tuple[bytes, ...], dict]:
+    """One owned invented frame per recorded callback, fragmented into fixed chunks, then the
+    scenario's trailing bytes; and the closed decoder's script for each frame's whole payload."""
+    keys = [_QUOTE_FRAME_KEY % i for i in range(len(steps))]
+    scripts = {key: (step,) for key, step in zip(keys, steps, strict=True)}
+    if scenario.decoder_raises_after_end and steps and steps[-1].entry is Entry.TICK_SNAPSHOT_END:
+        scripts[keys[-1]] = (steps[-1], Step(StepKind.RAISE))
+    stream = b"".join(_length_prefixed(key) for key in keys)
+    chunks = tuple(stream[i:i + _CHUNK_BYTES] for i in range(0, len(stream), _CHUNK_BYTES))
+    return chunks + scenario.trailing_bytes, scripts
 
 
 def _run_lifecycle(scenario: DemoScenario, contract: IbkrCallbackNormalizer,
-                   quote: IbkrCallbackNormalizer) -> tuple[AdapterReport, FramingReport]:
-    """Feed the scenario with its quote callbacks routed through one adapter, then shut it down.
-    Returns the adapter's report and the reader buffer's framing report, both unmodified."""
-    boundary = _QuoteBoundary(quote, scenario.socket_closure_known)
-    adapter = LifecycleAdapter(boundary, _SingleThreadLock())
-    framing = FrameAccumulator()
-    boundary.adapter = adapter
-    boundary.reader = _QuoteReader(adapter, boundary.queue, framing)
-    adapter.start()
-    adapter.open_read(ReadSlot.QUOTE_SNAPSHOT)
-    boundary.reader.receive_bytes(scenario.reader_bytes,
-                                  takes_final_frames=scenario.takes_final_frames)
-    scenario.feed(contract, boundary.reader)  # contract callbacks reach their normalizer directly
-    while adapter.consume_one():  # delivers each queued quote callback, END included, in order
-        pass
-    adapter.shutdown(join_timeout=0.0)  # the reader double's join returns at once
-    return adapter.report(), framing.report()
+                   clock: FakeClock) -> tuple[CallbackRouter, DecodeHandoff]:
+    """Carry the scenario's quote callbacks in owned frames through the decode handoff to the router's
+    consumer, then shut the router down. Contract callbacks reach their normalizer directly."""
+    recorder = _QuoteRecorder()
+    scenario.feed(contract, recorder)
+    chunks, scripts = _quote_frames(scenario, recorder.steps)
+    client = _QuoteClient(scenario.socket_closure_known)
+    router = CallbackRouter(client, _SingleThreadLock(), clock)
+    client.router = router
+    router.start()
+    router.register_quote(_QRID, _CON_ID)
+    handoff = DecodeHandoff(router, InventedDecoder(_DEMO_SERVER_VERSION, scripts),
+                            server_version=_DEMO_SERVER_VERSION)
+    client.reader.handoff = handoff
+    for index, chunk in enumerate(chunks):
+        handoff.feed(chunk)
+        if index < len(chunks) - 1 or scenario.takes_final_frames:
+            handoff.process_available()  # each complete frame: decoded, delivered and settled in turn
+    router.shutdown(join_timeout=0.0)  # the reader double's join returns at once
+    return router, handoff
 
 
 # ----------------------------------------------------------------------------- running and rendering
@@ -541,25 +543,28 @@ class DemoResult:
     positions_issues: tuple[str, ...]
     lifecycle: AdapterReport
     framing: FramingReport
+    handoff: DecodeHandoffReport
+    router: RouterReport
 
     @property
     def matches_expectation(self) -> bool:
         """Every expected outcome occurred. Only that: never readiness, retirement or authority."""
         return (self.report.outcome == self.scenario.expected_outcome
                 and self.lifecycle.completed == self.scenario.expected_lifecycle_completed
-                and self.framing.outcome == self.scenario.expected_framing_outcome)
+                and self.framing.outcome == self.scenario.expected_framing_outcome
+                and self.handoff.failure == self.scenario.expected_handoff_failure)
 
     @property
     def local_components_complete(self) -> bool:
-        """Both local components finished cleanly. Local and NON_AUTHORITATIVE only: it never
-        changes the readiness outcome and is never PAPER-READ-1, retirement or trading
-        permission."""
-        return self.lifecycle.completed and self.framing.clean
+        """The lifecycle, the framing and every decode handoff finished cleanly, together. Local and
+        NON_AUTHORITATIVE only: it never changes the readiness outcome and is never PAPER-READ-1,
+        retirement or trading permission."""
+        return self.lifecycle.completed and self.framing.clean and self.handoff.completed
 
 
 def _cli_only() -> tuple[DemoScenario, ...]:
     """The CLI's extra fixed cases, after the three SCENARIOS, in the order they are printed."""
-    return (UNKNOWN_CLEANUP, *ACCOUNT_POSITION_FAILURES, *READER_FRAMING_CASES)
+    return (UNKNOWN_CLEANUP, *ACCOUNT_POSITION_FAILURES, *READER_FRAMING_CASES, *HANDOFF_FAILURE_CASES)
 
 
 def _scenario(name: str) -> DemoScenario:
@@ -575,24 +580,27 @@ def run_demo(name: str) -> DemoResult:
     scenario = _scenario(name)
     clock = FakeClock(DEMO_CLOCK)
     contract = IbkrCallbackNormalizer(_CRID, CallbackRequest.CONTRACT_DETAILS)
-    quote = IbkrCallbackNormalizer(_QRID, CallbackRequest.QUOTE_SNAPSHOT, con_id=_CON_ID, clock=clock)
     summary = AccountSummaryCallbacks(_ARID)
     positions = PositionSnapshotCallbacks(_PSID)
-    lifecycle, framing = _run_lifecycle(scenario, contract, quote)
+    router, handoff = _run_lifecycle(scenario, contract, clock)
+    router_report, handoff_report = router.report(), handoff.report()
+    # The quote normalizer is the router's own; its evidence is read through stream_status().
+    quote = next(st for st in router.stream_status() if st.stream is StreamKind.QUOTE_SNAPSHOT)
     scenario.summary_feed(summary)  # passed to the accepted normalizers directly
     scenario.positions_feed(positions)
     script = FakeScript(session=_session(), contract_details=contract.envelopes(),
-                        quote_snapshot=quote.envelopes(), account_summary=summary.envelopes(),
+                        quote_snapshot=router.quote_envelopes(), account_summary=summary.envelopes(),
                         positions=positions.envelopes())
     report = run_readiness_check(FakeReadOnlyTransport(script, clock), DEMO_EXPECTATION, clock=clock,
                                  label=f"callback-demo:{name}")
     return DemoResult(
         scenario=scenario, report=report,
         contract_completed=contract.completed, contract_issues=_codes(contract),
-        quote_completed=quote.completed, quote_issues=_codes(quote),
+        quote_completed=quote.completed, quote_issues=quote.issue_codes,
         account_summary_completed=summary.completed, account_summary_issues=_codes(summary),
         positions_completed=positions.completed, positions_issues=_codes(positions),
-        lifecycle=lifecycle, framing=framing,
+        lifecycle=router_report.adapter, framing=handoff_report.framing, handoff=handoff_report,
+        router=router_report,
     )
 
 
@@ -628,15 +636,30 @@ def _summary(result: DemoResult) -> dict:
             "lifecycle_reader_partial_bytes": result.lifecycle.reader_partial_bytes,
             "downstream_retirement": result.framing.downstream_retirement,
         },
+        "decode_handoff": {
+            "expected_failure": _value(result.scenario.expected_handoff_failure),
+            "failure": _value(result.handoff.failure),
+            "held_sequence": result.handoff.held_sequence,
+            "handoffs": len(result.handoff.handoffs),
+            "settled": sum(h.status.value == "SETTLED" for h in result.handoff.handoffs),
+            "router_faults": list(result.router.faults),
+            "router_completed": result.router.completed,
+            "completed": result.handoff.completed,
+        },
         "local_components": {
             "lifecycle_completed": result.lifecycle.completed,
             "framing_clean": result.framing.clean,
-            "both_complete": result.local_components_complete,
+            "handoff_completed": result.handoff.completed,
+            "all_complete": result.local_components_complete,
             "authority": "NON_AUTHORITATIVE",
             "trading_permission": False,
             "paper_read_1": "NOT_ASSESSED",
         },
     }
+
+
+def _value(member: object) -> str | None:
+    return None if member is None else member.value
 
 
 def _framing_json(report: FramingReport) -> dict:
@@ -653,7 +676,10 @@ def render_demo_json(results: list[DemoResult]) -> str:
                "framing_notice": FRAMING_NOTICE,
                "scenarios": [{**_summary(r), "report": r.report.model_dump(mode="json"),
                               "lifecycle_report": asdict(r.lifecycle),
-                              "framing_report": _framing_json(r.framing)} for r in results]}
+                              "framing_report": _framing_json(r.framing),
+                              "handoff_records": [{**asdict(h), "status": h.status.value,
+                                                   "failure": _value(h.failure)}
+                                                  for h in r.handoff.handoffs]} for r in results]}
     return json.dumps(payload, indent=2, sort_keys=True) + "\n"
 
 
@@ -688,14 +714,21 @@ def render_demo_text(results: list[DemoResult]) -> str:
                      f"handed_off={framing.frames_handed_off} queued={framing.frames_queued} "
                      f"first_refusal={refusal} "
                      f"downstream_retirement={framing.downstream_retirement}")
+        handoff = s["decode_handoff"]
+        lines.append(f"   decode handoff: expected_failure={handoff['expected_failure']} "
+                     f"failure={handoff['failure']} held={handoff['held_sequence']} "
+                     f"settled={handoff['settled']}/{handoff['handoffs']} "
+                     f"router_faults={', '.join(handoff['router_faults']) or 'none'} "
+                     f"completed={handoff['completed']}")
         lines.append(f"   local components (NON_AUTHORITATIVE): "
                      f"lifecycle_completed={life.completed} framing_clean={framing.clean} "
-                     f"both_complete={r.local_components_complete}")
+                     f"handoff_completed={r.handoff.completed} "
+                     f"all_complete={r.local_components_complete}")
         lines.append(render_text(r.report, summary=True).rstrip("\n"))
         lines.append("")
     matched = sum(r.matches_expectation for r in results)
-    lines.append(f"{matched}/{len(results)} scenarios matched their expected readiness, lifecycle "
-                 "and framing outcomes. A match means only that: NON_AUTHORITATIVE; "
+    lines.append(f"{matched}/{len(results)} scenarios matched their expected readiness, lifecycle, "
+                 "framing and handoff outcomes. A match means only that: NON_AUTHORITATIVE; "
                  "trading_permission=False; never PAPER-READ-1, broker-side retirement or trading "
                  "authority.")
     return "\n".join(lines) + "\n"
