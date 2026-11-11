@@ -87,7 +87,7 @@ def test_html_entities_are_unescaped_before_asset_recognition():
 def test_plural_sides_and_position_noun_entries():
     for text, side in [("We are taking a long position in $TLT at $88.50 with a stop at $86.", PositionSide.LONG),
                        ("Opening shorts in $SPY at $685 with a stop at $695.", PositionSide.SHORT),
-                       ("Taking some longs in $GLD here at $280 with a $270 stop.", PositionSide.LONG)]:
+                       ("Opening a new long position in $KLVQ with entry at 47.30 and stop at 44.85.", PositionSide.LONG)]:
         c, a = one(TklInterpreter().interpret(post("p", text)))
         assert c.message_class == MessageClass.OPEN and c.side == side, text
         assert "HEADLINE_POSITION_LINE_WITHOUT_ENTRY_VERB" not in a.ambiguities and "SIDE_UNCLEAR" not in a.ambiguities, text
@@ -112,9 +112,9 @@ def test_multiline_levels_attach_across_intervening_commentary_and_quotes_stay_r
 
 
 def test_role_keywords_after_the_number():
-    c, _ = one(TklInterpreter().interpret(post("k", "We are now long $TLT: 95 target, 86 stop, 88.50 entry.")))
-    assert roles(c) == {PriceRole.TARGET: "95", PriceRole.STOP: "86", PriceRole.ENTRY: "88.50"}
-    c, _ = one(TklInterpreter().interpret(post("k2", "Current positions:\nLong $TLT: 95 target, 86 stop, 88.50 entry\nShort $SPY: 650 target, 700 stop, 685 entry")))
+    c, _ = one(TklInterpreter().interpret(post("k", "Opening a new long position in $ZORBT: 126.40 entry, 119.75 stop, 141.20 target.")))
+    assert roles(c) == {PriceRole.TARGET: "141.20", PriceRole.STOP: "119.75", PriceRole.ENTRY: "126.40"}
+    c, _ = one(TklInterpreter().interpret(post("k2", "Open positions summary:\nLong $HWXN: 58.20 entry, 54.60 stop, 66.90 target.\nShort $PFJT: 233.50 entry, 241.80 stop, 214.00 target.")))
     assert c.message_class == MessageClass.POSITION_SUMMARY
 
 
