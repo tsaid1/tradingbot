@@ -86,6 +86,9 @@ EXIT_NOT_NETTED = "EXIT_NOT_NETTED"
 # An exit was not sent because the broker quote was not usable to price its limit (review S2); the
 # broker-side protective stop remains the protection.
 EXIT_WITHOUT_QUOTE = "EXIT_WITHOUT_QUOTE"
+# A child of the entry is active at the broker, so the entry filled, but its executions are no
+# longer in the broker's history: the ledger cannot be updated from fills; a human must.
+ENTRY_FILL_NOT_IN_EXECUTIONS = "ENTRY_FILL_NOT_IN_EXECUTIONS"
 
 
 def default_halt_file() -> Path:
@@ -310,13 +313,24 @@ class ExecutionCoordinator:
         """After a restart (or any time): resolve every intent of unknown outcome, then sync."""
         out = []
         for intent in self.store.intents(UNRESOLVED_STATES):
-            self.store.log(
-                self.clock(),
-                "RECOVERY_LOOKUP",
-                order_ref=intent.order_ref,
-                idea_id=intent.idea_id,
-                state=intent.state.value,
+            # Journaled when the intent's state changes, not on every cycle while it is stuck.
+            last = next(
+                (
+                    e
+                    for e in reversed(self.store.journal(intent.order_ref))
+                    if e.event == "RECOVERY_LOOKUP"
+                ),
+                None,
             )
+            seen = {"state": intent.state.value, "attempts": intent.attempts}
+            if last is None or {k: last.detail.get(k) for k in seen} != seen:
+                self.store.log(
+                    self.clock(),
+                    "RECOVERY_LOOKUP",
+                    order_ref=intent.order_ref,
+                    idea_id=intent.idea_id,
+                    **seen,
+                )
             self._resolve(intent)
             out.append(self._outcome(intent.order_ref))
         self.sync()
@@ -1104,8 +1118,36 @@ class ExecutionCoordinator:
         else:
             # Not working at the broker but executions exist: the entry completed.
             filled = sum(f.quantity for f in fills if f.order_ref == intent.order_ref)
-            state = IntentState.FILLED if filled >= intent.quantity else IntentState.CANCELLED
+            # A child of the entry that is active (or has filled) means the entry filled, even when
+            # the entry's own executions have left the broker's history.
+            child_active = any(
+                o.parent_ref == intent.order_ref and o.status != OrderStatus.PRE_SUBMITTED
+                for o in orders
+            ) or any(f.order_ref != intent.order_ref for f in fills)
+            state = (
+                IntentState.FILLED
+                if filled >= intent.quantity or child_active
+                else IntentState.CANCELLED
+            )
             broker_status, reasons = None, None
+            if child_active and filled < intent.quantity:
+                reasons = [ENTRY_FILL_NOT_IN_EXECUTIONS]
+                for row in rows:
+                    if row.order_ref == intent.order_ref:
+                        self.store.update_order(row.order_ref, now, status="Filled")
+                detail = (
+                    f"a protective child of {intent.order_ref} is active at the broker, so the "
+                    f"entry filled, but only {filled} of {intent.quantity} is in the executions "
+                    "history; the ledger cannot apply what it cannot see. Reconcile by hand."
+                )
+                self.store.raise_exception(
+                    now, ENTRY_FILL_NOT_IN_EXECUTIONS, detail, idea_id=intent.idea_id,
+                    order_ref=intent.order_ref,
+                )
+                self.store.log(
+                    now, ENTRY_FILL_NOT_IN_EXECUTIONS, order_ref=intent.order_ref,
+                    idea_id=intent.idea_id, filled_seen=filled, quantity=intent.quantity,
+                )
         self.store.set_state(
             intent.order_ref, state, now, broker_status=broker_status, reasons=reasons
         )

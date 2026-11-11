@@ -504,3 +504,44 @@ def test_s3_exposure_is_valued_at_the_current_quote(tmp_path):
     out = h.execute("p2", open_action(symbol="QQZ", entry="20", stop="19", target="22"))
     assert out.state == IntentState.REFUSED  # 240 + 80.80 > 300 (at cost it would pass)
     assert out.reasons[0].startswith("AGGREGATE_EXPOSURE_CAP")
+
+
+# ------------------------------------------------------------- previous engineer's open notes
+
+
+def test_note_a_visible_child_means_the_entry_filled_even_without_its_execution(tmp_path):
+    h = Harness(tmp_path, strict=True)
+    h.broker.script_next_submit("LOST_ACK_PLACED")  # placed and filled, the ack is lost
+    h.broker.lookup_failures = 2  # and the lookups fail until the next day
+    out = h.execute("p1", open_action())
+    assert out.state == IntentState.UNRESOLVED
+    h.broker.history_seconds = 3600  # yesterday's fill and completed entry are out of history
+    h.clock.advance(10 * 3600)  # past midnight: executions show nothing of yesterday
+    h.broker.set_quote(SYMBOL, "49.98", "50.02")
+    assert h.broker.executions() == []
+    h.coord.recover()
+    intent = h.coord.intent(out.order_ref)
+    assert intent.state == IntentState.FILLED  # not CANCELLED
+    assert h.coord.store.position("p1:open").status != "NOT_FILLED"
+    working = h.working()
+    assert f"{out.order_ref}.STP" in working  # the protection at the broker is left alone
+    assert "ENTRY_FILL_NOT_IN_EXECUTIONS" in [
+        e.kind for e in h.coord.store.exceptions(open_only=True)
+    ]
+    assert not h.coord.reconcile().clean  # the broker holds 4 the ledger cannot see
+
+
+def test_note_recovery_lookup_is_journaled_on_state_change_only(tmp_path):
+    h = Harness(tmp_path, strict=True)
+    h.broker.script_next_submit("LOST_ACK_NOT_PLACED")
+    h.broker.script_next_submit("LOST_ACK_NOT_PLACED")
+    out = h.execute("p1", open_action())
+    h.clock.advance(h.config.settle_seconds + 1)
+    h.coord.recover()  # the one resend (also lost)
+    h.clock.advance(h.config.settle_seconds + 1)
+    h.coord.recover()  # budget spent: stuck
+    stuck = h.events(out.order_ref).count("RECOVERY_LOOKUP")
+    for _ in range(5):
+        h.clock.advance(5)
+        h.coord.recover()
+    assert h.events(out.order_ref).count("RECOVERY_LOOKUP") == stuck
