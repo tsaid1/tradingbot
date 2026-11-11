@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import dataclasses
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
 from enum import Enum
 
@@ -77,6 +77,8 @@ PRICE_TICKS = {1: ("bid", False), 2: ("ask", False), 4: ("last", False),
 SIZE_TICKS = {0: ("bid", False), 3: ("ask", False), 5: ("last", False),
               69: ("bid", True), 70: ("ask", True), 71: ("last", True)}
 LAST_TIMESTAMP_TICKS = {45: False, 88: True}  # tickString, unix seconds of the last trade
+CLOSE_TICKS = {9: False, 75: True}  # CLOSE, DELAYED_CLOSE (prior close; never a bid/ask)
+DELAYED_TICK_IDS = frozenset({66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 88, 90})
 
 
 @dataclass(frozen=True)
@@ -98,6 +100,26 @@ class QuoteSnapshot:
     flags: tuple[str, ...]
     notices: tuple[int, ...] = ()
     unavailable_code: int | None = None
+    # --- evidence (kept even when the request did not end) ---
+    route: str = "snapshot"  # "snapshot" or "stream"
+    close: float | None = None
+    snapshot_end_missing: bool = False
+    waited_ms: int = 0
+    tick_counts: dict[str, int] = field(default_factory=dict)  # by TickTypeEnum name
+    market_data_types_delivered: tuple[int, ...] = ()
+    tick_req_params: dict | None = None
+    request_events: tuple[tuple[int, str], ...] = ()  # (code, message) for this reqId
+    request_error: str | None = None
+    first_tick_ms: int | None = None  # after the request was sent
+    last_tick_ms: int | None = None
+
+    @property
+    def ticks_received(self) -> int:
+        return sum(self.tick_counts.values())
+
+    @property
+    def has_price(self) -> bool:
+        return any(x is not None and x > 0 for x in (self.bid, self.ask, self.last))
 
     @property
     def two_sided_valid(self) -> bool:
@@ -170,3 +192,43 @@ def to_jsonable(obj: object) -> object:
         return [to_jsonable(v) for v in obj]
     return obj
 
+
+
+QUOTE_PASS, QUOTE_WARN, QUOTE_FAIL = "PASS", "PASS_WITH_WARNINGS", "FAIL"
+
+
+@dataclass(frozen=True)
+class QuoteReport:
+    """All quote attempts (snapshot, then at most one streaming sample) and the step verdict."""
+    attempts: tuple[QuoteSnapshot, ...]
+    status: str
+    reason: str
+
+    @property
+    def best(self) -> QuoteSnapshot:
+        return max(self.attempts, key=lambda q: (q.two_sided_valid, q.has_price,
+                                                 q.ticks_received))
+
+
+def assess_quote_attempts(attempts: tuple[QuoteSnapshot, ...]) -> tuple[str, str]:
+    """PASS: a LIVE two-sided quote with a broker-reported market-data type, by either route.
+    PASS_WITH_WARNINGS: only delayed/frozen two-sided data, or only partial data (says which).
+    FAIL: nothing at all arrived on any route."""
+    two_sided = [q for q in attempts if q.two_sided_valid and q.market_data_type is not None]
+    for q in two_sided:
+        if q.quality is QuoteQuality.LIVE:
+            return QUOTE_PASS, f"live two-sided quote via {q.route}"
+    if two_sided:
+        q = two_sided[0]
+        return QUOTE_WARN, (f"only {q.market_data_type_name} two-sided data (quality "
+                            f"{q.quality.value}) via {q.route}")
+    if any(q.ticks_received for q in attempts):
+        parts = []
+        for q in attempts:
+            got = [n for n, v in (("bid", q.bid), ("ask", q.ask), ("last", q.last),
+                                  ("close", q.close)) if v is not None and v > 0]
+            parts.append(f"{q.route}: {', '.join(got) or 'no price'}; "
+                         f"type {q.market_data_type_name}; flags {list(q.flags)}")
+        return QUOTE_WARN, "partial data only (" + " | ".join(parts) + ")"
+    routes = ", ".join(f"{q.route} {q.waited_ms} ms" for q in attempts)
+    return QUOTE_FAIL, f"no market data delivered ({routes})"

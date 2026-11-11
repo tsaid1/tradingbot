@@ -22,12 +22,14 @@ from _ibkr_fake_tws import (
     text_frame,
     tlt_contract_frame,
 )
+from ibapi import comm
 from ibapi.client import EClient
 from ibapi.common import PROTOBUF_MSG_ID
 from ibapi.message import IN, OUT
 from ibapi.protobuf.ContractDataEnd_pb2 import ContractDataEnd
 from ibapi.protobuf.TickPrice_pb2 import TickPrice
 from ibapi.protobuf.TickSnapshotEnd_pb2 import TickSnapshotEnd
+from ibapi.protobuf.TickString_pb2 import TickString
 from ibapi.server_versions import MIN_SERVER_VER_CANCEL_CONTRACT_DATA
 from ibapi.ticktype import TickTypeEnum
 from ibapi.wrapper import EWrapper
@@ -53,7 +55,6 @@ CFG_DATA = {"mode": "paper", "host": "127.0.0.1", "port": 7497, "client_id": 7, 
             "tws_profile_ini": "/Users/someone/Jts/jts.ini", "tws_os_user": "someone",
             "read_only_check": "config-read"}  # synthetic
 CFG = validate_config(CFG_DATA)
-ATTESTED = validate_config({**CFG_DATA, "read_only_check": "owner-attested"})
 
 
 def stub_preflight(cfg):  # the real preflight reads the local socket table; tested elsewhere
@@ -318,12 +319,13 @@ def test_timeout_raises_and_cancels(tws, handler, call, cancel):
     assert_closed(s)
 
 
-def test_quote_timeout_cancels_market_data(tws):
+def test_quote_timeout_keeps_evidence_and_cancels(tws):
     with session() as s:
         contract = s.resolve_contract(TLT_QUERY)
         tws.on["REQ_MKT_DATA"] = lambda srv, c, r: None
-        with pytest.raises(E.IbkrTimeout):
-            s.quote_snapshot(contract, timeout=0.3)
+        q = s.quote_snapshot(contract, timeout=0.3)
+    assert q.snapshot_end_missing and "SNAPSHOT_END_MISSING" in q.flags
+    assert q.quality is QuoteQuality.UNAVAILABLE and q.ticks_received == 0
     assert "CANCEL_MKT_DATA" in tws.names()
 
 
@@ -372,14 +374,17 @@ def test_check_runner_end_to_end(tws, tmp_path):
     cfg_path.write_text("".join(f"{k} = {json.dumps(v)}\n" for k, v in CFG_DATA.items()))
     os.chmod(cfg_path, 0o600)
     report = run_check(cfg_path, session_factory=lambda cfg: session())
-    assert report["overall"] == "PASS", report
+    assert report["overall"] in ("PASS", "PASS_WITH_WARNINGS"), report
     assert report["sdk_version"] == "1052.1"
     assert report["session"]["server_version"] == tws.server_version
     assert report["session"]["reader_joined"] and report["reconnect_session"]["reader_joined"]
     assert report["session"]["tws_connection_time"] == tws.connection_time
     assert PAPER not in json.dumps(report)
     assert tws.names().count("START_API") == 2
-    assert any("DELAYED" in n for n in report["notes"]) and report["warnings"] == []
+    # default fake quote is delayed-only: two-sided, broker-reported type 3 -> PASS_WITH_WARNINGS
+    assert report["overall"] == "PASS_WITH_WARNINGS"
+    step = next(st for st in report["steps"] if st["name"] == "quote")
+    assert step["status"] == "PASS_WITH_WARNINGS" and "DELAYED" in step["detail"]["reason"]
 
 
 # --- review round: preflight, server version, read-only verification ----------------------------
@@ -485,32 +490,21 @@ def test_config_read_unsupported_server_version_is_distinct(tws, monkeypatch):
     assert "REQ_CONFIG" not in tws.names() and not DATA_REQUESTS & set(tws.names())
 
 
-def test_owner_attested_sends_no_config_request(tws):
-    with session(ATTESTED) as s:
-        assert s.read_only_status == "OWNER_ATTESTED_NOT_VERIFIED"
-        s.positions()
-    assert "REQ_CONFIG" not in tws.names()
-
-
-def test_owner_attested_check_is_pass_with_warnings(tws, tmp_path):
-    cfg_path = tmp_path / "paper.toml"
-    data = {**CFG_DATA, "read_only_check": "owner-attested"}
-    cfg_path.write_text("".join(f"{k} = {json.dumps(v)}\n" for k, v in data.items()))
-    os.chmod(cfg_path, 0o600)
-    report = run_check(cfg_path, session_factory=lambda cfg: session(cfg))
-    assert report["overall"] == "PASS_WITH_WARNINGS"
-
-
-def test_unavailable_quote_check_is_pass_with_warnings(tws, tmp_path):
+def test_unentitled_quote_on_both_routes_check_fails_with_evidence(tws, tmp_path):
     tws.on["REQ_MKT_DATA"] = lambda srv, c, r: c.push(error_frame(r.reqId, 354, "not subscribed"))
     cfg_path = tmp_path / "paper.toml"
     cfg_path.write_text("".join(f"{k} = {json.dumps(v)}\n" for k, v in CFG_DATA.items()))
     os.chmod(cfg_path, 0o600)
     from tradingbot.ibkr.check import summarize
 
-    report = run_check(cfg_path, session_factory=lambda cfg: session())
-    assert report["overall"] == "PASS_WITH_WARNINGS"
+    report = run_check(cfg_path, session_factory=lambda cfg: session(stream_seconds=0.3))
+    assert report["overall"] == "FAIL"
     assert "no market data delivered" in summarize(report).splitlines()[0]
+    step = next(st for st in report["steps"] if st["name"] == "quote")
+    assert step["status"] == "FAIL"
+    attempts = step["detail"]["attempts"]
+    assert [a["route"] for a in attempts] == ["snapshot", "stream"]
+    assert all(a["request_events"][0][0] == 354 for a in attempts)
 
 
 # --- managedAccounts: every value, from the first on ---------------------------------------------
@@ -711,5 +705,237 @@ def test_unbound_base_class_calls_send_nothing(tws, meth):
         getattr(EClient, meth)(s._client, *_order_args(meth))
     except ReadOnlyViolation:
         pass
+    assert tws.requests == before
+    s.disconnect()
+
+
+# --- quote evidence: snapshot without end, streaming fallback ------------------------------------
+def _tick(req_id, tick_type, price, size="100"):
+    return frame(IN.TICK_PRICE, TickPrice(reqId=req_id, tickType=tick_type, price=price,
+                                          size=size, attrMask=0))
+
+
+def _mdt(req_id, value):
+    from ibapi.protobuf.MarketDataType_pb2 import MarketDataType
+
+    return frame(IN.MARKET_DATA_TYPE, MarketDataType(reqId=req_id, marketDataType=value))
+
+
+def _req_params(req_id, permissions=3):
+    from ibapi.protobuf.TickReqParams_pb2 import TickReqParams
+
+    return frame(IN.TICK_REQ_PARAMS, TickReqParams(reqId=req_id, minTick="0.01",
+                                                   bboExchange="9c0001",
+                                                   snapshotPermissions=permissions))
+
+
+def _resolve(s):
+    return s.resolve_contract(TLT_QUERY)
+
+
+def test_snapshot_with_ticks_but_no_end_returns_evidence(tws):
+    def handler(srv, c, r):
+        c.push(_mdt(r.reqId, 3))
+        c.push(_req_params(r.reqId))
+        c.push(_tick(r.reqId, 66, 88.10))
+        c.push(_tick(r.reqId, 67, 88.12))
+        # no TickSnapshotEnd
+
+    tws.on["REQ_MKT_DATA"] = handler
+    with session() as s:
+        report = s.quote(_resolve(s), snapshot_timeout=0.5, stream_seconds=0.3)
+    assert len(report.attempts) == 1  # bid/ask arrived: no streaming fallback
+    q = report.attempts[0]
+    assert q.snapshot_end_missing and "SNAPSHOT_END_MISSING" in q.flags
+    assert (q.bid, q.ask) == (88.10, 88.12) and q.quality is QuoteQuality.DELAYED
+    assert q.tick_counts == {"DELAYED_BID": 1, "DELAYED_BID_SIZE": 1, "DELAYED_ASK": 1,
+                             "DELAYED_ASK_SIZE": 1}
+    assert q.market_data_types_delivered == (3,)
+    assert q.tick_req_params == {"minTick": 0.01, "bboExchange": "9c0001",
+                                 "snapshotPermissions": 3}
+    assert q.first_tick_ms is not None and q.last_tick_ms >= q.first_tick_ms
+    assert report.status == "PASS_WITH_WARNINGS" and "DELAYED" in report.reason
+    assert tws.names().count("CANCEL_MKT_DATA") == 1  # unended snapshot cancelled
+
+
+def test_empty_snapshot_then_streaming_success(tws):
+    def handler(srv, c, r):
+        if r.snapshot:
+            c.push(frame(IN.TICK_SNAPSHOT_END, TickSnapshotEnd(reqId=r.reqId)))
+            return
+        c.push(_mdt(r.reqId, 1))
+        c.push(_tick(r.reqId, 1, 88.00))
+        c.push(_tick(r.reqId, 2, 88.02))
+        c.push(_tick(r.reqId, 4, 88.01))
+
+    tws.on["REQ_MKT_DATA"] = handler
+    with session() as s:
+        report = s.quote(_resolve(s), stream_seconds=0.4)
+    snap, stream = report.attempts
+    assert snap.route == "snapshot" and not snap.snapshot_end_missing and snap.ticks_received == 0
+    assert stream.route == "stream" and stream.quality is QuoteQuality.LIVE
+    assert report.status == "PASS" and "stream" in report.reason
+    reqs = [r for n, r in tws.requests if n == "REQ_MKT_DATA"]
+    assert [r.snapshot for r in reqs] == [True, False]
+    assert tws.names().count("CANCEL_MKT_DATA") == 1  # stream always cancelled; ended snapshot not
+
+
+def test_nothing_on_both_routes(tws):
+    tws.on["REQ_MKT_DATA"] = lambda srv, c, r: None
+    with session() as s:
+        report = s.quote(_resolve(s), snapshot_timeout=0.3, stream_seconds=0.3)
+    assert report.status == "FAIL" and "no market data delivered" in report.reason
+    snap, stream = report.attempts
+    assert snap.snapshot_end_missing and not stream.snapshot_end_missing
+    assert snap.ticks_received == stream.ticks_received == 0
+    assert snap.waited_ms >= 300 and stream.waited_ms >= 300
+    assert tws.names().count("CANCEL_MKT_DATA") == 2
+
+
+def test_delayed_tick_types_only_are_all_mapped(tws):
+    def handler(srv, c, r):
+        c.push(_mdt(r.reqId, 4))
+        c.push(_tick(r.reqId, 66, 88.10))  # DELAYED_BID (+ DELAYED_BID_SIZE)
+        c.push(_tick(r.reqId, 67, 88.12))  # DELAYED_ASK (+ DELAYED_ASK_SIZE)
+        c.push(_tick(r.reqId, 68, 88.11))  # DELAYED_LAST (+ DELAYED_LAST_SIZE)
+        c.push(_tick(r.reqId, 75, 87.90))  # DELAYED_CLOSE
+        c.push(_tick(r.reqId, 72, 88.50))  # DELAYED_HIGH
+        c.push(frame(IN.TICK_STRING, TickString(reqId=r.reqId, tickType=88,
+                                                value="1794412800")))
+        c.push(frame(IN.TICK_SNAPSHOT_END, TickSnapshotEnd(reqId=r.reqId)))
+
+    tws.on["REQ_MKT_DATA"] = handler
+    with session() as s:
+        q = s.quote_snapshot(_resolve(s))
+    assert (q.bid, q.ask, q.last, q.close) == (88.10, 88.12, 88.11, 87.90)
+    assert (str(q.bid_size), str(q.ask_size), str(q.last_size)) == ("100", "100", "100")
+    assert q.last_trade_time.startswith("2026-11-11T16:00")
+    assert q.quality is QuoteQuality.FROZEN and q.market_data_type_name == "DELAYED_FROZEN"
+    assert set(q.tick_counts) == {"DELAYED_BID", "DELAYED_BID_SIZE", "DELAYED_ASK",
+                                  "DELAYED_ASK_SIZE", "DELAYED_LAST", "DELAYED_LAST_SIZE",
+                                  "DELAYED_CLOSE", "DELAYED_HIGH", "DELAYED_LAST_TIMESTAMP"}
+    assert "MIXED_TICK_TYPES" not in q.flags
+
+
+def test_live_two_sided_quote_check_is_plain_pass(tws, tmp_path):
+    def handler(srv, c, r):
+        c.push(_mdt(r.reqId, 1))
+        c.push(_tick(r.reqId, 1, 88.00))
+        c.push(_tick(r.reqId, 2, 88.02))
+        c.push(frame(IN.TICK_SNAPSHOT_END, TickSnapshotEnd(reqId=r.reqId)))
+
+    tws.on["REQ_MKT_DATA"] = handler
+    cfg_path = tmp_path / "paper.toml"
+    cfg_path.write_text("".join(f"{k} = {json.dumps(v)}\n" for k, v in CFG_DATA.items()))
+    os.chmod(cfg_path, 0o600)
+    report = run_check(cfg_path, session_factory=lambda cfg: session())
+    assert report["overall"] == "PASS", report["steps"]
+
+
+# --- S-A: the connection-level choke point -----------------------------------------------------
+def test_reviewer_probe_unbound_base_send_is_refused_at_connection(tws):
+    """Reviewer's probe: EClient.sendMsgProtoBuf(client, PLACE_ORDER/UPDATE_CONFIG, real payload)."""
+    from ibapi.client_utils import createPlaceOrderRequestProto
+    from ibapi.contract import Contract
+    from ibapi.order import Order
+    from ibapi.protobuf.UpdateConfigRequest_pb2 import UpdateConfigRequest
+
+    s = session()
+    s.connect()
+    before = list(tws.requests)
+    order_payload = createPlaceOrderRequestProto(1, Contract(), Order()).SerializeToString()
+    for mid, payload in ((OUT.PLACE_ORDER, order_payload),
+                         (OUT.UPDATE_CONFIG, UpdateConfigRequest(reqId=1).SerializeToString())):
+        with pytest.raises(ReadOnlyViolation):
+            EClient.sendMsgProtoBuf(s._client, mid + PROTOBUF_MSG_ID, payload)
+        with pytest.raises(ReadOnlyViolation):
+            EClient.sendMsg(s._client, mid, "1\0")
+        with pytest.raises(ReadOnlyViolation):
+            s._client.conn.sendMsg(comm.make_msg_proto(mid + PROTOBUF_MSG_ID, payload))
+    assert tws.requests == before and not any(n.startswith("OUT_") for n in tws.names())
+    s.disconnect()
+
+
+def test_every_disallowed_id_refused_by_unbound_base_sends(tws):
+    s = session()
+    s.connect()
+    before = list(tws.requests)
+    out_ids = {v for k, v in vars(OUT).items() if not k.startswith("_") and isinstance(v, int)}
+    for mid in sorted(out_ids - ALLOWED_OUT_MESSAGES):
+        with pytest.raises(ReadOnlyViolation):
+            EClient.sendMsgProtoBuf(s._client, mid + PROTOBUF_MSG_ID, b"")
+        with pytest.raises(ReadOnlyViolation):
+            EClient.sendMsg(s._client, mid, "")
+    assert tws.requests == before
+    s.disconnect()
+
+
+def test_conn_is_always_guarded():
+    from tradingbot.ibkr.session import _GuardedConnection, _ReadOnlyClient
+
+    c = _ReadOnlyClient(None)
+    assert c.conn is None
+    c.conn = object()
+    assert isinstance(c.conn, _GuardedConnection)
+
+
+def test_second_handshake_frame_is_refused(tws):
+    s = session()
+    s.connect()
+    with pytest.raises(ReadOnlyViolation):
+        s._client.conn.sendMsg(b"API\0" + comm.make_initial_msg("v100..226"))
+    s.disconnect()
+
+
+# --- S-B / config response changes ----------------------------------------------------------
+def test_later_differing_config_response_poisons(tws):
+    from ibapi.protobuf.ApiConfig_pb2 import ApiConfig
+    from ibapi.protobuf.ApiSettingsConfig_pb2 import ApiSettingsConfig
+    from ibapi.protobuf.ConfigResponse_pb2 import ConfigResponse
+
+    changed = ConfigResponse(reqId=1, api=ApiConfig(settings=ApiSettingsConfig(
+        readOnlyApi=False, socketPort=7497, allowLocalhostOnly=True)))
+    tws.on["REQ_POSITIONS"] = lambda srv, c, r: c.push(frame(IN.CONFIG_RESPONSE, changed))
+    s = session()
+    s.connect()
+    with pytest.raises(E.ConfigResponseChanged):
+        s.positions(timeout=2)
+    assert s.poisoned
+    assert_closed(s)
+
+
+def test_second_differing_config_response_during_connect_fails(tws):
+    def twice(srv, c, r):
+        FakeTws.config_handler(srv, c, r)
+        srv.api_settings = {**srv.api_settings, "allowLocalhostOnly": False}
+        FakeTws.config_handler(srv, c, r)
+
+    tws.on["REQ_CONFIG"] = twice
+    s = session()
+    with pytest.raises(E.ConfigResponseChanged):
+        s.connect()
+    assert_closed(s)
+    assert not DATA_REQUESTS & set(tws.names())
+
+
+def test_repeated_identical_config_response_is_ignored(tws):
+    def twice(srv, c, r):
+        FakeTws.config_handler(srv, c, r)
+        FakeTws.config_handler(srv, c, r)
+
+    tws.on["REQ_CONFIG"] = twice
+    with session() as s:
+        assert s.positions() is not None
+        assert not s.poisoned
+
+
+def test_malformed_frames_are_refused(tws):
+    s = session()
+    s.connect()
+    before = list(tws.requests)
+    good = comm.make_msg_proto(OUT.REQ_POSITIONS + PROTOBUF_MSG_ID, b"")
+    for bad in (good[:6], good + b"x", b"\0\0\0\x09" + good[4:]):
+        with pytest.raises(ReadOnlyViolation):
+            s._client.conn.sendMsg(bad)
     assert tws.requests == before
     s.disconnect()

@@ -32,6 +32,7 @@ from ibapi.const import UNSET_DECIMAL, UNSET_DOUBLE
 from ibapi.contract import Contract
 from ibapi.message import OUT
 from ibapi.protobuf.ConfigRequest_pb2 import ConfigRequest
+from ibapi.ticktype import TickTypeEnum
 from ibapi.wrapper import EWrapper
 
 from tradingbot.ibkr.config import PaperConnectionConfig
@@ -45,6 +46,7 @@ from tradingbot.ibkr.errors import (
     ConfigReadTimeout,
     ConfigReadUncorrelated,
     ConfigReadUnsupported,
+    ConfigResponseChanged,
     ContractNotFound,
     ErrorClass,
     IbkrConnectionError,
@@ -60,6 +62,8 @@ from tradingbot.ibkr.errors import (
 )
 from tradingbot.ibkr.identity import check_managed_accounts, check_row_account
 from tradingbot.ibkr.models import (
+    CLOSE_TICKS,
+    DELAYED_TICK_IDS,
     LAST_TIMESTAMP_TICKS,
     MARKET_DATA_TYPE_NAMES,
     PRICE_TICKS,
@@ -68,9 +72,11 @@ from tradingbot.ibkr.models import (
     AccountValue,
     ContractQuery,
     PositionRow,
+    QuoteReport,
     QuoteSnapshot,
     ResolvedContract,
     assess_quote,
+    assess_quote_attempts,
 )
 from tradingbot.ibkr.redact import mask_account, redact_accounts
 
@@ -129,9 +135,62 @@ def _denied(name: str) -> Callable[..., None]:
     return method
 
 
+def _outgoing_msg_id(frame: bytes, server_version: int | None) -> int | None:
+    """Message id of a framed request (4-byte length prefix, then the body)."""
+    body = frame[4:]
+    if server_version is not None and server_version >= 201:  # raw 4-byte big-endian id
+        if len(body) < 4:
+            return None
+        mid = int.from_bytes(body[:4], "big")
+        return mid - PROTOBUF_MSG_ID if mid > PROTOBUF_MSG_ID else mid
+    try:  # legacy text framing: "<id>\0..."
+        return int(body.split(b"\0", 1)[0])
+    except ValueError:
+        return None
+
+
+class _GuardedConnection:
+    """Wraps the SDK ``Connection``. Every SDK send path (bound or unbound, base or subclass,
+    text or protobuf) ends in ``self.conn.sendMsg(frame)``, so this is the lowest shared choke
+    point: it allows the one initial ``API\\0`` handshake, then only ``ALLOWED_OUT_MESSAGES``."""
+
+    def __init__(self, raw, client: EClient) -> None:
+        self._raw = raw
+        self._client = client
+        self._handshake_sent = False
+
+    def sendMsg(self, msg: bytes):
+        if msg.startswith(b"API\0"):
+            if self._handshake_sent:
+                raise ReadOnlyViolation("a second API handshake frame is refused")
+            self._handshake_sent = True
+            return self._raw.sendMsg(msg)
+        if (not self._handshake_sent or len(msg) < 8
+                or int.from_bytes(msg[:4], "big") != len(msg) - 4):
+            raise ReadOnlyViolation("malformed or out-of-order outgoing frame refused")
+        mid = _outgoing_msg_id(msg, self._client.serverVersion())
+        if mid not in ALLOWED_OUT_MESSAGES:
+            raise ReadOnlyViolation(f"outgoing message id {mid} refused at the connection")
+        return self._raw.sendMsg(msg)
+
+    def __getattr__(self, name: str):  # isConnected, recvMsg, disconnect, lock, ...
+        return getattr(self._raw, name)
+
+
 class _ReadOnlyClient(EClient):
-    """``EClient`` with every non-allowlisted public method replaced by one that raises, and the
-    two send primitives refusing any message id outside ``ALLOWED_OUT_MESSAGES``."""
+    """``EClient`` with every non-allowlisted public method replaced by one that raises, the two
+    send primitives refusing ids outside ``ALLOWED_OUT_MESSAGES``, and ``conn`` always wrapped in
+    ``_GuardedConnection`` (the SDK assigns ``self.conn = Connection(...)`` in ``connect``)."""
+
+    @property
+    def conn(self):
+        return self.__dict__.get("_guarded_conn")
+
+    @conn.setter
+    def conn(self, value) -> None:
+        self.__dict__["_guarded_conn"] = (
+            None if value is None or isinstance(value, _GuardedConnection)
+            else _GuardedConnection(value, self))
 
     def sendMsg(self, msgId: int, msg: str):
         if msgId not in ALLOWED_OUT_MESSAGES:
@@ -175,6 +234,16 @@ class _Pending:
     live_ticks: bool = False
     last_trade_time: str | None = None
     unavailable_code: int | None = None
+    close: float | None = None
+    tick_counts: dict[str, int] = field(default_factory=dict)
+    mdt_values: list[int] = field(default_factory=list)
+    tick_req_params: dict | None = None
+    events: list[tuple[int, str]] = field(default_factory=list)
+    t0: float = 0.0
+    first_tick: float | None = None
+    last_tick: float | None = None
+    timed_out: bool = False
+    request_error: str | None = None
 
     def fail(self, exc: BaseException) -> None:
         if self.error is None:
@@ -249,10 +318,11 @@ class _Wrapper(EWrapper):
         self._call(self._s._on_tick_string, reqId, tickType, value)
 
     def tickGeneric(self, reqId, tickType, value):
-        pass
+        self._call(self._s._on_tick_other, reqId, tickType)
 
     def tickReqParams(self, tickerId, minTick, bboExchange, snapshotPermissions):
-        pass
+        self._call(self._s._on_tick_req_params, tickerId, minTick, bboExchange,
+                   snapshotPermissions)
 
     def tickSnapshotEnd(self, reqId):
         self._call(self._s._on_end, reqId)
@@ -271,7 +341,8 @@ class IbkrSession:
     sdk_version = SDK_VERSION
 
     def __init__(self, config: PaperConnectionConfig, *, connect_timeout: float = 15.0,
-                 request_timeout: float = 10.0, quote_timeout: float = 15.0,
+                 request_timeout: float = 10.0, quote_timeout: float = 20.0,
+                 stream_seconds: float = 8.0,
                  shutdown_timeout: float = 5.0,
                  preflight: Callable[[PaperConnectionConfig], dict] = run_preflight) -> None:
         if not isinstance(config, PaperConnectionConfig) or config.mode != "paper":
@@ -282,6 +353,7 @@ class IbkrSession:
         self._connect_timeout = connect_timeout
         self._request_timeout = request_timeout
         self._quote_timeout = quote_timeout
+        self._stream_seconds = stream_seconds
         self._shutdown_timeout = shutdown_timeout
 
         self._cond = threading.Condition(threading.RLock())
@@ -301,7 +373,8 @@ class IbkrSession:
         self._identity_failure: AccountIdentityError | None = None
         self._connection_lost: str | None = None
         self._connectivity_interrupted = False
-        self._poisoned: AccountIdentityError | None = None
+        self._poisoned: IbkrError | None = None
+        self._config_first_api: bytes | None = None
         self._pending: dict[int, _Pending] = {}
         self._positions: _Pending | None = None
         self._next_req_id = 9000
@@ -315,7 +388,7 @@ class IbkrSession:
         self.connection_time: str | None = None
         self.connected_at: str | None = None
         self.preflight_result: dict | None = None
-        self.read_only_status = "NOT_CHECKED"  # VERIFIED | OWNER_ATTESTED_NOT_VERIFIED
+        self.read_only_status = "NOT_CHECKED"  # VERIFIED once the config read passed
         self.read_only_settings: dict | None = None
 
     # ------------------------------------------------------------------ public properties
@@ -449,10 +522,7 @@ class IbkrSession:
         explicit presence), so an unset field is never read as a value. Each failure mode has its
         own type; the caller disconnects.
         """
-        if self._cfg.read_only_check == "owner-attested":
-            self.read_only_status = "OWNER_ATTESTED_NOT_VERIFIED"
-            return
-        if self._cfg.read_only_check != "config-read":
+        if self._cfg.read_only_check != "config-read":  # the only legal value
             raise ReadOnlyNotVerified(f"unknown read_only_check {self._cfg.read_only_check!r}")
         if self.server_version is None or self.server_version < MIN_SERVER_VER_CONFIG:
             raise ConfigReadUnsupported(
@@ -594,10 +664,36 @@ class IbkrSession:
             lambda rid: self._client.cancelPositions(), timeout or self._request_timeout,
             cancel_always=True, build=build)
 
+    def quote(self, contract: ResolvedContract, *, market_data_type: int = 3,
+              snapshot_timeout: float | None = None,
+              stream_seconds: float | None = None) -> QuoteReport:
+        """Snapshot first; if it delivers no bid/ask/last price, ONE bounded streaming sample.
+        Every attempt is kept as evidence; the verdict comes from ``assess_quote_attempts``."""
+        attempts = [self.quote_snapshot(contract, market_data_type=market_data_type,
+                                        timeout=snapshot_timeout)]
+        if not attempts[0].has_price:
+            attempts.append(self.quote_stream_sample(contract, market_data_type=market_data_type,
+                                                     seconds=stream_seconds))
+        status, reason = assess_quote_attempts(tuple(attempts))
+        return QuoteReport(attempts=tuple(attempts), status=status, reason=reason)
+
     def quote_snapshot(self, contract: ResolvedContract, *, market_data_type: int = 3,
                        timeout: float | None = None) -> QuoteSnapshot:
         """One snapshot. ``market_data_type`` 3 asks for live data and lets TWS fall back to delayed
-        if the account is not entitled; the type actually delivered is reported, not assumed."""
+        if the account is not entitled; the type actually delivered is reported, not assumed.
+        A snapshot that does not end in time is returned with what arrived, flagged
+        ``snapshot_end_missing`` (and cancelled)."""
+        return self._quote_attempt(contract, market_data_type, snapshot=True,
+                                   wait=timeout or self._quote_timeout)
+
+    def quote_stream_sample(self, contract: ResolvedContract, *, market_data_type: int = 3,
+                            seconds: float | None = None) -> QuoteSnapshot:
+        """Streaming ``reqMktData`` for a bounded window, then always ``cancelMktData``."""
+        return self._quote_attempt(contract, market_data_type, snapshot=False,
+                                   wait=seconds or self._stream_seconds)
+
+    def _quote_attempt(self, contract: ResolvedContract, market_data_type: int, *,
+                       snapshot: bool, wait: float) -> QuoteSnapshot:
         if market_data_type not in MARKET_DATA_TYPE_NAMES:
             raise ValueError("market_data_type must be 1, 2, 3 or 4")
         c = Contract()
@@ -607,7 +703,10 @@ class IbkrSession:
 
         def send(rid: int) -> None:
             self._client.reqMarketDataType(market_data_type)
-            self._client.reqMktData(rid, c, "", True, False, [])
+            self._client.reqMktData(rid, c, "", snapshot, False, [])
+
+        def ms(t: float | None, p: _Pending) -> int | None:
+            return None if t is None else int((t - p.t0) * 1000)
 
         def build(p: _Pending) -> QuoteSnapshot:
             bid, ask, last = p.prices.get("bid"), p.prices.get("ask"), p.prices.get("last")
@@ -615,6 +714,11 @@ class IbkrSession:
                 bid=bid, ask=ask, last=last, market_data_type=p.market_data_type,
                 delayed_ticks_seen=p.delayed_ticks, live_ticks_seen=p.live_ticks,
                 unavailable_code=p.unavailable_code)
+            end_missing = snapshot and not p.ended
+            if end_missing:
+                flags = (*flags, "SNAPSHOT_END_MISSING")
+            if p.request_error:
+                flags = (*flags, "REQUEST_ERROR")
             return QuoteSnapshot(
                 con_id=contract.con_id, symbol=contract.symbol, bid=bid,
                 bid_size=p.sizes.get("bid"), ask=ask, ask_size=p.sizes.get("ask"), last=last,
@@ -622,19 +726,27 @@ class IbkrSession:
                 market_data_type_name=MARKET_DATA_TYPE_NAMES.get(p.market_data_type, "UNREPORTED"),
                 requested_market_data_type=market_data_type, received_at=_now_iso(),
                 last_trade_time=p.last_trade_time, quality=quality, flags=flags,
-                notices=tuple(p.notices), unavailable_code=p.unavailable_code)
+                notices=tuple(p.notices), unavailable_code=p.unavailable_code,
+                route="snapshot" if snapshot else "stream", close=p.close,
+                snapshot_end_missing=end_missing, waited_ms=int((time.monotonic() - p.t0) * 1000),
+                tick_counts=dict(p.tick_counts), market_data_types_delivered=tuple(p.mdt_values),
+                tick_req_params=p.tick_req_params, request_events=tuple(p.events),
+                request_error=p.request_error, first_tick_ms=ms(p.first_tick, p),
+                last_tick_ms=ms(p.last_tick, p))
 
         return self._request(
-            "quote", send, lambda rid: self._client.cancelMktData(rid),
-            timeout or self._quote_timeout, cancel_always=False, build=build)
+            "quote", send, lambda rid: self._client.cancelMktData(rid), wait,
+            cancel_always=not snapshot, build=build, soft=True)
 
     # ------------------------------------------------------------------ request machinery
     def _require_ready(self, gate: bool = False) -> None:
         if self._identity_failure is not None:
             raise AccountIdentityError(f"identity failed: {self._identity_failure}",
                                        reason="IDENTITY_FAILED")
-        if self._poisoned is not None:
+        if isinstance(self._poisoned, AccountIdentityError):
             raise AccountIdentityError(f"session poisoned: {self._poisoned}", reason="POISONED")
+        if self._poisoned is not None:
+            raise ConfigResponseChanged(f"session poisoned: {self._poisoned}")
         if self._connection_lost is not None:
             raise IbkrConnectionError(f"connection lost: {self._connection_lost}")
         if self._connectivity_interrupted:
@@ -645,7 +757,9 @@ class IbkrSession:
 
     def _request(self, kind: str, send: Callable[[int], None],
                  cancel: Callable[[int], None] | None, timeout: float, *, cancel_always: bool,
-                 build: Callable[[_Pending], T], gate: bool = False) -> T:
+                 build: Callable[[_Pending], T], gate: bool = False, soft: bool = False) -> T:
+        """``soft`` (quotes): a timeout or a request-scoped broker error does not raise; the
+        result is built from what arrived. Connection loss and poisoning always raise."""
         with self._cond:
             self._require_ready(gate)
             self._next_req_id += 1
@@ -662,13 +776,21 @@ class IbkrSession:
             with self._cond:
                 # Re-check and send under the lock: no poison/loss callback can interleave.
                 self._require_ready(gate)
+                p.t0 = time.monotonic()
                 send(p.req_id)
             with self._cond:
                 completed = self._cond.wait_for(lambda: p.done, timeout)
             if not completed:
-                primary = IbkrTimeout(f"{kind} (reqId {p.req_id}) timed out after {timeout:.1f}s")
+                if soft:
+                    p.timed_out = True
+                else:
+                    primary = IbkrTimeout(
+                        f"{kind} (reqId {p.req_id}) timed out after {timeout:.1f}s")
             elif p.error is not None:
-                primary = p.error
+                if soft and isinstance(p.error, IbkrRequestError):
+                    p.request_error = str(p.error)
+                else:
+                    primary = p.error
         except BaseException as exc:  # noqa: BLE001 - cleanup must still run (incl. Ctrl-C)
             primary = exc
         finally:
@@ -679,7 +801,7 @@ class IbkrSession:
                     self._positions = None
                 else:
                     self._pending.pop(p.req_id, None)
-        if isinstance(primary, AccountIdentityError):
+        if isinstance(primary, (AccountIdentityError, ConfigResponseChanged)):
             try:
                 self.disconnect()
             except CleanupError as exc:
@@ -744,7 +866,7 @@ class IbkrSession:
             exc.add_note(f"additionally: {cleanup}")
         raise exc
 
-    def _poison(self, exc: AccountIdentityError) -> None:
+    def _poison(self, exc: IbkrError) -> None:
         with self._cond:
             if self._poisoned is None:
                 self._poisoned = exc
@@ -799,21 +921,38 @@ class IbkrSession:
             self._poison(exc)
 
     def _on_config_response(self, proto) -> None:
-        """Correlate strictly: a response without our reqId fails the outstanding config read."""
+        """Correlate strictly: a response without our reqId fails the outstanding config read.
+        After the first correlated response, any later one (same or other reqId) whose ``api``
+        section differs from the first poisons the session; an identical one is ignored."""
         rid = proto.reqId if proto.HasField("reqId") else None
+        api = proto.api.SerializeToString(deterministic=True) if proto.HasField("api") else b""
+        changed: ConfigResponseChanged | None = None
         with self._cond:
-            waiting = [p for p in self._pending.values() if p.kind == "config" and not p.done]
-            for p in waiting:
-                if rid == p.req_id:
-                    p.rows.append(proto)
-                    p.ended = p.done = True
-                else:
-                    p.fail(ConfigReadUncorrelated(
-                        f"config response reqId {rid} does not match request {p.req_id}"))
-            if not waiting:
-                self.unrouted_errors.append((rid if rid is not None else -1, 0,
-                                             "unsolicited config response ignored"))
+            if self._config_first_api is not None:
+                if api == self._config_first_api:
+                    self.unrouted_errors.append((rid if rid is not None else -1, 0,
+                                                 "repeated identical config response ignored"))
+                    return
+                changed = ConfigResponseChanged(
+                    f"a later config response (reqId {rid}) differs from the first")
+                if self._state is SessionState.CONNECTING:
+                    self._connect_failure = self._connect_failure or changed
+            else:
+                waiting = [p for p in self._pending.values() if p.kind == "config" and not p.done]
+                for p in waiting:
+                    if rid == p.req_id:
+                        p.rows.append(proto)
+                        p.ended = p.done = True
+                        self._config_first_api = api
+                    else:
+                        p.fail(ConfigReadUncorrelated(
+                            f"config response reqId {rid} does not match request {p.req_id}"))
+                if not waiting:
+                    self.unrouted_errors.append((rid if rid is not None else -1, 0,
+                                                 "unsolicited config response ignored"))
             self._cond.notify_all()
+        if changed is not None:
+            self._poison(changed)
 
     def _on_error(self, req_id: int, code: int, message: str) -> None:
         msg = redact_accounts(message)
@@ -824,6 +963,8 @@ class IbkrSession:
             return
         with self._cond:
             p = self._positions if req_id == -1 and self._positions else self._pending.get(req_id)
+            if p is not None and p.kind == "quote":
+                p.events.append((code, msg))
             if cls is ErrorClass.NOTICE:
                 self.notices.append((req_id, code, msg))
                 if p is not None:
@@ -902,39 +1043,79 @@ class IbkrSession:
                 self._positions.ended = self._positions.done = True
                 self._cond.notify_all()
 
+    def _quote_pending(self, req_id: int) -> _Pending | None:
+        p = self._pending.get(req_id)
+        return p if p is not None and p.kind == "quote" else None
+
+    def _count_tick(self, p: _Pending, tick_type: int) -> None:
+        try:
+            name = TickTypeEnum.toStr(int(tick_type))
+        except Exception:  # noqa: BLE001 - unknown id: count it by number
+            name = f"TICK_{tick_type}"
+        p.tick_counts[name] = p.tick_counts.get(name, 0) + 1
+        now = time.monotonic()
+        p.first_tick = p.first_tick if p.first_tick is not None else now
+        p.last_tick = now
+        if int(tick_type) in DELAYED_TICK_IDS:
+            p.delayed_ticks = True
+
     def _on_market_data_type(self, req_id: int, market_data_type: int) -> None:
         with self._cond:
-            p = self._pending.get(req_id)
-            if p is not None and p.kind == "quote":
+            p = self._quote_pending(req_id)
+            if p is not None:
                 p.market_data_type = int(market_data_type)
+                p.mdt_values.append(int(market_data_type))
+
+    def _on_tick_req_params(self, req_id, min_tick, bbo_exchange, snapshot_permissions) -> None:
+        with self._cond:
+            p = self._quote_pending(req_id)
+            if p is not None:
+                p.tick_req_params = {"minTick": float(min_tick), "bboExchange": str(bbo_exchange),
+                                     "snapshotPermissions": int(snapshot_permissions)}
+
+    def _on_tick_other(self, req_id: int, tick_type: int) -> None:
+        with self._cond:
+            p = self._quote_pending(req_id)
+            if p is not None:
+                self._count_tick(p, tick_type)
 
     def _on_tick_price(self, req_id: int, tick_type: int, price: float) -> None:
-        mapped = PRICE_TICKS.get(int(tick_type))
+        tick = int(tick_type)
         with self._cond:
-            p = self._pending.get(req_id)
-            if p is None or p.kind != "quote" or mapped is None:
+            p = self._quote_pending(req_id)
+            if p is None:
+                return
+            self._count_tick(p, tick)
+            value = None if price == UNSET_DOUBLE else float(price)
+            if tick in CLOSE_TICKS:
+                p.close = value
+                return
+            mapped = PRICE_TICKS.get(tick)
+            if mapped is None:
                 return
             name, delayed = mapped
-            p.prices[name] = None if price == UNSET_DOUBLE else float(price)
-            p.delayed_ticks |= delayed
+            p.prices[name] = value
             p.live_ticks |= not delayed
 
     def _on_tick_size(self, req_id: int, tick_type: int, size) -> None:
-        mapped = SIZE_TICKS.get(int(tick_type))
         with self._cond:
-            p = self._pending.get(req_id)
-            if p is None or p.kind != "quote" or mapped is None:
+            p = self._quote_pending(req_id)
+            if p is None:
                 return
-            p.sizes[mapped[0]] = None if size == UNSET_DECIMAL else Decimal(size)
+            self._count_tick(p, tick_type)
+            mapped = SIZE_TICKS.get(int(tick_type))
+            if mapped is not None:
+                p.sizes[mapped[0]] = None if size == UNSET_DECIMAL else Decimal(size)
 
     def _on_tick_string(self, req_id: int, tick_type: int, value: str) -> None:
-        if int(tick_type) not in LAST_TIMESTAMP_TICKS:
-            return
-        try:
-            ts = datetime.fromtimestamp(int(value), UTC).isoformat()
-        except (TypeError, ValueError, OverflowError, OSError):
-            ts = f"unparsed:{value!r}"
         with self._cond:
-            p = self._pending.get(req_id)
-            if p is not None and p.kind == "quote":
-                p.last_trade_time = ts
+            p = self._quote_pending(req_id)
+            if p is None:
+                return
+            self._count_tick(p, tick_type)
+            if int(tick_type) not in LAST_TIMESTAMP_TICKS:
+                return
+            try:
+                p.last_trade_time = datetime.fromtimestamp(int(value), UTC).isoformat()
+            except (TypeError, ValueError, OverflowError, OSError):
+                p.last_trade_time = f"unparsed:{value!r}"
