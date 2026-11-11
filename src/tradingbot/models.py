@@ -104,6 +104,10 @@ class MockPolicy(StrictModel):
         default=90, gt=0, validation_alias=AliasChoices("max_signal_age_seconds", "max_source_age_seconds"),
     )
     max_quote_age_seconds: int = Field(default=30, gt=0)
+    # Execution-core exposure caps across follower ideas (execution/coordinator.py), checked before
+    # every broker entry or add. None for the per-instrument cap means "same as max_notional_usd".
+    max_instrument_exposure_usd: Decimal | None = Field(default=None, gt=0)
+    max_aggregate_exposure_usd: Decimal = Field(default=Decimal(10000), gt=0)
     require_stop_on_open: bool = True
     # None = no symbol allowlist (the demo grammar accepts any well-formed symbol);
     # a set restricts fictional fills to those symbols.
