@@ -189,6 +189,9 @@ class SimBroker:
         # next broker interaction (0 = at the next interaction).
         self.pending_seconds = pending_seconds
         self.lookup_failures = 0  # next N open_orders()/executions() calls raise BrokerError
+        # Test control: the next submit arms ``lookup_failures`` with this count, so the lookups
+        # after an order fail while the pre-trade sync still succeeds.
+        self.lookup_failures_after_submit = 0
         self.submit_calls = 0
         # IBKR realism, off by default: a freshly placed order is invisible to open_orders() for
         # this long, and executions / completed orders reach back only this far (IBKR: one day).
@@ -363,6 +366,10 @@ class SimBroker:
 
     def submit(self, order: OrderIntent, children: Sequence[OrderIntent] = ()) -> list[BrokerOrder]:
         self.submit_calls += 1
+        if self.lookup_failures_after_submit:
+            self.lookup_failures, self.lookup_failures_after_submit = (
+                self.lookup_failures_after_submit, 0
+            )
         script = self._submit_script.popleft() if self._submit_script else _Script(Behaviour.FILL)
         if any(ch.parent_ref != order.order_ref for ch in children):
             raise BrokerError("every child must name the entry as its parent")

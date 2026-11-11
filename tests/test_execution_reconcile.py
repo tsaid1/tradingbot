@@ -88,7 +88,7 @@ def test_unapplied_execution_until_synced(h):
 
 def test_intent_stuck_unresolved(h):
     h.broker.script_next_submit("LOST_ACK_PLACED")
-    h.broker.lookup_failures = 2
+    h.broker.lookup_failures_after_submit = 1  # the post-submit lookup fails (the pre-trade sync must succeed, F1)
     h.execute("p1", open_action())
     assert K.INTENT_STUCK_UNRESOLVED not in kinds(h)  # not yet stuck
     h.clock.advance(61)

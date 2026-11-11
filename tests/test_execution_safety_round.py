@@ -108,7 +108,7 @@ def _capped(tmp_path, cap: int = 250) -> Harness:
 def test_m2_an_entry_whose_ack_was_lost_still_counts_against_the_caps(tmp_path):
     h = _capped(tmp_path)
     h.broker.script_next_submit("LOST_ACK_PLACED_RESTING")  # live at the broker, ack lost
-    h.broker.lookup_failures = 2  # the pre-trade sync and the follow-up lookup both fail
+    h.broker.lookup_failures_after_submit = 1  # the post-submit lookup fails (the pre-trade sync must succeed, F1)
     first = h.execute("p1", open_action())
     assert first.state == IntentState.UNRESOLVED
     h.broker.set_quote("QQZ", "19.99", "20.01")
@@ -120,7 +120,7 @@ def test_m2_an_entry_whose_ack_was_lost_still_counts_against_the_caps(tmp_path):
 def test_m2_a_recorded_entry_counts_and_does_not_count_against_its_own_resend(tmp_path):
     h = _capped(tmp_path)
     h.broker.script_next_submit("LOST_ACK_NOT_PLACED")
-    h.broker.lookup_failures = 2
+    h.broker.lookup_failures_after_submit = 1  # the post-submit lookup fails (the pre-trade sync must succeed, F1)
     first = h.execute("p1", open_action())
     assert first.state == IntentState.UNRESOLVED
     _, total = h.coord._exposure("ZZQ")
@@ -512,7 +512,7 @@ def test_s3_exposure_is_valued_at_the_current_quote(tmp_path):
 def test_note_a_visible_child_means_the_entry_filled_even_without_its_execution(tmp_path):
     h = Harness(tmp_path, strict=True)
     h.broker.script_next_submit("LOST_ACK_PLACED")  # placed and filled, the ack is lost
-    h.broker.lookup_failures = 2  # and the lookups fail until the next day
+    h.broker.lookup_failures_after_submit = 1  # the post-submit lookup fails (the pre-trade sync must succeed, F1)
     out = h.execute("p1", open_action())
     assert out.state == IntentState.UNRESOLVED
     h.broker.history_seconds = 3600  # yesterday's fill and completed entry are out of history

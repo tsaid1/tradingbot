@@ -13,7 +13,7 @@ from datetime import timedelta
 import pytest
 from execution_harness import Harness, action, open_action
 
-from tradingbot.execution.broker import OrderStatus
+from tradingbot.execution.broker import BrokerError, OrderStatus
 from tradingbot.execution.coordinator import (
     STALE_AFTER_UNKNOWN_OUTCOME,
     SUBMIT_ERROR,
@@ -37,7 +37,7 @@ def _unknown_and_unlookable(h: Harness, behaviour: str) -> None:
     """The next submit's ack is lost and the follow-up lookup fails, so the intent stays UNRESOLVED
     (the pre-trade sync and the post-ack-loss lookup each consume one failure)."""
     h.broker.script_next_submit(behaviour)
-    h.broker.lookup_failures = 2
+    h.broker.lookup_failures_after_submit = 1  # the post-submit lookup fails (the pre-trade sync must succeed, F1)
 
 
 # ------------------------------------------------------------------------------- SimBroker surface
@@ -110,7 +110,8 @@ def test_failed_completed_orders_lookup_keeps_the_intent_unresolved(h):
         raise BrokerError("invented: completed orders unavailable")
 
     h.broker.completed_orders = unavailable
-    h.coord.recover()
+    with pytest.raises(BrokerError):  # a failed sync is never swallowed (review F1)
+        h.coord.recover()
     assert h.coord.intent(out.order_ref).state == IntentState.UNRESOLVED
     assert h.broker.submit_calls == 1
     assert h.events(out.order_ref).count("LOOKUP_FAILED") == 2
@@ -347,7 +348,7 @@ def test_r4_filled_order_outside_the_executions_window_is_never_resent(h):
     nothing beyond the lookup horizon, so the intent stays for a human."""
     h.broker.history_seconds = 3600
     h.broker.script_next_submit("LOST_ACK_PLACED")  # placed and filled, ack lost
-    h.broker.lookup_failures = 2  # and the lookups fail until long after
+    h.broker.lookup_failures_after_submit = 1  # the post-submit lookup fails (the pre-trade sync must succeed, F1)
     # No protective children: nothing of this order is left in any lookup once history rolls off.
     out = h.execute("p1", open_action(stop=None, target=None))
     assert out.state == IntentState.UNRESOLVED

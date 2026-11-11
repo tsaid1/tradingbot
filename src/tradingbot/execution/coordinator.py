@@ -89,6 +89,15 @@ EXIT_WITHOUT_QUOTE = "EXIT_WITHOUT_QUOTE"
 # A child of the entry is active at the broker, so the entry filled, but its executions are no
 # longer in the broker's history: the ledger cannot be updated from fills; a human must.
 ENTRY_FILL_NOT_IN_EXECUTIONS = "ENTRY_FILL_NOT_IN_EXECUTIONS"
+# A broker read failed (open orders, executions, completed orders or positions): the ledger may be
+# stale, every position's protection is UNKNOWN and nothing that creates or increases exposure is
+# sent until a full sync succeeds (review F1).
+BROKER_STATE_UNKNOWN = "BROKER_STATE_UNKNOWN"
+BROKER_UNREADABLE = "BROKER_UNREADABLE"
+
+
+class BrokerUnreadable(BrokerError):
+    """A full broker sync failed: the coordinator cannot tell what the account holds."""
 
 
 def default_halt_file() -> Path:
@@ -283,12 +292,17 @@ class ExecutionCoordinator:
                 state=existing.state.value,
             )
             return self._outcome(ref, duplicate=True)
-        self.sync()
+        synced = self.sync()
         account = self.broker.account_id()
         if self.config.expected_account and account != self.config.expected_account:
             return self._refuse(
                 source, action, gate, ref, account, ["BROKER_ACCOUNT_MISMATCH"], now
             )
+        if action.action in (Action.OPEN, Action.ADD) and (
+            not synced or self._broker_state_unknown()
+        ):
+            # Review F1: a stale ledger never authorizes new exposure.
+            return self._refuse(source, action, gate, ref, account, [BROKER_UNREADABLE], now)
         if action.action == Action.OPEN:
             return self._open(source, action, gate, ref, account, now)
         if action.action == Action.ADD:
@@ -334,7 +348,9 @@ class ExecutionCoordinator:
                 )
             self._resolve(intent)
             out.append(self._outcome(intent.order_ref))
-        self.sync()
+        if not self.sync():
+            # Never swallowed (review F1): the caller must not act on a ledger it cannot verify.
+            raise BrokerUnreadable("broker state could not be read; recovery incomplete")
         return out
 
     def sync(self, *, _halt_rerun: bool = True) -> bool:
@@ -344,9 +360,14 @@ class ExecutionCoordinator:
         try:
             fills = self.broker.executions()
             open_orders = self.broker.open_orders()
+            # Read for health only: every read the coordinator depends on must succeed (F1).
+            self.broker.completed_orders(since=now)
+            self.broker.positions()
         except BrokerError as exc:
-            self.store.log(now, "SYNC_FAILED", error=str(exc))
+            self._broker_unreadable("sync", exc)
             return False
+        if self.store.resolve_exceptions(now, BROKER_STATE_UNKNOWN, idea_id=None):
+            self.store.log(now, "BROKER_STATE_RESTORED", rule="full broker sync succeeded")
         ours = {o.order_ref: o for o in self.store.orders()}
         touched: set[str] = set()
         for f in fills:
@@ -404,6 +425,26 @@ class ExecutionCoordinator:
                 halt_file=str(self.config.halt_file),
             )
         return asked
+
+    def _broker_state_unknown(self) -> bool:
+        return any(
+            e.kind == BROKER_STATE_UNKNOWN for e in self.store.exceptions(open_only=True)
+        )
+
+    def _broker_unreadable(self, read: str, exc: BaseException) -> None:
+        """A broker read failed: every open position's protection becomes UNKNOWN and an open
+        BROKER_STATE_UNKNOWN exception blocks new exposure until a full sync succeeds (F1)."""
+        now = self.clock()
+        self.store.log(now, "SYNC_FAILED", read=read, error=str(exc))
+        for p in self.store.positions():
+            if p.quantity > 0 and p.stop_price is not None and p.protection != "UNKNOWN":
+                self.store.update_position(p.idea_id, now, protection="UNKNOWN")
+        detail = (
+            f"broker {read} read failed: {exc}; protection unknown and new exposure blocked "
+            "until a full broker sync succeeds"
+        )
+        if self.store.raise_exception(now, BROKER_STATE_UNKNOWN, detail):
+            self.store.log(now, BROKER_STATE_UNKNOWN, read=read, error=str(exc))
 
     # ================================================================== actions
 
@@ -566,7 +607,8 @@ class ExecutionCoordinator:
             held = sum(
                 p.quantity for p in self.broker.positions() if p.contract.symbol == contract.symbol
             )
-        except BrokerError:
+        except BrokerError as exc:
+            self._broker_unreadable("positions", exc)
             return self._refuse(
                 source, action, gate, ref, account, ["BROKER_POSITIONS_UNAVAILABLE"], now
             )
@@ -908,6 +950,7 @@ class ExecutionCoordinator:
             completed = self.broker.completed_orders(since=intent.created_at - COMPLETED_LOOKBACK)
         except BrokerError as exc:
             self._mark_unresolved(intent, "LOOKUP_FAILED", str(exc))
+            self._broker_unreadable("lookup", exc)
             return
         rows = self.store.orders(intent.order_ref)
         refs = {r.order_ref for r in rows}
@@ -1233,6 +1276,7 @@ class ExecutionCoordinator:
             open_by_ref = {o.order_ref: o for o in self.broker.open_orders()}
         except BrokerError as exc:
             self._protection_unverified(pos, str(exc))
+            self._broker_unreadable("open_orders", exc)
             return
         refs = [r for r in (pos.stop_ref, pos.target_ref) if r]
         if pos.quantity == 0:
@@ -1282,6 +1326,7 @@ class ExecutionCoordinator:
                 open_by_ref = {o.order_ref: o for o in self.broker.open_orders()}
             except BrokerError as exc:
                 self._protection_unverified(pos, str(exc))
+                self._broker_unreadable("open_orders", exc)
                 return
         for ref in refs:
             o = open_by_ref.get(ref)
@@ -1294,6 +1339,26 @@ class ExecutionCoordinator:
         if cover == 0:
             # Fully committed to working exits; no stop may work beside them (never CONFIRMED).
             self.store.update_position(idea_id, now, protection="EXITING")
+            return
+        # CONFIRMED needs the fills read after the working orders: a fill the ledger has not applied
+        # yet means the working-orders view may describe a position that no longer exists (F1).
+        mine = {r.order_ref for r in self.store.orders() if r.idea_id == idea_id}
+        try:
+            late = [
+                f.exec_id
+                for f in self.broker.executions()
+                if f.order_ref in mine and not self.store.has_fill(f.exec_id)
+            ]
+        except BrokerError as exc:
+            self._protection_unverified(pos, str(exc))
+            self._broker_unreadable("executions", exc)
+            return
+        if late:
+            self.store.update_position(idea_id, now, protection="UNKNOWN")
+            self.store.log(
+                now, "PROTECTION_CHECK_STALE", idea_id=idea_id, unapplied=late,
+                rule="fills arrived after the working-orders read; checked again next sync",
+            )
             return
         stop = open_by_ref.get(pos.stop_ref) if pos.stop_ref else None
         if (
@@ -1340,13 +1405,13 @@ class ExecutionCoordinator:
         pos = self.store.position(idea_id)
         if pos is None or pos.stop_price is None:
             return "NOT_REQUIRED"
-        if any(
-            e.kind == UNPROTECTED_POSITION and e.idea_id == idea_id
-            for e in self.store.exceptions(open_only=True)
-        ):
+        open_ = self.store.exceptions(open_only=True)
+        if any(e.kind == UNPROTECTED_POSITION and e.idea_id == idea_id for e in open_):
             return "UNPROTECTED"
         if pos.quantity == 0:
             return "PENDING" if pos.status == "PENDING" else "NOT_REQUIRED"
+        if any(e.kind == BROKER_STATE_UNKNOWN for e in open_):
+            return "UNKNOWN"
         if pos.protection in ("CONFIRMED", "EXITING"):
             return pos.protection
         return "UNKNOWN"
@@ -1487,7 +1552,8 @@ class ExecutionCoordinator:
         new = limit * qty
         try:
             symbol_exposure, total_exposure = self._exposure(contract.symbol, exclude_ref, now)
-        except BrokerError:
+        except BrokerError as exc:
+            self._broker_unreadable("positions", exc)
             return None, ["BROKER_POSITIONS_UNAVAILABLE"]
         if symbol_exposure + new > per_cap:
             return None, [f"INSTRUMENT_EXPOSURE_CAP:{symbol_exposure + new}>{per_cap}"]

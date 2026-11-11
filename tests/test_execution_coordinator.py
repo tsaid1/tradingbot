@@ -211,7 +211,7 @@ def test_resend_budget_exhausted_stays_unresolved_and_is_reported_stuck(h):
 
 def test_failed_lookup_keeps_intent_unresolved_until_the_broker_answers(h):
     h.broker.script_next_submit("LOST_ACK_PLACED")
-    h.broker.lookup_failures = 2  # the pre-trade sync, then the post-ack-loss lookup
+    h.broker.lookup_failures_after_submit = 1  # the post-submit lookup fails (the pre-trade sync must succeed, F1)
     out, _ = opened(h)
     assert out.state == IntentState.UNRESOLVED
     assert "LOOKUP_FAILED" in h.events(out.order_ref)
@@ -265,7 +265,7 @@ def test_halt_switch_blocks_submission_and_is_journaled(h):
 
 def test_halt_also_blocks_a_recovery_resubmission(h):
     h.broker.script_next_submit("LOST_ACK_NOT_PLACED")
-    h.broker.lookup_failures = 2  # the pre-trade sync, then the post-ack-loss lookup
+    h.broker.lookup_failures_after_submit = 1  # the post-submit lookup fails (the pre-trade sync must succeed, F1)
     out, _ = opened(h)
     assert out.state == IntentState.UNRESOLVED
     h.halt()

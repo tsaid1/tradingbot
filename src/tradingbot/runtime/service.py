@@ -253,8 +253,12 @@ class RuntimeService:
 
     def _probe_broker(self, now: datetime) -> bool:
         try:
+            # Every read the coordinator depends on (review F1), not only open orders.
             self.broker.account_id()
             self.broker.open_orders()
+            self.broker.executions()
+            self.broker.completed_orders(since=now)
+            self.broker.positions()
             if self.source.realtime:
                 self._publish_mock_quotes(now)
         except Exception as exc:  # noqa: BLE001 - any broker fault is a broker failure
