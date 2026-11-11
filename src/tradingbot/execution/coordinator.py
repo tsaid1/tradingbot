@@ -83,6 +83,9 @@ UNKNOWN_OUTCOME_BEYOND_LOOKUP_HORIZON = "UNKNOWN_OUTCOME_BEYOND_LOOKUP_HORIZON"
 # An exit was not sent because the working entries, earlier exits or protective children could not
 # be cancelled or resized first, with the result confirmed at the broker (review R1 / R6).
 EXIT_NOT_NETTED = "EXIT_NOT_NETTED"
+# An exit was not sent because the broker quote was not usable to price its limit (review S2); the
+# broker-side protective stop remains the protection.
+EXIT_WITHOUT_QUOTE = "EXIT_WITHOUT_QUOTE"
 
 
 def default_halt_file() -> Path:
@@ -521,7 +524,8 @@ class ExecutionCoordinator:
         return self._outcome(ref)
 
     def _exit(self, source, action, gate, ref, account, now) -> ExecutionOutcome:
-        """REDUCE / CLOSE: reduce-only market orders that can never open or reverse a position."""
+        """REDUCE / CLOSE: a marketable limit, priced from a fresh broker quote inside the policy
+        collar and netted against every working exit before it is sent (review R1, S2)."""
         pos = self._open_position(action.idea_reference)
         if pos is None:
             return self._refuse(
@@ -562,12 +566,26 @@ class ExecutionCoordinator:
                 [f"EXIT_EXCEEDS_BROKER_POSITION:{reducible}<{qty}"],
                 now,
             )
+        limit, problem = self._exit_limit(contract, side, now)
+        if problem:
+            detail = (
+                f"{action.action.value} {qty} of {pos.idea_id} not sent: {problem}; the protective "
+                "stop at the broker remains the protection"
+            )
+            self.store.raise_exception(
+                now, EXIT_WITHOUT_QUOTE, detail, idea_id=pos.idea_id, order_ref=ref
+            )
+            return self._refuse(
+                source, action, gate, ref, account, [EXIT_WITHOUT_QUOTE, problem], now,
+                idea_id=pos.idea_id,
+            )
         order = OrderIntent(
             order_ref=ref,
             contract=contract,
             side=side,
             quantity=qty,
-            order_type=OrderType.MKT,
+            order_type=OrderType.LMT,
+            limit_price=limit,
             reduce_only=True,
         )
         intent = self._new_intent(
@@ -580,7 +598,8 @@ class ExecutionCoordinator:
             now,
             side=side.value,
             quantity=qty,
-            order_type="MKT",
+            order_type="LMT",
+            limit_price=str(limit),
         )
         self._record(intent, [order], role=Role.EXIT)
         self._submit_exit(self.store.intent(ref), order)
@@ -1405,21 +1424,9 @@ class ExecutionCoordinator:
         Returns the collar-bounded limit price, or the reasons to refuse."""
         if self._reversal_blocks(contract.symbol):
             return None, ["INSTRUMENT_BLOCKED_LEDGER_REVERSAL"]
-        try:
-            q: BrokerQuote = self.broker.quote(contract)
-        except BrokerError:
-            return None, ["BROKER_QUOTE_UNAVAILABLE"]
-        if q.quality == QuoteQuality.UNAVAILABLE:
-            return None, ["BROKER_QUOTE_UNAVAILABLE"]
-        if q.quality not in self.config.accepted_quote_qualities:
-            return None, [f"BROKER_QUOTE_QUALITY_{q.quality.value}"]
-        age = (now - q.received_at).total_seconds()
-        if age > self.policy.max_quote_age_seconds or age < -5:
-            return None, ["BROKER_QUOTE_STALE"]
-        if q.bid is None or q.ask is None or q.bid <= 0 or q.ask <= 0:
-            return None, ["BROKER_QUOTE_NON_POSITIVE"]
-        if q.bid > q.ask:
-            return None, ["BROKER_QUOTE_CROSSED"]
+        q, problem = self._usable_quote(contract, now)
+        if problem:
+            return None, [problem]
         ref = _dec(reference)
         if ref is None:
             return None, ["ENTRY_REFERENCE_MISSING"]
@@ -1442,6 +1449,40 @@ class ExecutionCoordinator:
             cap = self.policy.max_aggregate_exposure_usd
             return None, [f"AGGREGATE_EXPOSURE_CAP:{total_exposure + new}>{cap}"]
         return limit, []
+
+    def _usable_quote(
+        self, contract: ContractRef, now: datetime
+    ) -> tuple[BrokerQuote | None, str | None]:
+        """The broker's own quote, if it is fresh, of an accepted quality, positive and uncrossed."""
+        try:
+            q: BrokerQuote = self.broker.quote(contract)
+        except BrokerError:
+            return None, "BROKER_QUOTE_UNAVAILABLE"
+        if q.quality == QuoteQuality.UNAVAILABLE:
+            return None, "BROKER_QUOTE_UNAVAILABLE"
+        if q.quality not in self.config.accepted_quote_qualities:
+            return None, f"BROKER_QUOTE_QUALITY_{q.quality.value}"
+        age = (now - q.received_at).total_seconds()
+        if age > self.policy.max_quote_age_seconds or age < -5:
+            return None, "BROKER_QUOTE_STALE"
+        if q.bid is None or q.ask is None or q.bid <= 0 or q.ask <= 0:
+            return None, "BROKER_QUOTE_NON_POSITIVE"
+        if q.bid > q.ask:
+            return None, "BROKER_QUOTE_CROSSED"
+        return q, None
+
+    def _exit_limit(
+        self, contract: ContractRef, side: OrderSide, now: datetime
+    ) -> tuple[Decimal | None, str | None]:
+        """A marketable limit for an exit: the touch it trades against (bid for a sell, ask for a
+        buy) moved by the policy collar, so it fills now but never far from a fresh reference."""
+        q, problem = self._usable_quote(contract, now)
+        if problem:
+            return None, problem
+        band = self.policy.max_price_deviation_pct / Decimal(100)
+        if side == OrderSide.SELL:
+            return (q.bid * (1 - band)).quantize(CENT, ROUND_CEILING), None
+        return (q.ask * (1 + band)).quantize(CENT, ROUND_FLOOR), None
 
     def _reversal_blocks(self, symbol: str) -> bool:
         """An open LEDGER_REVERSAL on any idea in this instrument blocks all new exposure in it."""

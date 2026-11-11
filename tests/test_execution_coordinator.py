@@ -305,7 +305,8 @@ def test_partial_reduce_is_reduce_only_and_shrinks_protection(h):
     out = h.execute("p2", action("trim", Action.REDUCE, idea=pos.idea_id, fraction="0.25"))
     assert out.state == IntentState.FILLED and out.filled_quantity == 1
     order = h.broker.orders_with_ref(out.order_ref)[0]
-    assert order.reduce_only and order.side == OrderSide.SELL and order.order_type == OrderType.MKT
+    # A marketable limit from the fresh quote, not a market order (safety review S2).
+    assert order.reduce_only and order.side == OrderSide.SELL and order.order_type == OrderType.LMT
     assert h.coord.store.position(pos.idea_id).quantity == 3
     w = h.working()
     assert w[pos.stop_ref].remaining == 3 and w[pos.target_ref].remaining == 3

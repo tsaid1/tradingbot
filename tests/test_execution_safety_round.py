@@ -8,7 +8,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
-from decimal import Decimal
+from decimal import ROUND_CEILING, Decimal
 from pathlib import Path
 
 import pytest
@@ -23,6 +23,7 @@ from tradingbot.execution.broker import (
     OrderSide,
     OrderStatus,
     OrderType,
+    QuoteQuality,
 )
 from tradingbot.execution.coordinator import (
     PROTECTION_UNVERIFIED,
@@ -433,3 +434,39 @@ def test_s1_a_stop_on_the_wrong_side_of_the_average_entry_is_flagged(tmp_path):
     report = h.coord.reconcile()
     [d] = [d for d in report.discrepancies if d.kind.value == "PROTECTIVE_STOP_INVALID"]
     assert "51" in d.detail and not report.clean
+
+
+# ----------------------------------------------------------------------------------------- S2
+
+
+def test_s2_an_exit_is_a_marketable_limit_priced_from_a_fresh_quote(tmp_path):
+    h = Harness(tmp_path, strict=True)
+    h.execute("p1", open_action())
+    close = h.execute("p2", action("close", Action.CLOSE, idea="p1:open"))
+    [order] = h.broker.orders_with_ref(close.order_ref)
+    band = h.policy.max_price_deviation_pct / Decimal(100)
+    assert order.order_type == OrderType.LMT
+    assert order.limit_price == (Decimal("49.98") * (1 - band)).quantize(
+        Decimal("0.01"), ROUND_CEILING
+    )
+    assert close.state == IntentState.FILLED and order.avg_fill_price == Decimal("49.98")
+
+
+@pytest.mark.parametrize(
+    "quote",
+    [
+        {"bid": None, "ask": None, "quality": QuoteQuality.UNAVAILABLE},
+        {"bid": "50.10", "ask": "50.00"},
+        {"bid": "49.98", "ask": "50.02", "quality": QuoteQuality.DELAYED},
+    ],
+)
+def test_s2_no_usable_quote_means_no_exit_and_an_exception(tmp_path, quote):
+    h = Harness(tmp_path, strict=True)
+    opened = h.execute("p1", open_action())
+    h.broker.set_quote(SYMBOL, **quote)
+    calls = h.broker.submit_calls
+    trim = h.execute("p2", action("trim", Action.REDUCE, idea="p1:open", fraction="0.5"))
+    assert trim.state == IntentState.REFUSED and trim.reasons[0] == "EXIT_WITHOUT_QUOTE"
+    assert h.broker.submit_calls == calls
+    assert "EXIT_WITHOUT_QUOTE" in [e.kind for e in h.coord.store.exceptions(open_only=True)]
+    assert h.working()[f"{opened.order_ref}.STP"].remaining == 4  # the broker stop stays
