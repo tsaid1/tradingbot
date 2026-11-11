@@ -257,7 +257,7 @@ DATE_RE = _r(r"\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\
 PRICE_RE = re.compile(r"(?<![\w.$])\$?\s?(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)(?!\s*%)(?!\d)(?!,\d)")
 STOP_WORD_RE = _r(r"\b(?:stop|stop[- ]loss|sl)\b")
 TARGET_WORD_RE = _r(r"\b(?:target(?:ing)?|take[- ]profit|tp|objective)\b")
-# A role word may follow the number ("95 target, 86 stop, 88 entry"). A trailing "now" marks a quoted
+# A role word (entry, stop or target) may follow its number. A trailing "now" marks a quoted
 # market price: a reference by default, never an entry (only explicit execution language sets ENTRY).
 AFTER_ROLE_RE = _r(r"^\s*(?:(?P<stop>stop(?:[- ]loss)?|sl)|(?P<target>target|tp)|(?P<entry>entry|ent)|(?P<now>now))\b")
 TRIGGER_WORD_RE = _r(r"\b(?:below|above|under|over|breaks?|breaking|break of|through|closes?|cross(?:es|ing)?)\b")
