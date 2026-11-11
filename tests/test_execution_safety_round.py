@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from execution_harness import Harness, action, open_action, source
+from execution_harness import SYMBOL, Harness, action, open_action, source
 
 from tradingbot.event_models import ParsedPost
 from tradingbot.execution.broker import (
@@ -155,3 +155,39 @@ def test_m3_a_refused_close_stops_the_group_and_holds_the_open(tmp_path):
     report = h.coord.reconcile()
     assert "PARTIAL_GROUP" in [d.kind.value for d in report.discrepancies]
     assert not report.clean
+
+
+# ----------------------------------------------------------------------------------------- R2
+
+
+def test_r2_a_reversing_fill_is_recorded_and_blocks_only_that_instrument(tmp_path):
+    h = Harness(tmp_path, strict=True)
+    opened = h.execute("p1", open_action())
+    stop = f"{opened.order_ref}.STP"
+    h.broker.modify(stop, quantity=9)  # enlarged outside the bot (e.g. by hand at the broker)
+    h.broker.open_orders()  # the pending amendment takes effect
+    h.broker.set_quote(SYMBOL, "47.90", "47.95")  # the stop sells 9 against 4 held
+    assert sum(p.quantity for p in h.broker.positions()) == -5
+    assert h.coord.sync() is True  # no RuntimeError, and again on the next call
+    assert h.coord.sync() is True
+    [fill] = [f for f in h.coord.store.fills() if f["order_ref"] == stop]
+    assert fill["quantity"] == 9  # recorded as it happened
+    pos = h.coord.store.position("p1:open")
+    assert pos.quantity == 0 and pos.status == "REVERSED"
+    [exc] = [e for e in h.coord.store.exceptions(open_only=True) if e.kind == "LEDGER_REVERSAL"]
+    assert exc.idea_id == "p1:open" and "5" in exc.detail
+    h.broker.set_quote(SYMBOL, "49.98", "50.02")
+    blocked = h.execute("p2", open_action())
+    assert blocked.state == IntentState.REFUSED
+    assert blocked.reasons == ["INSTRUMENT_BLOCKED_LEDGER_REVERSAL"]
+    h.broker.set_quote("QQZ", "19.99", "20.01")
+    other = h.execute("p3", open_action(symbol="QQZ", entry="20", stop="19", target="22"))
+    assert other.state == IntentState.FILLED  # everything else keeps working
+    r = h.replay.process(
+        source("p4", at=h.clock.now()),
+        ParsedPost(actions=[open_action("again", symbol="QQZ", entry="20", stop="19")]),
+        h.quotes("QQZ"),
+        now=h.clock.now(),
+    )
+    assert [o.status for o in r.outcomes] == ["EXECUTED"]
+    assert "UNEXPLAINED_BROKER_POSITION" in [d.kind.value for d in h.coord.reconcile().discrepancies]

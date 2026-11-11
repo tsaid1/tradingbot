@@ -43,6 +43,7 @@ from tradingbot.execution.broker import (
     TimeInForce,
 )
 from tradingbot.execution.store import (
+    LEDGER_REVERSAL,
     UNRESOLVED_STATES,
     ExecutionStore,
     Intent,
@@ -1138,6 +1139,8 @@ class ExecutionCoordinator:
     ) -> tuple[Decimal | None, list[str]]:
         """Broker-quote sanity, the price collar and exposure caps, before any entry or add.
         Returns the collar-bounded limit price, or the reasons to refuse."""
+        if self._reversal_blocks(contract.symbol):
+            return None, ["INSTRUMENT_BLOCKED_LEDGER_REVERSAL"]
         try:
             q: BrokerQuote = self.broker.quote(contract)
         except BrokerError:
@@ -1175,6 +1178,15 @@ class ExecutionCoordinator:
             cap = self.policy.max_aggregate_exposure_usd
             return None, [f"AGGREGATE_EXPOSURE_CAP:{total_exposure + new}>{cap}"]
         return limit, []
+
+    def _reversal_blocks(self, symbol: str) -> bool:
+        """An open LEDGER_REVERSAL on any idea in this instrument blocks all new exposure in it."""
+        ideas = {
+            e.idea_id
+            for e in self.store.exceptions(open_only=True)
+            if e.kind == LEDGER_REVERSAL
+        }
+        return any(p.symbol == symbol for p in self.store.positions() if p.idea_id in ideas)
 
     def _exposure(self, symbol: str, exclude_ref: str | None = None) -> tuple[Decimal, Decimal]:
         """Gross exposure at cost of every open follower idea plus every non-terminal entry or add

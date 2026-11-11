@@ -124,6 +124,8 @@ class IntentState(str, Enum):
 
 
 UNRESOLVED_STATES = frozenset({IntentState.RECORDED, IntentState.UNRESOLVED})
+# An exit fill larger than the follower position: the broker account went through flat.
+LEDGER_REVERSAL = "LEDGER_REVERSAL"
 
 
 class Role(str, Enum):
@@ -183,7 +185,8 @@ class OrderRow(StrictModel):
 
 class LedgerPosition(StrictModel):
     """One follower idea. ``status``: PENDING (entry working, nothing filled yet), OPEN, CLOSED,
-    NOT_FILLED (the entry ended without any fill)."""
+    NOT_FILLED (the entry ended without any fill), REVERSED (an exit fill exceeded the position:
+    the ledger stops at zero and a LEDGER_REVERSAL exception holds the excess)."""
 
     idea_id: str
     symbol: str
@@ -389,7 +392,10 @@ class ExecutionStore:
         executed_at: datetime,
         at: datetime,
     ) -> LedgerPosition | None:
-        """The only writer of follower quantities: one broker execution, applied exactly once."""
+        """The only writer of follower quantities: one broker execution, applied exactly once.
+        An exit fill larger than the position is recorded as it happened; the ledger stops at zero,
+        the idea becomes REVERSED and a LEDGER_REVERSAL exception is opened in the same
+        transaction (safety review R2)."""
         with self.tx() as c:
             if c.execute("SELECT 1 FROM exec_fills WHERE exec_id=?", (exec_id,)).fetchone():
                 return None
@@ -420,14 +426,37 @@ class ExecutionStore:
                 raise RuntimeError(f"fill for unknown idea {order.idea_id}")
             qty = pos["quantity"]
             avg = Decimal(pos["avg_price"]) if pos["avg_price"] else None
+            excess = 0
             if order.role == Role.ENTRY:
                 new_qty = qty + quantity
                 avg = ((avg or Decimal(0)) * qty + price * quantity) / new_qty
             else:
                 new_qty = qty - quantity
                 if new_qty < 0:
-                    raise RuntimeError(f"reduce-only fill would reverse idea {order.idea_id}")
-            status = "OPEN" if new_qty > 0 else "CLOSED"
+                    excess, new_qty = -new_qty, 0
+            status = "OPEN" if new_qty > 0 else ("REVERSED" if excess else "CLOSED")
+            if excess:
+                detail = (
+                    f"{order.role.value} {order.side} {quantity} @ {price} ({exec_id}) against a "
+                    f"follower position of {qty}: the account went through flat by {excess}. "
+                    "New exposure in this instrument is blocked until a human resolves this."
+                )
+                c.execute(
+                    "INSERT INTO exec_exceptions (at,kind,idea_id,order_ref,detail) "
+                    "VALUES (?,?,?,?,?)",
+                    (at.isoformat(), LEDGER_REVERSAL, order.idea_id, order.order_ref, detail),
+                )
+                self.log(
+                    at,
+                    LEDGER_REVERSAL,
+                    order_ref=order.order_ref,
+                    idea_id=order.idea_id,
+                    c=c,
+                    exec_id=exec_id,
+                    fill_quantity=quantity,
+                    ledger_before=qty,
+                    excess=excess,
+                )
             c.execute(
                 "UPDATE exec_positions SET quantity=?, avg_price=?, status=?, "
                 "protection='UNKNOWN', updated_at=? WHERE idea_id=?",
