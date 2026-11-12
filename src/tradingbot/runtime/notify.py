@@ -54,6 +54,9 @@ BROKER_RECONNECTED = "BROKER_RECONNECTED"
 # Shadow mode: the quote-stream cap is full of contracts the simulation depends on (no stream for
 # a new contract: its quote is unavailable and its entries hold).
 SHADOW_STREAM_CAP_REACHED = "SHADOW_STREAM_CAP_REACHED"
+# Shadow mode: the simulator refused the cancel of a resting opening order on a read that does not
+# qualify it (the read is then not published); open until the cancel succeeds or the order ends.
+SHADOW_OPENING_CANCEL_REFUSED = "SHADOW_OPENING_CANCEL_REFUSED"
 BROKER_IDENTITY_MISMATCH = "BROKER_IDENTITY_MISMATCH"
 HEARTBEAT_STALE = "HEARTBEAT_STALE"
 HEARTBEAT_RESTORED = "HEARTBEAT_RESTORED"

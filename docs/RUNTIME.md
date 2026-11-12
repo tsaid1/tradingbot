@@ -182,7 +182,8 @@ invariant is enforced where a read is published: before a read that fails the op
 published, every resting opening order of the contract is cancelled in the simulator, the one
 the core is cancelling in that same call included (its journal row is left to the core, and the
 core's cancel then finds it cancelled, a confirmed cancel). If a cancel is refused, the read is not
-published at all. Reduce-only orders (stops, closes, take-profits) keep the simulator's rules on any
+published at all, the refusal is journaled (`SHADOW_OPENING_CANCEL_REFUSED`, with the code) and the
+alert of the same name stays open until a later read cancels the order or the order has ended. Reduce-only orders (stops, closes, take-profits) keep the simulator's rules on any
 real quote, and every simulated fill's label says what it was computed from:
 `SIMULATED_AT_LIVE_QUOTE`, `SIMULATED_AT_DELAYED_QUOTE` or `SIMULATED_AT_FROZEN_QUOTE`.
 

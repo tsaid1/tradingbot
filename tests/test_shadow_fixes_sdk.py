@@ -580,3 +580,49 @@ def test_round3_a_restart_between_the_shadow_cancel_and_the_core_expiry(shadow, 
     finally:
         again.close()
     assert_only_read_only_messages(tws)
+
+
+# ------------------------------------------------------------------ a refused shadow cancel alerts
+def _refused_alerts(sh):
+    return [a for a in sh.service.store.alerts(open_only=True)
+            if a["kind"] == "SHADOW_OPENING_CANCEL_REFUSED"]
+
+
+def test_a_refused_shadow_opening_cancel_alerts_until_the_cancel_succeeds(shadow, tws):
+    sh = shadow([post("1", 0, RESTING)])
+    fresh = _above_the_limit(sh)
+    run_until_processed(sh, 1, before=fresh)
+    intent, _ = _entry_life(sh)
+    assert intent.state.value == "WORKING" and _refused_alerts(sh) == []
+    sh.sim().script_next_cancel("REJECT")  # the simulator refuses the shadow's own cancel
+    _delayed(sh, 88.38, 88.40)
+    sh.step()
+    [r] = sh.events("SHADOW_OPENING_CANCEL_REFUSED")
+    assert r["order_ref"] == intent.order_ref
+    [a] = _refused_alerts(sh)
+    assert a["key"] == f"SHADOW:CANCEL_REFUSED:{intent.order_ref}"
+    assert "SHADOW_OPENING_QUOTE_NOT_LIVE" in a["detail"]
+    assert sh.sim().executions() == []  # the read was never published
+    _delayed(sh, 88.38, 88.40)
+    sh.step()  # the next read cancels it: the alert is swept
+    assert len(sh.events("SHADOW_OPENING_ORDER_CANCELLED")) == 1
+    assert _refused_alerts(sh) == []
+    assert sh.sim().executions() == []
+    sh.close()
+    assert_only_read_only_messages(tws)
+
+
+def test_a_refused_shadow_cancel_alert_is_swept_once_the_order_is_otherwise_terminal(
+        shadow, tws):
+    sh = shadow([post("1", 0, RESTING)])
+    fresh = _above_the_limit(sh)
+    run_until_processed(sh, 1, before=fresh)
+    intent, _ = _entry_life(sh)
+    sh.sim().script_next_cancel("REJECT")
+    _delayed(sh, 88.38, 88.40)
+    sh.step()
+    assert _refused_alerts(sh)
+    sh.sim().cancel(intent.order_ref)  # the order ends by another path
+    sh.step()
+    assert _refused_alerts(sh) == []
+    sh.close()

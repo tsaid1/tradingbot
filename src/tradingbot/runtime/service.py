@@ -988,6 +988,16 @@ class RuntimeService:
                 "contract with a working simulated order or position): its quote is "
                 "unavailable and its entries hold", now)
         self.alerter.sweep("SHADOW:CAP:", keep, now)
+        keep = set()
+        for ref, r in self.broker.open_cancel_refusals().items():
+            key = f"SHADOW:CANCEL_REFUSED:{ref}"
+            keep.add(key)
+            self.alerter.raise_(
+                key, N.SHADOW_OPENING_CANCEL_REFUSED, "Shadow opening cancel refused",
+                f"{ref} {r['contract_key']}: {r['code']}: the simulator refused the cancel of a "
+                f"resting opening order (since {r['since']}); the read was not published, so "
+                "nothing matched on it, and the cancel is retried at the next read", now)
+        self.alerter.sweep("SHADOW:CANCEL_REFUSED:", keep, now)
 
     def _opening_limit(self, order_ref: str) -> float | None:
         """The per-side quote age an opening order was approved under: the anchored rule's
