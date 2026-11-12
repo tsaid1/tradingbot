@@ -300,12 +300,23 @@ number `AMBIGUOUS`). None of them is loosened. Two tightenings apply in **every*
     whatever the key); otherwise HOLD (`AMBIGUOUS`, `FOLLOWING_NOT_UNDERSTOOD`). "... 41.20 now.
     Stop 40.10." passes; "... 41.20 now. That is our average cost." and "... 41.20 now. The chart
     looks constructive." hold.
-  - **R2, an elliptical level** (its clause does not name this family and its sentence is not the
-    action's own instruction sentence): the earlier clauses of its sentence, else the sentence
-    BEFORE it, must be the action's own instruction sentence or, only with
-    `level_after_own_protective_levels = true`, a protective-levels sentence; otherwise HOLD
-    (`AMBIGUOUS`, `NEIGHBOUR_NOT_UNDERSTOOD`), also when the level opens the post. A generic
-    allow-listed sentence ("Our position.", "This.", "We are long.") no longer attributes a level.
+  - **An elliptical level never anchors by default** (fallback after review F1, 12 November
+    2026). A level written on its own ("41.20 now.", or a later clause of a sentence that is not
+    the instruction) whose clause does not name this family HOLDs with `AMBIGUOUS`,
+    `STANDALONE_LEVEL_NOT_ENABLED`, unless the owner sets `standalone_level_sentence = true`
+    (strict boolean, default false, shipped false for every family). The reason: the instruction
+    sentence can name another market in plain lower-case words ("long $X and spy", "like the long
+    end"), and the level on its own line could be that market's price. A level written inside the
+    instruction sentence, or naming this family, is decided as before.
+  - **With `standalone_level_sentence = true`**, an elliptical level may anchor only if (a) the
+    earlier clauses of its sentence, else the sentence BEFORE it, are the action's own instruction
+    sentence or a protective-levels sentence (`NEIGHBOUR_NOT_UNDERSTOOD` otherwise, also when the
+    level opens the post); (b) R1 holds; and (c) every one of the action's own instruction
+    sentences passes the same whole-sentence allow-list a level's own sentence must pass (not a
+    question, every word allow-listed, no other number), so the level is accepted only where it
+    would have been accepted inside the instruction sentence (`INSTRUCTION_NOT_UNDERSTOOD`
+    otherwise: "long $X and spy", "long $X, bought last week"). The old key name
+    `level_after_own_protective_levels` is refused with a message naming the new one.
   - The level- and cost-word deny-list (`CONTEXT_WORD:<w>`) stays as a second check that can only
     add a hold: on the neighbour before an elliptical level and on the clauses before a level in
     the instruction sentence ("We are now long $X, stop 40.10, 41.20 now." holds).
@@ -314,18 +325,18 @@ number `AMBIGUOUS`). None of them is loosened. Two tightenings apply in **every*
     needs no preceding neighbour, but R1 still applies. A level sentence that cannot be located in
     the post holds (`CONTEXT_UNKNOWN`).
 
-* **Own protective levels** (`entry_anchor.level_after_own_protective_levels`, a strict boolean,
-  default false, shipped false for every family; an owner decision). When true, R2 also accepts as
-  the sentence before an elliptical level a protective-levels sentence, which satisfies all of: every alphabetic token is on a small closed public list
+* **Protective-levels sentence** (used by R1 always, and before an elliptical level only with
+  `standalone_level_sentence = true`). It satisfies all of: every alphabetic token is on a small closed public list
   (`instruction_terms.PROTECTIVE_WORDS`: stop, stops, stop-loss, stoploss, protective, target,
   targets, targeting, objective, with, a, an, the, and, at, is, are, our, my, set, of, price, level,
   loss) or the private `context_words`; it holds no time, condition or cost-basis word and no month;
   it holds at least one number and every number is exactly the action's own stop or target; the stop
   is on the protective side of the level (below it for a long, above for a short) and a target on the
-  profit side; it is not a question. The attribution is then `AFTER_OWN_PROTECTIVE_LEVELS`. "Stop
-  40.10. 41.20 now." is accepted; "We raised our stop.", "Stop moved to 40.10.", another value, a
+  profit side; it is not a question. Before an elliptical level (switch on) the attribution is then
+  `AFTER_OWN_PROTECTIVE_LEVELS`. "Stop 40.10. 41.20 now." is accepted with the switch on; "We
+  raised our stop.", "Stop moved to 40.10.", another value, a
   stop on the wrong side, an extra number, "today", "if needed", an unknown word or a question still
-  hold, and so does such a sentence that is not the immediate neighbour. The key lives in
+  hold, and so does such a sentence that is not the immediate neighbour. The switch lives in
   `[entry_anchor]`, so it cannot exist without the rule.
 
 This is one classification function with a closed result (`FamilyMapping._level_kind`); there is no
