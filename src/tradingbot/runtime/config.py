@@ -89,6 +89,10 @@ class ServiceConfig(StrictModel):
 class InterpreterConfig(StrictModel):
     # Optional private lexicon extension (tkl_interpreter.LexiconExtension JSON). Never committed.
     lexicon_path: Path | None = None
+    # Optional PRIVATE review log for the owner's vocabulary review page (default off): one JSON
+    # line per entry-rule hold caused by vocabulary, with the words and sentences involved. Must
+    # lie outside the repository and every git work tree; created with mode 0600.
+    review_log_path: Path | None = None
 
 
 class NotifyConfig(StrictModel):
@@ -251,7 +255,7 @@ def _resolve_paths(raw: dict, base: Path) -> None:
 
     fix(raw.get("paths"), "state_dir", "halt_file", "mapping_file")
     fix(raw.get("source"), "file", "token_file", "client_file")
-    fix(raw.get("interpreter"), "lexicon_path")
+    fix(raw.get("interpreter"), "lexicon_path", "review_log_path")
     fix(raw.get("notify"), "log_file", "alerts_file")
     fix(raw.get("shadow"), "paper_config")
 

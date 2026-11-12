@@ -48,7 +48,7 @@ resolve against the config file.
   `max_submit_attempts`, `settle_seconds`, `exit_no_trace_lookups` (at least 3),
   `max_intent_age_seconds`, `max_exit_intent_age_seconds`, `lookup_horizon_seconds`,
   `confirm_attempts`, `confirm_wait_seconds`.
-* Optional: `[interpreter] lexicon_path`, `[notify] channels, macos, realert_seconds,
+* Optional: `[interpreter] lexicon_path, review_log_path` (see "Vocabulary review"), `[notify] channels, macos, realert_seconds,
   alerts_file`, `[service] source_stall_after_seconds, activity_window_utc,
   heartbeat_stale_after_seconds` (alerting only), `[service]
   lockout_clear_requires_full_reconnect` (default `true`, see `docs/OPERATIONS.md`), `[mock]
@@ -261,3 +261,129 @@ placeholders before the first quote (a placeholder never counts; the current val
 how 2186 / 10090 / 10167 attach to a stream; how a TWS restart surfaces (socket close vs 1100) and
 how long reconnect takes; contract resolution for TLT with `exchange = "SMART"` and no primary
 exchange returning exactly one contract.
+
+## Vocabulary review (owner only)
+
+The entry rule fails closed: an entry holds when its post holds a word the public lists do not
+know (`ENTRY_ANCHOR_POST_UNRESOLVED_MARKET`, `ENTRY_ANCHOR_CONTEXT_UNCLEAR`,
+`ENTRY_ANCHOR_INSTRUMENT_UNCLEAR`, or a level whose instruction or neighbour sentence is not
+understood). The journal records only the reason code and the mention kinds, and only the owner may
+see the publisher's words. Dashboard page *Vocabulary Review* (`10_Vocabulary_Review.py`) shows
+them to the owner, locally, as one batch of proposed lexicon additions.
+
+**Config** (both optional; the review log is off by default):
+
+```toml
+[interpreter]
+lexicon_path = "/Users/you/tradingbot-private/lexicon.json"     # the PRODUCTION private lexicon
+review_log_path = "/Users/you/tradingbot-private/review.jsonl"  # the PRIVATE review log
+```
+
+With `review_log_path` set, every held action whose mapping decision is a vocabulary hold appends
+one JSON line: time, post and action ids, family, the public reason code and detail, and privately
+the words (with their kind: `UNKNOWN_WORD`, `PROPER_NOUN`, `MARKET_NOUN`, `INSTRUMENT_PHRASE`,
+`TICKER_SHAPED`, `NEIGHBOUR_WORD`, `LEVEL_LINE_WORD`) and the sentences involved (role `LEVEL`,
+`INSTRUCTION`, `NEIGHBOUR`, `PRECEDING`, `MENTION`, `LEVEL_LINE`). A neighbour sentence is logged
+only when context words alone could make it a protective-levels sentence. One record per (post,
+revision, action, reason code and detail): a replay or a restart that sees the same hold again
+does not append it again. The review log is the ONE file holding the publisher's sentences;
+proposals, candidates, the decisions file and backups hold words and public codes only. To bound
+it, stop the service and run
+`python -c "from tradingbot.runtime.vocab_review import truncate_review_log as t; t('<path>', 2000)"`
+(keeps the last 2,000 lines). Unset, nothing is collected and every journal, alert and heartbeat
+byte is as before.
+
+**Proposals** (`tradingbot.vocab_proposal/1`, JSON lines, private). The page reads
+`TRADINGBOT_VOCAB_PROPOSALS`, else `<review log>.proposals.jsonl` beside the log; without one it
+builds a plain batch from the log by kind (proper noun: non-market word; market noun or instrument
+phrase seen in posts of one family: a name of that family; unknown word of an instruction sentence:
+instruction phrase; anything else: ambiguous). One line:
+
+```json
+{"schema": "tradingbot.vocab_proposal/1", "token": "zorbs", "group": "MARKET_NAME",
+ "family": "TLT", "meaning": "invented nickname", "kind": "MARKET_NOUN",
+ "evidence": {"posts": 4, "holds": 5},
+ "categories": {"families": ["TLT"], "reasons": ["ENTRY_ANCHOR_POST_UNRESOLVED_MARKET"]},
+ "measured": {"holds_resolved": 4, "executable_gained": 3, "false_executable_introduced": 0},
+ "examples": [{"role": "MENTION", "text": "..."}, {"source_id": "7", "action_id": "a1"}]}
+```
+
+`group` is one of `MARKET_NAME` (market names and instrument aliases: `family_aliases[family]`),
+`NON_MARKET` (non-market words mistaken for instruments: `non_market_words`), `INSTRUCTION_PHRASE`
+(publisher-specific instruction phrases: `context_words`) or `AMBIGUOUS` (no list until the owner
+picks one). `family` must be a family code. `measured` holds public counts only, from a local
+evaluation, and the page labels them "claimed by the proposals file; not verified by this page";
+anything else, or `null`, is shown as "not measured". An example should be a reference into the
+review log (`{"source_id", "action_id"}`), resolved when the page renders; inline `text` is
+displayed but never copied into another file. A plain batch built from the log emits references
+only. At most five example sentences are loaded per proposal. Words already in the lexicon or kept
+holding are not proposed again.
+
+**The batch.** For each proposal the owner edits the meaning, may change the group (and family), and
+chooses accept, reject (not now), keep holding (recorded, not offered again) or leaves it undecided.
+The page shows a **final table** of the batch (each word, the exact list it is written to and its
+family, and its effect: "removes a hold: posts containing this word may become executable" or
+"keeps holding") with a **digest** of the table and of the production lexicon's bytes; the
+confirmation names that digest. *Apply batch* recomputes the batch from the current files at click
+time and refuses when the digest differs ("the batch changed since you reviewed it"). Widgets are
+keyed by a stable id of each proposal (word, kind, group, family), never by position, and every
+verdict and confirmation is cleared after any write (apply, undo, candidate). *Undo* and *Write a
+candidate* need their own confirmation.
+
+*Apply batch* is one change of the production lexicon: each accepted word is checked by the
+service's own loader (`service.load_lexicons`; a refused word is listed with the loader's reason and
+left out), the whole result is checked again, then written atomically (temporary file and rename),
+mode 0600, with one timestamped backup beside it (`lexicon.json.bak-<UTC time>`). *Undo* restores the
+latest backup and drops that batch's records; it refuses when the lexicon is not the file the tool
+last wrote (its sha256 is recorded per write), so a hand edit is never silently discarded: the
+message names the backup to restore by hand. Only the `entry_anchor` lists change; every other
+key, including the interpreter's own sections, keeps its content and meaning, but the file is
+re-serialised (JSON, two-space indent), so its formatting may change. Keep-holding words, the
+applied words, the owner's meanings and the sha256 of each write are kept in
+`<lexicon>.review-decisions.json` beside the lexicon; a keep-holding word that could not be
+recorded is reported as failed. **A new word
+takes effect only when the service (or a replay) is restarted.**
+
+**Experiment versus production.** *Write a candidate* writes the production lexicon plus the accepted
+proposals, validated by the same loader, to a separate file (`<lexicon>.candidate.json`) marked
+`candidate_lexicon`; the production lexicon is only read. A candidate is only ever written to a
+`*.candidate.json` path, never over a file without the marker, the production lexicon, a backup,
+the decisions file or the review log. The service refuses to start with a
+candidate as its `lexicon_path`; only an offline replay may load one, explicitly:
+`scripts/run_service.py --config <replay.toml> --source replay:<posts.jsonl>
+--allow-candidate-lexicon` (refused with any live source). The candidate replay needs a **new
+state directory** (no heartbeat, no journaled event or signal) or one an earlier candidate run
+marked (`CANDIDATE_RUN`); it marks it, and a production run on a marked directory is refused, so
+experimental holds and trades never enter production's journal. Production eligibility therefore
+changes only through *Apply batch* (or the owner editing the file by hand).
+
+**Privacy rules.** Every private file (review log, proposals, lexicon, backups, decisions,
+candidate) lies outside the repository, every git work tree it can detect (a `.git` entry in an
+ancestor) and every bare repository; the service refuses to start otherwise, and refuses a group-
+or world-readable review log. A work tree whose git directory lives elsewhere without a `.git`
+entry (`core.worktree`) cannot be detected. A cloud-synced folder (`~/Library/CloudStorage`,
+iCloud Drive, `~/Dropbox`, OneDrive, Google Drive, possibly iCloud Desktop and Documents) is
+allowed by the owner's policy but warned: a banner on the page and, when the review log is on, a
+start-up alert `PRIVATE_PATH_IN_SYNCED_FOLDER` naming the file kind and path class only. A
+non-synced private directory is recommended for the review log, proposals, candidates and
+backups; credentials never belong in a synced folder. A lexicon the loader refuses stops the
+service with a `ConfigError` naming the error type, field paths and count only, never a value. Files are created with mode 0600. The
+private words ride on the mapping decision as a pydantic private attribute that no serialisation
+reads, so they never reach the journal, logs, alerts, the heartbeat, the exception register or
+another page. (`pickle`, `copy.deepcopy`, `model_copy` and `==` on a decision do carry or compare
+the private evidence; nothing under `src/` does any of these to a decision, and a test scans for
+it.) A failed write raises `REVIEW_LOG_WRITE_FAILED` by code only and never stops the service. The
+page refuses to run unless Streamlit is bound to localhost with usage statistics off, renders every
+private or file-supplied string as plain text (never Markdown, HTML, links or images), keeps no
+sentence in its session state, caches nothing and puts nothing in the URL. Binding to localhost
+does not protect against other user accounts on the same Mac:
+
+```
+PYTHONPATH=src streamlit run dashboard/app.py --server.address 127.0.0.1 --browser.gatherUsageStats false
+```
+
+**The honest limit.** The owner's judgement is the safeguard. A word wrongly marked "not a market"
+or added as a family name removes a hold that protected against a second market; a word wrongly
+added as instruction wording widens what an anchor sentence may say. Nothing is accepted
+automatically, and no validator is relaxed: the loader still refuses a disqualifying word, a market
+noun as a non-market word and a marker word in an alias.

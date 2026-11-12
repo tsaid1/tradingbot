@@ -125,6 +125,7 @@ def build_service(
     transport: HttpTransport | None = None,
     notifier: Notifier | None = None,
     session_factory=None,
+    allow_candidate_lexicon: bool = False,
 ) -> RuntimeService:
     """``session_factory`` (shadow mode, tests only): builds the read-only ``IbkrSession`` from the
     paper config; whatever it returns must be exactly an ``IbkrSession`` or the start is refused."""
@@ -156,6 +157,7 @@ def build_service(
             notifier=notifier or build_notifier(config, clock),
             clock=clock,
             store=store,
+            allow_candidate_lexicon=allow_candidate_lexicon,
         )
     except BaseException:
         if config.mode == "shadow":

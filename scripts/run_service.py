@@ -6,6 +6,8 @@ nothing is ever sent to a broker but the read-only adapter's market-data and rea
     PYTHONPATH=src python scripts/run_service.py --config path/to/runtime.toml
     PYTHONPATH=src python scripts/run_service.py --config runtime.toml --once
     PYTHONPATH=src python scripts/run_service.py --config runtime.toml --source replay:posts.jsonl
+    PYTHONPATH=src python scripts/run_service.py --config replay.toml --source replay:posts.jsonl \
+        --allow-candidate-lexicon      # an offline replay with a CANDIDATE lexicon (docs/RUNTIME.md)
 
 Exit codes: 0 after a clean stop (or one cycle with --once), 2 when the config is refused,
 1 on an unhandled fault. See docs/RUNTIME.md.
@@ -34,6 +36,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--once", action="store_true", help="run one cycle and exit")
     parser.add_argument("--source", help="override the source: replay:<file.jsonl>")
+    parser.add_argument("--allow-candidate-lexicon", action="store_true",
+                        help="offline replay only: accept a CANDIDATE lexicon (unapproved "
+                             "vocabulary proposals) as [interpreter] lexicon_path")
     args = parser.parse_args(argv)
     try:
         config = load_config(args.config)
@@ -42,7 +47,7 @@ def main(argv: list[str] | None = None) -> int:
             if kind != "replay" or not value:
                 raise ConfigError("--source must be replay:<file>")
             config = with_replay_source(config, value)
-        service = build_service(config)
+        service = build_service(config, allow_candidate_lexicon=args.allow_candidate_lexicon)
     except (ConfigError, ExecutionStoreLocked) as exc:
         print(f"refusing to start: {exc}", file=sys.stderr)
         return 2
