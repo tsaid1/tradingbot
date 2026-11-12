@@ -476,7 +476,7 @@ class PaperOrderSession(IbkrSession):
         self._next_local_id = 0
         self._contract: ResolvedContract | None = None
         self._baseline_position: Decimal | None = None  # read once at connect
-        self._baseline_exec_ids: frozenset[str] = frozenset()  # executions known at that read
+        self.position_check: dict | None = None  # the read vs the experiment's executions
         self.order_mode_status = "NOT_CHECKED"
         self.order_frames_sent = 0  # PLACE_ORDER and CANCEL_ORDER frames handed to the SDK
         # this session's own order events with receipt times (evidence; no account in it)
@@ -762,34 +762,44 @@ class PaperOrderSession(IbkrSession):
                                        self.count_problem or "submission counter is not open"))
 
     def _take_baseline(self) -> None:
-        """The executions known so far, then the position read: from here on the session's own
-        figure is this position plus every later fill it receives (see ``_implied_position``). A
-        read that lags at this moment shows up later as a disagreement (refused, never guessed)."""
+        """At connect: today's executions (``reqExecutions``), then the position read, compared
+        (``position_check``). The guard repeats the comparison before every submission; the first
+        submission of a session re-reads the executions (``_count_at_broker``)."""
         self.executions()
         rows = self.positions()
         with self._cond:
-            self._baseline_exec_ids = frozenset(self._execs)
             self._baseline_position = sum((r.quantity for r in rows
                                            if r.con_id == self.contract.con_id), Decimal(0))
+        implied = self._implied_position(self.contract.con_id)
+        self.position_check = {"read": str(self._baseline_position), "implied": str(implied),
+                               "agree": implied == self._baseline_position}
 
     def _implied_position(self, con_id: int) -> Decimal | None:
-        """Baseline position plus every fill since, signed. For an order this session placed, the
-        larger of its execution total and its ``orderStatus`` filled quantity (either can arrive
-        first). None when unknown."""
+        """The experiment's own position, derived from the broker's executions (today's, from
+        ``reqExecutions``, plus every one received live) that belong to the experiment: an
+        ``orderRef`` with the experiment prefix, or this client's order id recorded in the
+        journal or placed here. For an order this session placed, the larger of its execution
+        total and its ``orderStatus`` filled quantity (either can arrive first). It does not use
+        the position read, so a read that lags across a restart is caught. It assumes the account
+        holds none of the contract outside the experiment (otherwise: a disagreement, refused).
+        None when unknown."""
         with self._cond:
             if self._baseline_position is None:
                 return None
             here = {t.order_id: t for t in self._tracks.values()
                     if t.own and t.placed_here and t.con_id == con_id}
+            journal_ids = {e["order_id"] for e in self._counter.entries}
             sign = {"BUY": Decimal(1), "SELL": Decimal(-1)}
-            total = self._baseline_position
+            total = Decimal(0)
             by_order: dict[int, Decimal] = {}
             for rec in self._execs.values():
-                if rec.exec_id in self._baseline_exec_ids or rec.con_id != con_id:
+                own = rec.client_id == self._cfg.client_id
+                if rec.con_id != con_id or not (rec.experiment or (own and (
+                        rec.order_id in journal_ids or rec.order_id in here))):
                     continue
                 if rec.side not in sign:
                     return None
-                if rec.client_id == self._cfg.client_id and rec.order_id in here:
+                if own and rec.order_id in here:
                     by_order[rec.order_id] = by_order.get(rec.order_id, Decimal(0)) + rec.shares
                 else:
                     total += sign[rec.side] * rec.shares
