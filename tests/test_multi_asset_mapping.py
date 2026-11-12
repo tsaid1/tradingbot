@@ -207,19 +207,24 @@ def test_a_named_month_is_used_and_the_rule_picks_the_nearest_outside_the_roll_w
 
 
 @pytest.mark.parametrize(
-    "asset,clause,detail",
+    "asset,clause,code,detail",
     [
-        ("QOIL", "long $QOIL at 71.5", "CONTRACT_MONTH_NOT_STATED"),  # EXPLICIT_ONLY
-        ("QOIL", "long $QOIL Dec 2026 at 71.5", "MONTH_NOT_LISTED:202612"),
-        ("QOIL", "long $QOIL Jun 2026 and Jul 2026 at 71.5", "SEVERAL_MONTHS_NAMED"),
-        ("QIDX", "long $QIDX Mar contract at 5010", "MONTH_03_MATCHES_0"),
+        ("QOIL", "long $QOIL at 71.5", "CONTRACT_SELECTION_AMBIGUOUS",
+         "CONTRACT_MONTH_NOT_STATED"),  # EXPLICIT_ONLY
+        # A named month that does not resolve to exactly one listed contract (review F2).
+        ("QOIL", "long $QOIL Dec 2026 at 71.5", "CONTRACT_MONTH_UNRECOGNISED",
+         "MONTH_NOT_LISTED:202612"),
+        ("QOIL", "long $QOIL Jun 2026 and Jul 2026 at 71.5", "CONTRACT_MONTH_UNRECOGNISED",
+         "SEVERAL_MONTHS_NAMED"),
+        ("QIDX", "long $QIDX Mar contract at 5010", "CONTRACT_MONTH_UNRECOGNISED",
+         "MONTH_03_MATCHES_0"),
     ],
 )
-def test_contract_selection_ambiguous_holds(tmp_path, asset, clause, detail):
+def test_contract_selection_ambiguous_holds(tmp_path, asset, clause, code, detail):
     p = demo(tmp_path)
     parsed, [d] = p.apply(ParsedPost(actions=[act(asset)]), clauses={"a1": clause}, now=NOW)
     assert d.status == "UNRESOLVED"
-    assert parsed.actions[0].ambiguities == ["CONTRACT_SELECTION_AMBIGUOUS", detail]
+    assert parsed.actions[0].ambiguities == [code, detail]
 
 
 def test_a_follow_up_acts_on_its_idea_contract_and_never_another_month(tmp_path):
@@ -276,8 +281,11 @@ def test_terms_are_read_only_when_stated():
     t = extract_terms("Buying $QSTK 2026-09-18 105 call; the Dec contract; Jul 2026")
     assert t.months == ["202607"] and t.bare_months == [12] and t.strikes == [Decimal(105)]
     assert t.rights == ["CALL"] and [d.isoformat() for d in t.expiries] == ["2026-09-18"]
-    nothing = extract_terms("Raising our stop to 70.40 on Dec 18")
+    nothing = extract_terms("Raising our stop to 70.40 tomorrow, as we may")
     assert not nothing.names_a_month and not nothing.expiries and not nothing.option_language
+    # A month name with a two-digit number reads as a month and a year (review F2): "Dec 18" is
+    # December 2018, which no entry lists, so a futures action naming it HOLDs.
+    assert extract_terms("Raising our stop to 70.40 on Dec 18").months == ["201812"]
 
 
 # ------------------------------------------------------------------ terms for the gateway

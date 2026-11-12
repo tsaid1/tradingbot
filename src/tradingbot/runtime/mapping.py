@@ -57,6 +57,9 @@ MAPPING_NOT_APPROVED = "MAPPING_NOT_APPROVED"
 CONTRACT_SELECTION_AMBIGUOUS = "CONTRACT_SELECTION_AMBIGUOUS"
 OPTION_TERMS_INCOMPLETE = "OPTION_TERMS_INCOMPLETE"
 IDEA_CONTRACT_MISMATCH = "IDEA_CONTRACT_MISMATCH"
+# The clause has a month-like or contract-code token that does not resolve to exactly one listed
+# contract of the entry (review F2): never replaced by the nearest month.
+CONTRACT_MONTH_UNRECOGNISED = "CONTRACT_MONTH_UNRECOGNISED"
 
 
 class BasisRelation(str, Enum):
@@ -480,24 +483,50 @@ class FamilyMapping(StrictModel):
             return self._select_future(terms, today, held)
         return self._select_option(asset, terms, held)
 
-    def _select_future(self, terms, today, held):
+    def _named_months(self, terms: InstructionTerms, today: date):
+        """The contract months the clause names, or the reasons it names something that does not
+        resolve to a listed contract of this entry. Anything month-like that is not read exactly
+        HOLDs (CONTRACT_MONTH_UNRECOGNISED): it is never replaced by the nearest month."""
         x = self.execution
-        named = set(terms.months)
+        unread = [*terms.unrecognised_months]
+        named = set(terms.months) | {f"{d.year}{d.month:02d}" for d in terms.expiries}
+        for token, root, month, digits in terms.month_codes:
+            if root and root != x.symbol:
+                unread.append(token)
+                continue
+            if len(digits) == 2:
+                year = 2000 + int(digits)
+            else:  # one digit: the first year from this one that ends in it
+                year = next(y for y in range(today.year, today.year + 10) if y % 10 == int(digits))
+            named.add(f"{year}{month:02d}")
+        codes = {t for t, _, _, _ in terms.month_codes}
+        unread += [w for w in terms.upper_words
+                   if w.startswith(x.symbol) and w != x.symbol and w not in codes]
+        if unread:
+            return None, [CONTRACT_MONTH_UNRECOGNISED, *(f"MONTH_TOKEN:{t}" for t in unread)]
         for n in terms.bare_months:
             matches = {c.month for c in self.contracts if int(c.month[4:]) == n}
             if len(matches) != 1:
-                return None, [CONTRACT_SELECTION_AMBIGUOUS, f"MONTH_{n:02d}_MATCHES_{len(matches)}"]
+                return None, [CONTRACT_MONTH_UNRECOGNISED, f"MONTH_{n:02d}_MATCHES_{len(matches)}"]
             named |= matches
+        listed = {c.month for c in self.contracts}
+        if len(named) > 1:
+            return None, [CONTRACT_MONTH_UNRECOGNISED, "SEVERAL_MONTHS_NAMED"]
+        if named and not named <= listed:
+            return None, [CONTRACT_MONTH_UNRECOGNISED, f"MONTH_NOT_LISTED:{min(named)}"]
+        return named, []
+
+    def _select_future(self, terms, today, held):
+        x = self.execution
+        named, problems = self._named_months(terms, today)
+        if problems:
+            return None, problems
         if held is not None:  # a follow-up acts on the idea's own contract
             month = (held.expiry or "")[:6]
             if named and named != {month}:
                 return None, [IDEA_CONTRACT_MISMATCH, f"IDEA_MONTH:{month}"]
-        elif len(named) > 1:
-            return None, [CONTRACT_SELECTION_AMBIGUOUS, "SEVERAL_MONTHS_NAMED"]
         elif named:
             month = named.pop()
-            if month not in {c.month for c in self.contracts}:
-                return None, [CONTRACT_SELECTION_AMBIGUOUS, f"MONTH_NOT_LISTED:{month}"]
         elif self.contract_selection.rule == "EXPLICIT_ONLY":
             return None, [CONTRACT_SELECTION_AMBIGUOUS, "CONTRACT_MONTH_NOT_STATED"]
         else:

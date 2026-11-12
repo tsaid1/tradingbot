@@ -8,17 +8,22 @@ and the SHOULD FIX rows of the review table.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from decimal import Decimal
 
+import pytest
 from test_multi_asset_gateway import act, gate, leg, mq, position, terms
 
-from tradingbot.models import Action
+from tradingbot.event_models import PriceBasis, Timing, TradeAction
+from tradingbot.models import Action, AssetClass, Instrument, PositionSide
+from tradingbot.runtime.mapping import MappingPolicy
 from tradingbot.runtime.mock_multi_asset import (
     QIF_JUN,
     STATIC,
     MockMultiAssetRun,
     Scenario,
     Step,
+    mapping_toml,
 )
 
 ENTRY = "We are now long $QIDX at 5,010. Stop 4,980. Target 5,070."
@@ -115,4 +120,77 @@ def test_f1_end_to_end_backstop_kept_and_exception_raised(tmp_path):
     assert backstop.stop_price == Decimal("4995.00")
     assert (p.stop_price, p.backstop_price, p.protection) == ("4985", "4995.00", "CONFIRMED")
     assert "PROTECTIVE_LEVEL_NOT_LOOSENED" in exception_kinds(run)
+    run.close()
+
+
+# ================================================================== F2: contract-month recognition
+
+MAP_NOW = datetime(2026, 6, 1, 14, 0, tzinfo=UTC)
+
+
+def demo_policy(tmp_path, text=None) -> MappingPolicy:
+    p = tmp_path / "m.toml"
+    p.write_text(text or mapping_toml(approved=True))
+    return MappingPolicy.from_toml(p)
+
+
+def opening(asset, action=Action.OPEN, *, idea=None) -> TradeAction:
+    return TradeAction(
+        action_id="a1", action=action, timing=Timing.CURRENT,
+        instrument=Instrument(asset_class=AssetClass.EQUITY, symbol=asset),
+        position_side=PositionSide.LONG, idea_reference=idea,
+        price_basis=PriceBasis.TRADED_CONTRACT, source_market_symbol=asset,
+        entry_reference="10" if action in (Action.OPEN, Action.ADD) else None,
+        explicit_instruction=True, evidence=["invented"],
+    )
+
+
+@pytest.mark.parametrize(
+    "form",
+    ["Sep 2026", "September 2026", "Sept 2026", "Sep. 2026", "Sep '26", "Sep'26", "Sep 26",
+     "Sep26", "SEPTEMBER '26", "Sep ’26", "2026-09", "2026/09", "09/2026", "9/2026", "202609",
+     "QIFU6", "QIFU26", "U6", "U26", "the Sep contract"],
+)
+def test_f2_each_common_month_form_selects_that_month(tmp_path, form):
+    d, inst = demo_policy(tmp_path).resolve(
+        opening("QIDX"), clause=f"We are now long $QIDX {form} at 5,010. Stop 4,980.", now=MAP_NOW)
+    assert d.status == "SUPPORTED", d.reason
+    assert inst.futures_contract == "202609"  # never the nearest (June)
+
+
+@pytest.mark.parametrize(
+    "form",
+    ["Sep", "Sept.", "September", "Sep '27", "Sep 2027", "Sep 18", "QIFX6", "QIFU7", "QABU6",
+     "QIFU", "2026-13", "13/2026", "2026-00", "Sep 202", "Nov 2026", "(QIFZ26)", "Dec contract"],
+)
+def test_f2_a_month_like_token_that_does_not_resolve_holds(tmp_path, form):
+    """Reviewer probe: "Sep '26" and "(QIFU6)" executed in June. Every near miss now HOLDs."""
+    d, inst = demo_policy(tmp_path).resolve(
+        opening("QIDX"), clause=f"We are now long $QIDX {form} at 5,010. Stop 4,980.", now=MAP_NOW)
+    assert d.status == "UNRESOLVED" and inst is None
+    assert d.reason.split(",")[0] == "CONTRACT_MONTH_UNRECOGNISED"
+
+
+def test_f2_the_nearest_rule_applies_only_without_any_month_like_token(tmp_path):
+    p = demo_policy(tmp_path)
+    for clause in ["We are now long $QIDX at 5,010. Stop 4,980.",
+                   "We may add to $QIDX at 5,010 and will march on. Stop 4,980."]:
+        d, inst = p.resolve(opening("QIDX"), clause=clause, now=MAP_NOW)
+        assert d.status == "SUPPORTED" and inst.futures_contract == "202606", clause
+
+
+def test_f2_reviewer_probes_through_the_service(tmp_path):
+    for i, text in enumerate([
+        "We are now long $QIDX Sep '26 at 5,010. Stop 4,980. Target 5,070.",
+        "We are now long $QIDX (QIFU6) at 5,010. Stop 4,980. Target 5,070.",
+    ]):
+        run = run_steps(tmp_path, [Step(0, text, "EXECUTED")], name=f"p{i}")
+        refs = [o.contract.expiry for o in run.broker.all_orders()]
+        assert refs and all(e == "20260918" for e in refs), refs  # September, never June
+        run.close()
+    run = run_steps(tmp_path, [Step(0, "We are now long $QIDX Sep '27 at 5,010. Stop 4,980.",
+                                    "HOLD")], name="miss")
+    [a] = traded(run)
+    assert a["status"] == "HOLD" and "CONTRACT_MONTH_UNRECOGNISED" in a["reasons"]
+    assert run.broker.submit_calls == 0
     run.close()
