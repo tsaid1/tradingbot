@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  TEMPLATE, not installed by the repository. Copy to ~/Library/LaunchAgents/, replace every
+  __PLACEHOLDER__ with an absolute path, then: launchctl bootstrap gui/$(id -u) <file>.
+  See docs/OPERATIONS.md (start, stop, recovery). Mock mode only.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.example.tradingbot.watchdog</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__REPO__/ops/run_tradingbot.sh</string>
+        <string>watchdog</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>TRADINGBOT_REPO</key>
+        <string>__REPO__</string>
+        <key>TRADINGBOT_PYTHON</key>
+        <string>__VENV__/bin/python</string>
+        <key>TRADINGBOT_RUNTIME_CONFIG</key>
+        <string>__HOME__/.config/tradingbot/runtime.toml</string>
+        <key>TRADINGBOT_LOG_DIR</key>
+        <string>__HOME__/Library/Logs/tradingbot</string>
+    </dict>
+    <key>StartInterval</key>
+    <integer>60</integer>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>__HOME__/Library/Logs/tradingbot/launchd-watchdog.out</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Library/Logs/tradingbot/launchd-watchdog.err</string>
+</dict>
+</plist>

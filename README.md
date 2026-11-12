@@ -1,109 +1,52 @@
-# Tradingbot — Signal-to-Execution Lab
+# TradingBot
 
-**A deliberately fail-closed, mock-only development foundation.**
+Turns a publisher's trading posts into typed actions. A deterministic gateway validates every
+action, and only an action it approves can reach a broker. Today that broker is a strict
+**simulated broker**. An Interactive Brokers paper adapter is being prepared separately, and no
+real order can be sent from `main`.
 
-This project converts synthetic trading signals (or user-provided analysis in optional AI mode)
-into typed candidate instructions, runs deterministic validations, and records simulated orders.
-It does **not** connect to X, does **not** contact a broker, and cannot place live orders.
+```
+source (replay file | X timeline) -> TklInterpreter -> mapping policy -> gateway (validator.py)
+   -> ExecutionCoordinator -> Broker (SimBroker) -> fills -> follower ledger -> reconciliation
+                         runtime service: heartbeat, alerts, operator queue, dashboard
+```
 
-## Current offline capabilities
+* **Gateway** (`validator.py`, `execution/replay.py`): every rule that can say no. Commentary,
+  edits, unverified or stale posts, unmapped instruments and cap breaches are held with reason
+  codes. Nothing that is held is traded.
+* **Execution core** (`execution/`): write-ahead intents, idempotent order refs, an order of
+  unknown outcome never resent on assumption, confirmed protective stops, exit netting, the halt
+  switch, read-only reconciliation, and operator settlement. See `docs/EXECUTION_CORE.md`.
+* **Multi-asset mapping** (`runtime/mapping.py`): only owner-approved families execute. See
+  `docs/MULTI_ASSET_MAPPING.md`.
+* **Runtime service** (`runtime/`, `scripts/run_service.py`): one restart-safe loop with immediate,
+  de-duplicated alerts, a broker reconnect policy and a heartbeat watchdog. See `docs/RUNTIME.md`.
+* **IBKR, read-only** (`ibkr/`, `scripts/ibkr_paper_check.py`): an operator-run identity and
+  read check against a local paper session. It sends no orders. See `docs/IBKR_ADAPTER.md`.
+* **Dashboard** (`streamlit run dashboard/app.py`): the *Execution* and *Exceptions* pages, among
+  others. Its only controls are the halt and operator requests.
 
-Everything below runs locally on synthetic or invented data. No broker is contacted and no order can be
-placed.
-
-- **Signal to mock fill:** the Sprint 1 demo parser, the deterministic validator and a SQLite journal of
-  fictional OPEN/REDUCE/CLOSE fills (this README's quickstart).
-- **Multi-action replay:** atomic OPEN/ADD/REDUCE/CLOSE/MODIFY with once-only processing
-  ([SPRINT_1_1_EVENT_REPLAY.md](docs/SPRINT_1_1_EVENT_REPLAY.md)), plus a restart-safe synthetic shadow
-  runner and soak ([SHADOW_01](docs/SHADOW_01_SYNTHETIC_SHADOW_RUNNER.md),
-  [SHADOW_02](docs/SHADOW_02_SYNTHETIC_SOAK.md)).
-- **Execution core against a simulated broker:** a `Broker` protocol, a durable `SimBroker`, write-ahead
-  order intents, lost-acknowledgement recovery, confirmed protective stops and read-only reconciliation
-  ([EXECUTION_CORE.md](docs/EXECUTION_CORE.md); demo: `scripts/run_mock_lifecycle.py`). No real broker.
-- **Read-only dashboard pages:**
-  - Mock Operations, with optional valuation of fictional positions against invented marks
-    ([MOCK_OPERATIONS.md](docs/MOCK_OPERATIONS.md), [MOCK_MARK_REPORT.md](docs/MOCK_MARK_REPORT.md))
-  - Shadow Run Health ([SHADOW_RUN_HEALTH.md](docs/SHADOW_RUN_HEALTH.md))
-  - Paper Readiness ([PAPER_READINESS.md](docs/PAPER_READINESS.md))
-  - Callback Demo ([IBKR_CALLBACK_DEMO.md](docs/IBKR_CALLBACK_DEMO.md))
-  - Read Retirement ([READ_RETIREMENT_VIEW.md](docs/READ_RETIREMENT_VIEW.md))
-- **Read-only IBKR preparation, offline only:** callback normalization
-  ([IBKR_CALLBACK_NORMALIZATION.md](docs/IBKR_CALLBACK_NORMALIZATION.md)), a callback router
-  ([CALLBACK_ROUTER.md](docs/CALLBACK_ROUTER.md)), a bounded frame accumulator
-  ([READ_FRAMING.md](docs/READ_FRAMING.md)) and a contract-details facade
-  ([IBKR_CONTRACT_FACADE.md](docs/IBKR_CONTRACT_FACADE.md)). These use invented data only. The IBKR SDK is
-  not imported or run, no connection is made, and no account is read.
-
-Release gates for anything beyond this are in [SECURITY_AND_RELEASE_GATES.md](docs/SECURITY_AND_RELEASE_GATES.md).
-
-## Quickstart (macOS / Linux)
+## Run it (mock)
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install -e '.[dev]'
-cp .env.example .env
+python3 -m venv .venv && source .venv/bin/activate && pip install -e '.[dev]'
 pytest
+PYTHONPATH=src python scripts/run_mock_service_demo.py
+PYTHONPATH=src python scripts/run_service.py --config config/runtime.example.toml --once
 streamlit run dashboard/app.py
 ```
 
-For free tests, select **Deterministic demo**. Paste:
+Operating it (start and stop, alerts, recovery, the daily checklist): `docs/OPERATIONS.md`.
 
-```text
-BUY ABC @ 100 STOP 95 TARGET 110
-```
+## Rules
 
-Use synthetic quote symbol `ABC`, bid `99.95`, ask `100.05`. A single fictional share
-will be recorded as `SIMULATED_FILLED`. Re-run using the same source ID and it is rejected
-as `DUPLICATE` before invoking an interpreter. The mock also supports:
+The safety rules are in `AGENTS.md`. In short:
 
-```text
-CLOSE ABC IDEA <original-source-id>
-REDUCE 50% ABC IDEA <original-source-id>
-```
+* every order passes the one gateway;
+* no paid source content and no credentials in this public repo;
+* no order submission without the owner's explicit authorization of a specific experiment;
+* independent review before any change to an order path;
+* the funded account is out of scope.
 
-The demo grammar is intentionally narrow and recognizes **neither arbitrary prose nor charts**.
-That is a safety feature, not a claim of NLP quality.
-
-### Optional LLM + chart mode
-
-Set `OPENAI_API_KEY` and optionally `OPENAI_MODEL` in `.env` (not in source control).
-Select **AI vision** in the dashboard and optionally attach a PNG/JPEG/WEBP chart.
-It calls the OpenAI Responses API with Pydantic structured output (`store=False`).
-API costs apply; avoid sending publisher material unless its use is permitted.
-An LLM may hallucinate: output still passes the deterministic validator, and no
-live broker is present in the codebase.
-
-This is **not** a production risk engine. Important work remains: author authentication,
-cryptographically verified source provenance, quote and broker state sync, instrument
-resolution, conditional signal semantics, stop lifecycle, live order idempotency and
-broker capability tests. No live trading should be enabled before these gates are met.
-
-## Data and privacy
-
-Local SQLite state lives under `data/`, which is ignored by Git. Never commit
-subscription reports, protected posts, raw screenshots, API keys, or user account
-information. The `fixtures/` directory contains **fictional synthetic material only**.
-Check publisher terms and source/API permissions before protected-feed ingestion.
-
-## Repository layout
-
-- `src/tradingbot/models.py`: typed contracts
-- `src/tradingbot/interpreters.py`: narrow demo parser; optional vision parser
-- `src/tradingbot/validator.py`: deterministic safety preflight
-- `src/tradingbot/storage.py`: durable source IDs, atomic fictional fills and idea positions
-- `src/tradingbot/pipeline.py`: orchestration (dedupe before parsing)
-- `dashboard/app.py`: signal console
-- `tests/`: safety regression suite
-- `docs/`: scope, architecture decisions, agent coordination
-
-## Project rules
-
-1. A publication or bullish thesis is **not** automatically an entry instruction.
-2. Never guess option contract identifiers, futures expiry, or missing position references.
-3. Unsupported asset classes/actions fail closed (`REVIEW`), not silently translated.
-4. Model output can NEVER call broker APIs directly.
-5. A failed or uncertain submission cannot be blindly retried.
-6. The user's broker will eventually own approved trading parameters; API preset behavior
-   needs independent verification before live deployment.
-7. Do not enable live order submission in this branch or Sprint 1.
+Local state lives outside the repo (`~/.local/state/tradingbot/` by default). `fixtures/` holds
+invented material only.

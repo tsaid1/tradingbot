@@ -56,6 +56,10 @@ class DiscrepancyKind(str, Enum):
     PROTECTIVE_STOP_INVALID = "PROTECTIVE_STOP_INVALID"
     # The working stop's price differs from the ledger's confirmed stop for the idea (review F3).
     STOP_PRICE_MISMATCH = "STOP_PRICE_MISMATCH"
+    # Fills of an intent an operator settled as NOT_AT_BROKER or CANCELLED (beyond what it had
+    # when settled), or an open SETTLED_INTENT_CONTRADICTED exception: quantity no broker evidence
+    # or verified settlement explains. Never explained away (review F1).
+    SETTLED_INTENT_CONTRADICTED = "SETTLED_INTENT_CONTRADICTED"
 
 
 # Never explained away: while any of these is present the report is not clean.
@@ -66,6 +70,7 @@ SAFETY_KINDS = frozenset(
         DiscrepancyKind.STOP_PRICE_MISMATCH,
         DiscrepancyKind.WORKING_ENTRY_ON_CLOSED_IDEA,
         DiscrepancyKind.PARTIAL_GROUP,
+        DiscrepancyKind.SETTLED_INTENT_CONTRADICTED,
     }
 )
 
@@ -186,6 +191,48 @@ def _quote(broker: Broker, contract):
         return broker.quote(contract)
     except BrokerError:
         return None
+
+
+SETTLED_WITHOUT_FILL = ("OPERATOR_SETTLED_NOT_AT_BROKER", "OPERATOR_SETTLED_CANCELLED")
+
+
+def _declared_filled(store: ExecutionStore, order_ref: str) -> int:
+    for e in reversed(store.journal(order_ref)):
+        if e.event == "OPERATOR_SETTLEMENT":
+            d = e.detail
+            return int(d.get("declared_filled", d.get("before", {}).get("intent", {})
+                             .get("filled", 0)) or 0)
+    return 0
+
+
+def _settlement_discrepancies(store, intents, open_exceptions, broker_net, ledger_net):
+    out = []
+    for e in open_exceptions:
+        if e.kind == DiscrepancyKind.SETTLED_INTENT_CONTRADICTED.value:
+            i = intents.get(e.order_ref or "")
+            out.append(Discrepancy(
+                kind=DiscrepancyKind.SETTLED_INTENT_CONTRADICTED,
+                symbol=i.symbol if i else None, contract_key=i.contract_key if i else None,
+                idea_id=e.idea_id, order_ref=e.order_ref, detail=e.detail[:300],
+            ))
+    reported = {d.order_ref for d in out}
+    for i in intents.values():
+        if i.order_ref in reported or "SETTLED_INTENT_CONTRADICTED" in i.reasons:
+            continue
+        if not any(r in SETTLED_WITHOUT_FILL for r in i.reasons):
+            continue
+        excess = store.filled_quantity(i.order_ref) - _declared_filled(store, i.order_ref)
+        if excess <= 0:
+            continue
+        key = i.contract_key
+        out.append(Discrepancy(
+            kind=DiscrepancyKind.SETTLED_INTENT_CONTRADICTED, symbol=i.symbol, contract_key=key,
+            idea_id=i.idea_id, order_ref=i.order_ref,
+            detail=(f"{excess} filled beyond the operator's declaration; broker "
+                    f"{broker_net.get(key, 0) if key else '?'}, explained by evidence "
+                    f"{ledger_net.get(key, 0) - excess if key else '?'}"),
+        ))
+    return out
 
 
 def reconcile(
@@ -447,6 +494,10 @@ def reconcile(
                     detail=e.detail,
                 )
             )
+
+    # 7. Operator settlements the broker contradicts (review F1): the broker position may hold
+    #    quantity that only fills of an intent declared never filled account for.
+    out.extend(_settlement_discrepancies(store, intents, open_exceptions, broker_net, ledger_net))
 
     return ReconciliationReport(
         checked_at=now,
