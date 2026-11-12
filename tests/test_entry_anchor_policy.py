@@ -249,7 +249,7 @@ SESSION = ('session = { policy = "REGULAR_ONLY", timezone = "UTC", '
            'days = ["MON", "TUE", "WED", "THU", "FRI"], regular = ["13:00-21:00"] }')
 ANCHOR_RULE = ('entry_rule = "REFERENCE_AS_COLLAR"\n'
                'entry_anchor = { max_adverse_move = "0.5%", max_favourable_move = "1%", '
-               'max_signal_age_seconds = 60 }')
+               'max_signal_age_seconds = 60, anchor_scope = "SENTENCE_STRICT" }')
 OIL_CONTRACTS = ('contracts = [ { month = "202607", roll_date = 2026-07-06 }, '
                  '{ month = "202608", roll_date = 2026-08-05 } ]')
 
@@ -549,7 +549,8 @@ def load(text):
 @pytest.mark.parametrize("text,message", [
     (etf_entry(rule='entry_rule = "REFERENCE_AS_COLLAR"'), "needs its [entry_anchor] limits"),
     (etf_entry(rule='entry_anchor = { max_adverse_move = "1%", max_favourable_move = "1%", '
-                    'max_signal_age_seconds = 60 }'), "needs its [entry_anchor] limits"),
+                    'max_signal_age_seconds = 60, anchor_scope = "SENTENCE_STRICT" }'),
+     "needs its [entry_anchor] limits"),
     (etf_entry(rule=ANCHOR_RULE.replace(', max_signal_age_seconds = 60', '')), "Field required"),
     (etf_entry(rule=ANCHOR_RULE.replace('"0.5%"', '"abc"')), "String should match"),
     (etf_entry(rule=ANCHOR_RULE.replace('"0.5%"', '"0"')), "must be positive"),
@@ -665,11 +666,12 @@ def _write(body: str) -> Path:
 
 RULE_TOML = ('entry_rule = "REFERENCE_AS_COLLAR"\n'
              'entry_anchor = {{ max_adverse_move = "{adverse}", max_favourable_move = "1%", '
-             'max_signal_age_seconds = 60 }}')
+             'max_signal_age_seconds = 60, anchor_scope = "{scope}" }}')
 
 
-def service_mapping(*, rule=True, adverse="0.2%", front=True, oil_contracts=None) -> str:
-    anchor = RULE_TOML.format(adverse=adverse) if rule else ""
+def service_mapping(*, rule=True, adverse="0.2%", front=True, oil_contracts=None,
+                    scope="SENTENCE_STRICT") -> str:
+    anchor = RULE_TOML.format(adverse=adverse, scope=scope) if rule else ""
     oil = oil_contracts or 'contracts = [ { month = "202607", roll_date = 2026-07-06 } ]'
     return f"""
 version = 2

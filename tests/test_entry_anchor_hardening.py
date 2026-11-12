@@ -296,7 +296,7 @@ sizing = {{ units_per_signal = 2, max_units = 4, max_notional = "60000" }}
 roll = {{ business_days_before = 3, action = "FLATTEN" }}
 reference_trigger = {{ released_order_type = "MKT", reference_hours = ["13:30-20:00"], require_backstop = false }}
 entry_rule = "REFERENCE_AS_COLLAR"
-entry_anchor = {{ max_adverse_move = "0.5%", max_favourable_move = "1%", max_signal_age_seconds = 60{cap} }}
+entry_anchor = {{ max_adverse_move = "0.5%", max_favourable_move = "1%", max_signal_age_seconds = 60, anchor_scope = "SENTENCE_STRICT"{cap} }}
 """
 
 
@@ -371,7 +371,8 @@ def test_the_loader_refuses_limits_above_the_ceilings(change, message):
 
 def test_limits_at_the_ceilings_load():
     rule = ('entry_rule = "REFERENCE_AS_COLLAR"\nentry_anchor = { max_adverse_move = "1%", '
-            'max_favourable_move = "2%", max_signal_age_seconds = 120 }')
+            'max_favourable_move = "2%", max_signal_age_seconds = 120, '
+            'anchor_scope = "SENTENCE_STRICT" }')
     assert load(etf_entry(rule=rule)).entry_anchor.max_signal_age_seconds == 120
     # An absolute move within 1% of the highest price the family's sizing can buy (5000 / 10).
     assert load(etf_entry(rule=ANCHOR_RULE.replace('"0.5%"', '"5"'))).entry_anchor
