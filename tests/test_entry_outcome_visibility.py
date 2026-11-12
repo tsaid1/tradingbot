@@ -18,7 +18,6 @@ import tempfile
 from pathlib import Path
 
 import pytest
-
 from execution_harness import Harness, action, open_action
 from runtime_harness import MAPPING, Runtime, post
 
@@ -366,8 +365,8 @@ def test_the_row_change_and_its_event_are_one_transaction(tmp_path):
         c.execute("INSERT INTO signal_actions (seq,action_id,action,status,reasons,order_ref) "
                   "VALUES (1,'a','OPEN','WORKING','[]','TB-INVENTED')")
         c.execute("DROP TABLE service_events")  # the event write will fail
-    from datetime import UTC, datetime
     import sqlite3
+    from datetime import UTC, datetime
     with pytest.raises(sqlite3.OperationalError):
         store.settle_signal_action(1, "a", expect="WORKING", status="CANCELLED",
                                    reasons=["BROKER_CANCELLED"], settled_state="CANCELLED",
