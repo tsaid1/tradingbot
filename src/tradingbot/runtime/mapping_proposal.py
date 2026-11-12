@@ -23,6 +23,7 @@ import json
 import math
 import re
 import tomllib
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation
@@ -472,17 +473,21 @@ def _series(v: Vehicle, missing: list[str], where: str, *, execution: bool,
     return out
 
 
-def report_warnings(cat: dict, x: Vehicle, ref: Vehicle) -> list[str]:
+def report_warnings(cat: dict, x: Vehicle, ref: Vehicle,
+                    span: Callable[[Any], str] | None = None) -> list[str]:
+    """The report's warnings. ``span`` formats a name shown in a code span: by default the plain
+    Markdown form (the TOML note keeps exactly that); the sheets pass ``_code``."""
+    span = span or _md_plain
     out = []
     if cat.get("overall") != "COMPLETE":
         out.append(f"the discovery report is {_md_plain(cat.get('overall'))} "
                    f"({_md_plain(cat.get('failure'))}): "
                    "re-run discovery before relying on it")
     if x.truncated:
-        out.append(f"execution row `{_md_plain(x.query)}` is TRUNCATED: the month list may be "
+        out.append(f"execution row `{span(x.query)}` is TRUNCATED: the month list may be "
                    f"incomplete (the report kept {len(x.contracts)} rows at limit {show(x.limit)})")
     if ref is not x and ref.truncated:
-        out.append(f"reference row `{_md_plain(ref.query)}` is TRUNCATED: the broker returned "
+        out.append(f"reference row `{span(ref.query)}` is TRUNCATED: the broker returned "
                    "more rows than "
                    f"the report kept ({len(ref.contracts)} at limit {show(ref.limit)})")
     return out
@@ -539,7 +544,8 @@ def build_family(plan: FamilyPlan, cat: dict, policy: ProposalPolicy) -> FamilyP
     missing: list[str] = []
     warnings = report_warnings(cat, x, ref)
     warn_note = (" WARNINGS: " + "; ".join(warnings) + ".") if warnings else ""
-    extra = {"warnings": warnings, "holidays_applied": bool(policy.holidays)}
+    shown = report_warnings(cat, x, ref, span=_code)  # the sheets' form of the same warnings
+    extra = {"warnings": shown, "holidays_applied": bool(policy.holidays)}
 
     def unsupported(reason: str) -> FamilyProposal:
         entry = {"family": plan.family, "basis": "UNSUPPORTED", "approved": False,
@@ -818,6 +824,20 @@ def _md(v: Any) -> str:
     return _html(_md_plain(v))
 
 
+def _code(v: Any) -> str:
+    """Report- or policy-derived text inside a code span: written literally (a renderer escapes
+    code-span content, and an entity there would show as typed), on one line, with every
+    back-tick replaced, so it can neither end its span nor open a new line. No code span is in
+    a table row, so a pipe there opens no cell."""
+    return show(v).replace("`", "'")
+
+
+def _html_outside_code(text: str) -> str:
+    """``_html`` applied outside code spans only (the text's back-ticks are its own spans)."""
+    parts = text.split("`")
+    return "`".join(_html(t) if i % 2 == 0 else t for i, t in enumerate(parts))
+
+
 def render_contract_table(props: list[FamilyProposal], cat: dict) -> str:
     out = [(f"# Verified contract table (report {_md(cat.get('started_at'))}, "
            f"overall {_md(cat.get('overall'))})"), "",
@@ -836,7 +856,7 @@ def render_contract_table(props: list[FamilyProposal], cat: dict) -> str:
             if not v.found:
                 code = "absent" if v.error_code is None else str(v.error_code)
                 label = "NOT_FOUND row" if v.status == "NOT_FOUND" else "unresolved row"
-                out += [(f"{label}: status `{_md(v.status)}`, broker code {_md(code)}, message "
+                out += [(f"{label}: status `{_code(v.status)}`, broker code {_md(code)}, message "
                         f"{_md(v.error_message)}."), ""]
                 continue
             if v.truncated:
@@ -880,11 +900,11 @@ def render_calendar(props: list[FamilyProposal], policy: ProposalPolicy, cat: di
         if not p.calendar:
             continue
         out += [f"## {p.plan.family}: {_md(p.execution.query)}", ""]
-        out += [f"**WARNING:** {_html(one_line(w))}." for w in p.warnings]
+        out += [f"**WARNING:** {_html_outside_code(one_line(w))}." for w in p.warnings]
         if p.warnings:
             out.append("")
         if p.same_series_diffs:
-            out += [(f"Same-series proposal: reference `{_md(p.reference.query)}`. Roll dates "
+            out += [(f"Same-series proposal: reference `{_code(p.reference.query)}`. Roll dates "
                     "follow the execution vehicle's own last-trade dates; each month's difference "
                     "from the reference is listed in the flags."), ""]
         out += ["| month | local symbol | last trade | from field | proposed roll_date | flags |",
@@ -925,7 +945,7 @@ def render_sheet(p: FamilyProposal, cat: dict) -> str:
            "Every entry this tool writes is `approved = false`."), ""]
     if p.warnings:
         out += ["## Warnings", ""] + [
-            f"* **WARNING:** {_html(one_line(w))}." for w in p.warnings] + [""]
+            f"* **WARNING:** {_html_outside_code(one_line(w))}." for w in p.warnings] + [""]
     if p.unsupported_reason:
         out += [("**Not proposable from this report.** The proposed entry is `UNSUPPORTED` and "
                 f"HOLDs: {_md(p.unsupported_reason)}."), "",
@@ -1008,7 +1028,7 @@ def render_sheet(p: FamilyProposal, cat: dict) -> str:
         facts = ", ".join(f"{k} {_md(v.spec.get(k))}" for k in (
             "sec_type", "symbol", "exchange", "currency", "multiplier", "min_tick",
             "size_increment", "price_magnifier", "trading_class", "time_zone_id") if k in v.spec)
-        out.append(f"* {role} query `{_md(v.query)}`: {facts}; conIds {_md(ids)}")
+        out.append(f"* {role} query `{_code(v.query)}`: {facts}; conIds {_md(ids)}")
         for k, why in v.spec_problems.items():
             if k not in ("trading_hours", "liquid_hours"):
                 out.append(f"  * `{k}`: {_md(why)}")
@@ -1066,8 +1086,8 @@ def render_sheet(p: FamilyProposal, cat: dict) -> str:
     out.append("")
     if p.owner_inputs or p.broker_missing:
         out += ["## Still open in the proposed entry (it will not load until filled)", ""]
-        out += [f"* owner input: `{_md(k)}`" for k in p.owner_inputs]
-        out += [f"* broker fact missing: `{_md(k)}`" for k in p.broker_missing]
+        out += [f"* owner input: `{_code(k)}`" for k in p.owner_inputs]
+        out += [f"* broker fact missing: `{_code(k)}`" for k in p.broker_missing]
         out.append("")
     return "\n".join(out)
 
