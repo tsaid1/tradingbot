@@ -32,10 +32,12 @@ import time
 from datetime import UTC, datetime
 from decimal import ROUND_FLOOR, Decimal
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from tradingbot.event_models import PriceBasis, ReplaySource, Timing, TradeAction
 from tradingbot.execution.broker import OrderStatus, QuoteQuality, TimeInForce
 from tradingbot.execution.coordinator import ExecutionConfig, ExecutionCoordinator
+from tradingbot.execution.store import IntentState
 from tradingbot.ibkr.redact import redact_accounts
 from tradingbot.ibkr_orders.broker import IbkrPaperBroker
 from tradingbot.ibkr_orders.config import PaperOrderConfig, load_order_config
@@ -57,6 +59,92 @@ STOP_RAISE = Decimal("0.10")  # stage 3: the one amendment
 FILL_TIMEOUT_SECONDS = 120.0  # stage 3: wait this long for the entry and for the close
 POLL_SECONDS = 1.0
 READ_BACK_WAIT_SECONDS = 2.0  # stage 2: let the views settle before reading back
+# Stage 3: after the entry fill, the protection check is retried (reads only) this long, since
+# the position read can lag the execution.
+PROTECTION_SETTLE_SECONDS = 15.0
+# Stages 2 and 3 can leave an order or a share behind; neither STARTS at or after this New York
+# wall-clock time (hour, minute). The runbook still recommends starting stage 3 by 14:30.
+LATEST_START_NEW_YORK = (15, 0)
+NEW_YORK = ZoneInfo("America/New_York")
+
+
+def _wall_clock() -> datetime:
+    """The wall clock, aware (UTC). Not a parameter: tests replace this module name."""
+    return datetime.now(UTC)
+
+
+# A protective stop counts as working ONLY with one of these statuses AND visible in a completed
+# open-orders read; anything else (Inactive, PendingCancel, unknown, a failed read) is not.
+STOP_WORKING_STATUSES = frozenset({OrderStatus.SUBMITTED, OrderStatus.PRE_SUBMITTED})
+
+
+def _check_start_time(stage: str) -> None:
+    now = _wall_clock().astimezone(NEW_YORK)
+    h, m = LATEST_START_NEW_YORK
+    if (now.hour, now.minute) >= (h, m):
+        raise StageRefused(f"{stage} may not start at or after {h:02d}:{m:02d} New York time "
+                           f"(now {now:%H:%M %Z}): it could leave an order or a share near the "
+                           "close. Run it on another day, before 14:30 as the runbook says.")
+
+
+def _position_state(s: PaperOrderSession) -> dict:
+    """What is known now, from reads only: the held quantity (the more cautious of the position
+    read and the experiment's own fills), the protective stop, the resting closing limit."""
+    state: dict = {"held": None, "stop_working": False, "stop_status": None,
+                   "close_working": False, "own_working": None, "read_errors": []}
+    con_id = s.contract.con_id
+    try:
+        read = sum((r.quantity for r in s.positions() if r.con_id == con_id), Decimal(0))
+        implied = s._implied_position(con_id)
+        state["held"] = str(read if implied is None else max(read, implied))
+    except Exception as exc:  # noqa: BLE001 - evidence: unknown is reported as unknown
+        state["read_errors"].append(redact_accounts(f"positions: {exc}"))
+    try:
+        own = [o for o in s.open_orders() if o.own]
+    except Exception as exc:  # noqa: BLE001
+        state["read_errors"].append(redact_accounts(f"open orders: {exc}"))
+        return state
+    stops = [o for o in own if o.action == "SELL" and o.order_type == "STP"]
+    state["own_working"] = len(own)
+    state["stop_status"] = ",".join(o.status.value for o in stops) or None
+    state["stop_working"] = any(o.status in STOP_WORKING_STATUSES for o in stops)
+    state["close_working"] = any(o.action == "SELL" and o.order_type == "LMT" for o in own)
+    return state
+
+
+HAND_CLOSE = ("in TWS SELL the share by hand with a limit at the bid, lower it a tick at a time "
+              "until it fills, and confirm the TLT position is 0")
+
+
+def _instruction(state: dict) -> str:
+    """What the owner does now, from the actual state. Never 'run abort first' while a
+    protective stop is working (abort cancels it)."""
+    held, stop, close = state["held"], state["stop_working"], state["close_working"]
+    if held is None or state["own_working"] is None:
+        return ("the position or the working orders could not be read: check TWS. If TLT is "
+                "held and its protective stop is working: close by hand first, then run abort "
+                "(Do NOT run abort first: it cancels the stop). If TLT is held without a working "
+                f"stop: it is UNPROTECTED, {HAND_CLOSE} NOW, then run abort. If flat: run abort.")
+    if Decimal(held) > 0 and stop and close:
+        return (f"{held} TLT held; the protective stop ({state['stop_status']}) AND a closing "
+                "limit are working. In TWS cancel the closing limit only (not the stop), then "
+                f"close by hand first, then run abort: {HAND_CLOSE}. Do NOT run abort first: it "
+                "cancels the stop.")
+    if Decimal(held) > 0 and stop:
+        return (f"{held} TLT held, protective stop working ({state['stop_status']}): close by "
+                f"hand first, then run abort ({HAND_CLOSE}). Do NOT run abort first: it cancels "
+                "the stop.")
+    if Decimal(held) > 0 and close:
+        return (f"{held} TLT held with NO working protective stop: UNPROTECTED. A closing limit "
+                "is resting: run abort now (it cancels that limit; there is no stop to lose), "
+                f"then {HAND_CLOSE} at once.")
+    if Decimal(held) > 0:
+        return (f"{held} TLT held with NO working protective stop (status "
+                f"{state['stop_status'] or 'none'}): UNPROTECTED. Close by hand NOW: {HAND_CLOSE}; "
+                "then run abort.")
+    if state["own_working"]:
+        return f"flat; {state['own_working']} own order(s) still working: run abort."
+    return "flat and nothing of this client working: nothing to do in TWS."
 
 
 class StageRefused(RuntimeError):
@@ -222,6 +310,7 @@ def _require_count(s: PaperOrderSession, stage: str) -> None:
 
 
 def _stage2(cfg: PaperOrderConfig, ev: dict) -> None:
+    _check_start_time(STAGES[2])  # an unexpected fill must be closable by hand before 16:00
     s = _session(cfg)
     s.connect()
     try:
@@ -300,7 +389,8 @@ def _stage2(cfg: PaperOrderConfig, ev: dict) -> None:
             child_status = ct.status.value if ct.status is not None else "UNKNOWN"
             in_open = any(r["own"] and r["order_id"] == child
                           for r in after["open_orders"].get("rows", []))
-            stop_working = ct.status is not None and ct.status not in FINAL_STATUSES and in_open
+            stop_working = (ct.status in STOP_WORKING_STATUSES and in_open
+                            and after["open_orders"].get("completed") is True)
             ev["held"] = {"symbol": c.symbol, "quantity": str(pt.filled or sum(
                 (e.shares for e in parent_execs), Decimal(0))), "entry_order_id": parent,
                 "stop_order_id": child, "stop_price": str(ct.stop_price),
@@ -325,8 +415,11 @@ def _stage2(cfg: PaperOrderConfig, ev: dict) -> None:
         elif not parent_clean:
             ev["result"] = "STAGE2_PARENT_NOT_CONFIRMED_CANCELLED"
             ev["passed"] = False
-            ev["why_failed"] = ("the parent was not confirmed cancelled; its stop child was left "
-                                "alone. Check TWS, then run abort.")
+            ev["why_failed"] = (
+                "the parent was not confirmed cancelled; its stop child was left alone. Check "
+                "TWS: if TLT is held and the stop is working, close by hand first, then run "
+                "abort (Do NOT run abort first: it cancels the stop); if TLT is held without a "
+                "working stop, close by hand NOW, then run abort; if flat, run abort.")
     finally:
         s.disconnect()
 
@@ -342,6 +435,7 @@ def _wait(pred, timeout: float) -> bool:
 
 
 def _stage3(cfg: PaperOrderConfig, ev: dict) -> None:
+    _check_start_time(STAGES[3])
     quality = (_read(evidence_path(cfg, STAGES[1])) or {}).get("quote", {}).get("quality")
     if quality not in (QuoteQuality.LIVE.value, QuoteQuality.DELAYED.value):
         raise StageRefused(f"stage 1 recorded quote quality {quality!r}; stage 3 needs LIVE or "
@@ -395,32 +489,44 @@ def _stage3(cfg: PaperOrderConfig, ev: dict) -> None:
         opened = step("open", coord.execute(src, act("open", Action.OPEN,
                                                      entry_reference=str(entry),
                                                      stop_price=str(stop)), gate))
+        def fail(result: str, what: str) -> None:
+            ev["state"] = state = _position_state(s)
+            ev.update(passed=False, result=result,
+                      why_failed=f"{result}: {what}. Now: {_instruction(state)}")
+
         if not _wait(lambda: coord.sync() and bool(coord.ledger())
                      and coord.ledger()[0].quantity == 1, FILL_TIMEOUT_SECONDS):
-            ev.update(passed=False, why_failed="the entry did not fill in time: run abort")
+            fail("STAGE3_ENTRY_NOT_FILLED", "the entry did not fill in time")
             return
+        # The position read can lag the fill: the core then sees the stop sized above what the
+        # broker shows. Retry the check (the same sync reads as above, no new order) briefly.
+        _wait(lambda: coord.sync() and coord.ledger()[0].protection == "CONFIRMED",
+              PROTECTION_SETTLE_SECONDS)
         ledger = coord.ledger()[0]
         ev["protection_after_fill"] = ledger.protection
         if ledger.protection != "CONFIRMED":
-            ev.update(passed=False, why_failed="the stop was not confirmed working: run abort "
-                      "and close by hand")
+            fail("STAGE3_PROTECTION_UNCONFIRMED", "the entry filled but the core could not "
+                 f"confirm its protective stop within {PROTECTION_SETTLE_SECONDS:.0f} s "
+                 f"(protection {ledger.protection})")
             return
         step("raise-stop", coord.execute(src, act("raise-stop", Action.MODIFY,
                                                   idea_reference=ledger.idea_id,
                                                   stop_price=str(stop + STOP_RAISE)), gate))
-        step("close", coord.execute(src, act("close", Action.CLOSE,
-                                             idea_reference=ledger.idea_id), gate))
+        closed = step("close", coord.execute(src, act("close", Action.CLOSE,
+                                                      idea_reference=ledger.idea_id), gate))
         if broker.protection_lost:  # the close was refused after its stop was cancelled
             coord.sync()  # the core raises UNPROTECTED_POSITION now, not at a later read
-            ev.update(passed=False, protection_lost=broker.protection_lost,
-                      why_failed="POSITION OPEN, PROTECTION ABSENT: the close was not sent after "
-                      "the stop was cancelled. Close the share by hand in TWS now (runbook: "
-                      "Emergency stop).")
+            ev["protection_lost"] = broker.protection_lost
+            fail("STAGE3_PROTECTION_LOST", "POSITION OPEN, PROTECTION ABSENT: the close was not "
+                 "sent after the stop was cancelled")
+            return
+        if closed.state in (IntentState.REFUSED, IntentState.REJECTED, IntentState.HALTED):
+            fail("STAGE3_CLOSE_REFUSED", f"the close was {closed.state.value} and not working "
+                 f"({', '.join(closed.reasons) or 'no reason given'})")
             return
         if not _wait(lambda: coord.sync() and coord.ledger()[0].quantity == 0,
                      FILL_TIMEOUT_SECONDS):
-            ev.update(passed=False, why_failed="the closing limit did not fill in time: run "
-                      "abort, then close the share by hand in TWS")
+            fail("STAGE3_CLOSE_NOT_FILLED", "the closing limit was sent but did not fill in time")
             return
         report = coord.reconcile()
         ev["reconcile_clean"] = bool(report.clean)
@@ -428,6 +534,10 @@ def _stage3(cfg: PaperOrderConfig, ev: dict) -> None:
         ev["lookups_after"] = _lookups(s)
         ev["submissions_used"] = s.submissions_used
         ev["passed"] = bool(report.clean) and s.submissions_used == 6
+        ev["result"] = "STAGE3_PASSED" if ev["passed"] else "STAGE3_NOT_CLEAN"
+        if not ev["passed"]:
+            fail("STAGE3_NOT_CLEAN", f"reconciliation clean={bool(report.clean)}, submissions "
+                 f"used {s.submissions_used}")
     finally:
         if coord is not None:
             coord.close()

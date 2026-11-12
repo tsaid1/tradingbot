@@ -21,6 +21,13 @@ import sys
 from tradingbot.ibkr_orders.config import DEFAULT_ORDER_CONFIG_PATH
 from tradingbot.ibkr_orders.experiment import ABORT, STAGES, StageRefused, run_stage
 
+# Text only. CI has no ibapi, so the order-path tests are skipped there.
+SUITE_REMINDER = (
+    "REQUIRED before stage 2 and again before stage 3: run the full test suite locally WITH the "
+    "SDK (ibapi installed, TRADINGBOT_BLOCK_IBAPI unset) at the exact commit you will run, and "
+    "record the commit and the passed/skipped counts in the evidence directory "
+    "(docs/IBKR_PAPER_ORDERS.md, staged runbook).")
+
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__,
@@ -41,6 +48,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"submissions: {evidence.get('submissions_before')} -> "
           f"{evidence.get('submissions_after')}")
     print(f"evidence: {path}")
+    if args.stage == STAGES[1]:
+        print(SUITE_REMINDER)
     return 0 if evidence.get("passed") else 1
 
 

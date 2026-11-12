@@ -5,6 +5,8 @@ from __future__ import annotations
 import importlib.util
 import json
 import socket
+import threading
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -22,6 +24,7 @@ from tradingbot.ibkr_orders.config import load_order_config
 from tradingbot.ibkr_orders.counter import init_journal
 
 ROOT = Path(__file__).resolve().parents[1]
+MIDDAY = datetime(2026, 11, 11, 17, 0, tzinfo=UTC)  # 12:00 New York (EST), invented
 
 
 @pytest.fixture
@@ -40,6 +43,8 @@ def tws(monkeypatch):
     monkeypatch.setattr(X, "READ_BACK_WAIT_SECONDS", 0.1)
     monkeypatch.setattr(X, "POLL_SECONDS", 0.05)
     monkeypatch.setattr(X, "FILL_TIMEOUT_SECONDS", 3.0)
+    monkeypatch.setattr(X, "PROTECTION_SETTLE_SECONDS", 3.0)
+    monkeypatch.setattr(X, "_wall_clock", lambda: MIDDAY)  # before the start cut-off
     return server
 
 
@@ -294,3 +299,109 @@ def test_stage_names_and_per_stage_budget_are_the_runbooks():
     assert [X.SUBMISSIONS_OF[s] for s in X.STAGES] == [0, 0, 2, 4]
     assert [X.SUBMISSIONS_BEFORE[s] for s in X.STAGES] == [0, 0, 0, 2]
     assert X.SUBMISSIONS_OF.get(X.ABORT, 0) == 0
+
+
+# --- fix round after the review of f272640 -------------------------------------------------------
+@pytest.mark.parametrize("child_status", ["Inactive", "PendingCancel"])
+def test_a_stage2_stop_that_is_not_submitted_is_never_reported_working(tws, cfg_path,
+                                                                      child_status):
+    """SHOULD FIX 1: only Submitted or PreSubmitted AND visible in open orders is working."""
+    from _ibkr_fake_tws_orders import FakeOrderTws
+    stage0(tws, cfg_path)
+    run("stage1-lookups", cfg_path)
+    tws.autofill = True
+    tws.ask = 70.00
+
+    def place_then_child_status(s, conn, req):
+        FakeOrderTws.place(s, conn, req)
+        fo = s.orders[req.orderId]
+        if fo.order.parentId and s.orders[fo.order.parentId].status == "Filled":
+            s.set_status(fo.order_id, child_status)
+
+    tws.on["PLACE_ORDER"] = place_then_child_status
+    ev = run("stage2-unfillable-bracket", cfg_path)
+    assert ev["result"] == "STAGE2_UNEXPECTED_FILL"
+    assert ev["held"]["stop_working"] is False and ev["held"]["stop_status"] == child_status
+    assert "NOT working" in ev["why_failed"] and "Do NOT run abort first" not in ev["why_failed"]
+
+
+def _to_stage3(tws, cfg_path):
+    stage0(tws, cfg_path)
+    assert run("stage1-lookups", cfg_path)["passed"]
+    assert run("stage2-unfillable-bracket", cfg_path)["passed"]
+    tws.autofill = True
+
+
+def test_a_refused_close_is_reported_refused_and_never_says_abort_first(tws, cfg_path):
+    """SHOULD FIX 2 (i, ii): the close is refused for want of a bid: REFUSED with its reason;
+    the stop still works, so: close by hand first, then abort."""
+    from _ibkr_fake_tws_orders import FakeOrderTws
+    _to_stage3(tws, cfg_path)
+
+    def place_then_no_bid(s, conn, req):
+        amend = req.orderId in s.orders
+        FakeOrderTws.place(s, conn, req)
+        if amend:  # the stop raise: from now on the quote has no bid
+            s.bid = 0.0
+
+    tws.on["PLACE_ORDER"] = place_then_no_bid
+    ev = run("stage3-lifecycle", cfg_path)
+    assert not ev["passed"]
+    assert ev["result"] == "STAGE3_CLOSE_REFUSED", ev
+    assert "REFUSED" in ev["why_failed"] and "did not fill" not in ev["why_failed"]
+    assert "EXIT_WITHOUT_QUOTE" in ev["why_failed"]
+    assert ev["state"]["stop_working"] is True and ev["state"]["held"] == "1"
+    assert "close by hand first, then run abort" in ev["why_failed"]
+    assert "run abort, then" not in ev["why_failed"]
+    assert "Do NOT run abort first" in ev["why_failed"]
+    assert placed(tws) == 5  # the close was never sent
+
+
+def test_a_position_read_lagging_the_entry_fill_is_waited_for_with_reads_only(tws, cfg_path):
+    """SHOULD FIX 2 (iii): the protection check is retried for a bounded time; no extra frame."""
+    _to_stage3(tws, cfg_path)
+    tws.positions_lag = True
+    threading.Timer(1.0, tws.catch_up_positions).start()
+    ev = run("stage3-lifecycle", cfg_path)
+    assert ev["passed"], ev
+    assert placed(tws) == 6 and ev["submissions_after"] == 6
+
+
+def test_a_position_read_that_keeps_lagging_says_what_is_known(tws, cfg_path):
+    _to_stage3(tws, cfg_path)
+    tws.positions_lag = True
+    ev = run("stage3-lifecycle", cfg_path)
+    assert not ev["passed"] and ev["result"] == "STAGE3_PROTECTION_UNCONFIRMED"
+    assert ev["state"]["stop_working"] is True
+    assert "close by hand first, then run abort" in ev["why_failed"]
+    assert placed(tws) == 4  # the bracket only: no raise, no close
+    assert tws.count("CANCEL_ORDER") == 1  # stage 2's parent cancel only: nothing new
+
+
+@pytest.mark.parametrize("stage", ["stage2-unfillable-bracket", "stage3-lifecycle"])
+def test_stages_that_place_refuse_to_start_after_the_cut_off(tws, cfg_path, monkeypatch, stage):
+    """SHOULD FIX 3: no stage that can leave anything working starts after 15:00 New York."""
+    stage0(tws, cfg_path)
+    run("stage1-lookups", cfg_path)
+    if stage == "stage3-lifecycle":
+        assert run("stage2-unfillable-bracket", cfg_path)["passed"]
+        tws.autofill = True
+    assert X.LATEST_START_NEW_YORK == (15, 0)
+    monkeypatch.setattr(X, "_wall_clock", lambda: datetime(2026, 11, 11, 20, 1, tzinfo=UTC))
+    names, frames = list(tws.names()), placed(tws)
+    ev = run(stage, cfg_path)
+    assert not ev["passed"] and "15:00" in ev["why_failed"]
+    assert tws.names() == names and placed(tws) == frames  # refused before connecting
+    monkeypatch.setattr(X, "_wall_clock", lambda: datetime(2026, 7, 1, 18, 59, tzinfo=UTC))
+    assert run(stage, cfg_path)["passed"]  # 14:59 EDT: allowed
+
+
+def test_stage1_reminds_to_run_the_full_suite_with_the_sdk(tws, cfg_path, capsys):
+    spec = importlib.util.spec_from_file_location("ibkr_paper_experiment",
+                                                  ROOT / "scripts" / "ibkr_paper_experiment.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    stage0(tws, cfg_path)
+    assert mod.main(["stage1-lookups", "--config", str(cfg_path)]) == 0
+    out = capsys.readouterr().out
+    assert "WITH the SDK" in out and "before stage 2" in out
