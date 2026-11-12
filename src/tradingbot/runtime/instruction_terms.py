@@ -69,13 +69,13 @@ COMPACT_STRIKE_RE = re.compile(r"(?<![\w.$-])\$?(?P<strike>\d+(?:\.\d+)?)(?P<rig
 # Words naming a multi-leg option strategy (review F3). Any of them in an option instruction HOLDs.
 STRATEGY_RE = re.compile(
     r"\b(?P<word>spread|vertical|calendar|diagonal|straddle|strangle|condor|butterfl(?:y|ies)|"
-    r"collar|ratio|covered|combo)s?\b",
+    r"collar|ratio|covered|combo|fly|flies|reversal)s?\b",
     re.IGNORECASE,
 )
 # The ones that only ever name options: they route an instruction to its option family even
 # without the words call, put or option.
 OPTION_ONLY_STRATEGY_RE = re.compile(
-    r"\b(?:straddles?|strangles?|condors?|butterfl(?:y|ies)|"
+    r"\b(?:straddles?|strangles?|condors?|butterfl(?:y|ies)|iron\s+fl(?:y|ies)|risk\s+reversals?|"
     r"(?:vertical|calendar|diagonal|ratio|credit|debit)\s+spreads?)\b",
     re.IGNORECASE,
 )
@@ -241,4 +241,27 @@ def leftover_tokens(terms: InstructionTerms, consumed: set[Decimal],
             code = any(word.startswith(r) and word != r for r in upper_roots)
             if month or code:
                 out.append(token)
+    return out
+
+
+# Language that adds a leg: selling, shorting or writing an option, or one put on "against" another.
+SECOND_LEG_RE = re.compile(
+    r"\b(?P<word>sell|sells|selling|sold|short|shorts|shorting|shorted|write|writes|writing|"
+    r"wrote|written|against)\b",
+    re.IGNORECASE,
+)
+
+
+def post_multi_leg(post_text: str | None) -> list[str]:
+    """Why a whole post is not one single-leg option (review F3, confirmation): single leg is the
+    exception. The post as a whole must state exactly one strike, one expiry and one right, with
+    no strategy word and no selling, shorting, writing or "against" language. Empty when it is
+    one leg, or when there is no post text to judge."""
+    if not post_text:
+        return []
+    t = extract_terms(post_text)
+    out = list(t.multi_leg)
+    m = SECOND_LEG_RE.search(post_text)
+    if m:
+        out.append(f"SECOND_LEG_LANGUAGE:{m.group('word').lower()}")
     return out

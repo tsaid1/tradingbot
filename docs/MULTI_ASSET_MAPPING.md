@@ -60,8 +60,12 @@ above. A month name with a two-digit number is read as a year: "Dec 18" is Decem
 **Single-leg options only.** An option instruction executes only with exactly one underlying, one
 expiry, one strike and one right. More than one strike (`100/105`, `105 and 110 calls`, two
 strike-right pairs), more than one expiry, more than one right, or a strategy word (spread,
-vertical, calendar, diagonal, straddle, strangle, condor, butterfly, collar, ratio, covered, combo)
-HOLDs with `OPTION_STRATEGY_NOT_SINGLE_LEG`.
+vertical, calendar, diagonal, straddle, strangle, condor, butterfly, collar, ratio, covered, combo,
+iron fly, risk reversal) HOLDs with `OPTION_STRATEGY_NOT_SINGLE_LEG`. Single leg is the exception:
+an option OPEN or ADD executes only if the WHOLE post, not just the action's clause, states exactly
+one strike, one expiry and one right, with no strategy word and no selling, shorting, writing or
+"against" language ("sell the 110 against it" in a later sentence HOLDs the whole post). An exit or
+amendment on an open option idea is bound to that idea's contract.
 
 **What approval governs.** Approval governs new exposure only. OPEN and ADD on an unapproved or
 removed family HOLD (`MAPPING_NOT_APPROVED` or `UNSUPPORTED_INSTRUMENT_MAPPING`). Each idea records

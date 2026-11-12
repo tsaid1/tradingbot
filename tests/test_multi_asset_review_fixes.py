@@ -889,3 +889,47 @@ def test_f2c_a_percentage_that_is_the_reduction_is_consumed(tmp_path):
     d, inst = demo_policy(tmp_path).resolve(red, clause="Selling 50% of our $QIDX long at 5,030.",
                                             now=MAP_NOW, held=held)
     assert d.status == "SUPPORTED" and inst.futures_contract == "202606"
+
+
+# ================================================================== F3 (confirmation): whole post
+
+OPT_OPEN = "We are now long $QSTK 2026-09-18 105 call at 4.22. Stop 3.40."
+
+
+def opt_resolve(tmp_path, post, action=None):
+    """The action's clause is its own sentence; the rest of the post is elsewhere."""
+    return demo_policy(tmp_path).resolve(action or opening("QSTK"), clause=OPT_OPEN, now=MAP_NOW,
+                                         post_text=post)
+
+
+@pytest.mark.parametrize("rest", [
+    # The reviewer's input: the second leg in its own clause.
+    "Sell the 110 against it at 1.10.",
+    "Selling the 110 call against it.",
+    "Writing the 110 calls against it.",
+    "Short the 2026-12-18 105 call.",
+    "Also long the 110 call at 1.20.",
+    "Also buying the 105 put at 2.00.",
+    "It is half of an iron fly.",
+    "Think of it as a risk reversal.",
+    "Sold the 95 put to pay for it.",
+])
+def test_f3c_a_second_leg_anywhere_in_the_post_holds(tmp_path, rest):
+    d, inst = opt_resolve(tmp_path, f"{OPT_OPEN} {rest}")
+    assert d.status == "UNRESOLVED" and inst is None, rest
+    assert d.reason.split(",")[0] == "OPTION_STRATEGY_NOT_SINGLE_LEG"
+
+
+def test_f3c_a_post_with_one_strike_expiry_and_right_executes(tmp_path):
+    d, inst = opt_resolve(tmp_path, f"{OPT_OPEN} Target 6.00. Risk is the premium.")
+    assert d.status == "SUPPORTED" and (inst.strike, inst.option_right) == ("105", "CALL")
+
+
+def test_f3c_the_whole_post_reaches_the_policy_from_the_service(tmp_path):
+    run = run_steps(tmp_path, [Step(0, "We are now long $QSTK 2026-09-18 105 call at 4.22. "
+                                       "Stop 3.40. Sell the 110 against it at 1.10.", "HOLD")],
+                    family="QSTK.OPT")
+    acts = traded(run)
+    assert acts and all(a["status"] != "EXECUTED" for a in acts)
+    assert run.broker.submit_calls == 0
+    run.close()

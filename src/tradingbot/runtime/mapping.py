@@ -49,7 +49,12 @@ from tradingbot.models import (
     MarketTerms,
     StrictModel,
 )
-from tradingbot.runtime.instruction_terms import InstructionTerms, extract_terms, leftover_tokens
+from tradingbot.runtime.instruction_terms import (
+    InstructionTerms,
+    extract_terms,
+    leftover_tokens,
+    post_multi_leg,
+)
 from tradingbot.validator import business_days_until
 
 UNSUPPORTED_INSTRUMENT_MAPPING = "UNSUPPORTED_INSTRUMENT_MAPPING"
@@ -543,6 +548,7 @@ class FamilyMapping(StrictModel):
         terms: InstructionTerms,
         today: date,
         held: ContractRef | None,
+        post_text: str | None = None,
     ) -> tuple[Instrument | None, list[str]]:
         """The execution instrument for this action, or the reasons it cannot be selected."""
         x = self.execution
@@ -553,7 +559,7 @@ class FamilyMapping(StrictModel):
             return Instrument(asset_class=x.asset, symbol=x.symbol, exchange=x.exchange), []
         if x.sec_type == "FUT":
             return self._select_future(terms, today, held, action)
-        return self._select_option(asset, terms, held)
+        return self._select_option(asset, terms, held, action, post_text)
 
     def _roots(self) -> set[str]:
         """The symbols a contract code of this family may start with."""
@@ -630,8 +636,13 @@ class FamilyMapping(StrictModel):
             futures_contract=month,
         ), []
 
-    def _select_option(self, asset, terms, held):
+    def _select_option(self, asset, terms, held, action=None, post_text=None):
         x = self.execution
+        if held is None or (action is not None and action.action == Action.ADD):
+            # New exposure: the whole post, not only this clause, must be one leg.
+            post = post_multi_leg(post_text)
+            if post:
+                return None, [OPTION_STRATEGY_NOT_SINGLE_LEG, *post]
         if terms.multi_leg:  # only one underlying, expiry, strike and right is a single leg
             return None, [OPTION_STRATEGY_NOT_SINGLE_LEG, *terms.multi_leg]
         if held is not None:
@@ -732,6 +743,7 @@ class MappingPolicy:
         now: datetime | None = None,
         held: dict[str, ContractRef] | None = None,
         recorded: dict[str, FamilyMapping] | None = None,
+        post_text: str | None = None,
     ) -> tuple[MappingDecision, Instrument | None]:
         """One action's mapping decision and, when SUPPORTED, its execution instrument.
         ``clause`` is the instruction text the action came from (contract terms are read from it);
@@ -800,7 +812,7 @@ class MappingPolicy:
         today = (now or datetime.now(UTC)).astimezone(
             ZoneInfo(entry.session.timezone if entry.session else "UTC")
         ).date()
-        instrument, problems = entry.select(action, asset, terms, today, held_contract)
+        instrument, problems = entry.select(action, asset, terms, today, held_contract, post_text)
         if instrument is None:
             return MappingDecision(
                 status="UNRESOLVED", reason=",".join(problems), **out
@@ -843,6 +855,7 @@ class MappingPolicy:
         now: datetime | None = None,
         held: dict[str, ContractRef] | None = None,
         recorded: dict[str, FamilyMapping] | None = None,
+        post_text: str | None = None,
     ) -> tuple[ParsedPost, list[MappingDecision]]:
         """Return the post with every action that may not execute marked for HOLD, and one
         decision per action. A supported action gets its execution instrument. ``clauses`` maps
@@ -851,7 +864,8 @@ class MappingPolicy:
         decisions: list[MappingDecision] = []
         for a in parsed.actions:
             d, instrument = self.resolve(
-                a, clause=(clauses or {}).get(a.action_id), now=now, held=held, recorded=recorded
+                a, clause=(clauses or {}).get(a.action_id), now=now, held=held, recorded=recorded,
+                post_text=post_text,
             )
             decisions.append(d)
             marks: list[str] = []

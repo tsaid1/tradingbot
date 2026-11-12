@@ -381,6 +381,7 @@ class RuntimeService:
             now=decision_now,
             held=self._held_contracts(),
             recorded=recorded,
+            post_text=post.text,  # an option must be one leg across the whole post
         )
         quotes = self._gate_quotes(mapped, decisions, decision_now, recorded)
         self.replay.gate_stamps = {}
