@@ -206,6 +206,10 @@ class MarketTerms(StrictModel):
     anchor_max_adverse_move: str | None = None
     anchor_max_favourable_move: str | None = None
     anchor_max_signal_age_seconds: float | None = None
+    # The anchor's own basis cap (additive), for a reference-series family with no basis_shift
+    # (max_abs_basis above is then None): execution prices, and the quotes' oldest age and skew.
+    anchor_max_abs_basis: Decimal | None = None
+    anchor_max_basis_age_seconds: float | None = None
     # Problems found while building these terms (contract unresolved, specification differs).
     problems: list[str] = Field(default_factory=list)
 

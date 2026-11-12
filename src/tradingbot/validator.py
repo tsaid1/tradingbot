@@ -382,10 +382,14 @@ def _touch(leg: LegQuote, buy: bool) -> Decimal:
     return side if side is not None and side > 0 else (leg.last or Decimal(0))
 
 
-def _basis(q: MappedQuote, now: datetime) -> tuple[ExecutionPlan | None, list[str]]:
-    """The basis observed now from two live, fresh, near-simultaneous quotes, within its cap."""
+def _basis(q: MappedQuote, now: datetime, cap: Decimal | None = None,
+           max_age: float | None = None) -> tuple[ExecutionPlan | None, list[str]]:
+    """The basis observed now from two live, fresh, near-simultaneous quotes, within its cap
+    (the terms' basis-shift cap unless ``cap`` and ``max_age`` are given)."""
     t = q.terms
-    age = t.max_basis_age_seconds or 0
+    if cap is None:
+        cap, max_age = t.max_abs_basis, t.max_basis_age_seconds
+    age = max_age or 0
     execution = LegQuote(contract_key=t.execution_key, bid=q.bid, ask=q.ask,
                          observed_at=q.observed_at, quality=q.quality)
     for name, leg in (("EXECUTION", execution), ("REFERENCE", q.reference)):
@@ -399,7 +403,7 @@ def _basis(q: MappedQuote, now: datetime) -> tuple[ExecutionPlan | None, list[st
         return None, ["BASIS_QUOTE_UNUSABLE", "QUOTES_NOT_SIMULTANEOUS"]
     em, rm = _mid(execution), _mid(q.reference)
     basis = em - rm
-    if t.max_abs_basis is None or abs(basis) > t.max_abs_basis:
+    if cap is None or abs(basis) > cap:
         return None, ["BASIS_EXCEEDS_CAP", f"BASIS:{basis}"]
     plan = ExecutionPlan(family=t.family, basis=t.basis, execution_key=t.execution_key,
                          basis_value=basis, basis_execution_mid=em, basis_reference_mid=rm,
@@ -510,6 +514,16 @@ ANCHOR_RULE_INCOMPLETE = "ENTRY_ANCHOR_RULE_INCOMPLETE"
 ANCHOR_SIGNAL_TOO_OLD = "ENTRY_ANCHOR_SIGNAL_TOO_OLD"
 ANCHOR_ADVERSE_MOVE = "ENTRY_ANCHOR_ADVERSE_MOVE"  # the market ran away: do not chase
 ANCHOR_FAVOURABLE_MOVE = "ENTRY_ANCHOR_FAVOURABLE_MOVE"  # moved too far the other way: stale?
+ANCHOR_LIMIT_ABOVE_CEILING = "ENTRY_ANCHOR_LIMIT_ABOVE_CEILING"
+ANCHOR_BASIS_CAP_MISSING = "ENTRY_ANCHOR_BASIS_CAP_MISSING"
+# Hard ceilings of the entry rule's limits (review F6). Constants on purpose: raising one is a code
+# change and its review, never a configuration value. The mapping loader refuses limits above them
+# (an absolute move: above the ceiling percentage of the highest price the family's sizing can
+# buy), and the gateway refuses terms above them as a percentage of the anchor, or wider than the
+# policy's own entry collar (max_price_deviation_pct).
+ANCHOR_MAX_ADVERSE_PCT_CEILING = Decimal(1)
+ANCHOR_MAX_FAVOURABLE_PCT_CEILING = Decimal(2)
+ANCHOR_MAX_SIGNAL_AGE_CEILING_SECONDS = 120
 
 
 def move_limit(spec: str | None, anchor: Decimal) -> Decimal | None:
@@ -547,6 +561,14 @@ def _entry_anchor(a: TradeAction, q: MappedQuote, policy: MockPolicy, now: datet
     favourable = move_limit(t.anchor_max_favourable_move, anchor)
     if adverse is None or favourable is None or not t.anchor_max_signal_age_seconds:
         return None, _gate("HOLD", ANCHOR_RULE_INCOMPLETE)
+    collar = policy.max_price_deviation_pct
+    for name, limit, ceiling in (("ADVERSE", adverse, ANCHOR_MAX_ADVERSE_PCT_CEILING),
+                                 ("FAVOURABLE", favourable, ANCHOR_MAX_FAVOURABLE_PCT_CEILING)):
+        if limit <= 0 or limit > anchor * min(ceiling, collar) / 100:
+            return None, _gate("HOLD", ANCHOR_LIMIT_ABOVE_CEILING, f"{name}:{limit}")
+    if t.anchor_max_signal_age_seconds > ANCHOR_MAX_SIGNAL_AGE_CEILING_SECONDS:
+        return None, _gate("HOLD", ANCHOR_LIMIT_ABOVE_CEILING,
+                           f"SIGNAL_AGE:{t.anchor_max_signal_age_seconds:g}")
     if (now - published_at).total_seconds() > t.anchor_max_signal_age_seconds:
         return None, _gate("HOLD", ANCHOR_SIGNAL_TOO_OLD,
                            f"MAX_AGE:{t.anchor_max_signal_age_seconds:g}")
@@ -557,6 +579,15 @@ def _entry_anchor(a: TradeAction, q: MappedQuote, policy: MockPolicy, now: datet
         held = _reference_leg(q, policy, now)
         if held:
             return None, held
+        # Review F4: the anchor bounds the reference price only. The execution price is bounded
+        # by the live basis, within the family's cap, or the entry does not happen.
+        cap, age = ((t.max_abs_basis, t.max_basis_age_seconds) if t.max_abs_basis is not None
+                    else (t.anchor_max_abs_basis, t.anchor_max_basis_age_seconds))
+        if cap is None or not age:
+            return None, _gate("HOLD", ANCHOR_BASIS_CAP_MISSING)
+        _, reasons = _basis(q, now, cap, age)
+        if reasons:
+            return None, _gate("HOLD", *reasons)
         live, series = _touch(q.reference, long), "REFERENCE"
     else:
         live, series = (q.ask if long else q.bid), "EXECUTION"
@@ -603,7 +634,8 @@ def _mapped_open(a: TradeAction, q: MappedQuote, policy: MockPolicy, now: dateti
     stop, target, bad = _mapped_levels(a)
     if bad:
         return bad
-    if policy.require_stop_on_open and stop is None:
+    if (policy.require_stop_on_open or anchored) and stop is None:
+        # An anchored entry always carries a protective stop, whatever the policy says.
         return _gate("HOLD", "PROTECTIVE_STOP_MISSING")
     # Direction checks in the publisher's own series (both sides of each comparison are there).
     if stop is not None and (stop >= ref if long else stop <= ref):
@@ -745,6 +777,8 @@ def _mapped_follow_up(a: TradeAction, q: MappedQuote, policy: MockPolicy,
             if anchored is None:
                 extra = [ANCHOR_NOT_STATED] if t.entry_rule == REFERENCE_AS_COLLAR else []
                 return _gate("HOLD", "ADD_ENTRY_REFERENCE_MISSING", *extra)
+            if prior_stop is None:  # an anchored add never adds to an unprotected idea
+                return _gate("HOLD", "PROTECTIVE_STOP_MISSING")
             entry = anchored.entry_limit
             if t.basis == "BASIS_SHIFT":  # both legs live and near-simultaneous, recorded
                 shifted, reasons = _basis(q, now)
