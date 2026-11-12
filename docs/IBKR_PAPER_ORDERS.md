@@ -18,6 +18,29 @@ owner's explicit, separate authorization of one bounded experiment and an indepe
 The read-only `IbkrSession` is unchanged and still cannot send an order message. The order code
 lives in this separate package; the read-only package's AST test still forbids order names there.
 
+## What is disabled by default, and what would have to be true for one order to be sent
+
+An order frame is a PLACE_ORDER (place, bracket child, amendment: id 3) or a CANCEL_ORDER (id 4).
+Global cancel (58), option exercise (21), configuration update (109) and financial-advisor writes
+(18, 19) are refused on every path. On the shipped tree, with nothing written by hand, **no path
+below can send one**.
+
+| Way an order frame could reach the wire | Shipped default | What must ALL be true to send one | Tests that pin it |
+|---|---|---|---|
+| The runtime service (`scripts/run_service.py`, `tb_operator.py`, the watchdog, the dashboard) | No broker connection at all: `mode = "mock"` only, the SimBroker | Impossible: the runtime accepts only `"mock"`, has no key that selects a broker, imports neither `tradingbot.ibkr` nor `tradingbot.ibkr_orders`, and `build_service` builds only `SimBroker` | `test_the_runtime_accepts_only_its_simulated_mode`, `test_the_runtime_config_has_no_key_that_selects_another_broker`, `test_the_runtime_builds_the_simulated_broker_only`, `test_runtime_execution_core_and_read_only_adapter_do_not_load_the_order_package` |
+| The read-only adapter (`IbkrSession`, `ibkr_paper_check.py`, `ibkr_contract_discovery.py`, dashboard page 7) | Cannot: ids 3 and 4 are not in its deny-by-default allowlist, the order methods are denied | Impossible: the allowlist is exactly the 12 reviewed reads, unchanged by the merge | `test_read_only_allowlist_is_exactly_the_reviewed_read_set`, `test_read_only_allowlist_by_message_id_with_the_sdk`, `test_read_only_session_still_cannot_send_any_order_message` |
+| Any other module importing the order package | None does | Only `tradingbot.ibkr_orders` and the two `scripts/ibkr_paper_*` scripts import it; no shipped file names it otherwise | `test_only_the_order_package_and_its_two_scripts_import_it`, `test_no_shipped_non_test_file_names_the_order_package_dynamically` |
+| `scripts/ibkr_paper_init_journal.py` | Never sends | Offline: opens no socket | `test_init_script_is_offline_and_runs_once` |
+| `scripts/ibkr_paper_experiment.py` without a stage | Does nothing | One explicit stage argument; no flag skips or repeats a stage | `test_the_script_does_nothing_without_one_explicit_stage`, `test_the_script_has_no_flag_to_skip_or_repeat` |
+| `PaperOrderSession._send_place` (stage 2 bracket; stage 3 entry, stop, amendment, close) | Unreachable | 1. a private `~/.config/tradingbot/ibkr/paper_orders.toml` (mode 0600, owner-only) written by hand with `orders = "paper-test-1"` (the repo ships none and no template); 2. `state_dir` an existing private directory; 3. the journal created by hand with the init script; 4. paper port, loopback, a `D…` account, `tradingMode=p` and a listener owned by `tws_os_user`; 5. TWS's own `managedAccounts` exactly that account; 6. TWS reports Read-Only API **OFF**, localhost-only ON, the configured port; 7. the TLT contract pinned; 8. the stage's preconditions (the previous stage passed, this one never passed, the journal at the stage's starting count; stage 3 also a LIVE or DELAYED stage-1 quote); 9. `order_guard` ALLOW on every cap, the clock and the position cross-check; 10. the journal line fsync'd; 11. a one-shot permit for exactly those bytes, re-checked at the wire | `test_no_orders_entry_no_state_dir_or_no_journal_means_no_order_capability`, `test_the_repo_ships_no_order_config_and_no_template_that_works_as_is`, `test_the_default_order_config_path_is_private_and_absent_by_default`, `test_order_session_needs_a_loaded_order_config`, `test_deleting_the_journal_never_gives_a_fresh_budget`, `test_order_mode_refuses_unless_read_only_is_explicitly_off`, `test_every_stage_refuses_without_its_predecessor`, `test_a_failed_stage_that_submitted_cannot_run_again`, `test_stage3_refuses_without_a_live_or_delayed_quote_in_stage1`, `test_stage3_refuses_when_the_journal_is_not_at_two`, the guard and wire tests below |
+| `PaperOrderSession._send_cancel` (the core's cancels, stage 2, `abort`, a partial bracket's parent cancel) | Unreachable | Items 1, 2 and 4 to 7 above (a READY order session); an own, non-final order of this client; a one-shot permit. Never counted; works with the journal unknown (cancels only reduce risk) | `test_abort_cancels_only_this_clients_orders_by_id`, `test_what_counts_toward_the_six` |
+| Direct SDK calls (`placeOrder`, `cancelOrder`, `placeOrderProtoBuf`, `sendMsg`, a replayed frame, global cancel) | Refused | Impossible without a permit; the text-framed and global paths are denied | `test_denied_methods_raise_and_send_nothing`, `test_direct_sends_without_a_guard_permit_never_reach_the_wire`, `test_object_graph_of_order_session_reaches_no_unguarded_order_send` |
+| The funded (live) account | Unreachable | Impossible: the config accepts only a `D…` paper id on a paper port, and TWS's own account list must be exactly that id (a live login reports `U…`) | `test_only_a_paper_account_id_can_be_configured`, `test_non_paper_accounts_refused_in_order_mode`, `test_live_ports_refused_in_order_mode`, `test_the_broker_account_list_must_be_exactly_the_paper_account` |
+| Another program on the Mac while Read-Only API is OFF | The owner's standing TWS setting is Read-Only API ON | Out of scope for this code: the owner turns Read-Only OFF only for stages 1 to 3 and back ON afterwards | runbook below |
+
+Order execution stays separate from merging: merging this code changes nothing above. One order
+needs every hand-written item in the `_send_place` row **and** the owner running one stage command.
+
 ## Safety model
 
 1. **Enabling.** Order mode exists only when `PaperOrderSession` is given a `PaperOrderConfig`
@@ -86,8 +109,11 @@ they agree again. A failed read is `POSITION_UNKNOWN`. The comparison made at co
 
 **Exits never remove protection for a refused close.** Before the binding cancels or shrinks a
 protective SELL stop (the execution core does this before sending a close), it runs the guard on
-a closing SELL LMT for what is held, with the same inputs it will see at send time and the stop
-assumed gone (`dry_check_exit`). If that is refused, nothing is cancelled and the core sees a
+a closing SELL LMT for what is held, priced as the core prices the close (a fresh bid less the
+policy collar, `exit_collar_pct` = `MockPolicy.max_price_deviation_pct`, snapped up to the tick
+with the core's own `snap_to_tick`), never at the stop price, with the same inputs it will see at
+send time and the stop assumed gone (`dry_check_exit`). A binding without a collar, or a quote
+that cannot price the exit, cancels or shrinks no stop while anything is held. If that is refused, nothing is cancelled and the core sees a
 cancel failure (`EXIT_WOULD_BE_REFUSED`), so the exit is not netted and the stop stays. If the
 real close is nevertheless refused or fails (nothing sent) after the stop was cancelled, the
 binding raises `ProtectionLost` ("POSITION_OPEN_PROTECTION_ABSENT", a `BrokerError`). The core
@@ -102,8 +128,37 @@ submission of an earlier session with no terminal evidence: a final status, a co
 it is older than `JOURNAL_SETTLE_SECONDS` (120 s). So a second SELL is refused while an earlier
 SELL is possibly live, and a second BUY likewise; a confirmed cancel frees it.
 
-The cap is **6 submissions**, and every `placeOrder` counts (bracket children and amendments too).
-Cancels do not count and stay possible after the cap, because they only reduce risk.
+The cap is **6 submissions** (`caps.py:45`): every PLACE_ORDER frame counts, and nothing else.
+
+| Event | Counts | Why |
+|---|---|---|
+| Entry (BUY LMT), alone or as a bracket parent | 1 | a PLACE_ORDER frame |
+| Protective child (SELL STP) of a bracket | 1 | its own PLACE_ORDER frame |
+| Amendment (stop raise, price or quantity change) | 1 | re-placed under the same id |
+| Closing SELL LMT | 1 | a PLACE_ORDER frame |
+| An order the broker rejects, or never acknowledges | 1 | it was sent; it is never resent |
+| Cancel (by the core, by stage 2, by `abort`, a partial bracket's parent cancel) | 0 | a CANCEL_ORDER frame only reduces risk; possible after the cap |
+| A guard refusal, or any failure before the send | 0 | nothing was sent |
+
+The journal line is fsync'd **before** the frame is sent, so a crash after the append counts the
+order even if it never left. A bracket is checked whole: if it does not fit the rest of the budget,
+nothing of it is sent (`SUBMISSION_CAP`); once 6 are used, every placement is
+`EXPERIMENT_FINISHED`.
+
+| Stage | Submissions | Starts from | Ends at |
+|---|---|---|---|
+| 0 `stage0-refusal` | 0 | 0 | 0 |
+| 1 `stage1-lookups` | 0 | 0 | 0 |
+| 2 `stage2-unfillable-bracket` | 2 (BUY LMT parent + SELL STP child) | 0 | 2 |
+| 3 `stage3-lifecycle` | 4 (entry + stop = 2, one stop raise = 1, close = 1; the stop's cancel before the close = 0) | 2 | 6 |
+| `abort` | 0 (cancels only) | any | unchanged |
+
+Pinned by `test_what_counts_toward_the_six`, `test_a_partial_bracket_counts_both_orders_and_its_parent_cancel_counts_nothing`,
+`test_a_bracket_that_does_not_fit_the_remaining_budget_sends_nothing`,
+`test_full_lifecycle_within_the_six_submission_cap` (2, 3, 4),
+`test_stages_0_to_3_then_nothing_more` (stage 3 steps 4, 5, 6),
+`test_stage_names_and_per_stage_budget_are_the_runbooks` and
+`test_submission_arithmetic_is_exactly_the_cap`.
 
 Refusal reasons (`RefusalReason`):
 
@@ -173,6 +228,10 @@ which is accepted). The used count is the number of submission lines.
   of `AckLost`. The coordinator journals `ACK_LOST`, never `ACK`, and adopts what the lookup
   finds: a cancelled entry, or a filled entry with a missing stop, which gives
   `UNPROTECTED_POSITION`.
+- **Price conditions** (main's optional `ConditionalOrders`): `supports_price_conditions()` is
+  False, so the core sends no reference-triggered order here, and `submit` refuses an
+  `OrderIntent` with a `condition` (`PRICE_CONDITION_NOT_SUPPORTED`, nothing sent). There is no
+  `reconnect` (`ReconnectableBroker`): a dropped session is a new process and a new session.
 - **`modify`.** Re-places under the original id (counts as a submission). It succeeds only when an
   `openOrder` echo shows the new values. An error gives `BrokerError` (the original stands); a
   timeout gives `AckLost`.
@@ -237,8 +296,11 @@ hand (below); stage 3 then never runs.
 
 **If stage 2 fills** (result `STAGE2_UNEXPECTED_FILL`): stage 2 cancels the parent first and
 cancels the child only when the parent is confirmed cancelled with nothing filled. After any
-fill it leaves the protective SELL STP working, records what is held and blocks stage 3. Do NOT
-run `abort` first: it would cancel the stop. In TWS, sell the share by hand with a limit at the
+fill it sends no cancel for the protective SELL STP, records what is held and blocks stage 3. The
+evidence (`held.stop_status`, `held.stop_working`) and the message report the child's actual
+state: the broker may have cancelled it with its parent. If the stop is working, do NOT run
+`abort` first: it would cancel the stop. If it is not working, the share is unprotected: close it
+by hand at once. In TWS, sell the share by hand with a limit at the
 bid, confirm the TLT position is 0, then run `abort` to cancel the remaining stop.
 
 ## Emergency stop
@@ -271,8 +333,11 @@ bid, confirm the TLT position is 0, then run `abort` to cancel the remaining sto
   default for an absent field is undocumented.
 - Whether untransmitted orders appear in open orders.
 - How a real child rejection affects its held parent.
-- Simulated stops that report PreSubmitted while active. The coordinator's "child active ⇒ entry
-  filled" inference treats PreSubmitted as inactive.
+- Stops that report PreSubmitted while active. The coordinator never infers an entry fill from
+  its child (`ENTRY_STATE_UNKNOWN`: at IBKR a child is PreSubmitted before the parent fills and
+  may stay so after). A PreSubmitted stop is confirmed as protection only once the parent's own
+  fills are applied (`coordinator.py` `_maintain_protection`, `reconcile.py`); until then the
+  position reads UNPROTECTED.
 - Execution corrections (execId suffix revisions).
 - Commission arriving before or after its execution.
 - `openOrder` rows without an account. These are treated as foreign and poison the session.
