@@ -89,6 +89,7 @@ def build_service(
     clock: Callable[[], datetime] | None = None,
     transport: HttpTransport | None = None,
     notifier: Notifier | None = None,
+    allow_candidate_lexicon: bool = False,
 ) -> RuntimeService:
     if config.mode != "mock":
         raise ConfigError("only mock mode may run")
@@ -105,4 +106,5 @@ def build_service(
         notifier=notifier or build_notifier(config, clock),
         clock=clock,
         store=store,
+        allow_candidate_lexicon=allow_candidate_lexicon,
     )

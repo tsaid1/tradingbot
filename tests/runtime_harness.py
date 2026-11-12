@@ -136,9 +136,11 @@ class Runtime:
         posts_file: Path | None = None,
         compression: float | None = 1.0,
         mapping_file: Path = SERVICE_MAPPING,
+        allow_candidate_lexicon: bool = False,
         **overrides,
     ):
         self.folder = Path(folder)
+        self.allow_candidate_lexicon = allow_candidate_lexicon
         self.clock = SimClock(START)
         self.posts_file = posts_file or write_posts(self.folder / "posts.jsonl", posts or [])
         raw = {
@@ -185,6 +187,7 @@ class Runtime:
             notifier=self.notifier,
             clock=self.clock.now,
             store=self.store,
+            allow_candidate_lexicon=self.allow_candidate_lexicon,
         )
         return self.service
 

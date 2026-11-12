@@ -770,11 +770,15 @@ def understood_words(extra=()) -> frozenset[str]:
 def unresolved_market_mentions(text: str, own: set[str], own_codes: set[str], roots: set[str],
                                *, understood: frozenset[str] = frozenset(),
                                non_market: set[str] = frozenset(),
-                               futures: bool = False) -> list[MarketMention]:
+                               futures: bool = False,
+                               found_out: list[tuple[str, MarketMention]] | None = None,
+                               ) -> list[MarketMention]:
     """The kinds of market mention in ``text`` that do not resolve to this family. ``own`` are the
     family's lower-case names and aliases (public and private), ``own_codes`` its upper-case codes
     and symbols, ``roots`` its futures roots (a contract code of its own is its own). Cashtags are
-    decided by the caller. Kinds only: never the words."""
+    decided by the caller. Kinds only: never the words. ``found_out`` (the owner's local review
+    tool only; never logged or journaled) also receives each mention as (word, kind); it changes
+    nothing in the result."""
     text = (text or "").replace("’", "'").replace("‘", "'")
     own = {o.lower() for o in own if o}
     understood = understood or understood_words()
@@ -792,10 +796,12 @@ def unresolved_market_mentions(text: str, own: set[str], own_codes: set[str], ro
                         lambda m: " " * len(m.group(0)), masked, flags=re.IGNORECASE)
     found: set[MarketMention] = set()
     low = masked.lower()
-    for noun in MARKET_NOUNS:
+    for noun in sorted(MARKET_NOUNS):
         if re.search(rf"(?<![\w]){re.escape(noun)}(?![\w])", low):
             found.add(MarketMention.MARKET_NOUN)
-            break
+            if found_out is None:
+                break
+            found_out.append((noun, MarketMention.MARKET_NOUN))
     head_re = (rf"(?<![\w])\$?(?:{'|'.join(re.escape(o) for o in sorted(own, key=len, reverse=True))})"
                r"(?:'s)?[\s-]+$") if own else None
     for m in _TOKEN_RE.finditer(masked):
@@ -813,6 +819,8 @@ def unresolved_market_mentions(text: str, own: set[str], own_codes: set[str], ro
                 head.upper() == r or code_shaped(head.upper(), r) for r in roots))
             if not (own_head or month_head):
                 found.add(MarketMention.INSTRUMENT_PHRASE)
+                if found_out is not None:
+                    found_out.append((whole, MarketMention.INSTRUMENT_PHRASE))
             continue
         # "EUR/USD", "BRK.B": each part is a candidate (review B2); only the first part can be
         # sentence-initial.
@@ -823,6 +831,8 @@ def unresolved_market_mentions(text: str, own: set[str], own_codes: set[str], ro
                                  initial=(k == 0 and at in first_tokens))
             if kind is not None:
                 found.add(kind)
+                if found_out is not None:
+                    found_out.append((bare, kind))
     return sorted(found, key=lambda k: k.value)
 
 
@@ -855,6 +865,19 @@ PROTECTIVE_WORDS = frozenset((
     "objective", "with", "a", "an", "the", "and", "at", "is", "are", "our", "my", "set", "of",
     "price", "level", "loss",
 ))
+
+
+def protective_unknown_words(sentence: str, extra=()) -> list[str]:
+    """The owner's local review tool only (never logged or journaled): the words of ``sentence``
+    a protective-levels sentence may not hold, besides ``PROTECTIVE_WORDS`` and the private
+    phrases ``extra``. Decides nothing."""
+    seg = _TOKEN_RE.findall(sentence or "")
+    words = [_word(t) for t in seg]
+    tags: list[str | None] = [None] * len(words)
+    _tag(words, list(extra), "allowed", tags)
+    return [w for t, w, tag in zip(seg, words, tags, strict=True)
+            if tag is None and not any(ch.isdigit() for ch in t)
+            and any(ch.isalpha() for ch in w) and w not in PROTECTIVE_WORDS]
 
 
 def protective_sentence_problem(sentence: str, own_values: set[Decimal], extra=()) -> str | None:
