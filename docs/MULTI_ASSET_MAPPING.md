@@ -243,6 +243,25 @@ is written in between punctuation (`,` `;` `.` `:` `!` `?`, a line break, a spac
    anchor of an oil family that does not list "brent". For a future, a month or contract code on
    the line is left to the contract check instead (rule 3 of the *Level contract rule*).
 
+*Anchor scope* (`entry_anchor.anchor_scope`, required with the rule, no default: how much textual
+certainty the owner requires). Both values apply rules 1 to 3 to the marked number's own sentence
+unchanged; there is no windowed option (a window's start and end could be gamed inside one
+sentence). They differ only for a standalone level sentence ("41.20 now." on its own):
+
+* `"SENTENCE_STRICT"` trusts only words: the sentence immediately before the level sentence must be
+  entirely on the allow-list (`ENTRY_ANCHOR_INSTRUMENT_UNCLEAR`, `PRECEDING_SENTENCE` otherwise).
+* `"ACTION_BLOCK"` also trusts the interpreter's delimitation: the level sentence is attributed
+  when the sentence immediately before it is one of this action's own clause sentences
+  (`Classification.clause`, the text the service passes as the action's clause), with nothing in
+  between; otherwise it falls back to the SENTENCE_STRICT test. The typed action exposes only that
+  clause. Which sentence a stop or target came from is not exposed (`PriceMention` carries a role
+  and a value, no sentence index), so a stop or target sentence counts as part of the block only
+  when it is itself entirely allow-listed ("Stop 40.10." is; "Stop below 40.10." is not). To
+  attribute more, the interpreter would have to expose the sentence span of the action's block.
+
+The decision records how the anchor was attributed (`anchor_attribution`: `OWN_SENTENCE`,
+`AFTER_OWN_INSTRUCTION`, `AFTER_ALLOW_LISTED_SENTENCE`, `FIRST_SENTENCE`).
+
 *Private extension.* A publisher's own present-market phrasing, and further names of a family,
 are never added to the public lists. They go in the optional `entry_anchor` section of the private
 lexicon file (`[interpreter] lexicon_path`, git-ignored):
@@ -400,8 +419,8 @@ Approve the following for each family:
 * The contract months and their roll dates, with the business-day margin.
 * The units per signal and the caps.
 * The trading session.
-* The entry rule. `REFERENCE_AS_COLLAR` only with its adverse and favourable move limits and its
-  signal age, chosen for the family within the code ceilings (1 %, 2 %, 120 s); for a
+* The entry rule. `REFERENCE_AS_COLLAR` only with its anchor scope, its adverse and favourable
+  move limits and its signal age, chosen for the family within the code ceilings (1 %, 2 %, 120 s); for a
   reference-series family without `[basis_shift]`, also its basis cap; and the family's plain-word
   `aliases` a level line may name it by.
 * For a DIRECT future, whether a level without a month means the front contract (`FRONT_MONTH`).
