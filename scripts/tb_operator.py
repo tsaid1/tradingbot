@@ -78,11 +78,12 @@ def _apply_now(config) -> list[dict] | None:
     from tradingbot.runtime.service import execution_config
     from tradingbot.runtime.store import RuntimeStore
 
-    if config.mode != "mock":
-        raise ConfigError("only mock mode may run")
+    if config.mode not in ("mock", "shadow"):
+        raise ConfigError("only mock mode or shadow mode may run")
     opened_at = datetime.now(UTC)  # this process opens its own broker session (review N2)
     try:
-        broker = SimBroker(config.broker_db, account=config.mock.account)
+        # Both modes simulate the account; this offline apply reads no quote at all.
+        broker = SimBroker(config.broker_db, account=config.simulated_account)
         coordinator = ExecutionCoordinator(
             broker, config.execution_db, config.policy, execution_config(config)
         )

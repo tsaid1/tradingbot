@@ -1,6 +1,8 @@
 """Runtime configuration: one TOML file, validated strictly, failing closed.
 
-Only ``mode = "mock"`` is accepted (the simulated broker). Every table and key is checked: an
+Two modes are accepted, both with the simulated broker for every order, fill, position and the
+account: ``mode = "mock"`` (a static invented market) and ``mode = "shadow"`` (real quotes from the
+read-only IBKR adapter, simulated fills; ``[shadow]`` names the private paper config). Every table and key is checked: an
 unknown key, a missing required value or a wrong type refuses to start. Every size, cap, collar,
 freshness and timing value the service uses, and the expected broker account, must be written out
 explicitly (``REQUIRED_KEYS``): nothing that sizes or bounds an order runs on a default (review F4). Relative paths resolve
@@ -20,7 +22,7 @@ from pydantic import Field, ValidationError
 from tradingbot.models import MockPolicy, StrictModel
 
 DEFAULT_CONFIG_PATH = Path("~/.config/tradingbot/runtime.toml")
-ACCEPTED_MODES = ("mock",)
+ACCEPTED_MODES = ("mock", "shadow")
 
 
 class ConfigError(ValueError):
@@ -132,8 +134,18 @@ class MockConfig(StrictModel):
     quotes: dict[str, MockQuote] = Field(default_factory=dict)
 
 
+class ShadowConfig(StrictModel):
+    """``mode = "shadow"``: real read-only quotes, simulated fills (docs/RUNTIME.md)."""
+
+    # The private IBKR paper connection config, loaded exactly as the paper check loads it
+    # (tradingbot.ibkr.config.load_config: 0600 file, owner, no symlink, paper only). Required.
+    paper_config: Path
+    # The SIMULATED account the shadow broker reports; execution.expected_account must equal it.
+    account: str = Field(default="SIM-SHADOW-0001", pattern=r"^SIM-[A-Z0-9-]{1,32}$")
+
+
 class RuntimeConfig(StrictModel):
-    mode: Literal["mock"]
+    mode: Literal["mock", "shadow"]
     paths: PathsConfig
     source: SourceConfig
     service: ServiceConfig
@@ -142,6 +154,12 @@ class RuntimeConfig(StrictModel):
     notify: NotifyConfig = Field(default_factory=NotifyConfig)
     execution: ExecutionSettings
     mock: MockConfig = Field(default_factory=MockConfig)
+    shadow: ShadowConfig | None = None
+
+    @property
+    def simulated_account(self) -> str:
+        """The simulated broker's account in either mode."""
+        return self.shadow.account if self.shadow is not None else self.mock.account
 
     @property
     def runtime_db(self) -> Path:
@@ -239,6 +257,7 @@ def _resolve_paths(raw: dict, base: Path) -> None:
     fix(raw.get("source"), "file", "token_file", "client_file")
     fix(raw.get("interpreter"), "lexicon_path", "review_log_path")
     fix(raw.get("notify"), "log_file", "alerts_file")
+    fix(raw.get("shadow"), "paper_config")
 
 
 def parse_config(raw: dict, *, base: Path) -> RuntimeConfig:
@@ -246,8 +265,10 @@ def parse_config(raw: dict, *, base: Path) -> RuntimeConfig:
         raise ConfigError("config has no 'mode'; refusing to start")
     if raw["mode"] not in ACCEPTED_MODES:
         raise ConfigError(
-            f"mode {raw['mode']!r} is not accepted by this build; only 'mock' may run"
+            f"mode {raw['mode']!r} is not accepted by this build; only 'mock' (the simulated "
+            "broker) or 'shadow' (the simulated broker at read-only real quotes) may run"
         )
+    _check_mode_tables(raw)
     missing = [t for t in REQUIRED_TABLES if t not in raw]
     if missing:
         raise ConfigError(f"config is missing required table(s): {', '.join(missing)}")
@@ -266,6 +287,31 @@ def parse_config(raw: dict, *, base: Path) -> RuntimeConfig:
             f"{'.'.join(str(p) for p in e['loc'])}: {e['msg']}" for e in exc.errors()
         )
         raise ConfigError(f"invalid runtime config: {problems}") from None
+
+
+def _check_mode_tables(raw: dict) -> None:
+    """Shadow mode has its own table and never an invented market; mock mode has no [shadow]."""
+    if raw["mode"] == "mock":
+        if "shadow" in raw:
+            raise ConfigError("[shadow] is only accepted with mode = \"shadow\"")
+        return
+    if not isinstance(raw.get("shadow"), dict) or "paper_config" not in raw["shadow"]:
+        raise ConfigError("mode = \"shadow\" needs [shadow] paper_config (the private IBKR "
+                          "paper connection config); refusing to start")
+    if "mock" in raw:
+        raise ConfigError("mode = \"shadow\" takes its quotes from the read-only adapter only: "
+                          "remove the [mock] table (no invented market, no second account)")
+    source = raw.get("source")
+    if isinstance(source, dict) and source.get("kind") == "replay" \
+            and source.get("compression") is None:
+        raise ConfigError("mode = \"shadow\" decides on today's real quotes: a replay source "
+                          "needs compression (posts rebased onto the service clock); a historical "
+                          "replay would compare old posts with today's market")
+    account = raw["shadow"].get("account", ShadowConfig.model_fields["account"].default)
+    execution = raw.get("execution")
+    if isinstance(execution, dict) and execution.get("expected_account") != account:
+        raise ConfigError(f"mode = \"shadow\": execution.expected_account must be the simulated "
+                          f"shadow account {account!r}")
 
 
 def load_config(path: str | Path | None = None) -> RuntimeConfig:

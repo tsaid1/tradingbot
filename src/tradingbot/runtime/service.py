@@ -27,6 +27,12 @@ checks; a session under another account identity locks the service out of the br
 the halt; otherwise a full sync and a reconciliation with nothing unexplained must succeed before
 the block lifts, and what changed at the broker meanwhile is reported.
 
+Shadow mode (``mode = "shadow"``, docs/RUNTIME.md) runs the same cycle on a ``ShadowBroker``:
+every order, fill and position is simulated, quotes are real and read-only. The service stamps the
+broker's time anchor at each cycle and each decision, refreshes the quotes of held contracts every
+cycle (simulated stops see the real market), and journals the quote evidence of every decision
+and every simulated fill (``SHADOW_DECISION_QUOTES``, ``SHADOW_SIMULATED_FILL``).
+
 The service decides nothing itself. Every order comes from an action the gateway approved through
 the replay path; the mapping policy can only add a HOLD reason.
 """
@@ -47,11 +53,13 @@ from tradingbot.event_models import ParsedPost
 from tradingbot.execution import settlement
 from tradingbot.execution.broker import (
     Broker,
+    BrokerEnvironment,
     BrokerError,
     BrokerIdentityError,
     ContractRef,
     QuoteQuality,
     broker_connected,
+    broker_environment,
     reference_quote,
     session_identity,
 )
@@ -75,8 +83,9 @@ from tradingbot.execution.coordinator import (
 )
 from tradingbot.execution.reconcile import DiscrepancyKind, ReconciliationReport
 from tradingbot.execution.replay import BrokerEventReplay
+from tradingbot.execution.shadow_broker import FILL_LABEL, ShadowBroker
 from tradingbot.execution.store import LEDGER_REVERSAL, UNRESOLVED_STATES
-from tradingbot.models import Action, Instrument, LegQuote, MappedQuote, Quote
+from tradingbot.models import Action, ExecutionPlan, Instrument, LegQuote, MappedQuote, Quote
 from tradingbot.runtime import notify as N
 from tradingbot.runtime import vocab_review
 from tradingbot.runtime.alerts import Alerter
@@ -143,6 +152,9 @@ ADOPTED_EVENTS = frozenset(
      "ENTRY_STATE_UNKNOWN", "ENTRY_REMAINDER_CANCELLED", "PROTECTIVE_CANCELLED", LEDGER_REVERSAL,
      "UNPROTECTED_POSITION"}
 )
+SHADOW_CANDIDATE_REFUSED = ("a candidate lexicon may not run in shadow mode: an experimental "
+                            "vocabulary runs only in an offline mock replay on a throwaway state "
+                            "directory, and a shadow run reads a real broker session")
 # Bounds the arithmetic only; max_backoff_seconds still bounds the wait itself.
 MAX_BACKOFF_EXPONENT = 32
 FAILURE_KIND = {
@@ -306,11 +318,20 @@ class RuntimeService:
         allow_what_if_mapping: bool = False,
         allow_candidate_lexicon: bool = False,
     ):
-        if config.mode != "mock":
-            raise ValueError("only mock mode may run")
+        if config.mode not in ("mock", "shadow"):
+            raise ValueError("only mock mode or shadow mode may run")
+        if config.mode == "shadow" and not (
+                isinstance(broker, ShadowBroker)
+                and broker_environment(broker) is BrokerEnvironment.SIM):
+            raise ValueError("shadow mode runs on the ShadowBroker only (simulated fills, "
+                             "read-only quotes)")
         if allow_what_if_mapping and not isinstance(source, ReplayFileSource):
             # A what-if mapping is an offline analysis aid: never with a live source.
             raise ValueError("a what-if mapping may only be used with a replay-file source")
+        if allow_candidate_lexicon and config.mode == "shadow":
+            # An experimental vocabulary runs only in an offline replay on a throwaway state
+            # directory; a shadow run reads a real (read-only) broker session.
+            raise ConfigError(SHADOW_CANDIDATE_REFUSED)
         if allow_candidate_lexicon and not isinstance(source, ReplayFileSource):
             # A candidate lexicon is an experiment: never with a live source.
             raise ConfigError("a candidate lexicon may only be used with a replay-file source")
@@ -379,13 +400,34 @@ class RuntimeService:
             cursor=source.cursor(),
             restart=self.cycles > 0,
             what_if_mapping=self.mapping.what_if is not None,
+            **({"mode": "shadow", "fills": FILL_LABEL} if self.shadow else {}),
         )
+        if self.shadow:
+            # Review S3: every shadow record is journaled the moment it happens; fills a crash
+            # left unjournaled are rebuilt from the simulator and the write-ahead evidence.
+            self.broker.journal = lambda event, detail: self.store.event(
+                self.clock(), event, **detail)
+            self.broker.opening_limit = self._opening_limit
+            journaled = {str(e["detail"].get("exec_id")) for e in self.store.events()
+                         if e["event"] == "SHADOW_SIMULATED_FILL"}
+            for record in self.broker.recover_fill_records(journaled):
+                self.store.event(now, "SHADOW_SIMULATED_FILL", **record)
 
     # ================================================================== cycle
 
+    @property
+    def shadow(self) -> bool:
+        return self.config.mode == "shadow"
+
     def close(self) -> None:
-        """Release the execution store lock (one live coordinator per store)."""
-        self.coordinator.close()
+        """Release the execution store lock (one live coordinator per store). Shadow mode: close
+        every held quote stream and disconnect the read-only session first."""
+        try:
+            if self.shadow:
+                failures = self.broker.close()
+                self.store.event(self.clock(), "SHADOW_SESSION_CLOSED", cleanup_failures=failures)
+        finally:
+            self.coordinator.close()
 
     @property
     def halted(self) -> bool:
@@ -395,6 +437,8 @@ class RuntimeService:
         now = self.clock()
         report = CycleReport(started_at=now)
         self.cycles += 1
+        if self.shadow:  # no quote read this cycle is stamped later than any decision's now
+            self.broker.set_reference_time(now)
         report.halted = self._check_halt(now)
         if session_state(self.store)["state"] == LOCKED_OUT:
             # Another account identity: no broker call at all (not even a cancel) until an
@@ -430,6 +474,7 @@ class RuntimeService:
             settlement.lift_verified_blocks(self.coordinator)
             self._check_roll_windows(now)
         report.halted = self._check_halt(self.clock()) or report.halted
+        self._journal_shadow_fills()
         self._raise_alerts(self.clock(), report)
         self._heartbeat(report)
         return report
@@ -514,6 +559,8 @@ class RuntimeService:
             self.broker.positions()
             if self.source.realtime:
                 self._publish_mock_quotes(now)
+            if self.shadow:  # simulated stops and targets see the real market every cycle
+                self.broker.refresh_quotes()
         except Exception as exc:  # noqa: BLE001 - any broker fault is a broker failure
             self._failure("broker", exc, now)
             self._session_lost(now, exc)
@@ -797,6 +844,9 @@ class RuntimeService:
             lag = getattr(self.config.source, "lag_seconds", 0.0)
             decision_now = post.available_at + timedelta(seconds=lag)
             self._publish_mock_quotes(decision_now)
+        if self.shadow:
+            self.broker.set_reference_time(decision_now)
+            self.broker.take_quote_log()  # reads before this post are not its decision
         interpreted = self.interpreter.interpret(post)
         interpreted_at = self.clock()
         recorded = self._recorded_mappings()
@@ -901,9 +951,53 @@ class RuntimeService:
             context=self.interpreter.context,
             at=decided_at,
         )
+        if self.shadow:
+            # What each decision was made on: the label, reason and per-side ages of every quote
+            # read for this post, in order (public codes and numbers only).
+            self.store.event(
+                decided_at, "SHADOW_DECISION_QUOTES", source_id=post.source_id,
+                revision=post.revision, post_id=post.post_id,
+                decisions=[{"action_id": r["action_id"], "status": r["status"],
+                            "order_ref": r["order_ref"]} for r in rows],
+                quotes=self.broker.take_quote_log())
+            self._journal_shadow_fills()
         if self.review_log is not None and not result.duplicate:
             self._write_review_log(post, result.outcomes, decision_by_id, decided_at)
         return len(exceptions), result.duplicate
+
+    def _journal_shadow_fills(self) -> None:
+        """Records buffered before a journal was attached, and the stream-cap alert."""
+        if not self.shadow:
+            return
+        for record in self.broker.take_fill_log():
+            record = dict(record)
+            self.store.event(self.clock(), record.pop("event", "SHADOW_SIMULATED_FILL"),
+                             **record)
+        now = self.clock()
+        keep = set()
+        for key, since in self.broker.cap_refusals.items():
+            keep.add(f"SHADOW:CAP:{key}")
+            self.alerter.raise_(
+                f"SHADOW:CAP:{key}", N.SHADOW_STREAM_CAP_REACHED, "Quote stream cap reached",
+                f"{key}: no quote stream (cap reached since {since}; every stream is held by a "
+                "contract with a working simulated order or position): its quote is "
+                "unavailable and its entries hold", now)
+        self.alerter.sweep("SHADOW:CAP:", keep, now)
+
+    def _opening_limit(self, order_ref: str) -> float | None:
+        """The per-side quote age an opening order was approved under: the anchored rule's
+        ``anchor_max_quote_age_seconds``, else the policy's ``max_quote_age_seconds``. None (never
+        matched) when the intent or its plan cannot be read."""
+        intent = self.coordinator.intent(order_ref)
+        if intent is None:
+            return None
+        try:
+            plan = ExecutionPlan.model_validate_json(intent.plan) if intent.plan else None
+        except ValueError:
+            return None
+        if plan is not None and plan.entry_rule == "REFERENCE_AS_COLLAR":
+            return plan.anchor_max_quote_age_seconds
+        return float(self.config.policy.max_quote_age_seconds)
 
     def _warn_synced_private_paths(self) -> None:
         """Review S5 and the Product Owner's path policy: a private file in a cloud-synced folder
@@ -1334,6 +1428,8 @@ class RuntimeService:
                 "explained": (len(rec.discrepancies) - len(rec.blocking)) if rec else 0,
             },
         }
+        if self.shadow:
+            payload["shadow"] = self.broker.status()
         self.store.put("health", {c: asdict(h) for c, h in self.health.items()}, now)
         self.store.put("cycles", self.cycles, now)
         self.store.put("heartbeat", payload, now)
