@@ -426,3 +426,157 @@ def test_entry_life_the_core_expiry_first_and_the_shadow_never_cancels_twice(
     _assert_clean_end(sh, intent)
     sh.close()
     assert_only_read_only_messages(tws)
+
+
+# ------------------------------------------------------------------ the spared order (round 3)
+def _turn(sh, mono, how):
+    """The stream stops qualifying an opening order, with an ask BELOW the resting 88.35 limit."""
+    rid = sh.rid()
+    if how == "delayed":
+        _delayed(sh, 88.30, 88.32)
+    elif how == "frozen":
+        sh.tick(-1, price(rid, 1, 88.30), price(rid, 2, 88.32),
+                frame(IN.MARKET_DATA_TYPE, MarketDataType(reqId=rid, marketDataType=2)))
+    else:  # one side stale: the ask sits at 88.32 beyond the 30 s limit, only the bid moves
+        sh.tick(-1, price(rid, 2, 88.32))
+        mono.t += 31.0
+        sh.tick(-1, price(rid, 1, 88.29))
+
+
+@pytest.mark.parametrize("how", ["delayed", "frozen", "one_side_stale"])
+def test_round3_the_reviewers_probe_the_cancelled_entry_never_fills_on_the_cancel_read(
+        shadow, tws, mono, how):
+    sh = shadow()
+    b, sim = sh.broker, sh.sim()
+    c = next(iter(b._by_query.values()))
+    sh.live(88.40, 88.42)
+    b.opening_limit = lambda ref: 30.0
+    entry = OrderIntent(order_ref="TB-e", contract=c, side=OrderSide.BUY, quantity=1,
+                        order_type=OrderType.LMT, limit_price=Decimal("88.35"))
+    stop = OrderIntent(order_ref="TB-e.STP", contract=c, side=OrderSide.SELL, quantity=1,
+                       order_type=OrderType.STP, stop_price=Decimal("87.00"), parent_ref="TB-e",
+                       reduce_only=True)
+    b.submit(entry, [stop])
+    _turn(sh, mono, how)
+    out = b.cancel("TB-e")  # the core cancels its resting entry: no exception
+    assert out.status.value == "Cancelled"
+    assert sim.executions() == [] and sim.positions() == [] and sim.open_orders() == []
+    assert {o.order_ref: o.status.value for o in sim.all_orders()} == {
+        "TB-e": "Cancelled", "TB-e.STP": "Cancelled"}
+    assert [r for r in b.take_fill_log()] == []  # the core's reason only
+    sh.close()
+    assert_only_read_only_messages(tws)
+
+
+@pytest.mark.parametrize("by", ["expiry", "close"])
+@pytest.mark.parametrize("when", ["before", "at", "after"])
+def test_round3_the_core_cancels_by_expiry_or_close_and_the_stream_turns_around_it(
+        shadow, tws, mono, by, when):
+    posts = [post("1", 0, RESTING)] + ([post("2", 30, CLOSE)] if by == "close" else [])
+    sh = shadow(posts)
+    fresh = _above_the_limit(sh)
+    run_until_processed(sh, 1, before=fresh)
+    intent, _ = _entry_life(sh)
+    if when == "at":
+        orig = sh.broker.cancel
+
+        def cancel(order_ref):
+            _turn(sh, mono, "delayed")
+            return orig(order_ref)
+
+        sh.broker.cancel = cancel
+    turned = False
+    for _ in range(40):
+        due = (sh.service.clock() - intent.created_at).total_seconds() > (
+            25 if by == "close" else 115)
+        if when == "before" and due and not turned:
+            _turn(sh, mono, "delayed")
+            turned = True
+        else:
+            fresh()
+        sh.step(5.0)
+        if _entry_life(sh)[0].state.value != "WORKING":
+            break
+    if when == "after":
+        for _ in range(2):
+            _turn(sh, mono, "delayed")
+            sh.step()
+    intent, journal = _entry_life(sh)
+    assert intent.state.value == "CANCELLED", (intent.state, journal)
+    core = {"expiry": "ENTRY_EXPIRED_UNFILLED", "close": "ENTRY_CANCELLED_BEFORE_FILL"}[by]
+    shadow_reasons = sh.events("SHADOW_OPENING_ORDER_CANCELLED")
+    if when == "before":
+        assert len(shadow_reasons) == 1 and core not in journal, journal
+    else:
+        assert shadow_reasons == [] and core in journal, (journal, shadow_reasons)
+    assert not [e for e in sh.service.store.events() if e["event"] == "POST_PROCESSING_FAILED"]
+    assert "CANCEL_FAILED" not in journal
+    _assert_clean_end(sh, intent)
+    sh.close()
+    assert_only_read_only_messages(tws)
+
+
+def test_round3_an_unconfirmed_core_cancel_on_a_not_live_stream_blocks_and_never_fills(
+        shadow, tws, mono):
+    sh = shadow([post("1", 0, RESTING)])
+    fresh = _above_the_limit(sh)
+    run_until_processed(sh, 1, before=fresh)
+    intent, _ = _entry_life(sh)
+    orig = sh.broker.cancel
+    state = {"armed": True}
+
+    def cancel(order_ref):
+        if state["armed"]:  # the simulated broker refuses the cancel requests of this call
+            state["armed"] = False
+            _turn(sh, mono, "delayed")
+            sh.sim().script_next_cancel("REJECT")
+            sh.sim().script_next_cancel("REJECT")
+        return orig(order_ref)
+
+    sh.broker.cancel = cancel
+    for _ in range(30):
+        fresh() if state["armed"] else _turn(sh, mono, "delayed")
+        sh.step(5.0)
+        kinds = {e.kind for e in sh.service.coordinator.store.exceptions(open_only=True)}
+        if not state["armed"] and "ENTRY_REMAINDER_NOT_CANCELLED" in kinds:
+            break
+    assert "ENTRY_REMAINDER_NOT_CANCELLED" in kinds  # the instrument is blocked
+    assert sh.sim().executions() == []
+    for _ in range(3):  # later: the cancel goes through and is confirmed; the block lifts
+        _turn(sh, mono, "delayed")
+        sh.step(5.0)
+    kinds = {e.kind for e in sh.service.coordinator.store.exceptions(open_only=True)}
+    assert "ENTRY_REMAINDER_NOT_CANCELLED" not in kinds, kinds
+    intent, _ = _entry_life(sh)
+    assert intent.state.value == "CANCELLED" and sh.sim().executions() == []
+    assert sh.sim().positions() == [] and sh.sim().open_orders() == []
+    sh.close()
+    assert_only_read_only_messages(tws)
+
+
+def test_round3_a_restart_between_the_shadow_cancel_and_the_core_expiry(shadow, tmp_path, tws,
+                                                                         mono):
+    sh = shadow([post("1", 0, RESTING)])
+    fresh = _above_the_limit(sh)
+    run_until_processed(sh, 1, before=fresh)
+    _turn(sh, mono, "delayed")
+    sh.step()
+    assert len(sh.events("SHADOW_OPENING_ORDER_CANCELLED")) == 1
+    sh.service.coordinator.close()  # the process dies here
+    sh.broker.close()
+    again = Shadow(tmp_path, tws, mono, restart=True, clock=sh.clock)
+    try:
+        fresh2 = _above_the_limit(again)
+        for _ in range(30):
+            fresh2()
+            again.step(5.0)
+        [intent] = [i for i in again.service.coordinator.store.intents()
+                    if i.action.value == "OPEN"]
+        journal = [e.event for e in again.service.coordinator.store.journal()
+                   if e.order_ref == intent.order_ref]
+        assert intent.state.value == "CANCELLED" and "ENTRY_EXPIRED_UNFILLED" not in journal
+        assert len(again.events("SHADOW_OPENING_ORDER_CANCELLED")) == 1
+        assert again.sim().executions() == [] and again.sim().open_orders() == []
+    finally:
+        again.close()
+    assert_only_read_only_messages(tws)

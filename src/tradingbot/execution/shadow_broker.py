@@ -63,6 +63,7 @@ from tradingbot.execution.broker import (
     ContractRef,
     Fill,
     OrderIntent,
+    OrderNotFound,
     QuoteQuality,
 )
 from tradingbot.execution.shadow_quotes import (
@@ -175,7 +176,8 @@ class ShadowBroker:
         # (None: unknown, so the order is never matched), and the durable journal.
         self.opening_limit: Callable[[str], float | None] = lambda order_ref: None
         self.journal: Callable[[str, dict], None] | None = None
-        self.cap_refusals: dict[str, str] = {}  # contract_key -> when the cap refused its stream
+        self.cap_refusals: dict[str, str] = {}
+        self._spared: set[str] = set()  # cancelled for the core within its own cancel call  # contract_key -> when the cap refused its stream
         with self._evidence_db() as c:  # write-ahead quote evidence for fills (review S3)
             c.execute("CREATE TABLE IF NOT EXISTS shadow_quote_evidence (contract_key TEXT "
                       "PRIMARY KEY, label TEXT NOT NULL, evidence TEXT NOT NULL)")
@@ -470,9 +472,15 @@ class ShadowBroker:
         that this read does not qualify are cancelled first (review B1); the quote's evidence is
         written ahead (review S3); the quote is published (the simulator matches); ``action``
         runs on it; every new fill is journaled with its label; the store is set back to
-        UNAVAILABLE, so no later match can use this quote."""
-        self._cancel_unqualified_openings(quote, evidence, at, spare)
-        usable = (simulated.bid is not None and simulated.ask is not None
+        UNAVAILABLE, so no later match can use this quote.
+
+        The invariant (review round 3): an opening order is never exposed to matching on a read
+        that fails the opening gate, on any path. Every such order of the contract is cancelled
+        in the simulator BEFORE the read is published, ``spare`` (the order the execution core is
+        cancelling in this call) included: only its journal row is left to the core. If any of
+        them is still working afterwards (a refused cancel), the read is not published at all."""
+        exposed_safe = self._cancel_unqualified_openings(quote, evidence, at, spare)
+        usable = (exposed_safe and simulated.bid is not None and simulated.ask is not None
                   and simulated.quality is not QuoteQuality.UNAVAILABLE)
         label = simulated.quality.value if usable else None
         with self._evidence_db() as c:
@@ -497,21 +505,37 @@ class ShadowBroker:
                             received_at=self.clock(), contract=contract)
 
     def _cancel_unqualified_openings(self, quote: BrokerQuote, evidence: QuoteEvidence,
-                                     at: datetime, spare: str | None = None) -> None:
-        """``spare``: the order the execution core is cancelling in this very call (its expiry or
-        a publisher exit): it is cancelled once, for the core's reason, not twice."""
+                                     at: datetime, spare: str | None = None) -> bool:
+        """Cancel every resting opening order of the contract this read does not qualify.
+        ``spare``: the order the execution core is cancelling in this very call (its expiry or a
+        publisher exit): it is cancelled here too, but journaled once, for the core's reason.
+        Returns whether no unqualified opening order is left working (safe to publish)."""
         key = quote.contract.contract_key
-        for o in self._sim.open_orders():
-            if o.contract.contract_key != key or o.reduce_only or o.parent_ref is not None \
-                    or o.status.value == "PendingCancel" or o.order_ref == spare:
+
+        def unqualified():
+            return [(o, code) for o in self._sim.open_orders()
+                    if o.contract.contract_key == key and not o.reduce_only
+                    and o.parent_ref is None
+                    and (code := opening_problem(quote, at, self.opening_limit(o.order_ref)))]
+
+        for o, code in unqualified():
+            if o.status.value == "PendingCancel":
                 continue
-            code = opening_problem(quote, at, self.opening_limit(o.order_ref))
-            if code is None:
+            try:
+                self._sim.cancel(o.order_ref)  # takes effect before any match
+            except BrokerError as exc:
+                if o.order_ref != spare:
+                    self._record("SHADOW_OPENING_CANCEL_REFUSED", {
+                        "order_ref": o.order_ref, "contract_key": key, "code": code,
+                        "error": _safe(exc)})
                 continue
-            self._sim.cancel(o.order_ref)  # takes effect before the next match
-            self._record("SHADOW_OPENING_ORDER_CANCELLED", {
-                "order_ref": o.order_ref, "contract_key": key, "code": code,
-                "quote": evidence.as_dict()})
+            if o.order_ref == spare:
+                self._spared.add(o.order_ref)
+            else:
+                self._record("SHADOW_OPENING_ORDER_CANCELLED", {
+                    "order_ref": o.order_ref, "contract_key": key, "code": code,
+                    "quote": evidence.as_dict()})
+        return not unqualified()  # open_orders() settles the pending cancels first
 
     def _note_fills(self, label: str | None, evidence: QuoteEvidence | None) -> None:
         for f in self._sim.executions():
@@ -594,9 +618,23 @@ class ShadowBroker:
             order_ref, limit_price=limit_price, stop_price=stop_price, quantity=quantity))
 
     def cancel(self, order_ref: str) -> BrokerOrder:
+        """Idempotent for an order this very call already cancelled before publishing its read
+        (round 3): the core's cancel then sees it cancelled, as a confirmed cancel."""
         self._drain_stale_scripts("cancel")
-        return self._on_contract_of(order_ref, lambda: self._sim.cancel(order_ref),
-                                    spare=order_ref)
+        self._spared.discard(order_ref)
+
+        def cancel_it() -> BrokerOrder:
+            try:
+                return self._sim.cancel(order_ref)
+            except OrderNotFound:
+                if order_ref in self._spared:
+                    return self._sim.orders_with_ref(order_ref)[-1]
+                raise
+
+        try:
+            return self._on_contract_of(order_ref, cancel_it, spare=order_ref)
+        finally:
+            self._spared.discard(order_ref)
 
     def supports_price_conditions(self) -> bool:
         return self._sim.supports_price_conditions()
