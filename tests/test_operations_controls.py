@@ -318,6 +318,58 @@ def test_a_session_under_another_account_halts_and_stops_touching_the_broker(tmp
     assert rt.config.paths.halt_file.exists()  # the halt is the operator's to clear
 
 
+def _clear_lockout(rt, queue):
+    queue.enqueue(at=rt.clock.now(), operator="tester", origin="test",
+                  action=Q.CLEAR_IDENTITY_LOCKOUT, target="SIM-PAPER-0001", note=NOTE,
+                  confirmation=cat.lockout_phrase("SIM-PAPER-0001"))
+    rt.step()
+    return queue.requests()[-1]
+
+
+def test_clearing_a_lockout_reruns_every_identity_check_through_a_full_reconnect(tmp_path):
+    """Review F2: the identity check failed but the session came back up by itself. Clearing the
+    lockout must reconnect and run the checks afresh; while they fail the lockout stays."""
+    rt = Runtime(tmp_path, [])
+    rt.step()
+    rt.broker.disconnect()
+    rt.broker.fail_identity_check = True
+    rt.step()
+    assert session_state(rt.store)["state"] == "LOCKED_OUT"
+    assert session_state(rt.store)["reason"] == "IDENTITY_CHECK_FAILED"
+    rt.broker._connected = True  # the workstation reconnected on its own; the check still fails
+    queue = Q.OperatorQueue(rt.config.operator_db)
+    checks = rt.broker.identity_checks
+    req = _clear_lockout(rt, queue)
+    assert req["status"] == "REFUSED" and req["reasons"] == ["IDENTITY_CHECK_FAILED"]
+    assert rt.broker.identity_checks == checks + 1  # the checks ran again
+    assert session_state(rt.store)["state"] == "LOCKED_OUT"
+    assert any(e["event"] == "IDENTITY_LOCKOUT_CLEAR_REFUSED" for e in rt.store.events())
+    rt.broker.fail_identity_check = False
+    req = _clear_lockout(rt, queue)
+    assert req["status"] == "APPLIED"
+    assert rt.broker.identity_checks == checks + 2
+    rt.step()
+    assert session_state(rt.store)["state"] == "CONNECTED"
+    assert rt.config.paths.halt_file.exists()  # the halt stays the operator's to clear
+
+
+def test_clearing_a_lockout_needs_the_accepted_session_identity_too(tmp_path):
+    rt = Runtime(tmp_path, [])
+    rt.step()
+    accepted = rt.store.get("broker_identity")
+    rt.broker.disconnect()
+    real = rt.broker.session_identity
+    rt.broker.session_identity = lambda: {**real(), "session": "SIMULATED_LIVE"}
+    rt.step()
+    assert session_state(rt.store)["reason"] == "SESSION_IDENTITY_CHANGED"
+    queue = Q.OperatorQueue(rt.config.operator_db)
+    req = _clear_lockout(rt, queue)
+    assert req["status"] == "REFUSED" and req["reasons"] == ["SESSION_IDENTITY_NOT_ACCEPTED"]
+    assert rt.store.get("broker_identity") == accepted
+    rt.broker.session_identity = real
+    assert _clear_lockout(rt, queue)["status"] == "APPLIED"
+
+
 # ------------------------------------------------------------------------------ watchdog
 
 

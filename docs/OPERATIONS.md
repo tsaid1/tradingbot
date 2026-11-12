@@ -80,8 +80,13 @@ show under `operator.py history` and on the page.
 * `ack <id> <kind>`: closes a record that blocks nothing (`EXIT_NOT_NETTED`, `EXIT_WITHOUT_QUOTE`,
   `STALE_AFTER_UNKNOWN_OUTCOME`, `MODIFY_NOT_CONFIRMED`, `PROTECTIVE_LEVEL_NOT_LOOSENED`,
   `PARTIAL_GROUP`). `ack-signal <id> <kind>` closes a held signal.
-* `clear-lockout <expected account>`: applied only once the broker shows the expected account
-  again. The next cycle then runs the full resync.
+* `clear-lockout <expected account>`: forces a full reconnect through the adapter, so every
+  identity check it has runs again, even if the session looks connected. It is applied only if
+  that reconnect succeeds with the expected account and the same session identity the service
+  last accepted (account and paper or live; a session that changed kind is never accepted by a
+  typed word). Otherwise it is refused with the reason (`IDENTITY_CHECK_FAILED`,
+  `BROKER_STILL_SHOWS_ANOTHER_ACCOUNT`, `SESSION_IDENTITY_NOT_ACCEPTED`, `BROKER_UNREADABLE`) and
+  the lockout stays. Once applied, the next cycle runs the full resync. The halt stays engaged.
 * Never operator-clearable, because only evidence resolves them: `UNPROTECTED_POSITION`,
   `PROTECTION_UNVERIFIED`, `ENTRY_REMAINDER_NOT_CANCELLED`, `BROKER_STATE_UNKNOWN`,
   `BROKER_RECONNECT_PENDING`, `OPERATOR_SETTLEMENT_UNVERIFIED`.

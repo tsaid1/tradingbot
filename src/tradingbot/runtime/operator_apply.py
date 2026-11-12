@@ -9,7 +9,7 @@ from collections.abc import Callable
 from datetime import datetime
 
 from tradingbot.execution import settlement
-from tradingbot.execution.broker import BrokerError, session_identity
+from tradingbot.execution.broker import BrokerError, BrokerIdentityError, session_identity
 from tradingbot.execution.coordinator import ExecutionCoordinator
 from tradingbot.execution.operator_catalog import acknowledge_signal_phrase, lockout_phrase
 from tradingbot.runtime import operator_actions as Q
@@ -107,6 +107,10 @@ def _acknowledge_signal(store: RuntimeStore, req: dict, clock) -> settlement.Ope
 
 
 def _clear_lockout(coord, store: RuntimeStore, req: dict, expected_account: str, clock):
+    """Review F2: clearing a lockout always forces a full reconnect through the adapter, so every
+    identity check it has runs afresh, and succeeds only with the expected account AND the session
+    identity this service last accepted. Otherwise the lockout stays and the reason is recorded.
+    It never clears the halt."""
     session = session_state(store)
     before = {"session": session.get("state"), "reason": session.get("reason")}
     reasons = []
@@ -119,12 +123,22 @@ def _clear_lockout(coord, store: RuntimeStore, req: dict, expected_account: str,
     identity = None
     if not reasons:
         try:
+            _force_reconnect(coord.broker)
             identity = session_identity(coord.broker)
+        except BrokerIdentityError:
+            reasons.append("IDENTITY_CHECK_FAILED")
         except BrokerError:
             reasons.append("BROKER_UNREADABLE")
-    if identity is not None and identity.get("account") != expected_account:
-        reasons.append("BROKER_STILL_SHOWS_ANOTHER_ACCOUNT")
+    accepted = store.get("broker_identity")
+    if identity is not None:
+        if identity.get("account") != expected_account:
+            reasons.append("BROKER_STILL_SHOWS_ANOTHER_ACCOUNT")
+        elif accepted is not None and identity != accepted:
+            reasons.append("SESSION_IDENTITY_NOT_ACCEPTED")
     if reasons:
+        if session.get("state") == LOCKED_OUT:
+            store.event(clock(), "IDENTITY_LOCKOUT_CLEAR_REFUSED", request_id=req["id"],
+                        reasons=reasons, lockout_reason=session.get("reason"))
         return settlement.OperatorResult(status="REFUSED", reasons=reasons, before=before,
                                          after=before)
     now = clock()
@@ -134,6 +148,18 @@ def _clear_lockout(coord, store: RuntimeStore, req: dict, expected_account: str,
                             "reason": "LOCKOUT_CLEARED"}, now)
     store.put("broker_identity", identity, now)
     store.event(now, "IDENTITY_LOCKOUT_CLEARED", request_id=req["id"], before=before,
-                identity=identity)
+                identity=identity, rule="full reconnect, identity checks passed afresh")
     return settlement.OperatorResult(status="APPLIED", before=before,
                                      after={"session": DISCONNECTED, "reason": "LOCKOUT_CLEARED"})
+
+
+def _force_reconnect(broker) -> None:
+    """Drop the session and reconnect through the adapter (its identity checks run again). An
+    adapter without session control has no checks beyond the identity read that follows."""
+    reconnect = getattr(broker, "reconnect", None)
+    if not callable(reconnect):
+        return
+    disconnect = getattr(broker, "disconnect", None)
+    if callable(disconnect):
+        disconnect()
+    reconnect()
