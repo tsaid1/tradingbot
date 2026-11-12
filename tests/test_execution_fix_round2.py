@@ -361,6 +361,21 @@ def test_f9_an_opposite_open_in_the_same_contract_is_held(tmp_path):
     assert direct.reasons == ["OPPOSITE_IDEA_IN_SAME_CONTRACT"]
 
 
+def test_f9_a_retrospective_opposite_entry_report_is_reconciled_not_held(tmp_path):
+    """Found by the historical service replay: a past-tense report of an entry on the other side
+    of an open idea was HELD as an opposite open; it never opens anything, so the gateway decides
+    it (RECONCILE) and no held-signal exception is raised for it."""
+    from tradingbot.event_models import Timing
+
+    h = Harness(tmp_path)
+    h.post("p1", open_action())  # long 4
+    report = _short_open("past").model_copy(update={"timing": Timing.HISTORICAL})
+    [o] = h.post("p2", report).outcomes
+    assert o.status == "RECONCILE", o.reasons
+    assert "OPPOSITE_IDEA_IN_SAME_CONTRACT" not in o.reasons
+    assert [p.quantity for p in h.broker.positions()] == [4]
+
+
 def test_f9_a_publisher_reversal_is_a_close_then_an_open(tmp_path):
     h = Harness(tmp_path)
     h.post("p1", open_action())
