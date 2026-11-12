@@ -84,19 +84,22 @@ SourcePost -> PaperEventReplay.process  (gate_source, gate_action, atomic groups
   `UNPROTECTED_POSITION`. Either way the outcome is `EXCEPTION`, not `EXECUTED`, and new exposure
   in the instrument is blocked. `EXITING` means everything held is committed to working exits and
   no stop works beside them.
-* **Cover never exceeds the broker's position (review N1).** The working protective exits of a
-  contract never cover more than the broker shows held there, whatever the ledger believes. Each
-  idea's cover is the smaller of its ledger cover and its share of the broker's position on its
-  side (less the working exits), so cover grows only once the ledger (moved by broker executions
-  or a declaration) and the broker's position both show it, and an order working above it is sized
-  down (cancelled at zero) at once. When the broker's position differs from the ledger's, in either
-  direction, protection is not `CONFIRMED`: `UNPROTECTED_POSITION` opens with
-  `BROKER_POSITION_DIFFERS` in its detail and new exposure in the contract is blocked. A broker
-  holding more than the ledger is covered only for the ledger's quantity; the excess is left to
-  reconciliation's unexplained `QUANTITY_MISMATCH` / `UNEXPLAINED_BROKER_POSITION`, as for any
-  position the ledger cannot explain (a stop the system invented for it would be an order no one
-  approved). When the positions cannot be read nothing is sized up, `PROTECTION_UNVERIFIED` and
-  `BROKER_STATE_UNKNOWN` open.
+* **Cover follows the broker's position, asymmetrically (review N1).** Upward, a protective
+  order is never placed or sized above what the broker shows held in the contract (each idea's
+  share of the broker's position on its side, less the working exits), so cover grows only once
+  the ledger and the broker both show it; when the positions cannot be read nothing is sized up.
+  Downward, cover is never reduced below the ledger, or cancelled, on a position read alone: only
+  as far as exit-side executions in the contract that the ledger has not applied explain, or to
+  the lower position once `exit_no_trace_lookups` consecutive successful reads spread over
+  `settle_seconds` all show it (a failed read restarts that run, and is never a quantity). Until
+  then the working order stays as it is. Whenever the broker's position differs from the ledger,
+  in either direction, `UNPROTECTED_POSITION` opens with `BROKER_POSITION_DIFFERS`, it is alerted,
+  and new exposure in the contract is blocked. A broker holding more than the ledger is covered
+  only for the ledger's quantity; the excess is reconciliation's unexplained `QUANTITY_MISMATCH` /
+  `UNEXPLAINED_BROKER_POSITION` (a stop the system invented for it would be an order no one
+  approved). The trade-off: an oversized stop risks a small reversal if it triggers before the
+  discrepancy is resolved; a missing stop risks an unbounded loss on what is really held; so cover
+  is reduced only on corroborated evidence, and an operator is alerted immediately in either case.
 * **Stop-outs (review F2).** Once a protective stop has filled for an idea, or the idea is closed,
   every working remainder of its entry and add orders is cancelled and the cancel confirmed
   (`ENTRY_REMAINDER_CANCELLED`). An unconfirmed cancel opens `ENTRY_REMAINDER_NOT_CANCELLED`, which
