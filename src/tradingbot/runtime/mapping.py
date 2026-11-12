@@ -1074,11 +1074,12 @@ class FamilyMapping(StrictModel):
         for family, (codes, aliases) in (post.get("vocabulary") or {}).items():
             if family.removesuffix(".OPT") == self.family.removesuffix(".OPT"):
                 continue
-            for code in codes - mine:
-                if re.search(rf"(?<![\w$]){re.escape(code)}(?!\w)", text):
-                    return [ENTRY_ANCHOR_POST_SEVERAL_MARKETS, "OTHER_FAMILY_NAMED"]
-            for alias in aliases - mine_lower:
-                if re.search(rf"(?<![\w$]){re.escape(alias)}(?!\w)", text, re.IGNORECASE):
+            # Any case, with or without a cashtag sign or surrounding punctuation, whole tokens
+            # only (final review): "qof", "(QOF)" and "$qof" name the family, "qoffee" does not.
+            for name in {c.lower() for c in codes} | set(aliases):
+                if name in mine_lower:
+                    continue
+                if re.search(rf"(?<!\w){re.escape(name)}(?!\w)", text, re.IGNORECASE):
                     return [ENTRY_ANCHOR_POST_SEVERAL_MARKETS, "OTHER_FAMILY_NAMED"]
         marked = [s for s, _ in sentences(text) if marked_numbers(s, markers)]
         if len(marked) != 1:

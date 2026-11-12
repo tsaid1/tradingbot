@@ -149,3 +149,18 @@ def test_a_reference_series_level_names_nothing_or_the_reference(tmp_path):
             assert d.status == "SUPPORTED", (line, d.reason)
         else:
             assert d.reason.split(",")[0] == reason, (line, d.reason)
+
+
+@pytest.mark.parametrize("extra", ["qoil is quiet.", "Watching $qof.", "(Qof) is quiet.",
+                                   "Also qof, quiet.", "The BOND FUND is quiet."])
+def test_check_b_is_case_and_punctuation_insensitive(tmp_path, extra):
+    p = policy(tmp_path, etf_entry(rule=SMP), oil_entry(rule="").replace(
+        'family = "QOIL"', 'family = "QOIL"\naliases = ["bond fund"]'))
+    d = decide(p, post=POST.replace(NOTE, f"{NOTE} {extra}"))
+    assert d.reason.split(",")[0] == "ENTRY_ANCHOR_POST_SEVERAL_MARKETS", d.reason
+
+
+@pytest.mark.parametrize("extra", ["Qoils are quiet.", "Qofstad wrote.", "A qoffee break."])
+def test_check_b_matches_whole_tokens_only(tmp_path, extra):
+    d = decide(two_families(tmp_path), post=POST.replace(NOTE, f"{NOTE} {extra}"))
+    assert d.reason.split(",")[0] != "ENTRY_ANCHOR_POST_SEVERAL_MARKETS", d.reason
