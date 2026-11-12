@@ -224,6 +224,9 @@ class RuntimeStore:
             cols = {r["name"] for r in c.execute("PRAGMA table_info(signal_actions)")}
             if "mapping_family" not in cols:  # multi-asset mapping: the family the action fell in
                 c.execute("ALTER TABLE signal_actions ADD COLUMN mapping_family TEXT")
+            for col in ("settled_state", "settled_reasons"):  # a WORKING row's later outcome
+                if col not in cols:
+                    c.execute(f"ALTER TABLE signal_actions ADD COLUMN {col} TEXT")
             acols = {r["name"] for r in c.execute("PRAGMA table_info(alerts)")}
             for col, kind in (("last_notified_at", "TEXT"), ("notified", "INTEGER DEFAULT 0")):
                 if col not in acols:  # operations controls: re-alert schedule
@@ -335,27 +338,41 @@ class RuntimeStore:
             out.append(d)
         return out
 
-    def working_signal_actions(self) -> list[dict]:
-        """The journal rows that still read WORKING and name an order (their outcome may have
-        ended at the broker since the row was written)."""
+    def settleable_signal_actions(self) -> list[dict]:
+        """The journal rows written WORKING that name an order: those that still read WORKING and
+        those already settled from their intent (``settled_state``), which follow it if it
+        changes again."""
         with self.tx() as c:
             rows = c.execute(
-                "SELECT seq, action_id, order_ref, reasons FROM signal_actions "
-                "WHERE status='WORKING' AND order_ref IS NOT NULL ORDER BY seq, rowid"
+                "SELECT seq, action_id, order_ref, status, reasons, settled_state, "
+                "settled_reasons FROM signal_actions WHERE order_ref IS NOT NULL "
+                "AND (status='WORKING' OR settled_state IS NOT NULL) ORDER BY seq, rowid"
             ).fetchall()
-        return [{**dict(r), "reasons": json.loads(r["reasons"])} for r in rows]
+        return [{**dict(r), "reasons": json.loads(r["reasons"]),
+                 "settled_reasons": json.loads(r["settled_reasons"] or "[]")} for r in rows]
 
-    def settle_signal_action(self, seq: int, action_id: str, status: str,
-                             reasons: list[str]) -> bool:
-        """Move one WORKING row to the terminal status its order reached. Only a row that still
-        reads WORKING is changed. True when it was."""
+    def settle_signal_action(self, seq: int, action_id: str, *, expect: str, status: str,
+                             reasons: list[str], settled_state: str | None,
+                             settled_reasons: list[str], at: datetime, detail: dict) -> bool:
+        """Set one row to the status its intent shows now and journal SIGNAL_ACTION_SETTLED, in
+        ONE transaction. Only a row still reading ``expect`` is changed. True when it was."""
         with self.tx() as c:
             cur = c.execute(
-                "UPDATE signal_actions SET status=?, reasons=? "
-                "WHERE seq=? AND action_id=? AND status='WORKING'",
-                (status, json.dumps(list(reasons)), seq, action_id),
+                "UPDATE signal_actions SET status=?, reasons=?, settled_state=?, "
+                "settled_reasons=? WHERE seq=? AND action_id=? AND status=?",
+                (status, json.dumps(list(reasons)), settled_state,
+                 json.dumps(list(settled_reasons)) if settled_state else None,
+                 seq, action_id, expect),
             )
-        return cur.rowcount > 0
+            if cur.rowcount == 0:
+                return False
+            c.execute(
+                "INSERT INTO service_events (at,event,detail) VALUES (?,?,?)",
+                (at.isoformat(), "SIGNAL_ACTION_SETTLED",
+                 json.dumps({"seq": seq, "action_id": action_id, "was": expect,
+                             "status": status, **detail}, sort_keys=True, default=str)),
+            )
+        return True
 
     # ------------------------------------------------------------------ exceptions
 

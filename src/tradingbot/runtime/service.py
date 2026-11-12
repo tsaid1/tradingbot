@@ -234,6 +234,21 @@ class _StampingReplay(BrokerEventReplay):
         return out
 
 
+def _row_outcome(intent, filled: int) -> tuple[str, list[str], dict] | None:
+    """The journal status and reasons a WORKING row takes from its intent's terminal state (None
+    while it is not terminal), and any detail for the event."""
+    if intent.state == IntentState.FILLED:
+        return "EXECUTED", ["BROKER_FILLED", *intent.reasons], {}
+    if intent.state == IntentState.CANCELLED and filled:
+        # Part filled, the rest cancelled: the row shows the fill; why the remainder went is in
+        # the event (its reasons may say UNFILLED, which the fill contradicts).
+        return ("EXECUTED", ["BROKER_CANCELLED", "ENTRY_REMAINDER_CANCELLED"],
+                {"remainder_reasons": list(intent.reasons)})
+    if intent.state in (IntentState.CANCELLED, IntentState.REJECTED):
+        return intent.state.value, [f"BROKER_{intent.state.value}", *intent.reasons], {}
+    return None
+
+
 def _safe_error(exc: BaseException) -> str:
     """Typed source and broker errors carry sanitized messages; anything else may echo input (for
     example a validation error quoting post text), so only its type is kept."""
@@ -1230,29 +1245,43 @@ class RuntimeService:
                 self.store.resolve_exception(e["id"], now, f"intent {intent.state.value}")
 
     def _settle_working_rows(self, now: datetime) -> None:
-        """A journal row written WORKING (a resting order) takes the terminal outcome its order
-        reached since, read from the execution store (durable, so also after a restart): a fill
-        reads EXECUTED, a cancel with nothing filled CANCELLED with the intent's public reasons
-        (for example ENTRY_EXPIRED_UNFILLED or ENTRY_CANCELLED_BEFORE_FILL). While a cancel is not
-        confirmed the intent is still WORKING, and so is the row. Display only: nothing is sent."""
+        """A journal row written WORKING (a resting order) shows the outcome its intent shows now,
+        read from the execution store (durable, so also after a restart): a fill reads EXECUTED,
+        a cancel with nothing filled CANCELLED with the intent's public reasons (for example
+        ENTRY_EXPIRED_UNFILLED or ENTRY_CANCELLED_BEFORE_FILL). A cancel after a partial fill reads
+        EXECUTED with ENTRY_REMAINDER_CANCELLED; the remainder's reasons are in the event. While a
+        cancel is not confirmed the intent is still WORKING, and so is the row. A settled row
+        follows its intent if that changes again (an operator settlement the broker contradicts):
+        back to WORKING, then to the new outcome; each change is journaled with the row in one
+        transaction. Display only: nothing is sent."""
         ex = self.coordinator.store
-        for row in self.store.working_signal_actions():
-            intent = ex.intent(row["order_ref"])
-            if intent is None or intent.state not in (
-                IntentState.FILLED, IntentState.CANCELLED, IntentState.REJECTED
-            ):
+        rows = self.store.settleable_signal_actions()
+        if not rows:
+            return
+        intents = {i.order_ref: i for i in ex.intents()}
+        for row in rows:
+            intent = intents.get(row["order_ref"])
+            if intent is None:
                 continue
             filled = ex.filled_quantity(intent.order_ref)
-            status = ("EXECUTED" if intent.state == IntentState.FILLED or filled
-                      else intent.state.value)
-            reasons = list(row["reasons"])
-            for r in (f"BROKER_{intent.state.value}", *intent.reasons):
-                if r not in reasons:
-                    reasons.append(r)
-            if self.store.settle_signal_action(row["seq"], row["action_id"], status, reasons):
-                self.store.event(now, "SIGNAL_ACTION_SETTLED", seq=row["seq"],
-                                 action_id=row["action_id"], order_ref=intent.order_ref,
-                                 was="WORKING", status=status, filled=filled)
+            target = _row_outcome(intent, filled)
+            if target is None and row["settled_state"] is None:
+                continue  # still WORKING, as written
+            base = [r for r in row["reasons"] if r not in row["settled_reasons"]]
+            if target is None:
+                status, added, state, detail = "WORKING", [], None, {}
+            else:
+                status, extra, detail = target
+                added = [r for r in dict.fromkeys(extra) if r not in base]
+                state = intent.state.value
+            reasons = base + added
+            if (status, reasons, state) == (row["status"], row["reasons"], row["settled_state"]):
+                continue
+            self.store.settle_signal_action(
+                row["seq"], row["action_id"], expect=row["status"], status=status,
+                reasons=reasons, settled_state=state, settled_reasons=added, at=now,
+                detail={"order_ref": intent.order_ref, "intent_state": intent.state.value,
+                        "filled": filled, "quantity": intent.quantity, **detail})
 
     def _reconcile(self, report: CycleReport) -> None:
         now = self.clock()

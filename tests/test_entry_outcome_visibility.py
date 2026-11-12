@@ -17,6 +17,8 @@ from __future__ import annotations
 import tempfile
 from pathlib import Path
 
+import pytest
+
 from execution_harness import Harness, action, open_action
 from runtime_harness import MAPPING, Runtime, post
 
@@ -285,3 +287,90 @@ def test_a_failure_in_the_flag_path_never_alters_the_exit(tmp_path, monkeypatch)
     assert ("CLOSE", "EXECUTED") in faulty[1]
     assert "EXIT_FLAG_FAILED" in faulty[2] and "EXIT_FLAG_FAILED" not in clean[2]
     assert "POST_PROCESSING_FAILED" not in faulty[3]
+
+
+def _settle_cancelled_by_operator(rt, ref):
+    """The entry's own order becomes invisible, so its intent turns UNRESOLVED; the operator
+    then settles it CANCELLED."""
+    from tradingbot.execution.settlement import settle_intent
+    c = coord(rt)
+    rt.broker.open_orders_lag_seconds = 10_000
+    rt.run(4)
+    for _ in range(6):
+        rt.clock.advance(5)
+        c.recover()
+    assert c.intent(ref).state in (IntentState.RECORDED, IntentState.UNRESOLVED)
+    res = settle_intent(c, request_id="invented-q1", order_ref=ref, outcome="CANCELLED",
+                        confirmation=cat.settle_phrase(ref, "CANCELLED"),
+                        note="invented: looked it up by hand", operator="tester")
+    assert res.status == "APPLIED", res
+
+
+@pytest.mark.parametrize("restart", [False, True])
+def test_a_row_settled_cancelled_follows_the_intent_when_the_broker_contradicts(restart):
+    rt = service(post("1", 0, RESTING))
+    rt.run(2)
+    ref = open_row(rt)["order_ref"]
+    _settle_cancelled_by_operator(rt, ref)
+    rt.run(1)
+    assert open_row(rt)["status"] == "CANCELLED"
+    if restart:
+        rt.restart()
+    rt.broker.open_orders_lag_seconds = 0  # the broker shows the order after all
+    rt.run(2)
+    intent = coord(rt).intent(ref)
+    assert intent.state == IntentState.WORKING, intent.state
+    assert open_row(rt)["status"] == "WORKING", open_row(rt)  # no terminal claim it lost
+    if restart:
+        rt.restart()
+    rt.broker.fill(ref, price="88.30")
+    rt.run(3)
+    assert coord(rt).intent(ref).state == IntentState.FILLED
+    assert [p.quantity for p in coord(rt).ledger() if p.quantity] == [1]
+    row = open_row(rt)
+    assert row["status"] == "EXECUTED", row
+    assert "BROKER_CANCELLED" not in row["reasons"] and "BROKER_FILLED" in row["reasons"]
+    settled = [e["detail"] for e in rt.store.events() if e["event"] == "SIGNAL_ACTION_SETTLED"]
+    assert [d["status"] for d in settled] == ["CANCELLED", "WORKING", "EXECUTED"], settled
+    rt.service.close()
+
+
+def test_a_half_filled_entry_that_expires_reads_its_fill_without_an_unfilled_reason():
+    from runtime_harness import SERVICE_MAPPING
+    rt = Runtime(Path(tempfile.mkdtemp()), [post("1", 0, RESTING)], mapping_file=SERVICE_MAPPING)
+    rt.broker.script_next_submit("PARTIAL", quantity=1)
+    rt.run(30)  # 150 s: the remainder expires
+    ref = open_row(rt)["order_ref"]
+    intent = coord(rt).intent(ref)
+    assert intent.state == IntentState.CANCELLED and ENTRY_EXPIRED_UNFILLED in intent.reasons
+    assert coord(rt).store.filled_quantity(ref) == 1
+    row = open_row(rt)
+    assert row["status"] == "EXECUTED", row
+    assert not any("UNFILLED" in r for r in row["reasons"]), row["reasons"]
+    assert "ENTRY_REMAINDER_CANCELLED" in row["reasons"]
+    [d] = [e["detail"] for e in rt.store.events() if e["event"] == "SIGNAL_ACTION_SETTLED"]
+    assert d["filled"] == 1 and d["quantity"] == 2
+    assert ENTRY_EXPIRED_UNFILLED in d["remainder_reasons"]
+    rt.service.close()
+
+
+def test_the_row_change_and_its_event_are_one_transaction(tmp_path):
+    from tradingbot.runtime.store import RuntimeStore
+    store = RuntimeStore(tmp_path / "rt.sqlite3")
+    with store.tx() as c:
+        c.execute("INSERT INTO signals (source_name,source_id,post_id,revision,post_hash,"
+                  "provenance,verified_author,text_complete,text_len,media_count,links,"
+                  "published_at,received_at,interpreted_at,decided_at,decision_now,duplicate,"
+                  "hydrated) VALUES ('s','x','x',1,'h','SYNTHETIC',1,1,1,0,'[]','t','t','t','t',"
+                  "'t',0,0)")
+        c.execute("INSERT INTO signal_actions (seq,action_id,action,status,reasons,order_ref) "
+                  "VALUES (1,'a','OPEN','WORKING','[]','TB-INVENTED')")
+        c.execute("DROP TABLE service_events")  # the event write will fail
+    from datetime import UTC, datetime
+    import sqlite3
+    with pytest.raises(sqlite3.OperationalError):
+        store.settle_signal_action(1, "a", expect="WORKING", status="CANCELLED",
+                                   reasons=["BROKER_CANCELLED"], settled_state="CANCELLED",
+                                   settled_reasons=["BROKER_CANCELLED"],
+                                   at=datetime(2026, 6, 1, tzinfo=UTC), detail={})
+    assert store.signal_actions()[0]["status"] == "WORKING"  # rolled back with the event
