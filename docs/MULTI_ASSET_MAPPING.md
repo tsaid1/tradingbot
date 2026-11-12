@@ -170,6 +170,51 @@ submission**, and the only broker on `main` is the simulated one. Every other fa
 `EXPLICIT_ENTRY_ONLY`. The protective stop is mandatory and the order is always a limit, never a
 market order.
 
+**The owner's further decisions of 12 November 2026 (DECIDED 7), TLT only, paper and simulation
+only (they do not authorize order submission):**
+
+* `standalone_level_sentence = true`: a level may stand in its own sentence directly after the
+  instruction, or after the instruction's own stop and target sentence (see *What the level is*).
+* `max_stop_distance = "5%"`: a **family** rule (owner, 12 November 2026, extended the same day
+  to explicit entries). It governs every OPEN and ADD of the family, explicit-entry and anchored
+  alike; it is required whenever the family has the entry rule and optional otherwise (a family
+  without it behaves exactly as before); strict "N%", code ceiling
+  `validator.ANCHOR_MAX_STOP_DISTANCE_PCT_CEILING` = 10 %; written beside `entry_rule`, and refused
+  inside `[entry_anchor]`. Only TLT sets it. It is an **outer rejection boundary**, not a stop
+  placement the bot recommends, and it does **not** bound the loss actually realised in a gap or
+  with slippage. The bot never synthesizes, moves or chooses a stop. An entry is refused, with
+  one set of codes for both paths, when the stop is:
+  - absent (`PROTECTIVE_STOP_MISSING`; for an ADD the idea's stop as it stands is the one
+    checked, and an ADD to an idea without one holds);
+  - on the wrong side of the entry (`STOP_DIRECTION_CONTRADICTION`);
+  - not uniquely this action's (`PROTECTIVE_STOP_NOT_UNIQUE`, at the mapping stage: more than one
+    value tagged STOP for the action `TWO_STOP_VALUES`; the action's own stop not among them
+    `STOP_DIFFERS_FROM_ACTION`; the value stated by another trading action of the post,
+    commentary aside, `STOP_SHARED_WITH_ANOTHER_ACTION`; and on the text, every number in a
+    clause with a stop word anywhere in the post ("stop" in any hyphenated or qualified form,
+    "stoploss", "stops", "sl", "protective"; not "stopped", which reports an exit; in a clause
+    that also names a target, only the numbers between the stop word and the target word): more
+    than one distinct value `SEVERAL_STOP_VALUES`, one value other than the action's stop
+    `STOP_TEXT_DIFFERS`; a repeated identical value is not a second stop. So "Stop 87.20.
+    Protective level 87.10." holds. "Protective stop 87.20." alone is read by the interpreter as
+    commentary and attaches no stop, so such a post holds for a missing stop (the safe direction);
+    the guard that the action's own protective stop still anchors lives at the mapping stage);
+  - farther than the limit from the entry (`PROTECTIVE_STOP_TOO_FAR_FROM_ENTRY`: the explicit
+    entry price, or an anchored entry's stated reference, in the publisher's series);
+  - farther than the limit from the limit-entry price actually to be sent
+    (`PROTECTIVE_STOP_TOO_FAR_FROM_LIMIT`, in the series the stop is held in): at the gateway for
+    an anchored entry, and at the execution core before every submission, explicit and anchored,
+    OPEN and ADD, recovery included. For an explicit entry the limit sent is the stated entry
+    price itself (the collar only rejects), so the two checks coincide up to tick snapping: a stop
+    4.9 % below an explicit entry trades under the default 1 % collar.
+  Exactly at the limit is accepted (inclusive); farther is refused. A distance written as a stop
+  ("Stop 1.20." on an 88 share price) is refused as too far.
+* `long_only = true` (a family switch, default false): an OPEN or ADD on the short side HOLDs at
+  the mapping stage (`MAPPING_LONG_ONLY`), explicit and anchored alike. TLT entries are limit
+  orders; exits are marketable limits; the protective stop child is a stop order (it becomes a
+  market order at the broker when triggered), as for every family.
+* Approximate levels ("~N now") still hold.
+
 `entry_rule = "REFERENCE_AS_COLLAR"`, approved per family with its three limits (no defaults),
 changes one thing. A **current** OPEN or ADD (timing CURRENT: never a retrospective report, a
 conditional, commentary or an uncertain one) that states **exactly one** market level for its
@@ -373,10 +418,42 @@ sentence). They differ only in how a standalone level sentence is attributed ("4
   sentence does not name the execution instrument (`ENTRY_ANCHOR_REFERENCE_UNNAMED`). Every gateway
   protection is unchanged.
 
-  **Unresolved competing references** (part of (b); owner, 12 November 2026). A mention the bot
-  cannot resolve is never taken to mean that no second market exists: it HOLDs with
-  `ENTRY_ANCHOR_POST_UNRESOLVED_MARKET` and the mention kinds only (`MENTION:<MarketMention>`). The
-  detectors are closed public lists of generic words (`instruction_terms`), never a publisher's:
+  **Competing actionable instruments** (part of (b); the owner's decision of 12 November 2026,
+  DECIDED 7: "An unknown capitalized word alone is insufficient to establish a second market";
+  "If the post may contain multiple actionable instruments ..., HOLD"). Two closed tests, one
+  function (`FamilyMapping._competing_instrument`):
+  - *Mention with context* (`ENTRY_ANCHOR_POST_UNRESOLVED_MARKET`, `RULE:MENTION_WITH_CONTEXT`,
+    then the mention kinds): a mention the bot cannot tie to this family (the detectors below)
+    holds only when its own sentence also holds an instruction, stop or target word
+    (`instruction_terms.ACTION_SEMANTIC_WORDS`) or a price-like level (`price_like_level`: a number
+    written as a price, with a decimal, a thousands separator or a currency sign, a number with a
+    present-market marker, or a number after "at"; not a percentage, a year, a date or a count).
+    Plain commentary ("Qorvex reported earnings.", "NFA.") no longer holds.
+  - *Unattributed action sentence* (`ENTRY_ANCHOR_POST_UNATTRIBUTED_ACTION`,
+    `RULE:UNATTRIBUTED_ACTION_SENTENCE`): any sentence outside this action's own clause sentences
+    that holds an instruction word (`INSTRUCTION_WORDS`: the side words long, buy, buying, short,
+    shorting, sell, selling; add, adding; reduce, reducing, trim, trimming; exit, exiting, cover,
+    covering) holds, whatever it names ("We are buying spy as well.", "Also long the ten-year.").
+    A past form ("bought") and "close" (a chart level for the anchor rule) are not instruction
+    words here; stop and target words are not either, so the action's own stop sentence never
+    fires it. Hyphenated and slashed tokens are split first ("Qorvex-long", "Long/short"). What
+    this costs, pinned in tests and not fixed: "The long end is bid.", "In short, we like it.",
+    "Enjoy the long weekend.", "Add to that the CPI print.", "Buy the dip, as always.", "Exit plan:
+    below the stop.", "Long story short", "Do not sell in panic.", "long-term", "Long-duration".
+  - Narrow additions for missed second instruments (review of PR #70): a sentence-initial unknown
+    capitalised word counts as a mention when its sentence has a trading context; with a mention
+    in the same sentence, past forms of the instruction words (bought, added, sold, shorted,
+    trimmed, reduced, exited, covered), close / closing / closed and the acquisition verbs
+    entering, accumulating, picking up, grabbing, loading count as context (alone they do not);
+    and the sentence directly after an own instruction sentence that holds a mention and "too",
+    "also", "as well", "same" or "likewise" holds (`RULE:ADDITIVE_ELLIPSIS`). Residual, pinned: a
+    lowercase unknown market with another verb ("Get qorvex.", "Load qorvex.") is not detected; a
+    sentence that opens with an ordinary capitalised word outside the understood vocabulary and
+    holds a context word counts as a mention (over-blocking). The owner accepted these residuals for now (12 November 2026: "Accept
+    the documented residual cases for now. Do not open a broad parser redesign to address rare
+    hypothetical phrasing."). A post whose commentary the interpreter itself reads as
+    another family's action still holds on the action rule (`ACTION_FOR_ANOTHER_FAMILY`).
+  The mention detectors are closed public lists of generic words (`instruction_terms`), never a publisher's:
   `TICKER_SHAPED` (2 to 5 capital letters, optionally with a futures month and year, or any
   all-capitals word of six or more letters wherever it stands, that are not
   this family's names, its own contract codes, a word the anchor rule already understands written

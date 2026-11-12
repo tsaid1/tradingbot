@@ -152,6 +152,8 @@ def anchored_gate(limit="50.02", age=3.0, rule="REFERENCE_AS_COLLAR") -> GateDec
                          anchor_max_quote_age_seconds=age if rule == "REFERENCE_AS_COLLAR"
                          else None,
                          anchor_max_signal_age_seconds=90 if rule == "REFERENCE_AS_COLLAR"
+                         else None,
+                         max_stop_distance="5%" if rule == "REFERENCE_AS_COLLAR"
                          else None)
     return GateDecision(status="APPROVE", reasons=["PAPER_OPEN"], plan=plan)
 

@@ -211,12 +211,15 @@ def scenarios() -> list[Scenario]:
         Scenario("index", "QIDX", "REFERENCE_TRIGGER",
                  lifecycle("QIDX", "5,010", "4,980", "5,070", "4,995", "5,030")),
         Scenario("energy", "QOIL", "DIRECT",
-                 [*lifecycle("QOIL", "71.50", "69.80", "75.00", "70.40", "71.80",
+                 # The entry at the ask: an explicit limit is the stated price itself (owner,
+                 # 12 Nov 2026); a stated price below the ask rests.
+                 [*lifecycle("QOIL", "71.52", "69.80", "75.00", "70.40", "71.80",
                              qualifier="Jul 2026"),
                   Step(240, "We are now long $QOIL Jun 2026 at 70.10. Stop 68.90.", "HOLD",
                        "CONTRACT_IN_ROLL_WINDOW", action="OPEN")]),
         Scenario("metal", "QMTL", "BASIS_SHIFT",
-                 [*lifecycle("QMTL", "1,850", "1,835", "1,880", "1,842", "1,851"),
+                 # 1,850.1 converts to 1862.1, the execution ask (basis +12).
+                 [*lifecycle("QMTL", "1,850.1", "1,835", "1,880", "1,842", "1,851"),
                   Step(240, "We are now long $QMTL at 1,850. Stop 1,835.", "HOLD",
                        "BASIS_EXCEEDS_CAP", action="OPEN")],
                  quotes=metal_quotes),

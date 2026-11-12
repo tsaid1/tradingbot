@@ -88,8 +88,10 @@ def test_an_off_tick_stop_is_refused_and_limits_are_snapped_to_the_tick(tmp_path
     assert h.broker.submit_calls == 0
     ok = h.execute("p2", fut_open("open", "202703").model_copy(update={"entry_reference": "99.9"}))
     [entry] = h.broker.orders_with_ref(ok.order_ref)
-    assert entry.limit_price % Decimal("0.25") == 0  # 99.9 x 1.01 = 100.899, floored to 100.75
-    assert entry.limit_price == Decimal("100.75")
+    # The stated entry itself (owner, 12 Nov 2026: the collar never prices the order), snapped
+    # down to the tick: 99.9 -> 99.75 (was 99.9 x 1.01 = 100.899 -> 100.75).
+    assert entry.limit_price % Decimal("0.25") == 0
+    assert entry.limit_price == Decimal("99.75")
 
 
 def test_an_off_tick_amendment_is_refused(tmp_path):
@@ -138,7 +140,8 @@ def test_a_stock_and_a_future_sharing_a_symbol_do_not_net(tmp_path):
     h = harness(tmp_path, notional=20000, instrument=20000, aggregate=50000)
     h.broker.set_quote(FUT, "49.98", "50.02")  # the stock's own quote (by symbol)
     stock = h.execute("p1", open_action(symbol=FUT))  # long 1 share
-    short = h.execute("p2", fut_open("open", "202703", side=PositionSide.SHORT))
+    short = h.execute("p2", fut_open("open", "202703", side=PositionSide.SHORT).model_copy(
+        update={"entry_reference": "99.75"}))  # at the bid: an explicit sell limit is its price
     assert stock.state == short.state == IntentState.FILLED
     held = {p.contract.contract_key: p.quantity for p in h.broker.positions()}
     assert held[MAR.contract_key] == -1 and sum(held.values()) == 0

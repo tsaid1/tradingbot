@@ -43,6 +43,7 @@ from pydantic import (
     StrictBool,
     StrictFloat,
     StrictInt,
+    StrictStr,
     ValidationError,
     field_validator,
     model_validator,
@@ -57,12 +58,18 @@ from tradingbot.models import (
     EntryRule,
     Instrument,
     MarketTerms,
+    PositionSide,
     StrictModel,
 )
 from tradingbot.runtime.instruction_terms import (
+    ACTION_SEMANTIC_WORDS,
     ADD_WORDS,
+    ADDITIVE_PHRASES,
+    ADDITIVE_WORDS,
     INSTRUMENT_NOUNS,
     MARKET_NOUNS,
+    MENTION_ACTION_PHRASES,
+    MENTION_ACTION_WORDS,
     MONTH_WORD_RE,
     PRESENT_MARKERS,
     SIDE_WORDS,
@@ -75,26 +82,33 @@ from tradingbot.runtime.instruction_terms import (
     code_shaped,
     context_problem,
     extract_terms,
+    first_word_mention,
     foreign_words,
+    has_phrase,
+    instruction_word_in,
     leftover_tokens,
     level_kind_of_words,
     level_places,
     marked_numbers,
     post_multi_leg,
+    price_like_level,
     protective_sentence_problem,
     quote_clause_words,
     relative_contract_words,
     sentences,
+    stop_values,
     understood_words,
     unknown_tokens,
     unknown_words,
     unresolved_market_mentions,
+    words_with_parts,
 )
 from tradingbot.validator import (
     ANCHOR_MAX_ADVERSE_PCT_CEILING,
     ANCHOR_MAX_FAVOURABLE_PCT_CEILING,
     ANCHOR_MAX_QUOTE_AGE_CEILING_SECONDS,
     ANCHOR_MAX_SIGNAL_AGE_CEILING_SECONDS,
+    ANCHOR_MAX_STOP_DISTANCE_PCT_CEILING,
     business_days_until,
 )
 
@@ -137,6 +151,14 @@ ENTRY_ANCHOR_POST_UNRESOLVED_MARKET = "ENTRY_ANCHOR_POST_UNRESOLVED_MARKET"
 # LEVEL_KIND:<AnchorLevelKind> and what decided it (OWN_CLAUSE, CONTEXT_WORD:<w>, CONTEXT_NUMBER,
 # CONTEXT_UNKNOWN).
 ENTRY_ANCHOR_LEVEL_NOT_MARKET_QUOTE = "ENTRY_ANCHOR_LEVEL_NOT_MARKET_QUOTE"
+# Owner, 12 November 2026 (DECIDED 7). (b) a sentence outside this action's own clause carries an
+# instruction word: the post may hold a second actionable instruction (RULE:UNATTRIBUTED_ACTION_
+# SENTENCE). D3: the anchored entry's protective stop is not uniquely this action's (detail
+# TWO_STOP_VALUES, STOP_DIFFERS_FROM_ACTION, STOP_SHARED_WITH_ANOTHER_ACTION). D5: a short entry
+# in a long-only family.
+ENTRY_ANCHOR_POST_UNATTRIBUTED_ACTION = "ENTRY_ANCHOR_POST_UNATTRIBUTED_ACTION"
+PROTECTIVE_STOP_NOT_UNIQUE = "PROTECTIVE_STOP_NOT_UNIQUE"
+MAPPING_LONG_ONLY = "MAPPING_LONG_ONLY"
 # Runtime modes in which a family may carry entry_rule = REFERENCE_AS_COLLAR: an allow-list, so a
 # future mode never inherits the rule silently. Both modes simulate every order and fill: "mock"
 # on an invented market, "shadow" at read-only real quotes (no order capability).
@@ -425,10 +447,12 @@ class EntryAnchorRules(StrictModel):
     # or its own stop-and-target sentence, when every own instruction sentence passes the
     # whole-sentence allow-list (docs/MULTI_ASSET_MAPPING.md, "What the level is").
     standalone_level_sentence: StrictBool = False
-
     @model_validator(mode="before")
     @classmethod
     def _renamed(cls, data):
+        if isinstance(data, dict) and "max_stop_distance" in data:
+            raise ValueError("max_stop_distance is a family-level key (it governs every entry of "
+                             "the family): write it beside entry_rule, not in [entry_anchor]")
         if isinstance(data, dict) and "level_after_own_protective_levels" in data:
             raise ValueError("level_after_own_protective_levels was renamed to "
                              "standalone_level_sentence (an elliptical level may anchor only "
@@ -569,6 +593,16 @@ class FamilyMapping(StrictModel):
     # entry rule on, a separate level line may name only this family: its code, its series
     # symbols, these aliases (and the private lexicon's).
     aliases: list[str] = Field(default_factory=list)
+    # Owner, 12 November 2026 (D5): an OPEN or ADD on the short side HOLDs at the mapping stage
+    # (MAPPING_LONG_ONLY), for explicit and anchored entries alike. Default false.
+    long_only: StrictBool = False
+    # Owner, 12 November 2026: the farthest the protective stop of ANY entry of this family
+    # (explicit or anchored, OPEN or ADD) may be, as a percentage, from the entry (the explicit
+    # price, or the stated reference of an anchored entry) and from the limit actually sent.
+    # Strict "N%", code ceiling validator.ANCHOR_MAX_STOP_DISTANCE_PCT_CEILING; required with
+    # entry_rule = REFERENCE_AS_COLLAR, optional otherwise (absent: today's behaviour). An outer
+    # rejection boundary, never a stop the bot sets; it does not bound the loss in a gap.
+    max_stop_distance: StrictStr | None = Field(default=None, pattern=r"^\d+(?:\.\d+)?%$")
 
     @field_validator("aliases")
     @classmethod
@@ -585,6 +619,14 @@ class FamilyMapping(StrictModel):
             bad("entry_rule = REFERENCE_AS_COLLAR needs its [entry_anchor] limits "
                 "(max_adverse_move, max_favourable_move, max_signal_age_seconds; no defaults), "
                 "and [entry_anchor] is used only by it")
+        if self.max_stop_distance is not None:
+            stop_limit = Decimal(self.max_stop_distance[:-1])
+            if not stop_limit.is_finite() or stop_limit <= 0 \
+                    or stop_limit > ANCHOR_MAX_STOP_DISTANCE_PCT_CEILING:
+                bad(f"max_stop_distance {self.max_stop_distance!r} must be above 0 and at most "
+                    f"its ceiling of {ANCHOR_MAX_STOP_DISTANCE_PCT_CEILING}% (a code constant)")
+        if collar and self.max_stop_distance is None:
+            bad("entry_rule = REFERENCE_AS_COLLAR needs max_stop_distance (a family-level key)")
         if collar and (self.basis == "UNSUPPORTED" or self.family.endswith(".OPT")):
             bad("entry_rule = REFERENCE_AS_COLLAR applies to a non-option traded family only")
 
@@ -845,6 +887,7 @@ class FamilyMapping(StrictModel):
             anchor_max_abs_basis=self.entry_anchor.max_abs_basis if self.entry_anchor else None,
             anchor_max_basis_age_seconds=self.entry_anchor.max_basis_age_seconds
             if self.entry_anchor else None,
+            max_stop_distance=self.max_stop_distance,
             anchor_max_quote_age_seconds=self.entry_anchor.max_quote_age_seconds
             if self.entry_anchor else None,
             problems=out,
@@ -1105,7 +1148,8 @@ class FamilyMapping(StrictModel):
         own = self.anchor_names(asset, lexicon)
         if self.entry_anchor.anchor_scope == "SINGLE_MARKET_POST":
             problems = self._single_market_problems(action, asset, anchor, source, post_text,
-                                                    markers, post or {}, lexicon)
+                                                    markers, post or {}, lexicon,
+                                                    own_clause=terms.clause)
             if problems:
                 return held(problems, None)  # the post, not the level, is in doubt
         attributed: list[str] = []
@@ -1292,7 +1336,8 @@ class FamilyMapping(StrictModel):
                    for t in clause.split() for r in roots)
 
     def _single_market_problems(self, action, asset, anchor, source, post_text, markers,
-                                post, lexicon: AnchorLexicon | None = None) -> list[str]:
+                                post, lexicon: AnchorLexicon | None = None,
+                                own_clause: str | None = None) -> list[str]:
         """anchor_scope = SINGLE_MARKET_POST: the post as a whole attributes the level. (c) this is
         the post's only action besides commentary, and no action is conditional, retrospective or
         uncertain; (b) every action is this family's, no instrument is unresolved, and the post
@@ -1330,15 +1375,12 @@ class FamilyMapping(StrictModel):
                     continue
                 if re.search(rf"(?<!\w){re.escape(name)}(?!\w)", text, re.IGNORECASE):
                     return [ENTRY_ANCHOR_POST_SEVERAL_MARKETS, "OTHER_FAMILY_NAMED"]
-        # The owner's safeguard: a market mention the bot cannot resolve is not "no second market".
-        lexicon = lexicon or AnchorLexicon()
-        unresolved = unresolved_market_mentions(
-            text, set(self.anchor_names(asset, lexicon)) | mine_lower, {m.upper() for m in mine},
-            self._roots(),
-            understood=understood_words([*lexicon.present_markers, *lexicon.context_words]),
-            non_market=set(lexicon.non_market_words), futures=self.execution.sec_type == "FUT")
-        if unresolved:
-            return [ENTRY_ANCHOR_POST_UNRESOLVED_MARKET, *(f"MENTION:{k.value}" for k in unresolved)]
+        # The owner's decision (DECIDED 7): a competing market holds the post only when the post
+        # "may contain multiple actionable instruments".
+        problem = self._competing_instrument(text, asset, mine, mine_lower, markers,
+                                             lexicon or AnchorLexicon(), own_clause)
+        if problem:
+            return problem
         marked = [s for s, _ in sentences(text) if marked_numbers(s, markers)]
         if len(marked) != 1:
             return [ENTRY_ANCHOR_POST_SEVERAL_LEVELS, f"MARKED_SENTENCES:{len(marked)}"]
@@ -1349,6 +1391,46 @@ class FamilyMapping(StrictModel):
                         re.search(rf"(?<![\w]){re.escape(x)}(?!\w)", s.replace("$", " "))
                         for x in execution):
                     return [ENTRY_ANCHOR_REFERENCE_UNNAMED, "EXECUTION_SYMBOL"]
+        return []
+
+    def _competing_instrument(self, text, asset, mine, mine_lower, markers, lexicon,
+                              own_clause) -> list[str]:
+        """(a) a mention the bot cannot tie to this family (``unresolved_market_mentions``, and a
+        sentence-initial unknown capitalised word) holds only when its own sentence gives it a
+        trading context: an instruction, stop or target word (``ACTION_SEMANTIC_WORDS``), a
+        price-like level (``price_like_level``) or, with the mention only, a past form, close or
+        acquisition verb (``MENTION_ACTION_WORDS``). (d) the sentence directly after an own
+        instruction sentence holds a mention and an additive word ("Qorvex too."). (b) a sentence
+        outside this action's own clause sentences that holds an instruction word (hyphen and
+        slash parts included) holds, whatever it names. Plain commentary holds none of them."""
+        own_sentences = {s for s, _ in sentences(own_clause or "")}
+        own = set(self.anchor_names(asset, lexicon)) | mine_lower
+        understood = understood_words([*lexicon.present_markers, *lexicon.context_words])
+        codes = {m.upper() for m in mine}
+        non_market = set(lexicon.non_market_words)
+        texts = [s for s, _ in sentences(text)]
+        for k, sentence in enumerate(texts):
+            kinds = set(unresolved_market_mentions(
+                sentence, own, codes, self._roots(), understood=understood,
+                non_market=non_market, futures=self.execution.sec_type == "FUT"))
+            initial = first_word_mention(sentence, own, understood, non_market, codes,
+                                         self._roots())
+            mention = kinds or initial is not None
+            context = (instruction_word_in(sentence, ACTION_SEMANTIC_WORDS)
+                       or price_like_level(sentence, markers)
+                       or instruction_word_in(sentence, MENTION_ACTION_WORDS)
+                       or has_phrase(sentence, MENTION_ACTION_PHRASES))
+            if mention and context:
+                found = sorted({*kinds, *([initial] if initial else [])}, key=lambda m: m.value)
+                return [ENTRY_ANCHOR_POST_UNRESOLVED_MARKET, "RULE:MENTION_WITH_CONTEXT",
+                        *(f"MENTION:{m.value}" for m in found)]
+            if mention and k > 0 and texts[k - 1] in own_sentences and (
+                    words_with_parts(sentence) & ADDITIVE_WORDS
+                    or has_phrase(sentence, ADDITIVE_PHRASES)):
+                return [ENTRY_ANCHOR_POST_UNRESOLVED_MARKET, "RULE:ADDITIVE_ELLIPSIS"]
+        for sentence in texts:
+            if sentence not in own_sentences and instruction_word_in(sentence):
+                return [ENTRY_ANCHOR_POST_UNATTRIBUTED_ACTION, "RULE:UNATTRIBUTED_ACTION_SENTENCE"]
         return []
 
     def _month_spans(self, text: str) -> list[tuple[int, int]]:
@@ -1512,6 +1594,31 @@ class FamilyMapping(StrictModel):
 
 
 _LINE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+|\n+")
+
+
+def _stop_not_unique(action, levels, others, text, trading_values) -> list[str]:
+    """The family stop rule (owner, 12 November 2026): an entry's protective stop must be
+    uniquely this action's; the bot never selects among competing stops. Checked on the
+    interpreter's facts (the values tagged STOP for the action, the action's own stop, the values
+    other trading actions of the post state) and on the text (every number in a clause with a
+    stop word anywhere in the post, ``stop_values``). A repeated identical value is not a second
+    stop. An ADD is checked on the text only: its stop is the idea's, checked at the gateway."""
+    tagged = {v for role, raw in levels or () if role == "STOP" and (v := _level(raw)) is not None}
+    own_stop = _level(action.stop_price) if action.stop_price is not None else None
+    if len(tagged) > 1:
+        return [PROTECTIVE_STOP_NOT_UNIQUE, "TWO_STOP_VALUES"]
+    if own_stop is not None and tagged and own_stop not in tagged:
+        return [PROTECTIVE_STOP_NOT_UNIQUE, "STOP_DIFFERS_FROM_ACTION"]
+    stop_value = own_stop if own_stop is not None else next(iter(tagged), None)
+    written = stop_values(text or "")
+    if len(written) > 1:
+        return [PROTECTIVE_STOP_NOT_UNIQUE, "SEVERAL_STOP_VALUES"]
+    if written and stop_value is not None and written != {stop_value}:
+        return [PROTECTIVE_STOP_NOT_UNIQUE, "STOP_TEXT_DIFFERS"]
+    pool = trading_values if trading_values is not None else [v for _, _, v in others]
+    if stop_value is not None and any(stop_value in vals for vals in pool):
+        return [PROTECTIVE_STOP_NOT_UNIQUE, "STOP_SHARED_WITH_ANOTHER_ACTION"]
+    return []
 
 
 def _allow_list(action, levels, markers, own, lexicon):
@@ -1686,6 +1793,7 @@ class MappingPolicy:
         levels: list[tuple[str, str]] | None = None,
         others: list[tuple[str | None, str | None, set[Decimal]]] = (),
         post_actions: list[TradeAction] | None = None,
+        trading_values: list[set[Decimal]] | None = None,
     ) -> tuple[MappingDecision, Instrument | None]:
         """One action's mapping decision and, when SUPPORTED, its execution instrument.
         ``clause`` is the instruction text the action came from (contract terms are read from it);
@@ -1748,6 +1856,15 @@ class MappingPolicy:
             return MappingDecision(status="UNSUPPORTED", reason="BASIS_UNSUPPORTED", **out), None
         if not entry.approved:
             return MappingDecision(status="NOT_APPROVED", reason=MAPPING_NOT_APPROVED, **out), None
+        if getattr(entry, "long_only", False) and action.action in (Action.OPEN, Action.ADD) \
+                and action.position_side == PositionSide.SHORT:
+            return MappingDecision(status="UNRESOLVED", reason=MAPPING_LONG_ONLY, **out), None
+        if not revoked and getattr(entry, "max_stop_distance", None) \
+                and action.action in (Action.OPEN, Action.ADD):
+            problem = _stop_not_unique(action, levels, others, post_text or clause,
+                                       trading_values)
+            if problem:
+                return MappingDecision(status="UNRESOLVED", reason=",".join(problem), **out), None
         if action.instrument is not None and action.instrument.symbol not in (
             asset, entry.execution.symbol
         ):
@@ -1761,7 +1878,8 @@ class MappingPolicy:
         kind: list[AnchorLevelKind] = []
         anchor, source, problems = (None, None, []) if revoked else entry.entry_anchor_for(
             action, asset, terms, levels, others, post_text, self.anchor_lexicon, attribution,
-            {"actions": post_actions, "vocabulary": self.vocabulary()}, kind_out=kind)
+            {"actions": post_actions, "vocabulary": self.vocabulary(),
+             "trading_values": trading_values}, kind_out=kind)
         if kind:
             out["anchor_level_kind"] = kind[0].value
         if problems:
@@ -1851,6 +1969,8 @@ class MappingPolicy:
                 a, clause=clauses.get(a.action_id), now=now, held=held, recorded=recorded,
                 post_text=post_text, levels=levels.get(a.action_id), others=others,
                 post_actions=list(parsed.actions),
+                trading_values=[stated[b.action_id] for b in parsed.actions
+                                if b.action_id != a.action_id and b.action != Action.NO_TRADE],
             )
             decisions.append(d)
             marks: list[str] = []

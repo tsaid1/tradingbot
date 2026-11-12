@@ -35,7 +35,7 @@ REPO = Path(__file__).resolve().parents[1]
 SHIPPED = REPO / "config" / "instrument_mapping.toml"
 RULE = {"entry_rule": "REFERENCE_AS_COLLAR", "anchor_max_adverse_move": "0.2%",
         "anchor_max_favourable_move": "0.5%", "anchor_max_signal_age_seconds": 30,
-        "anchor_max_quote_age_seconds": 3}
+        "anchor_max_quote_age_seconds": 3, "max_stop_distance": "5%"}
 
 
 def anchored(anchor="5025", **kw):
@@ -209,6 +209,10 @@ def test_an_explicit_entry_is_decided_exactly_as_today(entry, quote, basis):
     a = act(entry=entry if basis == "DIRECT" else str(Decimal(entry) - 15))
     off = gate(a, mq(terms(basis), **quote, **extra))
     on = gate(a, q_with(terms(basis, **RULE), "5025", **quote, **extra))
+    # The family stop rule (max_stop_distance, in RULE) is recorded on the plan; the decision is
+    # otherwise the same (these stops are well within it).
+    if on.plan is not None:
+        on = on.model_copy(update={"plan": on.plan.model_copy(update={"max_stop_distance": None})})
     assert on == off
 
 
@@ -251,7 +255,7 @@ SESSION = ('session = { policy = "REGULAR_ONLY", timezone = "UTC", '
            'days = ["MON", "TUE", "WED", "THU", "FRI"], regular = ["13:00-21:00"] }')
 # Fallback round (PR #66): the elliptical-level machinery is tested with the owner's switch on
 # (standalone_level_sentence = true); the shipped default (off) in test_entry_rule_standalone.
-ANCHOR_RULE = ('entry_rule = "REFERENCE_AS_COLLAR"\n'
+ANCHOR_RULE = ('max_stop_distance = "5%"\nentry_rule = "REFERENCE_AS_COLLAR"\n'
                'entry_anchor = { max_adverse_move = "0.5%", max_favourable_move = "1%", '
                'max_signal_age_seconds = 60, anchor_scope = "SENTENCE_STRICT", max_quote_age_seconds = 3, environment = "PAPER", standalone_level_sentence = true }')
 OIL_CONTRACTS = ('contracts = [ { month = "202607", roll_date = 2026-07-06 }, '
@@ -690,7 +694,7 @@ def _write(body: str) -> Path:
 
 # ================================================================== the whole service path
 
-RULE_TOML = ('entry_rule = "REFERENCE_AS_COLLAR"\n'
+RULE_TOML = ('max_stop_distance = "5%"\nentry_rule = "REFERENCE_AS_COLLAR"\n'
              'entry_anchor = {{ max_adverse_move = "{adverse}", max_favourable_move = "1%", '
              'max_signal_age_seconds = 60, anchor_scope = "{scope}", max_quote_age_seconds = 3, environment = "PAPER", standalone_level_sentence = true }}')
 

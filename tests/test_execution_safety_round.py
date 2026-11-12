@@ -81,7 +81,7 @@ def test_m1_protection_is_not_confirmed_when_the_post_fill_check_failed(tmp_path
         return real()
 
     h.broker.open_orders = failing_after_the_add_fill
-    add = h.execute("p2", action("add", Action.ADD, idea=idea, entry="50"))
+    add = h.execute("p2", action("add", Action.ADD, idea=idea, entry="50.02"))
     assert add.state == IntentState.FILLED and h.coord.store.position(idea).quantity == 6
     assert add.protection == "UNKNOWN" and add.replay_status == "EXCEPTION"
     assert PROTECTION_UNVERIFIED in [e.kind for e in h.coord.store.exceptions(open_only=True)]
@@ -112,7 +112,7 @@ def test_m2_an_entry_whose_ack_was_lost_still_counts_against_the_caps(tmp_path):
     first = h.execute("p1", open_action())
     assert first.state == IntentState.UNRESOLVED
     h.broker.set_quote("QQZ", "19.99", "20.01")
-    second = h.execute("p2", open_action(symbol="QQZ", entry="20", stop="19", target="22"))
+    second = h.execute("p2", open_action(symbol="QQZ", entry="20.01", stop="19", target="22"))
     assert second.state == IntentState.REFUSED
     assert second.reasons[0].startswith("AGGREGATE_EXPOSURE_CAP")
 
@@ -122,7 +122,7 @@ def test_m2_a_recorded_entry_counts_and_does_not_count_against_its_own_resend(tm
     ref = h.record_never_sent("p1", open_action())  # round 2 (F5): the only late-sent entry case
     assert h.coord.intent(ref).state == IntentState.RECORDED
     _, total = h.coord._exposure(h.broker.resolve(open_action().instrument))
-    assert total == Decimal("50.50") * 4  # the full intended quantity at its limit
+    assert total == Decimal("50.02") * 4  # the full intended quantity at its limit
     h.coord.recover()  # no trace: the resend is not refused by its own exposure
     assert h.coord.intent(ref).state == IntentState.FILLED
 
@@ -151,7 +151,7 @@ def test_m3_a_refused_close_stops_the_group_and_holds_the_open(tmp_path):
             actions=[
                 action("close", Action.CLOSE, idea="p1:open", group="swap"),
                 open_action(
-                    "open-b", symbol="QQZ", entry="20", stop="19", target="22", group="swap"
+                    "open-b", symbol="QQZ", entry="20.01", stop="19", target="22", group="swap"
                 ),
             ]
         ),
@@ -198,11 +198,11 @@ def test_r2_a_reversing_fill_is_recorded_and_blocks_only_that_instrument(tmp_pat
     assert blocked.state == IntentState.REFUSED
     assert blocked.reasons == ["INSTRUMENT_BLOCKED_LEDGER_REVERSAL"]
     h.broker.set_quote("QQZ", "19.99", "20.01")
-    other = h.execute("p3", open_action(symbol="QQZ", entry="20", stop="19", target="22"))
+    other = h.execute("p3", open_action(symbol="QQZ", entry="20.01", stop="19", target="22"))
     assert other.state == IntentState.FILLED  # everything else keeps working
     r = h.replay.process(
         source("p4", at=h.clock.now()),
-        ParsedPost(actions=[open_action("again", symbol="QQZ", entry="20", stop="19")]),
+        ParsedPost(actions=[open_action("again", symbol="QQZ", entry="20.01", stop="19")]),
         h.quotes("QQZ"),
         now=h.clock.now(),
     )
@@ -508,7 +508,7 @@ def test_s3_exposure_is_valued_at_the_current_quote(tmp_path):
     h.execute("p1", open_action(target=None))  # 4 at 50.02 (cost 200.08)
     h.broker.set_quote(SYMBOL, "59.98", "60.02")  # now worth 240
     h.broker.set_quote("QQZ", "19.99", "20.01")
-    out = h.execute("p2", open_action(symbol="QQZ", entry="20", stop="19", target="22"))
+    out = h.execute("p2", open_action(symbol="QQZ", entry="20.01", stop="19", target="22"))
     assert out.state == IntentState.REFUSED  # 240 + 80.80 > 300 (at cost it would pass)
     assert out.reasons[0].startswith("AGGREGATE_EXPOSURE_CAP")
 

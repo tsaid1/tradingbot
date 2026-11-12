@@ -212,7 +212,7 @@ def test_a_stale_reference_quote_holds_a_basis_shift_entry(tmp_path):
 
 def test_a_follow_up_naming_another_month_never_touches_the_held_contract(tmp_path):
     steps = [
-        Step(0, "We are now long $QOIL Jul 2026 at 71.50. Stop 69.80.", "EXECUTED"),
+        Step(0, "We are now long $QOIL Jul 2026 at 71.52. Stop 69.80.", "EXECUTED"),  # at the ask
         Step(60, "Closing our $QOIL Jun 2026 long.", "HOLD"),
     ]
     s = Scenario("months", "QOIL", "DIRECT", steps)

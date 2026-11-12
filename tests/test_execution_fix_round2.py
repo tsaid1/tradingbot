@@ -346,7 +346,8 @@ def test_f8_an_old_recorded_exit_without_a_usable_quote_becomes_an_exception(tmp
 def _short_open(action_id: str = "open"):
     from tradingbot.models import PositionSide
 
-    return open_action(action_id, side=PositionSide.SHORT, entry="50", stop="52", target="45")
+    return open_action(action_id, side=PositionSide.SHORT, entry="49.98", stop="52",
+                       target="45")
 
 
 def test_f9_an_opposite_open_in_the_same_contract_is_held(tmp_path):

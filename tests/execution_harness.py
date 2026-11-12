@@ -72,7 +72,7 @@ def action(
 
 
 def open_action(action_id: str = "open", **kw) -> TradeAction:
-    kw.setdefault("entry", "50")
+    kw.setdefault("entry", "50.02")  # at the ask: an explicit limit is the stated price
     kw.setdefault("stop", "48")
     kw.setdefault("target", "55")
     return action(action_id, Action.OPEN, **kw)
