@@ -83,7 +83,7 @@ from tradingbot.execution.reconcile import DiscrepancyKind, ReconciliationReport
 from tradingbot.execution.replay import BrokerEventReplay
 from tradingbot.execution.shadow_broker import FILL_LABEL, ShadowBroker
 from tradingbot.execution.store import LEDGER_REVERSAL, UNRESOLVED_STATES
-from tradingbot.models import Action, Instrument, LegQuote, MappedQuote, Quote
+from tradingbot.models import Action, ExecutionPlan, Instrument, LegQuote, MappedQuote, Quote
 from tradingbot.runtime import notify as N
 from tradingbot.runtime.alerts import Alerter
 from tradingbot.runtime.config import RuntimeConfig
@@ -312,6 +312,16 @@ class RuntimeService:
             what_if_mapping=self.mapping.what_if is not None,
             **({"mode": "shadow", "fills": FILL_LABEL} if self.shadow else {}),
         )
+        if self.shadow:
+            # Review S3: every shadow record is journaled the moment it happens; fills a crash
+            # left unjournaled are rebuilt from the simulator and the write-ahead evidence.
+            self.broker.journal = lambda event, detail: self.store.event(
+                self.clock(), event, **detail)
+            self.broker.opening_limit = self._opening_limit
+            journaled = {str(e["detail"].get("exec_id")) for e in self.store.events()
+                         if e["event"] == "SHADOW_SIMULATED_FILL"}
+            for record in self.broker.recover_fill_records(journaled):
+                self.store.event(now, "SHADOW_SIMULATED_FILL", **record)
 
     # ================================================================== cycle
 
@@ -864,10 +874,38 @@ class RuntimeService:
         return len(exceptions), result.duplicate
 
     def _journal_shadow_fills(self) -> None:
+        """Records buffered before a journal was attached, and the stream-cap alert."""
         if not self.shadow:
             return
-        for fill in self.broker.take_fill_log():
-            self.store.event(self.clock(), "SHADOW_SIMULATED_FILL", **fill)
+        for record in self.broker.take_fill_log():
+            record = dict(record)
+            self.store.event(self.clock(), record.pop("event", "SHADOW_SIMULATED_FILL"),
+                             **record)
+        now = self.clock()
+        keep = set()
+        for key, since in self.broker.cap_refusals.items():
+            keep.add(f"SHADOW:CAP:{key}")
+            self.alerter.raise_(
+                f"SHADOW:CAP:{key}", N.SHADOW_STREAM_CAP_REACHED, "Quote stream cap reached",
+                f"{key}: no quote stream (cap reached since {since}; every stream is held by a "
+                "contract with a working simulated order or position): its quote is "
+                "unavailable and its entries hold", now)
+        self.alerter.sweep("SHADOW:CAP:", keep, now)
+
+    def _opening_limit(self, order_ref: str) -> float | None:
+        """The per-side quote age an opening order was approved under: the anchored rule's
+        ``anchor_max_quote_age_seconds``, else the policy's ``max_quote_age_seconds``. None (never
+        matched) when the intent or its plan cannot be read."""
+        intent = self.coordinator.intent(order_ref)
+        if intent is None:
+            return None
+        try:
+            plan = ExecutionPlan.model_validate_json(intent.plan) if intent.plan else None
+        except ValueError:
+            return None
+        if plan is not None and plan.entry_rule == "REFERENCE_AS_COLLAR":
+            return plan.anchor_max_quote_age_seconds
+        return float(self.config.policy.max_quote_age_seconds)
 
     def _held_contracts(self) -> dict[str, ContractRef]:
         """Each open follower idea's contract: a follow-up acts on its own idea's contract."""

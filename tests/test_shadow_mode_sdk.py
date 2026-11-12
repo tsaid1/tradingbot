@@ -99,24 +99,29 @@ def fast_session(cfg, cls=IbkrSession, preflight=stub_preflight, cap=None):
 
 
 class Shadow:
-    def __init__(self, folder: Path, server: FakeTws, mono: Mono, posts=(), *, factory=None):
+    def __init__(self, folder: Path, server: FakeTws, mono: Mono, posts=(), *, factory=None,
+                 restart: bool = False, clock: SimClock | None = None):
+        """``restart``: a new process on the same files (posts, state, private config)."""
         self.folder, self.tws, self.mono = folder, server, mono
-        self.clock = SimClock(START)
+        self.clock = clock or SimClock(START)
         self.feed = Feed(server)
         raw = {
             "mode": "shadow",
             "paths": {"state_dir": str(folder / "state"), "halt_file": str(folder / "HALT"),
                       "mapping_file": str(MAPPING)},
             "source": {"kind": "replay", "compression": 1.0,
-                       "file": str(write_posts(folder / "posts.jsonl", list(posts)))},
+                       "file": str(folder / "posts.jsonl") if restart
+                       else str(write_posts(folder / "posts.jsonl", list(posts)))},
             "service": dict(REQUIRED_SERVICE),
             "policy": dict(REQUIRED_POLICY),
             "execution": {**REQUIRED_EXECUTION, "expected_account": SHADOW_ACCOUNT},
-            "shadow": {"paper_config": str(paper_config_file(folder))},
+            "shadow": {"paper_config": str(folder / "private" / "paper.toml") if restart
+                       else str(paper_config_file(folder))},
         }
         self.raw = raw
         self.config = parse_config(raw, base=folder)
-        OperatorQueue.initialise(self.config.operator_db)
+        if not restart:
+            OperatorQueue.initialise(self.config.operator_db)
         self.notifier = RecordingNotifier()
         self.service = build_service(self.config, clock=self.clock.now, notifier=self.notifier,
                                      session_factory=factory or fast_session)
@@ -219,12 +224,18 @@ def test_explicit_open_amend_and_close_all_simulated_at_real_quotes(shadow, tws)
     sh = shadow([post("1", 0, EXPLICIT), post("2", 30, RAISE_STOP), post("3", 60, CLOSE)])
     assert broker_environment(sh.broker) is BrokerEnvironment.SIM
     assert len(sh.feed.subs) == 1  # the TLT stream was opened at start (watched family)
-    keep_fresh = lambda: sh.live(88.40, 88.42)
+    moves = iter(range(100000))
+
+    def keep_fresh():  # real changes on both sides (a repeated image would age: review B2)
+        i = next(moves) % 2
+        sh.live(88.40, 88.42 + i / 100)
+        sh.live(88.40 - i / 100, 88.42)
     run_until_processed(sh, 1, before=keep_fresh)
     [a] = [a for a in sh.actions() if a["action"] == "OPEN"]
     assert a["status"] == "EXECUTED", (a["status"], a["reasons"])
     fills = sh.events("SHADOW_SIMULATED_FILL")
-    assert [(f["side"], f["price"], f["label"]) for f in fills] == [("BUY", "88.42", FILL_LABEL)]
+    assert [(f["side"], f["price"], f["label"]) for f in fills] == [
+        ("BUY", "88.42", "SIMULATED_AT_LIVE_QUOTE")]
     assert fills[0]["quote"]["label"] == "LIVE" and fills[0]["quote"]["reason"] == "REPORTED_LIVE"
     stops = [o for o in sh.sim().open_orders() if o.order_type.value == "STP"]
     assert [o.stop_price for o in stops] == [Decimal("87.20")]
@@ -298,9 +309,13 @@ def test_held_on_delayed_quotes(shadow):
         sh.tick(-1, price(rid, 66, 88.40), price(rid, 67, 88.42))
 
     a = _held(sh, delayed)
-    assert a["reasons"] == ["QUOTE_QUALITY_DELAYED"] or "QUALITY:DELAYED" in a["reasons"]
+    # Delayed ticks carry no live per-side time: the execution core sees the quote UNAVAILABLE
+    # (review B2); the journal keeps the adapter's DELAYED label and the reason.
+    assert a["reasons"] == ["QUOTE_UNAVAILABLE"], a["reasons"]
     [d] = sh.events("SHADOW_DECISION_QUOTES")
-    assert {q["label"] for q in d["quotes"]} == {"DELAYED"}
+    assert {(q["label"], q["adapter_label"], q["reason"]) for q in d["quotes"]} == {
+        ("UNAVAILABLE", "DELAYED", "REPORTED_DELAYED")}
+    assert all("SIDE_TIME_UNKNOWN" in q["problems"] for q in d["quotes"])
 
 
 def test_held_when_the_type_is_unreported_and_the_sides_do_not_change(shadow):
@@ -551,7 +566,7 @@ def test_the_execution_page_labels_everything_simulated_and_shows_the_quotes(
     text = shown(at)
     for needle in ("SHADOW MODE", "SIMULATED at real quotes", "Quotes each decision was made on",
                    "REPORTED_LIVE", "Read-only quote session** READY", "Simulated fills",
-                   "88.42", FILL_LABEL, "simulated broker"):
+                   "88.42", "SIMULATED_AT_LIVE_QUOTE", "simulated broker"):
         assert needle in text, needle
     assert "MOCK" not in text and PAPER not in text
     # "broker" appears only as the simulated broker or to say nothing reached any broker.

@@ -154,10 +154,36 @@ time), so the gateway measures at least the adapter's age. A side that is missin
 not finite or flagged off-tick, and both sides of a halted series, arrive absent; a side with
 non-live ticks or an observation-time problem arrives without a time; an unreported-type LIVE
 quote whose evidence has expired at the read arrives FROZEN. A property test checks that the
-gateway's anchored rule refuses every quote `entry_quote_check` refuses.
+gateway's anchored rule refuses every quote `entry_quote_check` refuses. The quote's own
+`received_at` is its OLDER side's time (the read time minus the larger side age), so the policy's
+`max_quote_age_seconds` measures what the adapter measured: a hung feed that still reports LIVE
+is stale (review B2). When either side's time is unknown (delayed ticks, a missing side, a halted
+series, an unknown observation time), the quote the gateway and the execution core see is
+UNAVAILABLE with no sides (code `SIDE_TIME_UNKNOWN`): no entry, add or exit is priced on it; the
+journal keeps the adapter's own label (for example DELAYED) and reason.
+
+**Simulated fills (review B1).** A real quote is in the simulator's store only for the instant of
+one read: it is published, the simulator matches, the read's own action (a submit, amendment or
+cancel) runs on it, and the store is set back to UNAVAILABLE; nothing can later match on an older
+quote. An OPENING order (not reduce-only: an entry or an add) is matched only on a LIVE quote with
+both sides present, bid below ask, and each side no older than the limit it was approved under
+(the anchored rule's `max_quote_age_seconds` for an anchored entry, the policy's
+`max_quote_age_seconds` for an explicit one). The shadow submit checks its own read first; if it
+fails, the simulated broker rejects the whole bracket with a public code
+(`SHADOW_OPENING_QUOTE_NOT_LIVE`, `..._SIDE_STALE`, `..._LOCKED_OR_CROSSED`, `..._LIMIT_UNKNOWN`;
+journaled `SHADOW_OPENING_ORDER_REJECTED`): nothing rests. A resting opening order is cancelled
+(`SHADOW_OPENING_ORDER_CANCELLED`, with the code and the quote) as soon as a read of its contract
+fails that test: the simulation cannot know what a real resting order would have done on data it
+does not have. Reduce-only orders (stops, closes, take-profits) keep the simulator's rules on any
+real quote, and every simulated fill's label says what it was computed from:
+`SIMULATED_AT_LIVE_QUOTE`, `SIMULATED_AT_DELAYED_QUOTE` or `SIMULATED_AT_FROZEN_QUOTE`.
 
 **Streams.** One per contract, opened on demand and reused, at most the session's
-`max_quote_streams` (4); at the cap the least recently read stream is closed first. A contract
+`max_quote_streams` (4); at the cap the least recently read stream is closed first, but never
+the stream of a contract with a working simulated order, a price condition or a position (review
+S2). When every stream is held by such a contract, the new contract gets no stream: its quote is
+UNAVAILABLE (`STREAM_CAP_REACHED`), its entries hold, and the alert `SHADOW_STREAM_CAP_REACHED`
+stays open until a stream is free. A contract
 with no stream yet does not block the loop: its stream is opened and that read returns what has
 arrived (normally nothing: UNAVAILABLE, journaled `NO_STREAM_YET`), so a decision on it holds.
 The approved stock and ETF families of the mapping (TLT) are opened at start and after every
@@ -184,7 +210,7 @@ replay (a replay needs `compression`: decisions are taken on today's market), wi
 and whenever the session cannot be positively identified as the approved paper environment:
 config file unsafe, profile not paper, listener absent or owned by another user, server too old,
 identity mismatch, Read-Only not verified, the SDK missing, or the watched families not
-streamable. Exit code 2, nothing left connected.
+streamable. Exit code 2, nothing left connected (the simulator is opened before the session, and the session is closed on any later start-up failure; review S4).
 
 ```
 PYTHONPATH=src python scripts/run_service.py --config <private>/runtime.shadow.toml
@@ -195,9 +221,13 @@ session state, masked paper account, requested market-data type, open streams wi
 reason, reconnects, `fills = SIMULATED_AT_REAL_QUOTE`). The journal's `SERVICE_START` carries the
 mode; every post records `SHADOW_DECISION_QUOTES` (for each quote read during its decision: label,
 adapter reason, market-data type, per-side ages, problem codes); every simulated fill records
-`SHADOW_SIMULATED_FILL` with the quote it was computed from. The Execution page shows a shadow
-banner, labels positions, orders and fills `SIMULATED at real quotes`, and lists the quotes each
-decision was made on. The paper account appears only masked.
+`SHADOW_SIMULATED_FILL` with its label and the quote it was computed from, journaled the moment the
+fill is noted. The quote's evidence is written to the simulator's own file just before the quote
+is published, so a fill that a crash left unjournaled is rebuilt at the next start from the
+simulator's executions and that evidence (marked `recovered`; review S3). The Execution page shows a shadow
+banner, labels positions and orders `SIMULATED at real quotes`, shows each fill's label
+(`SIMULATED_AT_LIVE_QUOTE`, `..._DELAYED_...`, `..._FROZEN_...`), and lists the quotes each decision
+was made on. The paper account appears only masked.
 
 **Delayed or quiet quotes.** Anchored entries need a LIVE quote with each side changed within
 `max_quote_age_seconds` (3 s for TLT). A delayed (this account's US stocks answer 2186 with delayed
@@ -205,7 +235,8 @@ ids), frozen, unreported-and-unchanging, one-sided-stale, failed or unavailable 
 BLOCKs the entry (`QUOTE_QUALITY_DELAYED`, `ENTRY_ANCHOR_QUOTE_NOT_LIVE`,
 `ENTRY_ANCHOR_QUOTE_SIDE_STALE`, `QUOTE_UNAVAILABLE`, ...). Explicit-price entries follow the
 gateway's quality rules as in mock mode. A simulated stop is checked against every real quote read,
-including a delayed one, exactly as the simulator does today; the fill records the label.
+including a delayed one, exactly as the simulator does today, and its fill is labelled
+`SIMULATED_AT_DELAYED_QUOTE`; a simulated entry never fills on one.
 
 **Session loss.** A connectivity interruption (1100) fails the streams: quotes UNAVAILABLE, entries
 held, streams reopened once TWS answers again. A dropped socket, poison or disconnect marks the

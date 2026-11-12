@@ -42,8 +42,11 @@ service locks itself out and engages the halt), anything else ``BrokerDisconnect
 
 from __future__ import annotations
 
+import json
+import sqlite3
 from collections import OrderedDict
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import closing, contextmanager
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -64,11 +67,12 @@ from tradingbot.execution.broker import (
 )
 from tradingbot.execution.shadow_quotes import (
     QuoteEvidence,
-    map_snapshot,
+    map_all,
+    opening_problem,
     unavailable_evidence,
     unavailable_quote,
 )
-from tradingbot.execution.sim_broker import SimBroker
+from tradingbot.execution.sim_broker import Behaviour, SimBroker
 from tradingbot.ibkr.config import PaperConnectionConfig
 from tradingbot.ibkr.config import load_config as load_paper_config
 from tradingbot.ibkr.errors import (
@@ -89,7 +93,11 @@ from tradingbot.models import AssetClass, Instrument
 
 SHADOW_MARKET_DATA_TYPE = 3  # live when entitled, delayed (and labelled so) otherwise
 SHADOW_SESSION = "SHADOW_SIMULATED_FILLS"
-FILL_LABEL = "SIMULATED_AT_REAL_QUOTE"
+# The mode, as the heartbeat and the journal's SERVICE_START state it.
+FILL_LABEL = "SIMULATED_FILLS_AT_REAL_QUOTES"
+# Every simulated fill's top-level label: the quality of the real quote it was computed from.
+FILL_LABELS = {"LIVE": "SIMULATED_AT_LIVE_QUOTE", "DELAYED": "SIMULATED_AT_DELAYED_QUOTE",
+               "FROZEN": "SIMULATED_AT_FROZEN_QUOTE"}
 # Stream close reasons that mean the session itself is gone.
 SESSION_LOST_REASONS = frozenset({"CONNECTION_LOST", "SESSION_POISONED", "SESSION_DISCONNECTED"})
 SHADOW_ASSET_CLASSES = (AssetClass.EQUITY, AssetClass.ETF)
@@ -163,6 +171,14 @@ class ShadowBroker:
         self._reads: list[QuoteEvidence] = []
         self._fills: list[dict] = []
         self._seen_execs = {f.exec_id for f in sim.executions()}
+        # Set by the runtime service: the per-side age limit an opening order was approved under
+        # (None: unknown, so the order is never matched), and the durable journal.
+        self.opening_limit: Callable[[str], float | None] = lambda order_ref: None
+        self.journal: Callable[[str, dict], None] | None = None
+        self.cap_refusals: dict[str, str] = {}  # contract_key -> when the cap refused its stream
+        with self._evidence_db() as c:  # write-ahead quote evidence for fills (review S3)
+            c.execute("CREATE TABLE IF NOT EXISTS shadow_quote_evidence (contract_key TEXT "
+                      "PRIMARY KEY, label TEXT NOT NULL, evidence TEXT NOT NULL)")
 
     # ------------------------------------------------------------------ shadow-specific controls
     def set_reference_time(self, at: datetime | None) -> None:
@@ -175,6 +191,41 @@ class ShadowBroker:
     def take_fill_log(self) -> list[dict]:
         out, self._fills = self._fills, []
         return out
+
+    def _record(self, event: str, detail: dict) -> None:
+        """Journal at once when the service gave a journal, else keep for the next drain."""
+        if self.journal is not None:
+            self.journal(event, detail)
+        else:
+            self._fills.append({"event": event, **detail})
+
+    @contextmanager
+    def _evidence_db(self) -> Iterator[sqlite3.Connection]:
+        with closing(sqlite3.connect(str(self._sim.db_path), timeout=10.0)) as c, c:
+            yield c
+
+    def recover_fill_records(self, journaled: set[str]) -> list[dict]:
+        """Simulated fills the journal does not show (a crash between the fill and its row):
+        rebuilt from the simulator's executions and the quote evidence written just before the
+        quote that filled them was published. Marked ``recovered``."""
+        with self._evidence_db() as c:
+            evidence = {k: (label, json.loads(ev)) for k, label, ev in c.execute(
+                "SELECT contract_key, label, evidence FROM shadow_quote_evidence")}
+        out = []
+        for f in self._sim.executions():
+            if f.exec_id in journaled:
+                continue
+            label, ev = evidence.get(f.contract.contract_key, (None, None))
+            out.append({**self._fill_record(f, label, ev), "recovered": True})
+        return out
+
+    @staticmethod
+    def _fill_record(f: Fill, label: str | None, evidence: dict | None) -> dict:
+        return {"label": FILL_LABELS.get(label or "", "SIMULATED_AT_UNKNOWN_QUOTE"),
+                "exec_id": f.exec_id, "order_ref": f.order_ref,
+                "contract_key": f.contract.contract_key, "side": f.side.value,
+                "quantity": f.quantity, "price": str(f.price),
+                "executed_at": f.executed_at.isoformat(), "quote": evidence}
 
     def status(self) -> dict:
         s = self._session
@@ -207,10 +258,13 @@ class ShadowBroker:
         return problems
 
     def close(self) -> list[str]:
-        """Close every held stream, then disconnect. Returns the cleanup failures."""
+        """Close every held stream, then disconnect. Returns the cleanup failures. The simulator's
+        store holds no real quote afterwards (every read already leaves it UNAVAILABLE)."""
         failures: list[str] = []
         for key in list(self._streams):
             failures += self._close_stream(key)
+        for contract in list(self._by_query.values()):
+            self._clear(contract)
         s, self._session = self._session, None
         if s is not None:
             try:
@@ -311,8 +365,17 @@ class ShadowBroker:
         if rc is None:
             return None
         cap = self._session.max_quote_streams
-        while len(self._streams) >= cap:
-            self._close_stream(next(iter(self._streams)))  # least recently read first
+        if len(self._streams) >= cap:
+            # Review S2: never the stream of a contract the simulation depends on (a working
+            # order, a price condition or a position); least recently read first among the rest.
+            protected = self._protected_keys()
+            evictable = [k for k in self._streams if k not in protected]
+            if len(self._streams) - len(evictable) >= cap:
+                self.cap_refusals[key] = self.clock().isoformat()
+                return None
+            while len(self._streams) >= cap:
+                self._close_stream(next(k for k in self._streams if k not in protected))
+        self.cap_refusals.pop(key, None)
         try:
             stream = self._session.open_quote_stream(rc, market_data_type=SHADOW_MARKET_DATA_TYPE)
         except IbkrError:
@@ -339,20 +402,33 @@ class ShadowBroker:
         now = self.clock()
         return now if self._reference is None else min(now, self._reference)
 
-    def _read(self, contract: ContractRef) -> tuple[BrokerQuote, QuoteEvidence]:
+    def _protected_keys(self) -> set[str]:
+        keys: set[str] = set()
+        for o in self._sim.open_orders():
+            keys.add(o.contract.contract_key)
+            if o.condition is not None:
+                keys.add(o.condition.contract.contract_key)
+        keys |= {p.contract.contract_key for p in self._sim.positions()}
+        return keys
+
+    def _read(self, contract: ContractRef):
+        """(the execution core's quote, the simulator's quote, the evidence, the read anchor)."""
         at = self._anchor()  # taken BEFORE the snapshot: any lag only ages the sides
+
+        def none(code: str, reason: str | None = None):
+            q = unavailable_quote(contract, at)
+            return q, q, unavailable_evidence(contract, at, code, reason), at
+
         if not self.connected():
-            return unavailable_quote(contract, at), unavailable_evidence(
-                contract, at, "SESSION_NOT_READY")
+            return none("SESSION_NOT_READY")
         if self._resolved_for(contract) is None:
-            return unavailable_quote(contract, at), unavailable_evidence(
-                contract, at, "CONTRACT_UNKNOWN")
+            return none("CONTRACT_UNKNOWN")
         key = contract.contract_key
         fresh = key not in self._streams
         stream = self._ensure_stream(key)
         if stream is None:
-            return unavailable_quote(contract, at), unavailable_evidence(
-                contract, at, "STREAM_UNAVAILABLE")
+            return none("STREAM_CAP_REACHED" if key in self.cap_refusals
+                        else "STREAM_UNAVAILABLE")
         try:
             snapshot = stream.latest()
         except QuoteStreamClosed:
@@ -360,9 +436,8 @@ class ShadowBroker:
             reason = stream.closed_reason or "CLOSED"
             if reason in SESSION_LOST_REASONS:
                 self._lost = True
-            return unavailable_quote(contract, at), unavailable_evidence(
-                contract, at, "STREAM_CLOSED", reason)
-        quote, evidence = map_snapshot(snapshot, contract, at=at)
+            return none("STREAM_CLOSED", reason)
+        quote, simulated, evidence = map_all(snapshot, contract, at=at)
         if snapshot.quality_reason == REASON_STREAM_FAILED:
             self._close_stream(key)
             self._ensure_stream(key)  # a new subscription earns its own evidence from now on
@@ -371,42 +446,77 @@ class ShadowBroker:
         elif fresh and quote.quality is QuoteQuality.UNAVAILABLE:
             evidence = QuoteEvidence(**{**evidence.__dict__, "problems": (
                 *evidence.problems, "NO_STREAM_YET")})
-        return quote, evidence
+        return quote, simulated, evidence, at
 
-    def quote(self, contract: ContractRef) -> BrokerQuote:
+    def _take(self, contract: ContractRef):
         self._sim.account_id()  # the simulated session must be up as well
-        quote, evidence = self._read(contract)
+        quote, simulated, evidence, at = self._read(contract)
         self._reads.append(evidence)
         self.last_evidence[contract.contract_key] = evidence
-        self._publish(quote)
-        self._note_fills(evidence)
+        return quote, simulated, evidence, at
+
+    def quote(self, contract: ContractRef) -> BrokerQuote:
+        quote, simulated, evidence, at = self._take(contract)
+        self._with_quote(quote, simulated, evidence, at)
         return quote
 
     def reference_quote(self, contract: ContractRef) -> BrokerQuote:
         return self.quote(contract)
 
-    def _publish(self, q: BrokerQuote) -> None:
-        """To the simulator's matching engine: the real quote, or UNAVAILABLE with no sides."""
-        usable = q.bid is not None and q.ask is not None and q.quality != QuoteQuality.UNAVAILABLE
-        self._sim.set_quote(
-            q.contract.symbol, q.bid if usable else None, q.ask if usable else None,
-            last=q.last if usable else None,
-            quality=q.quality if usable else QuoteQuality.UNAVAILABLE,
-            received_at=q.received_at, contract=q.contract, updated_at=q.updated_at,
-            bid_at=q.bid_at, ask_at=q.ask_at)
+    def _with_quote(self, quote: BrokerQuote, simulated: BrokerQuote, evidence: QuoteEvidence,
+                    at: datetime, action: Callable[[], Any] | None = None) -> Any:
+        """The ONLY moment a real quote is in the simulator's store: resting opening orders
+        that this read does not qualify are cancelled first (review B1); the quote's evidence is
+        written ahead (review S3); the quote is published (the simulator matches); ``action``
+        runs on it; every new fill is journaled with its label; the store is set back to
+        UNAVAILABLE, so no later match can use this quote."""
+        self._cancel_unqualified_openings(quote, evidence, at)
+        usable = (simulated.bid is not None and simulated.ask is not None
+                  and simulated.quality is not QuoteQuality.UNAVAILABLE)
+        label = simulated.quality.value if usable else None
+        with self._evidence_db() as c:
+            c.execute("INSERT OR REPLACE INTO shadow_quote_evidence VALUES (?,?,?)",
+                      (simulated.contract.contract_key, label or "UNAVAILABLE",
+                       json.dumps(evidence.as_dict())))
+        try:
+            if usable:
+                self._sim.set_quote(
+                    simulated.contract.symbol, simulated.bid, simulated.ask, last=simulated.last,
+                    quality=simulated.quality, received_at=simulated.received_at,
+                    contract=simulated.contract, updated_at=simulated.updated_at)
+            return action() if action is not None else None
+        finally:
+            try:
+                self._note_fills(label, evidence)
+            finally:
+                self._clear(simulated.contract)
 
-    def _note_fills(self, evidence: QuoteEvidence | None = None) -> None:
+    def _clear(self, contract: ContractRef) -> None:
+        self._sim.set_quote(contract.symbol, None, None, quality=QuoteQuality.UNAVAILABLE,
+                            received_at=self.clock(), contract=contract)
+
+    def _cancel_unqualified_openings(self, quote: BrokerQuote, evidence: QuoteEvidence,
+                                     at: datetime) -> None:
+        key = quote.contract.contract_key
+        for o in self._sim.open_orders():
+            if o.contract.contract_key != key or o.reduce_only or o.parent_ref is not None \
+                    or o.status.value == "PendingCancel":
+                continue
+            code = opening_problem(quote, at, self.opening_limit(o.order_ref))
+            if code is None:
+                continue
+            self._sim.cancel(o.order_ref)  # takes effect before the next match
+            self._record("SHADOW_OPENING_ORDER_CANCELLED", {
+                "order_ref": o.order_ref, "contract_key": key, "code": code,
+                "quote": evidence.as_dict()})
+
+    def _note_fills(self, label: str | None, evidence: QuoteEvidence | None) -> None:
         for f in self._sim.executions():
             if f.exec_id in self._seen_execs:
                 continue
             self._seen_execs.add(f.exec_id)
-            ev = self.last_evidence.get(f.contract.contract_key) or evidence
-            self._fills.append({
-                "label": FILL_LABEL, "exec_id": f.exec_id, "order_ref": f.order_ref,
-                "contract_key": f.contract.contract_key, "side": f.side.value,
-                "quantity": f.quantity, "price": str(f.price),
-                "executed_at": f.executed_at.isoformat(),
-                "quote": ev.as_dict() if ev is not None else None})
+            self._record("SHADOW_SIMULATED_FILL", self._fill_record(
+                f, label, evidence.as_dict() if evidence is not None else None))
 
     def refresh_quotes(self) -> int:
         """Read (and publish) the quote of every contract with a working order, a price
@@ -428,43 +538,46 @@ class ShadowBroker:
                     self._ensure_stream(contract.contract_key)
         return len(contracts)
 
-    def _refresh_ref(self, order_ref: str) -> None:
+    def _on_contract_of(self, order_ref: str, action: Callable[[], Any]) -> Any:
+        """Run ``action`` on a fresh read of the order's contract (and only on it)."""
         orders = self._sim.orders_with_ref(order_ref)
-        if orders:
-            self.quote(orders[-1].contract)
+        if not orders:
+            return action()
+        return self._with_quote(*self._take(orders[-1].contract), action=action)
 
     # ------------------------------------------------------------------ simulated (SimBroker)
     def account_id(self) -> str:
         return self._sim.account_id()
 
     def submit(self, order: OrderIntent, children: Sequence[OrderIntent] = ()) -> list[BrokerOrder]:
-        self.quote(order.contract)
-        out = self._sim.submit(order, children)
-        self._note_fills()
-        return out
+        """Review B1: an opening order (not reduce-only) is checked against this very read; if
+        it is not LIVE with each side within the order's approved age, the (simulated) broker
+        rejects the whole bracket with a public code: nothing rests, nothing fills."""
+        quote, simulated, evidence, at = self._take(order.contract)
+        if not order.reduce_only:
+            code = opening_problem(quote, at, self.opening_limit(order.order_ref))
+            if code is not None:
+                self._record("SHADOW_OPENING_ORDER_REJECTED", {
+                    "order_ref": order.order_ref, "contract_key": order.contract.contract_key,
+                    "code": code, "quote": evidence.as_dict()})
+                self._sim.script_next_submit(Behaviour.REJECT, reason=code)
+        return self._with_quote(quote, simulated, evidence, at,
+                                action=lambda: self._sim.submit(order, children))
 
     def modify(self, order_ref: str, *, limit_price: Decimal | None = None,
                stop_price: Decimal | None = None, quantity: int | None = None) -> BrokerOrder:
-        self._refresh_ref(order_ref)
-        out = self._sim.modify(order_ref, limit_price=limit_price, stop_price=stop_price,
-                               quantity=quantity)
-        self._note_fills()
-        return out
+        return self._on_contract_of(order_ref, lambda: self._sim.modify(
+            order_ref, limit_price=limit_price, stop_price=stop_price, quantity=quantity))
 
     def cancel(self, order_ref: str) -> BrokerOrder:
-        self._refresh_ref(order_ref)
-        out = self._sim.cancel(order_ref)
-        self._note_fills()
-        return out
+        return self._on_contract_of(order_ref, lambda: self._sim.cancel(order_ref))
 
     def supports_price_conditions(self) -> bool:
         return self._sim.supports_price_conditions()
 
     def modify_condition(self, order_ref: str, *, trigger_price: Decimal) -> BrokerOrder:
-        self._refresh_ref(order_ref)
-        out = self._sim.modify_condition(order_ref, trigger_price=trigger_price)
-        self._note_fills()
-        return out
+        return self._on_contract_of(order_ref, lambda: self._sim.modify_condition(
+            order_ref, trigger_price=trigger_price))
 
     def open_orders(self) -> list[BrokerOrder]:
         return self._sim.open_orders()
@@ -488,6 +601,11 @@ def build_shadow_broker(*, sim_db: str | Path, account: str, paper_config: str |
     build the broker. Raises ``ShadowStartRefused`` on any failure; nothing is left connected."""
     if not account.startswith("SIM-"):
         raise ShadowStartRefused("the shadow account must be a simulated SIM- account")
+    # Review S4: the simulator first, so a failure there never connects at all.
+    try:
+        sim = SimBroker(sim_db, account=account, clock=clock)
+    except Exception as exc:  # noqa: BLE001 - any failure refuses the start
+        raise ShadowStartRefused(f"simulator not opened: {_safe(exc)}") from None
     try:
         cfg = load_paper_config(paper_config)
 
@@ -499,8 +617,13 @@ def build_shadow_broker(*, sim_db: str | Path, account: str, paper_config: str |
         if isinstance(exc, (KeyboardInterrupt, SystemExit)):
             raise
         raise ShadowStartRefused(f"read-only paper session refused: {_safe(exc)}") from None
-    broker = ShadowBroker(SimBroker(sim_db, account=account, clock=clock), session,
-                          connect_session=connect, clock=clock, watch=watch)
+    try:
+        broker = ShadowBroker(sim, session, connect_session=connect, clock=clock, watch=watch)
+    except BaseException:  # noqa: BLE001 - disconnect on anything, then re-raise
+        try:
+            session.disconnect()
+        finally:
+            raise
     problems = broker.prewarm()
     if problems:
         broker.close()
