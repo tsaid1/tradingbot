@@ -191,6 +191,9 @@ class MarketTerms(StrictModel):
     # The terms an idea was opened under, used after its family lost approval: exits and protective
     # amendments only, never new exposure.
     exits_only: bool = False
+    # DIRECT with same_series = true: the owner declared the reference series and the execution
+    # price one series, so levels tagged as source-series levels are execution prices.
+    same_series: bool = False
     # Problems found while building these terms (contract unresolved, specification differs).
     problems: list[str] = Field(default_factory=list)
 

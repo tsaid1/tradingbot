@@ -688,3 +688,83 @@ def test_f11_a_proper_approval_loads(tmp_path):
                                  'approved_at = 2026-01-01T00:00:00Z'))
     assert p.executable_assets == ["TLT"]
     assert load(tmp_path, tlt_entry("approved = false")).executable_assets == []
+
+
+# ================================================================== same_series: source-series levels
+
+ENERGY = """version = 2
+[[mapping]]
+family = "QNRG"
+basis = "DIRECT"
+approved = true
+approved_by = "o"
+approved_at = 2026-05-29T12:00:00Z
+same_series = true
+same_series_reason = "the micro QMOF trades at the standard QOF contract month's own price"
+reference = { sec_type = "FUT", symbol = "QOF", exchange = "SIMNRG", currency = "USD" }
+execution = { sec_type = "FUT", symbol = "QMOF", exchange = "SIMNRG", currency = "USD", multiplier = "10", min_tick = "0.01" }
+contract_selection = { rule = "EXPLICIT_ONLY", min_business_days_to_roll = 6 }
+contracts = [ { month = "202607", roll_date = 2026-07-06 }, { month = "202608", roll_date = 2026-08-05 } ]
+sizing = { units_per_signal = 1, max_units = 2, max_notional = "5000" }
+session = { policy = "REGULAR_ONLY", timezone = "UTC", days = ["MON"], regular = ["13:00-21:00"] }
+roll = { business_days_before = 3, action = "FLATTEN" }
+"""
+
+
+def energy_action(action=Action.OPEN):
+    """What the interpreter emits for a source-series code: no instrument, SOURCE_SERIES levels."""
+    return opening("QNRG", action).model_copy(update={
+        "instrument": None, "price_basis": PriceBasis.SOURCE_SERIES,
+        "stop_price": "69.80" if action == Action.OPEN else None})
+
+
+def test_same_series_direct_resolves_the_named_month_only(tmp_path):
+    p = load(tmp_path, ENERGY)
+    d, inst = p.resolve(energy_action(), clause="long QNRG Jul 2026 at 71.50", now=MAP_NOW)
+    assert d.status == "SUPPORTED" and inst.symbol == "QMOF" and inst.futures_contract == "202607"
+    for clause in ["long QNRG at 71.50", "long QNRG Sep '27 at 71.50", "long QNRG Aug at 71.5"]:
+        d, inst = p.resolve(energy_action(), clause=clause, now=MAP_NOW)
+        assert d.status == "UNRESOLVED" and inst is None, clause  # never another month
+
+
+def energy_terms(**kw):
+    base = {"family": "QNRG", "execution_symbol": "QXF", "same_series": True,
+            "min_tick": Decimal("0.25")}
+    return terms(**{**base, **kw})
+
+
+def energy_act(action=Action.OPEN, **kw):
+    a = act(action, family="QNRG", basis=PriceBasis.SOURCE_SERIES, **kw)
+    return a
+
+
+def test_same_series_direct_accepts_source_series_levels_in_the_execution_series():
+    g = gate(energy_act(), mq(energy_terms()))
+    assert g.status == "APPROVE" and "MAPPING_DIRECT" in g.reasons
+    p = g.plan
+    assert (p.execution_reference, p.stop, p.target) == (Decimal(5025), Decimal(4995),
+                                                         Decimal(5085))
+    # The usual checks, all in the execution series.
+    assert gate(energy_act(entry="5200", stop="5150", target="5300"), mq(energy_terms())).reasons == ["ENTRY_PRICE_COLLAR"]
+    assert gate(energy_act(stop="4995.1"), mq(energy_terms())).reasons == [
+        "STOP_PRICE_OFF_TICK"]
+    assert gate(energy_act(stop="5030"), mq(energy_terms())).reasons == [
+        "STOP_DIRECTION_CONTRADICTION"]
+    m = gate(energy_act(Action.MODIFY, idea="9:a1", stop="5000", target=None),
+             mq(energy_terms()), position())
+    assert m.status == "APPROVE" and m.plan.stop == Decimal(5000)
+
+
+def test_direct_without_same_series_still_refuses_source_series_levels():
+    g = gate(energy_act(), mq(energy_terms(same_series=False)))
+    assert g.status == "HOLD" and g.reasons == ["SOURCE_TO_BROKER_PRICE_BASIS_UNRESOLVED"]
+    g = gate(act(family="QNRG", basis=PriceBasis.UNKNOWN), mq(energy_terms()))
+    assert g.reasons == ["SOURCE_TO_BROKER_PRICE_BASIS_UNRESOLVED"]
+
+
+def test_same_series_reaches_the_gateway_terms(tmp_path):
+    e = load(tmp_path, ENERGY).entries["QNRG"]
+    inst = Instrument(asset_class=AssetClass.FUTURE, symbol="QMOF", futures_contract="202607")
+    assert e.terms(inst, None, None).same_series is True
+    tlt_e = MappingPolicy.from_toml(SHIPPED).entries["TLT"]
+    assert tlt_e.same_series is False

@@ -85,7 +85,13 @@ quote. Version-1 files still load.
 **DIRECT.** The levels are the execution instrument's own prices: the named futures month, the
 ETF, the option premium. The gateway checks entry, stop and target against the execution quote,
 and requires them on its tick. Levels the interpreter marked as belonging to another series
-(`SOURCE_SERIES`) are refused, as on the stock path (`SOURCE_TO_BROKER_PRICE_BASIS_UNRESOLVED`).
+(`SOURCE_SERIES`) are refused, as on the stock path (`SOURCE_TO_BROKER_PRICE_BASIS_UNRESOLVED`),
+unless the entry declares `same_series = true`. That declaration asserts that the reference series
+the publisher quotes (for example a futures contract month) and the execution instrument's price
+are one and the same series (for example a micro contract on that underlying), so its levels are
+execution prices and get every check above in that one series. It is part of what the owner
+approves, together with its stated reason, and the contract-month rules then apply in full: a level
+is used only in the month the instruction names or the selection rule picks.
 *Risk:* the publisher's "front month" may not be the month the
 broker lets you hold near expiry, so name the month or use `EXPLICIT_ONLY`.
 

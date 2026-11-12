@@ -439,9 +439,12 @@ def _gate_mapped(a: TradeAction, published_at: datetime, q: MappedQuote, policy:
     if a.source_market_symbol != t.family.removesuffix(".OPT"):
         return _gate("HOLD", "SOURCE_TO_BROKER_MAPPING_UNAPPROVED")
     if a.price_basis == PriceBasis.UNKNOWN or (
-            t.basis == "DIRECT" and a.price_basis != PriceBasis.TRADED_CONTRACT):
+            t.basis == "DIRECT" and a.price_basis != PriceBasis.TRADED_CONTRACT
+            and not (t.same_series and a.price_basis == PriceBasis.SOURCE_SERIES)):
         # DIRECT means the levels are the traded contract's own prices: levels the interpreter
-        # marked as another series are refused, exactly as on the stock path.
+        # marked as another series are refused, exactly as on the stock path, unless the owner
+        # declared that series and the execution price one series (same_series = true). Every
+        # check below is then made in the execution series.
         return _gate("HOLD", "SOURCE_TO_BROKER_PRICE_BASIS_UNRESOLVED")
     if inst.quote_key != t.execution_key or inst.symbol != t.execution_symbol:
         return _gate("BLOCK", "QUOTE_INSTRUMENT_MISMATCH")

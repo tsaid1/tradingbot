@@ -504,6 +504,7 @@ class FamilyMapping(StrictModel):
             max_basis_age_seconds=self.basis_shift.max_age_seconds if self.basis_shift else None,
             require_backstop=bool(rt and rt.require_backstop),
             exits_only=exits_only,
+            same_series=self.same_series,
             problems=out,
         )
 

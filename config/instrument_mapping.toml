@@ -54,14 +54,17 @@ execution = { sec_type = "STK", asset_class = "ETF", symbol = "TLT", exchange = 
 # reference_trigger = { released_order_type = "MKT", reference_hours = ["09:30-16:00"], require_backstop = true }
 # basis_shift = { max_abs_basis = "40", max_age_seconds = 5, scale_ratio = "1" }   # prices the backstop stop
 #
-# --- an energy future quoted in its own contract month's price
+# --- an energy future quoted in its own contract month's price, executed in a micro contract
+# --- on the same underlying that trades at that same price (same_series asserts this)
 # [[mapping]]
 # family = "WTI"
 # basis = "DIRECT"
 # approved = false
 # note = "EXAMPLE: the publisher quotes the named contract month itself."
+# same_series = true
+# same_series_reason = "EXAMPLE: the micro trades at the standard contract month's own price"
 # reference = { sec_type = "FUT", symbol = "EXOIL", exchange = "EXAMPLE", currency = "USD" }
-# execution = { sec_type = "FUT", symbol = "EXOIL", exchange = "EXAMPLE", currency = "USD", multiplier = "100", min_tick = "0.01" }
+# execution = { sec_type = "FUT", symbol = "EXMOIL", exchange = "EXAMPLE", currency = "USD", multiplier = "100", min_tick = "0.01" }
 # contract_selection = { rule = "EXPLICIT_ONLY", min_business_days_to_roll = 6 }
 # contracts = [ { month = "202612", roll_date = 2026-11-16 }, { month = "202701", roll_date = 2026-12-15 } ]
 # sizing = { units_per_signal = 1, max_units = 2, max_notional = "20000" }
