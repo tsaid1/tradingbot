@@ -82,8 +82,8 @@ def test_no_shipped_non_test_file_names_the_order_package_dynamically():
     hits = []
     for p in _tracked():
         rel = _rel(p)
-        if rel in ORDER_SCRIPTS or rel.startswith(allowed_prefixes):
-            continue
+        if rel in ORDER_SCRIPTS or rel.startswith(allowed_prefixes) or p.suffix == ".md":
+            continue  # prose (AGENTS.md, README.md) may name it; it executes nothing
         try:
             text = p.read_text()
         except (UnicodeDecodeError, OSError):

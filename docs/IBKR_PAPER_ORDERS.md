@@ -109,16 +109,26 @@ they agree again. A failed read is `POSITION_UNKNOWN`. The comparison made at co
 
 **Exits never remove protection for a refused close.** Before the binding cancels or shrinks a
 protective SELL stop (the execution core does this before sending a close), it runs the guard on
-a closing SELL LMT for what is held, priced as the core prices the close (a fresh bid less the
-policy collar, `exit_collar_pct` = `MockPolicy.max_price_deviation_pct`, snapped up to the tick
-with the core's own `snap_to_tick`), never at the stop price, with the same inputs it will see at
-send time and the stop assumed gone (`dry_check_exit`). A binding without a collar, or a quote
-that cannot price the exit, cancels or shrinks no stop while anything is held. If that is refused, nothing is cancelled and the core sees a
+a closing SELL LMT for what is held (`dry_check_exit`). The price is the binding's own
+**estimate** of the core's exit limit: the core prices the close first (bid less the policy
+collar, snapped up to the tick); the binding then takes a **new** quote and prices it the same way
+(`exit_collar_pct` = `MockPolicy.max_price_deviation_pct`, the core's `snap_to_tick`). It is never
+the stop price, but it is not the core's number either, and the core sends its own limit. The
+other inputs are those of the send (fresh position, own fills, working orders without the stop,
+the count), with the stop assumed gone, and the liquid-hours rule is judged at now +
+`EXIT_HOURS_MARGIN_SECONDS` (60 s, `session.py`), so no stop is cancelled when the close could land
+outside liquid hours. A binding without a collar, or a quote that is missing or malformed, cancels
+or shrinks no stop while anything is held. If that is refused, nothing is cancelled and the core sees a
 cancel failure (`EXIT_WOULD_BE_REFUSED`), so the exit is not netted and the stop stays. If the
 real close is nevertheless refused or fails (nothing sent) after the stop was cancelled, the
 binding raises `ProtectionLost` ("POSITION_OPEN_PROTECTION_ABSENT", a `BrokerError`). The core
 records it as a submit error with that text, and its next `sync` raises `UNPROTECTED_POSITION`;
 stage 3 calls `sync` at once and stops.
+
+**Residual.** The dry check cannot see the future. If the market falls sharply between the core
+pricing the exit and the send, the stop is already cancelled and the closing limit (priced off
+the earlier bid) may rest unfilled: one share is then held with no stop, and the owner closes it
+by hand (stage 3 reports `STAGE3_CLOSE_NOT_FILLED` with that instruction).
 
 **Which working orders.** Every row of the broker's open-orders answer whatever its status, plus
 every order this session sent that is not final and not rejected even if no view shows it yet
@@ -281,6 +291,15 @@ entry 2, one stop amendment 1, closing limit 1): 2 + 4 = 6 = the cap (asserted i
    `orders = "paper-test-1"` and `state_dir = "<state_dir>"`.
 4. `python scripts/ibkr_paper_init_journal.py` (offline). It prints the journal path.
 5. Plan the day: start stage 3 no later than 14:30 ET; the experiment ends flat the same day.
+   The script itself refuses to START stage 2 or stage 3 at or after 15:00 New York time
+   (`LATEST_START_NEW_YORK`, `experiment.py`): stage 3 holds a share, and stage 2 can leave one
+   (an unexpected fill) that must be closed by hand before 16:00.
+6. **Required before stage 2 and again before stage 3:** run the full test suite locally WITH the
+   SDK (`ibapi` installed, `TRADINGBOT_BLOCK_IBAPI` unset) at the exact commit you will run:
+   `PYTHONPATH="$PWD/src" python -m pytest tests docs/research/g0_x_probe`. CI has no `ibapi`, so
+   it skips every order-path test. Record the commit hash and the passed / skipped counts in a
+   file beside the evidence (`<state_dir>/ibkr_paper_orders/paper-test-1.evidence/`). Stage 1
+   prints this reminder.
 
 | Stage | Owner does first | Command | Passes when | Count |
 |---|---|---|---|---|
@@ -291,17 +310,37 @@ entry 2, one stop amendment 1, closing limit 1): 2 + 4 = 6 = the cap (asserted i
 | any | — | `python scripts/ibkr_paper_experiment.py abort` | every working order of this client cancelled by its own order id; reports what remains and the position | 0 |
 
 After stage 3 (or on any failure): turn Read-Only API back ON, remove the `orders` line, and keep
-the evidence directory and journal. If stage 2 reports a fill, run `abort` and close the share by
-hand (below); stage 3 then never runs.
+the evidence directory and journal. If stage 2 reports a fill, follow its message (below): with a
+working stop, close the share by hand first and only then run `abort`; stage 3 then never runs.
 
 **If stage 2 fills** (result `STAGE2_UNEXPECTED_FILL`): stage 2 cancels the parent first and
 cancels the child only when the parent is confirmed cancelled with nothing filled. After any
 fill it sends no cancel for the protective SELL STP, records what is held and blocks stage 3. The
 evidence (`held.stop_status`, `held.stop_working`) and the message report the child's actual
-state: the broker may have cancelled it with its parent. If the stop is working, do NOT run
-`abort` first: it would cancel the stop. If it is not working, the share is unprotected: close it
-by hand at once. In TWS, sell the share by hand with a limit at the
-bid, confirm the TLT position is 0, then run `abort` to cancel the remaining stop.
+state: the broker may have cancelled it with its parent. The stop counts as working ONLY when its
+status is Submitted or PreSubmitted AND it is visible in a completed open-orders read; Inactive,
+PendingCancel, an unknown status or a failed read are "NOT working". If the stop is working, do
+NOT run `abort` first: it would cancel the stop. If it is not working, the share is unprotected:
+close it by hand at once. In TWS, sell the share by hand with a limit at the bid, confirm the TLT
+position is 0, then run `abort` to cancel what remains.
+
+**What the script prints on an abnormal ending, and what the owner does.** Every message ends with
+"Now:" and an instruction built from a fresh read of the position (the more cautious of the read
+and the experiment's own fills) and this client's working orders (evidence field `state`):
+
+| Result | Printed as the cause | The owner does (from the printed state) |
+|---|---|---|
+| `STAGE2_UNEXPECTED_FILL`, stop working | the stop is working (status) | close by hand first, then `abort`; never `abort` first |
+| `STAGE2_UNEXPECTED_FILL`, stop not working | the stop is NOT working (status, open orders), UNPROTECTED | close by hand NOW, then `abort` |
+| `STAGE2_PARENT_NOT_CONFIRMED_CANCELLED` | the parent's cancel was not confirmed | check TWS: held with a working stop: by hand first, then `abort`; held without one: by hand NOW, then `abort`; flat: `abort` |
+| `STAGE3_ENTRY_NOT_FILLED` | the entry did not fill in time | as the state says (normally flat with the bracket working: `abort`) |
+| `STAGE3_PROTECTION_UNCONFIRMED` | the stop was not confirmed within 15 s of the fill (`PROTECTION_SETTLE_SECONDS`, reads only) | held with a working stop: by hand first, then `abort`; without: by hand NOW, then `abort` |
+| `STAGE3_PROTECTION_LOST` | POSITION OPEN, PROTECTION ABSENT: the close was not sent after the stop was cancelled | by hand NOW, then `abort` |
+| `STAGE3_CLOSE_REFUSED` | the close was REFUSED (or REJECTED / HALTED) with the core's reasons, e.g. `EXIT_WITHOUT_QUOTE` | the stop still works: by hand first, then `abort` |
+| `STAGE3_CLOSE_NOT_FILLED` | the closing limit was sent but did not fill in time | no stop, a resting close: `abort` (it cancels that limit; there is no stop to lose), then by hand at once |
+| `STAGE3_NOT_CLEAN` | reconciliation not clean, or not 6 used | as the state says; keep the evidence for review |
+
+With the position or the orders unreadable, the message says so and gives all three cases.
 
 ## Emergency stop
 
@@ -318,7 +357,8 @@ bid, confirm the TLT position is 0, then run `abort` to cancel the remaining sto
   position: with a share held, sell it by hand first, then run `abort`.
 - **The close.** The protective stop is DAY: it expires at 16:00 ET and a share held overnight is
   unprotected; nothing can be placed after 16:00 ET. The experiment must end flat the same day.
-  **If the closing limit has not filled by 15:30 ET** (30 minutes before the close): run `abort`,
+  **If the closing limit has not filled by 15:30 ET** (the script normally reports
+  `STAGE3_CLOSE_NOT_FILLED` well before) (30 minutes before the close): run `abort`,
   then in TWS sell the share by hand with a limit at the bid (lower it a tick at a time until it
   fills), confirm the position is 0 before 16:00 ET, and record what you did beside the evidence.
 
