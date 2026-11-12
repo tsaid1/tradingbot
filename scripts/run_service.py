@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Run the TradingBot runtime service (mock mode only: the simulated broker).
+"""Run the TradingBot runtime service. Every order, fill and position is simulated in both modes:
+``mode = "mock"`` (an invented market) or ``mode = "shadow"`` (real read-only IBKR paper quotes;
+nothing is ever sent to a broker but the read-only adapter's market-data and read requests).
 
     PYTHONPATH=src python scripts/run_service.py --config path/to/runtime.toml
     PYTHONPATH=src python scripts/run_service.py --config runtime.toml --once
@@ -76,11 +78,17 @@ def main(argv: list[str] | None = None) -> int:
                 )
             )
         else:
-            print(f"service running (mock mode); heartbeat at {config.heartbeat_file}", flush=True)
+            what = ("simulated fills at read-only real quotes" if config.mode == "shadow"
+                    else "simulated broker")
+            print(f"service running ({config.mode} mode: {what}); heartbeat at "
+                  f"{config.heartbeat_file}", flush=True)
             service.run_forever(stop=lambda: stopping["flag"])
     except Exception as exc:  # noqa: BLE001 - an unhandled fault exits non-zero
         print(f"unhandled fault: {type(exc).__name__}", file=sys.stderr)
         return 1
+    finally:
+        if config.mode == "shadow":  # every quote stream closed, the session disconnected
+            service.close()
     return 0
 
 

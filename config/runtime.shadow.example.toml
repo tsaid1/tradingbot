@@ -1,0 +1,60 @@
+# Example runtime config, SHADOW mode: the whole product on REAL read-only IBKR paper quotes with
+# SIMULATED orders and fills. Nothing is ever submitted, amended or cancelled at a broker: the
+# order path is the simulated broker, and the only IBKR session is the read-only adapter
+# (preflight, identity gate, Read-Only verified from TWS's own settings, deny-by-default outgoing
+# allowlist). See docs/RUNTIME.md, "Shadow mode". Copy to a private location and adjust.
+# Relative paths resolve against the directory of this file. Unknown keys refuse to start.
+
+mode = "shadow"
+
+[shadow]
+# The private IBKR paper connection config, loaded exactly as scripts/ibkr_paper_check.py loads it
+# (0600 file, 0700 directory, owned by you, no symlink, paper only). Required, no default.
+paper_config = "~/.config/tradingbot/ibkr/paper.toml"
+account = "SIM-SHADOW-0001"   # the SIMULATED account; execution.expected_account must equal it
+
+[paths]
+state_dir = "~/.local/state/tradingbot/shadow-runtime"   # its own: never a mock state_dir
+halt_file = "~/.local/state/tradingbot/HALT-shadow"
+mapping_file = "instrument_mapping.toml"
+
+[source]
+# Invented posts, released in real time (compression is required in shadow mode: decisions are
+# taken on today's market). Their levels are invented too, so against the real TLT quote the
+# anchored post will usually HOLD on its adverse / favourable move limits: that is expected.
+kind = "replay"
+file = "../fixtures/runtime/shadow_example_posts.jsonl"
+compression = 1.0
+
+[service]
+cadence_seconds = 1.0     # quotes are read every cycle; a 3 s per-side limit needs a short cycle
+max_backoff_seconds = 60.0
+failure_alert_after = 3
+stuck_after_seconds = 60
+lockout_clear_requires_full_reconnect = true
+
+[policy]                  # illustrative limits (tradingbot.models.MockPolicy); all required
+quantity = 1
+quantity_per_add = 1
+max_price_deviation_pct = "1.0"
+max_spread_pct = "1.0"
+max_notional_usd = "150"
+max_signal_age_seconds = 90
+max_quote_age_seconds = 30
+max_instrument_exposure_usd = "150"
+max_aggregate_exposure_usd = "150"
+
+[notify]
+channels = ["log", "alerts_file"]
+realert_seconds = 3600
+
+[execution]
+expected_account = "SIM-SHADOW-0001"
+max_submit_attempts = 2
+settle_seconds = 10
+exit_no_trace_lookups = 3
+max_intent_age_seconds = 120
+max_exit_intent_age_seconds = 120
+lookup_horizon_seconds = 21600
+confirm_attempts = 3
+confirm_wait_seconds = 0

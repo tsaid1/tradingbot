@@ -111,6 +111,9 @@ def load(config: RuntimeConfig) -> dict:
         alerts = _rows(rt, "SELECT * FROM alerts ORDER BY opened_at, key")
         events = _rows(rt, "SELECT * FROM service_events ORDER BY seq DESC LIMIT 50")
         heartbeat = _kv(rt, "heartbeat")
+        shadow_events = _rows(
+            rt, "SELECT * FROM service_events WHERE event IN ('SHADOW_SIMULATED_FILL', "
+            "'SHADOW_DECISION_QUOTES') ORDER BY seq") if config.mode == "shadow" else []
         snapshot = _kv(rt, "broker_snapshot") or {}
         reconciliation = _kv(rt, "reconciliation")
         intents = {r["order_ref"]: r for r in _rows(ex, "SELECT * FROM exec_intents")}
@@ -364,6 +367,13 @@ def load(config: RuntimeConfig) -> dict:
         "alerts": alerts,
         "reconciliation": reconciliation,
         "events": events,
+        "mode": config.mode,
+        # Shadow mode: every simulated fill with the real quote it was computed from, and the
+        # quote evidence of each decision (public codes and numbers only).
+        "shadow_fills": [json.loads(e["detail"]) for e in shadow_events
+                         if e["event"] == "SHADOW_SIMULATED_FILL"],
+        "shadow_decisions": [json.loads(e["detail"]) for e in shadow_events
+                             if e["event"] == "SHADOW_DECISION_QUOTES"],
     }
 
 

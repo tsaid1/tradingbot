@@ -149,46 +149,149 @@ def test_read_only_allowlist_by_message_id_with_the_sdk():
 
 
 # --- row 3: the runtime service runs the simulated broker only --------------------------------------
+# Two modes exist, and both simulate every order, fill, position and the account: "mock" (an
+# invented market) and "shadow" (the same SimBroker at read-only real quotes). Neither can be
+# configured to build an order-capable broker.
+SIMULATED_MODES = ("mock", "shadow")
+SHADOW_ACCOUNT = "SIM-SHADOW-0001"
+
+
 def _runtime_raw(tmp_path: Path, mode: str) -> dict:
     text = (f'mode = "{mode}"\n[paths]\nstate_dir = "state"\nhalt_file = "HALT"\n'
             f'mapping_file = "{ROOT / "config" / "instrument_mapping.toml"}"\n'
             '[source]\nkind = "replay"\nfile = "posts.jsonl"\n' + required_toml())
-    return tomllib.loads(text)
+    raw = tomllib.loads(text)
+    if mode == "shadow":
+        raw["source"]["compression"] = 1.0
+        raw["execution"]["expected_account"] = SHADOW_ACCOUNT
+        raw["shadow"] = {"paper_config": "private/paper.toml"}
+    return raw
 
 
 @pytest.mark.parametrize("mode", ["paper", "ibkr", "ibkr-paper", "paper-test-1", "live",
-                                  "orders", "MOCK"])
-def test_the_runtime_accepts_only_its_simulated_mode(tmp_path, mode):
+                                  "orders", "MOCK", "SHADOW", "shadow-live", "shadow-paper"])
+def test_the_runtime_accepts_only_its_simulated_modes(tmp_path, mode):
     from tradingbot.runtime.config import ACCEPTED_MODES, ConfigError, parse_config
-    assert ACCEPTED_MODES == ("mock",)
-    assert parse_config(_runtime_raw(tmp_path, "mock"), base=tmp_path).mode == "mock"
+    assert ACCEPTED_MODES == SIMULATED_MODES
+    for ok in SIMULATED_MODES:
+        assert parse_config(_runtime_raw(tmp_path, ok), base=tmp_path).mode == ok
     with pytest.raises(ConfigError):
         parse_config(_runtime_raw(tmp_path, mode), base=tmp_path)
+    with pytest.raises(ConfigError):  # nor with the shadow table of a valid shadow config
+        parse_config({**_runtime_raw(tmp_path, "shadow"), "mode": mode}, base=tmp_path)
 
 
+@pytest.mark.parametrize("base", SIMULATED_MODES)
 @pytest.mark.parametrize("extra", [{"broker": "ibkr-paper"}, {"orders": "paper-test-1"},
-                                   {"ibkr": {"orders": "paper-test-1"}}])
-def test_the_runtime_config_has_no_key_that_selects_another_broker(tmp_path, extra):
+                                   {"ibkr": {"orders": "paper-test-1"}},
+                                   {"ibkr_orders": {"enabled": True}}])
+def test_the_runtime_config_has_no_key_that_selects_another_broker(tmp_path, extra, base):
     from tradingbot.runtime.config import ConfigError, parse_config
     with pytest.raises(ConfigError):
-        parse_config({**_runtime_raw(tmp_path, "mock"), **extra}, base=tmp_path)
+        parse_config({**_runtime_raw(tmp_path, base), **extra}, base=tmp_path)
+
+
+@pytest.mark.parametrize("extra", [{"orders": "paper-test-1"}, {"broker": "ibkr-paper"},
+                                   {"session": "PaperOrderSession"}, {"market_data_type": 1},
+                                   {"account": "DU1234567"}, {"read_only": False}])
+def test_the_shadow_table_has_no_key_that_selects_orders_or_a_real_account(tmp_path, extra):
+    from tradingbot.runtime.config import ConfigError, parse_config
+    raw = _runtime_raw(tmp_path, "shadow")
+    raw["shadow"] = {**raw["shadow"], **extra}
+    if "account" in extra:
+        raw["execution"]["expected_account"] = extra["account"]
+    with pytest.raises(ConfigError):
+        parse_config(raw, base=tmp_path)
+
+
+def test_shadow_mode_reports_a_simulated_account_only(tmp_path):
+    from tradingbot.runtime.config import ConfigError, parse_config
+    cfg = parse_config(_runtime_raw(tmp_path, "shadow"), base=tmp_path)
+    assert cfg.simulated_account == cfg.execution.expected_account == SHADOW_ACCOUNT
+    raw = _runtime_raw(tmp_path, "shadow")
+    raw["execution"]["expected_account"] = "SIM-PAPER-0001"  # not the shadow broker's account
+    with pytest.raises(ConfigError, match="expected_account"):
+        parse_config(raw, base=tmp_path)
+
+
+def _called_names(path: Path) -> set[str]:
+    tree = ast.parse(path.read_text())
+    out = set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Call):
+            f = n.func
+            out.add(f.id if isinstance(f, ast.Name) else f.attr if isinstance(f, ast.Attribute)
+                    else "")
+    return out
 
 
 def test_the_runtime_builds_the_simulated_broker_only():
     from tradingbot.runtime.app import build_service
     from tradingbot.runtime.config import ConfigError, RuntimeConfig
-    forced = RuntimeConfig.model_construct(mode="paper")  # past validation, on purpose
-    with pytest.raises(ConfigError):
-        build_service(forced)
+    for mode in ("paper", "live", "orders", "SHADOW"):
+        forced = RuntimeConfig.model_construct(mode=mode)  # past validation, on purpose
+        with pytest.raises(ConfigError):
+            build_service(forced)
     for p in (ROOT / "src/tradingbot/runtime").rglob("*.py"):
         tree = ast.parse(p.read_text())
         mods = {a.name for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names}
         mods |= {n.module for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and n.module}
         assert not {m for m in mods if m.startswith(("tradingbot.ibkr", "ibapi"))}, p.name
-    app = ast.parse((ROOT / "src/tradingbot/runtime/app.py").read_text())
-    built = {n.func.id for n in ast.walk(app) if isinstance(n, ast.Call)
-             and isinstance(n.func, ast.Name) and n.func.id.endswith("Broker")}
-    assert built == {"SimBroker"}
+    # Every broker construction in the wiring: the SimBroker (mock) and the shadow builder,
+    # which composes that same SimBroker with a read-only session (checked below). Any other
+    # call naming a broker is refused.
+    built = {n for n in _called_names(ROOT / "src/tradingbot/runtime/app.py")
+             if "broker" in n.lower()}
+    assert built == {"SimBroker", "build_shadow_broker"}
+    shadow = ROOT / "src/tradingbot/execution/shadow_broker.py"
+    assert {n for n in _called_names(shadow) if n.endswith("Broker")} == {"SimBroker",
+                                                                        "ShadowBroker"}
+    assert {n for n in _called_names(shadow) if n.endswith("Session")} == {"IbkrSession"}
+
+
+def test_the_shadow_broker_has_no_send_path_of_its_own():
+    """Every order method of the shadow broker delegates to the simulator; the module names no
+    order call, no order module and no raw transport, and takes only the exact read-only session
+    class (a subclass is refused before connect: tests/test_shadow_mode_sdk.py)."""
+    from tradingbot.execution.shadow_broker import ShadowBroker
+    path = ROOT / "src/tradingbot/execution/shadow_broker.py"
+    text = path.read_text()
+    for name in ("placeOrder", "cancelOrder", "reqGlobalCancel", "exerciseOptions",
+                 "updateConfig", "sendMsg", "PLACE_ORDER", "ibkr_orders", "socket", "_client",
+                 "_RAW_CONNECTIONS", "import_module"):
+        assert name not in text, name
+    assert "type(session) is not IbkrSession" in text
+    tree = ast.parse(text)
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "ShadowBroker")
+    for fn in (n for n in cls.body if isinstance(n, ast.FunctionDef)):
+        if fn.name in ("submit", "modify", "cancel", "modify_condition"):
+            calls = {f"{c.func.value.attr}.{c.func.attr}" for c in ast.walk(fn)
+                     if isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)
+                     and isinstance(c.func.value, ast.Attribute)}
+            assert calls & {"_sim.submit", "_sim.modify", "_sim.cancel", "_sim.modify_condition"}
+            assert not {c for c in calls if c.startswith("_session.")}, fn.name
+    assert not hasattr(ShadowBroker, "set_quote")  # no invented market either
+
+
+def test_runtime_and_shadow_modules_load_only_the_read_only_adapter_modules():
+    """Transitively: nothing the runtime, the shadow broker, the dashboard's view or the service
+    script loads is the order package, and the adapter modules loaded are the read-only ones."""
+    code = (
+        "import sys\n"
+        "import tradingbot.runtime.app, tradingbot.runtime.service, tradingbot.runtime.lifecycle\n"
+        "import tradingbot.execution.shadow_broker, tradingbot.execution.shadow_quotes\n"
+        "import runpy; runpy.run_path('scripts/run_service.py', run_name='not_main')\n"
+        "bad = sorted(m for m in sys.modules if m.startswith('tradingbot.ibkr_orders'))\n"
+        "assert not bad, bad\n"
+        "ibkr = sorted(m for m in sys.modules if m.startswith('tradingbot.ibkr'))\n"
+        "print(','.join(ibkr))\n")
+    env = {**os.environ, "PYTHONPATH": str(ROOT / "src")}
+    r = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True,
+                       check=False, cwd=ROOT)
+    assert r.returncode == 0, r.stderr
+    loaded = set(r.stdout.strip().split(","))
+    assert loaded <= {"tradingbot.ibkr", "tradingbot.ibkr.config", "tradingbot.ibkr.errors",
+                      "tradingbot.ibkr.models", "tradingbot.ibkr.redact"}, loaded
 
 
 # --- row 4: an order-capable session needs three things the owner writes by hand ----------------

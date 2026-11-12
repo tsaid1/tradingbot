@@ -24,6 +24,13 @@ BANNER = (
     "MOCK MODE: simulated broker only. This page reads the runtime service's journal; it places, "
     "amends and cancels nothing. Its only control is the emergency halt."
 )
+SHADOW_BANNER = (
+    "SHADOW MODE: every order, fill and position below is SIMULATED at real read-only quotes. "
+    "Nothing was sent to any broker: the only broker connection is the read-only IBKR adapter "
+    "(market data, contract details and reads). This page places, amends and cancels nothing. "
+    "Its only control is the emergency halt."
+)
+SIM_LABEL = "SIMULATED at real quotes"
 
 
 def _cell(value) -> str:
@@ -42,15 +49,26 @@ def _ms(v) -> str:
     return "-" if v is None else f"{v:.1f}"
 
 
-st.set_page_config(page_title="Execution (mock)", page_icon="🧪", layout="wide")
-st.title("Execution lifecycle (MOCK)")
-st.error(BANNER)
-
 config_path = Path(os.environ.get("TRADINGBOT_RUNTIME_CONFIG", str(DEFAULT_CONFIG_PATH)))
 try:
     config = load_config(config_path)
 except ConfigError as exc:
-    st.warning(f"No usable runtime config at `{config_path}`: {exc}")
+    config = None
+    config_problem = str(exc)
+SHADOW = config is not None and config.mode == "shadow"
+# Shadow mode: the "broker" is the simulator; say so wherever the page names it.
+BROKER = "simulated broker" if SHADOW else "broker"
+
+if SHADOW:
+    st.set_page_config(page_title="Execution (shadow)", page_icon="🧪", layout="wide")
+    st.title("Execution lifecycle (SHADOW: simulated fills at real quotes)")
+    st.error(SHADOW_BANNER)
+else:
+    st.set_page_config(page_title="Execution (mock)", page_icon="🧪", layout="wide")
+    st.title("Execution lifecycle (MOCK)")
+    st.error(BANNER)
+if config is None:
+    st.warning(f"No usable runtime config at `{config_path}`: {config_problem}")
     st.stop()
 
 view = load(config)
@@ -75,7 +93,7 @@ else:
         st.error("HALT ENGAGED. No new order or amendment; protective orders still follow the position.")
 
 # ------------------------------------------------------------------ health
-st.subheader("Source and broker health")
+st.subheader(f"Source and {BROKER} health")
 hb = view["heartbeat"]
 if not hb:
     st.warning("No heartbeat yet: the service has not completed a cycle with this config.")
@@ -85,7 +103,7 @@ else:
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Heartbeat age (s)", f"{age:.0f}")
     c2.metric("Source failures in a row", hb["source"]["consecutive_failures"])
-    c3.metric("Broker failures in a row", hb["broker"]["consecutive_failures"])
+    c3.metric(f"{BROKER.capitalize()} failures in a row", hb["broker"]["consecutive_failures"])
     c4.metric("Reconciliation", "clean" if rec.get("clean") else "DISCREPANCY")
     st.markdown(
         table(
@@ -109,7 +127,7 @@ else:
                     f"{hb['source']['name']} cursor {hb['source']['cursor']}",
                 ],
                 [
-                    "broker",
+                    BROKER,
                     hb["broker"]["last_success_at"],
                     hb["broker"]["last_error"],
                     hb["broker"]["last_error_at"],
@@ -131,14 +149,27 @@ else:
     )
     if rec.get("unexplained"):
         st.error("Unexplained reconciliation discrepancies: " + ", ".join(rec["unexplained"]))
+    if SHADOW and hb.get("shadow"):
+        sh = hb["shadow"]
+        st.markdown(
+            f"**Read-only quote session** {sh.get('quote_session')} (account "
+            f"{sh.get('quote_account')}, market-data type requested "
+            f"{sh.get('market_data_type_requested')}, streams {len(sh.get('streams') or [])} of "
+            f"{sh.get('stream_cap')}, reconnects {sh.get('reconnects')}). Fills: {SIM_LABEL}."
+        )
+        if sh.get("streams"):
+            st.markdown(table(["Contract", "Quote label", "Reason"],
+                              [[s["contract_key"], s["label"], s["reason"]]
+                               for s in sh["streams"]]))
 
 # ------------------------------------------------------------------ positions and orders
-st.subheader("Positions: follower ledger next to the broker")
-st.caption(f"Broker snapshot taken {view['snapshot_at'] or 'never'}.")
+st.subheader(f"Positions: follower ledger next to the {BROKER}"
+             + (f" ({SIM_LABEL})" if SHADOW else ""))
+st.caption(f"{BROKER.capitalize()} snapshot taken {view['snapshot_at'] or 'never'}.")
 if view["positions"]:
     st.markdown(
         table(
-            ["Contract", "Multiplier", "Follower", "Broker", "Match"],
+            ["Contract", "Multiplier", "Follower", BROKER.capitalize(), "Match"],
             [
                 [
                     p["contract"],
@@ -176,7 +207,8 @@ if view["protection"]:
         )
     )
 
-st.subheader("Working orders (including protective)")
+st.subheader("Working orders (including protective)" + (f": {SIM_LABEL}, never sent"
+                                                          if SHADOW else ""))
 if view["working_orders"]:
     st.markdown(
         table(
@@ -212,13 +244,15 @@ if view["working_orders"]:
         )
     )
 else:
-    st.info("No working order at the broker.")
+    st.info(f"No working order at the {BROKER}.")
 
 # ------------------------------------------------------------------ lifecycle
 st.subheader("Signal lifecycle")
 st.caption(
     "source → interpretation → mapping → gate decision → order → fills → protective orders "
     "→ reconciliation. Post text is never stored; rows carry identities and reason codes."
+    + (f" Orders, fills and protective orders: {SIM_LABEL}, never sent to any broker."
+       if SHADOW else "")
 )
 rows = []
 for r in view["lifecycle"]:
@@ -256,16 +290,42 @@ if rows:
                 "Mapping",
                 "Decision",
                 "Reasons",
-                "Order",
+                "Simulated order" if SHADOW else "Order",
                 "Intent",
-                "Fills",
-                "Protective",
+                "Simulated fills" if SHADOW else "Fills",
+                "Simulated protective" if SHADOW else "Protective",
             ],
             rows,
         )
     )
 else:
     st.info("No signal has been processed yet.")
+if SHADOW:
+    st.subheader(f"Fills ({SIM_LABEL})")
+    st.caption("Each fill was computed by the simulator from the real quote shown; no order "
+               "reached any broker.")
+    if view["shadow_fills"]:
+        st.markdown(table(
+            ["Exec", "Ref", "Contract", "Side", "Qty", "Price", "Quote label", "Reason",
+             "Bid age (s)", "Ask age (s)", "Fill"],
+            [[f["exec_id"], f["order_ref"], f["contract_key"], f["side"], f["quantity"],
+              f["price"], (f.get("quote") or {}).get("label"), (f.get("quote") or {}).get("reason"),
+              (f.get("quote") or {}).get("bid_age_seconds"),
+              (f.get("quote") or {}).get("ask_age_seconds"), f["label"]]
+             for f in view["shadow_fills"]]))
+    else:
+        st.info("No simulated fill yet.")
+    st.subheader("Quotes each decision was made on")
+    rows = [[d["source_id"], d["revision"], ", ".join(f"{x['action_id']} {x['status']}"
+                                                     for x in d["decisions"]),
+             q["contract_key"], q["label"], q["reason"], q["bid_age_seconds"],
+             q["ask_age_seconds"], ", ".join(q["problems"])]
+            for d in view["shadow_decisions"] for q in d["quotes"]]
+    if rows:
+        st.markdown(table(["Source", "Rev", "Decisions", "Contract", "Quote label", "Reason",
+                           "Bid age (s)", "Ask age (s)", "Problems"], rows))
+    else:
+        st.info("No decision on a quote yet.")
 lat = latency_table(view["lifecycle"])
 if lat:
     st.markdown("**Stage latency (ms, from journal timestamps)**")
@@ -277,9 +337,9 @@ if lat:
                 "publish→receive",
                 "receive→interpret",
                 "interpret→gate",
-                "gate→submit",
-                "submit→ack",
-                "ack→fill",
+                "gate→simulated submit" if SHADOW else "gate→submit",
+                "simulated submit→ack" if SHADOW else "submit→ack",
+                "ack→simulated fill" if SHADOW else "ack→fill",
                 "end to end",
                 "Note",
             ],
@@ -384,6 +444,6 @@ if alerts:
 
 st.divider()
 st.caption(
-    "Read-only view of the mock service. docs/RUNTIME.md describes the service, the config "
-    "and the mapping policy."
+    f"Read-only view of the {'shadow' if SHADOW else 'mock'} service. docs/RUNTIME.md describes "
+    "the service, the config and the mapping policy."
 )

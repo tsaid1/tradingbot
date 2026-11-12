@@ -1,4 +1,4 @@
-# Runtime service (mock mode)
+# Runtime service (mock and shadow modes)
 
 `src/tradingbot/runtime/` runs the pipeline as one restart-safe service:
 
@@ -8,7 +8,9 @@ source -> TklInterpreter -> mapping policy -> BrokerEventReplay.process -> SimBr
            lexicon)        not DIRECT)          gate_action, coordinator)                 dashboard
 ```
 
-Only `mode = "mock"` (the simulated broker) is accepted. There is no route to a real broker.
+Two modes are accepted, and in both every order, fill, position and the account are simulated by
+the strict `SimBroker`: `mode = "mock"` (a static invented market) and `mode = "shadow"` (real
+read-only IBKR paper quotes, see "Shadow mode" below). There is no route to an order-capable broker.
 
 ## Run it
 
@@ -26,8 +28,8 @@ by `TRADINGBOT_RUNTIME_CONFIG` (default `~/.config/tradingbot/runtime.toml`).
 ## Config
 
 One TOML file; `config/runtime.example.toml` documents every key. Unknown keys, a missing required
-table (`paths`, `source`, `service`, `policy`, `execution`) or any mode other than `mock` refuse to
-start. **The config fails closed (review F4):** every size, cap, collar, freshness and timing value
+table (`paths`, `source`, `service`, `policy`, `execution`) or any mode other than `mock` or
+`shadow` refuse to start. **The config fails closed (review F4):** every size, cap, collar, freshness and timing value
 the service uses must be written out, or the service refuses to start and names each missing key
 (`config.REQUIRED_KEYS`). Nothing that sizes or bounds an order runs on a default. Relative paths
 resolve against the config file.
@@ -123,6 +125,143 @@ at the start of the next cycle; see `docs/OPERATIONS.md`. Every publisher-driven
 timestamps for every stage (published, received, interpreted, gate decided, submitted,
 acknowledged, filled).
 
+## Shadow mode
+
+`mode = "shadow"` runs the whole product (source, interpreter, mapping policy, gateway, execution
+core, reconciliation, alerts, dashboard) on **real read-only quotes** with **simulated fills**.
+
+**What it is.** The broker is `tradingbot.execution.shadow_broker.ShadowBroker`. Orders, fills,
+positions, open orders, executions and the account are the strict `SimBroker`, unchanged, on a
+simulated account (`SIM-SHADOW-0001`; it declares `BrokerEnvironment.SIM`). Contract resolution
+(stocks and ETFs) and quotes come from ONE read-only `IbkrSession`
+(`docs/IBKR_ADAPTER.md`): preflight, identity gate, Read-Only verified from TWS's own settings,
+the deny-by-default outgoing allowlist. Quotes are held streams, market-data type 3 (live when
+entitled, honestly labelled delayed otherwise). The simulator fills working orders against each
+real quote with its existing rules.
+
+**What it is not.** It sends no order, amendment or cancel to any broker: the only messages a
+shadow run can send are the read-only adapter's (market data, contract details, account and
+position reads, the config read; `tests/test_shadow_mode_sdk.py` asserts this on the wire for full
+lifecycles). It does not use `tradingbot.ibkr_orders` and is not a second market-data source. It
+proves nothing about broker-side order handling (acks, rejections, real fills, queue position).
+
+**The quote mapping** (`execution/shadow_quotes.py`, pure). Quality maps one to one (anything
+unknown is UNAVAILABLE). Each side's age is measured only on the adapter's monotonic clock (its
+image or latest value change, never a repeat) and subtracted from a service-clock anchor, rounded
+up to the microsecond; the adapter's wall stamps are never read. The anchor is never later than
+any `now` a decision uses (the service sets it at each cycle start and to each post's decision
+time), so the gateway measures at least the adapter's age. A side that is missing, a placeholder,
+not finite or flagged off-tick, and both sides of a halted series, arrive absent; a side with
+non-live ticks or an observation-time problem arrives without a time; an unreported-type LIVE
+quote whose evidence has expired at the read arrives FROZEN. A property test checks that the
+gateway's anchored rule refuses every quote `entry_quote_check` refuses. The quote's own
+`received_at` is its OLDER side's time (the read time minus the larger side age), so the policy's
+`max_quote_age_seconds` measures what the adapter measured: a hung feed that still reports LIVE
+is stale (review B2). When either side's time is unknown (delayed ticks, a missing side, a halted
+series, an unknown observation time), the quote the gateway and the execution core see is
+UNAVAILABLE with no sides (code `SIDE_TIME_UNKNOWN`): no entry, add or exit is priced on it; the
+journal keeps the adapter's own label (for example DELAYED) and reason.
+
+**Simulated fills (review B1).** A real quote is in the simulator's store only for the instant of
+one read: it is published, the simulator matches, the read's own action (a submit, amendment or
+cancel) runs on it, and the store is set back to UNAVAILABLE; nothing can later match on an older
+quote. An OPENING order (not reduce-only: an entry or an add) is matched only on a LIVE quote with
+both sides present, bid below ask, and each side no older than the limit it was approved under
+(the anchored rule's `max_quote_age_seconds` for an anchored entry, the policy's
+`max_quote_age_seconds` for an explicit one). The shadow submit checks its own read first; if it
+fails, the simulated broker rejects the whole bracket with a public code
+(`SHADOW_OPENING_QUOTE_NOT_LIVE`, `..._SIDE_STALE`, `..._LOCKED_OR_CROSSED`, `..._LIMIT_UNKNOWN`;
+journaled `SHADOW_OPENING_ORDER_REJECTED`): nothing rests. A resting opening order is cancelled
+(`SHADOW_OPENING_ORDER_CANCELLED`, with the code and the quote) as soon as a read of its contract
+fails that test: the simulation cannot know what a real resting order would have done on data it
+does not have. This sits beside the execution core's own rules for a resting entry (it expires
+once its post is older than its validity, and a publisher CLOSE or REDUCE cancels it,
+docs/EXECUTION_CORE.md): whichever acts first cancels the order, the other finds nothing working,
+and the journal shows one reason per order; the stop child is cancelled with its parent. The
+invariant is enforced where a read is published: before a read that fails the opening test is
+published, every resting opening order of the contract is cancelled in the simulator, the one
+the core is cancelling in that same call included (its journal row is left to the core, and the
+core's cancel then finds it cancelled, a confirmed cancel). If a cancel is refused, the read is not
+published at all. Reduce-only orders (stops, closes, take-profits) keep the simulator's rules on any
+real quote, and every simulated fill's label says what it was computed from:
+`SIMULATED_AT_LIVE_QUOTE`, `SIMULATED_AT_DELAYED_QUOTE` or `SIMULATED_AT_FROZEN_QUOTE`.
+
+**Streams.** One per contract, opened on demand and reused, at most the session's
+`max_quote_streams` (4); at the cap the least recently read stream is closed first, but never
+the stream of a contract with a working simulated order, a price condition or a position (review
+S2). When every stream is held by such a contract, the new contract gets no stream: its quote is
+UNAVAILABLE (`STREAM_CAP_REACHED`), its entries hold, and the alert `SHADOW_STREAM_CAP_REACHED`
+stays open until a stream is free. A contract
+with no stream yet does not block the loop: its stream is opened and that read returns what has
+arrived (normally nothing: UNAVAILABLE, journaled `NO_STREAM_YET`), so a decision on it holds.
+The approved stock and ETF families of the mapping (TLT) are opened at start and after every
+reconnect, so a post normally meets a warm stream. A failed stream (request error, 1100
+connectivity loss) is cancelled and reopened at once; the new subscription must earn LIVE from
+its own evidence. Every unusable read is published to the simulator as UNAVAILABLE with no sides:
+nothing is filled on an older quote.
+
+**Configure and start.**
+
+```toml
+mode = "shadow"
+[shadow]
+paper_config = "~/.config/tradingbot/ibkr/paper.toml"   # loaded exactly as the paper check does
+account = "SIM-SHADOW-0001"                             # optional; the simulated account
+[execution]
+expected_account = "SIM-SHADOW-0001"                    # must equal it
+```
+
+`config/runtime.shadow.example.toml` is complete (invented posts). Shadow mode refuses to start
+without `[shadow] paper_config`, with a `[mock]` table (no invented market), with a historical
+replay (a replay needs `compression`: decisions are taken on today's market), with any other
+`expected_account`, on a state directory that mock mode used (and mock mode refuses a shadow one),
+and whenever the session cannot be positively identified as the approved paper environment:
+config file unsafe, profile not paper, listener absent or owned by another user, server too old,
+identity mismatch, Read-Only not verified, the SDK missing, or the watched families not
+streamable. Exit code 2, nothing left connected (the simulator is opened before the session, and the session is closed on any later start-up failure; review S4).
+
+```
+PYTHONPATH=src python scripts/run_service.py --config <private>/runtime.shadow.toml
+```
+
+**What the owner sees.** The heartbeat carries `mode = "shadow"` and a `shadow` block (quote
+session state, masked paper account, requested market-data type, open streams with their label and
+reason, reconnects, `fills = SIMULATED_AT_REAL_QUOTE`). The journal's `SERVICE_START` carries the
+mode; every post records `SHADOW_DECISION_QUOTES` (for each quote read during its decision: label,
+adapter reason, market-data type, per-side ages, problem codes); every simulated fill records
+`SHADOW_SIMULATED_FILL` with its label and the quote it was computed from, journaled the moment the
+fill is noted. The quote's evidence is written to the simulator's own file just before the quote
+is published, so a fill that a crash left unjournaled is rebuilt at the next start from the
+simulator's executions and that evidence (marked `recovered`; review S3). The Execution page shows a shadow
+banner, labels positions and orders `SIMULATED at real quotes`, shows each fill's label
+(`SIMULATED_AT_LIVE_QUOTE`, `..._DELAYED_...`, `..._FROZEN_...`), and lists the quotes each decision
+was made on. The paper account appears only masked.
+
+**Delayed or quiet quotes.** Anchored entries need a LIVE quote with each side changed within
+`max_quote_age_seconds` (3 s for TLT). A delayed (this account's US stocks answer 2186 with delayed
+ids), frozen, unreported-and-unchanging, one-sided-stale, failed or unavailable quote HOLDs or
+BLOCKs the entry (`QUOTE_QUALITY_DELAYED`, `ENTRY_ANCHOR_QUOTE_NOT_LIVE`,
+`ENTRY_ANCHOR_QUOTE_SIDE_STALE`, `QUOTE_UNAVAILABLE`, ...). Explicit-price entries follow the
+gateway's quality rules as in mock mode. A simulated stop is checked against every real quote read,
+including a delayed one, exactly as the simulator does today, and its fill is labelled
+`SIMULATED_AT_DELAYED_QUOTE`; a simulated entry never fills on one.
+
+**Session loss.** A connectivity interruption (1100) fails the streams: quotes UNAVAILABLE, entries
+held, streams reopened once TWS answers again. A dropped socket, poison or disconnect marks the
+broker disconnected: the existing policy applies (`BROKER_RECONNECT_PENDING`, every OPEN and ADD
+refused, the broker alert, no post consumed), and `reconnect()` opens a NEW session with every
+check again on the broker backoff; an identity, paper-environment or read-only failure locks the
+service out and engages the halt. Clean shutdown closes every stream and disconnects
+(`SHADOW_SESSION_CLOSED`).
+
+**What remains to verify against a real TWS.** Whether TLT's live quote is entitled at all on this
+account (if it stays DELAYED, every anchored entry holds, by design); how often each side changes
+in a quiet session against the 3 s limit; how soon a new stream earns LIVE; whether TWS sends -1/0
+placeholders before the first quote (a placeholder never counts; the current value must be valid);
+how 2186 / 10090 / 10167 attach to a stream; how a TWS restart surfaces (socket close vs 1100) and
+how long reconnect takes; contract resolution for TLT with `exchange = "SMART"` and no primary
+exchange returning exactly one contract.
+
 ## Vocabulary review (owner only)
 
 The entry rule fails closed: an entry holds when its post holds a word the public lists do not
@@ -212,7 +351,7 @@ proposals, validated by the same loader, to a separate file (`<lexicon>.candidat
 the decisions file or the review log. The service refuses to start with a
 candidate as its `lexicon_path`; only an offline replay may load one, explicitly:
 `scripts/run_service.py --config <replay.toml> --source replay:<posts.jsonl>
---allow-candidate-lexicon` (refused with any live source). The candidate replay needs a **new
+--allow-candidate-lexicon` (refused with any live source, and in shadow mode whatever the source). The candidate replay needs a **new
 state directory** (no heartbeat, no journaled event or signal) or one an earlier candidate run
 marked (`CANDIDATE_RUN`); it marks it, and a production run on a marked directory is refused, so
 experimental holds and trades never enter production's journal. Production eligibility therefore
