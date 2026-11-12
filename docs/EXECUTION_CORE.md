@@ -38,10 +38,10 @@ SourcePost -> PaperEventReplay.process  (gate_source, gate_action, atomic groups
     the gateway cannot see. Unreadable broker positions refuse the entry.
   * no open exception in the instrument of a blocking kind (`INSTRUMENT_BLOCKED_<KIND>`):
     `LEDGER_REVERSAL`, `ENTRY_REMAINDER_NOT_CANCELLED`, `UNPROTECTED_POSITION`,
-    `PROTECTION_UNVERIFIED`, `ENTRY_STATE_UNKNOWN`; and no entry or add of unknown outcome in the
-    instrument (`UNRESOLVED_ENTRY_IN_INSTRUMENT`).
-  * no open `BROKER_STATE_UNKNOWN` (see Broker reads below): OPEN and ADD refuse with
-    `BROKER_UNREADABLE`.
+    `PROTECTION_UNVERIFIED`, `ENTRY_STATE_UNKNOWN`, `OPERATOR_SETTLEMENT_UNVERIFIED`; and no entry
+    or add of unknown outcome in the instrument (`UNRESOLVED_ENTRY_IN_INSTRUMENT`).
+  * no open `BROKER_STATE_UNKNOWN` (see Broker reads below) or `BROKER_RECONNECT_PENDING` (the
+    runtime service's session policy): OPEN and ADD refuse with `BROKER_UNREADABLE`.
   * one net position per contract: an OPEN on the opposite side of an open or pending idea in the
     same contract is held by `BrokerEventReplay` (`HOLD`, `OPPOSITE_IDEA_IN_SAME_CONTRACT`) and
     refused by the coordinator. A publisher reversal is a CLOSE followed by an OPEN.
@@ -255,6 +255,28 @@ Duplicate delivery of a post revision is stopped twice:
    and the coordinator returns that intent's outcome. It never places a second order.
 
 `HALTED` and `REFUSED` intents are terminal. A redelivered post does not retry them.
+
+## Operator settlement
+
+`execution/settlement.py` lets a human end what the coordinator never ends by itself (an entry or
+add of unknown outcome, above all one beyond the lookup horizon). `settle_intent` declares one
+intent `NOT_AT_BROKER`, `CANCELLED` or `FILLED` (quantity, average price) after the operator
+checked the broker. Its own call only reads and records: it sends, amends and cancels nothing,
+not even protective upkeep, which the next normal sync does. It reads first
+(`sync(record_only=True)`), then refuses a declaration the broker
+contradicts (the order or its fills visible, a fill outside the limit, off tick or increment, or a
+resulting follower position the broker's cannot equal, allowing only for other intents of unknown
+outcome in the contract). A declared fill goes through `apply_fill` (`exec_id = OPERATOR:<request>`)
+so protection must then be confirmed at the broker like any fill. The settlement opens
+`OPERATOR_SETTLEMENT_UNVERIFIED`, a blocking kind that only `lift_verified_blocks` resolves, never
+in the call that records the settlement, after a full successful sync and a reconciliation with no
+blocking discrepancy in that contract. After `NOT_AT_BROKER` or `CANCELLED` it also needs the
+exit-resend evidence rule after the settlement (settle period, `exit_no_trace_lookups` no-trace
+lookups spread over it). Broker evidence for such an intent later opens
+`SETTLED_INTENT_CONTRADICTED` (blocking, a safety discrepancy in reconciliation, CLEAR-class).
+`clear_exception` (a `LEDGER_REVERSAL`, verified the same way) and `acknowledge_exception`
+(records that block nothing) complete the set; `operator_catalog.py` classes every exception kind.
+Every action, applied or refused, is journaled with its before and after state.
 
 ## Integration seam
 

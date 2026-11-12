@@ -8,7 +8,7 @@ from pathlib import Path
 
 from tradingbot.execution.sim_broker import SimBroker
 from tradingbot.runtime.config import ConfigError, ReplaySourceConfig, RuntimeConfig
-from tradingbot.runtime.notify import FanoutNotifier, LogFileNotifier, MacOSNotifier, Notifier
+from tradingbot.runtime.notify import ChannelContext, Notifier, build_channels
 from tradingbot.runtime.service import RuntimeService
 from tradingbot.runtime.sources import (
     FileTokenStore,
@@ -70,10 +70,17 @@ def build_source(
 
 
 def build_notifier(config: RuntimeConfig, clock=None) -> Notifier:
-    notifiers: list[Notifier] = [LogFileNotifier(config.notification_log, clock)]
-    if config.notify.macos:
-        notifiers.append(MacOSNotifier())
-    return FanoutNotifier(notifiers)
+    """The configured channels (``[notify] channels``; ``macos = true`` adds ``macos``)."""
+    names = list(config.notify.channels)
+    if config.notify.macos and "macos" not in names:
+        names.append("macos")
+    ctx = ChannelContext(
+        log_file=config.notification_log, alerts_file=config.alerts_file, clock=clock
+    )
+    try:
+        return build_channels(names, ctx)
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from None
 
 
 def build_service(

@@ -265,6 +265,52 @@ class OrderNotFound(BrokerError):
     """No working order with that order_ref (it is unknown or already terminal)."""
 
 
+class BrokerDisconnected(BrokerError):
+    """The session to the broker is down (additive): nothing was sent or read. An adapter whose
+    connection can drop (a Trader Workstation restarts daily) raises this from every call."""
+
+
+class BrokerIdentityError(BrokerError):
+    """The adapter's own identity checks failed on (re)connection (additive): the session is not
+    the one it is configured for. The caller must treat the broker as unusable."""
+
+
+@runtime_checkable
+class ReconnectableBroker(Protocol):
+    """Optional session control (additive; kept out of ``Broker`` so an adapter without it still
+    satisfies the protocol). ``reconnect`` re-establishes the session and runs the adapter's own
+    identity checks again (account, paper session, server); it raises ``BrokerIdentityError`` when
+    they fail and ``BrokerError`` when the session cannot be re-established. ``session_identity``
+    describes the session with stable identifiers only (account, paper or live, never a client id,
+    time or credential): the runtime service locks itself out of a broker whose identity differs
+    from the last one it accepted."""
+
+    def connected(self) -> bool: ...
+
+    def reconnect(self) -> None: ...
+
+    def session_identity(self) -> dict[str, str]: ...
+
+
+def broker_connected(broker) -> bool:
+    """False only when the broker reports its session down; a broker without session control is
+    taken as connected (its reads then decide)."""
+    probe = getattr(broker, "connected", None)
+    try:
+        return bool(probe()) if callable(probe) else True
+    except BrokerError:
+        return False
+
+
+def session_identity(broker) -> dict[str, str]:
+    """The session's identity: the adapter's own description when it offers one, else the
+    account. Raises BrokerError when it cannot be read."""
+    get = getattr(broker, "session_identity", None)
+    if callable(get):
+        return {str(k): str(v) for k, v in get().items()}
+    return {"account": broker.account_id()}
+
+
 @runtime_checkable
 class ConditionalOrders(Protocol):
     """Optional broker capabilities for REFERENCE_TRIGGER families (multi-asset mapping). Kept out
