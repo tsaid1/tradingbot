@@ -104,6 +104,14 @@ ENTRY_ANCHOR_NOT_CURRENT = "ENTRY_ANCHOR_NOT_CURRENT"
 ENTRY_ANCHOR_INSTRUMENT_UNCLEAR = "ENTRY_ANCHOR_INSTRUMENT_UNCLEAR"
 # A word in the anchor's context window is not on the allow-list: what the number is cannot be told.
 ENTRY_ANCHOR_CONTEXT_UNCLEAR = "ENTRY_ANCHOR_CONTEXT_UNCLEAR"
+# anchor_scope = SINGLE_MARKET_POST: why the post as a whole does not attribute the level.
+ENTRY_ANCHOR_POST_SEVERAL_LEVELS = "ENTRY_ANCHOR_POST_SEVERAL_LEVELS"  # (a)
+ENTRY_ANCHOR_POST_SEVERAL_MARKETS = "ENTRY_ANCHOR_POST_SEVERAL_MARKETS"  # (b)
+ENTRY_ANCHOR_POST_SEVERAL_ACTIONS = "ENTRY_ANCHOR_POST_SEVERAL_ACTIONS"  # (c)
+ENTRY_ANCHOR_REFERENCE_UNNAMED = "ENTRY_ANCHOR_REFERENCE_UNNAMED"  # (d)
+# Interpreter flags meaning it did not resolve one instrument.
+_UNRESOLVED_INSTRUMENT_FLAGS = ("ASSET_UNRESOLVED", "MIXED_SERIES_AND_TICKER",
+                                "MULTIPLE_TICKERS_IN_CLAUSE")
 # level_contract_rule = FRONT_MONTH: why the front contract cannot be used for an unnamed month.
 FRONT_MONTH_IN_ROLL_WINDOW = "FRONT_MONTH_IN_ROLL_WINDOW"
 FRONT_MONTH_AMBIGUOUS = "FRONT_MONTH_AMBIGUOUS"
@@ -366,7 +374,9 @@ class EntryAnchorRules(StrictModel):
     # also needs the sentence before it entirely allow-listed. ACTION_BLOCK: it is also accepted
     # when the sentence immediately before it is this action's own clause as the interpreter
     # delimited it (docs/MULTI_ASSET_MAPPING.md, "Anchor scope").
-    anchor_scope: Literal["SENTENCE_STRICT", "ACTION_BLOCK"]
+    # SINGLE_MARKET_POST: the level's own sentence as SENTENCE_STRICT; attribution by the whole
+    # post instead of a neighbouring sentence (one marked level, one market, one current entry).
+    anchor_scope: Literal["SENTENCE_STRICT", "ACTION_BLOCK", "SINGLE_MARKET_POST"]
 
     @field_validator("max_adverse_move", "max_favourable_move")
     @classmethod
@@ -926,6 +936,7 @@ class FamilyMapping(StrictModel):
         post_text: str | None = None,
         lexicon: AnchorLexicon | None = None,
         attribution: list[str] | None = None,
+        post: dict | None = None,
     ) -> tuple[Decimal | None, str | None, list[str]]:
         """entry_rule = REFERENCE_AS_COLLAR: the stated market level that may anchor this action's
         entry, the text it is written in, or why none may. ``levels`` are the interpreter's price
@@ -1000,6 +1011,11 @@ class FamilyMapping(StrictModel):
         if "NO_PRESENT_MARKER" in why:  # no positive evidence at all
             return None, None, [ENTRY_ANCHOR_NOT_CURRENT, *why]
         own = self.anchor_names(asset, lexicon)
+        if self.entry_anchor.anchor_scope == "SINGLE_MARKET_POST":
+            problems = self._single_market_problems(action, asset, anchor, source, post_text,
+                                                    markers, post or {})
+            if problems:
+                return None, None, problems
         attributed: list[str] = []
         problems = self._sentence_problems(action, anchor, source, terms, levels, post_text,
                                            markers, own, lexicon, attribution=attributed)
@@ -1025,6 +1041,56 @@ class FamilyMapping(StrictModel):
         if attribution is not None:
             attribution += attributed
         return anchor, source, []
+
+    def _single_market_problems(self, action, asset, anchor, source, post_text, markers,
+                                post) -> list[str]:
+        """anchor_scope = SINGLE_MARKET_POST: the post as a whole attributes the level. (c) this is
+        the post's only action besides commentary, and no action is conditional, retrospective or
+        uncertain; (b) every action is this family's, no instrument is unresolved, and the post
+        names no other family (its codes and symbols, case as written; its aliases from the
+        mapping file or the private lexicon, any case) and no cashtag but this family's; (a)
+        exactly one sentence of the post carries a marked number; (d) for a reference-series
+        family the level's sentence does not name the execution instrument."""
+        actions = post.get("actions")
+        if actions is None:
+            return [ENTRY_ANCHOR_POST_SEVERAL_ACTIONS, "POST_ACTIONS_UNKNOWN"]
+        for b in actions:
+            if b.action_id == action.action_id:
+                continue
+            if b.timing in (Timing.CONDITIONAL, Timing.HISTORICAL, Timing.UNCERTAIN) \
+                    or b.action != Action.NO_TRADE:
+                return [ENTRY_ANCHOR_POST_SEVERAL_ACTIONS, f"OTHER:{b.action.value}"]
+        for b in actions:
+            if any(f in a for a in b.ambiguities for f in _UNRESOLVED_INSTRUMENT_FLAGS):
+                return [ENTRY_ANCHOR_POST_SEVERAL_MARKETS, "INSTRUMENT_UNRESOLVED"]
+            if b.source_market_symbol is not None and b.source_market_symbol != asset:
+                return [ENTRY_ANCHOR_POST_SEVERAL_MARKETS, "ACTION_FOR_ANOTHER_FAMILY"]
+        text = post_text or source
+        mine = {asset, self.family.removesuffix(".OPT"), self.execution.symbol,
+                *self.equivalent_roots, *([self.reference.symbol] if self.reference else [])}
+        if {c.upper().rstrip(".") for c in _CASHTAG_RE.findall(text)} - mine:
+            return [ENTRY_ANCHOR_POST_SEVERAL_MARKETS, "OTHER_CASHTAG"]
+        mine_lower = {m.lower() for m in mine} | set(self.aliases)
+        for family, (codes, aliases) in (post.get("vocabulary") or {}).items():
+            if family.removesuffix(".OPT") == self.family.removesuffix(".OPT"):
+                continue
+            for code in codes - mine:
+                if re.search(rf"(?<![\w$]){re.escape(code)}(?!\w)", text):
+                    return [ENTRY_ANCHOR_POST_SEVERAL_MARKETS, "OTHER_FAMILY_NAMED"]
+            for alias in aliases - mine_lower:
+                if re.search(rf"(?<![\w$]){re.escape(alias)}(?!\w)", text, re.IGNORECASE):
+                    return [ENTRY_ANCHOR_POST_SEVERAL_MARKETS, "OTHER_FAMILY_NAMED"]
+        marked = [s for s, _ in sentences(text) if marked_numbers(s, markers)]
+        if len(marked) != 1:
+            return [ENTRY_ANCHOR_POST_SEVERAL_LEVELS, f"MARKED_SENTENCES:{len(marked)}"]
+        if self.basis in ("BASIS_SHIFT", "REFERENCE_TRIGGER") and self.reference is not None:
+            execution = {self.execution.symbol, *self.equivalent_roots} - {self.reference.symbol}
+            for s, _ in sentences(source):
+                if anchor in clause_numbers(s) and any(
+                        re.search(rf"(?<![\w]){re.escape(x)}(?!\w)", s.replace("$", " "))
+                        for x in execution):
+                    return [ENTRY_ANCHOR_REFERENCE_UNNAMED, "EXECUTION_SYMBOL"]
+        return []
 
     def _month_spans(self, text: str) -> list[tuple[int, int]]:
         """A future's contract months in ``text``: left to the contract check."""
@@ -1083,7 +1149,9 @@ class FamilyMapping(StrictModel):
                 at = texts.index(sentence) if sentence in texts else -1
                 before = texts[at - 1] if at > 0 else None
                 own_block = {s for s, _ in sentences(terms.clause)}
-                if before is None:
+                if self.entry_anchor.anchor_scope == "SINGLE_MARKET_POST":
+                    case = "SINGLE_MARKET_POST"  # attributed by the whole post, checked before
+                elif before is None:
                     case = "FIRST_SENTENCE"
                 elif (self.entry_anchor.anchor_scope == "ACTION_BLOCK" and before in own_block):
                     # The interpreter delimited this action's clause; the level sentence follows it
@@ -1242,6 +1310,25 @@ class MappingPolicy:
         # the runtime loads one.
         self.anchor_lexicon = AnchorLexicon()
 
+    def vocabulary(self) -> dict[str, tuple[set[str], set[str]]]:
+        """Every family the mapping file and the private lexicon know: its codes and series
+        symbols (matched as written) and its aliases (lower case, any case)."""
+        out: dict[str, tuple[set[str], set[str]]] = {}
+        for family, e in self.entries.items():
+            codes = {family.removesuffix(".OPT")}
+            if isinstance(e, FamilyMapping):
+                codes |= {s.symbol for s in (e.reference, e.execution) if s is not None}
+                codes |= set(e.equivalent_roots)
+                aliases = set(e.aliases)
+            else:
+                codes.add(e.broker_symbol)
+                aliases = set()
+            out[family] = (codes, aliases)
+        for family, names in self.anchor_lexicon.family_aliases.items():
+            codes, aliases = out.get(family, (set(), set()))
+            out[family] = (codes, aliases | set(names))
+        return out
+
     def check_policy(self, policy) -> None:
         """Refuse a gateway policy under which an entry rule here could open without a stop."""
         collar = sorted(f for f, e in self.entries.items()
@@ -1299,6 +1386,7 @@ class MappingPolicy:
         post_text: str | None = None,
         levels: list[tuple[str, str]] | None = None,
         others: list[tuple[str | None, str | None, set[Decimal]]] = (),
+        post_actions: list[TradeAction] | None = None,
     ) -> tuple[MappingDecision, Instrument | None]:
         """One action's mapping decision and, when SUPPORTED, its execution instrument.
         ``clause`` is the instruction text the action came from (contract terms are read from it);
@@ -1372,7 +1460,8 @@ class MappingPolicy:
         ).date()
         attribution: list[str] = []
         anchor, source, problems = (None, None, []) if revoked else entry.entry_anchor_for(
-            action, asset, terms, levels, others, post_text, self.anchor_lexicon, attribution)
+            action, asset, terms, levels, others, post_text, self.anchor_lexicon, attribution,
+            {"actions": post_actions, "vocabulary": self.vocabulary()})
         if problems:
             return MappingDecision(status="UNRESOLVED", reason=",".join(problems), **out), None
         instrument, problems = entry.select(action, asset, terms, today, held_contract, post_text,
@@ -1459,6 +1548,7 @@ class MappingPolicy:
             d, instrument = self.resolve(
                 a, clause=clauses.get(a.action_id), now=now, held=held, recorded=recorded,
                 post_text=post_text, levels=levels.get(a.action_id), others=others,
+                post_actions=list(parsed.actions),
             )
             decisions.append(d)
             marks: list[str] = []
