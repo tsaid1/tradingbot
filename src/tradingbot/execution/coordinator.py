@@ -2023,29 +2023,38 @@ class ExecutionCoordinator:
             self.store.resolve_exceptions(now, PROTECTION_UNVERIFIED, idea_id=idea_id)
             return
         cover = max(pos.quantity - self.store.committed_exit_quantity(idea_id), 0)
+        # Review N1: the cover is also capped at what the BROKER holds in the contract, whatever
+        # the ledger believes. None: the broker position could not be read (never size up then).
+        broker_cover, differs = self._broker_cover(pos)
+        target = cover if broker_cover is None else min(cover, broker_cover)
         changed = False
         for ref in refs:
             o = open_by_ref.get(ref)
             if o is None or o.status == OrderStatus.PENDING_CANCEL:
                 continue
-            if cover == 0:
-                # Everything held is committed to working exits: a child would over-commit.
+            want = target if broker_cover is not None else min(target, o.remaining)
+            if want == 0:
+                # Everything held is committed to working exits, or the broker holds nothing to
+                # cover: a child would over-commit (it could open a position if it triggered).
                 changed |= self._try(
                     lambda r=ref: self.broker.cancel(r),
                     "PROTECTIVE_CANCELLED",
                     idea_id,
                     ref,
-                    reason="position fully committed to working exits",
+                    reason="position fully committed to working exits" if cover == 0
+                    else "the broker holds nothing this order may cover",
                 )
                 continue
             # Allowed under the halt: sizing protection to the position never adds exposure.
-            if o.remaining != cover and self._try(
-                lambda o=o: self.broker.modify(o.order_ref, quantity=o.filled_quantity + cover),
+            if o.remaining != want and self._try(
+                lambda o=o, w=want: self.broker.modify(o.order_ref, quantity=o.filled_quantity + w),
                 "PROTECTIVE_RESIZED",
                 idea_id,
                 ref,
                 before=o.remaining,
-                after=cover,
+                after=want,
+                ledger_cover=cover,
+                broker_cover=broker_cover,
             ):
                 changed = True
         if changed:
@@ -2060,6 +2069,9 @@ class ExecutionCoordinator:
             if o is not None:
                 self.store.update_order(ref, now, status=o.status.value, quantity=o.quantity)
         if pos.stop_price is None:
+            return
+        if broker_cover is None:
+            self._protection_unverified(pos, "broker positions unreadable: cover never sized up")
             return
         # This check succeeded after every fill applied so far: its verdict is the protection.
         self.store.resolve_exceptions(now, PROTECTION_UNVERIFIED, idea_id=idea_id)
@@ -2099,9 +2111,10 @@ class ExecutionCoordinator:
             stop.status != OrderStatus.PRE_SUBMITTED
             or self.store.filled_quantity(stop.parent_ref or pos.stop_ref.rsplit(".", 1)[0]) > 0
         )
-        backstop_problem = self._backstop_problem(pos, open_by_ref, cover, exit_side)
+        backstop_problem = self._backstop_problem(pos, open_by_ref, target, exit_side)
         if (
-            stop is not None
+            differs is None
+            and stop is not None
             and stop.working
             and stop.status != OrderStatus.PENDING_CANCEL
             and stop.remaining == cover
@@ -2128,12 +2141,61 @@ class ExecutionCoordinator:
             detail += f"; STOP_PRICE_MISMATCH: working stop {working}, ledger {pos.stop_price}"
         if backstop_problem:
             detail += f"; {backstop_problem}"
+        if differs is not None:
+            detail += f"; {differs}"
         if self.store.raise_exception(
             now, UNPROTECTED_POSITION, detail, idea_id=idea_id, order_ref=pos.stop_ref
         ):
             self.store.log(
                 now, UNPROTECTED_POSITION, order_ref=pos.stop_ref, idea_id=idea_id, detail=detail
             )
+
+    def _broker_cover(self, pos: LedgerPosition) -> tuple[int | None, str | None]:
+        """Review N1: how much of the idea's protective cover the BROKER's position supports, and
+        why it differs from the ledger (None when it does not). The broker's position in the
+        contract, on the idea's side, less every exit that may be live, is shared among the
+        contract's open ideas in a fixed order, each taking at most its ledger cover. The result is
+        never more than the ledger's cover, so cover grows only once the ledger (moved by broker
+        executions, or a declaration) and the broker's position both show it. Returns (None, None)
+        when the positions cannot be read: the caller then never sizes anything up."""
+        key = self._key_of(pos.symbol, pos.asset_class, pos.contract_key)
+        try:
+            net = sum(
+                p.quantity for p in self.broker.positions() if p.contract.contract_key == key
+            )
+        except BrokerError as exc:
+            self._broker_unreadable("positions", exc)
+            return None, None
+        sign = 1 if pos.position_side == PositionSide.LONG else -1
+        same = sorted(
+            (
+                p for p in self.store.positions()
+                if p.quantity > 0 and p.position_side == pos.position_side
+                and self._key_of(p.symbol, p.asset_class, p.contract_key) == key
+            ),
+            key=lambda p: p.idea_id,
+        )
+        ledger_net = sum(
+            (1 if p.position_side == PositionSide.LONG else -1) * p.quantity
+            for p in self.store.positions()
+            if p.quantity > 0 and self._key_of(p.symbol, p.asset_class, p.contract_key) == key
+        )
+        committed = {p.idea_id: self.store.committed_exit_quantity(p.idea_id) for p in same}
+        budget = max(sign * net, 0) - sum(committed.values())
+        mine = 0
+        for p in same:
+            share = max(min(p.quantity - committed[p.idea_id], budget), 0)
+            budget -= share
+            if p.idea_id == pos.idea_id:
+                mine = share
+        differs = None
+        if net != ledger_net:
+            differs = (
+                f"BROKER_POSITION_DIFFERS: broker holds {net} in {key}, ledger {ledger_net}; "
+                f"protective cover is sized to what both show ({mine}) and anything held beyond "
+                "the ledger is left uncovered (never an order the system was not asked for)"
+            )
+        return mine, differs
 
     @staticmethod
     def _stop_matches(stop: BrokerOrder, pos: LedgerPosition) -> bool:

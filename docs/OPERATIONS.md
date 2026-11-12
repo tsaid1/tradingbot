@@ -42,7 +42,7 @@ an alert.
 | Alert | Meaning | Action |
 |---|---|---|
 | `ENTRY_UNKNOWN_OUTCOME` | An entry or add was sent and its outcome is unknown. It is never resent, and its contract is blocked. | Look the order up at the broker. If it does not appear on its own, settle it (below). |
-| `UNPROTECTED_POSITION` | No working stop is confirmed for the position, or the check failed. | Check the stop at the broker. The alert clears only on evidence: a confirmed stop or a flat position. |
+| `UNPROTECTED_POSITION` | No working stop is confirmed for the position, or the check failed. With `BROKER_POSITION_DIFFERS` in the detail, the broker holds a different quantity than the ledger: the stop and target are sized to the smaller of the two, never above what the broker holds, and the contract is blocked. | Check the stop at the broker. If the broker holds less than a settlement declared, correct it with `settle <ref> FILLED` naming the true total; if it holds more, deal with the excess by hand. The alert clears only on evidence: a confirmed stop or a flat position. |
 | `BROKER_FAILURE` | The broker is unreadable, or its state is not yet verified. New exposure is blocked. | Check TWS or the gateway. The service retries on its own. |
 | `BROKER_RECONNECTED` | The session is back. The alert lists the fills and order ends adopted while it was down. | Read the list. If the resync waits on a discrepancy, resolve that first. |
 | `BROKER_IDENTITY_MISMATCH` | The session came back under another account, or its identity check failed. The service stops touching the broker and engages the halt. | Connect the expected account, clear the lockout, then clear the halt. |

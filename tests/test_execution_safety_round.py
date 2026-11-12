@@ -157,7 +157,13 @@ def test_m3_a_refused_close_stops_the_group_and_holds_the_open(tmp_path):
         quotes,
         now=h.clock.now(),
     )
-    assert [o.status for o in result.outcomes] == ["REFUSED", "HOLD"]
+    # The CLOSE is refused. Since review N1 its outcome is EXCEPTION, not REFUSED: the broker holds
+    # 1 against the ledger's 4, so the stop is sized down to the 1 held and the position is
+    # flagged UNPROTECTED (BROKER_POSITION_DIFFERS) rather than reported protected.
+    assert [o.status for o in result.outcomes] == ["EXCEPTION", "HOLD"]
+    assert h.coord.intent(result.outcomes[0].order_ref).state == IntentState.REFUSED
+    assert "EXIT_EXCEEDS_BROKER_POSITION:1<4" in result.outcomes[0].reasons
+    assert h.working()[h.coord.store.position("p1:open").stop_ref].remaining == 1
     assert "PARTIAL_GROUP" in result.outcomes[1].reasons
     assert h.broker.submit_calls == calls  # OPEN B never reached the broker
     assert h.coord.store.position("p2:open-b") is None
