@@ -1,0 +1,57 @@
+# Proposal policy for scripts/tb_mapping_proposal.py (docs/MAPPING_PROPOSAL.md).
+# It names, per family, which rows of a contract-discovery report are its candidates and which
+# vehicle and treatment to PROPOSE. It cannot approve anything: a proposal is always
+# approved = false, and an `approved*` key here is refused. The vehicles below are the lead's
+# first choices (orchestration plan), all UNAPPROVED. Query names are those of
+# config/contract_discovery.toml.
+#
+# [roll_rule] business_days_before_last_trade = N is the owner's parameter: proposed roll_date =
+# the report's last-trade date minus N business days. Not set here; pass --roll-days N, or every
+# roll_date stays an owner input. First-notice and close-out dates are not in the report and are
+# always flagged for confirmation.
+#
+# [family.owner] may carry owner inputs already decided (sizing, session, roll,
+# contract_selection, basis_shift, reference_trigger, same_series_reason, aliases); anything not
+# stated is written as OWNER_INPUT_REQUIRED and the entry will not load until it is filled.
+
+schema = "tradingbot.mapping_proposal_policy/1"
+
+[[family]]
+family = "TLT"
+treatment = "DIRECT"
+execution = "TLT"
+candidates = ["TLT"]
+level_meaning = "The publisher quotes the ETF's own share price (already approved in config/instrument_mapping.toml; this re-checks its broker facts)."
+
+[[family]]
+family = "SPX"
+treatment = "REFERENCE_TRIGGER"
+execution = "MES fut"
+reference = "SPX index"
+candidates = ["SPX index", "ES fut", "MES fut", "SPY", "IBUS500 CFD"]
+level_meaning = "Working assumption to confirm: the publisher quotes the S&P 500 cash index. SPY is a different series and is never substituted."
+
+[[family]]
+family = "WTI"
+treatment = "DIRECT"
+execution = "MCL fut"
+reference = "CL fut"
+candidates = ["CL fut", "MCL fut", "USO"]
+level_meaning = "Working assumption to confirm: the publisher quotes a CL futures month. Front-month execution stays disabled until roll calendar, basis policy and limits are verified."
+
+[[family]]
+family = "NATGAS"
+treatment = "DIRECT"
+execution = "MHNG fut (micro Henry Hub, symbol as reported by IBKR product search; UNCONFIRMED)"
+reference = "NG fut"
+candidates = ["NG fut", "QG fut (e-mini NG)", "MNG fut (micro NG)", "MHNG fut (micro Henry Hub, symbol as reported by IBKR product search; UNCONFIRMED)", "UNG"]
+level_meaning = "Working assumption to confirm: the publisher quotes an NG futures month. Front-month execution stays disabled until roll calendar, basis policy and limits are verified."
+
+# If the account may not trade spot gold, the owner may choose instead (explicitly, never
+# automatically): execution = "MGC fut", reference = "XAUUSD spot gold", treatment = "BASIS_SHIFT".
+[[family]]
+family = "GOLD"
+treatment = "DIRECT"
+execution = "XAUUSD spot gold"
+candidates = ["XAUUSD spot gold", "GC fut", "MGC fut", "GLD"]
+level_meaning = "Working assumption to confirm: the publisher quotes spot gold (USD per ounce). GLD is a different series and is never substituted."

@@ -582,4 +582,8 @@ bond ETF. Its other entries are commented templates with placeholder values.
 * `tradingHours` and `liquidHours` per contract, to set each session.
 * That `reqContractDetails` returns the multiplier, `minTick` and contract month the entry expects.
 
+Once a read-only discovery report exists, `scripts/tb_mapping_proposal.py` turns it into a
+contract table, a proposed roll calendar, unapproved `[[mapping]]` entries and a one-page approval
+sheet per family (`MAPPING_PROPOSAL.md`).
+
 Run the demonstration: `PYTHONPATH=src python scripts/run_mock_multi_asset_demo.py`.
