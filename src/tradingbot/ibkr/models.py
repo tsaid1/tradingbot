@@ -568,7 +568,10 @@ ENTRY_QUOTE_REASONS = (
     "BID_NON_POSITIVE", "ASK_NON_POSITIVE", "LOCKED", "CROSSED", "BID_TICKS_NOT_LIVE",
     "ASK_TICKS_NOT_LIVE", "BID_TIME_UNKNOWN", "ASK_TIME_UNKNOWN", "BID_FROM_FUTURE",
     "ASK_FROM_FUTURE", "BID_STALE", "ASK_STALE", "BID_NOT_FINITE", "ASK_NOT_FINITE", "HALTED",
-    "UNREPORTED_EVIDENCE_EXPIRED")
+    "UNREPORTED_EVIDENCE_EXPIRED", "BID_OFF_TICK", "ASK_OFF_TICK")
+# BID_OFF_TICK / ASK_OFF_TICK: the subscription delivered a price for that side that is not on the
+# contract's minimum tick (snapshot flag ``<SIDE>_OFF_TICK_TICK``). Such a price can be the one the
+# snapshot shows, so the side is not usable until the stream is reopened.
 # HALTED: the TWS HALTED tick (49) carried a non-zero (or unreadable) value, -1 included.
 # UNREPORTED_EVIDENCE_EXPIRED: LIVE with no reported type, but at this check's ``now`` a side's
 # latest change or latest price change is older than UNREPORTED_LIVE_WINDOW_SECONDS.
@@ -611,6 +614,9 @@ def entry_quote_check(snapshot: QuoteSnapshot, *, now_monotonic: float,
             reasons.append(f"{side}_NOT_FINITE")
         elif not value > 0:
             reasons.append(f"{side}_NON_POSITIVE")
+    for side in ("BID", "ASK"):
+        if f"{side}_OFF_TICK_TICK" in snapshot.flags:
+            reasons.append(f"{side}_OFF_TICK")
     if _positive(snapshot.bid) and _positive(snapshot.ask):
         if snapshot.bid == snapshot.ask:
             reasons.append("LOCKED")

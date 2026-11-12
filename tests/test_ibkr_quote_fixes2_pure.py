@@ -155,3 +155,16 @@ def test_exhaustive_unreported_live_requires_recent_price_changes_on_both_sides(
             assert age is not None and age <= W and page is not None and page <= W
             assert not delayed and not notices
     assert lives > 0  # the LIVE branch is reached, not only refused
+
+
+# ------------------------------------------------- final review: an off-tick side is never usable
+@pytest.mark.parametrize("flag, reason", [("BID_OFF_TICK_TICK", "BID_OFF_TICK"),
+                                          ("ASK_OFF_TICK_TICK", "ASK_OFF_TICK")])
+def test_a_side_that_delivered_an_off_tick_price_is_not_usable(flag, reason):
+    clean = entry_quote_check(snap(), now_monotonic=100.5, max_age_seconds=3)
+    assert clean.usable
+    r = entry_quote_check(snap(flags=(flag,)), now_monotonic=100.5, max_age_seconds=3)
+    assert not r.usable and reason in r.reasons
+    q = snap(flags=(flag,), market_data_type=1)  # the reported-live path too
+    r = entry_quote_check(q, now_monotonic=100.5, max_age_seconds=3)
+    assert not r.usable and reason in r.reasons

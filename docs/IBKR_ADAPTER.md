@@ -492,6 +492,9 @@ carries) is flagged `BID_OFF_TICK_TICK` / `ASK_OFF_TICK_TICK` and is neither ima
 Prices on a coarser increment are multiples of the minimum tick, so they still count. When the
 minimum tick is unknown (missing, zero or not finite), the stream does no tick check, and the
 gateway's own off-tick refusal applies.
+A side that carries either flag is never usable for an automatic entry (`entry_quote_check` reasons
+`BID_OFF_TICK` / `ASK_OFF_TICK`), on the reported and the unreported path alike, until the stream is
+reopened: the off-tick price may be the one the snapshot shows.
 
 **Accepted consequence:** a thin or quiet market that is genuinely live but reports no type may
 never qualify, and an entry on it HOLDs. US stocks on this account answer 2186 with delayed ids
