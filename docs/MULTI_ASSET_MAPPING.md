@@ -173,7 +173,7 @@ decided exactly as before; the rule never touches it.
 (`PriceMention`: ENTRY, STOP, TARGET, EXIT, TRIGGER, REFERENCE). The typed action carries only
 ENTRY (`entry_reference`), STOP and TARGET; a REFERENCE level is not on it. The service passes each
 action's classified mentions, as (role, value) pairs, to `MappingPolicy.apply(levels=...)`, beside
-the clause text it already passes for contract months. Only an entry with the rule on reads them
+the clause text and post text it already passes for contract months and option legs. Only an entry with the rule on reads them
 (`FamilyMapping.entry_anchor_for`). The level becomes the anchor only if all of these hold, and
 otherwise the action HOLDs at the mapping stage with the reason shown:
 
@@ -182,9 +182,11 @@ otherwise the action HOLDs at the mapping stage with the reason shown:
 | exactly one distinct REFERENCE value for the action | `ENTRY_ANCHOR_SEVERAL_LEVELS` |
 | no other classified price (trigger, exit) beside the stop and target | `ENTRY_ANCHOR_SECOND_PRICE` |
 | the value is a number | `ENTRY_ANCHOR_UNREADABLE` |
-| the value is written in the action's own clause | `ENTRY_ANCHOR_NOT_IN_CLAUSE` |
-| no other action of the post for another instrument shares the clause or states the same value, and the clause names no other cashtag | `ENTRY_ANCHOR_INSTRUMENT_AMBIGUOUS` |
-| after the contract is selected, the clause holds no other number once its months, an index's own name, the anchor, the stop, the target and a reduction percentage are read | `ENTRY_ANCHOR_UNEXPLAINED_PRICE` |
+| no other action of the post for another instrument shares the clause or states the same value | `ENTRY_ANCHOR_INSTRUMENT_AMBIGUOUS` |
+| the value is written somewhere: the action's own clause, else another clause of the post (a commentary line quoting the market), else a line of the post that is no action's clause (a level line such as "41.20 now.", which the interpreter attaches to the instruction it follows) | `ENTRY_ANCHOR_NOT_IN_POST` |
+| ...and in exactly one such place | `ENTRY_ANCHOR_SOURCE_AMBIGUOUS` |
+| neither the clause nor that source names another cashtag | `ENTRY_ANCHOR_INSTRUMENT_AMBIGUOUS` |
+| after the contract is selected, neither the clause nor the source holds another number once months, an index's own name, the anchor, the stop, the target and a reduction percentage are read | `ENTRY_ANCHOR_UNEXPLAINED_PRICE` |
 
 No stated level at all leaves the action as today (`OPEN_ENTRY_PRICE_MISSING`, with
 `ENTRY_ANCHOR_NOT_STATED`). For a futures family the accepted anchor is the one extra level the

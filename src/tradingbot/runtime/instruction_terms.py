@@ -289,7 +289,7 @@ def clause_numbers(clause: str) -> set[Decimal]:
     for m in _TOKEN_RE.finditer(clause or ""):
         raw = m.group(0)
         start = m.start() + (len(raw) - len(raw.lstrip(_EDGE)))
-        token = raw.strip(_EDGE)
+        token = raw.strip(_EDGE).lstrip("~")  # "~41.20 now": the market, about
         if any(a <= start < b for a, b in names):
             continue
         n = _NUMBER_RE.match(token)

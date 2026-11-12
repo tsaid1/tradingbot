@@ -332,7 +332,7 @@ def test_without_the_rule_no_anchor_is_formed(tmp_path):
      [("REFERENCE", "50.10"), ("TRIGGER", "50.40")], "ENTRY_ANCHOR_SECOND_PRICE"),
     ("We are now long $QETF, 50.10 now, out at 52.",
      [("REFERENCE", "50.10"), ("EXIT", "52")], "ENTRY_ANCHOR_SECOND_PRICE"),
-    ("We are now long $QETF, 50.10 now.", [("REFERENCE", "50.20")], "ENTRY_ANCHOR_NOT_IN_CLAUSE"),
+    ("We are now long $QETF, 50.10 now.", [("REFERENCE", "50.20")], "ENTRY_ANCHOR_NOT_IN_POST"),
     ("We are now long $QETF, 50.10 now.", [("REFERENCE", "n/a")], "ENTRY_ANCHOR_UNREADABLE"),
     ("We are now long $QETF vs $QBOND, 50.10 now.", [("REFERENCE", "50.10")],
      "ENTRY_ANCHOR_INSTRUMENT_AMBIGUOUS"),
@@ -345,6 +345,48 @@ def test_anything_but_one_clear_level_holds(tmp_path, clause, levels, reason):
     d, inst = resolve(policy(tmp_path, etf_entry()), action(), clause, levels)
     assert d.status == "UNRESOLVED" and inst is None and d.entry_anchor is None
     assert d.reason.split(",")[0] == reason
+
+
+LONG = "We are now long $QETF."
+
+
+@pytest.mark.parametrize("post,anchor", [
+    ("We are now long $QETF.\n\n50.10 now.", "50.10"),
+    ("We are now long $QETF. Stop 48.90.\n~$50.10 now.", "50.10"),
+])
+def test_a_level_line_of_the_post_may_be_the_anchors_source(tmp_path, post, anchor):
+    d, _ = resolve(policy(tmp_path, etf_entry()), action(), LONG, [("REFERENCE", anchor)],
+                   post_text=post)
+    assert d.status == "SUPPORTED", d.reason
+    assert d.entry_anchor == anchor
+
+
+@pytest.mark.parametrize("post,reason", [
+    ("We are now long $QETF.\n50.10 now.\nYesterday it was 50.10 now too.",
+     "ENTRY_ANCHOR_SOURCE_AMBIGUOUS"),
+    ("We are now long $QETF.\n50.10 now, 49.20 support.", "ENTRY_ANCHOR_UNEXPLAINED_PRICE"),
+    ("We are now long $QETF.\n$QBOND 50.10 now.", "ENTRY_ANCHOR_INSTRUMENT_AMBIGUOUS"),
+    ("We are now long $QETF.", "ENTRY_ANCHOR_NOT_IN_POST"),
+])
+def test_a_level_line_with_anything_else_in_it_holds(tmp_path, post, reason):
+    d, _ = resolve(policy(tmp_path, etf_entry()), action(), LONG, [("REFERENCE", "50.10")],
+                   post_text=post)
+    assert d.status == "UNRESOLVED" and d.reason.split(",")[0] == reason
+
+
+def test_a_commentary_clause_quoting_the_market_may_be_the_source(tmp_path):
+    p = policy(tmp_path, etf_entry())
+    note = TradeAction(action_id="a2", action=Action.NO_TRADE, timing=Timing.COMMENTARY,
+                       source_market_symbol="QETF", evidence=[])
+    parsed = ParsedPost(actions=[action(), note])
+    post = "We are now long $QETF. The fund is at 50.10 now."
+    _, [d, _] = p.apply(parsed, clauses={"a1": LONG, "a2": "The fund is at 50.10 now."},
+                        now=MAP_NOW, post_text=post, levels={"a1": [("REFERENCE", "50.10")],
+                                                             "a2": [("REFERENCE", "50.10")]})
+    assert d.status == "SUPPORTED" and d.entry_anchor == "50.10"
+    _, [d, _] = p.apply(parsed, clauses={"a1": LONG, "a2": "The fund is at 50.10 now, from 48."},
+                        now=MAP_NOW, post_text=post, levels={"a1": [("REFERENCE", "50.10")]})
+    assert d.status == "UNRESOLVED" and d.reason.startswith("ENTRY_ANCHOR_UNEXPLAINED_PRICE")
 
 
 def test_the_marks_reach_the_gateway_as_a_hold(tmp_path):

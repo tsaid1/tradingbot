@@ -75,7 +75,8 @@ OPTION_STRATEGY_NOT_SINGLE_LEG = "OPTION_STRATEGY_NOT_SINGLE_LEG"
 ENTRY_ANCHOR_SEVERAL_LEVELS = "ENTRY_ANCHOR_SEVERAL_LEVELS"
 ENTRY_ANCHOR_SECOND_PRICE = "ENTRY_ANCHOR_SECOND_PRICE"
 ENTRY_ANCHOR_UNREADABLE = "ENTRY_ANCHOR_UNREADABLE"
-ENTRY_ANCHOR_NOT_IN_CLAUSE = "ENTRY_ANCHOR_NOT_IN_CLAUSE"
+ENTRY_ANCHOR_NOT_IN_POST = "ENTRY_ANCHOR_NOT_IN_POST"
+ENTRY_ANCHOR_SOURCE_AMBIGUOUS = "ENTRY_ANCHOR_SOURCE_AMBIGUOUS"
 ENTRY_ANCHOR_INSTRUMENT_AMBIGUOUS = "ENTRY_ANCHOR_INSTRUMENT_AMBIGUOUS"
 ENTRY_ANCHOR_UNEXPLAINED_PRICE = "ENTRY_ANCHOR_UNEXPLAINED_PRICE"
 # level_contract_rule = FRONT_MONTH: why the front contract cannot be used for an unnamed month.
@@ -755,23 +756,28 @@ class FamilyMapping(StrictModel):
         terms: InstructionTerms,
         levels: list[tuple[str, str]] | None,
         others: list[tuple[str | None, str | None, set[Decimal]]] = (),
-    ) -> tuple[Decimal | None, list[str]]:
+        post_text: str | None = None,
+    ) -> tuple[Decimal | None, str | None, list[str]]:
         """entry_rule = REFERENCE_AS_COLLAR: the stated market level that may anchor this action's
-        entry, or why none may. ``levels`` are the interpreter's price mentions for this action, as
-        (role, value): the interpreter's classification of the clause (``PriceMention``), never
-        its entry field. Applies only to a CURRENT OPEN or ADD with no explicit entry price on an
-        entry with the rule on; for anything else (None, []) and the gateway decides as today.
+        entry, the text it is written in, or why none may. ``levels`` are the interpreter's price
+        mentions for this action, as (role, value): its classification of the post
+        (``PriceMention``), never the action's entry field. Applies only to a CURRENT OPEN or ADD
+        with no explicit entry price on an entry with the rule on; for anything else
+        (None, None, []) and the gateway decides as today.
 
         A level is an anchor only if the interpreter tagged exactly one distinct value REFERENCE for
-        this action, tagged no other price (a trigger, an exit) beside its stop and target, the
-        value is written in the clause itself, and no other action of the post with another
-        instrument shares the clause or claims the same value, and the clause names no other
-        cashtag. The second check, that no other number is left in the clause, runs after the
+        this action and no other price (a trigger, an exit) beside its stop and target, and the value
+        is written in exactly one place: the action's own clause; else exactly one other clause of
+        the post (a commentary line quoting the market); else exactly one line of the post that is
+        no action's clause (a level line such as "41.20 now."). The interpreter attaches such lines
+        to the instruction they follow. No action of the post for another instrument may share the
+        action's clause or state the same value, and neither the clause nor the source line may name
+        another cashtag. The last check, that no other number is left in either, runs after the
         contract is selected (``unexplained_prices``)."""
         if not (self.entry_rule == "REFERENCE_AS_COLLAR"
                 and action.action in (Action.OPEN, Action.ADD)
                 and action.timing == Timing.CURRENT and action.entry_reference is None):
-            return None, []
+            return None, None, []
         refs, second = set(), []
         for role, value in levels or ():
             if role in ("STOP", "TARGET"):
@@ -781,42 +787,61 @@ class FamilyMapping(StrictModel):
                 continue
             v = _level(value)
             if v is None:
-                return None, [ENTRY_ANCHOR_UNREADABLE]
+                return None, None, [ENTRY_ANCHOR_UNREADABLE]
             refs.add(v)
         if not refs:
-            return None, []  # no stated level: the gateway holds for the missing entry, as today
+            return None, None, []  # no stated level: the gateway holds for the missing entry
         if len(refs) > 1:
-            return None, [ENTRY_ANCHOR_SEVERAL_LEVELS, f"LEVELS:{len(refs)}"]
+            return None, None, [ENTRY_ANCHOR_SEVERAL_LEVELS, f"LEVELS:{len(refs)}"]
         if second:
-            return None, [ENTRY_ANCHOR_SECOND_PRICE, *second]
+            return None, None, [ENTRY_ANCHOR_SECOND_PRICE, *second]
         anchor = refs.pop()
-        if anchor not in clause_numbers(terms.clause):
-            return None, [ENTRY_ANCHOR_NOT_IN_CLAUSE]
         for other_asset, other_clause, other_values in others:
-            if other_asset != asset and (
+            if other_asset is not None and other_asset != asset and (
                     (other_clause and other_clause == terms.clause) or anchor in other_values):
-                return None, [ENTRY_ANCHOR_INSTRUMENT_AMBIGUOUS, "SHARED_WITH_ANOTHER_ACTION"]
+                return None, None, [ENTRY_ANCHOR_INSTRUMENT_AMBIGUOUS,
+                                    "SHARED_WITH_ANOTHER_INSTRUMENT"]
+        if anchor in clause_numbers(terms.clause):
+            source = terms.clause
+        else:
+            clauses = {c for _, c, _ in others if c and anchor in clause_numbers(c)}
+            lines = [] if clauses else [
+                line for line in _post_lines(post_text)
+                if anchor in clause_numbers(line)
+                and not any(c and (c.strip() in line or line in c) for _, c, _ in others)]
+            found = sorted(clauses) or lines
+            if not found:
+                return None, None, [ENTRY_ANCHOR_NOT_IN_POST]
+            if len(found) > 1:
+                return None, None, [ENTRY_ANCHOR_SOURCE_AMBIGUOUS, f"PLACES:{len(found)}"]
+            source = found[0]
         names = {asset, self.family.removesuffix(".OPT")}
         names |= {s.symbol for s in (self.execution, self.reference) if s is not None}
-        tags = {t.upper() for t in _CASHTAG_RE.findall(terms.clause)}
-        if tags - names:
-            return None, [ENTRY_ANCHOR_INSTRUMENT_AMBIGUOUS, "OTHER_CASHTAG_IN_CLAUSE"]
-        return anchor, []
+        for text in {terms.clause, source}:
+            if {t.upper().rstrip(".") for t in _CASHTAG_RE.findall(text)} - names:
+                return None, None, [ENTRY_ANCHOR_INSTRUMENT_AMBIGUOUS, "OTHER_CASHTAG"]
+        return anchor, source, []
 
     def unexplained_prices(self, action: TradeAction, terms: InstructionTerms, anchor: Decimal,
-                           levels: list[tuple[str, str]] | None) -> list[str]:
-        """Numbers left in an anchored clause once its months, an index's own name, the anchor, the
-        stop and target (the action's, or the ones the interpreter tagged as such) and a reduction
-        percentage are read. Any one HOLDs: a second unexplained price is where a misread would
-        be most dangerous."""
+                           levels: list[tuple[str, str]] | None,
+                           source: str | None = None) -> list[str]:
+        """Numbers left in an anchored clause, and in the line its anchor is written in, once their
+        months, an index's own name, the anchor, the stop and target (the action's, or the ones the
+        interpreter tagged as such) and a reduction percentage are read. Any one HOLDs: a second
+        unexplained price is where a misread would be most dangerous."""
         consumed, fractions = _consumed(action)
         consumed = consumed | {anchor}
         for role, value in levels or ():
             v = _level(value) if role in ("STOP", "TARGET") else None
             if v is not None:
                 consumed.add(v)
-        return [t for t in leftover_tokens(terms, consumed, fractions, self._roots())
-                if any(ch.isdigit() for ch in t)]
+        out = []
+        for t in (terms, *([extract_terms(source)] if source and source != terms.clause else [])):
+            out += [x for x in leftover_tokens(t, consumed, fractions, self._roots())
+                    if any(ch.isdigit() for ch in x)
+                    and not (x.startswith("~") and clause_numbers(x[1:]) <= consumed
+                             and clause_numbers(x[1:]))]  # "~41.20": about the anchor itself
+        return out
 
     def _select_option(self, asset, terms, held, action=None, post_text=None):
         x = self.execution
@@ -855,6 +880,14 @@ class FamilyMapping(StrictModel):
             expiry=terms.expiries[0].isoformat(), strike=format(terms.strikes[0].normalize(), "f"),
             option_right=terms.rights[0], exchange=x.exchange,
         ), []
+
+
+_LINE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+|\n+")
+
+
+def _post_lines(text: str | None) -> list[str]:
+    """The post's lines and sentences, where a level line ("41.20 now.") stands on its own."""
+    return [p.strip() for p in _LINE_SPLIT_RE.split(text or "") if p and p.strip()]
 
 
 def _level(value) -> Decimal | None:
@@ -1030,8 +1063,8 @@ class MappingPolicy:
         today = (now or datetime.now(UTC)).astimezone(
             ZoneInfo(entry.session.timezone if entry.session else "UTC")
         ).date()
-        anchor, problems = (None, []) if revoked else entry.entry_anchor_for(
-            action, asset, terms, levels, others)
+        anchor, source, problems = (None, None, []) if revoked else entry.entry_anchor_for(
+            action, asset, terms, levels, others, post_text)
         if problems:
             return MappingDecision(status="UNRESOLVED", reason=",".join(problems), **out), None
         instrument, problems = entry.select(action, asset, terms, today, held_contract, post_text,
@@ -1041,7 +1074,7 @@ class MappingPolicy:
                 status="UNRESOLVED", reason=",".join(problems), **out
             ), None
         if anchor is not None:
-            extra = entry.unexplained_prices(action, terms, anchor, levels)
+            extra = entry.unexplained_prices(action, terms, anchor, levels, source)
             if extra:
                 return MappingDecision(status="UNRESOLVED", reason=",".join(
                     [ENTRY_ANCHOR_UNEXPLAINED_PRICE,
