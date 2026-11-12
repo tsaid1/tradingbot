@@ -10,11 +10,13 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 from test_multi_asset_gateway import NOW, act, gate, leg, mq, position, terms
 
 from tradingbot.event_models import PriceBasis, Timing, TradeAction
+from tradingbot.execution.broker import ContractRef
 from tradingbot.models import Action, AssetClass, Instrument, PositionSide
 from tradingbot.runtime.mapping import MappingPolicy
 from tradingbot.runtime.mock_multi_asset import (
@@ -489,3 +491,49 @@ def test_f5_without_a_broker_update_time_only_a_seen_change_counts(tmp_path):
     stuck = svc._mapped_quote(entry, inst, run.clock.now())
     assert stuck.reference.updated_at == run.clock.now() - timedelta(seconds=20)
     run.close()
+
+
+# ================================================================== F6: the bond ETF regression
+
+SHIPPED = Path(__file__).resolve().parents[1] / "config" / "instrument_mapping.toml"
+TLT_HELD = {"9:a0": ContractRef(symbol="TLT", asset_class=AssetClass.ETF, con_id=7)}
+
+
+def tlt(action, idea="9:a0"):
+    a = opening("TLT", action, idea=idea)
+    return a.model_copy(update={"instrument": Instrument(asset_class=AssetClass.ETF,
+                                                         symbol="TLT")})
+
+
+@pytest.mark.parametrize("clause", [
+    "Closing our TLT long.", "Calling it: closing our TLT long.",
+    "We'll call it a day and close TLT.", "Closing TLT, no options for now.",
+    "Closing TLT, put the proceeds in cash.",
+])
+@pytest.mark.parametrize("held", [TLT_HELD, None])
+def test_f6_a_stock_exit_is_never_routed_to_options_by_a_word(clause, held):
+    """Reviewer probe: a TLT CLOSE containing "call", "put" or "options" went to TLT.OPT and was
+    held, where main executed it. An exit binds to its idea, never to option language."""
+    pol = MappingPolicy.from_toml(SHIPPED)
+    d, inst = pol.resolve(tlt(Action.CLOSE), clause=clause, now=MAP_NOW, held=held)
+    assert d.status == "SUPPORTED" and d.family == "TLT", (d.family, d.reason)
+    assert inst.symbol == "TLT"
+
+
+@pytest.mark.parametrize("clause", [
+    "We are now long TLT options at 90.", "Buying TLT calls at 90.", "Buying the TLT 92 put.",
+])
+def test_f6_an_opening_option_mention_without_terms_never_buys_the_stock(clause):
+    pol = MappingPolicy.from_toml(SHIPPED)
+    d, inst = pol.resolve(tlt(Action.OPEN, idea=None), clause=clause, now=MAP_NOW)
+    assert d.status != "SUPPORTED" and inst is None and d.family == "TLT.OPT"
+
+
+def test_f6_an_option_idea_exit_binds_to_its_own_contract_without_option_words(tmp_path):
+    held = {"9:a1": ContractRef(symbol="QSTK", asset_class=AssetClass.OPTION, sec_type="OPT",
+                                expiry="20260918", strike=Decimal(105), right="C", con_id=1)}
+    d, inst = demo_policy(tmp_path).resolve(opening("QSTK", Action.CLOSE, idea="9:a1"),
+                                            clause="Closing our $QSTK position.", now=MAP_NOW,
+                                            held=held)
+    assert d.status == "SUPPORTED" and d.family == "QSTK.OPT"
+    assert (inst.strike, inst.option_right, inst.expiry) == ("105", "CALL", "2026-09-18")

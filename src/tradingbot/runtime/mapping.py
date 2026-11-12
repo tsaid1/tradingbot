@@ -657,13 +657,28 @@ class MappingPolicy:
                 action_id=action.action_id, status="UNSUPPORTED", reason="SOURCE_ASSET_UNRESOLVED"
             ), None
         terms = extract_terms(clause)
-        family = f"{asset}.OPT" if terms.option_language else asset
+        follow_up = action.action in (Action.ADD, Action.REDUCE, Action.CLOSE, Action.MODIFY)
+        idea = action.idea_reference if follow_up else None
+        held_contract = (held or {}).get(idea) if idea else None
+        idea_entry = (recorded or {}).get(idea) if idea else None
+        if not follow_up:
+            # Option routing applies only to an instruction that opens a position: one that names
+            # options (even without complete terms) looks up the option family and never the stock.
+            family = f"{asset}.OPT" if terms.option_language else asset
+        elif idea_entry is not None and idea_entry.family.removesuffix(".OPT") == asset:
+            family = idea_entry.family  # a follow-up binds to its idea's own family
+        elif held_contract is not None and held_contract.asset_class == AssetClass.OPTION:
+            family = f"{asset}.OPT"
+        elif held_contract is not None or asset in self.entries or not terms.option_language:
+            family = asset  # "call it a day" in a stock exit is not an option instruction
+        else:
+            # No idea on record and no stock entry: the option family names why it HOLDs (the
+            # gateway then finds no open idea either way).
+            family = f"{asset}.OPT"
         entry = self.entries.get(family)
         revoked = False
-        idea_entry = (recorded or {}).get(action.idea_reference) if action.action in (
-            Action.REDUCE, Action.CLOSE, Action.MODIFY) else None
-        if idea_entry is not None and idea_entry.family == family and (
-                entry is None or not entry.executable):
+        if idea_entry is not None and action.action != Action.ADD \
+                and idea_entry.family == family and (entry is None or not entry.executable):
             entry, revoked = idea_entry, True
         if entry is None:
             return MappingDecision(
@@ -690,8 +705,6 @@ class MappingPolicy:
             return MappingDecision(
                 status="UNSUPPORTED", reason="INTERPRETED_INSTRUMENT_DIFFERS_FROM_MAPPING", **out
             ), None
-        follow_up = action.action in (Action.ADD, Action.REDUCE, Action.CLOSE, Action.MODIFY)
-        held_contract = (held or {}).get(action.idea_reference) if follow_up else None
         today = (now or datetime.now(UTC)).astimezone(
             ZoneInfo(entry.session.timezone if entry.session else "UTC")
         ).date()
