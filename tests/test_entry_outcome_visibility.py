@@ -186,7 +186,7 @@ def test_the_flag_stays_while_the_entry_filled_and_is_held(tmp_path):
     h.coord.recover()
     h.coord.sync()
     assert h.coord.intent(ref).state == IntentState.FILLED
-    [pos] = [p for p in h.coord.ledger() if p.quantity]
+    assert [p.quantity for p in h.coord.ledger()] == [4]
     assert open_exc(h)  # known now, but the idea holds a position the publisher has left
     assert h.broker.submit_calls == 1  # no exit was invented for it
     h.coord.close()
