@@ -478,8 +478,8 @@ def _gate_mapped(a: TradeAction, published_at: datetime, q: MappedQuote, policy:
     if spread_pct > policy.max_spread_pct:
         return _gate("BLOCK", "SPREAD_TOO_WIDE")
     if a.action == Action.OPEN:
-        return _mapped_open(a, q, policy, now)
-    return _mapped_follow_up(a, q, policy, position, now)
+        return _mapped_open(a, q, policy, now, published_at)
+    return _mapped_follow_up(a, q, policy, position, now, published_at)
 
 
 def _reference_leg(q: MappedQuote, policy: MockPolicy, now: datetime) -> GateDecision | None:
@@ -503,7 +503,83 @@ def _off_tick(t: MarketTerms, **prices) -> GateDecision | None:
     return _gate("BLOCK", *bad) if bad else None
 
 
-def _mapped_open(a: TradeAction, q: MappedQuote, policy: MockPolicy, now: datetime) -> GateDecision:
+# entry_rule = REFERENCE_AS_COLLAR (docs/MULTI_ASSET_MAPPING.md, "Entry rule").
+REFERENCE_AS_COLLAR = "REFERENCE_AS_COLLAR"
+ANCHOR_NOT_STATED = "ENTRY_ANCHOR_NOT_STATED"
+ANCHOR_RULE_INCOMPLETE = "ENTRY_ANCHOR_RULE_INCOMPLETE"
+ANCHOR_SIGNAL_TOO_OLD = "ENTRY_ANCHOR_SIGNAL_TOO_OLD"
+ANCHOR_ADVERSE_MOVE = "ENTRY_ANCHOR_ADVERSE_MOVE"  # the market ran away: do not chase
+ANCHOR_FAVOURABLE_MOVE = "ENTRY_ANCHOR_FAVOURABLE_MOVE"  # moved too far the other way: stale?
+
+
+def move_limit(spec: str | None, anchor: Decimal) -> Decimal | None:
+    """A move limit in the anchor's own price units: "2.5" as stated, "0.5%" of the anchor."""
+    if not spec:
+        return None
+    try:
+        if spec.endswith("%"):
+            return anchor * Decimal(spec[:-1]) / 100
+        return Decimal(spec)
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def _entry_anchor(a: TradeAction, q: MappedQuote, policy: MockPolicy, now: datetime,
+                  published_at: datetime, long: bool) -> tuple[ExecutionPlan | None,
+                                                               GateDecision | None]:
+    """The anchored entry of a CURRENT OPEN or ADD without an explicit entry price, on an entry
+    with REFERENCE_AS_COLLAR. Returns ``(None, None)`` when the rule does not apply (the caller
+    then holds for the missing entry exactly as before), a refusal, or the plan fields: the
+    anchor, the live price it was compared with in the anchor's own series and the entry limit.
+
+    The anchor is compared in its own series: the live reference quote for BASIS_SHIFT and
+    REFERENCE_TRIGGER, the execution quote for DIRECT (a same-series future included). Its side
+    is the one the entry trades against (ask for a long, bid for a short). The execution quote has
+    passed the gateway's quote checks already; the reference leg must be live and fresh here."""
+    t = q.terms
+    if t.entry_rule != REFERENCE_AS_COLLAR or a.entry_reference is not None \
+            or a.timing != Timing.CURRENT or a.action not in (Action.OPEN, Action.ADD):
+        return None, None
+    anchor = q.entry_anchors.get(a.action_id)
+    if anchor is None or not anchor.is_finite() or anchor <= 0:
+        return None, None
+    adverse = move_limit(t.anchor_max_adverse_move, anchor)
+    favourable = move_limit(t.anchor_max_favourable_move, anchor)
+    if adverse is None or favourable is None or not t.anchor_max_signal_age_seconds:
+        return None, _gate("HOLD", ANCHOR_RULE_INCOMPLETE)
+    if (now - published_at).total_seconds() > t.anchor_max_signal_age_seconds:
+        return None, _gate("HOLD", ANCHOR_SIGNAL_TOO_OLD,
+                           f"MAX_AGE:{t.anchor_max_signal_age_seconds:g}")
+    if t.basis == "REFERENCE_TRIGGER" and not in_windows(
+            t.reference_windows, t.session_days, t.session_timezone, now):
+        return None, _gate("HOLD", "REFERENCE_SERIES_NOT_UPDATING")
+    if t.basis in ("BASIS_SHIFT", "REFERENCE_TRIGGER"):
+        held = _reference_leg(q, policy, now)
+        if held:
+            return None, held
+        live, series = _touch(q.reference, long), "REFERENCE"
+    else:
+        live, series = (q.ask if long else q.bid), "EXECUTION"
+    worse = (live - anchor) if long else (anchor - live)
+    if worse > adverse:
+        return None, _gate("HOLD", ANCHOR_ADVERSE_MOVE, f"MOVE:{worse}>{adverse}")
+    if -worse > favourable:
+        return None, _gate("HOLD", ANCHOR_FAVOURABLE_MOVE, f"MOVE:{-worse}>{favourable}")
+    # A limit at the marketable side of the live execution quote, never past it.
+    limit = _snap(q.ask, t.min_tick, ROUND_FLOOR) if long else _snap(q.bid, t.min_tick,
+                                                                     ROUND_CEILING)
+    if limit <= 0:
+        return None, _gate("BLOCK", "INVALID_BID_ASK")
+    return ExecutionPlan(family=t.family, basis=t.basis, execution_key=t.execution_key,
+                         entry_rule=REFERENCE_AS_COLLAR, entry_anchor=anchor,
+                         anchor_series=series, anchor_live=live, entry_limit=limit), None
+
+
+_ANCHOR_FIELDS = {"entry_rule", "entry_anchor", "anchor_series", "anchor_live", "entry_limit"}
+
+
+def _mapped_open(a: TradeAction, q: MappedQuote, policy: MockPolicy, now: datetime,
+                 published_at: datetime) -> GateDecision:
     t = q.terms
     if a.idea_reference is not None:
         return _gate("HOLD", "OPEN_SHOULD_NOT_REFERENCE_EXISTING_IDEA")
@@ -513,8 +589,17 @@ def _mapped_open(a: TradeAction, q: MappedQuote, policy: MockPolicy, now: dateti
     if not long and not t.allow_short:
         return _gate("HOLD", "SHORT_NOT_PERMITTED_FOR_FAMILY")
     ref = _num(a.entry_reference)
+    anchored = None
     if ref is None:
-        return _gate("HOLD", "OPEN_ENTRY_PRICE_MISSING")
+        anchored, refused = _entry_anchor(a, q, policy, now, published_at, long)
+        if refused:
+            return refused
+        if anchored is None:
+            extra = [ANCHOR_NOT_STATED] if t.entry_rule == REFERENCE_AS_COLLAR else []
+            return _gate("HOLD", "OPEN_ENTRY_PRICE_MISSING", *extra)
+        # The publisher's own series: direction checks compare the stop and target with the
+        # anchor; the collar is the anchor's own limits, already applied.
+        ref = anchored.entry_anchor
     stop, target, bad = _mapped_levels(a)
     if bad:
         return bad
@@ -534,7 +619,7 @@ def _mapped_open(a: TradeAction, q: MappedQuote, policy: MockPolicy, now: dateti
         bad = _off_tick(t, stop=stop, target=target)
         if bad:
             return bad
-        if abs(exec_touch - ref) / ref * 100 > band:
+        if not anchored and abs(exec_touch - ref) / ref * 100 > band:
             return _gate("BLOCK", "ENTRY_PRICE_COLLAR")
         if stop is not None and (stop >= q.bid if long else stop <= q.ask):
             return _gate("BLOCK", "STOP_ALREADY_CROSSED_AT_ENTRY")
@@ -548,7 +633,7 @@ def _mapped_open(a: TradeAction, q: MappedQuote, policy: MockPolicy, now: dateti
         stop_x = _shift_protection(stop, b, t.min_tick, long, "stop") if stop is not None else None
         target_x = (_shift_protection(target, b, t.min_tick, long, "target")
                     if target is not None else None)
-        if abs(exec_touch - entry) / entry * 100 > band:
+        if not anchored and abs(exec_touch - entry) / entry * 100 > band:
             return _gate("BLOCK", "ENTRY_PRICE_COLLAR")
         if stop_x is not None and (stop_x >= q.bid if long else stop_x <= q.ask):
             return _gate("BLOCK", "STOP_ALREADY_CROSSED_AT_ENTRY")
@@ -563,7 +648,7 @@ def _mapped_open(a: TradeAction, q: MappedQuote, policy: MockPolicy, now: dateti
         if held:
             return held
         ref_touch = _touch(q.reference, long)
-        if abs(ref_touch - ref) / ref * 100 > band:
+        if not anchored and abs(ref_touch - ref) / ref * 100 > band:
             return _gate("BLOCK", "ENTRY_PRICE_COLLAR")
         ref_bid, ref_ask = _touch(q.reference, False), _touch(q.reference, True)
         if stop is not None and (stop >= ref_bid if long else stop <= ref_ask):
@@ -585,13 +670,19 @@ def _mapped_open(a: TradeAction, q: MappedQuote, policy: MockPolicy, now: dateti
                 **shifted.model_dump(include={"basis_value", "basis_execution_mid",
                                               "basis_reference_mid", "basis_observed_at"}),
                 "backstop_stop": backstop})
+    if anchored:
+        # The entry is the live marketable limit; the publisher's level is recorded as the anchor.
+        plan = plan.model_copy(update={
+            **anchored.model_dump(include=_ANCHOR_FIELDS), "entry_reference": None,
+            "execution_reference": anchored.entry_limit})
     qty = t.units_per_signal
     if qty > t.max_units or qty % t.size_increment:
         return _gate("BLOCK", "UNIT_CAP_OR_INCREMENT")
     notional = plan.execution_reference * qty * t.multiplier
     if notional > min(t.max_notional, policy.max_notional_usd):
         return _gate("BLOCK", "NOTIONAL_LIMIT")
-    return _gate_plan(plan, "PAPER_OPEN", f"MAPPING_{t.basis}")
+    return _gate_plan(plan, "PAPER_OPEN", f"MAPPING_{t.basis}",
+                      *([REFERENCE_AS_COLLAR] if anchored else []))
 
 
 def _gate_plan(plan: ExecutionPlan, *reasons: str) -> GateDecision:
@@ -599,7 +690,8 @@ def _gate_plan(plan: ExecutionPlan, *reasons: str) -> GateDecision:
 
 
 def _mapped_follow_up(a: TradeAction, q: MappedQuote, policy: MockPolicy,
-                      position: Position | None, now: datetime) -> GateDecision:
+                      position: Position | None, now: datetime,
+                      published_at: datetime | None = None) -> GateDecision:
     t = q.terms
     inst = a.instrument
     assert inst is not None
@@ -644,9 +736,32 @@ def _mapped_follow_up(a: TradeAction, q: MappedQuote, policy: MockPolicy,
         if prior_stop is not None and (prior_stop >= bid if long else prior_stop <= ask):
             return _gate("HOLD", "EXISTING_STOP_ALREADY_CROSSED")
         ref = _num(a.entry_reference)
-        if ref is None:
-            return _gate("HOLD", "ADD_ENTRY_REFERENCE_MISSING")
         exec_touch = q.ask if long else q.bid
+        if ref is None:
+            anchored, refused = (None, None) if published_at is None else _entry_anchor(
+                a, q, policy, now, published_at, long)
+            if refused:
+                return refused
+            if anchored is None:
+                extra = [ANCHOR_NOT_STATED] if t.entry_rule == REFERENCE_AS_COLLAR else []
+                return _gate("HOLD", "ADD_ENTRY_REFERENCE_MISSING", *extra)
+            entry = anchored.entry_limit
+            if t.basis == "BASIS_SHIFT":  # both legs live and near-simultaneous, recorded
+                shifted, reasons = _basis(q, now)
+                if shifted is None:
+                    return _gate("HOLD", *reasons)
+                base = base.model_copy(update=shifted.model_dump(
+                    include={"basis_value", "basis_execution_mid", "basis_reference_mid",
+                             "basis_observed_at"}))
+            qty = t.units_per_signal
+            if position.quantity + qty > t.max_units:
+                return _gate("BLOCK", "UNIT_CAP")
+            if entry * (position.quantity + qty) * t.multiplier > min(t.max_notional,
+                                                                       policy.max_notional_usd):
+                return _gate("BLOCK", "NOTIONAL_LIMIT")
+            plan = base.model_copy(update={**anchored.model_dump(include=_ANCHOR_FIELDS),
+                                           "quantity": qty, "execution_reference": entry})
+            return _gate_plan(plan, "PAPER_ADD", f"MAPPING_{t.basis}", REFERENCE_AS_COLLAR)
         if t.basis == "DIRECT":
             entry = ref
         elif t.basis == "BASIS_SHIFT":

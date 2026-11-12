@@ -386,6 +386,10 @@ class RuntimeService:
             held=self._held_contracts(),
             recorded=recorded,
             post_text=post.text,  # an option must be one leg across the whole post
+            # The interpreter's price mentions per action, as (role, value): read only by an
+            # entry with entry_rule = REFERENCE_AS_COLLAR, for its entry anchor.
+            levels={c.action_id: [(m.role.value, m.value) for m in c.prices]
+                    for c in interpreted.classifications},
         )
         quotes = self._gate_quotes(mapped, decisions, decision_now, recorded)
         self.replay.gate_stamps = {}
@@ -541,6 +545,12 @@ class RuntimeService:
                         entry, exits_only = self.mapping.entries[d.family], False
                     quotes[key] = self._mapped_quote(entry, a.instrument, now,
                                                      exits_only=exits_only)
+                if d.entry_anchor is not None:
+                    # The anchor the mapping policy accepted for this action (REFERENCE_AS_COLLAR):
+                    # the gateway compares it with the live price in its own series.
+                    q = quotes[key]
+                    quotes[key] = q.model_copy(update={"entry_anchors": {
+                        **q.entry_anchors, a.action_id: Decimal(d.entry_anchor)}})
                 continue
             symbol = a.instrument.symbol
             if symbol in quotes:

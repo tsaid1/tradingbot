@@ -140,6 +140,11 @@ class MockPolicy(StrictModel):
 # file and broker reads, never by a model; handed to ``validator.gate_action`` as a ``MappedQuote``.
 
 BasisTreatment = Literal["DIRECT", "BASIS_SHIFT", "REFERENCE_TRIGGER", "UNSUPPORTED"]
+# How an OPEN or ADD gets its entry price (docs/MULTI_ASSET_MAPPING.md, "Entry rule"). The default,
+# EXPLICIT_ENTRY_ONLY, is the product decision of 5 Nov 2026: only explicit execution language sets
+# an entry. REFERENCE_AS_COLLAR, approved per family, lets a current instruction that states exactly
+# one market level enter at the live marketable price, with that level as a bounded anchor.
+EntryRule = Literal["EXPLICIT_ENTRY_ONLY", "REFERENCE_AS_COLLAR"]
 
 
 class LegQuote(StrictModel):
@@ -194,6 +199,13 @@ class MarketTerms(StrictModel):
     # DIRECT with same_series = true: the owner declared the reference series and the execution
     # price one series, so levels tagged as source-series levels are execution prices.
     same_series: bool = False
+    # The entry rule (additive). With REFERENCE_AS_COLLAR the three limits are set (from the
+    # approved entry; never defaulted): a move as "<decimal>" (the anchor's own price units) or
+    # "<decimal>%" (of the anchor), and the oldest source post the rule may act on.
+    entry_rule: EntryRule = "EXPLICIT_ENTRY_ONLY"
+    anchor_max_adverse_move: str | None = None
+    anchor_max_favourable_move: str | None = None
+    anchor_max_signal_age_seconds: float | None = None
     # Problems found while building these terms (contract unresolved, specification differs).
     problems: list[str] = Field(default_factory=list)
 
@@ -205,6 +217,9 @@ class MappedQuote(Quote):
     quality: str
     terms: MarketTerms
     reference: LegQuote | None = None
+    # REFERENCE_AS_COLLAR only (additive): the stated market level the mapping policy accepted as
+    # the entry anchor of each action of this post, by action id. Empty otherwise.
+    entry_anchors: dict[str, Decimal] = Field(default_factory=dict)
 
 
 class ExecutionPlan(StrictModel):
@@ -236,6 +251,15 @@ class ExecutionPlan(StrictModel):
     # protective level the loosening way keeps the working level instead; each kept level is
     # recorded here ("BACKSTOP: computed 4980.00 looser than working 4995.00; kept 4995.00").
     protective_levels_kept: list[str] = Field(default_factory=list)
+    # REFERENCE_AS_COLLAR (additive): the publisher's stated level (the anchor), the series it was
+    # compared in and the live price it was compared with, and the entry limit: the marketable
+    # side of the live execution quote, snapped to tick never past it. The execution core sends
+    # exactly this limit.
+    entry_rule: EntryRule = "EXPLICIT_ENTRY_ONLY"
+    entry_anchor: Decimal | None = None
+    anchor_series: Literal["EXECUTION", "REFERENCE"] | None = None
+    anchor_live: Decimal | None = None
+    entry_limit: Decimal | None = None
 
 
 class GateDecision(StrictModel):

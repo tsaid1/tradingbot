@@ -33,24 +33,27 @@ import tomllib
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from enum import Enum
+from itertools import pairwise
 from pathlib import Path
 from typing import Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import Field, StrictBool, ValidationError, field_validator, model_validator
 
-from tradingbot.event_models import ParsedPost, TradeAction
+from tradingbot.event_models import ParsedPost, Timing, TradeAction
 from tradingbot.execution.broker import ContractRef
 from tradingbot.models import (
     Action,
     AssetClass,
     BasisTreatment,
+    EntryRule,
     Instrument,
     MarketTerms,
     StrictModel,
 )
 from tradingbot.runtime.instruction_terms import (
     InstructionTerms,
+    clause_numbers,
     code_shaped,
     extract_terms,
     leftover_tokens,
@@ -68,6 +71,17 @@ IDEA_CONTRACT_MISMATCH = "IDEA_CONTRACT_MISMATCH"
 CONTRACT_MONTH_UNRECOGNISED = "CONTRACT_MONTH_UNRECOGNISED"
 # An option instruction with more than one strike, expiry or right, or a strategy word (review F3).
 OPTION_STRATEGY_NOT_SINGLE_LEG = "OPTION_STRATEGY_NOT_SINGLE_LEG"
+# entry_rule = REFERENCE_AS_COLLAR: why a stated market level cannot be this action's entry anchor.
+ENTRY_ANCHOR_SEVERAL_LEVELS = "ENTRY_ANCHOR_SEVERAL_LEVELS"
+ENTRY_ANCHOR_SECOND_PRICE = "ENTRY_ANCHOR_SECOND_PRICE"
+ENTRY_ANCHOR_UNREADABLE = "ENTRY_ANCHOR_UNREADABLE"
+ENTRY_ANCHOR_NOT_IN_CLAUSE = "ENTRY_ANCHOR_NOT_IN_CLAUSE"
+ENTRY_ANCHOR_INSTRUMENT_AMBIGUOUS = "ENTRY_ANCHOR_INSTRUMENT_AMBIGUOUS"
+ENTRY_ANCHOR_UNEXPLAINED_PRICE = "ENTRY_ANCHOR_UNEXPLAINED_PRICE"
+# level_contract_rule = FRONT_MONTH: why the front contract cannot be used for an unnamed month.
+FRONT_MONTH_IN_ROLL_WINDOW = "FRONT_MONTH_IN_ROLL_WINDOW"
+FRONT_MONTH_AMBIGUOUS = "FRONT_MONTH_AMBIGUOUS"
+_CASHTAG_RE = re.compile(r"(?<![\w$])\$([A-Za-z][A-Za-z0-9.]{0,9})(?![\w])")
 
 
 class BasisRelation(str, Enum):
@@ -124,6 +138,12 @@ class MappingDecision(StrictModel):
     # The family's entry is no longer approved (or no longer present) and this exit or protective
     # amendment uses the terms recorded on its idea when it was opened.
     under_revoked_mapping: bool = False
+    # entry_rule = REFERENCE_AS_COLLAR: the stated market level accepted as this action's entry
+    # anchor (a decimal string), handed to the gateway on the MappedQuote. None otherwise.
+    entry_anchor: str | None = None
+    # How a futures month was chosen: NAMED (the clause), IDEA (a follow-up's own contract),
+    # NEAREST (EXPLICIT_OR_NEAREST) or FRONT_MONTH (level_contract_rule). None for other families.
+    month_source: Literal["NAMED", "IDEA", "NEAREST", "FRONT_MONTH"] | None = None
 
 
 class MappingFile(StrictModel):
@@ -289,6 +309,29 @@ class ReferenceTriggerRules(StrictModel):
         return self
 
 
+_MOVE = r"^(?:\d+(?:\.\d+)?)%?$"
+
+
+class EntryAnchorRules(StrictModel):
+    """The limits of entry_rule = REFERENCE_AS_COLLAR. All three are required: there are no
+    defaults. A move is a decimal in the anchor's own price units ("2.5") or a percentage of the
+    anchor ("0.5%")."""
+    # How far the live price may have moved from the anchor in the direction that makes the entry
+    # worse (up for a long, down for a short): beyond it the bot would be chasing.
+    max_adverse_move: str = Field(pattern=_MOVE)
+    # How far it may have moved the other way: beyond it the signal may be stale or misread.
+    max_favourable_move: str = Field(pattern=_MOVE)
+    # The oldest source post the rule may act on, at the decision.
+    max_signal_age_seconds: int = Field(gt=0, le=3600)
+
+    @field_validator("max_adverse_move", "max_favourable_move")
+    @classmethod
+    def _positive(cls, v):
+        if Decimal(v.rstrip("%")) <= 0:
+            raise ValueError(f"move limit {v!r} must be positive")
+        return v
+
+
 class FamilyMapping(StrictModel):
     """One source asset family (version 2). See docs/MULTI_ASSET_MAPPING.md."""
     family: str = Field(pattern=r"^[A-Z][A-Z0-9]{0,9}(\.OPT)?$")
@@ -314,11 +357,31 @@ class FamilyMapping(StrictModel):
     roll: Roll | None = None
     basis_shift: BasisShiftRules | None = None
     reference_trigger: ReferenceTriggerRules | None = None
+    # How an OPEN or ADD gets its entry price. EXPLICIT_ENTRY_ONLY (the default, today's rule):
+    # only explicit execution language sets it. REFERENCE_AS_COLLAR: a current instruction stating
+    # exactly one market level enters at the live marketable price, the level bounding it as an
+    # anchor ([entry_anchor] limits, required). Part of what the owner approves.
+    entry_rule: EntryRule = "EXPLICIT_ENTRY_ONLY"
+    entry_anchor: EntryAnchorRules | None = None
+    # DIRECT futures quoted in a futures series (their own, or same_series), EXPLICIT_ONLY: what a
+    # level stated without a contract month refers to.
+    # EXPLICIT_MONTH_ONLY (the default): nothing; the action HOLDs. FRONT_MONTH: the front contract
+    # of this entry's own list (the first listed contract still at least
+    # min_business_days_to_roll business days before its roll date), executed in that month.
+    level_contract_rule: Literal["EXPLICIT_MONTH_ONLY", "FRONT_MONTH"] = "EXPLICIT_MONTH_ONLY"
 
     @model_validator(mode="after")
     def _consistent(self):
         def bad(msg: str):
             raise ValueError(f"family {self.family}: {msg}")
+
+        collar = self.entry_rule == "REFERENCE_AS_COLLAR"
+        if collar != (self.entry_anchor is not None):
+            bad("entry_rule = REFERENCE_AS_COLLAR needs its [entry_anchor] limits "
+                "(max_adverse_move, max_favourable_move, max_signal_age_seconds; no defaults), "
+                "and [entry_anchor] is used only by it")
+        if collar and (self.basis == "UNSUPPORTED" or self.family.endswith(".OPT")):
+            bad("entry_rule = REFERENCE_AS_COLLAR applies to a non-option traded family only")
 
         if self.approved and (not (self.approved_by or "").strip() or self.approved_at is None):
             bad("an approved entry states approved_by and approved_at")
@@ -341,6 +404,9 @@ class FamilyMapping(StrictModel):
                 "neither, keeps the version-1 behaviour)")
         if legacy and (self.session or self.roll or self.contracts):
             bad("a stock entry without sizing takes no session, roll or contracts")
+        if legacy and collar:
+            bad("entry_rule = REFERENCE_AS_COLLAR is decided on the mapped path: state sizing "
+                "and session for this entry")
         if self.same_series or self.equivalent_roots:
             self._check_same_series(bad)
         if self.approved and x.currency != "USD":
@@ -390,6 +456,11 @@ class FamilyMapping(StrictModel):
                 bad("the selection rule would pick a contract already inside its roll window")
         elif self.contract_selection or self.contracts or self.roll:
             bad("contract_selection, contracts and roll apply to futures only")
+        if self.level_contract_rule == "FRONT_MONTH" and not (
+                self.basis == "DIRECT" and x.sec_type == "FUT" and ref.sec_type == "FUT"
+                and self.contract_selection.rule == "EXPLICIT_ONLY"):
+            bad("level_contract_rule = FRONT_MONTH is only for a DIRECT futures entry whose levels "
+                "are a futures series (its own, or same_series), selected EXPLICIT_ONLY")
         if x.sec_type == "OPT":
             if not self.family.endswith(".OPT"):
                 bad("an option family is named <UNDERLYING>.OPT")
@@ -537,6 +608,13 @@ class FamilyMapping(StrictModel):
             require_backstop=bool(rt and rt.require_backstop),
             exits_only=exits_only,
             same_series=self.same_series,
+            entry_rule=self.entry_rule,
+            anchor_max_adverse_move=self.entry_anchor.max_adverse_move if self.entry_anchor
+            else None,
+            anchor_max_favourable_move=self.entry_anchor.max_favourable_move if self.entry_anchor
+            else None,
+            anchor_max_signal_age_seconds=self.entry_anchor.max_signal_age_seconds
+            if self.entry_anchor else None,
             problems=out,
         )
 
@@ -550,8 +628,11 @@ class FamilyMapping(StrictModel):
         today: date,
         held: ContractRef | None,
         post_text: str | None = None,
+        anchor: Decimal | None = None,
     ) -> tuple[Instrument | None, list[str]]:
-        """The execution instrument for this action, or the reasons it cannot be selected."""
+        """The execution instrument for this action, or the reasons it cannot be selected.
+        ``anchor`` is the stated level accepted as the entry anchor (REFERENCE_AS_COLLAR): the
+        leftover-token rule counts it as read, and nothing else."""
         x = self.execution
         if x.sec_type == "STK":
             exchange = None if x.exchange == "SMART" else x.exchange  # v1: SMART is the default
@@ -559,7 +640,7 @@ class FamilyMapping(StrictModel):
         if x.sec_type in ("CMDTY", "CFD"):
             return Instrument(asset_class=x.asset, symbol=x.symbol, exchange=x.exchange), []
         if x.sec_type == "FUT":
-            return self._select_future(terms, today, held, action)
+            return self._select_future(terms, today, held, action, anchor)
         return self._select_option(asset, terms, held, action, post_text)
 
     def _roots(self) -> set[str]:
@@ -602,7 +683,7 @@ class FamilyMapping(StrictModel):
             return None, [CONTRACT_MONTH_UNRECOGNISED, f"MONTH_NOT_LISTED:{min(named)}"]
         return named, []
 
-    def _select_future(self, terms, today, held, action=None):
+    def _select_future(self, terms, today, held, action=None, anchor=None):
         x = self.execution
         named, problems = self._named_months(terms, today)
         if problems:
@@ -610,7 +691,11 @@ class FamilyMapping(StrictModel):
         if held is None and action is not None:
             # Default HOLD (review F2, confirmation): a clause that still names anything after its
             # recognised months and the action's own levels has named something not understood.
-            leftover = leftover_tokens(terms, *_consumed(action), self._roots())
+            # An accepted entry anchor is one of the action's levels; nothing else is added.
+            levels, fractions = _consumed(action)
+            if anchor is not None:
+                levels = levels | {anchor}
+            leftover = leftover_tokens(terms, levels, fractions, self._roots())
             if leftover:
                 return None, [CONTRACT_MONTH_UNRECOGNISED,
                               *(f"UNREAD_TOKEN:{t}" for t in leftover)]
@@ -621,7 +706,11 @@ class FamilyMapping(StrictModel):
         elif named:
             month = named.pop()
         elif self.contract_selection.rule == "EXPLICIT_ONLY":
-            return None, [CONTRACT_SELECTION_AMBIGUOUS, "CONTRACT_MONTH_NOT_STATED"]
+            if self.level_contract_rule != "FRONT_MONTH":
+                return None, [CONTRACT_SELECTION_AMBIGUOUS, "CONTRACT_MONTH_NOT_STATED"]
+            month, problems = self.front_month(today)
+            if problems:
+                return None, problems
         else:
             need = self.contract_selection.min_business_days_to_roll
             holidays = self.roll.holidays
@@ -636,6 +725,98 @@ class FamilyMapping(StrictModel):
             asset_class=AssetClass.FUTURE, symbol=x.symbol, exchange=x.exchange,
             futures_contract=month,
         ), []
+
+    def front_month(self, today: date) -> tuple[str | None, list[str]]:
+        """level_contract_rule = FRONT_MONTH: the contract a level stated without a month refers
+        to. The list must be unambiguous (months listed in order, roll dates strictly increasing
+        with them). The front is the first listed contract whose roll date has not been reached.
+        If it is fewer than ``min_business_days_to_roll`` business days from that date, the
+        publisher may be quoting either it or the next month: HOLD, never the next one."""
+        listed = list(self.contracts)
+        months = [c.month for c in listed]
+        dates = [c.roll_date for c in listed]
+        if months != sorted(months) or any(b <= a for a, b in pairwise(dates)):
+            return None, [FRONT_MONTH_AMBIGUOUS, "CONTRACT_LIST_NOT_IN_ROLL_ORDER"]
+        holidays = self.roll.holidays
+        live = [c for c in listed if business_days_until(today, c.roll_date, holidays) > 0]
+        if not live:
+            return None, [FRONT_MONTH_AMBIGUOUS, "NO_LISTED_CONTRACT_BEFORE_ITS_ROLL_DATE"]
+        front = live[0]
+        need = self.contract_selection.min_business_days_to_roll
+        if business_days_until(today, front.roll_date, holidays) < need:
+            return None, [FRONT_MONTH_IN_ROLL_WINDOW, f"FRONT:{front.month}",
+                          f"ROLL_DATE:{front.roll_date}"]
+        return front.month, []
+
+    def entry_anchor_for(
+        self,
+        action: TradeAction,
+        asset: str,
+        terms: InstructionTerms,
+        levels: list[tuple[str, str]] | None,
+        others: list[tuple[str | None, str | None, set[Decimal]]] = (),
+    ) -> tuple[Decimal | None, list[str]]:
+        """entry_rule = REFERENCE_AS_COLLAR: the stated market level that may anchor this action's
+        entry, or why none may. ``levels`` are the interpreter's price mentions for this action, as
+        (role, value): the interpreter's classification of the clause (``PriceMention``), never
+        its entry field. Applies only to a CURRENT OPEN or ADD with no explicit entry price on an
+        entry with the rule on; for anything else (None, []) and the gateway decides as today.
+
+        A level is an anchor only if the interpreter tagged exactly one distinct value REFERENCE for
+        this action, tagged no other price (a trigger, an exit) beside its stop and target, the
+        value is written in the clause itself, and no other action of the post with another
+        instrument shares the clause or claims the same value, and the clause names no other
+        cashtag. The second check, that no other number is left in the clause, runs after the
+        contract is selected (``unexplained_prices``)."""
+        if not (self.entry_rule == "REFERENCE_AS_COLLAR"
+                and action.action in (Action.OPEN, Action.ADD)
+                and action.timing == Timing.CURRENT and action.entry_reference is None):
+            return None, []
+        refs, second = set(), []
+        for role, value in levels or ():
+            if role in ("STOP", "TARGET"):
+                continue
+            if role != "REFERENCE":
+                second.append(f"PRICE_ROLE:{role}")
+                continue
+            v = _level(value)
+            if v is None:
+                return None, [ENTRY_ANCHOR_UNREADABLE]
+            refs.add(v)
+        if not refs:
+            return None, []  # no stated level: the gateway holds for the missing entry, as today
+        if len(refs) > 1:
+            return None, [ENTRY_ANCHOR_SEVERAL_LEVELS, f"LEVELS:{len(refs)}"]
+        if second:
+            return None, [ENTRY_ANCHOR_SECOND_PRICE, *second]
+        anchor = refs.pop()
+        if anchor not in clause_numbers(terms.clause):
+            return None, [ENTRY_ANCHOR_NOT_IN_CLAUSE]
+        for other_asset, other_clause, other_values in others:
+            if other_asset != asset and (
+                    (other_clause and other_clause == terms.clause) or anchor in other_values):
+                return None, [ENTRY_ANCHOR_INSTRUMENT_AMBIGUOUS, "SHARED_WITH_ANOTHER_ACTION"]
+        names = {asset, self.family.removesuffix(".OPT")}
+        names |= {s.symbol for s in (self.execution, self.reference) if s is not None}
+        tags = {t.upper() for t in _CASHTAG_RE.findall(terms.clause)}
+        if tags - names:
+            return None, [ENTRY_ANCHOR_INSTRUMENT_AMBIGUOUS, "OTHER_CASHTAG_IN_CLAUSE"]
+        return anchor, []
+
+    def unexplained_prices(self, action: TradeAction, terms: InstructionTerms, anchor: Decimal,
+                           levels: list[tuple[str, str]] | None) -> list[str]:
+        """Numbers left in an anchored clause once its months, an index's own name, the anchor, the
+        stop and target (the action's, or the ones the interpreter tagged as such) and a reduction
+        percentage are read. Any one HOLDs: a second unexplained price is where a misread would
+        be most dangerous."""
+        consumed, fractions = _consumed(action)
+        consumed = consumed | {anchor}
+        for role, value in levels or ():
+            v = _level(value) if role in ("STOP", "TARGET") else None
+            if v is not None:
+                consumed.add(v)
+        return [t for t in leftover_tokens(terms, consumed, fractions, self._roots())
+                if any(ch.isdigit() for ch in t)]
 
     def _select_option(self, asset, terms, held, action=None, post_text=None):
         x = self.execution
@@ -676,6 +857,14 @@ class FamilyMapping(StrictModel):
         ), []
 
 
+def _level(value) -> Decimal | None:
+    try:
+        v = Decimal(str(value).replace(",", "").lstrip("$"))
+    except ArithmeticError:
+        return None
+    return v if v.is_finite() and v > 0 else None
+
+
 def _consumed(action: TradeAction) -> tuple[set[Decimal], set[Decimal]]:
     """The numbers the interpreter already assigned to this action: its levels, and its
     reduction fraction."""
@@ -688,6 +877,11 @@ def _consumed(action: TradeAction) -> tuple[set[Decimal], set[Decimal]]:
         except ArithmeticError:
             continue
     return levels, fractions
+
+
+def _named(entry: FamilyMapping, terms: InstructionTerms, today: date) -> bool:
+    named, problems = entry._named_months(terms, today)
+    return bool(named) and not problems
 
 
 class MappingFileV2(StrictModel):
@@ -763,13 +957,18 @@ class MappingPolicy:
         held: dict[str, ContractRef] | None = None,
         recorded: dict[str, FamilyMapping] | None = None,
         post_text: str | None = None,
+        levels: list[tuple[str, str]] | None = None,
+        others: list[tuple[str | None, str | None, set[Decimal]]] = (),
     ) -> tuple[MappingDecision, Instrument | None]:
         """One action's mapping decision and, when SUPPORTED, its execution instrument.
         ``clause`` is the instruction text the action came from (contract terms are read from it);
         ``held`` maps follower idea ids to their contracts, so a follow-up acts on its own;
         ``recorded`` maps them to the entry each was opened under. Approval governs new exposure
         only: a REDUCE, CLOSE or MODIFY on an open idea whose family is no longer approved (or no
-        longer has an entry) uses its recorded entry, marked exits-only."""
+        longer has an entry) uses its recorded entry, marked exits-only. ``levels`` (the
+        interpreter's price mentions for this action, as (role, value)) and ``others`` (every
+        other action of the post: asset, clause, stated values) are read only by an entry with
+        entry_rule = REFERENCE_AS_COLLAR (``entry_anchor_for``)."""
         if action.action == Action.NO_TRADE:
             return MappingDecision(action_id=action.action_id, status="NOT_APPLICABLE"), None
         asset = action.source_market_symbol or (
@@ -831,13 +1030,36 @@ class MappingPolicy:
         today = (now or datetime.now(UTC)).astimezone(
             ZoneInfo(entry.session.timezone if entry.session else "UTC")
         ).date()
-        instrument, problems = entry.select(action, asset, terms, today, held_contract, post_text)
+        anchor, problems = (None, []) if revoked else entry.entry_anchor_for(
+            action, asset, terms, levels, others)
+        if problems:
+            return MappingDecision(status="UNRESOLVED", reason=",".join(problems), **out), None
+        instrument, problems = entry.select(action, asset, terms, today, held_contract, post_text,
+                                            anchor)
         if instrument is None:
             return MappingDecision(
                 status="UNRESOLVED", reason=",".join(problems), **out
             ), None
+        if anchor is not None:
+            extra = entry.unexplained_prices(action, terms, anchor, levels)
+            if extra:
+                return MappingDecision(status="UNRESOLVED", reason=",".join(
+                    [ENTRY_ANCHOR_UNEXPLAINED_PRICE,
+                     *(f"UNREAD_TOKEN:{t.replace(',', '')}" for t in extra)]),
+                    **out), None
+        month_source = None
+        if instrument.asset_class == AssetClass.FUTURE:
+            if held_contract is not None:
+                month_source = "IDEA"
+            elif _named(entry, terms, today):
+                month_source = "NAMED"
+            else:
+                month_source = ("FRONT_MONTH" if entry.level_contract_rule == "FRONT_MONTH"
+                                else "NEAREST")
         return MappingDecision(status="SUPPORTED", mapped=not entry.legacy_equivalent,
-                               under_revoked_mapping=revoked, **out), instrument
+                               under_revoked_mapping=revoked,
+                               entry_anchor=str(anchor) if anchor is not None else None,
+                               month_source=month_source, **out), instrument
 
     def _decide_v1(self, action: TradeAction, asset: str, entry: MappingEntry) -> MappingDecision:
         if not entry.executable:
@@ -875,16 +1097,24 @@ class MappingPolicy:
         held: dict[str, ContractRef] | None = None,
         recorded: dict[str, FamilyMapping] | None = None,
         post_text: str | None = None,
+        levels: dict[str, list[tuple[str, str]]] | None = None,
     ) -> tuple[ParsedPost, list[MappingDecision]]:
         """Return the post with every action that may not execute marked for HOLD, and one
         decision per action. A supported action gets its execution instrument. ``clauses`` maps
-        action ids to their instruction text (contract months and option terms are read there)."""
+        action ids to their instruction text (contract months and option terms are read there).
+        ``levels`` maps action ids to the interpreter's price mentions, as (role, value): only an
+        entry with entry_rule = REFERENCE_AS_COLLAR reads them (its entry anchor)."""
         actions: list[TradeAction] = []
         decisions: list[MappingDecision] = []
+        clauses, levels = clauses or {}, levels or {}
+        stated = {a.action_id: {v for _, raw in levels.get(a.action_id, ())
+                                if (v := _level(raw)) is not None} for a in parsed.actions}
         for a in parsed.actions:
+            others = [(b.source_market_symbol, clauses.get(b.action_id), stated[b.action_id])
+                      for b in parsed.actions if b.action_id != a.action_id]
             d, instrument = self.resolve(
-                a, clause=(clauses or {}).get(a.action_id), now=now, held=held, recorded=recorded,
-                post_text=post_text,
+                a, clause=clauses.get(a.action_id), now=now, held=held, recorded=recorded,
+                post_text=post_text, levels=levels.get(a.action_id), others=others,
             )
             decisions.append(d)
             marks: list[str] = []

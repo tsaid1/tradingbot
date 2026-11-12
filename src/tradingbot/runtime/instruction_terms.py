@@ -281,6 +281,23 @@ def leftover_tokens(terms: InstructionTerms, consumed: set[Decimal],
     return out
 
 
+def clause_numbers(clause: str) -> set[Decimal]:
+    """Every plain number written in the clause as a price could be ("4,512.25", "$88.4"), outside
+    the spans of an index's own name: where a stated level must appear to anchor an entry."""
+    names = [m.span() for m in INDEX_NAME_RE.finditer(clause or "")]
+    out = set()
+    for m in _TOKEN_RE.finditer(clause or ""):
+        raw = m.group(0)
+        start = m.start() + (len(raw) - len(raw.lstrip(_EDGE)))
+        token = raw.strip(_EDGE)
+        if any(a <= start < b for a, b in names):
+            continue
+        n = _NUMBER_RE.match(token)
+        if n and not n.group(3):
+            out.add(Decimal((n.group(1) + (n.group(2) or "")).replace(",", "")))
+    return out
+
+
 # Language that adds a leg: selling, shorting or writing an option, or one put on "against" another.
 SECOND_LEG_RE = re.compile(
     r"\b(?P<word>sell|sells|selling|sold|short|shorts|shorting|shorted|write|writes|writing|"

@@ -19,6 +19,19 @@
 # PROXY) is retired: such relationships are BASIS_SHIFT or REFERENCE_TRIGGER entries, approved per
 # family, or UNSUPPORTED. Loading fails closed: an unknown key, a missing required field, an
 # inconsistent combination or two entries for one family refuses to start.
+#
+# Two further rules are owner decisions per family and are OFF unless an approved entry says so
+# (see docs/MULTI_ASSET_MAPPING.md, "Entry rule" and "Level contract rule"):
+#
+#   entry_rule = "EXPLICIT_ENTRY_ONLY"   (default) only explicit execution language sets an entry
+#   entry_rule = "REFERENCE_AS_COLLAR"   a current open or add stating exactly one market level
+#                                        enters with a LIMIT at the live marketable price, the
+#                                        stated level an anchor bounded by [entry_anchor]
+#                                        max_adverse_move / max_favourable_move ("2.5" or "0.5%")
+#                                        and max_signal_age_seconds; all three required
+#   level_contract_rule = "EXPLICIT_MONTH_ONLY"  (default) a futures level needs a named month
+#   level_contract_rule = "FRONT_MONTH"  a DIRECT futures level with no month means the front
+#                                        contract of the entry's own list; HOLD in its roll window
 
 version = 2
 
@@ -29,6 +42,8 @@ approved = true
 approved_by = "owner"
 approved_at = 2026-06-01T00:00:00Z
 note = "Publisher levels for TLT are quoted in the ETF's own share price. Version-1 behaviour."
+# entry_rule is not set: EXPLICIT_ENTRY_ONLY. A stated market level ("long here, TLT 88.40 now")
+# is a REFERENCE and the OPEN is held (OPEN_ENTRY_PRICE_MISSING) until the owner decides otherwise.
 reference = { sec_type = "STK", asset_class = "ETF", symbol = "TLT", exchange = "SMART", currency = "USD" }
 execution = { sec_type = "STK", asset_class = "ETF", symbol = "TLT", exchange = "SMART", currency = "USD" }
 
@@ -53,6 +68,8 @@ execution = { sec_type = "STK", asset_class = "ETF", symbol = "TLT", exchange = 
 # roll = { business_days_before = 3, action = "FLATTEN" }
 # reference_trigger = { released_order_type = "MKT", reference_hours = ["09:30-16:00"], require_backstop = true }
 # basis_shift = { max_abs_basis = "40", max_age_seconds = 5, scale_ratio = "1" }   # prices the backstop stop
+# entry_rule = "REFERENCE_AS_COLLAR"               # owner decision: a stated index level anchors the entry
+# entry_anchor = { max_adverse_move = "10", max_favourable_move = "25", max_signal_age_seconds = 60 }   # index points
 #
 # --- an energy future quoted in its own contract month's price, executed in a micro contract
 # --- on the same underlying that trades at that same price (same_series asserts this)
@@ -71,6 +88,9 @@ execution = { sec_type = "STK", asset_class = "ETF", symbol = "TLT", exchange = 
 # sizing = { units_per_signal = 1, max_units = 2, max_notional = "20000" }
 # session = { policy = "EXTENDED", timezone = "America/New_York", days = ["MON", "TUE", "WED", "THU", "FRI"], regular = ["09:00-14:30"], extended = ["00:00-09:00", "14:30-17:00", "18:00-24:00"] }
 # roll = { business_days_before = 3, action = "FLATTEN", holidays = [2026-11-26] }
+# level_contract_rule = "FRONT_MONTH"              # owner decision: a level with no month is the front contract's
+# entry_rule = "REFERENCE_AS_COLLAR"               # owner decision: a stated level anchors the entry
+# entry_anchor = { max_adverse_move = "0.5%", max_favourable_move = "1.5%", max_signal_age_seconds = 60 }
 #
 # --- a metal quoted as spot and executed in a future
 # [[mapping]]
