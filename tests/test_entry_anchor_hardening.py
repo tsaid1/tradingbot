@@ -102,7 +102,7 @@ ANCHORS = [
     ("Long $QETF, now 50.10.", None),
     (LONG, "We are now long $QETF.\n50.10 now."),
     (LONG, "We are now long $QETF.\n$QETF currently 50.10."),
-    (LONG, "We are now long $QETF.\n~$50.10 now.\nStop 48.90."),
+    (LONG, "We are now long $QETF.\n$50.10 now.\nStop 48.90."),  # review S4 (12 Nov): "~" holds
     (LONG, "We are now long $QETF.\nQETF trading at 50.10 USD."),
 ]
 

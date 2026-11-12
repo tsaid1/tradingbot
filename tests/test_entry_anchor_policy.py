@@ -355,7 +355,7 @@ LONG = "We are now long $QETF."
 
 @pytest.mark.parametrize("post,anchor", [
     ("We are now long $QETF.\n\n50.10 now.", "50.10"),
-    ("We are now long $QETF.\n~$50.10 now. Stop 48.90.", "50.10"),
+    ("We are now long $QETF.\n$50.10 now. Stop 48.90.", "50.10"),  # review S4 (12 Nov): "~" holds
 ])
 def test_a_level_line_of_the_post_may_be_the_anchors_source(tmp_path, post, anchor):
     d, _ = resolve(policy(tmp_path, etf_entry()), action(), LONG, [("REFERENCE", anchor)],

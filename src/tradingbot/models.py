@@ -276,6 +276,9 @@ class ExecutionPlan(StrictModel):
     # The per-side quote freshness the gateway applied; the execution core applies it again to
     # the quote it re-reads before sending the anchored limit (additive).
     anchor_max_quote_age_seconds: float | None = None
+    # The anchor's signal age limit, re-applied when a never-submitted anchored intent is
+    # recovered (review S2; additive).
+    anchor_max_signal_age_seconds: float | None = None
 
 
 class GateDecision(StrictModel):

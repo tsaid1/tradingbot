@@ -92,11 +92,12 @@ def test_a_level_after_a_target_sentence_holds(tmp_path):
 
 
 def test_a_level_after_a_raised_stop_holds_even_where_only_the_post_attributes_it(tmp_path):
-    """Under SINGLE_MARKET_POST the neighbour need not be allow-listed; rule B still reads it."""
+    """Review B1: the neighbour "We raised our stop." is not on the allow-list, so it decides
+    first (AMBIGUOUS); the deny-list would hold it too."""
     post = f"{LONG}\nWe raised our stop.\n50.10 now."
     d = run(scoped(tmp_path, "SINGLE_MARKET_POST"), LONG, post)
-    assert d.reason.split(",")[:3] == [NOT_QUOTE, "LEVEL_KIND:STOP_OR_TARGET",
-                                       "CONTEXT_WORD:stop"], d.reason
+    assert d.reason.split(",")[:3] == [NOT_QUOTE, "LEVEL_KIND:AMBIGUOUS",
+                                       "NEIGHBOUR_NOT_UNDERSTOOD"], d.reason
     for scope in ("SENTENCE_STRICT", "ACTION_BLOCK"):
         assert run(scoped(tmp_path, scope), LONG, post).status == "UNRESOLVED"
 
@@ -112,7 +113,9 @@ def test_an_elliptical_level_after_cost_basis_language_or_another_number_holds(t
                                                                                detail):
     d = run(scoped(tmp_path, "SINGLE_MARKET_POST"), LONG, f"{LONG}\n{context}\n50.10 now.")
     assert d.status == "UNRESOLVED", d.reason
-    assert d.reason.split(",")[0] == NOT_QUOTE and d.reason.split(",")[2] == detail, d.reason
+    # Review B1: each of these neighbours is off the allow-list, which now decides first.
+    assert d.reason.split(",")[0] == NOT_QUOTE, d.reason
+    assert d.reason.split(",")[2] in (detail, "NEIGHBOUR_NOT_UNDERSTOOD"), d.reason
 
 
 @pytest.mark.parametrize("scope", SCOPES)
@@ -239,9 +242,11 @@ def test_the_private_non_market_list_is_checked_on_load(word, why):
 
 
 def test_the_residual_a_lowercase_unknown_market_word_stays_invisible(tmp_path):
-    """Documented residual: no named-entity recognition. A market named only by a lower-case word
-    outside the public lists, or by an unknown sentence-initial word, is not seen; the collar,
-    signal age, stop and size caps bound that case."""
+    """Documented residual (restated after review B2): no named-entity recognition. A market named
+    by a lower-case common word outside the lists, or an unknown sentence-initial word, in a
+    sentence that is NOT the level's neighbour, in an otherwise understood post, is not seen; the
+    collar, signal age, stop and size caps bound that case. Before an elliptical level it holds
+    (test_entry_rule_review_fixes)."""
     for extra in ("The widget fund is heavy.", "Qorvaline is heavy."):
         d = decide(two_families(tmp_path), post=POST.replace(NOTE, f"{NOTE} {extra}"))
         assert d.status == "SUPPORTED", d.reason

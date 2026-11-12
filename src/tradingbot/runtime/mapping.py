@@ -38,7 +38,15 @@ from pathlib import Path
 from typing import Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import Field, StrictBool, ValidationError, field_validator, model_validator
+from pydantic import (
+    Field,
+    StrictBool,
+    StrictFloat,
+    StrictInt,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from tradingbot.event_models import ParsedPost, Timing, TradeAction
 from tradingbot.execution.broker import ContractRef
@@ -73,6 +81,7 @@ from tradingbot.runtime.instruction_terms import (
     level_places,
     marked_numbers,
     post_multi_leg,
+    protective_sentence_problem,
     quote_clause_words,
     relative_contract_words,
     sentences,
@@ -388,13 +397,14 @@ class EntryAnchorRules(StrictModel):
     # How far it may have moved the other way: beyond it the signal may be stale or misread.
     max_favourable_move: str = Field(pattern=_MOVE)
     # The oldest source post the rule may act on, at the decision.
-    max_signal_age_seconds: int = Field(gt=0)
+    max_signal_age_seconds: StrictInt = Field(gt=0)
     # A family whose anchor is compared in a reference series and that has no [basis_shift] (a
     # REFERENCE_TRIGGER without a backstop): the largest absolute difference allowed between the
     # live execution and reference quotes at the decision, in execution prices, and the oldest
     # each quote (and their skew) may be. Otherwise [basis_shift]'s cap is the one used.
-    max_abs_basis: Decimal | None = Field(default=None, gt=0)
-    max_basis_age_seconds: float | None = Field(default=None, gt=0, le=60)
+    max_abs_basis: Decimal | None = Field(default=None, gt=0, allow_inf_nan=False)
+    max_basis_age_seconds: StrictFloat | StrictInt | None = Field(default=None, gt=0, le=60,
+                                                                  allow_inf_nan=False)
     # How much textual certainty an anchor needs (the owner's choice; no default). Both
     # allow-list the marked number's whole sentence. SENTENCE_STRICT: a standalone level sentence
     # also needs the sentence before it entirely allow-listed. ACTION_BLOCK: it is also accepted
@@ -405,10 +415,14 @@ class EntryAnchorRules(StrictModel):
     anchor_scope: Literal["SENTENCE_STRICT", "ACTION_BLOCK", "SINGLE_MARKET_POST"]
     # The oldest each side of a live streaming quote (bid and ask, by their own update times) may
     # be at an anchored decision. Required, no default; ceiling validator.ANCHOR_MAX_QUOTE_AGE_*.
-    max_quote_age_seconds: float = Field(gt=0)
+    max_quote_age_seconds: StrictFloat | StrictInt = Field(gt=0, allow_inf_nan=False)
     # Required, and "PAPER" is its only value: the rule is for simulation and the paper account,
     # never a funded account. The file states the limitation; no value could mean anything else.
     environment: Literal["PAPER"]
+    # An owner decision, default false (shipped false): an elliptical level ("88.42 now.") may
+    # also follow a sentence that states only this action's own stop and target, on their
+    # protective and profit sides (docs/MULTI_ASSET_MAPPING.md, "What the level is", B1b).
+    level_after_own_protective_levels: StrictBool = False
 
     @field_validator("max_adverse_move", "max_favourable_move")
     @classmethod
@@ -1092,7 +1106,9 @@ class FamilyMapping(StrictModel):
             return held(problems, words=unknown)
         if why:  # the disqualifying words: a second, redundant check
             return held([ENTRY_ANCHOR_NOT_CURRENT, *why], words=bad_words)
-        kind, detail = self._level_kind(anchor, source, post_text, own, markers)
+        kind, detail = self._level_kind(anchor, source, post_text, own, markers, action=action,
+                                        levels=levels, terms=terms, lexicon=lexicon,
+                                        attribution=attributed)
         if kind != AnchorLevelKind.MARKET_QUOTE:
             return held([ENTRY_ANCHOR_LEVEL_NOT_MARKET_QUOTE, f"LEVEL_KIND:{kind.value}", detail],
                         kind)
@@ -1117,26 +1133,37 @@ class FamilyMapping(StrictModel):
         return anchor, source, []
 
     def _level_kind(self, anchor: Decimal, source: str, post_text: str | None, own: list[str],
-                    markers) -> tuple[AnchorLevelKind, str]:
+                    markers, *, action: TradeAction | None = None, levels=None,
+                    terms: InstructionTerms | None = None, lexicon: AnchorLexicon | None = None,
+                    attribution: list[str] | None = None) -> tuple[AnchorLevelKind, str]:
         """The owner's ambiguity safeguard: what the candidate level is, as one closed kind. Only
         an explicit contemporaneous market quotation (MARKET_QUOTE) may anchor.
 
         A. The number's own clause (between punctuation, as ``anchor_not_current`` delimits it)
            holds only the number, its attached marker, the quote connectors, a currency or unit
-           and a name of this family. A holder, position or trade word there makes the number
-           possibly an entry price or an average cost (ENTRY_OR_COST_BASIS: "Our position is 71.60
-           now.", "We are long $X here at 41.20."); a pronoun subject or any other word some other
-           thing's level (AMBIGUOUS: "It is 41.20 now.").
-        B. A clause that does not name this family is elliptical: it takes its topic from the
-           earlier clauses of its sentence and the sentence immediately before it, which must hold
-           no order, chart or cost-basis word and no other number ("We raised our stop. 86.50
-           now." is STOP_OR_TARGET). The interpreter's roles cannot show such a level to be the
-           market rather than the stop (``PriceMention`` has a role and a value, no sentence), so
-           it HOLDs. A clause that names this family ("$X 41.20 now.") is an explicit quotation
-           whatever its neighbours say.
+           and a name of this family; a holder, position or trade word reads as an entry price or
+           a cost basis (ENTRY_OR_COST_BASIS), a pronoun, a quotation or approximation mark or any
+           other word as AMBIGUOUS.
+        B. A clause that does not name this family is elliptical: it takes its topic from its
+           neighbour, the earlier clauses of its sentence or, when it opens its sentence, the
+           sentence immediately before. The neighbour is decided by an ALLOW-list (review B1):
+           (i) a sentence of this action's own clause, or (ii) a neighbour entirely on the
+           whole-sentence allow-list SENTENCE_STRICT applies to a preceding sentence
+           (``unknown_tokens``), or (iii) with ``level_after_own_protective_levels`` only, a
+           sentence stating only this action's own stop and target on their protective and profit
+           sides. Anything else HOLDs (AMBIGUOUS, NEIGHBOUR_NOT_UNDERSTOOD): the bot does not know
+           what the level is about. The level- and cost-word deny-list (``context_problem``) is a
+           second, independent check that can only add a hold ("Stop 40.10. 41.20 now." without
+           the key: the level may be the stop, since ``PriceMention`` has no sentence index).
+           A clause that names this family ("$X 41.20 now.") is an explicit quotation.
         A sentence that cannot be located in the post has no known context: AMBIGUOUS."""
+        lexicon = lexicon or AnchorLexicon()
         allowed = [*markers, *own]
-        whole = [s for s, _ in sentences(post_text or source)]
+        sentence_allowed = (_allow_list(action, levels, markers, own, lexicon)[0]
+                            if action is not None else allowed)
+        own_block = {s for s, _ in sentences(terms.clause)} if terms is not None else set()
+        whole_q = sentences(post_text or source)
+        whole = [s for s, _ in whole_q]
         places = level_places(source, anchor)
         if not places:
             return AnchorLevelKind.AMBIGUOUS, "NOT_FOUND"
@@ -1154,10 +1181,49 @@ class FamilyMapping(StrictModel):
                 # The source is a part of a longer post sentence: its earlier clauses count too.
                 earlier = [*next((e for s, c, e in level_places(whole[at], anchor)
                                   if c.strip() == clause.strip()), []), *earlier]
-            problem = context_problem([*earlier, *whole[at - 1:at]])
+            before = whole[at - 1] if at > 0 else None
+            if earlier:
+                neighbour = " ".join(earlier)
+                if not (neighbour in own_block or all(e in own_block for e in earlier)
+                        or not unknown_tokens(neighbour, sentence_allowed,
+                                              self._month_spans(neighbour))):
+                    return AnchorLevelKind.AMBIGUOUS, "NEIGHBOUR_NOT_UNDERSTOOD"
+            elif before is not None:
+                if self._own_protective_levels(before, whole_q[at - 1][1], anchor, action,
+                                               lexicon):
+                    if attribution is not None and "AFTER_OWN_PROTECTIVE_LEVELS" not in \
+                            attribution:
+                        attribution.append("AFTER_OWN_PROTECTIVE_LEVELS")
+                    continue
+                if not (before in own_block
+                        or not unknown_tokens(before, sentence_allowed,
+                                              self._month_spans(before))):
+                    return AnchorLevelKind.AMBIGUOUS, "NEIGHBOUR_NOT_UNDERSTOOD"
+            problem = context_problem([*earlier, *([before] if before is not None else [])])
             if problem:
                 return problem
         return AnchorLevelKind.MARKET_QUOTE, ""
+
+    def _own_protective_levels(self, sentence: str, question: bool, anchor: Decimal,
+                               action: TradeAction | None, lexicon: AnchorLexicon) -> bool:
+        """B1b (``level_after_own_protective_levels``, default false): ``sentence`` states only
+        this action's own stop (and target): every word on the public protective-levels list or
+        the private context words, every number exactly the action's own stop or target, the stop
+        on the protective side of the level (below it for a long), a target on the profit side,
+        no time, condition or cost-basis word, no month, not a question."""
+        if not (self.entry_anchor and self.entry_anchor.level_after_own_protective_levels) \
+                or action is None or question:
+            return False
+        stop, target = _level(action.stop_price), _level(action.target_price)
+        if stop is None:
+            return False
+        long = getattr(action.position_side, "value", "") == "LONG"
+        if (stop >= anchor) if long else (stop <= anchor):
+            return False
+        if target is not None and ((target <= anchor) if long else (target >= anchor)):
+            return False
+        own_values = {stop} | ({target} if target is not None else set())
+        return protective_sentence_problem(sentence, own_values, lexicon.context_words) is None
 
     def _names_family(self, clause: str, own: list[str]) -> bool:
         """Does the clause name this family: one of its names or aliases, or a contract code of
@@ -1246,21 +1312,9 @@ class FamilyMapping(StrictModel):
         number than the action's own levels and contract months. A level sentence without the
         action's own instruction words also needs the sentence before it to be entirely on the
         allow-list: otherwise whose level it is cannot be told."""
-        instruction = list(SIDE_WORDS.get(getattr(action.position_side, "value", ""), ()))
-        if action.action == Action.ADD:
-            instruction += ADD_WORDS
-        consumed, fractions = _consumed(action)
-        for role, raw in levels or ():
-            v = _level(raw) if role in ("STOP", "TARGET") else None
-            if v is not None:
-                consumed.add(v)
-                instruction += ["stop", "stops"] if role == "STOP" else ["target", "targets"]
-        if action.stop_price is not None:
-            instruction += ["stop", "stops"]
-        if action.target_price is not None:
-            instruction += ["target", "targets"]
+        allowed, instruction, consumed, fractions = _allow_list(action, levels, markers, own,
+                                                               lexicon)
         consumed.add(anchor)
-        allowed = [*markers, *own, *instruction, *lexicon.context_words]
         found = [(s, q) for s, q in sentences(source) if anchor in clause_numbers(s)]
         if not found:
             return [ENTRY_ANCHOR_NOT_IN_POST]
@@ -1391,6 +1445,28 @@ class FamilyMapping(StrictModel):
 
 
 _LINE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+|\n+")
+
+
+def _allow_list(action, levels, markers, own, lexicon):
+    """The whole-sentence allow-list of an anchor's sentence (and of the sentence before a level
+    sentence): markers, this family's names, the action's own side, verb and level words and the
+    private context words; with the action's instruction words, its consumed levels and its
+    reduction fractions."""
+    instruction = list(SIDE_WORDS.get(getattr(action.position_side, "value", ""), ()))
+    if action.action == Action.ADD:
+        instruction += ADD_WORDS
+    consumed, fractions = _consumed(action)
+    for role, raw in levels or ():
+        v = _level(raw) if role in ("STOP", "TARGET") else None
+        if v is not None:
+            consumed.add(v)
+            instruction += ["stop", "stops"] if role == "STOP" else ["target", "targets"]
+    if action.stop_price is not None:
+        instruction += ["stop", "stops"]
+    if action.target_price is not None:
+        instruction += ["target", "targets"]
+    allowed = [*markers, *own, *instruction, *lexicon.context_words]
+    return allowed, instruction, consumed, fractions
 
 
 def _post_lines(text: str | None) -> list[str]:

@@ -107,7 +107,7 @@ CLEAR = [
     ("Long $QETF at the market, around 50.10 now.", PositionSide.LONG, None),
     ("Short $QETF, 50.10 right now.", PositionSide.SHORT, None),
     ("Selling $QETF short, here at 50.10.", PositionSide.SHORT, None),
-    ("Long $QETF, ~50.10 now.", PositionSide.LONG, None),
+    ("Long $QETF, 50.10 now.", PositionSide.LONG, None),  # review S4 (12 Nov): "~" holds
     ("Long QETF, QETF is 50.10 now.", PositionSide.LONG, None),
     ("Long the bond fund, currently 50.10 USD.", PositionSide.LONG, 'aliases = ["bond fund"]'),
 ]

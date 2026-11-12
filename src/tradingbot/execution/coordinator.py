@@ -77,8 +77,10 @@ from tradingbot.models import (
 from tradingbot.validator import (
     ANCHOR_MAX_QUOTE_AGE_CEILING_SECONDS,
     ANCHOR_RULE_INCOMPLETE,
+    ANCHOR_SIGNAL_TOO_OLD,
     anchor_quote_problem,
     fill_quantity,
+    finite_positive,
     source_is_fresh,
 )
 
@@ -1752,9 +1754,23 @@ class ExecutionCoordinator:
         contract, problem = self._contract_for(intent)
         if problem:
             return [problem]
+        # Review S2: a never-submitted anchored entry is recovered under its own rule: the plan's
+        # anchored limit, the per-side quote rule and the anchor's signal age.
+        plan = _plan_of(intent.plan)
+        fixed = _anchored_limit(plan)
+        if fixed is not None:
+            limit_age = plan.anchor_max_signal_age_seconds
+            if not finite_positive(limit_age):
+                return [ANCHOR_RULE_INCOMPLETE]
+            if (now - intent.source_published_at).total_seconds() > limit_age:
+                return [ANCHOR_SIGNAL_TOO_OLD]
+        # As at the first attempt: a mapped plan's entry level is its execution reference.
+        reference = (str(plan.execution_reference) if plan is not None
+                     and plan.execution_reference is not None else intent.entry_reference)
         limit, reasons = self._entry_checks(
-            contract, OrderSide(intent.side), intent.quantity, intent.entry_reference,
-            intent.idea_id, now, exclude_ref=intent.order_ref,
+            contract, OrderSide(intent.side), intent.quantity, reference,
+            intent.idea_id, now, exclude_ref=intent.order_ref, fixed_limit=fixed,
+            anchor_quote_age=_anchor_quote_age(plan),
         )
         if reasons:
             return reasons
@@ -2593,7 +2609,8 @@ class ExecutionCoordinator:
             refused = self._paper_only_problem(idea_id)
             if refused:
                 return None, refused
-            if not anchor_quote_age or anchor_quote_age > ANCHOR_MAX_QUOTE_AGE_CEILING_SECONDS:
+            if not finite_positive(anchor_quote_age) \
+                    or anchor_quote_age > ANCHOR_MAX_QUOTE_AGE_CEILING_SECONDS:
                 return None, [ANCHOR_RULE_INCOMPLETE]
             stale = anchor_quote_problem(q.bid, q.ask, q.bid_at, q.ask_at, q.quality, now,
                                          anchor_quote_age, contract.min_tick)

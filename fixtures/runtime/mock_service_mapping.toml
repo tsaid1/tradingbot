@@ -1,3 +1,4 @@
+# TEST FIXTURE, not a production mapping: never point a runtime at this file.
 # Mapping for the mock service demo (scripts/run_mock_service_demo.py) and the service-mechanics
 # tests (tests/runtime_harness.py) ONLY. Not the owner's mapping: config/instrument_mapping.toml is.
 #

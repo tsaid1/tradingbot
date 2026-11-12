@@ -331,10 +331,12 @@ LEVEL_WORDS = STOP_TARGET_WORDS | frozenset((
     "settle", "settled", "settlement", "resistance", "support", "level", "levels", "pivot", "zone",
     "area", "entry", "exit",
 ))
-NOT_CURRENT_WORDS = TIME_WORDS | LEVEL_WORDS | frozenset((
-    # a condition or a level to cross
+# a condition or a level to cross
+CONDITION_WORDS = frozenset((
     "from", "to", "above", "below", "over", "under", "through", "break", "breaks", "broke",
     "breakout", "breakdown", "if", "when", "once", "until", "unless", "whenever",
+))
+NOT_CURRENT_WORDS = TIME_WORDS | LEVEL_WORDS | CONDITION_WORDS | frozenset((
     # a range or a comparison
     "between", "range", "vs", "versus", "than", "higher", "lower", "up", "down", "more",
     "less", "or",
@@ -583,6 +585,8 @@ class AnchorLevelKind(str, Enum):
 # The only plain words a market quotation's own clause may hold besides the number, its attached
 # marker, a currency or unit and a name of this family ("here" only as part of "here at").
 QUOTE_CONNECTORS = frozenset(("at", "is", "are", "around", "near", "@"))
+QUOTATION_MARKS = frozenset("\"'`\u2018\u2019\u201a\u201b\u201c\u201d\u201e\u201f\u00ab\u00bb\u2039\u203a")
+APPROXIMATION_MARKS = frozenset("~\u2248\u00b1<>\u2243\u2245\u223c")
 # A holder, position or trade word: the number may be the holder's entry price or average cost.
 HOLDER_WORDS = frozenset((
     "we", "i", "us", "me", "our", "my", "position", "positions", "trade", "trades", "long",
@@ -636,6 +640,14 @@ def quote_clause_words(clause: str, allowed, skip_spans: list[tuple[int, int]] =
     _tag(words, allowed, "allowed", tags)
     out = []
     for (a, b, tok), w, tag in zip(seg, words, tags, strict=True):
+        # Review S4: quotation marks make the clause someone's words, an approximation or a sign
+        # mark makes the number something else; neither is interpreted (HOLD).
+        if any(ch in QUOTATION_MARKS for ch in tok):
+            out.append("quotation-mark")
+            continue
+        if any(ch in APPROXIMATION_MARKS for ch in tok) or re.match(r"^[+\-\u2212]\$?\d", tok):
+            out.append("approximation-mark")
+            continue
         if tag is not None or any(x <= a and b <= y for x, y in skip_spans):
             continue
         if not any(ch.isalpha() for ch in w) or any(ch.isdigit() for ch in w):
@@ -660,23 +672,19 @@ def clause_kind(words: list[str]) -> AnchorLevelKind | None:
     return AnchorLevelKind.AMBIGUOUS
 
 
-def context_problem(texts: list[str]) -> tuple[AnchorLevelKind, str] | None:
-    """Rule B: an elliptical level takes its topic from the words before it, which must not be about
-    another level: no order, chart or cost-basis word, and no other number."""
+def context_problem(texts: list[str], exempt=frozenset()) -> tuple[AnchorLevelKind, str] | None:
+    """Rule B's second, independent check (it can only add a hold): the words before an elliptical
+    level hold no order, chart or cost-basis word (``exempt`` words aside). The deciding test is
+    the neighbour allow-list (``FamilyMapping._level_kind``); another number in the context is no
+    rule of its own (review B1: the allow-list's own checks cover it)."""
     words = set()
     for t in texts:
         for tok in (t or "").split():
             w = _word(tok)
             words |= {p for p in (w, *w.split("-"), *w.split("/")) if p}
-    hit = words & CONTEXT_LEVEL_WORDS
+    hit = (words & CONTEXT_LEVEL_WORDS) - set(exempt)
     if hit:
         return level_kind_of_words(hit), f"CONTEXT_WORD:{min(hit)}"
-    for t in texts:
-        # A contract month ("Aug 2026") is the contract check's, not another level.
-        spans = extract_terms(t).month_spans
-        if clause_numbers("".join(" " if any(a <= k < b for a, b in spans) else ch
-                                  for k, ch in enumerate(t or ""))):
-            return AnchorLevelKind.AMBIGUOUS, "CONTEXT_NUMBER"
     return None
 
 
@@ -792,13 +800,12 @@ def unresolved_market_mentions(text: str, own: set[str], own_codes: set[str], ro
                r"(?:'s)?[\s-]+$") if own else None
     for m in _TOKEN_RE.finditer(masked):
         raw = m.group(0)
-        word = raw.strip(_EDGE)
-        if not word or word.startswith(("$", "@", "#")):
+        word = raw.strip(_EDGE).lstrip("#")  # a hashtag is read as its word
+        if not word or word.startswith(("$", "@")):
             continue
         start = m.start() + raw.index(word[0])
-        bare = word[:-2] if word.lower().endswith("'s") else word
-        lw = bare.lower()
-        if lw in INSTRUMENT_NOUNS:
+        whole = word[:-2] if word.lower().endswith("'s") else word
+        if whole.lower() in INSTRUMENT_NOUNS:
             before = text[:start]
             head = before.split()[-1].strip(_EDGE) if before.split() else ""
             own_head = bool(head_re and re.search(head_re, before, re.IGNORECASE))
@@ -807,17 +814,72 @@ def unresolved_market_mentions(text: str, own: set[str], own_codes: set[str], ro
             if not (own_head or month_head):
                 found.add(MarketMention.INSTRUMENT_PHRASE)
             continue
-        if not bare[:1].isupper():
-            continue
-        if lw in understood or lw in non_market or bare.upper() in own_codes \
-                or any(code_shaped(bare.upper(), r) for r in roots):
-            continue
-        if _TICKER_RE.match(bare):
-            if lw not in NON_INSTRUMENT_ACRONYMS and lw not in NON_MARKET_PROPER_NOUNS:
-                found.add(MarketMention.TICKER_SHAPED)
-            continue
-        if not _PROPER_RE.match(bare) or start in first_tokens:
-            continue
-        if lw not in NON_MARKET_PROPER_NOUNS and lw not in NON_INSTRUMENT_ACRONYMS:
-            found.add(MarketMention.PROPER_NOUN)
+        # "EUR/USD", "BRK.B": each part is a candidate (review B2); only the first part can be
+        # sentence-initial.
+        offset = 0
+        for k, bare in enumerate(re.split(r"[/.]", whole)):
+            at, offset = start + offset, offset + len(bare) + 1
+            kind = _mention_kind(bare, understood, non_market, own_codes, roots,
+                                 initial=(k == 0 and at in first_tokens))
+            if kind is not None:
+                found.add(kind)
     return sorted(found, key=lambda k: k.value)
+
+
+def _mention_kind(bare: str, understood, non_market, own_codes, roots, *, initial: bool):
+    """The kind of one capitalised candidate token, or None when it is understood or this
+    family's: a 2-5 capital ticker shape (with an optional month and year), any all-capitals word
+    of six or more letters wherever it sits, or a capitalised word that is not sentence-initial."""
+    if not bare or bare.startswith(("$", "@")) or not bare[:1].isupper():
+        return None
+    lw = bare.lower()
+    if lw in understood or lw in non_market or bare.upper() in own_codes \
+            or any(code_shaped(bare.upper(), r) for r in roots):
+        return None
+    if _TICKER_RE.match(bare) or (bare.isalpha() and bare.isupper() and len(bare) >= 6):
+        if lw not in NON_INSTRUMENT_ACRONYMS and lw not in NON_MARKET_PROPER_NOUNS:
+            return MarketMention.TICKER_SHAPED
+        return None
+    if not _PROPER_RE.match(bare) or initial:
+        return None
+    if lw not in NON_MARKET_PROPER_NOUNS and lw not in NON_INSTRUMENT_ACRONYMS:
+        return MarketMention.PROPER_NOUN
+    return None
+
+
+# entry_anchor.level_after_own_protective_levels (an owner decision, default false): the only words
+# a "protective-levels sentence" may hold, besides numbers that are exactly the action's own stop
+# and target and the private context words. Closed and generic on purpose.
+PROTECTIVE_WORDS = frozenset((
+    "stop", "stops", "stop-loss", "stoploss", "protective", "target", "targets", "targeting",
+    "objective", "with", "a", "an", "the", "and", "at", "is", "are", "our", "my", "set", "of",
+    "price", "level", "loss",
+))
+
+
+def protective_sentence_problem(sentence: str, own_values: set[Decimal], extra=()) -> str | None:
+    """Why ``sentence`` is not a protective-levels sentence, or None: every alphabetic token is in
+    ``PROTECTIVE_WORDS`` (or the private phrases ``extra``), none is a time, condition or
+    cost-basis word, it holds at least one number, every token with a digit is a plain number
+    equal to one of ``own_values``, and it names no contract month."""
+    if extract_terms(sentence).month_spans or MONTH_WORD_RE.search(sentence or ""):
+        return "MONTH"
+    seg = [t for t in _TOKEN_RE.findall(sentence or "")]
+    words = [_word(t) for t in seg]
+    tags: list[str | None] = [None] * len(words)
+    _tag(words, list(extra), "allowed", tags)
+    numbers = 0
+    for tok, w, tag in zip(seg, words, tags, strict=True):
+        if any(ch.isdigit() for ch in tok):
+            v = _value(tok)
+            if v is None or v not in own_values or "~" in tok:
+                return "NOT_OWN_LEVEL"
+            numbers += 1
+            continue
+        if not any(ch.isalpha() for ch in w):
+            continue
+        if w in TIME_WORDS or w in CONDITION_WORDS or w in COST_BASIS_WORDS:
+            return "QUALIFIER"
+        if tag is None and w not in PROTECTIVE_WORDS:
+            return "WORD"
+    return None if numbers else "NO_LEVEL"

@@ -24,7 +24,9 @@ SMP = ANCHOR_RULE.replace('"SENTENCE_STRICT"', '"SINGLE_MARKET_POST"')
 OWN = "We are now long $QETF from the lows."
 NOTE = "The fund has been basing for weeks."
 STOP = "Stop 48.90."
-POST = f"{OWN} {NOTE}\n{STOP}\nThe chart looks constructive.\n50.10 now."
+# Review B1 (12 Nov): the sentence before an elliptical level must be understood (the action's
+# own clause or entirely allow-listed), so the level line follows "We are long." here.
+POST = f"{OWN} {NOTE}\n{STOP}\nThe chart looks constructive.\nWe are long.\n50.10 now."
 
 
 def two_families(tmp_path) -> MappingPolicy:
@@ -57,10 +59,16 @@ def test_a_closing_level_sentence_in_a_one_market_post_anchors(tmp_path):
     assert d.anchor_attribution == "SINGLE_MARKET_POST"
 
 
-def test_the_other_scopes_refuse_the_same_post(tmp_path):
+def test_the_neighbour_rule_is_the_same_in_every_scope(tmp_path):
+    """Review B1 (12 Nov): SINGLE_MARKET_POST attributes no level the other scopes would not; it
+    adds the post-level checks (one marked level, one market, one current entry)."""
     for scope in ("SENTENCE_STRICT", "ACTION_BLOCK"):
         p = policy(tmp_path, etf_entry(rule=ANCHOR_RULE.replace("SENTENCE_STRICT", scope)))
-        assert decide(p).status == "UNRESOLVED", scope
+        assert decide(p).status == "SUPPORTED", scope
+        chart = POST.replace("We are long.\n", "")
+        assert decide(p, post=chart).status == "UNRESOLVED", scope
+    assert decide(two_families(tmp_path), post=POST.replace("We are long.\n", "")).status == \
+        "UNRESOLVED"
 
 
 @pytest.mark.parametrize("extra", [

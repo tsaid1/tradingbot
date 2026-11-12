@@ -351,7 +351,7 @@ def broker_environment(broker) -> BrokerEnvironment | None:
     try:
         value = get()
         return BrokerEnvironment(getattr(value, "value", value))
-    except (BrokerError, ValueError, TypeError):
+    except Exception:  # noqa: BLE001 - review S3: any failure to declare is "undeclared"
         return None
 
 
