@@ -38,10 +38,17 @@ class LedgerIdea(Idea):
     of one future apart in a follow-up (multi-asset mapping)."""
 
     contract_key: str | None = None
+    # The working backstop and the publisher's own stop: an amendment is judged against both.
+    backstop_price: str | None = None
+    publisher_stop: str | None = None
 
     def as_position(self):
         p = super().as_position()
-        return p.model_copy(update={"contract_key": self.contract_key}) if p is not None else None
+        if p is None:
+            return None
+        return p.model_copy(update={"contract_key": self.contract_key,
+                                    "backstop_price": self.backstop_price,
+                                    "publisher_stop": self.publisher_stop})
 
 
 def _idea(p: LedgerPosition) -> Idea:
@@ -55,6 +62,8 @@ def _idea(p: LedgerPosition) -> Idea:
         target_price=p.target_price,
         status=p.status,
         contract_key=p.contract_key,
+        backstop_price=p.backstop_price,
+        publisher_stop=p.publisher_stop,
     )
 
 

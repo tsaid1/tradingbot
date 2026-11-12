@@ -296,6 +296,8 @@ ROLL_WINDOW = "CONTRACT_IN_ROLL_WINDOW"
 OUTSIDE_SESSION = "OUTSIDE_PERMITTED_SESSION"
 MAPPING_NOT_APPROVED = "MAPPING_NOT_APPROVED"
 UNSUPPORTED_MAPPING = "UNSUPPORTED_INSTRUMENT_MAPPING"
+# An amendment kept a working protective level rather than loosen it (the plan records which).
+PROTECTIVE_LEVEL_NOT_LOOSENED = "PROTECTIVE_LEVEL_NOT_LOOSENED"
 
 
 def business_days_until(today: date, target: date, holidays=()) -> int:
@@ -636,6 +638,20 @@ def _mapped_follow_up(a: TradeAction, q: MappedQuote, policy: MockPolicy,
         if bad:
             return bad
         plan = base.model_copy(update={"publisher_stop": stop, "publisher_target": target})
+
+        def looser(new: Decimal, old: Decimal) -> bool:
+            return new < old if long else new > old
+
+        # The publisher's own previous stop: the ledger's stop for DIRECT and REFERENCE_TRIGGER
+        # (it is in the publisher's series), the recorded publisher stop for BASIS_SHIFT.
+        old_publisher = _num(position.publisher_stop if t.basis == "BASIS_SHIFT"
+                             else position.stop_price)
+        if stop is not None and old_publisher is not None and looser(stop, old_publisher):
+            return _gate("HOLD", "STOP_WIDENING_REQUIRES_POLICY_REVIEW")
+        # A tightening by the publisher never moves a broker-side protective level the loosening
+        # way (the basis may have moved since it was set): the tighter level is kept, recorded on
+        # the plan and raised as an exception by the execution core.
+        kept: list[str] = []
         if t.basis == "BASIS_SHIFT" or (reference_series and t.require_backstop
                                         and stop is not None):
             shifted, reasons = _basis(q, now)
@@ -649,8 +665,20 @@ def _mapped_follow_up(a: TradeAction, q: MappedQuote, policy: MockPolicy,
                 stop = _shift_protection(stop, b, t.min_tick, long, "stop") if stop else None
                 target = (_shift_protection(target, b, t.min_tick, long, "target")
                           if target else None)
+                working = _num(position.stop_price)
+                if stop is not None and working is not None and looser(stop, working):
+                    if old_publisher is None:  # the publisher's direction is unknown
+                        return _gate("HOLD", "STOP_WIDENING_REQUIRES_POLICY_REVIEW")
+                    kept.append(f"STOP: computed {stop} looser than working {working}; "
+                                f"kept {working}")
+                    stop = working
             else:
                 backstop = _shift_protection(stop, b, t.min_tick, long, "stop")
+                working = _num(position.backstop_price)
+                if working is not None and looser(backstop, working):
+                    kept.append(f"BACKSTOP: computed {backstop} looser than working {working}; "
+                                f"kept {working}")
+                    backstop = working
                 if backstop >= q.bid if long else backstop <= q.ask:
                     return _gate("BLOCK", "BACKSTOP_ON_WRONG_SIDE_OF_MARKET")
                 plan = plan.model_copy(update={"backstop_stop": backstop})
@@ -666,8 +694,10 @@ def _mapped_follow_up(a: TradeAction, q: MappedQuote, policy: MockPolicy,
                 return _gate("BLOCK", "STOP_ON_WRONG_SIDE_OF_MARKET")
         if target is not None and (target <= bid if long else target >= ask):
             return _gate("BLOCK", "TARGET_ON_WRONG_SIDE_OF_MARKET")
-        plan = plan.model_copy(update={"stop": stop, "target": target})
-        return _gate_plan(plan, "PAPER_PROTECTION_AMENDMENT", f"MAPPING_{t.basis}")
+        plan = plan.model_copy(update={"stop": stop, "target": target,
+                                       "protective_levels_kept": kept})
+        return _gate_plan(plan, "PAPER_PROTECTION_AMENDMENT", f"MAPPING_{t.basis}",
+                          *([PROTECTIVE_LEVEL_NOT_LOOSENED] if kept else []))
     return _gate("HOLD", "UNKNOWN_ACTION")
 
 

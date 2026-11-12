@@ -223,6 +223,10 @@ class ExecutionPlan(StrictModel):
     basis_observed_at: datetime | None = None
     publisher_stop: Decimal | None = None
     publisher_target: Decimal | None = None
+    # An amendment that tightened the publisher's level but would have moved a broker-side
+    # protective level the loosening way keeps the working level instead; each kept level is
+    # recorded here ("BACKSTOP: computed 4980.00 looser than working 4995.00; kept 4995.00").
+    protective_levels_kept: list[str] = Field(default_factory=list)
 
 
 class GateDecision(StrictModel):
@@ -254,6 +258,11 @@ class Position(StrictModel):
     # The idea's broker contract identity (ContractRef.contract_key) when the ledger knows it, so
     # two months of one future are never confused by a follow-up (multi-asset mapping).
     contract_key: str | None = None
+    # Multi-asset mapping (additive). The working backstop stop (execution prices) beside a
+    # reference-triggered stop, and the publisher's own stop level when ``stop_price`` is a
+    # converted one (BASIS_SHIFT): an amendment is judged in both series.
+    backstop_price: str | None = None
+    publisher_stop: str | None = None
 
 
 class MockOrder(StrictModel):

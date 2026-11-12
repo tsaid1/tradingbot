@@ -78,6 +78,8 @@ UNPROTECTED_POSITION = "UNPROTECTED_POSITION"
 # The broker could not be read after a fill: protection is unknown, never assumed (review M1).
 PROTECTION_UNVERIFIED = "PROTECTION_UNVERIFIED"
 MODIFY_NOT_CONFIRMED = "MODIFY_NOT_CONFIRMED"
+# A mapped amendment kept a working protective level instead of loosening it (validator).
+PROTECTIVE_LEVEL_NOT_LOOSENED = "PROTECTIVE_LEVEL_NOT_LOOSENED"
 # An entry or add whose first submission outcome was unknown, that the broker shows no trace of,
 # and whose source post is no longer fresh enough to act on: it is never resent.
 STALE_AFTER_UNKNOWN_OUTCOME = "STALE_AFTER_UNKNOWN_OUTCOME"
@@ -757,6 +759,7 @@ class ExecutionCoordinator:
             reference_key=plan.reference_contract_key if reference_series else None,
             backstop_ref=backstop_ref(ref) if plan and plan.backstop_stop else None,
             backstop_price=str(plan.backstop_stop) if plan and plan.backstop_stop else None,
+            publisher_stop=str(plan.publisher_stop) if plan and plan.publisher_stop else None,
         )
         self._record(intent, [entry, *children], ledger)
         self._submit(intent, entry, children)
@@ -1062,6 +1065,13 @@ class ExecutionCoordinator:
                 backstop=str(plan.backstop_stop) if plan and plan.backstop_stop else None,
                 basis=str(plan.basis_value) if plan and plan.basis_value is not None else None,
                 gate=gate.reasons,
+            )
+        if plan is not None and plan.protective_levels_kept:
+            # The publisher tightened, but a broker-side level would have loosened: the working
+            # level is kept (the plan says which) and a human sees the divergence.
+            self.store.raise_exception(
+                now, PROTECTIVE_LEVEL_NOT_LOOSENED, "; ".join(plan.protective_levels_kept),
+                idea_id=pos.idea_id, order_ref=ref,
             )
         self._apply_modify(self.store.intent(ref))
         return self._outcome(ref)
@@ -2053,6 +2063,8 @@ class ExecutionCoordinator:
                 fields["stop_price"] = str(price)
             else:
                 fields["target_price"] = str(price)
+        if plan is not None and plan.publisher_stop is not None:
+            fields["publisher_stop"] = str(plan.publisher_stop)
         self.store.update_position(intent.idea_id, now, **fields)
         self.store.set_state(intent.order_ref, IntentState.APPLIED, now)
         self.store.log(

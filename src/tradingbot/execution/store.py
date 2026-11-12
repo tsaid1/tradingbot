@@ -229,6 +229,9 @@ class LedgerPosition(StrictModel):
     reference_key: str | None = None
     backstop_ref: str | None = None
     backstop_price: str | None = None
+    # The publisher's own stop level when ``stop_price`` is a converted one (BASIS_SHIFT), so an
+    # amendment can tell a publisher tightening from a loosening.
+    publisher_stop: str | None = None
 
 
 class JournalEntry(StrictModel):
@@ -273,7 +276,7 @@ class ExecutionStore:
                     c.execute(f"ALTER TABLE exec_intents ADD COLUMN {col} TEXT")
             pcols = {r["name"] for r in c.execute("PRAGMA table_info(exec_positions)")}
             for col in ("protection", "contract_key", "contract", "protection_series",
-                        "reference_key", "backstop_ref", "backstop_price"):
+                        "reference_key", "backstop_ref", "backstop_price", "publisher_stop"):
                 if col not in pcols:
                     c.execute(f"ALTER TABLE exec_positions ADD COLUMN {col} TEXT")
             ocols = {r["name"] for r in c.execute("PRAGMA table_info(exec_orders)")}
@@ -548,7 +551,8 @@ class ExecutionStore:
         return [_row(LedgerPosition, r) for r in rows]
 
     def update_position(self, idea_id: str, at: datetime, **fields) -> None:
-        allowed = {"status", "stop_price", "target_price", "protection", "backstop_price"}
+        allowed = {"status", "stop_price", "target_price", "protection", "backstop_price",
+                   "publisher_stop"}
         if not fields or set(fields) - allowed:
             raise ValueError(f"only {allowed} may be set directly; quantities change through fills")
         sets = ",".join(f"{k}=?" for k in fields)
