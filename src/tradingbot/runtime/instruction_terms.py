@@ -86,6 +86,16 @@ STRIKE_PAIR_RE = re.compile(
     re.IGNORECASE,
 )
 OPTION_LANGUAGE_RE = re.compile(r"\b(?:calls?|puts?|options?|strike)\b", re.IGNORECASE)
+# Verb and idiom uses of "call" and "put" (an instruction to put a stop in, to call it a day):
+# removed before the words are read as option rights. A bare noun use that remains with no
+# strike, expiry or the word option is unclear, and still routes an OPEN to the option family.
+IDIOM_RE = re.compile(
+    r"\bput(?:s|ting)?\s+(?:a|an|our|my|your|on|in|it|them|us|up|down|out|back|stops?)\b"
+    r"|\bput\s+the\s+(?:stop|proceeds|position|trade)\b"
+    r"|\bcall(?:s|ing)?\s+(?:it|me|us|them|this|that|for)\b"
+    r"|\bclose\s+calls?\b",
+    re.IGNORECASE,
+)
 
 
 @dataclass
@@ -160,7 +170,8 @@ def extract_terms(clause: str | None) -> InstructionTerms:
         out.month_codes.append(
             (m.group(0), m.group("root"), _CODE_MONTH[m.group("code")], m.group("yy")))
     out.upper_words = UPPER_WORD_RE.findall(clause)
-    out.option_language = (OPTION_LANGUAGE_RE.search(clause) is not None
+    words = IDIOM_RE.sub(" ", clause)  # call and put as nouns only
+    out.option_language = (OPTION_LANGUAGE_RE.search(words) is not None
                            or OPTION_ONLY_STRATEGY_RE.search(clause) is not None
                            or COMPACT_STRIKE_RE.search(clause) is not None)
     for m in ISO_DATE_RE.finditer(clause):
@@ -178,7 +189,7 @@ def extract_terms(clause: str | None) -> InstructionTerms:
             continue
         if strike > 0 and strike not in out.strikes:
             out.strikes.append(strike)
-    for m in RIGHT_RE.finditer(clause):
+    for m in RIGHT_RE.finditer(words):
         right = m.group("right").upper()
         if right not in out.rights:
             out.rights.append(right)

@@ -12,9 +12,12 @@ sent as an execution price. Nothing is substituted silently. Anything unresolved
 
 Each `[[mapping]]` entry is one **family**: the asset code the interpreter emits, or
 `<UNDERLYING>.OPT` for single-leg options on that underlying. An instruction that OPENS a position
-and names options ("call", "put", "strike", "option", a compact `105C`, or a word that only names
-options such as "straddle") only ever looks up the `.OPT` family; without complete terms it HOLDs,
-and it never falls back to buying the stock. A follow-up (ADD, REDUCE, CLOSE, MODIFY) binds to its
+and names options ("call" or "put" as nouns, "strike", "option", a compact `105C`, or a word that
+only names options such as "straddle") only ever looks up the `.OPT` family; without complete
+terms it HOLDs, and it never falls back to buying the stock. Verb and idiom uses are not option
+language: "put a stop at 88", "put on", "put in", "put it", "call it", "call me", "close call",
+"calling" and "called" leave a stock instruction a stock instruction. A bare "calls" or "puts" with
+no strike, expiry or "option" is unclear and HOLDs. A follow-up (ADD, REDUCE, CLOSE, MODIFY) binds to its
 idea: it uses the family recorded on the idea when it was opened (or the option family if the idea
 holds an option), never the words in the follow-up, so "call it a day and close TLT" closes the
 ETF. An entry states:

@@ -933,3 +933,34 @@ def test_f3c_the_whole_post_reaches_the_policy_from_the_service(tmp_path):
     assert acts and all(a["status"] != "EXECUTED" for a in acts)
     assert run.broker.submit_calls == 0
     run.close()
+
+
+# ================================================================== verbs are not option language
+
+@pytest.mark.parametrize("clause", [
+    "We are now long TLT at 90. Put a stop at 88.",  # the reviewer's input, as main executes it
+    "Long TLT at 90, put in a stop at 88.",
+    "We put on a TLT long at 90. Stop 88.",
+    "Buying TLT at 90; put it on with a stop at 88.",
+    "Putting a stop at 88 on our new TLT long at 90.",
+    "Call it a starter: long TLT at 90. Stop 88.",
+    "A close call, but we are long TLT at 90. Stop 88.",
+    "Calling the low: long TLT at 90. Stop 88.",
+    "As called last week, long TLT at 90. Stop 88.",
+    "Call me cautious: long TLT at 90, stop 88.",
+])
+def test_verb_and_idiom_uses_of_call_and_put_buy_the_stock_as_on_main(clause):
+    d, inst = MappingPolicy.from_toml(SHIPPED).resolve(tlt(Action.OPEN, idea=None), clause=clause,
+                                                       now=MAP_NOW)
+    assert d.status == "SUPPORTED" and d.family == "TLT" and inst.symbol == "TLT", clause
+
+
+@pytest.mark.parametrize("clause", [
+    "Buying TLT calls at 1.20.", "Long the TLT puts at 2.10.", "Buying a TLT call at 1.20.",
+    "Buying TLT 92 puts at 2.10.", "Buying TLT 2026-09-18 call at 1.20.",
+    "Buying TLT options at 1.20.", "Buying the TLT 92 strike at 1.20.",
+])
+def test_a_noun_or_unclear_use_of_call_or_put_on_an_open_still_holds(clause):
+    d, inst = MappingPolicy.from_toml(SHIPPED).resolve(tlt(Action.OPEN, idea=None), clause=clause,
+                                                       now=MAP_NOW)
+    assert d.family == "TLT.OPT" and d.status != "SUPPORTED" and inst is None, clause
