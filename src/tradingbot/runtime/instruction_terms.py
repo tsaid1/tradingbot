@@ -108,6 +108,10 @@ class InstructionTerms:
     # Why the instruction is not a single-leg option (several strikes, expiries or rights, a
     # strategy word). Empty for a single leg.
     multi_leg: list[str] = field(default_factory=list)
+    # The clause and the spans of it read as a contract month (month and year, numeric month,
+    # month code, "the Sep contract", an ISO date): the leftover-token rule skips those.
+    clause: str = ""
+    month_spans: list[tuple[int, int]] = field(default_factory=list)
 
     @property
     def names_a_month(self) -> bool:
@@ -119,6 +123,7 @@ def extract_terms(clause: str | None) -> InstructionTerms:
     out = InstructionTerms()
     if not clause:
         return out
+    out.clause = clause
     recognised: list[tuple[int, int]] = []  # spans of month words read as a month
 
     def add_month(year: int, month: int, token: str) -> None:
@@ -134,11 +139,13 @@ def extract_terms(clause: str | None) -> InstructionTerms:
         year_n = int(year) if len(year) == 4 else 2000 + int(year)
         add_month(year_n, _MONTH_NAMES[m.group("mon")[:3].lower()], m.group(0))
         recognised.append(m.span("mon"))
+        out.month_spans.append(m.span())
     for m in MONTH_CONTRACT_RE.finditer(clause):
         n = _MONTH_NAMES[m.group("mon")[:3].lower()]
         if n not in out.bare_months:
             out.bare_months.append(n)
         recognised.append(m.span("mon"))
+        out.month_spans.append(m.span())
     for m in MONTH_WORD_RE.finditer(clause):
         inside = any(a <= m.start("word") < b for a, b in recognised)
         if not inside and m.group("word").lower() not in ENGLISH_WORDS:
@@ -147,7 +154,9 @@ def extract_terms(clause: str | None) -> InstructionTerms:
         y = m.group("y1") or m.group("y2") or m.group("y3")
         mo = m.group("m1") or m.group("m2") or m.group("m3")
         add_month(int(y), int(mo), m.group(0))
+        out.month_spans.append(m.span())
     for m in CONTRACT_CODE_RE.finditer(clause):
+        out.month_spans.append(m.span())
         out.month_codes.append(
             (m.group(0), m.group("root"), _CODE_MONTH[m.group("code")], m.group("yy")))
     out.upper_words = UPPER_WORD_RE.findall(clause)
@@ -155,6 +164,7 @@ def extract_terms(clause: str | None) -> InstructionTerms:
                            or OPTION_ONLY_STRATEGY_RE.search(clause) is not None
                            or COMPACT_STRIKE_RE.search(clause) is not None)
     for m in ISO_DATE_RE.finditer(clause):
+        out.month_spans.append(m.span())
         try:
             d = date(int(m.group("y")), int(m.group("m")), int(m.group("d")))
         except ValueError:
@@ -190,4 +200,45 @@ def extract_terms(clause: str | None) -> InstructionTerms:
         out.multi_leg.append("SEVERAL_EXPIRIES")
     if len(out.rights) > 1:
         out.multi_leg.append("SEVERAL_RIGHTS")
+    return out
+
+
+_TOKEN_RE = re.compile(r"\S+")
+_EDGE = "()[]{}.,;:!?\"'\u2018\u2019"
+_NUMBER_RE = re.compile(r"^\$?(\d{1,3}(?:,\d{3})+|\d+)(\.\d+)?(%?)$")
+
+
+def leftover_tokens(terms: InstructionTerms, consumed: set[Decimal],
+                    fractions: set[Decimal], roots: set[str]) -> list[str]:
+    """What the clause still names after its contract months and the action's own levels
+    (review F2, confirmation): any token with a digit that is not a consumed level (``consumed``)
+    or a consumed reduction percentage (``fractions`` x 100), any month name, and any token shaped
+    like a contract code for ``roots`` (case-insensitive). A futures selection may fall back to its
+    nearest-contract rule only when this is empty; otherwise the clause names something the bot
+    has not understood."""
+    out = []
+    upper_roots = {r.upper() for r in roots if r}
+    for m in _TOKEN_RE.finditer(terms.clause):
+        raw = m.group(0)
+        start = m.start() + (len(raw) - len(raw.lstrip(_EDGE)))
+        token = raw.strip(_EDGE)
+        if not token:
+            continue
+        end = start + len(token)
+        if any(a <= start and end <= b for a, b in terms.month_spans):
+            continue
+        word = token.upper().lstrip("$")
+        if any(ch.isdigit() for ch in token):
+            n = _NUMBER_RE.match(token)
+            if n:
+                value = Decimal((n.group(1) + (n.group(2) or "")).replace(",", ""))
+                if (n.group(3) and value / 100 in fractions) or (not n.group(3)
+                                                                and value in consumed):
+                    continue
+            out.append(token)
+        else:
+            month = MONTH_WORD_RE.fullmatch(token) and token.lower().rstrip(".") not in ENGLISH_WORDS
+            code = any(word.startswith(r) and word != r for r in upper_roots)
+            if month or code:
+                out.append(token)
     return out

@@ -48,8 +48,13 @@ one- or two-digit year, with or without the contract's root (`QIFU6`, `U26`); a 
 by "contract" (`the Sep contract`). If the clause holds anything that looks like a month or a
 contract code and it does not resolve to exactly one listed contract of the entry (a bare `Sep`, a
 month or year that is not listed, a code with another root, `2026-13`), the action HOLDs with
-`CONTRACT_MONTH_UNRECOGNISED`. `EXPLICIT_OR_NEAREST` uses the nearest month only when the clause has
-no month-like or code-like token at all. "May" and "march" count as months only in one of the forms
+`CONTRACT_MONTH_UNRECOGNISED`. The default is HOLD, not the nearest month: for a futures family,
+after removing the recognised month forms and the numbers the interpreter already assigned to the
+action (its entry, stop and target, and a reduction percentage), any token still left that carries
+a digit (a percentage, a date, a time, a count, a second price, `09/26`, `U 26`), any month name, or
+any token shaped like a contract code for the family's roots in any case (`qifu6`, `QIFU`) HOLDs
+with `CONTRACT_MONTH_UNRECOGNISED`. `EXPLICIT_OR_NEAREST` uses the nearest month only for a clause
+with no such leftover token at all. A follow-up on an open idea uses the idea's own contract. "May" and "march" count as months only in one of the forms
 above. A month name with a two-digit number is read as a year: "Dec 18" is December 2018.
 
 **Single-leg options only.** An option instruction executes only with exactly one underlying, one

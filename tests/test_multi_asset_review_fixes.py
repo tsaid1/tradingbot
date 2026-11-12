@@ -156,7 +156,7 @@ def opening(asset, action=Action.OPEN, *, idea=None) -> TradeAction:
 )
 def test_f2_each_common_month_form_selects_that_month(tmp_path, form):
     d, inst = demo_policy(tmp_path).resolve(
-        opening("QIDX"), clause=f"We are now long $QIDX {form} at 5,010. Stop 4,980.", now=MAP_NOW)
+        idx_open(), clause=f"We are now long $QIDX {form} at 5,010. Stop 4,980.", now=MAP_NOW)
     assert d.status == "SUPPORTED", d.reason
     assert inst.futures_contract == "202609"  # never the nearest (June)
 
@@ -178,7 +178,7 @@ def test_f2_the_nearest_rule_applies_only_without_any_month_like_token(tmp_path)
     p = demo_policy(tmp_path)
     for clause in ["We are now long $QIDX at 5,010. Stop 4,980.",
                    "We may add to $QIDX at 5,010 and will march on. Stop 4,980."]:
-        d, inst = p.resolve(opening("QIDX"), clause=clause, now=MAP_NOW)
+        d, inst = p.resolve(idx_open(), clause=clause, now=MAP_NOW)
         assert d.status == "SUPPORTED" and inst.futures_contract == "202606", clause
 
 
@@ -711,7 +711,7 @@ roll = { business_days_before = 3, action = "FLATTEN" }
 def energy_action(action=Action.OPEN):
     """What the interpreter emits for a source-series code: no instrument, SOURCE_SERIES levels."""
     return opening("QNRG", action).model_copy(update={
-        "instrument": None, "price_basis": PriceBasis.SOURCE_SERIES,
+        "instrument": None, "price_basis": PriceBasis.SOURCE_SERIES, "entry_reference": "71.50",
         "stop_price": "69.80" if action == Action.OPEN else None})
 
 
@@ -814,3 +814,78 @@ def test_n1_a_micro_and_its_standard_future_may_be_declared_one_series(tmp_path)
     assert load(tmp_path, same_root).entries["QNRG"].same_series
     # A stock quoted in its own price needs no flag.
     assert not load(tmp_path, entry("SPY", "DIRECT", SPY, SPY)).entries["SPY"].same_series
+
+
+# ================================================================== F2 (confirmation): default HOLD
+
+def idx_open(entry="5010", stop="4980", target="5070", fraction=None):
+    return opening("QIDX").model_copy(update={"entry_reference": entry, "stop_price": stop,
+                                              "target_price": target,
+                                              "close_fraction": fraction})
+
+
+def idx(clause, action=None):
+    return demo_policy_cached().resolve(action or idx_open(), clause=clause, now=MAP_NOW)
+
+
+_POLICY_CACHE = {}
+
+
+def demo_policy_cached():
+    if "p" not in _POLICY_CACHE:
+        import tempfile
+
+        _POLICY_CACHE["p"] = demo_policy(Path(tempfile.mkdtemp()))
+    return _POLICY_CACHE["p"]
+
+
+@pytest.mark.parametrize("clause", [
+    "We are now long $QIDX at 5,010. Stop 4,980. Target 5,070.",
+    "We are now long $QIDX at $5,010.00, stop 4980, target 5,070!",
+    "Long $QIDX at 5010 (stop 4980; target 5070).",
+])
+def test_f2c_a_clause_whose_only_digits_are_its_levels_uses_the_nearest_rule(clause):
+    d, inst = idx(clause)
+    assert d.status == "SUPPORTED" and inst.futures_contract == "202606", d.reason
+
+
+@pytest.mark.parametrize("clause", [
+    # The reviewer's three inputs: they executed in June.
+    "We are now long $QIDX 09/26 at 5,010. Stop 4,980.",
+    "We are now long $QIDX qifu6 at 5,010. Stop 4,980.",
+    "We are now long $QIDX U 26 at 5,010. Stop 4,980.",
+    # Anything else the bot has not understood: a percentage, a date, a time, a second price, a
+    # count, a lower-case code without year, a bare month.
+    "We are now long $QIDX at 5,010 with 2% of the book. Stop 4,980.",
+    "We are now long $QIDX at 5,010 until 6/12. Stop 4,980.",
+    "We are now long $QIDX at 5,010 from 14:30. Stop 4,980.",
+    "We are now long $QIDX at 5,010, then 4,990. Stop 4,980.",
+    "We are now long 3 $QIDX at 5,010. Stop 4,980.",
+    "We are now long $QIDX qifu at 5,010. Stop 4,980.",
+    "We are now long $QIDX sept at 5,010. Stop 4,980.",
+    "We are now long $QIDX at 5,010. Stop 4,980. Target 5,070 and 5,100.",
+])
+def test_f2c_any_leftover_token_holds_rather_than_guess(clause):
+    d, inst = idx(clause)
+    assert d.status == "UNRESOLVED" and inst is None, clause
+    assert d.reason.split(",")[0] == "CONTRACT_MONTH_UNRECOGNISED"
+
+
+@pytest.mark.parametrize("clause", [
+    "We are now long $QIDX Sep 2026 at 5,010. Stop 4,980.",
+    "We are now long $QIDX (QIFU6) at 5,010. Stop 4,980.",
+    "We are now long $QIDX 2026-09 at 5,010. Stop 4,980.",
+])
+def test_f2c_a_recognised_month_beside_the_levels_still_resolves(clause):
+    d, inst = idx(clause)
+    assert d.status == "SUPPORTED" and inst.futures_contract == "202609", d.reason
+
+
+def test_f2c_a_percentage_that_is_the_reduction_is_consumed(tmp_path):
+    held = {"9:a1": ContractRef(symbol="QIF", asset_class=AssetClass.FUTURE, sec_type="FUT",
+                                expiry="20260619", con_id=1)}
+    red = opening("QIDX", Action.REDUCE, idea="9:a1").model_copy(
+        update={"close_fraction": "0.5", "entry_reference": None})
+    d, inst = demo_policy(tmp_path).resolve(red, clause="Selling 50% of our $QIDX long at 5,030.",
+                                            now=MAP_NOW, held=held)
+    assert d.status == "SUPPORTED" and inst.futures_contract == "202606"

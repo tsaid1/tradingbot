@@ -195,21 +195,21 @@ def test_an_option_instruction_never_falls_back_to_another_family(tmp_path):
 
 def test_a_named_month_is_used_and_the_rule_picks_the_nearest_outside_the_roll_window(tmp_path):
     p = demo(tmp_path)
-    d, inst = resolve(p, act("QOIL"), "long $QOIL Jul 2026 at 71.5")
+    d, inst = resolve(p, act("QOIL"), "long $QOIL Jul 2026 at 10")
     assert d.status == "SUPPORTED" and d.mapped and inst.futures_contract == "202607"
     assert inst.quote_key == "FUTURE:QOF:202607:-:-"
     # QIDX: June rolls on 12 June (9 business days away, >= 6): June; QMTL: its only month.
-    _, inst = resolve(p, act("QIDX"), "long $QIDX at 5010")
+    _, inst = resolve(p, act("QIDX"), "long $QIDX at 10")
     assert inst.futures_contract == "202606"
     late = datetime(2026, 6, 8, 14, tzinfo=UTC)  # 4 business days before 12 June: September
-    _, inst = p.resolve(act("QIDX"), clause="long $QIDX at 5010", now=late)
+    _, inst = p.resolve(act("QIDX"), clause="long $QIDX at 10", now=late)
     assert inst.futures_contract == "202609"
 
 
 @pytest.mark.parametrize(
     "asset,clause,code,detail",
     [
-        ("QOIL", "long $QOIL at 71.5", "CONTRACT_SELECTION_AMBIGUOUS",
+        ("QOIL", "long $QOIL at 10", "CONTRACT_SELECTION_AMBIGUOUS",
          "CONTRACT_MONTH_NOT_STATED"),  # EXPLICIT_ONLY
         # A named month that does not resolve to exactly one listed contract (review F2).
         ("QOIL", "long $QOIL Dec 2026 at 71.5", "CONTRACT_MONTH_UNRECOGNISED",

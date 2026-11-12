@@ -49,7 +49,7 @@ from tradingbot.models import (
     MarketTerms,
     StrictModel,
 )
-from tradingbot.runtime.instruction_terms import InstructionTerms, extract_terms
+from tradingbot.runtime.instruction_terms import InstructionTerms, extract_terms, leftover_tokens
 from tradingbot.validator import business_days_until
 
 UNSUPPORTED_INSTRUMENT_MAPPING = "UNSUPPORTED_INSTRUMENT_MAPPING"
@@ -552,8 +552,15 @@ class FamilyMapping(StrictModel):
         if x.sec_type in ("CMDTY", "CFD"):
             return Instrument(asset_class=x.asset, symbol=x.symbol, exchange=x.exchange), []
         if x.sec_type == "FUT":
-            return self._select_future(terms, today, held)
+            return self._select_future(terms, today, held, action)
         return self._select_option(asset, terms, held)
+
+    def _roots(self) -> set[str]:
+        """The symbols a contract code of this family may start with."""
+        roots = {self.execution.symbol, self.family, *self.equivalent_roots}
+        if self.reference is not None and self.reference.sec_type == "FUT":
+            roots.add(self.reference.symbol)
+        return roots
 
     def _named_months(self, terms: InstructionTerms, today: date):
         """The contract months the clause names, or the reasons it names something that does not
@@ -588,11 +595,18 @@ class FamilyMapping(StrictModel):
             return None, [CONTRACT_MONTH_UNRECOGNISED, f"MONTH_NOT_LISTED:{min(named)}"]
         return named, []
 
-    def _select_future(self, terms, today, held):
+    def _select_future(self, terms, today, held, action=None):
         x = self.execution
         named, problems = self._named_months(terms, today)
         if problems:
             return None, problems
+        if held is None and action is not None:
+            # Default HOLD (review F2, confirmation): a clause that still names anything after its
+            # recognised months and the action's own levels has named something not understood.
+            leftover = leftover_tokens(terms, *_consumed(action), self._roots())
+            if leftover:
+                return None, [CONTRACT_MONTH_UNRECOGNISED,
+                              *(f"UNREAD_TOKEN:{t}" for t in leftover)]
         if held is not None:  # a follow-up acts on the idea's own contract
             month = (held.expiry or "")[:6]
             if named and named != {month}:
@@ -648,6 +662,20 @@ class FamilyMapping(StrictModel):
             expiry=terms.expiries[0].isoformat(), strike=format(terms.strikes[0].normalize(), "f"),
             option_right=terms.rights[0], exchange=x.exchange,
         ), []
+
+
+def _consumed(action: TradeAction) -> tuple[set[Decimal], set[Decimal]]:
+    """The numbers the interpreter already assigned to this action: its levels, and its
+    reduction fraction."""
+    levels, fractions = set(), set()
+    for value, into in ((action.entry_reference, levels), (action.stop_price, levels),
+                        (action.target_price, levels), (action.close_fraction, fractions)):
+        try:
+            if value is not None:
+                into.add(Decimal(value))
+        except ArithmeticError:
+            continue
+    return levels, fractions
 
 
 class MappingFileV2(StrictModel):
