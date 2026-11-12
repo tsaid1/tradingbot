@@ -613,6 +613,62 @@ the publisher's level bounded by the two limits; that a misread level would be u
 listed, but not a single level the interpreter misread that also carries a marker); and that the limits are in the anchor's series, so for a basis-shifted family the
 execution price can differ from the anchor by the basis.
 
+### Text that is not plain ASCII
+
+The entry rule's lists and tokenisers were written for ASCII text, so a word holding an accented
+or non-Latin letter could split into fragments or vanish ("an unknown word holds" did not apply to
+it; an independent review found a second market named that way invisible). For an OPEN or ADD in
+a family with an entry rule (`REFERENCE_AS_COLLAR` or a family stop distance), a SUPPORTED decision
+is checked once more (`tradingbot.runtime.entry_text`); the check can only turn it into a hold:
+
+* *A word* is a maximal run of letters of any script (`str.isalpha()`) with any combining marks
+  attached. A word holding any non-ASCII character is never equal to an allow-listed, family,
+  alias, marker or instruction word, look-alikes included (Greek capital taus, full-width letters,
+  a combining mark): the text is normalised (NFC) and every such word is replaced by a distinct
+  ASCII placeholder that no list holds, keeping its leading capital, and the decision is taken
+  again on that shadow text. The stricter decision wins; the owner's review log receives the word
+  as written. So "Zörbleflux sits near 12.40." is a capitalised unknown word with a trading context:
+  `ENTRY_ANCHOR_POST_UNRESOLVED_MARKET`. Accented commentary with no trading context holds no
+  more than its ASCII spelling would.
+* *Invisible and odd characters*, fail closed: any format character (zero-width space, joiner,
+  non-joiner, word joiner, soft hyphen, byte-order mark, bidirectional controls), any control
+  character but tab and newline, any space but U+0020 (no-break and other exotic spaces), line and
+  paragraph separators, private-use or unassigned code points anywhere in the post:
+  `ENTRY_TEXT_INVISIBLE_CHARACTER`. Nothing is normalised away, so nothing can be joined into a
+  word that was not there. (A post with an emoji built with a joiner holds too.)
+* *Numbers*, fail closed, wherever the number is in the post (level, entry, stop, a second stop,
+  a target, commentary): any digit or numeral outside ASCII 0-9 (full-width, Arabic-Indic,
+  superscripts, fractions); any non-ASCII character directly touching an ASCII digit or inside
+  what would otherwise be one number token (ASCII digits, full stops, commas), so a full-width
+  full stop, a middle dot or an Arabic decimal separator ("88．42") is never truncated to
+  88; and the ASCII forms that would be read as a different number than written: an integer,
+  a full stop, spaces and a digit ("88. 42"), a digit, spaces, a full stop or comma, optional
+  spaces and a digit ("88 .42", "88 . 42", "88 , 42", "88 ,42"), a doubled separator ("88..42",
+  "87..") and a second decimal point ("88.42.1"): `ENTRY_TEXT_NUMBER_UNREADABLE`. A full stop
+  after a number that already has a decimal part is a sentence end ("Stop 87.20. 88.42 now."
+  reads as before). And a price the rule actually read for this action (its entry or reference
+  level, its stop, its target) written directly followed by spaces and another digit ("at 88 42"
+  read as 88, "Stop 87.20 5 below") or directly followed by an ASCII letter ("88.42k") holds the
+  same way; any other number never does ("Nov 12 2026", "S&P 500", "the 10Y", "20yr", "200DMA",
+  "3pm"). Collateral holds: an integer followed by a full stop and another number ("Stop 87.
+  88.42 now.", which cannot be told from a broken decimal); a non-ASCII currency, percent,
+  per-mille or degree sign touching a digit ("€88.42", "2％"); a dash or quote mark written
+  flush against a number; a dotted date ("12.11.2026"). Read as written and unchanged: a whole
+  number before a sentence end ("at 88." is 88), "1.20" (1.20), a comma list ("88.42, 87.20"),
+  thousands commas ("4,512.25", "1,250"), and a decimal comma ("1,20" is not read as a number
+  at all, so the post holds for a missing level or stop). Residual: a range written without
+  spaces in place of a decimal ("88-42") is read as its first number, 88; the price collar and
+  the 5 % stop distance bound the effect.
+* *Dashes and slashes*: in the shadow text every Unicode dash (category Pd, the minus sign) is
+  an ASCII hyphen and every slash-like character (fraction, division, full-width solidus) an
+  ASCII slash, so "Qorvex‐long" and "Long⁄short" split like their ASCII forms.
+
+Pure ASCII text is decided exactly as before, except the odd number forms above.
+
+*Existing policy, for the owner to decide:* the single-market checks (a second market named in
+the post) run only for anchored entries. On the explicit path a post such as "...at 88.42. Stop
+87.20. Zorbex 12.40." executes, in ASCII and in any other script alike.
+
 ## Level contract rule
 
 A DIRECT future whose levels are a futures series (its own, or `same_series`) is selected
