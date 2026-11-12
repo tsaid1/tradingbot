@@ -207,23 +207,93 @@ def test_n1_a_failed_read_restarts_the_run(h):
     assert protective(h) == {"STP": 4, "TGT": 4}  # the run started again after the failure
 
 
-def test_n1_an_exit_fill_in_executions_reduces_cover_at_once(h):
+def foreign(h, side: OrderSide, quantity: int, ref: str) -> None:
+    """Someone else trades the contract in the account (invented), visible in executions."""
     from tradingbot.execution.broker import OrderIntent, OrderType
 
-    h.execute("p1", open_action())
-    h.broker.submit(OrderIntent(  # someone sells 1 in the account (invented): visible in fills
-        order_ref="FOREIGN-1", contract=h.broker.resolve(open_action().instrument),
-        side=OrderSide.SELL, quantity=1, order_type=OrderType.MKT,
+    h.broker.set_quote(SYMBOL, "49.98", "50.02")
+    h.broker.submit(OrderIntent(
+        order_ref=ref, contract=h.broker.resolve(open_action().instrument), side=side,
+        quantity=quantity, order_type=OrderType.MKT,
     ))
+
+
+def test_n1_an_exit_fill_after_the_ideas_last_change_reduces_cover_by_exactly_its_quantity(h):
+    h.execute("p1", open_action())
+    h.clock.advance(1)
+    foreign(h, OrderSide.SELL, 1, "FOREIGN-1")
     assert h.broker.positions()[0].quantity == 3
+    broker_shows(h, 0)  # and the position view is (transiently) flat as well
     h.coord.sync()
-    assert protective(h) == {"STP": 3, "TGT": 3}
+    assert protective(h) == {"STP": 3, "TGT": 3}  # exactly the 1 sold, never the flat read
     assert differs_open(h)
 
 
-def test_n1_short_mirror(h):
-    from tradingbot.execution.broker import OrderIntent, OrderType
+def test_p1_probe_an_old_manual_sale_never_explains_a_later_flat_read(h):
+    """Reviewer's probe: a stray manual long was bought (yesterday) and sold by hand earlier
+    today; later the system opens 4; a transient flat read must change nothing."""
+    foreign(h, OrderSide.BUY, 2, "MANUAL-BUY")
+    h.clock.advance(10 * 3600)  # past midnight UTC: only today's executions are visible
+    foreign(h, OrderSide.SELL, 2, "MANUAL-SELL")
+    h.clock.advance(60)
+    h.broker.set_quote(SYMBOL, "49.98", "50.02")
+    assert h.execute("p1", open_action()).state == IntentState.FILLED
+    assert protective(h) == {"STP": 4, "TGT": 4}
+    h.broker.positions = list  # a transient flat read
+    h.coord.sync()
+    assert protective(h) == {"STP": 4, "TGT": 4}
+    assert differs_open(h)
 
+
+def test_p1_an_old_sale_plus_a_transient_flat_read_changes_nothing(h):
+    foreign(h, OrderSide.SELL, 1, "OLD-SALE")  # predates the idea (invented)
+    h.clock.advance(60)
+    h.broker.set_quote(SYMBOL, "49.98", "50.02")
+    h.execute("p1", open_action())
+    broker_shows(h, 0)
+    h.coord.sync()
+    assert protective(h) == {"STP": 4, "TGT": 4} and differs_open(h)
+
+
+def test_p1_the_same_execution_explains_a_reduction_only_once(h):
+    h.execute("p1", open_action())
+    h.clock.advance(1)
+    foreign(h, OrderSide.SELL, 1, "FOREIGN-1")
+    h.coord.sync()
+    assert protective(h) == {"STP": 3, "TGT": 3}
+    assert "EXECUTION_ATTRIBUTED" in h.events()
+    h.restart()  # the attribution is journaled, not held in memory
+    broker_shows(h, 0)  # a later transient flat read: the used sale explains nothing more
+    h.coord.sync()
+    assert protective(h) == {"STP": 3, "TGT": 3}
+
+
+def test_p1_a_sale_belongs_to_the_idea_it_followed_not_to_a_later_one(h):
+    h.broker.script_next_submit("REST")
+    a = h.execute("p1", open_action())  # idea A (sorted first), its entry resting
+    assert a.state == IntentState.WORKING
+    h.clock.advance(1)
+    h.execute("p2", open_action())  # idea B, same contract, filled
+    h.clock.advance(1)
+    foreign(h, OrderSide.SELL, 1, "FOREIGN-1")  # after B's fill, before A's
+    h.clock.advance(1)
+    h.broker.fill(a.order_ref)  # A's ledger change comes after the sale
+    broker_shows(h, 0)
+    h.coord.sync()
+    assert protective(h, "p1:open") == {"STP": 4, "TGT": 4}  # A: the sale predates it
+    assert protective(h, "p2:open") == {"STP": 3, "TGT": 3}  # B: reduced by exactly 1
+
+
+def test_p1_a_sale_on_the_wrong_side_explains_nothing(h):
+    h.execute("p1", open_action())
+    h.clock.advance(1)
+    foreign(h, OrderSide.BUY, 1, "FOREIGN-BUY")  # adds to a long: no reduction to explain
+    broker_shows(h, 0)
+    h.coord.sync()
+    assert protective(h) == {"STP": 4, "TGT": 4} and differs_open(h)
+
+
+def test_n1_short_mirror(h):
     h.execute("p1", open_action(side=PositionSide.SHORT, stop="52", target="45"))
     assert h.broker.positions()[0].quantity == -4
     real = h.broker.positions
@@ -238,12 +308,28 @@ def test_n1_short_mirror(h):
     assert protective(h) == {"STP": 2, "TGT": 2}
     h.broker.positions = real
     h.coord.sync()
-    h.broker.submit(OrderIntent(  # a buy of 1 covers part of the short (invented)
-        order_ref="FOREIGN-2", contract=h.broker.resolve(open_action().instrument),
-        side=OrderSide.BUY, quantity=1, order_type=OrderType.MKT,
-    ))
+
+
+def test_p1_short_mirror(h):
+    foreign(h, OrderSide.BUY, 1, "OLD-BUY")  # an old buy, then a short idea opens
+    h.clock.advance(60)
+    h.broker.set_quote(SYMBOL, "49.98", "50.02")
+    h.execute("p1", open_action(side=PositionSide.SHORT, stop="52", target="45"))
+    real = h.broker.positions
+    broker_shows(h, 0)
     h.coord.sync()
-    assert protective(h)["STP"] <= 3
+    assert protective(h) == {"STP": 4, "TGT": 4}  # the old buy explains nothing
+    h.broker.positions = real
+    h.clock.advance(1)
+    foreign(h, OrderSide.SELL, 1, "WRONG-SIDE")  # adds to the short: explains nothing
+    h.coord.sync()
+    assert protective(h) == {"STP": 4, "TGT": 4}
+    h.clock.advance(1)
+    # The old buy (+1) and the wrong-side sell (-1) cancel: broker -4, ledger -4. A later buy of
+    # 2 (broker -2) is an exit for a short after the idea's last change: cover reduced by 2.
+    foreign(h, OrderSide.BUY, 2, "COVER-2")
+    h.coord.sync()
+    assert protective(h) == {"STP": 2, "TGT": 2}
 
 
 def test_n1_a_failed_positions_read_changes_nothing(h):

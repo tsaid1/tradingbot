@@ -140,6 +140,7 @@ def test_m3_a_refused_close_stops_the_group_and_holds_the_open(tmp_path):
         quantity=3,
         order_type=OrderType.MKT,
     )
+    h.clock.advance(1)  # after the idea's fill (review P1: only a later sale explains a gap)
     h.broker.submit(foreign)  # someone else trades the account: the CLOSE will be refused
     h.broker.set_quote("QQZ", "19.99", "20.01")
     quotes = {**h.quotes(), **h.quotes("QQZ")}

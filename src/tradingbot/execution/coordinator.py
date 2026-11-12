@@ -2029,7 +2029,8 @@ class ExecutionCoordinator:
         cover = max(pos.quantity - self.store.committed_exit_quantity(idea_id), 0)
         # Review N1: the cover is also capped at what the BROKER holds in the contract, whatever
         # the ledger believes. None: the broker position could not be read (never size up then).
-        broker_cover, floor, differs = self._broker_cover(pos, cover)
+        broker_cover, floor, differs, attributed = self._broker_cover(pos, cover)
+        reduced = False
         target = cover if broker_cover is None else min(cover, broker_cover)
         changed = False
         for ref in refs:
@@ -2046,7 +2047,7 @@ class ExecutionCoordinator:
             if want == 0:
                 # Everything held is committed to working exits, or the broker holds nothing to
                 # cover: a child would over-commit (it could open a position if it triggered).
-                changed |= self._try(
+                done = self._try(
                     lambda r=ref: self.broker.cancel(r),
                     "PROTECTIVE_CANCELLED",
                     idea_id,
@@ -2054,6 +2055,8 @@ class ExecutionCoordinator:
                     reason="position fully committed to working exits" if cover == 0
                     else "the broker holds nothing this order may cover",
                 )
+                changed |= done
+                reduced |= done and cover > 0
                 continue
             # Allowed under the halt: sizing protection to the position never adds exposure.
             if o.remaining != want and self._try(
@@ -2067,6 +2070,14 @@ class ExecutionCoordinator:
                 broker_cover=broker_cover,
             ):
                 changed = True
+                reduced |= want < min(o.remaining, cover)
+        if reduced and attributed:
+            # Each execution explains one reduction, for one idea, once (review P1).
+            self.store.log(
+                now, "EXECUTION_ATTRIBUTED", idea_id=idea_id, exec_ids=attributed,
+                rule="an exit execution after the idea's last ledger change explained this "
+                "reduction of its cover; it explains nothing again",
+            )
         if changed:
             try:
                 open_by_ref = {o.order_ref: o for o in self.broker.open_orders()}
@@ -2162,7 +2173,7 @@ class ExecutionCoordinator:
 
     def _broker_cover(
         self, pos: LedgerPosition, cover: int
-    ) -> tuple[int | None, int | None, str | None]:
+    ) -> tuple[int | None, int | None, str | None, list[str]]:
         """Review N1, asymmetric. Returns (up, floor, differs):
 
         * ``up``: the most protective cover the BROKER's position supports. The broker's position
@@ -2185,7 +2196,7 @@ class ExecutionCoordinator:
             )
         except BrokerError as exc:
             self._broker_unreadable("positions", exc)
-            return None, None, None
+            return None, None, None, []
         sign = 1 if pos.position_side == PositionSide.LONG else -1
         same = sorted(
             (
@@ -2201,29 +2212,47 @@ class ExecutionCoordinator:
             if p.quantity > 0 and self._key_of(p.symbol, p.asset_class, p.contract_key) == key
         )
         committed = {p.idea_id: self.store.committed_exit_quantity(p.idea_id) for p in same}
-        # Exit-side executions in this contract the ledger has not applied explain a reduction.
+        # Review P1: an execution explains a reduction only if it is on the exit side, in this
+        # contract, unapplied by the ledger, after the idea's last ledger change (by its own
+        # broker timestamp), never attributed before, and only up to the ledger/broker gap.
         exit_side = OrderSide.SELL if sign == 1 else OrderSide.BUY
-        try:
-            unapplied = [
-                f for f in self.broker.executions()
-                if f.contract.contract_key == key and not self.store.has_fill(f.exec_id)
-            ]
-        except BrokerError:
-            unapplied = []  # no corroboration from executions this time
-        explained = max(
-            sum(f.quantity for f in unapplied if f.side == exit_side)
-            - sum(f.quantity for f in unapplied if f.side != exit_side), 0
-        )
+        gap = max(sign * (ledger_net - net), 0)
+        candidates = []
+        if gap:  # only a broker position below the ledger needs explaining
+            consumed = self._attributed_executions()
+            try:
+                candidates = sorted(
+                    (
+                        f for f in self.broker.executions()
+                        if f.contract.contract_key == key and f.side == exit_side
+                        and not self.store.has_fill(f.exec_id) and f.exec_id not in consumed
+                    ),
+                    key=lambda f: (f.executed_at, f.exec_id),
+                )
+            except BrokerError:
+                candidates = []  # no corroboration from executions this time
         budget = max(sign * net, 0) - sum(committed.values())
         mine = mine_explained = 0
+        mine_used: list[str] = []
+        taken: set[str] = set()
         for p in same:
             own = max(p.quantity - committed[p.idea_id], 0)
             share = max(min(own, budget), 0)
             budget -= share
-            took = min(own, explained)
-            explained -= took
+            changed_at = self._last_ledger_change(p.idea_id) if candidates else None
+            took, used = 0, []
+            for f in candidates:
+                if f.exec_id in taken or (changed_at is not None and f.executed_at <= changed_at):
+                    continue
+                room = min(own - took, gap)
+                if room <= 0:
+                    break
+                took += min(f.quantity, room)
+                gap -= min(f.quantity, room)
+                used.append(f.exec_id)
+                taken.add(f.exec_id)
             if p.idea_id == pos.idea_id:
-                mine, mine_explained = share, took
+                mine, mine_explained, mine_used = share, took, used
         run = self._position_runs.get(key)
         if net == ledger_net:
             self._position_runs.pop(key, None)
@@ -2252,7 +2281,31 @@ class ExecutionCoordinator:
                 f"cover is never sized above what both show ({mine}) and never reduced below "
                 f"{floor} ({how}); anything held beyond the ledger is left uncovered"
             )
-        return mine, floor, differs
+        return mine, floor, differs, (mine_used if mine_explained else [])
+
+    def _attributed_executions(self) -> set[str]:
+        """Executions already used to explain a reduction of cover (each explains one, once)."""
+        out: set[str] = set()
+        for e in self.store.journal():
+            if e.event == "EXECUTION_ATTRIBUTED":
+                out.update(e.detail.get("exec_ids", []))
+        return out
+
+    def _last_ledger_change(self, idea_id: str) -> datetime | None:
+        """When the quantity being protected was last set: the idea's latest fill (by broker
+        time) or operator settlement or correction of it."""
+        times = [
+            datetime.fromisoformat(f["executed_at"]) for f in self.store.fills()
+            if f["idea_id"] == idea_id
+        ]
+        times += [
+            e.at for e in self.store.journal()
+            if e.idea_id == idea_id and e.event in (
+                "OPERATOR_SETTLEMENT", "OPERATOR_SETTLEMENT_CORRECTED",
+                "DECLARED_FILL_PARTIAL", "DECLARED_FILL_REPLACED",
+            )
+        ]
+        return max(times) if times else None
 
     @staticmethod
     def _stop_matches(stop: BrokerOrder, pos: LedgerPosition) -> bool:

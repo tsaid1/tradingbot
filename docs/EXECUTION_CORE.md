@@ -89,8 +89,11 @@ SourcePost -> PaperEventReplay.process  (gate_source, gate_action, atomic groups
   share of the broker's position on its side, less the working exits), so cover grows only once
   the ledger and the broker both show it; when the positions cannot be read nothing is sized up.
   Downward, cover is never reduced below the ledger, or cancelled, on a position read alone: only
-  as far as exit-side executions in the contract that the ledger has not applied explain, or to
-  the lower position once `exit_no_trace_lookups` consecutive successful reads spread over
+  as far as qualifying executions explain (review P1: exit side for the idea, in the contract,
+  not applied by the ledger, executed by the broker's own timestamp after the idea's last fill or
+  settlement, never attributed before, each attributed once to one idea and journaled
+  `EXECUTION_ATTRIBUTED`, and together capped at the ledger/broker gap), or to the lower position
+  once `exit_no_trace_lookups` consecutive successful reads spread over
   `settle_seconds` all show it (a failed read restarts that run, and is never a quantity). Until
   then the working order stays as it is. Whenever the broker's position differs from the ledger,
   in either direction, `UNPROTECTED_POSITION` opens with `BROKER_POSITION_DIFFERS`, it is alerted,
