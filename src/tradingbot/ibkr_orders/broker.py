@@ -182,6 +182,11 @@ class IbkrPaperBroker:
         return before is None or after is None or after > before
 
     # ------------------------------------------------------------------ Broker protocol
+    def supports_price_conditions(self) -> bool:
+        """Main's optional ``ConditionalOrders`` capability: never. The core then sends no
+        reference-triggered order here, and ``submit`` refuses one anyway."""
+        return False
+
     def account_id(self) -> str:
         return self._s.account_id
 
@@ -218,6 +223,10 @@ class IbkrPaperBroker:
     def submit(self, order: OrderIntent, children: Sequence[OrderIntent] = ()) -> list[BrokerOrder]:
         if order.parent_ref is not None or any(c.parent_ref != order.order_ref for c in children):
             raise BrokerError("children must name the entry as parent; the entry has none")
+        if any(getattr(o, "condition", None) is not None for o in (order, *children)):
+            # main's optional PriceCondition: never sent unconditionally (nothing was sent)
+            raise BrokerError("PRICE_CONDITION_NOT_SUPPORTED: this binding places no "
+                              "conditional order")
         pinned = self._s.contract
         for o in (order, *children):
             if o.contract.con_id not in (None, pinned.con_id) or o.contract.symbol != \

@@ -1108,3 +1108,32 @@ def test_a_close_refused_after_the_stop_was_cancelled_reports_protection_absent(
     finally:
         coord.close()
         s.disconnect()
+
+
+# --- merge with main: the Broker protocol on main ---------------------------------------------
+def test_the_binding_satisfies_mains_protocol_and_places_no_conditional_order(tws, tmp_path):
+    from tradingbot.execution.broker import (
+        Broker,
+        ConditionalOrders,
+        ConditionDirection,
+        PriceCondition,
+        ReconnectableBroker,
+        supports_price_conditions,
+    )
+    s = make(tws, tmp_path)
+    try:
+        b = IbkrPaperBroker(s)
+        assert isinstance(b, Broker)
+        assert not isinstance(b, ConditionalOrders) and not isinstance(b, ReconnectableBroker)
+        assert supports_price_conditions(b) is False
+        contract = b.resolve(Instrument(asset_class=AssetClass.ETF, symbol="TLT"))
+        cond = PriceCondition(contract=contract, direction=ConditionDirection.BELOW,
+                              trigger_price=D("80.00"), released_order_type=OrderType.LMT)
+        intent = OrderIntent(order_ref="TB-C", contract=contract, side=OrderSide.BUY,
+                             quantity=1, order_type=OrderType.LMT, limit_price=D("80.00"),
+                             condition=cond)
+        with pytest.raises(BrokerError, match="PRICE_CONDITION_NOT_SUPPORTED"):
+            b.submit(intent)
+        assert placed(tws) == 0 and s.submissions_used == 0
+    finally:
+        s.disconnect()
