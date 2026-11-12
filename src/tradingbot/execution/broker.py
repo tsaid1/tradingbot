@@ -281,7 +281,9 @@ class ReconnectableBroker(Protocol):
     satisfies the protocol). ``reconnect`` re-establishes the session and runs the adapter's own
     identity checks again (account, paper session, server); it raises ``BrokerIdentityError`` when
     they fail and ``BrokerError`` when the session cannot be re-established. ``session_identity``
-    describes the session (identifiers only, never credentials)."""
+    describes the session with stable identifiers only (account, paper or live, never a client id,
+    time or credential): the runtime service locks itself out of a broker whose identity differs
+    from the last one it accepted."""
 
     def connected(self) -> bool: ...
 
