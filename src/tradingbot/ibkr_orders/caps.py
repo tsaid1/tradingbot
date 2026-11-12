@@ -50,5 +50,10 @@ PAPER_TEST_1 = ExperimentCaps(
     primary_exchange="NASDAQ",
 )
 
+# Hard ceiling of the owner's OPTIONAL stage-3 entry allowance (``stage3_entry_allowance_ticks``
+# in the private order config): stage 3 states its entry as the ask plus at most this many min
+# ticks. A code constant on purpose; the config can choose 0..this, never more.
+MAX_STAGE3_ENTRY_ALLOWANCE_TICKS = 5
+
 # Read-only mapping: the registry cannot be extended at run time through this name.
 EXPERIMENTS = MappingProxyType({PAPER_TEST_1.name: PAPER_TEST_1})

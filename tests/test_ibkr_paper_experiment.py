@@ -357,7 +357,7 @@ def test_a_refused_close_is_reported_refused_and_never_says_abort_first(tws, cfg
     assert ev["state"]["stop_working"] is True and ev["state"]["held"] == "1"
     assert X.TWS_PROCEDURE in ev["why_failed"]
     assert "run abort, then" not in ev["why_failed"]
-    assert "Never run abort while TWS shows 1 and a working stop" in ev["why_failed"]
+    assert "Never cancel the stop while TWS shows 1" in ev["why_failed"]
     assert placed(tws) == 5  # the close was never sent
 
 
@@ -463,7 +463,7 @@ def test_no_ending_prints_an_unconditional_sell_or_a_disputed_position_as_fact(e
 
 def test_every_result_code_in_the_experiment_is_a_known_ending():
     src = (ROOT / "src/tradingbot/ibkr_orders/experiment.py").read_text()
-    codes = set(re.findall(r'"(STAGE[23]_[A-Z_]+)"', src))
+    codes = set(re.findall(r'"((?:STAGE[23]|ABORT)_[A-Z_]+)"', src))
     assert codes - {"STAGE2_PASSED", "STAGE3_PASSED"} <= X.ABNORMAL_ENDINGS
     assert X.ABNORMAL_ENDINGS <= codes
 
@@ -582,3 +582,120 @@ def test_stages_check_the_brokers_liquid_hours_after_connecting(tws, cfg_path, m
     ev = run(stage, cfg_path)
     assert not ev["passed"] and "liquid hours" in ev["why_failed"]
     assert placed(tws) == frames
+
+
+# --- follow-up after PR #60 (main f9d7256) ----------------------------------------------------------
+def test_stage1_fails_and_stays_repeatable_without_a_live_or_delayed_quote(tws, cfg_path):
+    """Item 1: a FROZEN label fails stage 1 (nothing sent); it can run again and then pass."""
+    stage0(tws, cfg_path)
+    tws.market_data_type = 2  # invented: the adapter labels every sample FROZEN
+    ev = run("stage1-lookups", cfg_path)
+    assert not ev["passed"] and ev["result"] == "STAGE1_QUOTE_NOT_USABLE"
+    assert "FROZEN" in ev["why_failed"] and "no order was sent; run stage 1 again" in ev["why_failed"]
+    assert len(ev["quote_samples"]) == X.STAGE1_QUOTE_SAMPLES == 3
+    assert all(q["quality"] == "FROZEN" and "reason" in q for q in ev["quote_samples"])
+    with pytest.raises(X.StageRefused):
+        X.run_stage("stage2-unfillable-bracket", cfg_path)
+    tws.market_data_type = 1
+    ev = run("stage1-lookups", cfg_path)  # repeatable: it submitted nothing
+    assert ev["passed"] and ev["quote"]["quality"] == "LIVE" and len(ev["quote_samples"]) == 1
+    assert placed(tws) == 0
+
+
+def test_stage1_passes_on_the_first_live_or_delayed_sample(tws, cfg_path):
+    stage0(tws, cfg_path)
+    n = {"req": 0}
+    orig = tws.on["REQ_MKT_DATA"]
+
+    def quote(s, conn, req):
+        n["req"] += 1
+        s.market_data_type = 2 if n["req"] == 1 else 1  # the first sample FROZEN, then LIVE
+        orig(s, conn, req)
+
+    tws.on["REQ_MKT_DATA"] = quote
+    ev = run("stage1-lookups", cfg_path)
+    assert ev["passed"], ev
+    assert [q["quality"] for q in ev["quote_samples"]] == ["FROZEN", "LIVE"]
+    assert ev["quote"]["quality"] == "LIVE"
+
+
+def _held_with_working_stop(tws, cfg_path, *, lag=False):
+    from decimal import Decimal
+
+    from tradingbot.ibkr_orders.records import OrderSpec
+    s = OfflineTestSession(load_order_config(cfg_path))
+    s.connect()
+    try:
+        snaps = s.place([OrderSpec("TB-A", "BUY", 1, "LMT", limit_price=Decimal("80.00")),
+                         OrderSpec("TB-A.STP", "SELL", 1, "STP", stop_price=Decimal("79.00"))])
+        tws.positions_lag = lag
+        tws.fill(snaps[0].order_id, 1, 80.00)  # the entry fills after "run abort" was printed
+    finally:
+        s.disconnect()
+    return snaps
+
+
+@pytest.mark.parametrize("lag", [False, True], ids=["held", "read-lags-the-fill"])
+def test_abort_never_cancels_the_stop_of_a_held_or_disputed_share(tws, cfg_path, lag):
+    """Item 2: abort re-reads first; held, disputed or unreadable: the stop stays."""
+    stage0(tws, cfg_path)
+    run("stage1-lookups", cfg_path)
+    snaps = _held_with_working_stop(tws, cfg_path, lag=lag)
+    ev = run("abort", cfg_path)
+    assert not ev["passed"] and ev["result"] == "ABORT_STOP_LEFT_WORKING"
+    assert tws.orders[snaps[1].order_id].status == "Submitted"  # the stop still protects
+    assert tws.count("CANCEL_ORDER") == 0
+    assert "left working" in ev["why_failed"] and X.TWS_SELL in ev["why_failed"]
+    _assert_no_unconditional_sell(ev["why_failed"])
+
+
+def test_the_tws_procedure_checks_trades_and_aborts_right_after_a_manual_sale():
+    assert "Trades panel" in X.TWS_PROCEDURE
+    assert "run abort at once" in X.TWS_PROCEDURE and "still working" in X.TWS_PROCEDURE
+
+
+def _bump_ask_on_entry(tws):
+    def place(s, conn, req):
+        if req.orderId not in s.orders and req.order.action == "BUY" and not req.order.parentId:
+            s.ask = round(s.ask + 0.01, 2)  # the ask ticks up before the entry is live
+        FakeOrderTws.place(s, conn, req)
+    tws.on["PLACE_ORDER"] = place
+
+
+@pytest.mark.parametrize(("ticks", "limit"), [(None, 80.73), (0, 80.73), (3, 80.76)])
+def test_stage3_states_its_entry_as_the_ask_plus_the_owners_allowance(tws, tmp_path, ticks,
+                                                                     limit):
+    """Item 3: absent (today's behaviour) or 0: exactly the ask; 3 ticks: ask + 0.03. The limit on
+    the wire is the stated price (the core adds nothing)."""
+    p = write_cfg(tmp_path, **({} if ticks is None else {"stage3_entry_allowance_ticks": ticks}))
+    cfg = load_order_config(p)
+    init_journal(cfg.state_dir, cfg.experiment, cfg.connection.masked_account())
+    stage0(tws, p)
+    assert run("stage1-lookups", p)["passed"]
+    assert run("stage2-unfillable-bracket", p)["passed"]
+    tws.bid, tws.ask = 80.71, 80.73  # invented
+    tws.autofill = True
+    ev = run("stage3-lifecycle", p)
+    assert ev["passed"], ev
+    entry = tws.placed()[2]
+    assert entry.order.action == "BUY" and entry.order.lmtPrice == pytest.approx(limit)
+    assert ev["entry_price"] == {"ask": "80.73", "allowance_ticks": ticks or 0, "tick": "0.01",
+                                 "stated_entry": f"{limit:.2f}"}
+    assert placed(tws) == 6
+
+
+@pytest.mark.parametrize(("ticks", "fills"), [(0, False), (3, True)])
+def test_an_allowance_absorbs_a_one_tick_rise_of_the_ask(tws, tmp_path, ticks, fills):
+    p = write_cfg(tmp_path, stage3_entry_allowance_ticks=ticks)
+    cfg = load_order_config(p)
+    init_journal(cfg.state_dir, cfg.experiment, cfg.connection.masked_account())
+    stage0(tws, p)
+    run("stage1-lookups", p)
+    run("stage2-unfillable-bracket", p)
+    tws.bid, tws.ask = 80.71, 80.73
+    tws.autofill = True
+    _bump_ask_on_entry(tws)
+    ev = run("stage3-lifecycle", p)
+    assert ev["passed"] is fills
+    if not fills:
+        assert ev["result"] == "STAGE3_ENTRY_NOT_FILLED"

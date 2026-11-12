@@ -6,6 +6,8 @@ read-only config: owner-only, mode 0600, regular file, no symlink)::
     # every key of the read-only paper.toml, unchanged, plus:
     orders = "paper-test-1"                          # names a code-defined experiment (caps.py)
     state_dir = "/Users/<user>/.local/state/tradingbot"  # must already exist; holds the counter
+    # optional, the owner's choice; absent means 0 (stage 3 buys at exactly the ask):
+    # stage3_entry_allowance_ticks = 0                 # an integer 0..5 (caps.py ceiling)
 
 There is no default for ``orders`` or ``state_dir``, no environment-variable override and no flag:
 order mode exists only when this file names a known experiment. The read-only ``load_config``
@@ -20,10 +22,15 @@ from pathlib import Path
 
 from tradingbot.ibkr.config import _KEYS, PaperConnectionConfig, read_private_toml, validate_config
 from tradingbot.ibkr.errors import ConfigError, ConfigInvalid
-from tradingbot.ibkr_orders.caps import EXPERIMENTS, ExperimentCaps
+from tradingbot.ibkr_orders.caps import (
+    EXPERIMENTS,
+    MAX_STAGE3_ENTRY_ALLOWANCE_TICKS,
+    ExperimentCaps,
+)
 
 DEFAULT_ORDER_CONFIG_PATH = Path("~/.config/tradingbot/ibkr/paper_orders.toml")
 ORDER_KEYS = frozenset({"orders", "state_dir"})
+OPTIONAL_ORDER_KEYS = frozenset({"stage3_entry_allowance_ticks"})
 
 
 class OrdersNotEnabled(ConfigError):
@@ -47,6 +54,7 @@ class PaperOrderConfig:
     connection: PaperConnectionConfig
     experiment: ExperimentCaps
     state_dir: Path = field(repr=False)
+    stage3_entry_allowance_ticks: int = 0  # the owner's choice, 0..MAX (caps.py)
 
     def __repr__(self) -> str:
         return (f"PaperOrderConfig(connection={self.connection!r}, "
@@ -64,7 +72,7 @@ def _validate_order_config(data: dict) -> PaperOrderConfig:
     if "orders" not in data:
         raise OrdersNotEnabled("no 'orders' entry: order mode is not enabled")
     missing = sorted((_KEYS | ORDER_KEYS) - data.keys())
-    unknown = sorted(data.keys() - (_KEYS | ORDER_KEYS))
+    unknown = sorted(data.keys() - (_KEYS | ORDER_KEYS | OPTIONAL_ORDER_KEYS))
     if missing or unknown:
         raise ConfigInvalid(f"order config keys: missing {missing}, unknown {unknown}")
     name = data["orders"]
@@ -87,7 +95,12 @@ def _validate_order_config(data: dict) -> PaperOrderConfig:
         raise StateDirInvalid("state_dir must be owned by the current user")
     if st.st_mode & 0o022:
         raise StateDirInvalid("state_dir must not be group/world writable")
-    cfg = PaperOrderConfig(connection=connection, experiment=caps, state_dir=state_dir)
+    ticks = data.get("stage3_entry_allowance_ticks", 0)
+    if type(ticks) is not int or not 0 <= ticks <= MAX_STAGE3_ENTRY_ALLOWANCE_TICKS:
+        raise ConfigInvalid(f"stage3_entry_allowance_ticks must be an integer from 0 to "
+                            f"{MAX_STAGE3_ENTRY_ALLOWANCE_TICKS}; got {ticks!r}")
+    cfg = PaperOrderConfig(connection=connection, experiment=caps, state_dir=state_dir,
+                           stage3_entry_allowance_ticks=ticks)
     _ISSUED.append(cfg)
     return cfg
 

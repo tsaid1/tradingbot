@@ -698,3 +698,18 @@ def test_a_fixed_offset_time_zone_is_refused(zone):
 @pytest.mark.parametrize("zone", ["US/Eastern", "America/New_York"])
 def test_a_region_time_zone_is_accepted(zone):
     assert parse_hours("20261111:0930-20261111:1600", zone)
+
+
+# --- follow-up after PR #60: the owner's stage-3 entry allowance ---------------------------------
+def test_the_stage3_entry_allowance_is_optional_and_defaults_to_zero(tmp_path):
+    assert load_order_config(write_cfg(tmp_path)).stage3_entry_allowance_ticks == 0
+    assert C.MAX_STAGE3_ENTRY_ALLOWANCE_TICKS == 5
+    for ticks in (0, 1, 3, 5):
+        cfg = load_order_config(write_cfg(tmp_path, stage3_entry_allowance_ticks=ticks))
+        assert cfg.stage3_entry_allowance_ticks == ticks
+
+
+@pytest.mark.parametrize("value", [6, 50, -1, "3", 3.0, True, False])
+def test_the_stage3_entry_allowance_is_a_strict_integer_under_the_ceiling(tmp_path, value):
+    with pytest.raises(E.ConfigError):
+        load_order_config(write_cfg(tmp_path, stage3_entry_allowance_ticks=value))
