@@ -199,3 +199,19 @@ def test_the_script_has_no_flag_to_skip_or_repeat(tws, cfg_path, capsys):
     tws.api_settings["readOnlyApi"] = True
     assert mod.main(["stage0-refusal", "--config", str(cfg_path)]) == 0
     assert PAPER not in capsys.readouterr().out
+
+
+def test_an_unexpected_stage2_fill_keeps_the_stop_and_blocks_stage3(tws, cfg_path, capsys):
+    stage0(tws, cfg_path)
+    run("stage1-lookups", cfg_path)
+    tws.autofill = True
+    tws.ask = 70.00  # invented: the "unfillable" limit (90% of the bid) is above the ask
+    ev = run("stage2-unfillable-bracket", cfg_path)
+    assert not ev["passed"] and ev["result"] == "STAGE2_UNEXPECTED_FILL"
+    assert "abort" in ev["why_failed"] and "by hand" in ev["why_failed"]
+    assert ev["held"]["quantity"] == "1" and ev["held"]["stop_working"] is True
+    child = max(o.order_id for o in tws.orders.values())
+    assert tws.orders[child].status == "Submitted"  # the protective stop was left working
+    assert tws.count("CANCEL_ORDER") == 0
+    with pytest.raises(X.StageRefused):
+        X.run_stage("stage3-lifecycle", cfg_path)

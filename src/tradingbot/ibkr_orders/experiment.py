@@ -34,7 +34,7 @@ from decimal import ROUND_FLOOR, Decimal
 from pathlib import Path
 
 from tradingbot.event_models import PriceBasis, ReplaySource, Timing, TradeAction
-from tradingbot.execution.broker import QuoteQuality, TimeInForce
+from tradingbot.execution.broker import OrderStatus, QuoteQuality, TimeInForce
 from tradingbot.execution.coordinator import ExecutionConfig, ExecutionCoordinator
 from tradingbot.ibkr.redact import redact_accounts
 from tradingbot.ibkr_orders.broker import IbkrPaperBroker
@@ -85,7 +85,8 @@ def _check_order(cfg: PaperOrderConfig, stage: str) -> None:
     need = PREREQUISITE.get(stage)
     if need is not None:
         prev = _read(evidence_path(cfg, need))
-        if prev is None or prev.get("passed") is not True or prev.get("stage") != need:
+        if (prev is None or prev.get("passed") is not True or prev.get("stage") != need
+                or prev.get("result") == "STAGE2_UNEXPECTED_FILL"):
             raise StageRefused(f"{stage} needs {need} to have passed (its evidence is missing or "
                                "failed)")
     own = _read(evidence_path(cfg, stage))
@@ -243,11 +244,26 @@ def _stage2(cfg: PaperOrderConfig, ev: dict) -> None:
         ev["placed"] = [_row(x) for x in snaps]
         time.sleep(READ_BACK_WAIT_SECONDS)
         ev["read_back"] = _lookups(s)
-        ev["cancel"] = []
-        for oid in (parent, child):
-            t = s._tracks.get(oid)
-            if t is not None and t.status not in FINAL_STATUSES:
-                ev["cancel"].append(_row(s.cancel(oid)))
+        # The parent first, confirmed. Only a parent confirmed cancelled with nothing filled lets
+        # the child be cancelled: after any fill the stop is the share's protection and stays.
+        ev["cancel"], ev["cancel_errors"] = [], []
+        pt = s._tracks[parent]
+        if pt.status not in FINAL_STATUSES:
+            try:
+                ev["cancel"].append(_row(s.cancel(parent)))
+            except Exception as exc:  # noqa: BLE001 - evidence; the child is then left alone
+                ev["cancel_errors"].append({"order_id": parent,
+                                            "error": redact_accounts(str(exc))})
+        parent_execs = [e for e in s.executions() if e.order_id == parent
+                        and e.client_id == pt.client_id]
+        parent_filled = pt.filled > 0 or bool(parent_execs)
+        parent_clean = pt.status in (OrderStatus.CANCELLED, OrderStatus.API_CANCELLED) \
+            and not parent_filled
+        ev["parent_confirmed_cancelled_unfilled"] = parent_clean
+        if parent_clean:
+            ct = s._tracks[child]
+            if ct.status not in FINAL_STATUSES:
+                ev["cancel"].append(_row(s.cancel(child)))
         time.sleep(READ_BACK_WAIT_SECONDS)
         ev["after_cancel"] = _lookups(s)
         events = [e for e in s.order_events if e["order_id"] in (parent, child)]
@@ -274,8 +290,27 @@ def _stage2(cfg: PaperOrderConfig, ev: dict) -> None:
                         and all(done.get(k) in ("Cancelled", "ApiCancelled")
                                 for k in (parent, child))
                         and all(v["completed"] for v in ev["read_back"].values()))
-        if filled:
-            ev["why_failed"] = "THE BRACKET FILLED: run abort, then close the share by hand"
+        ev["result"] = "STAGE2_PASSED" if ev["passed"] else "STAGE2_FAILED"
+        if parent_filled:
+            ct = s._tracks[child]
+            ev["result"] = "STAGE2_UNEXPECTED_FILL"
+            ev["passed"] = False
+            ev["held"] = {"symbol": c.symbol, "quantity": str(pt.filled or sum(
+                (e.shares for e in parent_execs), Decimal(0))), "entry_order_id": parent,
+                "stop_order_id": child, "stop_price": str(ct.stop_price),
+                "stop_working": ct.status not in FINAL_STATUSES}
+            ev["why_failed"] = (
+                f"STAGE2_UNEXPECTED_FILL: the account HOLDS {ev['held']['quantity']} "
+                f"{c.symbol} share(s); the protective SELL STP {ev['held']['stop_price']} "
+                f"(order {child}) was left working. Do NOT run abort first (it cancels the "
+                "stop). Close by hand in TWS: SELL the share with a limit at the bid, confirm "
+                "the position is 0, then run abort to cancel the stop (runbook: 'If stage 2 "
+                "fills'). Stage 3 is blocked.")
+        elif not parent_clean:
+            ev["result"] = "STAGE2_PARENT_NOT_CONFIRMED_CANCELLED"
+            ev["passed"] = False
+            ev["why_failed"] = ("the parent was not confirmed cancelled; its stop child was left "
+                                "alone. Check TWS, then run abort.")
     finally:
         s.disconnect()
 
