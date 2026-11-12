@@ -160,9 +160,9 @@ tightening from a loosening; a BASIS_SHIFT idea recorded before that field exist
 
 A reference quote (BASIS_SHIFT, a REFERENCE_TRIGGER entry, amendment or add, and a backstop) is
 judged by when its series last updated, never only by when the bot received it. The broker's own
-update time (`BrokerQuote.updated_at`) is used when it gives one. Without it, the receipt time
-counts only once the service has seen the value change, so the first sighting of a value, or a
-value that never moves, is no evidence. A frozen value, an unknown update time, a crossed quote
+update time (`BrokerQuote.updated_at`) is the only evidence of freshness. When the broker supplies
+no update time for a reference series, every action that needs that reference HOLDs; a value seen
+to change between two decisions is not credited. A frozen value, an unknown update time, a crossed quote
 (bid above ask), or a quote outside the series' declared `reference_hours` HOLDs every action that
 needs it: `REFERENCE_QUOTE_NOT_FRESH` with `REFERENCE_QUOTE_STALE`, `_UPDATE_TIME_UNKNOWN`,
 `_CROSSED` or `_OUTSIDE_HOURS` (inside `BASIS_QUOTE_UNUSABLE` for a basis). A REFERENCE_TRIGGER ADD

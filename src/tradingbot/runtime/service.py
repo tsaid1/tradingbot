@@ -146,9 +146,6 @@ class RuntimeService:
         config.paths.state_dir.mkdir(parents=True, exist_ok=True)
         self.store = store or RuntimeStore(config.runtime_db)
         self.mapping = MappingPolicy.from_toml(config.paths.mapping_file)
-        # Reference series without a broker update time: (last values, when they were seen to
-        # change). Freshness evidence only; it starts empty, so the first sighting proves nothing.
-        self._reference_seen: dict[str, tuple[tuple, datetime | None]] = {}
         self.coordinator = ExecutionCoordinator(
             broker,
             config.execution_db,
@@ -587,24 +584,10 @@ class RuntimeService:
             rq = reference_quote(self.broker, reference, now)
             leg = LegQuote(contract_key=reference.contract_key, bid=rq.bid, ask=rq.ask,
                            last=rq.last, observed_at=rq.received_at, quality=rq.quality.value,
-                           updated_at=self._reference_updated_at(reference.contract_key, rq))
+                           # Freshness only from the series' own update time (None: HOLD).
+                           updated_at=rq.updated_at)
         return MappedQuote(symbol=instrument.symbol, bid=bid, ask=ask, observed_at=observed,
                            quality=quality, terms=terms, reference=leg)
-
-    def _reference_updated_at(self, key: str, rq) -> datetime | None:
-        """When a reference series last updated. The broker's own stamp when it gives one;
-        otherwise the receipt time at which this service saw the value change, and None until it
-        has seen one (a value seen once, or never seen to move, is no evidence of freshness)."""
-        values = (rq.bid, rq.ask, rq.last)
-        seen = self._reference_seen.get(key)
-        if seen is None:
-            changed_at = None
-        elif seen[0] != values:
-            changed_at = rq.received_at
-        else:
-            changed_at = seen[1]
-        self._reference_seen[key] = (values, changed_at)
-        return rq.updated_at if rq.updated_at is not None else changed_at
 
     def _check_roll_windows(self, now: datetime) -> None:
         """A follower position in a contract inside its roll window is flagged (alert and

@@ -464,9 +464,9 @@ def test_f5_a_frozen_reference_holds_through_the_service(tmp_path):
     run.close()
 
 
-def test_f5_without_a_broker_update_time_only_a_seen_change_counts(tmp_path):
-    """A broker that reports no update time: the first sighting of a value is not evidence of
-    freshness (HOLD); a value seen to change since the last decision is, at its receipt time."""
+def test_f5_without_a_broker_update_time_nothing_is_fresh(tmp_path):
+    """Confirmation review: a value that changed during a long gap between decisions was credited
+    as fresh at read time. Freshness now comes only from the series' own update time."""
     from tradingbot.models import Instrument as Inst
     from tradingbot.runtime.mock_multi_asset import QIDX
 
@@ -476,20 +476,22 @@ def test_f5_without_a_broker_update_time_only_a_seen_change_counts(tmp_path):
     svc, entry = run.service, run.service.mapping.entries["QIDX"]
     inst = Inst(asset_class=AssetClass.FUTURE, symbol="QIF", exchange="SIMFUT",
                 futures_contract="202606")
-    first = svc._mapped_quote(entry, inst, run.clock.now())
-    assert first.reference.updated_at is None
-    run.clock.advance(2)
-    run.publish_quotes()
-    same = svc._mapped_quote(entry, inst, run.clock.now())
-    assert same.reference.updated_at is None  # unchanged value: still no evidence
-    run.clock.advance(2)
+    assert svc._mapped_quote(entry, inst, run.clock.now()).reference.updated_at is None
+    run.clock.advance(600)  # a long gap, then a changed value
     run.broker.set_quote("QIDX", "5010.5", "5011.5", last="5011", contract=QIDX)
-    moved = svc._mapped_quote(entry, inst, run.clock.now())
-    assert moved.reference.updated_at == run.clock.now()
-    run.clock.advance(20)
-    run.broker.set_quote("QIDX", "5010.5", "5011.5", last="5011", contract=QIDX)
-    stuck = svc._mapped_quote(entry, inst, run.clock.now())
-    assert stuck.reference.updated_at == run.clock.now() - timedelta(seconds=20)
+    assert svc._mapped_quote(entry, inst, run.clock.now()).reference.updated_at is None
+    run.close()
+
+
+def test_f5_a_broker_without_update_times_holds_every_reference_action(tmp_path):
+    run = MockMultiAssetRun(tmp_path / "n", Scenario("n", "QIDX", "X", [Step(0, ENTRY, "X")]))
+    run.broker.reports_update_time = False
+    for _ in range(6):
+        run.step()
+    [a] = traded(run)
+    assert a["status"] == "HOLD" and "REFERENCE_QUOTE_NOT_FRESH" in a["reasons"]
+    assert "REFERENCE_QUOTE_UPDATE_TIME_UNKNOWN" in a["reasons"]
+    assert run.broker.submit_calls == 0
     run.close()
 
 
