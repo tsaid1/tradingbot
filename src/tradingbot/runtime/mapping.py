@@ -691,28 +691,46 @@ def _consumed(action: TradeAction) -> tuple[set[Decimal], set[Decimal]]:
 
 class MappingFileV2(StrictModel):
     version: Literal[2]
+    # A what-if analysis file (an offline replay harness's invented entries, never an owner's
+    # approval). ``MappingPolicy.from_toml`` refuses any file that carries this key unless its caller
+    # passes ``allow_what_if=True``, which only the historical replay seam does.
+    what_if: str | None = Field(default=None, min_length=1, max_length=200)
     mapping: list[FamilyMapping] = Field(default_factory=list)
+
+
+class WhatIfMappingRefused(ValueError):
+    """A what-if mapping file was offered where only an owner's mapping may be used."""
 
 
 # ============================================================================ the policy
 
 
 class MappingPolicy:
-    def __init__(self, entries: list[MappingEntry | FamilyMapping]):
+    def __init__(self, entries: list[MappingEntry | FamilyMapping], *, what_if: str | None = None):
         seen: dict[str, MappingEntry | FamilyMapping] = {}
         for e in entries:
             if e.source_asset in seen:
                 raise ValueError(f"duplicate mapping for source asset {e.source_asset!r}")
             seen[e.source_asset] = e
         self.entries = seen
+        # Set only for a what-if analysis file loaded with allow_what_if=True.
+        self.what_if = what_if
 
     @classmethod
-    def from_toml(cls, path: str | Path) -> MappingPolicy:
+    def from_toml(cls, path: str | Path, *, allow_what_if: bool = False) -> MappingPolicy:
+        """Load a mapping file. A file with a top-level ``what_if`` key is an analysis aid, not an
+        owner's mapping: it is refused (``WhatIfMappingRefused``) unless ``allow_what_if``."""
         p = Path(path)
         try:
             raw = tomllib.loads(p.read_text(encoding="utf-8"))
+            if "what_if" in raw and not allow_what_if:
+                raise WhatIfMappingRefused(
+                    f"instrument mapping file {p} is a what-if analysis mapping (what_if is set): "
+                    "it is never an owner's approval and only an offline replay harness may load it"
+                )
             if raw.get("version") == 2:
-                return cls(MappingFileV2.model_validate(raw).mapping)
+                parsed = MappingFileV2.model_validate(raw)
+                return cls(parsed.mapping, what_if=parsed.what_if)
             return cls(MappingFile.model_validate(raw).mapping)
         except FileNotFoundError:
             raise ValueError(f"instrument mapping file not found: {p}") from None

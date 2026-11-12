@@ -55,7 +55,7 @@ from tradingbot.runtime import notify as N
 from tradingbot.runtime.config import RuntimeConfig
 from tradingbot.runtime.mapping import FamilyMapping, MappingDecision, MappingPolicy
 from tradingbot.runtime.notify import Notifier
-from tradingbot.runtime.sources import SourceAdapter, SourceError
+from tradingbot.runtime.sources import ReplayFileSource, SourceAdapter, SourceError
 from tradingbot.runtime.store import RuntimeStore, write_json_atomic
 from tradingbot.source_events import SourcePost
 from tradingbot.tkl_interpreter import LexiconExtension, TklInterpreter, group_linked_actions
@@ -135,9 +135,13 @@ class RuntimeService:
         notifier: Notifier | None = None,
         clock: Callable[[], datetime] | None = None,
         store: RuntimeStore | None = None,
+        allow_what_if_mapping: bool = False,
     ):
         if config.mode != "mock":
             raise ValueError("only mock mode may run")
+        if allow_what_if_mapping and not isinstance(source, ReplayFileSource):
+            # A what-if mapping is an offline analysis aid: never with a live source.
+            raise ValueError("a what-if mapping may only be used with a replay-file source")
         self.config = config
         self.clock = clock or (lambda: datetime.now(UTC))
         self.source = source
@@ -145,7 +149,9 @@ class RuntimeService:
         self.notifier = notifier or N.LogFileNotifier(config.notification_log, self.clock)
         config.paths.state_dir.mkdir(parents=True, exist_ok=True)
         self.store = store or RuntimeStore(config.runtime_db)
-        self.mapping = MappingPolicy.from_toml(config.paths.mapping_file)
+        self.mapping = MappingPolicy.from_toml(
+            config.paths.mapping_file, allow_what_if=allow_what_if_mapping
+        )
         self.coordinator = ExecutionCoordinator(
             broker,
             config.execution_db,
@@ -191,6 +197,7 @@ class RuntimeService:
             source=source.name,
             cursor=source.cursor(),
             restart=self.cycles > 0,
+            what_if_mapping=self.mapping.what_if is not None,
         )
 
     # ================================================================== cycle

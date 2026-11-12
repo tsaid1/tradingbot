@@ -88,7 +88,11 @@ the execution series or a stock family that is not its own ticker (unless `same_
 with a reason), an index, spot or CFD reference with a stock or ETF execution under DIRECT,
 BASIS_SHIFT or a backstop (their price scales differ), BASIS_SHIFT rules without
 `scale_ratio = 1`, a selection rule that would pick a contract already in its roll window, or an
-option that is not DIRECT. A stock or ETF entry quoted in its own price, with no sizing and no
+option that is not DIRECT, or a file with a top-level `what_if` key. A `what_if` file is an offline
+analysis aid (an invented mapping for a historical replay), never an owner's approval: only a caller
+that passes `allow_what_if=True` may load it, `RuntimeService` accepts it only with
+`allow_what_if_mapping=True` and a replay-file source, and `build_service` and the scripts never
+pass either. A stock or ETF entry quoted in its own price, with no sizing and no
 session, keeps the version-1 behaviour exactly: policy sizing, the gateway's stock path, a plain
 quote. Version-1 files still load.
 
