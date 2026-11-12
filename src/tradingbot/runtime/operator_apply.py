@@ -102,7 +102,7 @@ def _acknowledge_signal(store: RuntimeStore, req: dict, clock) -> settlement.Ope
         return settlement.OperatorResult(status="REFUSED", reasons=reasons, before=before,
                                          after=before)
     store.resolve_exception(exc_id, clock(), f"acknowledged by operator request {req['id']}")
-    store.event(clock(), "OPERATOR_ACKNOWLEDGED_SIGNAL", request_id=req["uid"],
+    store.event(clock(), "OPERATOR_ACKNOWLEDGED_SIGNAL", request_id=req["uid"], note=req["note"],
                 exception_id=exc_id, kind=found["kind"], before=before,
                 after={"open": False, "kind": found["kind"]})
     return settlement.OperatorResult(status="APPLIED", before=before,
@@ -150,7 +150,8 @@ def _clear_lockout(coord, store: RuntimeStore, req: dict, expected_account: str,
                             "journal_mark": session.get("journal_mark", 0),
                             "reason": "LOCKOUT_CLEARED"}, now)
     store.put("broker_identity", identity, now)
-    store.event(now, "IDENTITY_LOCKOUT_CLEARED", request_id=req["uid"], before=before,
+    store.event(now, "IDENTITY_LOCKOUT_CLEARED", request_id=req["uid"], note=req["note"],
+                before=before,
                 identity=identity, rule="full reconnect, identity checks passed afresh")
     return settlement.OperatorResult(status="APPLIED", before=before,
                                      after={"session": DISCONNECTED, "reason": "LOCKOUT_CLEARED"})

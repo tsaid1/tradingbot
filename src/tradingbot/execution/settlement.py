@@ -28,8 +28,9 @@ protective orders and cancel working entries under the halt (risk-reducing only)
   ``ExecutionCoordinator._settlement_contradictions``), never a normal adoption.
 
 Every action, applied or refused, is journaled append-only in ``exec_journal`` with its time,
-request id and the state before and after. The operator's note stays in the operator queue
-(``runtime.operator_actions``); the journal keeps its SHA-256.
+request id and the state before and after, and the operator's note itself (the operator's own
+words, never publisher content) with its SHA-256 (review note d), so the reasoning survives the
+loss of the operator queue.
 """
 
 from __future__ import annotations
@@ -144,7 +145,7 @@ def _refuse(coord, request_id, action, reasons, *, order_ref=None, idea_id=None,
         coord.clock(), "OPERATOR_ACTION_REFUSED", order_ref=order_ref, idea_id=idea_id,
         request_id=request_id, action=action, target=str(target), outcome=outcome,
         status="REFUSED", reasons=reasons, before=before, after=before, operator=operator,
-        note_sha256=note_digest(note),
+        note=note, note_sha256=note_digest(note),
     )
     return OperatorResult(status="REFUSED", reasons=reasons, before=before, after=before)
 
@@ -393,7 +394,7 @@ def _apply_settlement(coord, intent, rows, outcome, fill_qty, price, request_id,
             declared_quantity=total if outcome == "FILLED" else 0, declared_filled=total,
             declared_price=str(price) if price is not None else None,
             fill_applied=fill_qty, intent_state=state.value, exceptions_ended=ended,
-            before=before, operator=operator, note_sha256=note_digest(note),
+            before=before, operator=operator, note=note, note_sha256=note_digest(note),
             rule="operator declaration after checking the broker; ledger moved as by a fill",
         )
 
@@ -569,7 +570,7 @@ def clear_exception(
             action=cat.CLEAR, target=str(exc_id), outcome=kind, status="APPLIED",
             exception_id=exc_id, kind=e.kind, before=before,
             after=_state_after_resolve(before, e.kind), contract=key, operator=operator,
-            note_sha256=note_digest(note),
+            note=note, note_sha256=note_digest(note),
             rule="cleared only after a full sync and reconciliation show the contract clean",
         )
     return OperatorResult(status="APPLIED", before=before, after=_state(coord, ref, idea))
@@ -608,7 +609,7 @@ def acknowledge_exception(
             request_id=request_id, action=cat.ACKNOWLEDGE, target=str(exc_id), outcome=kind,
             status="APPLIED", exception_id=exc_id,
             kind=e.kind, before=before, after=_state_after_resolve(before, e.kind),
-            operator=operator, note_sha256=note_digest(note),
+            operator=operator, note=note, note_sha256=note_digest(note),
         )
     return OperatorResult(status="APPLIED", before=before, after=_state(coord, ref, idea))
 

@@ -66,7 +66,9 @@ Every action needs a note and the exact confirmation words. It is queued append-
 running service on its next cycle, or `operator.py apply` while the service is stopped. Results
 show under `operator.py history` and on the page. Each request has a globally unique id (`uid`);
 the execution journal records the result under that id with its target and outcome, so a request
-is applied exactly once and never answered with another request's result.
+is applied exactly once and never answered with another request's result. Your note is kept in
+the queue and, with its hash, in the local execution journal, so your reasoning survives the loss
+of the queue; write what you checked, never a credential or a full account number.
 
 * `settle <ref> NOT_AT_BROKER | CANCELLED | FILLED --quantity N --price P`: declares the outcome
   of an intent whose outcome is unknown, once you have checked the broker. Applying it reads the

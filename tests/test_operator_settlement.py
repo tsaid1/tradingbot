@@ -102,7 +102,8 @@ def test_not_at_broker_settles_the_intent_and_lifts_the_block_after_a_clean_sync
     assert "OPERATOR_SETTLEMENT" in events and "OPERATOR_SETTLEMENT_VERIFIED" in events
     entry = next(e for e in h.coord.store.journal(ref) if e.event == "OPERATOR_SETTLEMENT")
     assert entry.detail["before"]["intent"]["state"] == "UNRESOLVED"
-    assert entry.detail["note_sha256"] == S.note_digest(NOTE) and NOTE not in str(entry.detail)
+    # Review note (d): the operator's own words are journaled, with their hash.
+    assert entry.detail["note_sha256"] == S.note_digest(NOTE) and entry.detail["note"] == NOTE
     assert second_open_state(h, "p3").state == IntentState.FILLED  # exposure allowed again
 
 
@@ -629,3 +630,14 @@ def test_a_partial_group_is_cleared_on_evidence_never_acknowledged(h):
     done = S.clear_exception(h.coord, request_id="clr-pg-2", exc_id=e.id, kind=e.kind,
                              confirmation=phrase, note=NOTE, operator="tester")
     assert done.status == "APPLIED" and h.coord.reconcile().clean
+
+
+def test_refusals_clears_and_acknowledgements_journal_the_note(h):
+    settle(h, "TB-unknown", "CANCELLED", note="saw it cancelled in the invented account")
+    rev, _ = _reversal(h)
+    S.clear_exception(h.coord, request_id="clr-note", exc_id=rev.id, kind=rev.kind,
+                      confirmation=cat.clear_phrase(rev.id, rev.kind), note="not flat yet, test",
+                      operator="tester")
+    notes = [e.detail.get("note") for e in h.coord.store.journal()
+             if e.event == "OPERATOR_ACTION_REFUSED"]
+    assert notes == ["saw it cancelled in the invented account", "not flat yet, test"]
