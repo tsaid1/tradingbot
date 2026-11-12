@@ -68,6 +68,7 @@ from tradingbot.execution.coordinator import (
     BROKER_STATE_UNKNOWN,
     ENTRY_STATE_UNKNOWN,
     EXIT_NOT_NETTED,
+    EXIT_WHILE_ENTRY_UNKNOWN,
     EXIT_WITHOUT_QUOTE,
     OPERATOR_SETTLEMENT_UNVERIFIED,
     PROTECTION_UNVERIFIED,
@@ -84,7 +85,7 @@ from tradingbot.execution.coordinator import (
 from tradingbot.execution.reconcile import DiscrepancyKind, ReconciliationReport
 from tradingbot.execution.replay import BrokerEventReplay
 from tradingbot.execution.shadow_broker import FILL_LABEL, ShadowBroker
-from tradingbot.execution.store import LEDGER_REVERSAL, UNRESOLVED_STATES
+from tradingbot.execution.store import LEDGER_REVERSAL, UNRESOLVED_STATES, IntentState
 from tradingbot.models import Action, ExecutionPlan, Instrument, LegQuote, MappedQuote, Quote
 from tradingbot.runtime import notify as N
 from tradingbot.runtime import vocab_review
@@ -139,6 +140,7 @@ EXCEPTION_ALERT_KIND = {
     OPERATOR_SETTLEMENT_UNVERIFIED: N.SETTLEMENT_UNVERIFIED,
     SETTLED_INTENT_CONTRADICTED: N.SETTLEMENT_CONTRADICTED,
     SETTLEMENT_DIFFERS_FROM_BROKER: N.SETTLEMENT_DIFFERS,
+    EXIT_WHILE_ENTRY_UNKNOWN: N.EXIT_WHILE_ENTRY_UNKNOWN,
 }
 # Alerted under their own keys (unprotected position, broker state), not as EXC:<id>.
 SEPARATELY_ALERTED = frozenset(
@@ -476,6 +478,7 @@ class RuntimeService:
             settlement.lift_verified_blocks(self.coordinator)
             self._check_roll_windows(now)
         report.halted = self._check_halt(self.clock()) or report.halted
+        self._settle_working_rows(self.clock())
         self._journal_shadow_fills()
         self._raise_alerts(self.clock(), report)
         self._heartbeat(report)
@@ -1215,6 +1218,31 @@ class RuntimeService:
             intent = self.coordinator.intent(e["order_ref"])
             if intent is not None and intent.state not in UNRESOLVED_STATES:
                 self.store.resolve_exception(e["id"], now, f"intent {intent.state.value}")
+
+    def _settle_working_rows(self, now: datetime) -> None:
+        """A journal row written WORKING (a resting order) takes the terminal outcome its order
+        reached since, read from the execution store (durable, so also after a restart): a fill
+        reads EXECUTED, a cancel with nothing filled CANCELLED with the intent's public reasons
+        (for example ENTRY_EXPIRED_UNFILLED or ENTRY_CANCELLED_BEFORE_FILL). While a cancel is not
+        confirmed the intent is still WORKING, and so is the row. Display only: nothing is sent."""
+        ex = self.coordinator.store
+        for row in self.store.working_signal_actions():
+            intent = ex.intent(row["order_ref"])
+            if intent is None or intent.state not in (
+                IntentState.FILLED, IntentState.CANCELLED, IntentState.REJECTED
+            ):
+                continue
+            filled = ex.filled_quantity(intent.order_ref)
+            status = ("EXECUTED" if intent.state == IntentState.FILLED or filled
+                      else intent.state.value)
+            reasons = list(row["reasons"])
+            for r in (f"BROKER_{intent.state.value}", *intent.reasons):
+                if r not in reasons:
+                    reasons.append(r)
+            if self.store.settle_signal_action(row["seq"], row["action_id"], status, reasons):
+                self.store.event(now, "SIGNAL_ACTION_SETTLED", seq=row["seq"],
+                                 action_id=row["action_id"], order_ref=intent.order_ref,
+                                 was="WORKING", status=status, filled=filled)
 
     def _reconcile(self, report: CycleReport) -> None:
         now = self.clock()

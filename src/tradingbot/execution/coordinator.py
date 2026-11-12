@@ -131,6 +131,12 @@ ENTRY_REMAINDER_NOT_CANCELLED = "ENTRY_REMAINDER_NOT_CANCELLED"
 ENTRY_EXPIRED_UNFILLED = "ENTRY_EXPIRED_UNFILLED"
 ENTRY_CANCELLED_BEFORE_FILL = "ENTRY_CANCELLED_BEFORE_FILL"
 ENTRY_CANCEL_UNCONFIRMED = "ENTRY_CANCEL_UNCONFIRMED"
+# A publisher exit (CLOSE or REDUCE) arrived while the acknowledgement of an entry or add of its
+# idea was unknown: nothing is sent, cancelled or resent for it (an unknown acknowledgement is never
+# acted on blindly), so the entry may still hold a protected position after the publisher left.
+# A flag only: it blocks nothing, and closes once every entry of the idea has a known, terminal
+# outcome and the idea holds nothing, or when the operator acknowledges it.
+EXIT_WHILE_ENTRY_UNKNOWN = "EXIT_WHILE_ENTRY_UNKNOWN"
 # The broker nets one position per contract: an idea on the opposite side of an open idea in the
 # same contract is never opened beside it. A publisher reversal is a close followed by an open.
 OPPOSITE_IDEA_IN_SAME_CONTRACT = "OPPOSITE_IDEA_IN_SAME_CONTRACT"
@@ -625,6 +631,7 @@ class ExecutionCoordinator:
                     ledger_quantity=pos.quantity,
                 )
         self._refresh_orders(open_orders, now, completed)
+        self._lift_exit_while_entry_unknown(now)
         touched |= self._settlement_contradictions(open_orders, fills, completed, now)
         touched |= self._declared_fill_evidence(completed, now)
         if record_only:
@@ -788,6 +795,42 @@ class ExecutionCoordinator:
         self._stamp_cancelled(confirmed, ENTRY_CANCELLED_BEFORE_FILL)
         return ENTRY_CANCELLED_BEFORE_FILL if len(confirmed) == len(refs) \
             else ENTRY_CANCEL_UNCONFIRMED
+
+    def flag_exit_while_entry_unknown(self, idea_id: str, action: Action) -> list[str]:
+        """A publisher exit on an idea whose entry or add has an unknown acknowledgement (RECORDED
+        or UNRESOLVED): open EXIT_WHILE_ENTRY_UNKNOWN for each such order. A flag only: nothing is
+        sent, cancelled or resent, and no exposure is blocked by it. Returns the refs flagged."""
+        now = self.clock()
+        refs = [
+            i.order_ref for i in self.store.intents(UNRESOLVED_STATES)
+            if i.idea_id == idea_id and i.action in (Action.OPEN, Action.ADD)
+        ]
+        for ref in refs:
+            if self.store.raise_exception(
+                now, EXIT_WHILE_ENTRY_UNKNOWN,
+                f"a publisher {action.value} arrived while the acknowledgement of {ref} was "
+                "unknown; nothing was sent or cancelled for it: if the entry filled, the idea "
+                "may still hold a protected position after the publisher's exit",
+                idea_id=idea_id, order_ref=ref,
+            ):
+                self.store.log(now, EXIT_WHILE_ENTRY_UNKNOWN, order_ref=ref, idea_id=idea_id,
+                               action=action.value)
+        return refs
+
+    def _lift_exit_while_entry_unknown(self, now: datetime) -> None:
+        """An EXIT_WHILE_ENTRY_UNKNOWN record closes once no entry or add of its idea is of
+        unknown outcome or still working, and the idea holds nothing."""
+        flagged = {e.idea_id for e in self.store.exceptions(open_only=True)
+                   if e.kind == EXIT_WHILE_ENTRY_UNKNOWN}
+        if not flagged:
+            return
+        live = UNRESOLVED_STATES | {IntentState.WORKING}
+        pending = {i.idea_id for i in self.store.intents(frozenset(live))
+                   if i.action in (Action.OPEN, Action.ADD)}
+        for idea in sorted(flagged - pending):
+            pos = self.store.position(idea)
+            if pos is None or pos.quantity == 0:
+                self.store.resolve_exceptions(now, EXIT_WHILE_ENTRY_UNKNOWN, idea_id=idea)
 
     def _cancel_entries_for_halt(self, open_orders: list[BrokerOrder]) -> bool:
         """Under the halt no entry or add may keep working (it could fill while nothing else may

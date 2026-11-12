@@ -111,6 +111,10 @@ class BrokerEventReplay(PaperEventReplay):
         # approved and reached execution, then died before the replay committed (a crash mid-order).
         # Its gate decision is on the intent; the coordinator adopts it rather than ordering again.
         self._plans.pop(a.action_id, None)  # action ids repeat across posts: never reuse a plan
+        if a.action in (Action.CLOSE, Action.REDUCE) and a.idea_reference:
+            # A flag only (EXIT_WHILE_ENTRY_UNKNOWN): an entry of unknown acknowledgement is never
+            # cancelled blind or resent; the exit is decided below exactly as before.
+            self.coordinator.flag_exit_while_entry_unknown(a.idea_reference, a.action)
         if self.coordinator.intent_for(source, a) is not None:
             return ActionOutcome(action_id=a.action_id, status="SIMULATED", reasons=[PRIOR_INTENT])
         if a.action in FOLLOW_UPS and a.idea_reference \

@@ -38,6 +38,8 @@ ENTRY_UNKNOWN_OUTCOME = "ENTRY_UNKNOWN_OUTCOME"
 REVERSAL = "LEDGER_REVERSAL"
 EXIT_REFUSED = "EXIT_REFUSED"
 EXECUTION_EXCEPTION = "EXECUTION_EXCEPTION"
+# A publisher exit arrived while an entry's acknowledgement was unknown (nothing sent for it).
+EXIT_WHILE_ENTRY_UNKNOWN = "EXIT_WHILE_ENTRY_UNKNOWN"
 SETTLEMENT_UNVERIFIED = "SETTLEMENT_UNVERIFIED"
 # The broker contradicts an operator settlement (a fill or an order of an intent declared never
 # filled): exposure the follower did not intend (review F1).

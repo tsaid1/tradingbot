@@ -335,6 +335,28 @@ class RuntimeStore:
             out.append(d)
         return out
 
+    def working_signal_actions(self) -> list[dict]:
+        """The journal rows that still read WORKING and name an order (their outcome may have
+        ended at the broker since the row was written)."""
+        with self.tx() as c:
+            rows = c.execute(
+                "SELECT seq, action_id, order_ref, reasons FROM signal_actions "
+                "WHERE status='WORKING' AND order_ref IS NOT NULL ORDER BY seq, rowid"
+            ).fetchall()
+        return [{**dict(r), "reasons": json.loads(r["reasons"])} for r in rows]
+
+    def settle_signal_action(self, seq: int, action_id: str, status: str,
+                             reasons: list[str]) -> bool:
+        """Move one WORKING row to the terminal status its order reached. Only a row that still
+        reads WORKING is changed. True when it was."""
+        with self.tx() as c:
+            cur = c.execute(
+                "UPDATE signal_actions SET status=?, reasons=? "
+                "WHERE seq=? AND action_id=? AND status='WORKING'",
+                (status, json.dumps(list(reasons)), seq, action_id),
+            )
+        return cur.rowcount > 0
+
     # ------------------------------------------------------------------ exceptions
 
     @staticmethod
