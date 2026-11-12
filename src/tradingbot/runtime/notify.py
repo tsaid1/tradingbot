@@ -42,6 +42,8 @@ SETTLEMENT_UNVERIFIED = "SETTLEMENT_UNVERIFIED"
 # The broker contradicts an operator settlement (a fill or an order of an intent declared never
 # filled): exposure the follower did not intend (review F1).
 SETTLEMENT_CONTRADICTED = "SETTLEMENT_CONTRADICTED"
+# The broker's executions for a FILLED settlement differ from the declaration (review F10).
+SETTLEMENT_DIFFERS = "SETTLEMENT_DIFFERS_FROM_BROKER"
 MAPPING_REVOKED_OPEN_POSITION = "MAPPING_REVOKED_OPEN_POSITION"
 ROLL_DUE = "ROLL_DUE_FLATTEN_REQUIRED"
 PIPELINE_FAILURE = "PIPELINE_FAILURE"

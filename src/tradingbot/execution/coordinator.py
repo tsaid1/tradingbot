@@ -131,6 +131,11 @@ OPERATOR_SETTLEMENT_UNVERIFIED = "OPERATOR_SETTLEMENT_UNVERIFIED"
 # takes the broker's state, new exposure in the contract is blocked and reconciliation stays unclean
 # until a verified clear. Never a normal adoption.
 SETTLED_INTENT_CONTRADICTED = "SETTLED_INTENT_CONTRADICTED"
+# Review F10: the broker's own executions for an intent settled FILLED replaced the declaration and
+# differ from it (quantity or average price). Blocks new exposure in the contract only when the
+# quantity differs (its detail then starts QUANTITY_DIFFERS); CLEAR-class.
+SETTLEMENT_DIFFERS_FROM_BROKER = "SETTLEMENT_DIFFERS_FROM_BROKER"
+QUANTITY_DIFFERS = "QUANTITY_DIFFERS"
 # The intent reasons an operator settlement that declared no (further) fill leaves behind.
 SETTLED_WITHOUT_FILL_REASONS = ("OPERATOR_SETTLED_NOT_AT_BROKER", "OPERATOR_SETTLED_CANCELLED")
 # The broker session dropped (runtime service): new exposure everywhere is refused until the
@@ -150,6 +155,7 @@ INSTRUMENT_BLOCKING_KINDS = (
     ENTRY_STATE_UNKNOWN,
     OPERATOR_SETTLEMENT_UNVERIFIED,
     SETTLED_INTENT_CONTRADICTED,
+    SETTLEMENT_DIFFERS_FROM_BROKER,  # only with QUANTITY_DIFFERS (see _instrument_block)
 )
 # An open exception of one of these kinds (no idea) blocks every OPEN and ADD (BROKER_UNREADABLE).
 ACCOUNT_BLOCKING_KINDS = (BROKER_STATE_UNKNOWN, BROKER_RECONNECT_PENDING)
@@ -566,6 +572,7 @@ class ExecutionCoordinator:
                 )
         self._refresh_orders(open_orders, now, completed)
         touched |= self._settlement_contradictions(open_orders, fills, completed, now)
+        touched |= self._declared_fill_evidence(completed, now)
         if record_only:
             return True
         asked = self._cancel_stopped_out_entries(open_orders)
@@ -767,6 +774,73 @@ class ExecutionCoordinator:
                 rule="broker evidence contradicts an operator settlement: never adopted silently",
             )
             touched.add(intent.idea_id)
+        return touched
+
+    def _declared_fill_evidence(self, completed, now) -> set[str]:
+        """Review F10: broker executions for an intent an operator settled FILLED replace the
+        declaration, never add to it. While they cover only part of it and the order is not over,
+        the declared remainder still counts (the ledger holds the larger of declared and
+        evidenced) and the contract stays blocked. Once they cover it, or the entry's completed row
+        shows the order over, the ledger holds exactly the broker's fills; a quantity or average
+        price that differs from the declaration opens SETTLEMENT_DIFFERS_FROM_BROKER (blocking
+        only for a quantity), otherwise the verification block closes on that evidence. Returns
+        the ideas touched."""
+        touched: set[str] = set()
+        done = {o.order_ref for o in completed}
+        for d in self.store.declared_fills():
+            ref = d["order_ref"]
+            evidence = self.store.evidenced_fills(ref)
+            got = sum(f["quantity"] for f in evidence)
+            if got == 0:
+                continue
+            declared, price = int(d["declared_quantity"]), Decimal(d["price"])
+            intent = self.store.intent(ref)
+            idea = d["idea_id"]
+            if got < declared and ref not in done:
+                remainder = declared - got
+                if d["declared_state"] != "PARTIAL" or d["quantity"] != remainder:
+                    self.store.set_declared_remainder(d["exec_id"], remainder, "PARTIAL", now)
+                    self.store.raise_exception(
+                        now, OPERATOR_SETTLEMENT_UNVERIFIED,
+                        f"the broker shows {got} of the {declared} declared for {ref}; the "
+                        f"remaining {remainder} stays counted and the contract blocked until it "
+                        "is evidenced or the settlement corrected", idea_id=idea, order_ref=ref,
+                    )
+                    self.store.log(
+                        now, "DECLARED_FILL_PARTIAL", order_ref=ref, idea_id=idea,
+                        declared=declared, evidenced=got, still_counted=remainder,
+                        exec_ids=[f["exec_id"] for f in evidence],
+                        rule="evidenced part replaces the declaration; the rest stays counted",
+                    )
+                    touched.add(idea)
+                continue
+            avg = sum(Decimal(f["price"]) * f["quantity"] for f in evidence) / got
+            self.store.set_declared_remainder(d["exec_id"], 0, "REPLACED", now)
+            self.store.log(
+                now, "DECLARED_FILL_REPLACED", order_ref=ref, idea_id=idea, declared=declared,
+                declared_price=str(price), broker_quantity=got,
+                broker_avg_price=str(avg.quantize(Decimal("0.0001"))),
+                exec_ids=[f["exec_id"] for f in evidence],
+                rule="the broker's executions replace the operator's declaration",
+            )
+            if self.store.resolve_exceptions(now, OPERATOR_SETTLEMENT_UNVERIFIED, idea_id=idea,
+                                             order_ref=ref):
+                self.store.log(now, "OPERATOR_SETTLEMENT_VERIFIED", order_ref=ref, idea_id=idea,
+                               rule="the broker's own executions for the settled intent")
+            if got != declared or avg != price:
+                what = QUANTITY_DIFFERS if got != declared else "PRICE_DIFFERS"
+                self.store.raise_exception(
+                    now, SETTLEMENT_DIFFERS_FROM_BROKER,
+                    f"{what}: operator declared {declared} @ {price} for {ref}; the broker's "
+                    f"executions show {got} @ {avg.quantize(Decimal('0.0001'))}. The ledger now "
+                    "holds the broker's fills" + (
+                        "; new exposure in this contract is blocked until cleared"
+                        if got != declared else ""),
+                    idea_id=idea, order_ref=ref,
+                )
+            if intent is not None and got < intent.quantity and intent.state == IntentState.FILLED:
+                self.store.set_state(ref, IntentState.CANCELLED, now)
+            touched.add(idea)
         return touched
 
     def _broker_state_unknown(self) -> bool:
@@ -2369,6 +2443,8 @@ class ExecutionCoordinator:
         }
         open_ = [
             e for e in self.store.exceptions(open_only=True) if e.idea_id in in_instrument
+            and not (e.kind == SETTLEMENT_DIFFERS_FROM_BROKER
+                     and not e.detail.startswith(QUANTITY_DIFFERS))
         ]
         for kind in INSTRUMENT_BLOCKING_KINDS:
             if any(e.kind == kind for e in open_):

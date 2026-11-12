@@ -55,6 +55,9 @@ EXCEPTION_ACTIONS: dict[str, tuple[str, str]] = {
     "OPERATOR_SETTLEMENT_UNVERIFIED": (
         EVIDENCE, ("clears after the settle period, repeated no-trace lookups and a clean "
                    "reconciliation of the contract")),
+    "SETTLEMENT_DIFFERS_FROM_BROKER": (
+        CLEAR, ("the broker's executions differ from your FILLED declaration: check the position "
+                "at the broker, then clear (verified by reconciliation)")),
     "SETTLED_INTENT_CONTRADICTED": (
         CLEAR, ("the broker shows the settled order after all: review the extra position at "
                 "the broker, then clear (verified by reconciliation)")),

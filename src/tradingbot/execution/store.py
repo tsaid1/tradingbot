@@ -287,6 +287,13 @@ class ExecutionStore:
             for col in ("contract_key", "condition"):
                 if col not in ocols:
                     c.execute(f"ALTER TABLE exec_orders ADD COLUMN {col} TEXT")
+            # Review F10: a fill an operator declared (not broker evidence). declared_quantity is
+            # what was declared; quantity is the part not yet replaced by broker executions;
+            # declared_state DECLARED | PARTIAL | REPLACED.
+            fcols = {r["name"] for r in c.execute("PRAGMA table_info(exec_fills)")}
+            for col, kind in (("declared_quantity", "INTEGER"), ("declared_state", "TEXT")):
+                if col not in fcols:
+                    c.execute(f"ALTER TABLE exec_fills ADD COLUMN {col} {kind}")
 
     @contextmanager
     def tx(self) -> Iterator[sqlite3.Connection]:
@@ -456,6 +463,7 @@ class ExecutionStore:
         executed_at: datetime,
         at: datetime,
         c: sqlite3.Connection | None = None,
+        declared: bool = False,
     ) -> LedgerPosition | None:
         """The only writer of follower quantities: one broker execution, applied exactly once.
         An exit fill larger than the position is recorded as it happened; the ledger stops at zero,
@@ -466,7 +474,7 @@ class ExecutionStore:
             with self.tx() as conn:
                 return self.apply_fill(
                     exec_id=exec_id, order=order, quantity=quantity, price=price,
-                    executed_at=executed_at, at=at, c=conn,
+                    executed_at=executed_at, at=at, c=conn, declared=declared,
                 )
         if c.execute("SELECT 1 FROM exec_fills WHERE exec_id=?", (exec_id,)).fetchone():
             return None
@@ -485,6 +493,11 @@ class ExecutionStore:
                 executed_at.isoformat(),
             ),
         )
+        if declared:
+            c.execute(
+                "UPDATE exec_fills SET declared_quantity=?, declared_state='DECLARED' "
+                "WHERE exec_id=?", (quantity, exec_id),
+            )
         c.execute(
             "UPDATE exec_orders SET filled_quantity=filled_quantity+?, updated_at=? "
             "WHERE order_ref=?",
@@ -543,6 +556,73 @@ class ExecutionStore:
             "SELECT * FROM exec_positions WHERE idea_id=?", (order.idea_id,)
         ).fetchone()
         return _row(LedgerPosition, row)
+
+    # ------------------------------------------------------------------ declared fills (F10)
+
+    def declared_fills(self, states=("DECLARED", "PARTIAL")) -> list[dict]:
+        marks = ",".join("?" * len(states))
+        with self.tx() as c:
+            rows = c.execute(
+                f"SELECT * FROM exec_fills WHERE declared_quantity IS NOT NULL "
+                f"AND declared_state IN ({marks}) ORDER BY rowid", tuple(states),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def declared_fill(self, order_ref: str) -> dict | None:
+        with self.tx() as c:
+            row = c.execute(
+                "SELECT * FROM exec_fills WHERE order_ref=? AND declared_quantity IS NOT NULL "
+                "ORDER BY rowid DESC", (order_ref,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def evidenced_fills(self, order_ref: str) -> list[dict]:
+        """The broker's own executions applied for ``order_ref`` (declared fills excluded)."""
+        with self.tx() as c:
+            rows = c.execute(
+                "SELECT * FROM exec_fills WHERE order_ref=? AND declared_quantity IS NULL "
+                "ORDER BY executed_at, rowid", (order_ref,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def set_declared_remainder(self, exec_id: str, remainder: int, state: str, at: datetime, *,
+                               declared_quantity: int | None = None,
+                               price: str | None = None) -> int:
+        """Replace (part of) a declared fill by broker evidence: its counted quantity becomes
+        ``remainder`` and the order row and the idea's position move by the difference; the
+        position's average is recomputed from the fills still counted. Returns the change."""
+        with self.tx() as c:
+            f = c.execute("SELECT * FROM exec_fills WHERE exec_id=?", (exec_id,)).fetchone()
+            delta = remainder - f["quantity"]
+            c.execute(
+                "UPDATE exec_fills SET quantity=?, declared_state=?, "
+                "declared_quantity=COALESCE(?, declared_quantity), price=COALESCE(?, price) "
+                "WHERE exec_id=?", (remainder, state, declared_quantity, price, exec_id),
+            )
+            c.execute(
+                "UPDATE exec_orders SET filled_quantity=filled_quantity+?, updated_at=? "
+                "WHERE order_ref=?", (delta, at.isoformat(), f["order_ref"]),
+            )
+            pos = c.execute(
+                "SELECT quantity, status FROM exec_positions WHERE idea_id=?", (f["idea_id"],)
+            ).fetchone()
+            entries = c.execute(
+                "SELECT quantity, price FROM exec_fills WHERE idea_id=? AND role=? AND "
+                "quantity>0", (f["idea_id"], Role.ENTRY.value),
+            ).fetchall()
+            total = sum(r["quantity"] for r in entries)
+            avg = (sum(Decimal(r["price"]) * r["quantity"] for r in entries) / total
+                   if total else None)
+            qty = max(pos["quantity"] + delta, 0)
+            status = pos["status"] if qty > 0 or pos["status"] != "OPEN" else "CLOSED"
+            c.execute(
+                "UPDATE exec_positions SET quantity=?, avg_price=COALESCE(?, avg_price), "
+                "status=?, protection=CASE WHEN ?=0 THEN protection ELSE 'UNKNOWN' END, "
+                "updated_at=? WHERE idea_id=?",
+                (qty, str(avg.quantize(Decimal("0.0001"))) if avg is not None else None,
+                 "OPEN" if qty > 0 else status, delta, at.isoformat(), f["idea_id"]),
+            )
+        return delta
 
     def insert_position(self, c: sqlite3.Connection, pos: LedgerPosition) -> None:
         d = pos.model_dump(mode="json")

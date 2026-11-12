@@ -93,6 +93,13 @@ of the queue; write what you checked, never a credential or a full account numbe
   If the order shows up later anyway, that is `SETTLED_INTENT_CONTRADICTED` (above), never a
   normal adoption; the intent's journal shows your declaration and the evidence that
   contradicted it.
+  A `FILLED` declaration is recorded as declared, not as broker evidence: when the broker's own
+  executions for that order arrive they replace it, so the ledger never holds both. While they
+  cover only part of what you declared, the declared rest still counts and the contract stays
+  blocked; correct it with a new `settle <ref> FILLED` naming the true total (never below what the
+  broker shows). If the broker's quantity or average price differs from your declaration,
+  `SETTLEMENT_DIFFERS_FROM_BROKER` opens and alerts (blocking only for a quantity); CLEAR it once
+  reconciliation is clean.
 * `clear <id> LEDGER_REVERSAL | SETTLED_INTENT_CONTRADICTED | PARTIAL_GROUP`: applied only if a
   sync and reconciliation made at that moment show the contract clean (the record's own line
   excepted). `PARTIAL_GROUP` is here, not under `ack`: while it is open reconciliation is not

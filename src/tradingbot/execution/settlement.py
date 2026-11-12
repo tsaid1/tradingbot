@@ -178,6 +178,10 @@ def settle_intent(
     done = _already_done(coord, request_id, cat.SETTLE, order_ref, outcome)
     if done is not None:
         return done
+    declared = coord.store.declared_fill(order_ref)
+    if outcome == "FILLED" and declared is not None and declared["declared_state"] == "PARTIAL":
+        return _correct_declaration(coord, request_id, order_ref, declared, confirmation, note,
+                                    operator, quantity, avg_price)
     intent = coord.store.intent(order_ref)
     idea = intent.idea_id if intent else None
     refuse = lambda reasons, before=None: _refuse(
@@ -276,6 +280,72 @@ def settle_intent(
     return OperatorResult(status="APPLIED", before=before, after=after, lifted=[])
 
 
+def _correct_declaration(coord, request_id, order_ref, declared, confirmation, note, operator,
+                         quantity, avg_price) -> OperatorResult:
+    """Review F10: the one second settlement allowed. A FILLED declaration the broker evidences
+    only in part may be corrected by a new FILLED settlement naming the true total: never below
+    what the broker's executions already show, never above the order, and never one the broker's
+    position contradicts. It only changes what the declaration still counts; the block lifts
+    only when the broker's executions then cover it."""
+    intent = coord.store.intent(order_ref)
+    idea = intent.idea_id
+    refuse = lambda reasons, before=None: _refuse(
+        coord, request_id, cat.SETTLE, reasons, order_ref=order_ref, idea_id=idea,
+        before=before, operator=operator, note=note, target=order_ref, outcome="FILLED",
+    )
+    problems = _basic_problems(
+        confirmation, cat.settle_phrase(order_ref, "FILLED", quantity, avg_price), note
+    )
+    try:
+        price = Decimal(str(avg_price)) if avg_price is not None else None
+    except (InvalidOperation, ValueError):
+        price = None
+    if price is None or not price.is_finite() or price <= 0:
+        problems.append("FILL_PRICE_REQUIRED")
+    if quantity is None or quantity <= 0:
+        problems.append("FILL_QUANTITY_REQUIRED")
+    if problems:
+        return refuse(problems)
+    before = _state(coord, order_ref, idea)
+    if not coord.sync(record_only=True):
+        return refuse(["BROKER_UNREADABLE"], before)
+    try:
+        broker_positions = coord.broker.positions()
+    except BrokerError:
+        coord.mark_broker_unreadable("operator settlement", BrokerError("read failed"))
+        return refuse(["BROKER_UNREADABLE"], before)
+    declared = coord.store.declared_fill(order_ref)
+    if declared["declared_state"] != "PARTIAL":
+        return refuse([f"DECLARATION_ALREADY_{declared['declared_state']}"], before)
+    got = sum(f["quantity"] for f in coord.store.evidenced_fills(order_ref))
+    if quantity < got:
+        problems.append(f"CORRECTION_BELOW_BROKER_EVIDENCE:{quantity}<{got}")
+    if quantity > intent.quantity:
+        problems.append(f"FILL_EXCEEDS_ORDER:{quantity}>{intent.quantity}")
+    contract = _contract_from(intent.contract)
+    if contract is not None and not contract.on_tick(price):
+        problems.append("FILL_PRICE_OFF_TICK")
+    if problems:
+        return refuse(problems, before)
+    counted = got + declared["quantity"]
+    contradiction = _position_contradiction(coord, intent, quantity - counted, broker_positions,
+                                            "FILLED")
+    if contradiction:
+        return refuse([contradiction], before)
+    now = coord.clock()
+    coord.store.set_declared_remainder(declared["exec_id"], max(quantity - got, 0), "PARTIAL",
+                                       now, declared_quantity=quantity, price=str(price))
+    coord.store.log(
+        now, "OPERATOR_SETTLEMENT_CORRECTED", order_ref=order_ref, idea_id=idea,
+        request_id=request_id, action=cat.SETTLE, target=order_ref, outcome="FILLED",
+        status="APPLIED", declared_before=declared["declared_quantity"],
+        declared_quantity=quantity, declared_price=str(price), evidenced=got, before=before,
+        operator=operator, note=note, note_sha256=note_digest(note),
+        rule="a partly evidenced FILLED declaration corrected; lifts only on broker evidence",
+    )
+    return OperatorResult(status="APPLIED", before=before, after=_state(coord, order_ref, idea))
+
+
 def _fill_problems(coord, intent: Intent, quantity: int, price: Decimal, applied: int) -> list[str]:
     out = []
     contract = _contract_from(intent.contract)
@@ -343,7 +413,7 @@ def _apply_settlement(coord, intent, rows, outcome, fill_qty, price, request_id,
         if fill_qty > 0:
             store.apply_fill(
                 exec_id=f"OPERATOR:{request_id}", order=entry_row, quantity=fill_qty,
-                price=price, executed_at=now, at=now, c=c,
+                price=price, executed_at=now, at=now, c=c, declared=True,
             )
         c.execute(
             "UPDATE exec_intents SET state=?, broker_status=?, reasons=?, updated_at=? "
@@ -494,6 +564,9 @@ def lift_verified_blocks(coord: ExecutionCoordinator) -> list[int]:
         intent = coord.store.intent(e.order_ref) if e.order_ref else None
         if intent is None:
             continue
+        declared = coord.store.declared_fill(intent.order_ref)
+        if declared is not None and declared["declared_state"] == "PARTIAL":
+            continue  # part of the declared fill is not evidenced yet (review F10)
         if e.id in no_fill:
             record = no_fill[e.id][1]
             since, run = _no_trace_run(coord, intent, record, now)

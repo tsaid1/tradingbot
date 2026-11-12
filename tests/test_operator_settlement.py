@@ -539,7 +539,7 @@ def test_every_exception_kind_has_an_operator_class():
         C.EXIT_NOT_NETTED, C.EXIT_WITHOUT_QUOTE, C.ENTRY_STATE_UNKNOWN, C.BROKER_STATE_UNKNOWN,
         C.ENTRY_REMAINDER_NOT_CANCELLED, C.OPERATOR_SETTLEMENT_UNVERIFIED,
         C.BROKER_RECONNECT_PENDING, ST.LEDGER_REVERSAL, R.PARTIAL_GROUP,
-        C.SETTLED_INTENT_CONTRADICTED,
+        C.SETTLED_INTENT_CONTRADICTED, C.SETTLEMENT_DIFFERS_FROM_BROKER,
     }
     assert opened <= kinds
     assert opened == set(cat.EXCEPTION_ACTIONS)
@@ -641,3 +641,134 @@ def test_refusals_clears_and_acknowledgements_journal_the_note(h):
     notes = [e.detail.get("note") for e in h.coord.store.journal()
              if e.event == "OPERATOR_ACTION_REFUSED"]
     assert notes == ["saw it cancelled in the invented account", "not flat yet, test"]
+
+
+# ----------------------------------------------------------------------------------- F10
+
+
+def _declared(h, quantity=4, price="50.02"):
+    """FILLED declared beyond the horizon: the broker's executions are not visible yet."""
+    ref = filled_beyond_horizon(h, stop=None, target=None)
+    result = settle(h, ref, "FILLED", quantity=quantity, avg_price=price, request_id=f"d-{ref}")
+    assert result.status == "APPLIED"
+    return ref
+
+
+def _late(h, ref, *parts, done=None, position=None):
+    """The broker's executions for ``ref`` appear late (invented quantities and prices);
+    ``done``: the entry's completed row then shows this filled quantity (the order is over)."""
+    from decimal import Decimal
+
+    from tradingbot.execution.broker import Fill, OrderStatus
+
+    contract = h.broker.positions()[0].contract
+    at = h.clock.now()
+    fills = [
+        Fill(exec_id=f"INV-LATE-{n}", broker_order_id="1", order_ref=ref, contract=contract,
+             side=OrderSide.BUY, quantity=q, price=Decimal(p), executed_at=at)
+        for n, (q, p) in enumerate(parts)
+    ]
+    real_exec, real_done = h.broker.executions, h.broker.completed_orders
+    h.broker.executions = lambda since=None: [*real_exec(since), *fills]
+    if done is not None:
+        [row] = [o for o in h.broker.orders_with_ref(ref)]
+        row = row.model_copy(update={"status": OrderStatus.FILLED if done == row.quantity
+                                     else OrderStatus.CANCELLED,
+                                     "filled_quantity": done, "updated_at": at})
+        h.broker.completed_orders = lambda since=None: [*real_done(since), row]
+    if position is not None:  # the account really holds this much (invented)
+        real_pos = h.broker.positions
+        h.broker.positions = lambda: [p.model_copy(update={"quantity": position})
+                                      for p in real_pos()]
+
+
+def _qty(h):
+    return h.coord.store.position("p1:open").quantity
+
+
+def test_f10_a_late_execution_equal_to_the_declaration_replaces_it(h):
+    ref = _declared(h)
+    assert _qty(h) == 4
+    _late(h, ref, (4, "50.02"))
+    h.coord.sync()
+    assert _qty(h) == 4  # never 8
+    assert h.coord.store.filled_quantity(ref) == 4
+    assert C.OPERATOR_SETTLEMENT_UNVERIFIED not in open_kinds(h)
+    assert C.SETTLEMENT_DIFFERS_FROM_BROKER not in open_kinds(h)
+    [d] = [f for f in h.coord.store.fills(ref) if f["exec_id"].startswith("OPERATOR:")]
+    assert d["declared_quantity"] == 4 and d["quantity"] == 0  # kept as the record, replaced
+    assert "DECLARED_FILL_REPLACED" in h.events(ref)
+
+
+def test_f10_a_late_execution_larger_than_declared(h):
+    ref = _declared(h, quantity=4)
+    _late(h, ref, (4, "50.02"), (1, "50.02"))
+    h.coord.sync()
+    assert _qty(h) == 5  # exactly the broker's fills
+    assert C.SETTLEMENT_DIFFERS_FROM_BROKER in open_kinds(h)
+    assert second_open_state(h, "p2").state == IntentState.REFUSED
+
+
+def test_f10_a_late_execution_smaller_than_declared_when_the_order_is_over(h):
+    ref = _declared(h, quantity=4)
+    _late(h, ref, (3, "50.02"), done=3)
+    h.coord.sync()
+    assert _qty(h) == 3
+    assert C.SETTLEMENT_DIFFERS_FROM_BROKER in open_kinds(h)
+    assert second_open_state(h, "p2").state == IntentState.REFUSED
+
+
+def test_f10_a_price_only_difference_is_recorded_and_alerted_but_does_not_block(h):
+    ref = _declared(h, quantity=4, price="50.00")
+    _late(h, ref, (4, "50.02"))
+    h.coord.sync()
+    assert _qty(h) == 4 and h.coord.store.position("p1:open").avg_price == "50.0200"
+    [e] = [x for x in h.coord.store.exceptions(open_only=True)
+           if x.kind == C.SETTLEMENT_DIFFERS_FROM_BROKER]
+    assert "50.00" in e.detail and "50.02" in e.detail
+    assert C.OPERATOR_SETTLEMENT_UNVERIFIED not in open_kinds(h)
+    assert second_open_state(h, "p2").state == IntentState.FILLED
+
+
+def test_f10_a_partial_arrival_keeps_the_declared_remainder_blocked_and_counted(h):
+    ref = _declared(h, quantity=4)
+    _late(h, ref, (2, "50.02"), position=2)  # the operator over-declared
+    h.coord.sync()
+    assert _qty(h) == 4  # the larger of declared (4) and evidenced (2)
+    assert C.OPERATOR_SETTLEMENT_UNVERIFIED in open_kinds(h)
+    assert wait_for_verification(h, seconds=40) == []  # never lifts while part is unevidenced
+    assert second_open_state(h, "p2").state == IntentState.REFUSED
+    # A second settlement is refused, except a correction of the partial declaration.
+    again = settle(h, ref, "FILLED", quantity=1, avg_price="50.02")
+    assert again.status == "REFUSED" and "CORRECTION_BELOW_BROKER_EVIDENCE:1<2" in again.reasons
+    fixed = settle(h, ref, "FILLED", quantity=2, avg_price="50.02", request_id="corr-1")
+    assert fixed.status == "APPLIED"
+    assert "OPERATOR_SETTLEMENT_CORRECTED" in h.events(ref)
+    h.coord.sync()
+    assert _qty(h) == 2
+    assert C.OPERATOR_SETTLEMENT_UNVERIFIED not in open_kinds(h)
+
+
+def test_f10_the_replacement_survives_a_restart(h):
+    ref = _declared(h, quantity=4)
+    h.restart()
+    h.broker.history_seconds = 3600
+    _late(h, ref, (2, "50.02"))
+    h.coord.sync()
+    assert _qty(h) == 4 and C.OPERATOR_SETTLEMENT_UNVERIFIED in open_kinds(h)
+    h.restart()
+    h.broker.history_seconds = 3600
+    _late(h, ref, (2, "50.02"), (2, "50.02"))
+    h.coord.sync()
+    assert _qty(h) == 4 and h.coord.store.filled_quantity(ref) == 4
+    assert C.OPERATOR_SETTLEMENT_UNVERIFIED not in open_kinds(h)
+    h.coord.sync()
+    assert _qty(h) == 4
+
+
+def test_f10_a_difference_alerts_under_its_own_kind():
+    from tradingbot.runtime import notify as N
+    from tradingbot.runtime.service import EXCEPTION_ALERT_KIND, SEPARATELY_ALERTED
+
+    assert EXCEPTION_ALERT_KIND[C.SETTLEMENT_DIFFERS_FROM_BROKER] == N.SETTLEMENT_DIFFERS
+    assert C.SETTLEMENT_DIFFERS_FROM_BROKER not in SEPARATELY_ALERTED
