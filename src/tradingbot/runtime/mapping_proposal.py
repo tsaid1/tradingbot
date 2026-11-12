@@ -475,15 +475,15 @@ def _series(v: Vehicle, missing: list[str], where: str, *, execution: bool,
 def report_warnings(cat: dict, x: Vehicle, ref: Vehicle) -> list[str]:
     out = []
     if cat.get("overall") != "COMPLETE":
-        out.append(f"the discovery report is {_md(cat.get('overall'))} "
-                   f"({_md(cat.get('failure'))}): "
+        out.append(f"the discovery report is {_md_plain(cat.get('overall'))} "
+                   f"({_md_plain(cat.get('failure'))}): "
                    "re-run discovery before relying on it")
     if x.truncated:
-        out.append(f"execution row `{_md(x.query)}` is TRUNCATED: the month list may be incomplete "
-                   f"(the report kept {len(x.contracts)} rows at limit {show(x.limit)})")
+        out.append(f"execution row `{_md_plain(x.query)}` is TRUNCATED: the month list may be "
+                   f"incomplete (the report kept {len(x.contracts)} rows at limit {show(x.limit)})")
     if ref is not x and ref.truncated:
-        out.append(f"reference row `{_md(ref.query)}` is TRUNCATED: the broker returned more "
-                   "rows than "
+        out.append(f"reference row `{_md_plain(ref.query)}` is TRUNCATED: the broker returned "
+                   "more rows than "
                    f"the report kept ({len(ref.contracts)} at limit {show(ref.limit)})")
     return out
 
@@ -798,11 +798,24 @@ def verify_rendered(text: str, props: list[FamilyProposal]) -> list[dict]:
     return entries
 
 
-def _md(v: Any) -> str:
+def _md_plain(v: Any) -> str:
     """Report- or policy-derived text inside Markdown: one line, pipes and backticks escaped, and
-    a leading # or > escaped, so it cannot forge a heading, a quote, a code span or a table row."""
+    a leading # or > escaped, so it cannot forge a heading, a quote, a code span or a table row.
+    No HTML escaping: this form also goes into the TOML notes (warnings)."""
     text = show(v).replace("\\", "\\\\").replace("|", "\\|").replace("`", "'")
     return "\\" + text if text[:1] in ("#", ">") else text
+
+
+def _html(text: str) -> str:
+    """``&`` and ``<`` as entities, so text in a sheet viewed as HTML or Markdown cannot open a
+    tag or an entity (a ``>`` alone opens nothing)."""
+    return text.replace("&", "&amp;").replace("<", "&lt;")
+
+
+def _md(v: Any) -> str:
+    """Report- or policy-derived text written into a Markdown sheet (``_md_plain``, then
+    ``_html``)."""
+    return _html(_md_plain(v))
 
 
 def render_contract_table(props: list[FamilyProposal], cat: dict) -> str:
@@ -867,7 +880,7 @@ def render_calendar(props: list[FamilyProposal], policy: ProposalPolicy, cat: di
         if not p.calendar:
             continue
         out += [f"## {p.plan.family}: {_md(p.execution.query)}", ""]
-        out += [f"**WARNING:** {one_line(w)}." for w in p.warnings]
+        out += [f"**WARNING:** {_html(one_line(w))}." for w in p.warnings]
         if p.warnings:
             out.append("")
         if p.same_series_diffs:
@@ -911,7 +924,8 @@ def render_sheet(p: FamilyProposal, cat: dict) -> str:
            f"Treatment named by the {plan.source}: **{plan.treatment}**. "
            "Every entry this tool writes is `approved = false`."), ""]
     if p.warnings:
-        out += ["## Warnings", ""] + [f"* **WARNING:** {one_line(w)}." for w in p.warnings] + [""]
+        out += ["## Warnings", ""] + [
+            f"* **WARNING:** {_html(one_line(w))}." for w in p.warnings] + [""]
     if p.unsupported_reason:
         out += [("**Not proposable from this report.** The proposed entry is `UNSUPPORTED` and "
                 f"HOLDs: {_md(p.unsupported_reason)}."), "",

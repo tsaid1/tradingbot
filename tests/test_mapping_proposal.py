@@ -737,3 +737,34 @@ def test_n3_a_fully_filled_policy_loads_with_no_hand_edit_even_with_fractional_s
     assert loaded.entries["TLT"].execution.size_increment == 1
     with pytest.raises(mp.ProposalInputInvalid):
         mp.parse_policy(_policy_with_owner({"size_increment": 0}))
+
+
+def test_catalog_text_cannot_inject_markup_into_the_sheets(tmp_path):
+    """Invented catalog strings with HTML markup: every Markdown output shows them escaped (`<`
+    and `&`), while the TOML keeps the exact value and its self-check still holds."""
+    cat = catalog()
+    tlt = next(r for r in cat["results"] if r["name"] == "TLT")
+    tlt["contracts"][0]["long_name"] = "INVENTED <script>alert(1)</script> & Co"
+    tlt["contracts"][0]["primary_exchange"] = "<img src=x onerror=alert(1)>"
+    mes = next(r for r in cat["results"] if r["name"] == "MES fut")
+    for c in mes["contracts"]:
+        c["trading_class"] = "<img src=x>"
+    cat["failure"] = "<script>x</script>"
+    cat["overall"] = "PARTIAL<b>"
+    out = tmp_path / "o"
+    assert _load().main([str(_write_cat(tmp_path, cat)), "--out", str(out),
+                         "--roll-days", "5"]) == 0
+    _assert_written_equals_proposal(out, cat, shipped())
+    sheets = sorted(out.glob("*.md"))
+    assert sheets
+    seen = ""
+    for path in sheets:
+        text = path.read_text()
+        seen += text
+        assert "<script" not in text and "<img" not in text and "<b>" not in text, path.name
+    assert "&lt;script>alert(1)&lt;/script> &amp; Co" in seen
+    assert "&lt;img src=x onerror=alert(1)>" in seen
+    assert "&lt;img src=x>" in seen
+    assert "PARTIAL&lt;b>" in seen and "&lt;script>x&lt;/script>" in seen
+    toml = (out / "proposed_mapping.toml").read_text()
+    assert "&lt;" not in toml and "&amp;" not in toml  # the TOML is not Markdown: never escaped
