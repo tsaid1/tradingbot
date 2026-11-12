@@ -39,7 +39,8 @@ def test_mock_default_is_unchanged(tmp_path, h):
 
 def test_full_lifecycle_through_the_replay(h):
     assert statuses(h.post("p1", open_action())) == ["EXECUTED"]
-    assert statuses(h.post("p2", action("add", Action.ADD, idea=IDEA, entry="50"))) == ["EXECUTED"]
+    assert statuses(h.post("p2", action("add", Action.ADD, idea=IDEA, entry="50.02"))) == [
+        "EXECUTED"]
     assert statuses(h.post("p3", action("raise", Action.MODIFY, idea=IDEA, stop="49"))) == [
         "EXECUTED"
     ]

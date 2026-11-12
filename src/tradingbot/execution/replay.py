@@ -23,7 +23,13 @@ from tradingbot.event_models import (
     TradeAction,
 )
 from tradingbot.event_replay import Idea, PaperEventReplay
-from tradingbot.execution.coordinator import OPPOSITE_IDEA_IN_SAME_CONTRACT, ExecutionCoordinator
+from tradingbot.execution.coordinator import (
+    ENTRY_CANCEL_UNCONFIRMED,
+    ENTRY_CANCELLED_BEFORE_FILL,
+    ENTRY_REMAINDER_NOT_CANCELLED,
+    OPPOSITE_IDEA_IN_SAME_CONTRACT,
+    ExecutionCoordinator,
+)
 from tradingbot.execution.store import LedgerPosition
 from tradingbot.models import Action, ExecutionPlan, GateDecision, MappedQuote, Quote
 from tradingbot.validator import ALL_ACTIONS, gate_action
@@ -31,6 +37,10 @@ from tradingbot.validator import ALL_ACTIONS, gate_action
 PRIOR_INTENT = "INTENT_ALREADY_ON_RECORD"
 # A member of an approved atomic group did not end EXECUTED: the rest of the group is held.
 PARTIAL_GROUP = "PARTIAL_GROUP"
+# A follow-up other than an exit on an idea whose entry was still working and unfilled: the entry
+# is cancelled and the follow-up is held (a resting bracket is never amended).
+FOLLOW_UP_ON_UNFILLED_ENTRY = "FOLLOW_UP_ON_UNFILLED_ENTRY"
+FOLLOW_UPS = (Action.CLOSE, Action.REDUCE, Action.MODIFY, Action.ADD)
 
 
 @dataclass
@@ -103,6 +113,14 @@ class BrokerEventReplay(PaperEventReplay):
         self._plans.pop(a.action_id, None)  # action ids repeat across posts: never reuse a plan
         if self.coordinator.intent_for(source, a) is not None:
             return ActionOutcome(action_id=a.action_id, status="SIMULATED", reasons=[PRIOR_INTENT])
+        if a.action in FOLLOW_UPS and a.idea_reference \
+                and self.coordinator.unfilled_entry_refs(a.idea_reference):
+            # The life of an entry order: an unfilled entry never outlives the publisher's own
+            # exit. The follower ledger holds nothing for this idea yet (its OPEN is resting), so
+            # the gateway alone would hold the follow-up and leave the order live.
+            held = self._follow_up_on_unfilled_entry(a, ideas)
+            if held is not None:
+                return held
         quote = quotes.get(a.instrument.quote_key) if a.instrument is not None else None
         if isinstance(quote, MappedQuote):
             # The gateway is pure: asked with exactly the inputs the base class is about to use
@@ -129,6 +147,27 @@ class BrokerEventReplay(PaperEventReplay):
                     reasons=[OPPOSITE_IDEA_IN_SAME_CONTRACT, f"OPEN_IDEA:{clash}"],
                 )
         return super()._simulate(source, a, quotes, ideas, now)
+
+    def _follow_up_on_unfilled_entry(self, a: TradeAction, ideas) -> ActionOutcome | None:
+        """Cancel the idea's working, unfilled entry (confirmed). A CLOSE or REDUCE is then handled:
+        the publisher left before the follower was filled (status CANCELLED, nothing else sent).
+        Any other follow-up is held. An unconfirmed cancel holds it with the instrument blocked.
+        None when the entry filled before its cancel took effect: the follow-up is then gated on
+        what is held, exactly as before."""
+        result = self.coordinator.cancel_unfilled_entry(a.idea_reference)
+        pos = self.coordinator.store.position(a.idea_reference)
+        if pos is not None:
+            ideas[pos.idea_id] = _idea(pos)
+        if result == ENTRY_CANCEL_UNCONFIRMED:
+            return ActionOutcome(action_id=a.action_id, status="HOLD",
+                                 reasons=[ENTRY_CANCEL_UNCONFIRMED, ENTRY_REMAINDER_NOT_CANCELLED])
+        if pos is not None and pos.quantity > 0:
+            return None
+        if a.action in (Action.CLOSE, Action.REDUCE):
+            return ActionOutcome(action_id=a.action_id, status="CANCELLED",
+                                 reasons=[ENTRY_CANCELLED_BEFORE_FILL])
+        return ActionOutcome(action_id=a.action_id, status="HOLD",
+                             reasons=[ENTRY_CANCELLED_BEFORE_FILL, FOLLOW_UP_ON_UNFILLED_ENTRY])
 
     def _execute_group(self, source, group, outcomes, ideas, now) -> list[ActionOutcome]:
         """Execute the approved group in order. In a multi-action group, the first member that
