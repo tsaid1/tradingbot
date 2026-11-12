@@ -215,3 +215,30 @@ def test_an_unexpected_stage2_fill_keeps_the_stop_and_blocks_stage3(tws, cfg_pat
     assert tws.count("CANCEL_ORDER") == 0
     with pytest.raises(X.StageRefused):
         X.run_stage("stage3-lifecycle", cfg_path)
+
+
+def test_a_stage2_fill_whose_stop_the_broker_cancelled_reports_it_unprotected(tws, cfg_path):
+    """Note (b): the stage never cancels the child after a fill, but the broker may have (with its
+    parent). The evidence and the text report the child's actual state, never 'left working'."""
+    from _ibkr_fake_tws_orders import FakeOrderTws
+    stage0(tws, cfg_path)
+    run("stage1-lookups", cfg_path)
+    tws.autofill = True
+    tws.ask = 70.00  # invented: the "unfillable" limit fills at once
+
+    def place_then_broker_cancels_child(s, conn, req):
+        FakeOrderTws.place(s, conn, req)
+        fo = s.orders[req.orderId]
+        if fo.order.parentId and s.orders[fo.order.parentId].status == "Filled":
+            s._set(fo, "Cancelled")
+            conn.push(s._status(fo))
+
+    tws.on["PLACE_ORDER"] = place_then_broker_cancels_child
+    ev = run("stage2-unfillable-bracket", cfg_path)
+    assert ev["result"] == "STAGE2_UNEXPECTED_FILL" and not ev["passed"]
+    assert ev["held"]["stop_working"] is False and ev["held"]["stop_status"] == "Cancelled"
+    assert "NOT working" in ev["why_failed"] and "UNPROTECTED" in ev["why_failed"]
+    assert "left working" not in ev["why_failed"] and "is working" not in ev["why_failed"]
+    assert tws.count("CANCEL_ORDER") == 0  # the stage itself cancelled nothing
+    with pytest.raises(X.StageRefused):
+        X.run_stage("stage3-lifecycle", cfg_path)

@@ -295,17 +295,33 @@ def _stage2(cfg: PaperOrderConfig, ev: dict) -> None:
             ct = s._tracks[child]
             ev["result"] = "STAGE2_UNEXPECTED_FILL"
             ev["passed"] = False
+            # The child's ACTUAL state: this stage never cancels it after a fill, but the broker
+            # may have cancelled it with its parent (a partial fill, or a fill racing the cancel).
+            child_status = ct.status.value if ct.status is not None else "UNKNOWN"
+            in_open = any(r["own"] and r["order_id"] == child
+                          for r in after["open_orders"].get("rows", []))
+            stop_working = ct.status is not None and ct.status not in FINAL_STATUSES and in_open
             ev["held"] = {"symbol": c.symbol, "quantity": str(pt.filled or sum(
                 (e.shares for e in parent_execs), Decimal(0))), "entry_order_id": parent,
                 "stop_order_id": child, "stop_price": str(ct.stop_price),
-                "stop_working": ct.status not in FINAL_STATUSES}
+                "stop_status": child_status, "stop_in_open_orders": in_open,
+                "stop_working": stop_working}
+            if stop_working:
+                protection = (
+                    f"the protective SELL STP {ev['held']['stop_price']} (order {child}) is "
+                    f"working ({child_status}). Do NOT run abort first (it cancels the stop). "
+                    "Close by hand in TWS: SELL the share with a limit at the bid, confirm the "
+                    "position is 0, then run abort to cancel the stop")
+            else:
+                protection = (
+                    f"the protective SELL STP (order {child}) is NOT working (status "
+                    f"{child_status}, {'in' if in_open else 'not in'} open orders): the share is "
+                    "UNPROTECTED. Close by hand in TWS NOW: SELL the share with a limit at the "
+                    "bid, confirm the position is 0, then run abort")
             ev["why_failed"] = (
                 f"STAGE2_UNEXPECTED_FILL: the account HOLDS {ev['held']['quantity']} "
-                f"{c.symbol} share(s); the protective SELL STP {ev['held']['stop_price']} "
-                f"(order {child}) was left working. Do NOT run abort first (it cancels the "
-                "stop). Close by hand in TWS: SELL the share with a limit at the bid, confirm "
-                "the position is 0, then run abort to cancel the stop (runbook: 'If stage 2 "
-                "fills'). Stage 3 is blocked.")
+                f"{c.symbol} share(s); {protection} (runbook: 'If stage 2 fills'). Stage 3 is "
+                "blocked.")
         elif not parent_clean:
             ev["result"] = "STAGE2_PARENT_NOT_CONFIRMED_CANCELLED"
             ev["passed"] = False
