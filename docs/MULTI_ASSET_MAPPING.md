@@ -244,9 +244,9 @@ is written in between punctuation (`,` `;` `.` `:` `!` `?`, a line break, a spac
    the line is left to the contract check instead (rule 3 of the *Level contract rule*).
 
 *Anchor scope* (`entry_anchor.anchor_scope`, required with the rule, no default: how much textual
-certainty the owner requires). Both values apply rules 1 to 3 to the marked number's own sentence
+certainty the owner requires). All values apply rules 1 to 3 to the marked number's own sentence
 unchanged; there is no windowed option (a window's start and end could be gamed inside one
-sentence). They differ only for a standalone level sentence ("41.20 now." on its own):
+sentence). They differ only in how a standalone level sentence is attributed ("41.20 now." on its own):
 
 * `"SENTENCE_STRICT"` trusts only words: the sentence immediately before the level sentence must be
   entirely on the allow-list (`ENTRY_ANCHOR_INSTRUMENT_UNCLEAR`, `PRECEDING_SENTENCE` otherwise).
@@ -259,8 +259,20 @@ sentence). They differ only for a standalone level sentence ("41.20 now." on its
   when it is itself entirely allow-listed ("Stop 40.10." is; "Stop below 40.10." is not). To
   attribute more, the interpreter would have to expose the sentence span of the action's block.
 
+* `"SINGLE_MARKET_POST"` trusts the post as a whole. The level's own sentence is checked exactly
+  as above; nothing is asked of its neighbours. Instead the anchor is accepted only if all hold:
+  (a) exactly one sentence of the post carries a marked number (`ENTRY_ANCHOR_POST_SEVERAL_LEVELS`);
+  (b) every action of the post is this family's, no action carries an unresolved-instrument flag
+  (`ASSET_UNRESOLVED`, `MIXED_SERIES_AND_TICKER`, `MULTIPLE_TICKERS_IN_CLAUSE`), and the post holds
+  no cashtag but this family's and no code, series symbol or alias of any other family the mapping
+  file or the private lexicon (`family_aliases`) knows (`ENTRY_ANCHOR_POST_SEVERAL_MARKETS`); (c)
+  this is the post's only action besides commentary, and no action is conditional, retrospective
+  or uncertain (`ENTRY_ANCHOR_POST_SEVERAL_ACTIONS`); (d) for a reference-series family the level's
+  sentence does not name the execution instrument (`ENTRY_ANCHOR_REFERENCE_UNNAMED`). Every gateway
+  protection is unchanged.
+
 The decision records how the anchor was attributed (`anchor_attribution`: `OWN_SENTENCE`,
-`AFTER_OWN_INSTRUCTION`, `AFTER_ALLOW_LISTED_SENTENCE`, `FIRST_SENTENCE`).
+`AFTER_OWN_INSTRUCTION`, `AFTER_ALLOW_LISTED_SENTENCE`, `FIRST_SENTENCE`, `SINGLE_MARKET_POST`).
 
 *Private extension.* A publisher's own present-market phrasing, and further names of a family,
 are never added to the public lists. They go in the optional `entry_anchor` section of the private
@@ -278,6 +290,12 @@ around it are all understood, but the publisher's intent is not. The protections
 case are the live-quote collar (`max_adverse_move`, `max_favourable_move`, within the code
 ceilings), the signal-age limit, the mandatory protective stop and the size caps (`max_units`,
 `max_notional`). The interpreter must also still tag the right number REFERENCE.
+Under `SINGLE_MARKET_POST` specifically: a market named only in plain words that neither the
+mapping file nor the lexicon's vocabulary knows is invisible to check (b), so a marked level that
+really belongs to such a market could be attributed to the post's family. The protections that
+bound that case are the same: the collar against the live quote, the signal-age limit, the
+mandatory stop and the size caps; and the vocabulary can be extended privately
+(`entry_anchor.family_aliases`).
 
 No stated level at all leaves the action as today (`OPEN_ENTRY_PRICE_MISSING`, with
 `ENTRY_ANCHOR_NOT_STATED`). For a futures family the accepted anchor is the one extra level the
