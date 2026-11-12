@@ -135,7 +135,7 @@ def test_d1_the_unattributed_action_rule_does_not_fire_on_these(tmp_path, extra)
 # ================================================================== D3: maximum stop distance
 
 
-STOP_RULE = {**RULE, "anchor_max_stop_distance": "5%"}
+STOP_RULE = {**RULE, "max_stop_distance": "5%"}
 
 
 def test_d3_the_ceiling_is_a_code_constant():
@@ -144,8 +144,8 @@ def test_d3_the_ceiling_is_a_code_constant():
 
 @pytest.mark.parametrize("stop,reason", [
     ("4995", None),  # 0.6 % below the anchor
-    ("4773.75", "ENTRY_ANCHOR_STOP_TOO_FAR_FROM_LIMIT"),  # 5.00 % from 5025, 5.005 % from 5025.25
-    ("4770", "ENTRY_ANCHOR_STOP_TOO_FAR_FROM_REFERENCE"),
+    ("4773.75", "PROTECTIVE_STOP_TOO_FAR_FROM_LIMIT"),  # 5.00 % from 5025, 5.005 % from 5025.25
+    ("4770", "PROTECTIVE_STOP_TOO_FAR_FROM_ENTRY"),
     (None, "PROTECTIVE_STOP_MISSING"),
     ("5030", "STOP_DIRECTION_CONTRADICTION"),
 ])
@@ -153,19 +153,21 @@ def test_d3_the_gateway_bounds_the_stop_distance(stop, reason):
     g = gate(act(entry=None, stop=stop), q_with(terms(**STOP_RULE), "5025"))
     if reason is None:
         assert g.status == "APPROVE", g.reasons
-        assert g.plan.anchor_max_stop_distance == "5%"
+        assert g.plan.max_stop_distance == "5%"
     else:
         assert g.status != "APPROVE" and g.reasons[0] == reason, g.reasons
 
 
 def test_d3_an_anchored_rule_without_the_limit_holds():
-    g = gate(act(entry=None), q_with(terms(**{**RULE, "anchor_max_stop_distance": None}), "5025"))
+    g = gate(act(entry=None), q_with(terms(**{**RULE, "max_stop_distance": None}), "5025"))
     assert g.reasons == ["ENTRY_ANCHOR_RULE_INCOMPLETE"]
 
 
-def test_d3_explicit_entries_are_not_affected():
+def test_d3_explicit_entries_are_bounded_too():
+    """Owner, 12 November 2026 (later decision): the stop rule governs explicit entries too."""
     g = gate(act(stop="4700"), q_with(terms(**STOP_RULE), "5025"))
-    assert g.status == "APPROVE", g.reasons
+    assert g.reasons[0] == "PROTECTIVE_STOP_TOO_FAR_FROM_ENTRY", g.reasons
+    assert gate(act(stop="4995"), q_with(terms(**STOP_RULE), "5025")).status == "APPROVE"
 
 
 @pytest.mark.parametrize("levels,others,reason", [
@@ -178,7 +180,7 @@ def test_d3_a_stop_that_is_not_uniquely_this_actions_holds(tmp_path, levels, oth
     p = policy(tmp_path, etf_entry())
     d, _ = p.resolve(etf_action(), clause="We are now long $QETF, 50.10 now.", now=MAP_NOW,
                      levels=levels, others=list(others))
-    assert d.reason.split(",")[:2] == ["ENTRY_ANCHOR_STOP_NOT_UNIQUE", reason], d.reason
+    assert d.reason.split(",")[:2] == ["PROTECTIVE_STOP_NOT_UNIQUE", reason], d.reason
 
 
 @pytest.mark.parametrize("value", ['"11%"', '"5"', "5", "true", '"nan%"'])
@@ -187,7 +189,7 @@ def test_d3_the_loader_takes_a_strict_percentage_under_the_ceiling(tmp_path, val
         policy(tmp_path, etf_entry(rule=ANCHOR_RULE.replace('max_stop_distance = "5%"',
                                                             f"max_stop_distance = {value}")))
     with pytest.raises(ValueError, match="max_stop_distance"):
-        policy(tmp_path, etf_entry(rule=ANCHOR_RULE.replace(', max_stop_distance = "5%"', "")))
+        policy(tmp_path, etf_entry(rule=ANCHOR_RULE.replace('max_stop_distance = "5%"\n', "")))
 
 
 def test_d3_the_execution_core_checks_the_limit_again(tmp_path):
@@ -195,7 +197,7 @@ def test_d3_the_execution_core_checks_the_limit_again(tmp_path):
     far = anchored_gate()
     far = far.model_copy(update={"plan": far.plan.model_copy(update={"stop": Decimal("47.50")})})
     out = run_entry(h, far)  # 5.04 % below the 50.02 limit
-    assert out.reasons[0] == "ENTRY_ANCHOR_STOP_TOO_FAR_FROM_LIMIT" and h.broker.submit_calls == 0
+    assert out.reasons[0] == "PROTECTIVE_STOP_TOO_FAR_FROM_LIMIT" and h.broker.submit_calls == 0
     ok = run_entry(h, anchored_gate(), sid="p2")  # 48 is 4.04 % below
     assert h.broker.submit_calls == 1, ok.reasons
     h.coord.close()
@@ -203,7 +205,7 @@ def test_d3_the_execution_core_checks_the_limit_again(tmp_path):
 
 def test_d3_the_shipped_limit_is_tlt_only():
     p = MappingPolicy.from_toml(MAPPING)
-    assert p.entries["TLT"].entry_anchor.max_stop_distance == "5%"
+    assert p.entries["TLT"].max_stop_distance == "5%"
 
 
 # ================================================================== D5: long only

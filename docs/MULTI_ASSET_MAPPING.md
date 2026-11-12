@@ -175,23 +175,37 @@ only (they do not authorize order submission):**
 
 * `standalone_level_sentence = true`: a level may stand in its own sentence directly after the
   instruction, or after the instruction's own stop and target sentence (see *What the level is*).
-* `max_stop_distance = "5%"` (required in `[entry_anchor]`, a strict percentage, no default; code
-  ceiling `validator.ANCHOR_MAX_STOP_DISTANCE_PCT_CEILING` = 10 %). An outer rejection threshold;
-  the bot never sets, moves or synthesizes a stop. An anchored entry is refused when the stop is
-  absent (`PROTECTIVE_STOP_MISSING`), on the wrong side (`STOP_DIRECTION_CONTRADICTION`), not
-  uniquely this action's (`ENTRY_ANCHOR_STOP_NOT_UNIQUE`, at the mapping stage, on the
-  interpreter's facts: more than one value tagged STOP for the action `TWO_STOP_VALUES`, the
-  action's own stop not among them `STOP_DIFFERS_FROM_ACTION`, or the value stated by another
-  trading action of the post, commentary aside, `STOP_SHARED_WITH_ANOTHER_ACTION`; and on the
-  text: every number in a clause with a stop word anywhere in the post, "stop" in any hyphenated
-  or qualified form, "stoploss", "stops" or "sl", but not "stopped", which reports an exit; in a
-  clause that also names a target, only the numbers between the stop word and the target word:
-  more than one distinct value `SEVERAL_STOP_VALUES`, one value other than the action's stop
-  `STOP_TEXT_DIFFERS`; a repeated identical value is not a second stop), farther than the limit from the stated
-  reference (`ENTRY_ANCHOR_STOP_TOO_FAR_FROM_REFERENCE`, the anchor in its own series) or from the
-  proposed limit (`ENTRY_ANCHOR_STOP_TOO_FAR_FROM_LIMIT`, in the series the stop is held in). The
-  gateway checks it; the execution core checks the limit distance again on the limit it sends.
-  Explicit-entry orders are not affected.
+* `max_stop_distance = "5%"`: a **family** rule (owner, 12 November 2026, extended the same day
+  to explicit entries). It governs every OPEN and ADD of the family, explicit-entry and anchored
+  alike; it is required whenever the family has the entry rule and optional otherwise (a family
+  without it behaves exactly as before); strict "N%", code ceiling
+  `validator.ANCHOR_MAX_STOP_DISTANCE_PCT_CEILING` = 10 %; written beside `entry_rule`, and refused
+  inside `[entry_anchor]`. Only TLT sets it. It is an **outer rejection boundary**, not a stop
+  placement the bot recommends, and it does **not** bound the loss actually realised in a gap or
+  with slippage. The bot never synthesizes, moves or chooses a stop. An entry is refused, with
+  one set of codes for both paths, when the stop is:
+  - absent (`PROTECTIVE_STOP_MISSING`; for an ADD the idea's stop as it stands is the one
+    checked, and an ADD to an idea without one holds);
+  - on the wrong side of the entry (`STOP_DIRECTION_CONTRADICTION`);
+  - not uniquely this action's (`PROTECTIVE_STOP_NOT_UNIQUE`, at the mapping stage: more than one
+    value tagged STOP for the action `TWO_STOP_VALUES`; the action's own stop not among them
+    `STOP_DIFFERS_FROM_ACTION`; the value stated by another trading action of the post,
+    commentary aside, `STOP_SHARED_WITH_ANOTHER_ACTION`; and on the text, every number in a
+    clause with a stop word anywhere in the post ("stop" in any hyphenated or qualified form,
+    "stoploss", "stops", "sl"; not "stopped", which reports an exit; in a clause that also names
+    a target, only the numbers between the stop word and the target word): more than one distinct
+    value `SEVERAL_STOP_VALUES`, one value other than the action's stop `STOP_TEXT_DIFFERS`; a
+    repeated identical value is not a second stop);
+  - farther than the limit from the entry (`PROTECTIVE_STOP_TOO_FAR_FROM_ENTRY`: the explicit
+    entry price, or an anchored entry's stated reference, in the publisher's series);
+  - farther than the limit from the limit-entry price actually to be sent
+    (`PROTECTIVE_STOP_TOO_FAR_FROM_LIMIT`, in the series the stop is held in): at the gateway for
+    an anchored entry, and at the execution core before every submission, explicit and anchored,
+    OPEN and ADD, recovery included (for an explicit entry the limit is the collar limit the core
+    computes, so with a 1 % collar a stop 4.5 % below the entry is 5.4 % below the limit and is
+    refused).
+  Exactly at the limit is accepted (inclusive); farther is refused. A distance written as a stop
+  ("Stop 1.20." on an 88 share price) is refused as too far.
 * `long_only = true` (a family switch, default false): an OPEN or ADD on the short side HOLDs at
   the mapping stage (`MAPPING_LONG_ONLY`), explicit and anchored alike. TLT entries are limit
   orders; exits are marketable limits; the protective stop child is a stop order (it becomes a
@@ -432,7 +446,9 @@ sentence). They differ only in how a standalone level sentence is attributed ("4
     "also", "as well", "same" or "likewise" holds (`RULE:ADDITIVE_ELLIPSIS`). Residual, pinned: a
     lowercase unknown market with another verb ("Get qorvex.", "Load qorvex.") is not detected; a
     sentence that opens with an ordinary capitalised word outside the understood vocabulary and
-    holds a context word counts as a mention (over-blocking). A post whose commentary the interpreter itself reads as
+    holds a context word counts as a mention (over-blocking). The owner accepted these residuals for now (12 November 2026: "Accept
+    the documented residual cases for now. Do not open a broad parser redesign to address rare
+    hypothetical phrasing."). A post whose commentary the interpreter itself reads as
     another family's action still holds on the action rule (`ACTION_FOR_ANOTHER_FAMILY`).
   The mention detectors are closed public lists of generic words (`instruction_terms`), never a publisher's:
   `TICKER_SHAPED` (2 to 5 capital letters, optionally with a futures month and year, or any

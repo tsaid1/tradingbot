@@ -210,8 +210,8 @@ class MarketTerms(StrictModel):
     anchor_max_adverse_move: str | None = None
     anchor_max_favourable_move: str | None = None
     anchor_max_signal_age_seconds: float | None = None
-    # The farthest the protective stop may be from the anchor and from the limit ("5%"; D3).
-    anchor_max_stop_distance: str | None = None
+    # The family stop rule ("5%"): the farthest any entry's stop may be from its entry and limit.
+    max_stop_distance: str | None = None
     # The anchor's own basis cap (additive), for a reference-series family with no basis_shift
     # (max_abs_basis above is then None): execution prices, and the quotes' oldest age and skew.
     anchor_max_abs_basis: Decimal | None = None
@@ -283,7 +283,7 @@ class ExecutionPlan(StrictModel):
     anchor_max_signal_age_seconds: float | None = None
     # The stop-distance limit the gateway applied (D3); the execution core applies it again to the
     # limit it sends (additive).
-    anchor_max_stop_distance: str | None = None
+    max_stop_distance: str | None = None
 
 
 class GateDecision(StrictModel):

@@ -157,7 +157,7 @@ ENTRY_ANCHOR_LEVEL_NOT_MARKET_QUOTE = "ENTRY_ANCHOR_LEVEL_NOT_MARKET_QUOTE"
 # TWO_STOP_VALUES, STOP_DIFFERS_FROM_ACTION, STOP_SHARED_WITH_ANOTHER_ACTION). D5: a short entry
 # in a long-only family.
 ENTRY_ANCHOR_POST_UNATTRIBUTED_ACTION = "ENTRY_ANCHOR_POST_UNATTRIBUTED_ACTION"
-ENTRY_ANCHOR_STOP_NOT_UNIQUE = "ENTRY_ANCHOR_STOP_NOT_UNIQUE"
+PROTECTIVE_STOP_NOT_UNIQUE = "PROTECTIVE_STOP_NOT_UNIQUE"
 MAPPING_LONG_ONLY = "MAPPING_LONG_ONLY"
 # Runtime modes in which a family may carry entry_rule = REFERENCE_AS_COLLAR: an allow-list, so a
 # future mode never inherits the rule silently. Only the simulated mode exists today.
@@ -446,14 +446,12 @@ class EntryAnchorRules(StrictModel):
     # or its own stop-and-target sentence, when every own instruction sentence passes the
     # whole-sentence allow-list (docs/MULTI_ASSET_MAPPING.md, "What the level is").
     standalone_level_sentence: StrictBool = False
-    # Owner, 12 November 2026 (D3): the farthest the protective stop may be, as a percentage, from
-    # the stated market reference and from the proposed limit-entry price. Required, no default;
-    # an outer rejection threshold, never a stop the bot sets. Ceiling validator.ANCHOR_MAX_STOP_*.
-    max_stop_distance: StrictStr = Field(pattern=r"^\d+(?:\.\d+)?%$")
-
     @model_validator(mode="before")
     @classmethod
     def _renamed(cls, data):
+        if isinstance(data, dict) and "max_stop_distance" in data:
+            raise ValueError("max_stop_distance is a family-level key (it governs every entry of "
+                             "the family): write it beside entry_rule, not in [entry_anchor]")
         if isinstance(data, dict) and "level_after_own_protective_levels" in data:
             raise ValueError("level_after_own_protective_levels was renamed to "
                              "standalone_level_sentence (an elliptical level may anchor only "
@@ -479,12 +477,6 @@ class EntryAnchorRules(StrictModel):
         if self.max_signal_age_seconds > ANCHOR_MAX_SIGNAL_AGE_CEILING_SECONDS:
             raise ValueError(f"max_signal_age_seconds {self.max_signal_age_seconds} is above its "
                              f"ceiling of {ANCHOR_MAX_SIGNAL_AGE_CEILING_SECONDS} s (a code "
-                             "constant)")
-        stop_limit = Decimal(self.max_stop_distance[:-1])
-        if not stop_limit.is_finite() or stop_limit <= 0 \
-                or stop_limit > ANCHOR_MAX_STOP_DISTANCE_PCT_CEILING:
-            raise ValueError(f"max_stop_distance {self.max_stop_distance!r} must be above 0 and at "
-                             f"most its ceiling of {ANCHOR_MAX_STOP_DISTANCE_PCT_CEILING}% (a code "
                              "constant)")
         if self.max_quote_age_seconds > ANCHOR_MAX_QUOTE_AGE_CEILING_SECONDS:
             raise ValueError(f"max_quote_age_seconds {self.max_quote_age_seconds:g} is above its "
@@ -603,6 +595,13 @@ class FamilyMapping(StrictModel):
     # Owner, 12 November 2026 (D5): an OPEN or ADD on the short side HOLDs at the mapping stage
     # (MAPPING_LONG_ONLY), for explicit and anchored entries alike. Default false.
     long_only: StrictBool = False
+    # Owner, 12 November 2026: the farthest the protective stop of ANY entry of this family
+    # (explicit or anchored, OPEN or ADD) may be, as a percentage, from the entry (the explicit
+    # price, or the stated reference of an anchored entry) and from the limit actually sent.
+    # Strict "N%", code ceiling validator.ANCHOR_MAX_STOP_DISTANCE_PCT_CEILING; required with
+    # entry_rule = REFERENCE_AS_COLLAR, optional otherwise (absent: today's behaviour). An outer
+    # rejection boundary, never a stop the bot sets; it does not bound the loss in a gap.
+    max_stop_distance: StrictStr | None = Field(default=None, pattern=r"^\d+(?:\.\d+)?%$")
 
     @field_validator("aliases")
     @classmethod
@@ -619,6 +618,14 @@ class FamilyMapping(StrictModel):
             bad("entry_rule = REFERENCE_AS_COLLAR needs its [entry_anchor] limits "
                 "(max_adverse_move, max_favourable_move, max_signal_age_seconds; no defaults), "
                 "and [entry_anchor] is used only by it")
+        if self.max_stop_distance is not None:
+            stop_limit = Decimal(self.max_stop_distance[:-1])
+            if not stop_limit.is_finite() or stop_limit <= 0 \
+                    or stop_limit > ANCHOR_MAX_STOP_DISTANCE_PCT_CEILING:
+                bad(f"max_stop_distance {self.max_stop_distance!r} must be above 0 and at most "
+                    f"its ceiling of {ANCHOR_MAX_STOP_DISTANCE_PCT_CEILING}% (a code constant)")
+        if collar and self.max_stop_distance is None:
+            bad("entry_rule = REFERENCE_AS_COLLAR needs max_stop_distance (a family-level key)")
         if collar and (self.basis == "UNSUPPORTED" or self.family.endswith(".OPT")):
             bad("entry_rule = REFERENCE_AS_COLLAR applies to a non-option traded family only")
 
@@ -879,8 +886,7 @@ class FamilyMapping(StrictModel):
             anchor_max_abs_basis=self.entry_anchor.max_abs_basis if self.entry_anchor else None,
             anchor_max_basis_age_seconds=self.entry_anchor.max_basis_age_seconds
             if self.entry_anchor else None,
-            anchor_max_stop_distance=self.entry_anchor.max_stop_distance
-            if self.entry_anchor else None,
+            max_stop_distance=self.max_stop_distance,
             anchor_max_quote_age_seconds=self.entry_anchor.max_quote_age_seconds
             if self.entry_anchor else None,
             problems=out,
@@ -1113,31 +1119,6 @@ class FamilyMapping(StrictModel):
                     (other_clause and other_clause == terms.clause) or anchor in other_values):
                 return None, None, [ENTRY_ANCHOR_INSTRUMENT_AMBIGUOUS,
                                     "SHARED_WITH_ANOTHER_INSTRUMENT"]
-        # D3: the protective stop must be uniquely this action's. Checked on the interpreter's
-        # facts only: the stop values it tagged STOP for this action, the action's own stop, and
-        # the values every other action of the post states.
-        if action.action == Action.OPEN:
-            tagged = {v for role, raw in levels or () if role == "STOP"
-                      and (v := _level(raw)) is not None}
-            own_stop = _level(action.stop_price) if action.stop_price is not None else None
-            if len(tagged) > 1:
-                return None, None, [ENTRY_ANCHOR_STOP_NOT_UNIQUE, "TWO_STOP_VALUES"]
-            if own_stop is not None and tagged and own_stop not in tagged:
-                return None, None, [ENTRY_ANCHOR_STOP_NOT_UNIQUE, "STOP_DIFFERS_FROM_ACTION"]
-            stop_value = own_stop if own_stop is not None else next(iter(tagged), None)
-            # Review of PR #70: every number in a clause with a stop word, anywhere in the post
-            # (a second stop in its own sentence; a repeated identical value is not a second one).
-            written = stop_values(post_text or terms.clause)
-            if len(written) > 1:
-                return None, None, [ENTRY_ANCHOR_STOP_NOT_UNIQUE, "SEVERAL_STOP_VALUES"]
-            if written and stop_value is not None and written != {stop_value}:
-                return None, None, [ENTRY_ANCHOR_STOP_NOT_UNIQUE, "STOP_TEXT_DIFFERS"]
-            # Another TRADING action's stated values (commentary does not share a stop).
-            trading = (post or {}).get("trading_values")
-            pool = trading if trading is not None else [vals for _, _, vals in others]
-            if stop_value is not None and any(stop_value in vals for vals in pool):
-                return None, None, [ENTRY_ANCHOR_STOP_NOT_UNIQUE,
-                                    "STOP_SHARED_WITH_ANOTHER_ACTION"]
         if anchor in clause_numbers(terms.clause):
             source = terms.clause
         else:
@@ -1614,6 +1595,31 @@ class FamilyMapping(StrictModel):
 _LINE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+|\n+")
 
 
+def _stop_not_unique(action, levels, others, text, trading_values) -> list[str]:
+    """The family stop rule (owner, 12 November 2026): an entry's protective stop must be
+    uniquely this action's; the bot never selects among competing stops. Checked on the
+    interpreter's facts (the values tagged STOP for the action, the action's own stop, the values
+    other trading actions of the post state) and on the text (every number in a clause with a
+    stop word anywhere in the post, ``stop_values``). A repeated identical value is not a second
+    stop. An ADD is checked on the text only: its stop is the idea's, checked at the gateway."""
+    tagged = {v for role, raw in levels or () if role == "STOP" and (v := _level(raw)) is not None}
+    own_stop = _level(action.stop_price) if action.stop_price is not None else None
+    if len(tagged) > 1:
+        return [PROTECTIVE_STOP_NOT_UNIQUE, "TWO_STOP_VALUES"]
+    if own_stop is not None and tagged and own_stop not in tagged:
+        return [PROTECTIVE_STOP_NOT_UNIQUE, "STOP_DIFFERS_FROM_ACTION"]
+    stop_value = own_stop if own_stop is not None else next(iter(tagged), None)
+    written = stop_values(text or "")
+    if len(written) > 1:
+        return [PROTECTIVE_STOP_NOT_UNIQUE, "SEVERAL_STOP_VALUES"]
+    if written and stop_value is not None and written != {stop_value}:
+        return [PROTECTIVE_STOP_NOT_UNIQUE, "STOP_TEXT_DIFFERS"]
+    pool = trading_values if trading_values is not None else [v for _, _, v in others]
+    if stop_value is not None and any(stop_value in vals for vals in pool):
+        return [PROTECTIVE_STOP_NOT_UNIQUE, "STOP_SHARED_WITH_ANOTHER_ACTION"]
+    return []
+
+
 def _allow_list(action, levels, markers, own, lexicon):
     """The whole-sentence allow-list of an anchor's sentence (and of the sentence before a level
     sentence): markers, this family's names, the action's own side, verb and level words and the
@@ -1852,6 +1858,12 @@ class MappingPolicy:
         if getattr(entry, "long_only", False) and action.action in (Action.OPEN, Action.ADD) \
                 and action.position_side == PositionSide.SHORT:
             return MappingDecision(status="UNRESOLVED", reason=MAPPING_LONG_ONLY, **out), None
+        if not revoked and getattr(entry, "max_stop_distance", None) \
+                and action.action in (Action.OPEN, Action.ADD):
+            problem = _stop_not_unique(action, levels, others, post_text or clause,
+                                       trading_values)
+            if problem:
+                return MappingDecision(status="UNRESOLVED", reason=",".join(problem), **out), None
         if action.instrument is not None and action.instrument.symbol not in (
             asset, entry.execution.symbol
         ):

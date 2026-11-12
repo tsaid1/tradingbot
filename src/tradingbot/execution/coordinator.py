@@ -78,7 +78,7 @@ from tradingbot.validator import (
     ANCHOR_MAX_QUOTE_AGE_CEILING_SECONDS,
     ANCHOR_RULE_INCOMPLETE,
     ANCHOR_SIGNAL_TOO_OLD,
-    ANCHOR_STOP_TOO_FAR_FROM_LIMIT,
+    STOP_TOO_FAR_FROM_LIMIT,
     anchor_quote_problem,
     fill_quantity,
     finite_positive,
@@ -278,15 +278,19 @@ def _anchor_quote_age(plan: ExecutionPlan | None) -> float | None:
 
 
 def _held_stop(plan: ExecutionPlan | None, stop: Decimal | None) -> Decimal | None:
-    """The stop an anchored entry's limit is checked against at the execution core (D3): held in
-    the execution series; a reference-series stop is the gateway's to check."""
-    if _anchored_limit(plan) is None or plan.protection_series != "EXECUTION":
+    """The stop an entry's limit is checked against at the execution core under the family stop
+    rule (any entry whose plan carries ``max_stop_distance``): held in the execution series; a
+    reference-series stop is the gateway's to check."""
+    if plan is None or not plan.max_stop_distance or plan.protection_series != "EXECUTION":
         return None
     return stop
 
 
 def _stop_spec(plan: ExecutionPlan | None) -> str | None:
-    return plan.anchor_max_stop_distance if plan is not None else None
+    # A reference-series stop (REFERENCE_TRIGGER) is checked by the gateway only.
+    if plan is None or plan.protection_series != "EXECUTION":
+        return None
+    return plan.max_stop_distance
 
 
 def _plan_of(raw: str | None) -> ExecutionPlan | None:
@@ -2657,12 +2661,15 @@ class ExecutionCoordinator:
             if buy
             else snap_to_tick(ref * (1 - band), contract.min_tick, ROUND_CEILING)
         )
-        if fixed_limit is not None and anchor_stop is not None:
-            # D3 again at the last check: the held stop within the limit of the limit sent.
+        if anchor_stop_distance:
+            # The family stop rule at the last check, explicit and anchored alike: the held stop
+            # within the limit of the limit actually sent (recomputed here for an explicit entry).
             pct = stop_distance_limit(anchor_stop_distance)
             if pct is None:
                 return None, [ANCHOR_RULE_INCOMPLETE]
-            far = stop_distance_problem(anchor_stop, limit, pct, ANCHOR_STOP_TOO_FAR_FROM_LIMIT)
+            if anchor_stop is None:
+                return None, ["PROTECTIVE_STOP_MISSING"]
+            far = stop_distance_problem(anchor_stop, limit, pct, STOP_TOO_FAR_FROM_LIMIT)
             if far:
                 return None, far
         mult = contract.multiplier

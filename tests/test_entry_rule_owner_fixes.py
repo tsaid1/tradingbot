@@ -54,21 +54,21 @@ BASE = "We are now long $TLT, 88.42 now. Stop 87.20."
                                    "Trailing stop 87.40.", "Stop-loss 87.00.", "Stoploss 87.00."])
 def test_a_second_stop_anywhere_in_the_post_holds_the_anchored_entry(extra):
     out, orders, _ = run([f"{BASE} {extra}"])
-    assert not orders and "ENTRY_ANCHOR_STOP_NOT_UNIQUE" in out[0][2], out
+    assert not orders and "PROTECTIVE_STOP_NOT_UNIQUE" in out[0][2], out
 
 
 def test_the_hold_names_the_text_level_reason(tmp_path):
     d = decide(tmp_path, f"{C} Hard stop 48.50.")
-    assert d.reason.split(",")[:2] == ["ENTRY_ANCHOR_STOP_NOT_UNIQUE", "SEVERAL_STOP_VALUES"]
+    assert d.reason.split(",")[:2] == ["PROTECTIVE_STOP_NOT_UNIQUE", "SEVERAL_STOP_VALUES"]
     d = decide(tmp_path, "We are now long $QETF, 50.10 now. Stop 48.50.")  # text differs
-    assert d.reason.split(",")[:2] == ["ENTRY_ANCHOR_STOP_NOT_UNIQUE", "STOP_TEXT_DIFFERS"]
+    assert d.reason.split(",")[:2] == ["PROTECTIVE_STOP_NOT_UNIQUE", "STOP_TEXT_DIFFERS"]
 
 
 @pytest.mark.parametrize("extra", ["Stop 87.20 again.", "The stop stays at 87.20.",
                                    "We got stopped out last month."])
 def test_a_repeated_stop_or_a_report_of_being_stopped_is_not_a_second_stop(extra):
     out, _, _ = run([f"{BASE} {extra}"])
-    assert all("ENTRY_ANCHOR_STOP_NOT_UNIQUE" not in o[2] for o in out), out
+    assert all("PROTECTIVE_STOP_NOT_UNIQUE" not in o[2] for o in out), out
 
 
 # ================================================================== a-d: missed second instruments

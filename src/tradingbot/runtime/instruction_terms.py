@@ -970,27 +970,24 @@ def has_phrase(sentence: str, phrases) -> bool:
 
 
 def stop_values(text: str) -> set[Decimal]:
-    """Every number written in the same clause as a stop word, anywhere in ``text``; in a clause
-    that also names a target, only the numbers after a stop word and before the target word."""
+    """Every stop value written anywhere in ``text``: the first number after each stop word, in
+    the same clause (so "a stop at 88 on our long at 90" reads 88, and "Stop 87.20 2026." reads
+    87.20). A repeated identical value is one value."""
     out: set[Decimal] = set()
-    profit = STOP_TARGET_WORDS - STOP_PRICE_WORDS
     for sentence, _ in sentences(text):
         for seg in _SEGMENT_RE.split(sentence):
             if not seg or not words_with_parts(seg) & STOP_PRICE_WORDS:
                 continue
             spans = extract_terms(seg).month_spans
-            has_target = bool(words_with_parts(seg) & profit)
-            collecting = not has_target
+            waiting = False
             for m in _TOKEN_RE.finditer(seg):
-                parts = _parts(m.group(0))
-                if parts & STOP_PRICE_WORDS:
-                    collecting = True
-                elif parts & profit:
-                    collecting = False
-                elif collecting and not any(a <= m.start() < b for a, b in spans):
+                if _parts(m.group(0)) & STOP_PRICE_WORDS:
+                    waiting = True
+                elif waiting and not any(a <= m.start() < b for a, b in spans):
                     v = _value(m.group(0))
                     if v is not None:
                         out.add(v)
+                        waiting = False
     return out
 
 
