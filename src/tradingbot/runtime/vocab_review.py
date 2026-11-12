@@ -202,8 +202,9 @@ class ReviewLog:
             os.close(fd)
 
     def append(self, record: dict) -> bool:
-        """Append one hold, unless the same hold (post, revision, action, reason) is already in
-        the log: a replay or a restart never duplicates it. True when appended."""
+        """Append one hold, unless the same hold (post, revision, action, reason code and
+        detail) is already in the log: a replay or a restart never duplicates it. The key is not
+        the words: the earlier line of the same hold already carries them. True when appended."""
         key = record_key(record)
         if key in self._seen:
             return False

@@ -400,3 +400,40 @@ def test_the_owner_can_truncate_the_review_log(tmp_path):
     assert [json.loads(x)["source_id"] for x in log.read_text().splitlines()] == ["7", "8", "9"]
     assert oct(log.stat().st_mode & 0o777) == "0o600"
     assert V.truncate_review_log(log, keep_last=3) == 0
+
+
+# ------------------------------------------------------------------ S6 follow-up: unknown keys
+
+
+@pytest.mark.parametrize("content", [
+    {"zorbleflux": []},  # an unknown top-level key
+    {"entry_anchor": {"zorbleflux": 1}},  # an unknown key in the entry-anchor section
+    {"entry_anchor": {"family_aliases": {"TLT": {"zorbleflux": 1}}}},  # one level deeper
+    {"entry_anchor": {"family_aliases": {"Zorbleflux": ["now"]}}},  # a private family key
+    {"entry_anchor": {"family_aliases": {"Zorbleflux": "not a list"}}},
+], ids=["top", "section", "deeper", "family-key", "family-key-type"])
+def test_an_unknown_or_private_key_never_appears_in_a_lexicon_error(tmp_path, content):
+    from test_vocab_review_page import write_config
+
+    from tradingbot.runtime.service import load_lexicons
+
+    lex = private_dir(tmp_path) / "bad.json"
+    lex.write_text(json.dumps(content))
+    lex.chmod(0o600)
+    with pytest.raises(ConfigError) as exc:
+        load_lexicons(lex)
+    assert not contains(str(exc.value), "zorbleflux") and "input_value" not in str(exc.value)
+    (tmp_path / "b").mkdir()
+    rt = Runtime(tmp_path / "b", [], mapping_file=MAPPING)
+    rt.service.close()
+    cfg = write_config(rt, tmp_path / "runtime.toml", interpreter={"lexicon_path": lex})
+    proc = subprocess.run(
+        [sys.executable, str(REPO / "scripts" / "run_service.py"), "--config", str(cfg), "--once"],
+        capture_output=True, text=True, env={**os.environ, "PYTHONPATH": str(REPO / "src")},
+        timeout=120, check=False)
+    assert proc.returncode == 2 and "refusing to start" in proc.stderr
+    for blob in (proc.stdout, proc.stderr):
+        assert not contains(blob, "zorbleflux"), blob
+    for f in (tmp_path / "b").rglob("*"):  # logs, the alert file, the journal
+        if f.is_file():
+            assert not contains(f.read_bytes(), "zorbleflux"), f.name

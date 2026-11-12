@@ -238,8 +238,9 @@ def load_lexicons(path, *, allow_candidate: bool = False
         return read_lexicons(path, allow_candidate=allow_candidate)
     except ValidationError as exc:
         errors = exc.errors()
-        prefix = "entry_anchor." if exc.title == AnchorLexicon.__name__ else ""
-        locs = sorted({prefix + ".".join(str(x) for x in e["loc"] if not isinstance(x, int))
+        anchor = exc.title == AnchorLexicon.__name__
+        model = AnchorLexicon if anchor else LexiconExtension
+        locs = sorted({("entry_anchor." if anchor else "") + _schema_path(model, e)
                        for e in errors})
         raise ConfigError(f"the private lexicon {path} is refused by its validators: "
                           f"{len(errors)} error(s) of type {type(exc).__name__} at "
@@ -251,6 +252,23 @@ def load_lexicons(path, *, allow_candidate: bool = False
     except (TypeError, AttributeError) as exc:
         raise ConfigError(f"the private lexicon {path} is not a JSON object "
                           f"({type(exc).__name__})") from None
+
+
+UNKNOWN_KEY = "<unknown key>"
+
+
+def _schema_path(model, error: dict) -> str:
+    """A validation error's field path built only from names the schema declares (review S6): a
+    key name in a private file can itself be a private word, so an unknown key (``extra_forbidden``
+    or any segment that is not a declared field, such as a family name under ``family_aliases``)
+    is reported as ``<unknown key>``; list indexes are dropped."""
+    out = []
+    for depth, seg in enumerate(error.get("loc") or ()):
+        if isinstance(seg, int):
+            continue
+        known = depth == 0 and seg in model.model_fields and error.get("type") != "extra_forbidden"
+        out.append(seg if known else UNKNOWN_KEY)
+    return ".".join(out) or "-"
 
 
 def read_lexicons(path, *, allow_candidate: bool = False
