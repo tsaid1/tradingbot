@@ -9,12 +9,18 @@ amends or cancels an order; every function only reads the broker and writes the 
   at the broker like any other fill. A settlement that contradicts what the broker shows now is
   refused (the order or a fill is visible, a limit was violated, the resulting follower position
   cannot match the broker's).
-* ``clear_exception``: a LEDGER_REVERSAL closes only when a full sync and reconciliation made now
-  show the contract clean.
+* ``clear_exception``: a CLEAR-class record (LEDGER_REVERSAL, SETTLED_INTENT_CONTRADICTED) closes
+  only when a full sync and reconciliation made now show the contract clean.
 * ``acknowledge_exception``: an informational record that blocks no exposure.
 * ``lift_verified_blocks``: a settled intent leaves OPERATOR_SETTLEMENT_UNVERIFIED open, which
   blocks new exposure in its contract until a full successful sync and reconciliation show no
-  blocking discrepancy there. Only that evidence resolves it.
+  blocking discrepancy there. Only that evidence resolves it, and never in the call that records
+  the settlement. A NOT_AT_BROKER or CANCELLED settlement needs, AFTER it, the evidence rule the
+  core uses before resending an exit: the settle period elapsed and at least
+  ``exit_no_trace_lookups`` consecutive no-trace lookups (open orders, executions, completed
+  orders) spread over that period, then a clean reconciliation of the contract (review F1). Broker
+  evidence for such an intent later is a contradiction (``SETTLED_INTENT_CONTRADICTED``, see
+  ``ExecutionCoordinator._settlement_contradictions``), never a normal adoption.
 
 Every action, applied or refused, is journaled append-only in ``exec_journal`` with its time,
 request id and the state before and after. The operator's note stays in the operator queue
@@ -32,8 +38,10 @@ from pydantic import Field
 from tradingbot.execution import operator_catalog as cat
 from tradingbot.execution.broker import BrokerError, OrderSide, OrderStatus
 from tradingbot.execution.coordinator import (
+    COMPLETED_LOOKBACK,
     ENTRY_STATE_UNKNOWN,
     OPERATOR_SETTLEMENT_UNVERIFIED,
+    SETTLED_WITHOUT_FILL_REASONS,
     UNKNOWN_OUTCOME_BEYOND_LOOKUP_HORIZON,
     UNKNOWN_OUTCOME_ENTRY_NOT_RESENT,
     ExecutionCoordinator,
@@ -169,6 +177,8 @@ def settle_intent(
         problems.append(f"INTENT_NOT_UNRESOLVED:{intent.state.value}")
     if intent.action == Action.MODIFY:
         problems.append("MODIFY_SETTLES_FROM_BROKER_EVIDENCE")
+    if coord.settlement_record(order_ref) is not None:
+        problems.append("ALREADY_SETTLED_BY_OPERATOR")
     price: Decimal | None = None
     if outcome == "FILLED":
         try:
@@ -242,9 +252,12 @@ def settle_intent(
                       operator, note, before)
     coord.sync()  # protection is sized and confirmed (or flagged) exactly as after a fill
     after = _state(coord, order_ref, idea)
-    lifted = lift_verified_blocks(coord)
-    if lifted:
-        after = _state(coord, order_ref, idea)
+    lifted: list[int] = []
+    if outcome == "FILLED":
+        # A NOT_AT_BROKER or CANCELLED block never lifts in the call that records it (review F1).
+        lifted = lift_verified_blocks(coord)
+        if lifted:
+            after = _state(coord, order_ref, idea)
     return OperatorResult(status="APPLIED", before=before, after=after, lifted=lifted)
 
 
@@ -362,7 +375,7 @@ def _apply_settlement(coord, intent, rows, outcome, fill_qty, price, request_id,
         store.log(
             now, "OPERATOR_SETTLEMENT", order_ref=intent.order_ref, idea_id=intent.idea_id, c=c,
             request_id=request_id, action=cat.SETTLE, status="APPLIED", outcome=outcome,
-            declared_quantity=total if outcome == "FILLED" else 0,
+            declared_quantity=total if outcome == "FILLED" else 0, declared_filled=total,
             declared_price=str(price) if price is not None else None,
             fill_applied=fill_qty, intent_state=state.value, exceptions_ended=ended,
             before=before, operator=operator, note_sha256=note_digest(note),
@@ -373,11 +386,16 @@ def _apply_settlement(coord, intent, rows, outcome, fill_qty, price, request_id,
 # ============================================================================ verification
 
 
-def _blocking_in(coord, report, key: str) -> list[str]:
+def _blocking_in(coord, report, key: str, exclude=None) -> list[str]:
+    """Blocking discrepancy kinds in the contract (``exclude``: the exception being cleared, whose
+    own reconciliation line is not evidence against clearing it)."""
     ideas = {p.idea_id for p in _ideas_in(coord, key)}
     symbol = next((p.symbol for p in _ideas_in(coord, key)), None)
     out = []
     for d in report.blocking:
+        if exclude is not None and d.kind.value == exclude.kind \
+                and d.order_ref == exclude.order_ref and d.idea_id == exclude.idea_id:
+            continue
         if (
             d.contract_key == key
             or (d.idea_id is not None and d.idea_id in ideas)
@@ -387,23 +405,87 @@ def _blocking_in(coord, report, key: str) -> list[str]:
     return sorted(set(out))
 
 
+def _no_fill_settlement(coord, e) -> tuple[Intent | None, object]:
+    """The intent and settlement journal entry of a NOT_AT_BROKER or CANCELLED settlement."""
+    intent = coord.store.intent(e.order_ref) if e.order_ref else None
+    if intent is None or not any(r in SETTLED_WITHOUT_FILL_REASONS for r in intent.reasons):
+        return None, None
+    return intent, coord.settlement_record(intent.order_ref)
+
+
+def _no_trace_run(coord, intent, record, now) -> tuple[float, list]:
+    """Seconds since the settlement and the consecutive no-trace lookups after it (a failed
+    lookup breaks the run)."""
+    since = (now - record.at).total_seconds()
+    run = []
+    for j in coord.store.journal(intent.order_ref):
+        if j.seq <= record.seq:
+            continue
+        if j.event == "SETTLEMENT_LOOKUP_FAILED":
+            run = []
+        elif j.event == "SETTLEMENT_NO_TRACE_LOOKUP" and j.at > record.at:
+            run.append(j.at)
+    return since, run
+
+
 def lift_verified_blocks(coord: ExecutionCoordinator) -> list[int]:
     """Resolve each open OPERATOR_SETTLEMENT_UNVERIFIED whose contract a full successful sync and a
-    reconciliation made now show without blocking discrepancy. Returns the ids resolved."""
+    reconciliation made now show without blocking discrepancy. A NOT_AT_BROKER or CANCELLED
+    settlement first needs, after it, the settle period and ``exit_no_trace_lookups`` consecutive
+    no-trace lookups spread over at least that period (each call is one lookup). Returns the ids
+    resolved."""
     pending = [
         e for e in coord.store.exceptions(open_only=True)
         if e.kind == OPERATOR_SETTLEMENT_UNVERIFIED
     ]
-    if not pending or not coord.sync():
+    if not pending:
+        return []
+    no_fill = {e.id: _no_fill_settlement(coord, e) for e in pending}
+    no_fill = {k: v for k, v in no_fill.items() if v[0] is not None and v[1] is not None}
+    synced = coord.sync()
+    reads = None
+    if synced and no_fill:
+        try:
+            since = min(r.at for _, r in no_fill.values()) - COMPLETED_LOOKBACK
+            reads = (coord.broker.open_orders(), coord.broker.executions(),
+                     coord.broker.completed_orders(since=since))
+        except BrokerError as exc:
+            coord.mark_broker_unreadable("settlement lookup", exc)
+    now = coord.clock()
+    for intent, _ in no_fill.values():
+        if reads is None:
+            coord.store.log(now, "SETTLEMENT_LOOKUP_FAILED", order_ref=intent.order_ref,
+                            idea_id=intent.idea_id, rule="a failed lookup restarts the run")
+            continue
+        fresh = coord.store.intent(intent.order_ref)
+        if fresh is None or fresh.state != intent.state or fresh.reasons != intent.reasons:
+            continue  # contradicted by the sync just made
+        trace = coord.settlement_trace(fresh, *reads)
+        if trace:  # seen between the sync and this read: the next sync raises the contradiction
+            continue
+        coord.store.log(now, "SETTLEMENT_NO_TRACE_LOOKUP", order_ref=intent.order_ref,
+                        idea_id=intent.idea_id,
+                        rule="no trace in open orders, executions or completed orders")
+    if not synced or (reads is None and no_fill):
         return []
     report = coord.reconcile()
     if any(d.kind == DiscrepancyKind.BROKER_UNREADABLE for d in report.discrepancies):
         return []
     lifted = []
     for e in pending:
+        if coord.store.exception(e.id).resolved_at is not None:
+            continue  # superseded by a contradiction during the sync
         intent = coord.store.intent(e.order_ref) if e.order_ref else None
         if intent is None:
             continue
+        if e.id in no_fill:
+            record = no_fill[e.id][1]
+            since, run = _no_trace_run(coord, intent, record, now)
+            cfg = coord.config
+            span = (run[-1] - run[0]).total_seconds() if run else 0.0
+            if since < cfg.settle_seconds or len(run) < cfg.exit_no_trace_lookups \
+                    or span < cfg.settle_seconds:
+                continue
         key = _contract_key(coord, intent)
         blocking = _blocking_in(coord, report, key)
         if blocking:
@@ -461,7 +543,7 @@ def clear_exception(
     key = (
         coord._key_of(pos.symbol, pos.asset_class, pos.contract_key) if pos else f"IDEA:{idea}"
     )
-    blocking = _blocking_in(coord, report, key)
+    blocking = _blocking_in(coord, report, key, exclude=e)
     if blocking:
         return refuse([f"CONTRACT_NOT_CLEAN:{','.join(blocking)}"])
     now = coord.clock()

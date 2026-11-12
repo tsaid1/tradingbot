@@ -89,9 +89,13 @@ def test_not_at_broker_settles_the_intent_and_lifts_the_block_after_a_clean_sync
     assert intent.state == IntentState.CANCELLED
     assert intent.reasons == ["OPERATOR_SETTLED_NOT_AT_BROKER"]
     assert h.coord.store.position("p1:open").status == "NOT_FILLED"
-    assert open_kinds(h) == []  # outcome exception ended, verification lifted at once (clean)
-    assert result.lifted and result.before["intent"]["state"] == "UNRESOLVED"
+    # The outcome exception ended; the verification block never lifts in the same call (F1).
+    assert open_kinds(h) == [C.OPERATOR_SETTLEMENT_UNVERIFIED]
+    assert result.lifted == [] and result.before["intent"]["state"] == "UNRESOLVED"
     assert result.after["intent"]["state"] == "CANCELLED"
+    assert second_open_state(h, "p2b").state == IntentState.REFUSED
+    assert wait_for_verification(h)
+    assert open_kinds(h) == []
     events = h.events(ref)
     assert "OPERATOR_SETTLEMENT" in events and "OPERATOR_SETTLEMENT_VERIFIED" in events
     entry = next(e for e in h.coord.store.journal(ref) if e.event == "OPERATOR_SETTLEMENT")
@@ -205,6 +209,8 @@ def test_cancelled_beyond_the_horizon_ends_the_intent_without_a_fill(h):
     assert result.status == "APPLIED"
     assert h.coord.intent(out.order_ref).state == IntentState.CANCELLED
     assert h.coord.store.position("p1:open").status == "NOT_FILLED"
+    assert open_kinds(h) == [C.OPERATOR_SETTLEMENT_UNVERIFIED]
+    assert wait_for_verification(h)
     assert open_kinds(h) == []
 
 
@@ -247,23 +253,23 @@ def test_only_an_intent_of_unknown_outcome_can_be_settled(h):
 
 def test_the_block_lifts_only_after_a_full_successful_sync(h, monkeypatch):
     ref = never_arrived(h)
-    real_sync = h.coord.sync
-    state = {"fail": 2}
-
-    def sync(**kw):
-        # The settlement's own reads succeed; the broker is unreadable right after it.
-        if state["fail"] and any(e.event == "OPERATOR_SETTLEMENT" for e in h.coord.store.journal()):
-            state["fail"] -= 1
-            return False
-        return real_sync(**kw)
-
-    monkeypatch.setattr(h.coord, "sync", sync)
     result = settle(h, ref, "NOT_AT_BROKER")
     assert result.status == "APPLIED" and result.lifted == []
+    real_sync = h.coord.sync
+    state = {"fail": True}
+
+    def sync(**kw):
+        return False if state["fail"] else real_sync(**kw)
+
+    monkeypatch.setattr(h.coord, "sync", sync)
+    for _ in range(10):  # the broker is unreadable after the settlement: nothing lifts
+        h.clock.advance(3)
+        assert S.lift_verified_blocks(h.coord) == []
     assert open_kinds(h) == [C.OPERATOR_SETTLEMENT_UNVERIFIED]
+    state["fail"] = False
     blocked = second_open_state(h, "p2")
     assert blocked.reasons == [f"INSTRUMENT_BLOCKED_{C.OPERATOR_SETTLEMENT_UNVERIFIED}"]
-    assert S.lift_verified_blocks(h.coord) != []
+    assert wait_for_verification(h) != []
     assert open_kinds(h) == []
     assert second_open_state(h, "p3").state == IntentState.FILLED
 
@@ -349,6 +355,171 @@ def test_an_informational_exception_is_acknowledged_without_touching_the_broker(
     assert C.EXIT_WITHOUT_QUOTE not in open_kinds(h)
 
 
+# ----------------------------------------------------------------------------------- lagging broker
+
+
+def resting_but_invisible(h, sid="p1"):
+    """Placed and resting at the broker, the ack lost, and open orders lag: the operator sees
+    nothing and (wrongly) declares NOT_AT_BROKER."""
+    h.broker.open_orders_lag_seconds = 3600
+    h.broker.script_next_submit("LOST_ACK_PLACED_RESTING")
+    out = h.execute(sid, open_action())
+    h.clock.advance(h.config.settle_seconds + 1)
+    h.coord.recover()
+    assert h.coord.intent(out.order_ref).state == IntentState.UNRESOLVED
+    return out.order_ref
+
+
+def broker_net(h) -> int:
+    return sum(p.quantity for p in h.broker.positions())
+
+
+def wait_for_verification(h, seconds=None, step=2.0):
+    """Normal cycles after a settlement: recover, then the verification pass."""
+    lifted = []
+    end = seconds if seconds is not None else h.config.settle_seconds * 3
+    t = 0.0
+    while t <= end and not lifted:
+        h.clock.advance(step)
+        t += step
+        h.broker.set_quote(SYMBOL, "49.98", "50.02")
+        h.coord.recover()
+        lifted = S.lift_verified_blocks(h.coord)
+    return lifted
+
+
+def test_probe_not_at_broker_while_open_orders_lag_never_lifts_in_the_same_call(h):
+    """Review F1 probe: NOT_AT_BROKER declared on a lagging read. The block must not lift in the
+    call that records it; a second OPEN stays refused; the original's later fill is a
+    contradiction (recorded, blocking, alerted, reconciliation unclean), never a silent adoption."""
+    ref = resting_but_invisible(h)
+    result = settle(h, ref, "NOT_AT_BROKER")
+    assert result.status == "APPLIED" and result.lifted == []
+    assert C.OPERATOR_SETTLEMENT_UNVERIFIED in open_kinds(h)
+    second = second_open_state(h, "p2")
+    assert second.state == IntentState.REFUSED
+    assert second.reasons == [f"INSTRUMENT_BLOCKED_{C.OPERATOR_SETTLEMENT_UNVERIFIED}"]
+
+    h.broker.fill(ref)  # the original was resting all along and now fills
+    h.coord.sync()
+
+    assert h.coord.store.filled_quantity(ref) == 4  # recorded as it happened
+    assert broker_net(h) == 4
+    assert C.SETTLED_INTENT_CONTRADICTED in open_kinds(h)
+    intent = h.coord.intent(ref)
+    assert C.SETTLED_INTENT_CONTRADICTED in intent.reasons
+    assert intent.state == IntentState.FILLED
+    events = h.events(ref)
+    assert events.index("OPERATOR_SETTLEMENT") < events.index(C.SETTLED_INTENT_CONTRADICTED)
+    rec = h.coord.reconcile()
+    assert not rec.clean
+    assert "SETTLED_INTENT_CONTRADICTED" in [d.kind.value for d in rec.blocking]
+    third = second_open_state(h, "p3")
+    assert third.state == IntentState.REFUSED
+    assert third.reasons[0].startswith("INSTRUMENT_BLOCKED_")
+
+
+def test_not_at_broker_lifts_only_after_the_settle_period_and_spread_no_trace_lookups(h):
+    ref = never_arrived(h)
+    t0 = h.clock.now()
+    assert settle(h, ref, "NOT_AT_BROKER").lifted == []
+    lifted = wait_for_verification(h)
+    assert lifted
+    elapsed = (h.clock.now() - t0).total_seconds()
+    assert elapsed >= h.config.settle_seconds
+    lookups = [e for e in h.coord.store.journal(ref) if e.event == "SETTLEMENT_NO_TRACE_LOOKUP"]
+    assert len(lookups) >= h.config.exit_no_trace_lookups
+    assert (lookups[-1].at - lookups[0].at).total_seconds() >= h.config.settle_seconds
+    assert all(e.at > t0 for e in lookups)
+    assert "OPERATOR_SETTLEMENT_VERIFIED" in h.events(ref)
+    assert second_open_state(h, "p2").state == IntentState.FILLED
+
+
+def test_a_failed_lookup_restarts_the_no_trace_run(h):
+    ref = never_arrived(h)
+    settle(h, ref, "NOT_AT_BROKER")
+    for _ in range(4):
+        h.clock.advance(3)
+        S.lift_verified_blocks(h.coord)
+    h.broker.lookup_failures = 1
+    h.clock.advance(3)
+    assert S.lift_verified_blocks(h.coord) == []
+    h.clock.advance(1)
+    assert S.lift_verified_blocks(h.coord) == []  # the run restarted: too few, too close
+    assert "SETTLEMENT_LOOKUP_FAILED" in h.events(ref)
+    assert C.OPERATOR_SETTLEMENT_UNVERIFIED in open_kinds(h)
+
+
+def test_contradiction_when_the_order_appears_as_working(h):
+    ref = resting_but_invisible(h)
+    settle(h, ref, "NOT_AT_BROKER")
+    h.broker.open_orders_lag_seconds = 0  # the broker's view catches up: resting, unfilled
+    h.coord.sync()
+    assert C.SETTLED_INTENT_CONTRADICTED in open_kinds(h)
+    assert C.OPERATOR_SETTLEMENT_UNVERIFIED not in open_kinds(h)  # superseded, still blocked
+    assert h.coord.intent(ref).state == IntentState.WORKING
+    assert not h.coord.reconcile().clean
+    assert second_open_state(h, "p2").state == IntentState.REFUSED
+    assert S.lift_verified_blocks(h.coord) == []
+
+
+def test_contradiction_after_a_restart(h):
+    ref = resting_but_invisible(h)
+    settle(h, ref, "NOT_AT_BROKER")
+    h.restart()  # a new process: the broker's view no longer lags
+    h.broker.set_quote(SYMBOL, "49.98", "50.02")
+    h.broker.fill(ref)
+    h.coord.recover()
+    assert C.SETTLED_INTENT_CONTRADICTED in open_kinds(h)
+    assert h.coord.store.filled_quantity(ref) == 4
+    assert not h.coord.reconcile().clean
+
+
+def test_contradiction_when_the_lag_outlasts_the_settle_period(h):
+    """The broker's view lags longer than the evidence window: the block lifts on the evidence
+    the system has, a second OPEN fills, then the original fills. The account holds 8; that is
+    raised at once as a contradiction, blocks the contract and keeps reconciliation unclean."""
+    ref = resting_but_invisible(h)
+    settle(h, ref, "NOT_AT_BROKER")
+    assert wait_for_verification(h)
+    second = second_open_state(h, "p2")
+    assert second.state == IntentState.FILLED
+    h.broker.fill(ref)
+    h.coord.sync()
+    assert broker_net(h) == 8
+    assert C.SETTLED_INTENT_CONTRADICTED in open_kinds(h)
+    rec = h.coord.reconcile()
+    assert not rec.clean
+    assert second_open_state(h, "p3").state == IntentState.REFUSED
+    [e] = [x for x in h.coord.store.exceptions(open_only=True)
+           if x.kind == C.SETTLED_INTENT_CONTRADICTED]
+    assert e.order_ref == ref and "NOT_AT_BROKER" in e.detail
+
+
+def test_cancelled_settlement_contradicted_by_a_later_fill(h):
+    ref = resting_but_invisible(h)
+    settle(h, ref, "CANCELLED")
+    h.broker.fill(ref)
+    h.coord.sync()
+    assert C.SETTLED_INTENT_CONTRADICTED in open_kinds(h)
+
+
+def test_reconciliation_is_unclean_when_fills_exceed_what_the_settlement_declared(h):
+    """Review F1.3, independently of the exception: the ledger holds fills of an intent settled as
+    never filled; reconciliation counts them as unexplained."""
+    ref = never_arrived(h)
+    settle(h, ref, "NOT_AT_BROKER")
+    row = h.coord.store.order(ref)
+    from decimal import Decimal
+
+    h.coord.store.apply_fill(exec_id="INVENTED-LATE-1", order=row, quantity=4,
+                             price=Decimal("50.02"), executed_at=h.clock.now(),
+                             at=h.clock.now())
+    rec = h.coord.reconcile()
+    assert "SETTLED_INTENT_CONTRADICTED" in [d.kind.value for d in rec.blocking]
+    assert not rec.clean
+
+
 def test_every_exception_kind_has_an_operator_class():
     kinds = {
         v for mod in (C, ST, R) for k, v in vars(mod).items()
@@ -362,6 +533,7 @@ def test_every_exception_kind_has_an_operator_class():
         C.EXIT_NOT_NETTED, C.EXIT_WITHOUT_QUOTE, C.ENTRY_STATE_UNKNOWN, C.BROKER_STATE_UNKNOWN,
         C.ENTRY_REMAINDER_NOT_CANCELLED, C.OPERATOR_SETTLEMENT_UNVERIFIED,
         C.BROKER_RECONNECT_PENDING, ST.LEDGER_REVERSAL, R.PARTIAL_GROUP,
+        C.SETTLED_INTENT_CONTRADICTED,
     }
     assert opened <= kinds
     assert opened == set(cat.EXCEPTION_ACTIONS)

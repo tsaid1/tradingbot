@@ -144,7 +144,9 @@ if reg["unresolved_intents"]:
     st.warning("An entry or add of unknown outcome is never resent and blocks new exposure in its "
                "contract. Check the order at the broker yourself, then declare what you saw. A "
                "declaration the broker contradicts is refused; after it, the contract stays "
-               "blocked until a clean sync and reconciliation.")
+               "blocked until repeated broker lookups over the settle period and a clean "
+               "reconciliation confirm it, and an order that appears later is raised as a "
+               "contradiction.")
     ref = st.selectbox("Intent", [i["order_ref"] for i in reg["unresolved_intents"]],
                        key="settle_ref")
     outcome = st.radio("What the broker shows", ["NOT_AT_BROKER", "FILLED", "CANCELLED"],

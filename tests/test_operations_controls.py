@@ -154,11 +154,54 @@ def test_a_queued_settlement_is_applied_by_the_service_on_its_next_cycle(tmp_pat
     assert rt.service.coordinator.intent(ref).state == IntentState.CANCELLED
     assert rt.broker.submit_calls == calls
     assert N.OPERATOR_ACTION in kinds(rt)
+    # Still blocked: the settle period and spread no-trace lookups must follow it (review F1).
+    assert exec_kinds(rt) == ["OPERATOR_SETTLEMENT_UNVERIFIED"]
+    rt.run(5, 5)
     assert exec_kinds(rt) == []
     reg = load_register(rt.config, rt.clock.now())
     assert reg["unresolved_intents"] == [] and reg["requests"][0]["status"] == "APPLIED"
     with pytest.raises(Exception, match="append-only"), queue._tx() as c:
         c.execute("UPDATE operator_requests SET note='x'")
+
+
+def test_a_contradicted_settlement_alerts_at_once_and_keeps_reconciliation_unclean(tmp_path):
+    """Review F1 at the service: NOT_AT_BROKER declared while the broker's open orders lag; the
+    resting entry then fills. Alerted in that cycle, blocked, reconciliation unclean; clearable
+    only by a verified CLEAR once reconciliation is otherwise clean."""
+    rt = Runtime(tmp_path, [post("1", 0, ENTRY)])
+    rt.broker.open_orders_lag_seconds = 3600
+    rt.broker.script_next_submit("LOST_ACK_PLACED_RESTING")
+    rt.run(4, 5)
+    [a] = rt.actions()
+    ref = a["order_ref"]
+    queue = Q.OperatorQueue(rt.config.operator_db)
+    queue.enqueue(at=rt.clock.now(), operator="tester", origin="test", action=Q.SETTLE,
+                  target=ref, outcome="NOT_AT_BROKER", note=NOTE,
+                  confirmation=cat.settle_phrase(ref, "NOT_AT_BROKER"))
+    rt.step()
+    assert queue.requests()[-1]["status"] == "APPLIED"
+    assert "OPERATOR_SETTLEMENT_UNVERIFIED" in exec_kinds(rt)
+    rt.broker.fill(ref)
+    rt.step()
+    assert "SETTLED_INTENT_CONTRADICTED" in exec_kinds(rt)
+    assert N.SETTLEMENT_CONTRADICTED in kinds(rt)
+    assert rt.service.last_reconciliation.clean is False
+    assert "SETTLED_INTENT_CONTRADICTED" in rt.heartbeat()["reconciliation"]["unexplained"]
+    rt.run(3)
+    assert kinds(rt).count(N.SETTLEMENT_CONTRADICTED) == 1
+    [e] = [x for x in rt.service.coordinator.store.exceptions(open_only=True)
+           if x.kind == "SETTLED_INTENT_CONTRADICTED"]
+    assert cat.action_for(e.kind)[0] == cat.CLEAR
+    rt.broker.open_orders_lag_seconds = 0  # the broker's view catches up: the stop is visible
+    rt.step()
+    assert "SETTLED_INTENT_CONTRADICTED" in rt.heartbeat()["reconciliation"]["unexplained"]
+    queue.enqueue(at=rt.clock.now(), operator="tester", origin="test", action=Q.CLEAR,
+                  target=str(e.id), kind=e.kind, note=NOTE,
+                  confirmation=cat.clear_phrase(e.id, e.kind))
+    rt.step()
+    assert queue.requests()[-1]["status"] == "APPLIED", queue.requests()[-1]["reasons"]
+    rt.step()
+    assert rt.service.last_reconciliation.clean
 
 
 # ------------------------------------------------------------------------------ reconnect

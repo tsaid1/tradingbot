@@ -42,7 +42,8 @@ it stays open, and closes when its cause is gone. Channels: the notifications lo
 | `RECONCILIATION_DISCREPANCY`, `STUCK_INTENT` | The ledger and the broker disagree, or an intent has stayed unresolved. | Compare the two pages with the broker. |
 | `LEDGER_REVERSAL` | An exit filled more than the position: the account went through flat. | Flatten the excess at the broker by hand, then CLEAR it. |
 | `EXIT_REFUSED`, `HALTED_ACTION_REFUSED` | A publisher exit or amendment was not executed. | Check the position and its stop. Exit by hand if needed, then acknowledge. |
-| `SETTLEMENT_UNVERIFIED` | A settlement was applied, but no clean sync and reconciliation has followed it yet. | None. It clears when the contract reconciles clean. |
+| `SETTLEMENT_UNVERIFIED` | A settlement was applied and its contract stays blocked until the evidence below has followed it. | None. It clears on its own once the evidence is in. |
+| `SETTLEMENT_CONTRADICTED` | The broker shows a fill, a working order or a completed order for an intent you settled as `NOT_AT_BROKER` or `CANCELLED`. The fill is in the ledger as it happened, the contract is blocked and reconciliation is not clean. | Check the account at the broker: it may hold more than intended. Decide what to do with the extra position, then CLEAR it once reconciliation is otherwise clean. |
 | `MAPPING_REVOKED_OPEN_POSITION` | A position is open in a family that has lost approval. It can be exited, never added to. | Decide whether to keep or exit the position. |
 | `ROLL_DUE_FLATTEN_REQUIRED` | A futures position is inside its roll window. | Flatten or roll it by a new instruction. |
 | `SOURCE_FAILURE`, `PIPELINE_FAILURE` | The source or the processing of a post has failed repeatedly. The cursor does not move. | See Source outage below. |
@@ -62,9 +63,20 @@ show under `operator.py history` and on the page.
   as a broker fill would move it. A settlement is refused if the broker contradicts it: the order or
   its fills are visible, the price breaks the limit, the quantity is off, or the resulting position
   cannot match the broker's. A declared fill with no confirmed stop opens `UNPROTECTED_POSITION`.
-  The contract stays blocked until a full sync and reconciliation show it clean.
-* `clear <id> LEDGER_REVERSAL`: applied only if a sync and reconciliation made at that moment show
-  the contract clean.
+  The contract stays blocked (`OPERATOR_SETTLEMENT_UNVERIFIED`) afterwards, never lifted in the
+  call that records the settlement. After `FILLED` it lifts on the next cycle whose sync and
+  reconciliation show the contract clean. After `NOT_AT_BROKER` or `CANCELLED` it lifts only when
+  the rule the core uses before resending an exit has been met *after* the settlement: the settle
+  period (`[execution] settle_seconds`) has passed, at least `exit_no_trace_lookups` consecutive
+  lookups spread over that period found no trace of the order in open orders, executions or
+  completed orders (a cancelled, unfilled row confirms a `CANCELLED`), and the contract then
+  reconciles clean. With the defaults that is about one settle period and three cycles. The
+  reason: the broker's open-orders view can lag, so "I don't see it" on one read is not proof.
+  If the order shows up later anyway, that is `SETTLED_INTENT_CONTRADICTED` (above), never a
+  normal adoption; the intent's journal shows your declaration and the evidence that
+  contradicted it.
+* `clear <id> LEDGER_REVERSAL | SETTLED_INTENT_CONTRADICTED`: applied only if a sync and
+  reconciliation made at that moment show the contract clean (the record's own line excepted).
 * `ack <id> <kind>`: closes a record that blocks nothing (`EXIT_NOT_NETTED`, `EXIT_WITHOUT_QUOTE`,
   `STALE_AFTER_UNKNOWN_OUTCOME`, `MODIFY_NOT_CONFIRMED`, `PROTECTIVE_LEVEL_NOT_LOOSENED`,
   `PARTIAL_GROUP`). `ack-signal <id> <kind>` closes a held signal.

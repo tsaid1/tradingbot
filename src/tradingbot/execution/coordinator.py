@@ -126,6 +126,13 @@ CONTRACT_CHANGED = "CONTRACT_CHANGED_SINCE_DECISION"
 # blocked until a full broker sync and reconciliation after it show no open safety discrepancy in
 # that contract; only that evidence resolves it, never the operator.
 OPERATOR_SETTLEMENT_UNVERIFIED = "OPERATOR_SETTLEMENT_UNVERIFIED"
+# The broker later showed a fill, a working order or a completed order for an intent an operator
+# settled as NOT_AT_BROKER or CANCELLED (review F1): the fill is recorded as it happened, the intent
+# takes the broker's state, new exposure in the contract is blocked and reconciliation stays unclean
+# until a verified clear. Never a normal adoption.
+SETTLED_INTENT_CONTRADICTED = "SETTLED_INTENT_CONTRADICTED"
+# The intent reasons an operator settlement that declared no (further) fill leaves behind.
+SETTLED_WITHOUT_FILL_REASONS = ("OPERATOR_SETTLED_NOT_AT_BROKER", "OPERATOR_SETTLED_CANCELLED")
 # The broker session dropped (runtime service): new exposure everywhere is refused until the
 # session is back, a full sync has succeeded and a reconciliation shows nothing unexplained.
 BROKER_RECONNECT_PENDING = "BROKER_RECONNECT_PENDING"
@@ -142,6 +149,7 @@ INSTRUMENT_BLOCKING_KINDS = (
     PROTECTION_UNVERIFIED,
     ENTRY_STATE_UNKNOWN,
     OPERATOR_SETTLEMENT_UNVERIFIED,
+    SETTLED_INTENT_CONTRADICTED,
 )
 # An open exception of one of these kinds (no idea) blocks every OPEN and ADD (BROKER_UNREADABLE).
 ACCOUNT_BLOCKING_KINDS = (BROKER_STATE_UNKNOWN, BROKER_RECONNECT_PENDING)
@@ -554,6 +562,7 @@ class ExecutionCoordinator:
                     ledger_quantity=pos.quantity,
                 )
         self._refresh_orders(open_orders, now, completed)
+        touched |= self._settlement_contradictions(open_orders, fills, completed, now)
         asked = self._cancel_stopped_out_entries(open_orders)
         if _rerun and self.halted() and self._cancel_entries_for_halt(open_orders):
             asked = True
@@ -630,6 +639,130 @@ class ExecutionCoordinator:
                 halt_file=str(self.config.halt_file),
             )
         return asked
+
+    # ================================================================== operator settlements
+
+    def settled_without_fill(self) -> list[Intent]:
+        """Intents an operator settled as NOT_AT_BROKER or CANCELLED and that no broker evidence
+        has contradicted yet."""
+        return [
+            i for i in self.store.intents(frozenset({IntentState.CANCELLED}))
+            if any(r in SETTLED_WITHOUT_FILL_REASONS for r in i.reasons)
+            and SETTLED_INTENT_CONTRADICTED not in i.reasons
+        ]
+
+    def settlement_record(self, order_ref: str):
+        """The journal entry of the operator settlement of ``order_ref`` (None if none)."""
+        return next(
+            (e for e in reversed(self.store.journal(order_ref))
+             if e.event == "OPERATOR_SETTLEMENT"),
+            None,
+        )
+
+    def settlement_trace(self, intent: Intent, open_orders, fills, completed) -> list[str]:
+        """Broker evidence that contradicts a NOT_AT_BROKER or CANCELLED settlement of ``intent``
+        (empty: none). NOT_AT_BROKER: any working order, execution or completed order of its refs.
+        CANCELLED: the entry working, filled beyond what was applied when it was settled, or a
+        bracket child working or filled although nothing had filled; a cancelled, unfilled row is
+        the broker confirming the declaration, not a contradiction."""
+        record = self.settlement_record(intent.order_ref)
+        detail = record.detail if record is not None else {}
+        declared = int(
+            detail.get("declared_filled", detail.get("before", {}).get("intent", {}).get("filled", 0))
+            or 0
+        )
+        not_at_broker = "OPERATOR_SETTLED_NOT_AT_BROKER" in intent.reasons
+        refs = {r.order_ref for r in self.store.orders(intent.order_ref)}
+        out = []
+        for o in open_orders:
+            if o.order_ref in refs and (
+                o.order_ref == intent.order_ref or not_at_broker or declared == 0
+            ):
+                out.append(f"WORKING:{o.order_ref}:{o.status.value}")
+        entry_filled = self.store.filled_quantity(intent.order_ref)
+        broker_entry = sum(f.quantity for f in fills if f.order_ref == intent.order_ref)
+        if max(entry_filled, broker_entry) > declared:
+            out.append(f"FILLED:{intent.order_ref}:{max(entry_filled, broker_entry)}>{declared}")
+        if not_at_broker or declared == 0:
+            child_fills = sorted(
+                {f.order_ref for f in fills if f.order_ref in refs and f.order_ref
+                 != intent.order_ref}
+            )
+            out.extend(f"FILLED:{r}" for r in child_fills)
+        for o in completed:
+            if o.order_ref not in refs:
+                continue
+            if not_at_broker:
+                out.append(f"COMPLETED:{o.order_ref}:{o.status.value}")
+            elif o.order_ref == intent.order_ref:
+                if o.status == OrderStatus.FILLED or o.filled_quantity > declared:
+                    out.append(f"COMPLETED:{o.order_ref}:{o.status.value}:{o.filled_quantity}")
+            elif declared == 0 and (o.status == OrderStatus.FILLED or o.filled_quantity > 0):
+                # A child of a CANCELLED entry that had filled in part may legitimately fill.
+                out.append(f"COMPLETED:{o.order_ref}:{o.status.value}:{o.filled_quantity}")
+        return sorted(set(out))
+
+    def _settlement_contradictions(self, open_orders, fills, completed, now) -> set[str]:
+        """Review F1: broker evidence for an intent settled as NOT_AT_BROKER or CANCELLED is a
+        contradiction, never a normal adoption. The fills were applied as they happened (above);
+        the intent takes the broker's state, the verification block is superseded by a blocking
+        SETTLED_INTENT_CONTRADICTED and the journal shows the declaration and the evidence.
+        Returns the ideas touched."""
+        touched: set[str] = set()
+        for intent in self.settled_without_fill():
+            evidence = self.settlement_trace(intent, open_orders, fills, completed)
+            if not evidence:
+                continue
+            record = self.settlement_record(intent.order_ref)
+            detail = record.detail if record is not None else {}
+            declared = next(r for r in intent.reasons if r in SETTLED_WITHOUT_FILL_REASONS)
+            entry_open = next((o for o in open_orders if o.order_ref == intent.order_ref), None)
+            entry_done = next((o for o in completed if o.order_ref == intent.order_ref), None)
+            filled = self.store.filled_quantity(intent.order_ref)
+            if entry_open is not None:
+                state, status = IntentState.WORKING, entry_open.status.value
+            elif entry_done is not None:
+                state = _intent_state(
+                    entry_done.status, max(filled, entry_done.filled_quantity), intent.quantity
+                )
+                status = entry_done.status.value
+            elif filled >= intent.quantity:
+                state, status = IntentState.FILLED, OrderStatus.FILLED.value
+            else:
+                # Only the entry's own evidence decides it: looked up again by recover().
+                state, status = IntentState.UNRESOLVED, "Unknown"
+            self.store.set_state(
+                intent.order_ref, state, now, broker_status=status,
+                reasons=[declared, SETTLED_INTENT_CONTRADICTED],
+            )
+            pos = self.store.position(intent.idea_id)
+            if intent.action == Action.OPEN and pos is not None and pos.quantity == 0 \
+                    and pos.status == "NOT_FILLED" and state != IntentState.CANCELLED:
+                self.store.update_position(intent.idea_id, now, status="PENDING")
+            self.store.resolve_exceptions(
+                now, OPERATOR_SETTLEMENT_UNVERIFIED, idea_id=intent.idea_id,
+                order_ref=intent.order_ref,
+            )
+            text = (
+                f"operator request {detail.get('request_id')} declared {intent.order_ref} "
+                f"{declared.removeprefix('OPERATOR_SETTLED_')}; the broker now shows "
+                f"{', '.join(evidence)}. Recorded as it happened; new exposure in this contract is "
+                "blocked and reconciliation stays unclean until this is cleared after a clean "
+                "reconciliation."
+            )
+            self.store.raise_exception(
+                now, SETTLED_INTENT_CONTRADICTED, text, idea_id=intent.idea_id,
+                order_ref=intent.order_ref,
+            )
+            self.store.log(
+                now, SETTLED_INTENT_CONTRADICTED, order_ref=intent.order_ref,
+                idea_id=intent.idea_id, declared=declared, request_id=detail.get("request_id"),
+                operator=detail.get("operator"), evidence=evidence, filled=filled,
+                state=state.value,
+                rule="broker evidence contradicts an operator settlement: never adopted silently",
+            )
+            touched.add(intent.idea_id)
+        return touched
 
     def _broker_state_unknown(self) -> bool:
         return any(

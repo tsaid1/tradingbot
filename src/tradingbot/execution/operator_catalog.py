@@ -49,7 +49,11 @@ EXCEPTION_ACTIONS: dict[str, tuple[str, str]] = {
     "BROKER_RECONNECT_PENDING": (
         EVIDENCE, "restore the session; clears after a full sync and reconciliation"),
     "OPERATOR_SETTLEMENT_UNVERIFIED": (
-        EVIDENCE, "clears when a full sync and reconciliation show the contract clean"),
+        EVIDENCE, ("clears after the settle period, repeated no-trace lookups and a clean "
+                   "reconciliation of the contract")),
+    "SETTLED_INTENT_CONTRADICTED": (
+        CLEAR, ("the broker shows the settled order after all: review the extra position at "
+                "the broker, then clear (verified by reconciliation)")),
 }
 UNRESOLVED_INTENT_ACTION = (SETTLE, "check the order at the broker, then settle the intent")
 SIGNAL_ACTION = (ACKNOWLEDGE, "review the held signal; acknowledge")
