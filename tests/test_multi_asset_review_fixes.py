@@ -8,11 +8,11 @@ and the SHOULD FIX rows of the review table.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
-from test_multi_asset_gateway import act, gate, leg, mq, position, terms
+from test_multi_asset_gateway import NOW, act, gate, leg, mq, position, terms
 
 from tradingbot.event_models import PriceBasis, Timing, TradeAction
 from tradingbot.models import Action, AssetClass, Instrument, PositionSide
@@ -358,4 +358,134 @@ def test_f4_the_execution_page_shows_an_open_under_revoked_mapping(tmp_path, mon
     text = " ".join(str(e.value) for kind in ("markdown", "warning") for e in at.get(kind))
     assert "| QOIL | NOT APPROVED |" in text
     assert "OPEN_UNDER_REVOKED_MAPPING" in text and "withdrawn mapping" in text
+    run.close()
+
+
+# ================================================================== F5: reference freshness
+
+def ref_leg(bid="5009.5", ask="5010.5", last="5010", *, updated_age=0.0, received_age=0.0,
+            known=True):
+    """A reference quote received ``received_age`` ago whose series last updated
+    ``updated_age`` ago (None when the broker does not say)."""
+    return leg(bid, ask, last, age=received_age).model_copy(update={
+        "updated_at": NOW - timedelta(seconds=updated_age) if known else None})
+
+
+BS_TERMS = {"min_tick": Decimal("0.10"), "max_abs_basis": Decimal(20)}
+
+
+def bs_open(reference):
+    t = terms("BASIS_SHIFT", **BS_TERMS)
+    return gate(act(entry="1850", stop="1835", target="1880"),
+                mq(t, bid="1861.9", ask="1862.1", reference=reference))
+
+
+def rt_open(reference, **kw):
+    return gate(act(entry="5010", stop="4980", target="5070"),
+                mq(terms("REFERENCE_TRIGGER", **kw), reference=reference))
+
+
+def test_f5_a_fresh_reference_quote_with_its_own_update_time_is_used():
+    assert bs_open(ref_leg("1849.9", "1850.1", None)).status == "APPROVE"
+    assert rt_open(ref_leg()).status == "APPROVE"
+
+
+@pytest.mark.parametrize("treatment", ["BASIS_SHIFT", "REFERENCE_TRIGGER"])
+@pytest.mark.parametrize(
+    "case,detail",
+    [
+        # Reviewer probe: a frozen value received just now. Its series last updated 20 s ago.
+        ({"updated_age": 45}, "REFERENCE_QUOTE_STALE"),
+        ({"known": False}, "REFERENCE_QUOTE_UPDATE_TIME_UNKNOWN"),
+        # Reviewer probe: a crossed reference (bid above ask) passed through its last price.
+        ({"bid": "5012", "ask": "5008"}, "REFERENCE_QUOTE_CROSSED"),
+    ],
+)
+def test_f5_an_unfresh_reference_quote_holds_every_treatment(treatment, case, detail):
+    if treatment == "BASIS_SHIFT":
+        kw = {"bid": "1849.9", "ask": "1850.1", "last": None, **case}
+        if "bid" in case:
+            kw.update(bid="1851", ask="1849", last="1850")
+        g = bs_open(ref_leg(**kw))
+    else:
+        g = rt_open(ref_leg(**case))
+    assert g.status == "HOLD" and "REFERENCE_QUOTE_NOT_FRESH" in g.reasons, g.reasons
+    assert detail in g.reasons
+
+
+def test_f5_a_reference_quote_outside_its_declared_hours_holds_an_amendment():
+    late = NOW.replace(hour=20, minute=30)  # the session is open, the index is not
+    t = terms("REFERENCE_TRIGGER")
+    q = mq(t, reference=leg(at=late).model_copy(update={"updated_at": late}), at=late)
+    g = gate(act(Action.MODIFY, idea="9:a1", stop="4990", target=None), q, position(stop="4980"),
+             now=late)
+    assert g.status == "HOLD" and g.reasons == ["REFERENCE_QUOTE_NOT_FRESH",
+                                                "REFERENCE_QUOTE_OUTSIDE_HOURS"]
+
+
+def test_f5_the_backstop_needs_a_fresh_reference_too():
+    g = rt_open(ref_leg(updated_age=8), require_backstop=True)  # the basis allows 5 s
+    assert g.status == "HOLD" and "REFERENCE_QUOTE_NOT_FRESH" in g.reasons
+
+
+def test_f5_the_sim_broker_reports_the_series_update_time(tmp_path):
+    from tradingbot.runtime.mock_multi_asset import QIDX
+
+    run = MockMultiAssetRun(tmp_path / "s", Scenario("s", "QIDX", "X", [Step(0, ENTRY, "X")]))
+    at = run.clock.now()
+    run.broker.set_quote("QIDX", "5009.5", "5010.5", last="5010", contract=QIDX,
+                         updated_at=at - timedelta(seconds=40))
+    q = run.broker.reference_quote(QIDX)
+    assert q.received_at == at and q.updated_at == at - timedelta(seconds=40)
+    run.close()
+
+
+def test_f5_a_frozen_reference_holds_through_the_service(tmp_path):
+    """The broker re-sends the index every cycle, but its own update time stopped 40 s ago."""
+    from tradingbot.runtime.mock_multi_asset import QIDX
+
+    run = MockMultiAssetRun(tmp_path / "f", Scenario("f", "QIDX", "X", [Step(0, ENTRY, "X")]))
+    frozen_at = run.clock.now() - timedelta(seconds=40)
+    publish = run.publish_quotes
+
+    def publish_frozen():
+        publish()
+        run.broker.set_quote("QIDX", "5009.5", "5010.5", last="5010", contract=QIDX,
+                             updated_at=frozen_at)
+
+    run.publish_quotes = publish_frozen
+    for _ in range(6):
+        run.step()
+    [a] = traded(run)
+    assert a["status"] == "HOLD" and "REFERENCE_QUOTE_NOT_FRESH" in a["reasons"]
+    assert run.broker.submit_calls == 0
+    run.close()
+
+
+def test_f5_without_a_broker_update_time_only_a_seen_change_counts(tmp_path):
+    """A broker that reports no update time: the first sighting of a value is not evidence of
+    freshness (HOLD); a value seen to change since the last decision is, at its receipt time."""
+    from tradingbot.models import Instrument as Inst
+    from tradingbot.runtime.mock_multi_asset import QIDX
+
+    run = MockMultiAssetRun(tmp_path / "u", Scenario("u", "QIDX", "X", [Step(0, ENTRY, "X")]))
+    run.broker.reports_update_time = False
+    run.publish_quotes()
+    svc, entry = run.service, run.service.mapping.entries["QIDX"]
+    inst = Inst(asset_class=AssetClass.FUTURE, symbol="QIF", exchange="SIMFUT",
+                futures_contract="202606")
+    first = svc._mapped_quote(entry, inst, run.clock.now())
+    assert first.reference.updated_at is None
+    run.clock.advance(2)
+    run.publish_quotes()
+    same = svc._mapped_quote(entry, inst, run.clock.now())
+    assert same.reference.updated_at is None  # unchanged value: still no evidence
+    run.clock.advance(2)
+    run.broker.set_quote("QIDX", "5010.5", "5011.5", last="5011", contract=QIDX)
+    moved = svc._mapped_quote(entry, inst, run.clock.now())
+    assert moved.reference.updated_at == run.clock.now()
+    run.clock.advance(20)
+    run.broker.set_quote("QIDX", "5010.5", "5011.5", last="5011", contract=QIDX)
+    stuck = svc._mapped_quote(entry, inst, run.clock.now())
+    assert stuck.reference.updated_at == run.clock.now() - timedelta(seconds=20)
     run.close()

@@ -334,8 +334,16 @@ def _mid(leg: LegQuote) -> Decimal | None:
     return leg.last if leg.last is not None and leg.last > 0 else None
 
 
+# A reference series that cannot be shown to be updating now (review F5): its value is never used.
+REFERENCE_NOT_FRESH = "REFERENCE_QUOTE_NOT_FRESH"
+_NOT_FRESH = frozenset({"STALE", "UPDATE_TIME_UNKNOWN", "CROSSED", "OUTSIDE_HOURS"})
+
+
 def _leg_problem(leg: LegQuote | None, t: MarketTerms, now: datetime, max_age: float,
-                 *, need_touch: bool = True) -> str | None:
+                 *, need_touch: bool = True, reference: bool = False) -> str | None:
+    """Why a quote cannot be used, or None. A ``reference`` leg is judged by the series' own
+    last-update time (never by when the quote was received), must not be crossed, and must fall
+    inside the series' declared hours when the entry declares them."""
     if leg is None or leg.quality == "UNAVAILABLE":
         return "UNAVAILABLE"
     if leg.quality not in t.accepted_qualities:
@@ -343,11 +351,28 @@ def _leg_problem(leg: LegQuote | None, t: MarketTerms, now: datetime, max_age: f
     age = (now - leg.observed_at).total_seconds()
     if age < -5 or age > max_age:
         return "STALE"
+    if reference:
+        if leg.updated_at is None:
+            return "UPDATE_TIME_UNKNOWN"
+        updated = (now - leg.updated_at).total_seconds()
+        if updated < -5 or updated > max_age:
+            return "STALE"
+        if leg.bid is not None and leg.ask is not None and leg.bid > leg.ask:
+            return "CROSSED"
+        if t.reference_windows and not in_windows(t.reference_windows, t.session_days,
+                                                  t.session_timezone, now):
+            return "OUTSIDE_HOURS"
     if need_touch and (leg.bid is None or leg.ask is None or leg.bid <= 0 or leg.ask < leg.bid):
         return "INVALID_BID_ASK"
     if _mid(leg) is None:
         return "NO_PRICE"
     return None
+
+
+def _leg_reasons(name: str, problem: str) -> list[str]:
+    reason = f"{name}_QUOTE_{problem}"
+    return [REFERENCE_NOT_FRESH, reason] if name == "REFERENCE" and problem in _NOT_FRESH \
+        else [reason]
 
 
 def _touch(leg: LegQuote, buy: bool) -> Decimal:
@@ -364,10 +389,12 @@ def _basis(q: MappedQuote, now: datetime) -> tuple[ExecutionPlan | None, list[st
     execution = LegQuote(contract_key=t.execution_key, bid=q.bid, ask=q.ask,
                          observed_at=q.observed_at, quality=q.quality)
     for name, leg in (("EXECUTION", execution), ("REFERENCE", q.reference)):
-        problem = _leg_problem(leg, t, now, age, need_touch=(name == "EXECUTION"))
+        problem = _leg_problem(leg, t, now, age, need_touch=(name == "EXECUTION"),
+                               reference=(name == "REFERENCE"))
         if problem:
-            return None, ["BASIS_QUOTE_UNUSABLE", f"{name}_QUOTE_{problem}"]
-    skew = abs((execution.observed_at - q.reference.observed_at).total_seconds())
+            return None, ["BASIS_QUOTE_UNUSABLE", *_leg_reasons(name, problem)]
+    # The two prices must describe the same moment: the reference at its own update time.
+    skew = abs((execution.observed_at - q.reference.updated_at).total_seconds())
     if skew > age:
         return None, ["BASIS_QUOTE_UNUSABLE", "QUOTES_NOT_SIMULTANEOUS"]
     em, rm = _mid(execution), _mid(q.reference)
@@ -376,7 +403,7 @@ def _basis(q: MappedQuote, now: datetime) -> tuple[ExecutionPlan | None, list[st
         return None, ["BASIS_EXCEEDS_CAP", f"BASIS:{basis}"]
     plan = ExecutionPlan(family=t.family, basis=t.basis, execution_key=t.execution_key,
                          basis_value=basis, basis_execution_mid=em, basis_reference_mid=rm,
-                         basis_observed_at=min(execution.observed_at, q.reference.observed_at))
+                         basis_observed_at=min(execution.observed_at, q.reference.updated_at))
     return plan, []
 
 
@@ -451,8 +478,8 @@ def _gate_mapped(a: TradeAction, published_at: datetime, q: MappedQuote, policy:
 
 def _reference_leg(q: MappedQuote, policy: MockPolicy, now: datetime) -> GateDecision | None:
     problem = _leg_problem(q.reference, q.terms, now, policy.max_quote_age_seconds,
-                           need_touch=False)
-    return _gate("HOLD", f"REFERENCE_QUOTE_{problem}") if problem else None
+                           need_touch=False, reference=True)
+    return _gate("HOLD", *_leg_reasons("REFERENCE", problem)) if problem else None
 
 
 def _mapped_levels(a: TradeAction) -> tuple[Decimal | None, Decimal | None, GateDecision | None]:

@@ -124,7 +124,8 @@ CREATE TABLE IF NOT EXISTS sim_quotes (
     symbol TEXT PRIMARY KEY,
     bid TEXT, ask TEXT, last TEXT,
     received_at TEXT NOT NULL,
-    quality TEXT NOT NULL
+    quality TEXT NOT NULL,
+    updated_at TEXT
 );
 """
 
@@ -221,6 +222,9 @@ class SimBroker:
         # Broker-side price conditions on a reference series (REFERENCE_TRIGGER families). A test
         # turns this off to model a broker that cannot place them.
         self.conditions_supported = True
+        # Whether quotes carry the series' own last-update time (IBKR lastTimestamp). A test turns
+        # this off to model a broker that reports only when it received the quote.
+        self.reports_update_time = True
         with self._tx() as c:
             c.executescript(SCHEMA)
             cols = {r["name"] for r in c.execute("PRAGMA table_info(sim_orders)")}
@@ -241,6 +245,9 @@ class SimBroker:
             ):
                 if col not in cols:
                     c.execute(f"ALTER TABLE sim_orders ADD COLUMN {col} {kind}")
+            qcols = {r["name"] for r in c.execute("PRAGMA table_info(sim_quotes)")}
+            if "updated_at" not in qcols:  # the series' own last-update time (multi-asset)
+                c.execute("ALTER TABLE sim_quotes ADD COLUMN updated_at TEXT")
             # A store written before positions were keyed by contract: move its rows once.
             for r in c.execute("SELECT * FROM sim_positions").fetchall():
                 contract = self.resolve(
@@ -367,18 +374,23 @@ class SimBroker:
         quality: QuoteQuality = QuoteQuality.LIVE,
         received_at: datetime | None = None,
         contract: ContractRef | None = None,
+        updated_at: datetime | None = None,
     ) -> None:
         """Publish a quote and run every working order against it (stops, targets, limits). With
-        ``contract`` the quote is for that exact contract; otherwise for the stock ``symbol``."""
+        ``contract`` the quote is for that exact contract; otherwise for the stock ``symbol``.
+        ``updated_at`` is the series' own last-update time (default: the receipt time); a frozen
+        series is modelled by re-publishing its value with an old ``updated_at``."""
         at = received_at or self._now()
+        updated = updated_at or at
         symbol = contract.contract_key if contract is not None else symbol
         with self._tx() as c:
             self._settle(c)
             c.execute(
-                """INSERT INTO sim_quotes (symbol,bid,ask,last,received_at,quality)
-                VALUES (?,?,?,?,?,?)
+                """INSERT INTO sim_quotes (symbol,bid,ask,last,received_at,quality,updated_at)
+                VALUES (?,?,?,?,?,?,?)
                 ON CONFLICT(symbol) DO UPDATE SET bid=excluded.bid, ask=excluded.ask,
-                last=excluded.last, received_at=excluded.received_at, quality=excluded.quality""",
+                last=excluded.last, received_at=excluded.received_at, quality=excluded.quality,
+                updated_at=excluded.updated_at""",
                 (
                     symbol,
                     _s(Decimal(bid)) if bid is not None else None,
@@ -386,6 +398,7 @@ class SimBroker:
                     _s(Decimal(last)) if last is not None else None,
                     at.isoformat(),
                     quality.value,
+                    updated.isoformat(),
                 ),
             )
             self._match(c)
@@ -479,6 +492,9 @@ class SimBroker:
             last=_d(row["last"]),
             received_at=datetime.fromisoformat(row["received_at"]),
             quality=QuoteQuality(row["quality"]),
+            updated_at=datetime.fromisoformat(row["updated_at"])
+            if row["updated_at"] and self.reports_update_time
+            else None,
         )
 
     # ------------------------------------------------------------------ conditional orders (additive)

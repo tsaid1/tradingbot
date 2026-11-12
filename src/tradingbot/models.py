@@ -150,6 +150,9 @@ class LegQuote(StrictModel):
     last: Decimal | None = None
     observed_at: datetime
     quality: str  # execution.broker.QuoteQuality value: LIVE | DELAYED | FROZEN | UNAVAILABLE
+    # When the series itself last updated: the broker's own stamp, or the receipt time at which
+    # the runtime saw the value change. None when neither is known: a reference leg then HOLDs.
+    updated_at: datetime | None = None
 
 
 class MarketTerms(StrictModel):

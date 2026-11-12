@@ -132,6 +132,9 @@ class BrokerQuote(StrictModel):
     last: Decimal | None = None
     received_at: datetime
     quality: QuoteQuality
+    # The series' own last-update time when the broker supplies it (IBKR lastTimestamp); additive.
+    # A reference series' freshness is judged by it, never by ``received_at`` alone.
+    updated_at: datetime | None = None
 
 
 class ConditionDirection(str, Enum):

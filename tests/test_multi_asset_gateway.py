@@ -53,9 +53,11 @@ def terms(basis="DIRECT", **kw) -> MarketTerms:
 
 
 def leg(bid="5009.5", ask="5010.5", last="5010", *, age=0.0, quality="LIVE", at=NOW):
+    # The series' own update time is the receipt time here (a live, moving series).
     return LegQuote(contract_key="IND:QREF:-:-:-:78", bid=Decimal(bid) if bid else None,
                     ask=Decimal(ask) if ask else None, last=Decimal(last) if last else None,
-                    observed_at=at - timedelta(seconds=age), quality=quality)
+                    observed_at=at - timedelta(seconds=age), quality=quality,
+                    updated_at=at - timedelta(seconds=age))
 
 
 def mq(t: MarketTerms, bid="5024.75", ask="5025.25", *, age=0.0, quality="LIVE",
@@ -290,7 +292,9 @@ def test_basis_shift_entry_holds_on_any_unusable_leg(execution, reference, reaso
         # basis is computed; either way nothing is converted from it.
         assert g.status == "BLOCK" and g.reasons == ["QUOTE_QUALITY_DELAYED"]
         return
-    assert g.status == "HOLD" and g.reasons == ["BASIS_QUOTE_UNUSABLE", reason]
+    # A stale reference is also named as not fresh (review F5).
+    fresh = ["REFERENCE_QUOTE_NOT_FRESH"] if reason == "REFERENCE_QUOTE_STALE" else []
+    assert g.status == "HOLD" and g.reasons == ["BASIS_QUOTE_UNUSABLE", *fresh, reason]
 
 
 def test_basis_shift_amendment_is_converted_at_its_own_decision():
@@ -337,7 +341,8 @@ def test_reference_trigger_collar_and_stop_side_use_the_reference_quote():
 def test_reference_trigger_needs_a_usable_reference_quote(reference, reason):
     ref = None if reference is None else leg(**reference)
     g = gate(act(entry="5010", stop="4980", target="5070"), mq(ref_terms(), reference=ref))
-    assert g.status == "HOLD" and g.reasons == [reason]
+    fresh = ["REFERENCE_QUOTE_NOT_FRESH"] if reason == "REFERENCE_QUOTE_STALE" else []
+    assert g.status == "HOLD" and g.reasons == [*fresh, reason]
 
 
 def test_reference_trigger_entry_outside_reference_hours_holds():

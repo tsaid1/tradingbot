@@ -205,7 +205,8 @@ def test_a_stale_reference_quote_holds_a_basis_shift_entry(tmp_path):
     run.run()
     [a] = actions(run)
     assert a["status"] == "HOLD"
-    assert a["reasons"] == ["BASIS_QUOTE_UNUSABLE", "REFERENCE_QUOTE_STALE"]
+    assert a["reasons"] == ["BASIS_QUOTE_UNUSABLE", "REFERENCE_QUOTE_NOT_FRESH",
+                            "REFERENCE_QUOTE_STALE"]
     assert run.broker.submit_calls == 0
 
 
