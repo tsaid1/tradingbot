@@ -127,3 +127,60 @@ def test_a_unicode_dash_or_slash_splits_like_its_ascii_form(text):
         twin = twin.replace(ch, "/")
     held(twin)  # the ASCII form holds today
     held(text)
+
+
+# ---------------------------------------------------------------- second fix round (PR #73)
+
+
+@pytest.mark.parametrize("text", [
+    "We are now long $TLT. Stop 87.20. 88.42 now.",  # the stand-alone level shape on one line
+    "We are now long $TLT at 88.42. Stop 87.20. 2 targets ahead.",
+    "We are now long $TLT at 88.42. Stop 87.20. Target 89.50. 3 weeks left.",
+])
+def test_a_full_stop_after_a_decimal_number_is_a_sentence_end(text):
+    """Read exactly as before this PR (11cc2d3): sent at the ask."""
+    opens, orders = run(text)
+    assert opens[0]["status"] == "EXECUTED", opens
+    [entry] = [o for o in orders if o.parent_ref is None]
+    assert entry.limit_price == Decimal("88.42")
+
+
+def test_an_integer_then_a_full_stop_then_a_digit_still_holds():
+    """Accepted collateral: "87. 88.42" cannot be told from a broken decimal."""
+    assert held("We are now long $TLT. Stop 87. 88.42 now.")[0]["mapping_reason"].startswith(
+        ENTRY_TEXT_NUMBER_UNREADABLE)
+
+
+@pytest.mark.parametrize("level", ["88 . 42", "88 , 42", "88 ,42", "88 .42", "88. 42"])
+def test_a_separator_with_spaces_inside_a_number_holds(level):
+    held(EXPLICIT.format(level=level, stop="87.20"))
+
+
+@pytest.mark.parametrize("text", [
+    EXPLICIT.format(level="88 42", stop="87.20"),  # was sent as a buy limit of 88
+    EXPLICIT.format(level="88.42k", stop="87.20"),  # was sent at 88.42
+    EXPLICIT.format(level="88.42x", stop="87.20"),
+    EXPLICIT.format(level="88.42", stop="87.20k"),
+    "We are now long $TLT at 88.42. Stop 87.20 5 below.",
+])
+def test_a_read_price_glued_to_a_letter_or_followed_by_another_number_holds(text):
+    held(text)
+
+
+@pytest.mark.parametrize("text", [
+    "We are now long $TLT at 88.42, stop 87.20.",
+    "We are now long $TLT at 88.42. Stop 87.20. The index sat at 4,512.25 and volume 1,250 lots.",
+    "We are now long $TLT at 88.42. Stop 87.20. Nov 12 2026 was quiet.",
+    "We are now long $TLT at 88.42. Stop 87.20. Eyes on the 10Y and the 20yr.",
+    "We are now long $TLT at 88.42. Stop 87.20. It sits above the 200DMA into 3pm.",
+    "We are now long $TLT at 88.42. Stop 87.20. The S&P 500 is calm.",
+])
+def test_ordinary_numbers_that_are_not_the_actions_prices_still_send(text):
+    opens, _ = run(text)
+    assert opens[0]["status"] == "EXECUTED", opens
+
+
+def test_a_comma_list_of_prices_reads_as_before():
+    # "88.42, 87.20 is the stop": the second number is not read as the stop (held, as before).
+    assert "PROTECTIVE_STOP_MISSING" in held(
+        "We are now long $TLT at 88.42, 87.20 is the stop.")[0]["reasons"]

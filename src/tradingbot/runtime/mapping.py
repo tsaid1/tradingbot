@@ -68,6 +68,7 @@ from tradingbot.runtime.entry_text import (
     entry_text_placeholder,
     entry_text_problem,
     has_non_ascii_word,
+    read_price_problem,
     restore,
 )
 from tradingbot.runtime.instruction_terms import (
@@ -1947,7 +1948,9 @@ class MappingPolicy:
         post_text, clause = kw.get("post_text"), kw.get("clause")
         others = list(kw.get("others") or ())
         texts = [post_text, clause, *(c for _, c, _ in others)]
-        problem = entry_text_problem(*texts)
+        problem = entry_text_problem(*texts) or read_price_problem(
+            [action.entry_reference, action.stop_price, action.target_price,
+             *(v for _, v in (kw.get("levels") or ()))], post_text, clause)
         out = d.model_dump(include={"action_id", "source_asset", "family", "broker_symbol",
                                     "basis", "anchor_level_kind"})
         if problem:

@@ -641,13 +641,24 @@ is checked once more (`tradingbot.runtime.entry_text`); the check can only turn 
   superscripts, fractions); any non-ASCII character directly touching an ASCII digit or inside
   what would otherwise be one number token (ASCII digits, full stops, commas), so a full-width
   full stop, a middle dot or an Arabic decimal separator ("88．42") is never truncated to
-  88; and the ASCII forms that would be read as a different number than written ("88. 42",
-  "88 .42", "88..42", "87..", "88.42.1"): `ENTRY_TEXT_NUMBER_UNREADABLE`. Collateral holds: a
-  non-ASCII currency, percent, per-mille or degree sign touching a digit ("€88.42",
-  "2％"), a dash or quote mark written flush against a number, and a dotted date
-  ("12.11.2026"). Read as written and unchanged: a whole number before a sentence end ("at 88."
-  is 88), "1.20" (1.20), and a decimal comma ("1,20" is not read as a number at all, so the post
-  holds for a missing level or stop).
+  88; and the ASCII forms that would be read as a different number than written: an integer,
+  a full stop, spaces and a digit ("88. 42"), a digit, spaces, a full stop or comma, optional
+  spaces and a digit ("88 .42", "88 . 42", "88 , 42", "88 ,42"), a doubled separator ("88..42",
+  "87..") and a second decimal point ("88.42.1"): `ENTRY_TEXT_NUMBER_UNREADABLE`. A full stop
+  after a number that already has a decimal part is a sentence end ("Stop 87.20. 88.42 now."
+  reads as before). And a price the rule actually read for this action (its entry or reference
+  level, its stop, its target) written directly followed by spaces and another digit ("at 88 42"
+  read as 88, "Stop 87.20 5 below") or directly followed by an ASCII letter ("88.42k") holds the
+  same way; any other number never does ("Nov 12 2026", "S&P 500", "the 10Y", "20yr", "200DMA",
+  "3pm"). Collateral holds: an integer followed by a full stop and another number ("Stop 87.
+  88.42 now.", which cannot be told from a broken decimal); a non-ASCII currency, percent,
+  per-mille or degree sign touching a digit ("€88.42", "2％"); a dash or quote mark written
+  flush against a number; a dotted date ("12.11.2026"). Read as written and unchanged: a whole
+  number before a sentence end ("at 88." is 88), "1.20" (1.20), a comma list ("88.42, 87.20"),
+  thousands commas ("4,512.25", "1,250"), and a decimal comma ("1,20" is not read as a number
+  at all, so the post holds for a missing level or stop). Residual: a range written without
+  spaces in place of a decimal ("88-42") is read as its first number, 88; the price collar and
+  the 5 % stop distance bound the effect.
 * *Dashes and slashes*: in the shadow text every Unicode dash (category Pd, the minus sign) is
   an ASCII hyphen and every slash-like character (fraction, division, full-width solidus) an
   ASCII slash, so "Qorvex‐long" and "Long⁄short" split like their ASCII forms.

@@ -21,8 +21,10 @@ holds the one definition the entry rule uses for such text. It only ever turns a
   superscripts, fractions, Roman numerals); any non-ASCII character directly touching an ASCII
   digit or inside what would otherwise be one number token (ASCII digits, full stops and commas):
   a separator (full-width full stop, middle dot, Arabic decimal separator), a minus or dash, and
-  collaterally a currency, percent or degree sign; and the ASCII forms that the rule would read as
-  a different number than written ("88. 42", "88 .42", "88..42", "88.42.1"): the entry holds
+  collaterally a currency, percent or degree sign; the ASCII forms that the rule would read as
+  a different number than written ("88. 42" after an integer, "88 .42", "88 , 42", "88..42",
+  "88.42.1"; a full stop after a decimal part is a sentence end); and a price READ for the action
+  directly followed by spaces and a digit or by a letter ("88 42", "88.42k"): the entry holds
   (``ENTRY_TEXT_NUMBER_UNREADABLE``), wherever the number is in the post. Such a number is never
   an anchor, an entry, a stop or a second stop.
 * DASHES AND SLASHES: in the shadow text every Unicode dash (category Pd, the minus sign) becomes
@@ -33,8 +35,10 @@ holds the one definition the entry rule uses for such text. It only ever turns a
 
 from __future__ import annotations
 
+import contextlib
 import re
 import unicodedata
+from decimal import Decimal, InvalidOperation
 
 ENTRY_TEXT_INVISIBLE_CHARACTER = "ENTRY_TEXT_INVISIBLE_CHARACTER"
 ENTRY_TEXT_NUMBER_UNREADABLE = "ENTRY_TEXT_NUMBER_UNREADABLE"
@@ -49,10 +53,17 @@ _SLASHES = frozenset("\u2044\u2215\uff0f\u29f8")
 # A number token: ASCII digits, full stops and commas, and any non-ASCII character that is not a
 # letter or a space between them. One holding a non-ASCII character is not read.
 _NUMBER_TOKEN_RE = re.compile(r"[0-9.,\u0080-\U0010ffff]*[0-9][0-9.,\u0080-\U0010ffff]*")
-# ASCII forms read as a different number than written: a space inside ("88. 42", "88 .42"), a
-# doubled separator ("88..42", "87.."), a second decimal point ("88.42.1").
+# ASCII forms read as a different number than written:
+# * an INTEGER, a full stop, spaces, a digit ("88. 42"; also "Stop 87. 88.42", accepted
+#   collateral); after a number that already has a decimal part ("87.20. 88.42") the full stop
+#   is a sentence end and is read as before;
+# * a digit, spaces, a full stop or comma, optional spaces, a digit ("88 .42", "88 . 42",
+#   "88 , 42", "88 ,42");
+# * a doubled separator ("88..42", "87..") and a second decimal point ("88.42.1").
 _ODD_ASCII_NUMBER_RE = re.compile(
-    r"\d\.[ \t]+\d|\d[ \t]+[.,]\d|\d[.,]{2,}|\d\.\d+\.\d")
+    r"(?<![\d.])\d+\.[ \t]+\d|\d[ \t]+[.,][ \t]*\d|\d[.,]{2,}|\d\.\d+\.\d")
+# One ASCII number as written (thousands commas, a decimal part), and what follows it.
+_READ_NUMBER_RE = re.compile(r"(?<![\d.,])\$?(\d{1,3}(?:,\d{3})+|\d+)(\.\d+)?")
 
 
 def _invisible(ch: str) -> bool:
@@ -89,6 +100,30 @@ def entry_text_problem(*texts: str | None) -> str | None:
             if not token.isascii() and any(
                 not ch.isascii() and not ch.isalpha() and not ch.isspace() for ch in token
             ):
+                return ENTRY_TEXT_NUMBER_UNREADABLE
+    return None
+
+
+def read_price_problem(prices, *texts: str | None) -> str | None:
+    """A price the rule actually READ for this action (its entry or reference level, its stop, its
+    target) written in the post as a number token directly followed by spaces and another digit
+    ("88 42" read as 88) or directly followed by an ASCII letter ("88.42k"): the number as read may
+    not be the number as written, so the entry holds. Any other number never triggers this
+    ("Nov 12 2026", "S&P 500", "10Y", "200DMA", "3pm")."""
+    wanted = set()
+    for p in prices:
+        with contextlib.suppress(InvalidOperation, TypeError, ValueError):
+            if p is not None and str(p).strip():
+                wanted.add(Decimal(str(p).replace(",", "").lstrip("$")))
+    if not wanted:
+        return None
+    for text in texts:
+        for m in _READ_NUMBER_RE.finditer(text or ""):
+            value = Decimal(m.group(1).replace(",", "") + (m.group(2) or ""))
+            if value not in wanted:
+                continue
+            rest = text[m.end():]
+            if re.match(r"[ \t]+\d|[A-Za-z]", rest):
                 return ENTRY_TEXT_NUMBER_UNREADABLE
     return None
 
