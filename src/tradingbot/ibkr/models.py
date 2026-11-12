@@ -225,10 +225,11 @@ class QuoteSnapshot:
     ended_early: bool = False  # stream ended once complete and settled, before its window
     window_ms: int = 0  # the bounded wait for this attempt
     # --- per-side evidence (additive; defaults keep older JSON reports loadable) ---------------
-    # ``*_at``: local UTC receipt time of the latest tick that confirmed that side (its price or
-    # its size tick); ``*_at_monotonic``: the same instant on this process's monotonic clock
-    # (comparable only with ``time.monotonic()`` in the same process). ``*_updates``: ticks on
-    # that side after its initial image that changed a value (see ``classify_quote``).
+    # ``*_at``: local UTC receipt time of the side's FRESHNESS event: its initial image or its
+    # latest value change (an identical repeat never moves it; see ``SideEvidence``);
+    # ``*_at_monotonic``: the same instant on this process's monotonic clock (comparable only
+    # with ``time.monotonic()`` in the same process). ``*_updates``: value changes on that side
+    # after its initial image.
     # ``*_tick_class``: LIVE / DELAYED / MIXED tick ids seen on that side (None: no tick).
     bid_at: str | None = None
     ask_at: str | None = None
@@ -240,6 +241,10 @@ class QuoteSnapshot:
     ask_tick_class: str | None = None
     quality_reason: str = ""  # one of QUOTE_REASONS ("" in reports written before it existed)
     observed_at_monotonic: float | None = None  # monotonic time this snapshot was built
+    # diagnostics only, NEVER freshness: monotonic time of the side's latest tick of any kind
+    bid_last_tick_monotonic: float | None = None
+    ask_last_tick_monotonic: float | None = None
+    halted: float | None = None  # latest HALTED tick (49) value; 0 = not halted, None = none seen
 
     @property
     def ticks_received(self) -> int:
@@ -251,15 +256,100 @@ class QuoteSnapshot:
 
     @property
     def two_sided_valid(self) -> bool:
-        bad = {"MISSING_BID", "MISSING_ASK", "NON_POSITIVE_BID", "NON_POSITIVE_ASK", "CROSSED"}
+        bad = {"MISSING_BID", "MISSING_ASK", "NON_POSITIVE_BID", "NON_POSITIVE_ASK", "CROSSED",
+               "NON_FINITE_BID", "NON_FINITE_ASK", "NON_FINITE_LAST"}
         return self.quality is not QuoteQuality.UNAVAILABLE and not bad.intersection(self.flags)
 
 
 def _positive(x: float | None) -> bool:
-    return x is not None and x > 0
+    return x is not None and _finite(x) and x > 0
 
 
 TICK_CLASS_LIVE, TICK_CLASS_DELAYED, TICK_CLASS_MIXED = "LIVE", "DELAYED", "MIXED"
+# Type NOT reported: LIVE needs at least this many post-image changes on EACH side, the most
+# recent of them no older than the window at the moment the snapshot is taken.
+UNREPORTED_LIVE_WINDOW_SECONDS = 5.0
+UNREPORTED_MIN_CHANGES = 2
+
+
+def _finite(x: object) -> bool:
+    if isinstance(x, Decimal):
+        return x.is_finite()
+    return not isinstance(x, bool) and isinstance(x, (int, float)) and math.isfinite(x)
+
+
+@dataclass
+class SideEvidence:
+    """Per-side (bid or ask) evidence of one subscription. Mutable; the session updates it under
+    its lock with its own clock. Pure (no SDK), so the counting rules are tested in CI.
+
+    * A valid price is finite and > 0; a valid size is finite and >= 0. Anything else (TWS's -1 /
+      0 "no quote yet" placeholders, a negative size, NaN, infinity) is recorded as evidence
+      (``placeholder_seen`` / ``non_finite_seen``) and never counts as image or change.
+    * Initial image: the side's first valid price; its size part is the first valid size at or
+      after that price (a size alone never establishes the image; sizes before it are ignored).
+    * A change: a valid price or size that differs from the previous valid value of the same kind,
+      after the image. An identical repeat is not a change.
+    * Freshness (``fresh_mono`` / ``fresh_wall``) moves ONLY when the image is established or a
+      value changes. ``last_tick_mono`` moves on every tick of the side and is diagnostics only.
+    """
+
+    price: float | None = None
+    size: Decimal | None = None
+    image: bool = False
+    changes: int = 0
+    fresh_wall: datetime | None = None
+    fresh_mono: float | None = None
+    last_tick_mono: float | None = None
+    live: bool = False
+    delayed: bool = False
+    placeholder_seen: bool = False
+    non_finite_seen: bool = False
+
+    def observe(self, kind: str, value: object, delayed: bool, *, mono: float,
+                wall: datetime | None = None) -> None:
+        if value is None:  # unset (UNSET_DOUBLE / UNSET_DECIMAL): no information at all
+            return
+        self.last_tick_mono = mono
+        if delayed:
+            self.delayed = True
+        else:
+            self.live = True
+        if not _finite(value):
+            self.non_finite_seen = True
+            return
+        if (kind == "price" and not value > 0) or (kind == "size" and value < 0):
+            self.placeholder_seen = True
+            return
+        if kind == "price":
+            if not self.image:
+                self.image, self.price = True, value
+                self._fresh(mono, wall)
+            elif value != self.price:
+                self.price = value
+                self._change(mono, wall)
+        elif self.image:
+            if self.size is None:
+                self.size = value  # the size part of the image
+            elif value != self.size:
+                self.size = value
+                self._change(mono, wall)
+
+    def _fresh(self, mono: float, wall: datetime | None) -> None:
+        self.fresh_mono, self.fresh_wall = mono, wall
+
+    def _change(self, mono: float, wall: datetime | None) -> None:
+        self.changes += 1
+        self._fresh(mono, wall)
+
+    @property
+    def tick_class(self) -> str | None:
+        if self.live and self.delayed:
+            return TICK_CLASS_MIXED
+        if self.delayed:
+            return TICK_CLASS_DELAYED
+        return TICK_CLASS_LIVE if self.live else None
+
 
 # Request-scoped notices that say the delivered data is delayed or only partly entitled. They are
 # recorded on the snapshot and can only make the label worse (a would-be LIVE becomes DELAYED).
@@ -281,13 +371,17 @@ REASON_REPORTED_LIVE_NO_LIVE_TICKS = "REPORTED_LIVE_NO_LIVE_TICKS"  # FROZEN: ty
 REASON_TYPE_UNREPORTED_NO_UPDATES_YET = "TYPE_UNREPORTED_NO_UPDATES_YET"  # FROZEN
 REASON_ENTITLEMENT_NOTICE = "ENTITLEMENT_NOTICE"  # DELAYED: would be LIVE, but a notice says not
 REASON_REPORTED_LIVE = "REPORTED_LIVE"  # LIVE: type 1 and live ticks (the initial image counts)
-REASON_TYPE_UNREPORTED_UPDATES_SEEN = "TYPE_UNREPORTED_UPDATES_SEEN"  # LIVE: both sides moved
+REASON_TYPE_UNREPORTED_UPDATES_SEEN = "TYPE_UNREPORTED_UPDATES_SEEN"  # LIVE: both sides moving
+REASON_TYPE_UNREPORTED_REQUESTED_NOT_ELIGIBLE = "TYPE_UNREPORTED_REQUESTED_NOT_ELIGIBLE"  # FROZEN
+REASON_TYPE_UNREPORTED_UPDATES_TOO_OLD = "TYPE_UNREPORTED_UPDATES_TOO_OLD"  # FROZEN
+REASON_REPORTED_TYPE_HISTORY_NOT_LIVE = "REPORTED_TYPE_HISTORY_NOT_LIVE"  # earlier 2/3/4: sticky
 QUOTE_REASONS = (
     REASON_NOT_ENTITLED, REASON_STREAM_FAILED, REASON_NO_PRICE, REASON_REPORTED_DELAYED,
     REASON_REPORTED_DELAYED_FROZEN, REASON_REPORTED_FROZEN, REASON_DELAYED_TICKS,
     REASON_UNKNOWN_TYPE, REASON_REPORTED_LIVE_NO_LIVE_TICKS,
     REASON_TYPE_UNREPORTED_NO_UPDATES_YET, REASON_ENTITLEMENT_NOTICE, REASON_REPORTED_LIVE,
-    REASON_TYPE_UNREPORTED_UPDATES_SEEN)
+    REASON_TYPE_UNREPORTED_UPDATES_SEEN, REASON_TYPE_UNREPORTED_REQUESTED_NOT_ELIGIBLE,
+    REASON_TYPE_UNREPORTED_UPDATES_TOO_OLD, REASON_REPORTED_TYPE_HISTORY_NOT_LIVE)
 
 
 @dataclass(frozen=True)
@@ -302,48 +396,54 @@ def classify_quote(*, bid: float | None, ask: float | None, last: float | None,
                    live_ticks_seen: bool, bid_updates: int = 0, ask_updates: int = 0,
                    notices: tuple[int, ...] | list[int] = (),
                    unavailable_code: int | None = None,
-                   stream_failed: bool = False) -> QuoteClassification:
+                   stream_failed: bool = False,
+                   requested_market_data_type: int | None = None,
+                   bid_change_age_seconds: float | None = None,
+                   ask_change_age_seconds: float | None = None,
+                   market_data_types_seen: tuple[int, ...] | list[int] = (),
+                   ) -> QuoteClassification:
     """THE quote classification: observed facts -> label, reason, flags. Pure; fails closed.
 
-    Rules, first match wins:
+    First matching rule wins (docs/IBKR_ADAPTER.md, section 8, has the same table):
 
-    ====  ===========================================================  ============  ===========
-    step  facts                                                        quality       reason
-    ====  ===========================================================  ============  ===========
-    1     entitlement refusal (``unavailable_code``)                   UNAVAILABLE   NOT_ENTITLED
-    2     the held stream failed (``stream_failed``)                   UNAVAILABLE   STREAM_FAILED
-    3     no positive bid, ask or last                                 UNAVAILABLE   NO_PRICE
-    4     reported type 3                                              DELAYED       REPORTED_DELAYED
-    5     reported type 4                                              FROZEN        REPORTED_DELAYED_FROZEN
-    6     reported type 2                                              FROZEN        REPORTED_FROZEN
-    7     any delayed tick id (type 1, unreported or unknown)          DELAYED       DELAYED_TICKS
-    8     reported type outside 1..4                                   FROZEN        UNKNOWN_MARKET_DATA_TYPE
-    9     reported type 1, no live tick                                FROZEN        REPORTED_LIVE_NO_LIVE_TICKS
-    10    reported type 1, live ticks (the initial image counts)       LIVE*         REPORTED_LIVE
-    11    type NOT reported, bid AND ask each >= 1 post-image update   LIVE*         TYPE_UNREPORTED_UPDATES_SEEN
-    12    type NOT reported, otherwise                                 FROZEN        TYPE_UNREPORTED_NO_UPDATES_YET
-    ====  ===========================================================  ============  ===========
+    1  entitlement refusal (``unavailable_code``)                  UNAVAILABLE  NOT_ENTITLED
+    2  the held stream failed (``stream_failed``)                  UNAVAILABLE  STREAM_FAILED
+    3  no finite positive bid, ask or last                         UNAVAILABLE  NO_PRICE
+    4  latest reported type 3                                      DELAYED      REPORTED_DELAYED
+    5  latest reported type 4                                      FROZEN       REPORTED_DELAYED_FROZEN
+    6  latest reported type 2                                      FROZEN       REPORTED_FROZEN
+    7  any delayed tick id on the subscription                     DELAYED      DELAYED_TICKS
+    8  an EARLIER reported type 2/3/4 (sticky)                     DELAYED/FROZEN REPORTED_TYPE_HISTORY_NOT_LIVE
+    9  latest reported type outside 1..4                           FROZEN       UNKNOWN_MARKET_DATA_TYPE
+    10 reported type 1, no live tick id                            FROZEN       REPORTED_LIVE_NO_LIVE_TICKS
+    11 reported type 1, live ticks (the initial image counts)      LIVE*        REPORTED_LIVE
+    12 type NOT reported, requested type not 1 or 3                FROZEN       TYPE_UNREPORTED_REQUESTED_NOT_ELIGIBLE
+    13 type NOT reported, < UNREPORTED_MIN_CHANGES on a side       FROZEN       TYPE_UNREPORTED_NO_UPDATES_YET
+    14 type NOT reported, a side's last change older than the
+       window (or unknown, or in the future)                       FROZEN       TYPE_UNREPORTED_UPDATES_TOO_OLD
+    15 type NOT reported, otherwise                                LIVE*        TYPE_UNREPORTED_UPDATES_SEEN
 
-    ``*``: an entitlement notice for the request (``ENTITLEMENT_NOTICE_CODES``) turns a would-be
-    LIVE into DELAYED / ENTITLEMENT_NOTICE. Nothing here ever makes a label better.
+    ``*``: an entitlement notice (``ENTITLEMENT_NOTICE_CODES``) turns a would-be LIVE into
+    DELAYED / ENTITLEMENT_NOTICE. Notices, delayed ticks and reported types accumulate over the
+    subscription, so bad news is sticky until it is closed and reopened.
 
-    Initial image: after subscribing, the FIRST price tick and the FIRST size tick of each side
-    (bid, ask), live or delayed id alike, with a set value. A post-image update is any later tick
-    of that side whose value differs from the previous value of the same kind (price or size), so
-    a frozen feed that repeats its image is still "no updates". Why an unreported type needs
-    them: TWS does not always send ``marketDataType`` for real-time data, and a frozen feed also
-    sends plain (non-delayed) tick ids, but only one image at subscription time; "arrived just
-    now" is no evidence of a moving market. Usability of the two sides is separate (flags below,
-    and ``entry_quote_check``): the label says what kind of data it is, not whether it can trade.
-    Timestamps play no part: a last-trade time never makes bid/ask "fresh".
+    ``bid_updates`` / ``ask_updates``: post-image changes (``SideEvidence``);
+    ``*_change_age_seconds``: age of the side's most recent change when the snapshot is taken;
+    ``market_data_types_seen``: every type the broker delivered for this subscription.
+    Usability of the two sides is separate (flags below, and ``entry_quote_check``).
+    Timestamps of trades play no part.
     """
     flags: list[str] = []
     for name, value in (("BID", bid), ("ASK", ask)):
         if value is None:
             flags.append(f"MISSING_{name}")
+        elif not _finite(value):
+            flags.append(f"NON_FINITE_{name}")
         elif value <= 0:
             flags.append(f"NON_POSITIVE_{name}")
-    if last is not None and last <= 0:
+    if last is not None and not _finite(last):
+        flags.append("NON_FINITE_LAST")
+    elif last is not None and last <= 0:
         flags.append("NON_POSITIVE_LAST")
     if _positive(bid) and _positive(ask):
         if bid > ask:
@@ -357,6 +457,7 @@ def classify_quote(*, bid: float | None, ask: float | None, last: float | None,
     if unavailable_code is not None:
         flags.append("NOT_ENTITLED")
     notice = any(int(c) in ENTITLEMENT_NOTICE_CODES for c in notices)
+    history = {int(t) for t in market_data_types_seen}
 
     def out(quality: QuoteQuality, reason: str) -> QuoteClassification:
         return QuoteClassification(quality, reason, tuple(flags))
@@ -381,6 +482,10 @@ def classify_quote(*, bid: float | None, ask: float | None, last: float | None,
         if market_data_type == 1:
             flags.append("TYPE_TICK_CONFLICT")
         return out(QuoteQuality.DELAYED, REASON_DELAYED_TICKS)
+    if history & {2, 3, 4}:
+        flags.append("EARLIER_TYPE_NOT_LIVE")
+        quality = QuoteQuality.DELAYED if history & {3, 4} else QuoteQuality.FROZEN
+        return out(quality, REASON_REPORTED_TYPE_HISTORY_NOT_LIVE)
     if not known:
         return out(QuoteQuality.FROZEN, REASON_UNKNOWN_TYPE)
     if market_data_type == 1:
@@ -388,9 +493,17 @@ def classify_quote(*, bid: float | None, ask: float | None, last: float | None,
             return out(QuoteQuality.FROZEN, REASON_REPORTED_LIVE_NO_LIVE_TICKS)
         reason = REASON_REPORTED_LIVE
     else:
-        if bid_updates < 1 or ask_updates < 1:
-            flags.append(REASON_TYPE_UNREPORTED_NO_UPDATES_YET)
-            return out(QuoteQuality.FROZEN, REASON_TYPE_UNREPORTED_NO_UPDATES_YET)
+        not_live = None
+        if requested_market_data_type not in (1, 3):
+            not_live = REASON_TYPE_UNREPORTED_REQUESTED_NOT_ELIGIBLE
+        elif bid_updates < UNREPORTED_MIN_CHANGES or ask_updates < UNREPORTED_MIN_CHANGES:
+            not_live = REASON_TYPE_UNREPORTED_NO_UPDATES_YET
+        elif not all(_finite(a) and 0 <= a <= UNREPORTED_LIVE_WINDOW_SECONDS
+                     for a in (bid_change_age_seconds, ask_change_age_seconds)):
+            not_live = REASON_TYPE_UNREPORTED_UPDATES_TOO_OLD
+        if not_live is not None:
+            flags.append(not_live)
+            return out(QuoteQuality.FROZEN, not_live)
         reason = REASON_TYPE_UNREPORTED_UPDATES_SEEN
     if notice:  # the codes themselves are on the snapshot (``notices``)
         flags.append("ENTITLEMENT_NOTICE")
@@ -416,7 +529,8 @@ ENTRY_QUOTE_REASONS = (
     "INVALID_MAX_AGE", "INVALID_NOW", "NOT_LIVE", "BID_MISSING", "ASK_MISSING",
     "BID_NON_POSITIVE", "ASK_NON_POSITIVE", "LOCKED", "CROSSED", "BID_TICKS_NOT_LIVE",
     "ASK_TICKS_NOT_LIVE", "BID_TIME_UNKNOWN", "ASK_TIME_UNKNOWN", "BID_FROM_FUTURE",
-    "ASK_FROM_FUTURE", "BID_STALE", "ASK_STALE")
+    "ASK_FROM_FUTURE", "BID_STALE", "ASK_STALE", "BID_NOT_FINITE", "ASK_NOT_FINITE", "HALTED")
+# HALTED: the TWS HALTED tick (49) carried a non-zero (or unreadable) value.
 
 
 @dataclass(frozen=True)
@@ -428,7 +542,7 @@ class EntryQuoteCheck:
 
 
 def _finite_number(x: object) -> bool:
-    return not isinstance(x, bool) and isinstance(x, (int, float)) and math.isfinite(x)
+    return not isinstance(x, Decimal) and _finite(x)
 
 
 def entry_quote_check(snapshot: QuoteSnapshot, *, now_monotonic: float,
@@ -447,9 +561,13 @@ def entry_quote_check(snapshot: QuoteSnapshot, *, now_monotonic: float,
         reasons.append("INVALID_NOW")
     if snapshot.quality is not QuoteQuality.LIVE:
         reasons.append("NOT_LIVE")
+    if snapshot.halted is not None and snapshot.halted != 0:  # NaN / -1 / 1 / 2: halted
+        reasons.append("HALTED")
     for side, value in (("BID", snapshot.bid), ("ASK", snapshot.ask)):
         if value is None:
             reasons.append(f"{side}_MISSING")
+        elif not _finite(value):
+            reasons.append(f"{side}_NOT_FINITE")
         elif not value > 0:
             reasons.append(f"{side}_NON_POSITIVE")
     if _positive(snapshot.bid) and _positive(snapshot.ask):

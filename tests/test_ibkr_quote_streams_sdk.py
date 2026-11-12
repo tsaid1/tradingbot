@@ -57,12 +57,12 @@ class Feed:
         self.marks[rid] = self.marks.get(rid, 0) + 1
         for f in frames:
             conn.push(f)
-        conn.push(frame(IN.TICK_GENERIC, TickGeneric(reqId=rid, tickType=49, value=1.0)))
+        conn.push(frame(IN.TICK_GENERIC, TickGeneric(reqId=rid, tickType=46, value=3.0)))
         deadline = time.monotonic() + 3.0
         while time.monotonic() < deadline:
             with s._cond:
                 p = s._pending.get(rid)
-                if p is None or p.tick_counts.get("HALTED", 0) >= self.marks[rid]:
+                if p is None or p.tick_counts.get("SHORTABLE", 0) >= self.marks[rid]:
                     return
             time.sleep(0.005)
         raise AssertionError("fake TWS frames were not processed in time")
@@ -179,11 +179,13 @@ def test_size_only_updates_confirm_a_side(tws, feed):  # noqa: F811
         feed.push(s, 0, _size(rid, 0, "250"), _size(rid, 3, "175"))  # BID_SIZE, ASK_SIZE
         q = st.latest()
         assert (q.bid, q.ask, str(q.bid_size), str(q.ask_size)) == (2000.0, 2000.5, "250", "175")
-        assert (q.bid_updates, q.ask_updates) == (1, 1) and q.quality is L
+        assert (q.bid_updates, q.ask_updates) == (1, 1) and q.quality is F  # one is not enough
         assert q.bid_at_monotonic >= before.bid_at_monotonic
+        feed.push(s, 0, _size(rid, 0, "260"), _size(rid, 3, "180"))
+        assert st.latest().quality is L
         # an unset size is no confirmation
         feed.push(s, 0, frame(IN.TICK_SIZE, TickSize(reqId=rid, tickType=0)))
-        assert st.latest().bid_updates == 1
+        assert st.latest().bid_updates == 2
 
 
 def test_one_side_goes_stale_while_the_other_keeps_updating(tws, feed, monkeypatch):  # noqa: F811

@@ -76,9 +76,6 @@ from tradingbot.ibkr.models import (
     NO_SECURITY_DEFINITION,
     PRICE_TICKS,
     SIZE_TICKS,
-    TICK_CLASS_DELAYED,
-    TICK_CLASS_LIVE,
-    TICK_CLASS_MIXED,
     AccountSummary,
     AccountValue,
     ContractQuery,
@@ -90,6 +87,7 @@ from tradingbot.ibkr.models import (
     QuoteReport,
     QuoteSnapshot,
     ResolvedContract,
+    SideEvidence,
     assess_quote_attempts,
     classify_quote,
     quote_age_seconds,
@@ -144,7 +142,8 @@ ALLOWED_OUT_MESSAGES = frozenset({
     OUT.CANCEL_MKT_DATA, OUT.REQ_MARKET_DATA_TYPE, OUT.REQ_CONFIG, OUT.REQ_SEC_DEF_OPT_PARAMS,
 })
 MAX_DISCOVERY_LIMIT = 1000  # upper bound on rows kept per discovery / option-chain request
-MAX_QUOTE_STREAMS = 10  # hard cap on simultaneously held-open quote streams per session
+MAX_QUOTE_STREAMS = 10
+HALTED_TICK = 49  # TickTypeEnum.HALTED (tickGeneric): 0 not halted, 1 / 2 halted  # hard cap on simultaneously held-open quote streams per session
 
 
 def _denied(name: str) -> Callable[..., None]:
@@ -345,50 +344,6 @@ _side_clock = time.monotonic
 
 
 @dataclass
-class _Side:
-    """Per-side (bid or ask) evidence of one quote request. Updated under the session lock.
-
-    Initial image: the first price tick and the first size tick of this side that carry a set
-    value. A post-image update is a later tick of the same kind whose value differs from the
-    previous one (a repeated image is not an update). Every set-value tick confirms the side
-    and moves its receipt times."""
-
-    price: float | None = None
-    size: Decimal | None = None
-    price_seen: bool = False
-    size_seen: bool = False
-    at_wall: datetime | None = None
-    at_mono: float | None = None
-    updates: int = 0
-    live: bool = False
-    delayed: bool = False
-
-    def observe(self, kind: str, value: Any, delayed: bool) -> None:
-        if value is None:  # an unset price or size says nothing about the side
-            return
-        seen = f"{kind}_seen"
-        if getattr(self, seen):
-            if value != getattr(self, kind):
-                self.updates += 1
-        else:
-            setattr(self, seen, True)
-        setattr(self, kind, value)
-        self.at_wall, self.at_mono = datetime.now(UTC), _side_clock()
-        if delayed:
-            self.delayed = True
-        else:
-            self.live = True
-
-    @property
-    def tick_class(self) -> str | None:
-        if self.live and self.delayed:
-            return TICK_CLASS_MIXED
-        if self.delayed:
-            return TICK_CLASS_DELAYED
-        return TICK_CLASS_LIVE if self.live else None
-
-
-@dataclass
 class _Pending:
     kind: str
     req_id: int
@@ -420,8 +375,11 @@ class _Pending:
     ended_early: bool = False
     timed_out: bool = False
     request_error: str | None = None
-    sides: dict[str, _Side] = field(default_factory=lambda: {"bid": _Side(), "ask": _Side()})
+    sides: dict[str, SideEvidence] = field(
+        default_factory=lambda: {"bid": SideEvidence(), "ask": SideEvidence()})
     stream: bool = False  # a held-open stream (open_quote_stream), not a bounded request
+    halted: float | None = None  # latest HALTED tick (49) value
+    refused: bool = False  # refused before anything was sent: no cancel
 
     def fail(self, exc: BaseException) -> None:
         if self.error is None:
@@ -504,7 +462,7 @@ class _Wrapper(EWrapper):
         self._call(self._s._on_tick_string, reqId, tickType, value)
 
     def tickGeneric(self, reqId, tickType, value):
-        self._call(self._s._on_tick_other, reqId, tickType)
+        self._call(self._s._on_tick_generic, reqId, tickType, value)
 
     def tickReqParams(self, tickerId, minTick, bboExchange, snapshotPermissions):
         self._call(self._s._on_tick_req_params, tickerId, minTick, bboExchange,
@@ -1001,7 +959,11 @@ class IbkrSession:
         c = _mkt_contract(contract)
 
         def send(rid: int) -> None:
-            self._check_stream_type(market_data_type)  # under the lock, before anything is sent
+            try:  # under the lock, before anything is sent
+                self._check_stream_type(market_data_type)
+            except QuoteStreamConflict:
+                self._pending[rid].refused = True  # nothing was requested: send no cancel
+                raise
             self._client.reqMarketDataType(market_data_type)
             self._client.reqMktData(rid, c, "", snapshot, False, [])
 
@@ -1030,16 +992,31 @@ class IbkrSession:
         with self._cond:
             bid, ask, last = p.prices.get("bid"), p.prices.get("ask"), p.prices.get("last")
             b, a = p.sides["bid"], p.sides["ask"]
+            received = datetime.now(UTC)
+            mono = _side_clock()
+
+            def change_age(side: SideEvidence) -> float | None:
+                if side.changes < 1 or side.fresh_mono is None:
+                    return None
+                return mono - side.fresh_mono  # fresh_mono is the latest change once changed
+
             verdict = classify_quote(
                 bid=bid, ask=ask, last=last, market_data_type=p.market_data_type,
                 delayed_ticks_seen=p.delayed_ticks, live_ticks_seen=p.live_ticks,
-                bid_updates=b.updates, ask_updates=a.updates, notices=tuple(p.notices),
+                bid_updates=b.changes, ask_updates=a.changes, notices=tuple(p.notices),
                 unavailable_code=p.unavailable_code,
-                stream_failed=p.stream and p.error is not None)
+                stream_failed=p.stream and p.error is not None,
+                requested_market_data_type=requested, bid_change_age_seconds=change_age(b),
+                ask_change_age_seconds=change_age(a), market_data_types_seen=tuple(p.mdt_values))
             flags = verdict.flags
+            for name, sd in (("BID", b), ("ASK", a)):
+                if sd.placeholder_seen:
+                    flags = (*flags, f"{name}_PLACEHOLDER_TICK")
+                if sd.non_finite_seen:
+                    flags = (*flags, f"{name}_NON_FINITE_TICK")
+            if p.halted is not None and p.halted != 0:
+                flags = (*flags, "HALTED")
             end_missing = snapshot and not p.ended
-            received = datetime.now(UTC)
-            mono = _side_clock()
             age = quote_age_seconds(received, p.last_trade_epoch)
             if age is None:
                 flags = (*flags, "QUOTE_AGE_UNKNOWN")
@@ -1073,10 +1050,13 @@ class IbkrSession:
                 request_events=tuple(p.events), request_error=request_error,
                 first_tick_ms=ms(p.first_tick), last_tick_ms=ms(p.last_tick),
                 quote_age_seconds=age, ended_early=p.ended_early, window_ms=int(window * 1000),
-                bid_at=iso(b.at_wall), ask_at=iso(a.at_wall), bid_at_monotonic=b.at_mono,
-                ask_at_monotonic=a.at_mono, bid_updates=b.updates, ask_updates=a.updates,
+                bid_at=iso(b.fresh_wall), ask_at=iso(a.fresh_wall),
+                bid_at_monotonic=b.fresh_mono, ask_at_monotonic=a.fresh_mono,
+                bid_updates=b.changes, ask_updates=a.changes,
                 bid_tick_class=b.tick_class, ask_tick_class=a.tick_class,
-                quality_reason=verdict.reason, observed_at_monotonic=mono)
+                quality_reason=verdict.reason, observed_at_monotonic=mono,
+                bid_last_tick_monotonic=b.last_tick_mono,
+                ask_last_tick_monotonic=a.last_tick_mono, halted=p.halted)
 
     # ------------------------------------------------------------------ held-open quote streams
     def open_quote_stream(self, contract: ResolvedContract, *,
@@ -1255,7 +1235,7 @@ class IbkrSession:
         except BaseException as exc:  # noqa: BLE001 - cleanup must still run (incl. Ctrl-C)
             primary = exc
         finally:
-            if cancel is not None and (cancel_always or not p.ended):
+            if cancel is not None and not p.refused and (cancel_always or not p.ended):
                 failures = self._cancel(kind, p.req_id, cancel)
             with self._cond:
                 if kind == "positions":
@@ -1562,6 +1542,18 @@ class IbkrSession:
                 p.tick_req_params = {"minTick": float(min_tick), "bboExchange": str(bbo_exchange),
                                      "snapshotPermissions": int(snapshot_permissions)}
 
+    def _on_tick_generic(self, req_id: int, tick_type: int, value) -> None:
+        with self._cond:
+            p = self._quote_pending(req_id)
+            if p is None:
+                return
+            self._count_tick(p, tick_type)
+            if int(tick_type) == HALTED_TICK:
+                try:
+                    p.halted = float(value)
+                except (TypeError, ValueError):
+                    p.halted = float("nan")  # unreadable: treated as halted
+
     def _on_tick_other(self, req_id: int, tick_type: int) -> None:
         with self._cond:
             p = self._quote_pending(req_id)
@@ -1586,7 +1578,8 @@ class IbkrSession:
             p.prices[name] = value
             p.live_ticks |= not delayed
             if name in p.sides:
-                p.sides[name].observe("price", value, delayed)
+                p.sides[name].observe("price", value, delayed, mono=_side_clock(),
+                                      wall=datetime.now(UTC))
 
     def _on_tick_size(self, req_id: int, tick_type: int, size) -> None:
         with self._cond:
@@ -1599,7 +1592,8 @@ class IbkrSession:
                 value = None if size == UNSET_DECIMAL else Decimal(size)
                 p.sizes[mapped[0]] = value
                 if mapped[0] in p.sides:
-                    p.sides[mapped[0]].observe("size", value, mapped[1])
+                    p.sides[mapped[0]].observe("size", value, mapped[1], mono=_side_clock(),
+                                               wall=datetime.now(UTC))
 
     def _on_tick_string(self, req_id: int, tick_type: int, value: str) -> None:
         with self._cond:

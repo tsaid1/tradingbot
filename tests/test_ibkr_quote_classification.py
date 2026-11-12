@@ -30,7 +30,9 @@ L, D, F, U = QuoteQuality.LIVE, QuoteQuality.DELAYED, QuoteQuality.FROZEN, Quote
 def cq(**kw):
     base = {"bid": 10.0, "ask": 10.02, "last": 10.01, "market_data_type": 1,
             "delayed_ticks_seen": False, "live_ticks_seen": True, "bid_updates": 0,
-            "ask_updates": 0, "notices": (), "unavailable_code": None, "stream_failed": False}
+            "ask_updates": 0, "notices": (), "unavailable_code": None, "stream_failed": False,
+            "requested_market_data_type": 3, "bid_change_age_seconds": 0.5,
+            "ask_change_age_seconds": 0.5}
     base.update(kw)
     return classify_quote(**base)
 
@@ -61,8 +63,14 @@ def cq(**kw):
     ({"market_data_type": None, "bid_updates": 31, "ask_updates": 35}, L,
      "TYPE_UNREPORTED_UPDATES_SEEN"),  # the spot-gold case
     ({"market_data_type": None}, F, "TYPE_UNREPORTED_NO_UPDATES_YET"),  # its mirror
-    ({"market_data_type": None, "bid_updates": 4}, F, "TYPE_UNREPORTED_NO_UPDATES_YET"),
+    ({"market_data_type": None, "bid_updates": 4, "ask_updates": 1}, F,
+     "TYPE_UNREPORTED_NO_UPDATES_YET"),
     ({"market_data_type": None, "ask_updates": 4}, F, "TYPE_UNREPORTED_NO_UPDATES_YET"),
+    ({"market_data_type": None, "bid_updates": 31, "ask_updates": 35,
+      "bid_change_age_seconds": 9.0}, F, "TYPE_UNREPORTED_UPDATES_TOO_OLD"),
+    ({"market_data_type": None, "bid_updates": 31, "ask_updates": 35,
+      "requested_market_data_type": 2}, F, "TYPE_UNREPORTED_REQUESTED_NOT_ELIGIBLE"),
+    ({"market_data_types_seen": (3, 1)}, D, "REPORTED_TYPE_HISTORY_NOT_LIVE"),
     ({"notices": (10167,)}, D, "ENTITLEMENT_NOTICE"),
     ({"notices": (2186,)}, D, "ENTITLEMENT_NOTICE"),
     ({"market_data_type": None, "bid_updates": 2, "ask_updates": 2, "notices": (10090,)}, D,
@@ -75,10 +83,10 @@ def test_classification_table(facts, quality, reason):
     assert (c.quality, c.reason) == (quality, reason)
 
 
-def test_initial_image_boundary_needs_one_update_on_each_side():
-    for b, a in ((0, 0), (1, 0), (0, 1)):
+def test_unreported_boundary_needs_two_changes_on_each_side():
+    for b, a in ((0, 0), (1, 1), (2, 1), (1, 2)):
         assert cq(market_data_type=None, bid_updates=b, ask_updates=a).quality is F
-    c = cq(market_data_type=None, bid_updates=1, ask_updates=1)
+    c = cq(market_data_type=None, bid_updates=2, ask_updates=2)
     assert (c.quality, c.reason) == (L, "TYPE_UNREPORTED_UPDATES_SEEN")
 
 
@@ -147,14 +155,17 @@ def test_reason_determines_quality():
                 "REPORTED_DELAYED_FROZEN": F, "REPORTED_FROZEN": F, "DELAYED_TICKS": D,
                 "UNKNOWN_MARKET_DATA_TYPE": F, "REPORTED_LIVE_NO_LIVE_TICKS": F,
                 "TYPE_UNREPORTED_NO_UPDATES_YET": F, "ENTITLEMENT_NOTICE": D,
-                "REPORTED_LIVE": L, "TYPE_UNREPORTED_UPDATES_SEEN": L}
+                "REPORTED_LIVE": L, "TYPE_UNREPORTED_UPDATES_SEEN": L,
+                "TYPE_UNREPORTED_REQUESTED_NOT_ELIGIBLE": F,
+                "TYPE_UNREPORTED_UPDATES_TOO_OLD": F, "REPORTED_TYPE_HISTORY_NOT_LIVE": (D, F)}
     assert set(expected) == set(QUOTE_REASONS)
     for mdt, delayed, live, bu, au, notices, unav, failed, (bid, ask), last in _SPACE:
         c = classify_quote(bid=bid, ask=ask, last=last, market_data_type=mdt,
                            delayed_ticks_seen=delayed, live_ticks_seen=live, bid_updates=bu,
                            ask_updates=au, notices=notices, unavailable_code=unav,
                            stream_failed=failed)
-        assert expected[c.reason] is c.quality
+        want = expected[c.reason]
+        assert c.quality in (want if isinstance(want, tuple) else (want,))
 
 
 def test_assess_quote_is_the_same_function_without_update_counts():
