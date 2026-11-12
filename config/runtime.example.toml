@@ -50,6 +50,7 @@ max_aggregate_exposure_usd = "10000"
 
 [interpreter]
 # lexicon_path = "/path/outside/the/repo/lexicon.json"   # optional private extension
+# review_log_path = "/path/outside/the/repo/review.jsonl"   # optional PRIVATE vocabulary review log (docs/RUNTIME.md)
 
 [notify]
 channels = ["log", "alerts_file"]   # registered channels (runtime/notify.py); no external one

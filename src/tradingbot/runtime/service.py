@@ -41,6 +41,8 @@ from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
+from pydantic import ValidationError
+
 from tradingbot.event_models import ParsedPost
 from tradingbot.execution import settlement
 from tradingbot.execution.broker import (
@@ -76,8 +78,9 @@ from tradingbot.execution.replay import BrokerEventReplay
 from tradingbot.execution.store import LEDGER_REVERSAL, UNRESOLVED_STATES
 from tradingbot.models import Action, Instrument, LegQuote, MappedQuote, Quote
 from tradingbot.runtime import notify as N
+from tradingbot.runtime import vocab_review
 from tradingbot.runtime.alerts import Alerter
-from tradingbot.runtime.config import RuntimeConfig
+from tradingbot.runtime.config import ConfigError, RuntimeConfig
 from tradingbot.runtime.mapping import (
     AnchorLexicon,
     FamilyMapping,
@@ -96,6 +99,14 @@ from tradingbot.runtime.operator_apply import (
 )
 from tradingbot.runtime.sources import ReplayFileSource, SourceAdapter, SourceError
 from tradingbot.runtime.store import RuntimeStore, write_json_atomic
+from tradingbot.runtime.vocab_review import (
+    CANDIDATE_KEY,
+    CANDIDATE_RUN_MARKER,
+    CandidateLexiconRefused,
+    PrivatePathError,
+    ReviewLog,
+    review_record,
+)
 from tradingbot.source_events import SourcePost
 from tradingbot.tkl_interpreter import LexiconExtension, TklInterpreter, group_linked_actions
 from tradingbot.validator import in_roll_window
@@ -218,14 +229,69 @@ def _safe_error(exc: BaseException) -> str:
 
 
 
-def load_lexicons(path) -> tuple[LexiconExtension, AnchorLexicon]:
+def load_lexicons(path, *, allow_candidate: bool = False
+                  ) -> tuple[LexiconExtension, AnchorLexicon]:
+    """``read_lexicons``, with a refusal reported as a ``ConfigError`` that carries only the
+    error type, the field paths and the count, never an input value: a refused lexicon's words
+    never reach stderr, a log or an alert (review S6)."""
+    try:
+        return read_lexicons(path, allow_candidate=allow_candidate)
+    except ValidationError as exc:
+        errors = exc.errors()
+        anchor = exc.title == AnchorLexicon.__name__
+        model = AnchorLexicon if anchor else LexiconExtension
+        locs = sorted({("entry_anchor." if anchor else "") + _schema_path(model, e)
+                       for e in errors})
+        raise ConfigError(f"the private lexicon {path} is refused by its validators: "
+                          f"{len(errors)} error(s) of type {type(exc).__name__} at "
+                          f"{', '.join(locs) or '-'}; open it on the owner's review page or "
+                          "check it by hand") from None
+    except json.JSONDecodeError as exc:
+        raise ConfigError(f"the private lexicon {path} is not valid JSON (line {exc.lineno}, "
+                          f"column {exc.colno})") from None
+    except (TypeError, AttributeError) as exc:
+        raise ConfigError(f"the private lexicon {path} is not a JSON object "
+                          f"({type(exc).__name__})") from None
+
+
+UNKNOWN_KEY = "<unknown key>"
+
+
+def _schema_path(model, error: dict) -> str:
+    """A validation error's field path built only from names the schema declares (review S6): a
+    key name in a private file can itself be a private word, so an unknown key (``extra_forbidden``
+    or any segment that is not a declared field, such as a family name under ``family_aliases``)
+    is reported as ``<unknown key>``; list indexes are dropped."""
+    out = []
+    for depth, seg in enumerate(error.get("loc") or ()):
+        if isinstance(seg, int):
+            continue
+        known = depth == 0 and seg in model.model_fields and error.get("type") != "extra_forbidden"
+        out.append(seg if known else UNKNOWN_KEY)
+    return ".".join(out) or "-"
+
+
+def read_lexicons(path, *, allow_candidate: bool = False
+                  ) -> tuple[LexiconExtension, AnchorLexicon]:
     """The private lexicon extension: the interpreter's patterns, and its optional
     ``entry_anchor`` section (present-market markers and family aliases), which only the mapping
-    policy reads. The interpreter never sees that section."""
+    policy reads. The interpreter never sees that section.
+
+    A CANDIDATE lexicon (the owner's experimental proposals, marked with ``CANDIDATE_KEY`` by
+    ``vocab_review.write_candidate``) is refused unless ``allow_candidate`` (an offline replay's
+    explicit opt-in): proposals never silently change production eligibility."""
     with open(path, encoding="utf-8") as f:
         raw = json.load(f)
+    if isinstance(raw, dict) and CANDIDATE_KEY in raw:
+        if not allow_candidate:
+            raise CandidateLexiconRefused(
+                f"the lexicon {path} is a CANDIDATE lexicon (unapproved vocabulary proposals); "
+                "the production lexicon changes only through the owner's batch approval. Only an "
+                "offline replay may load a candidate, with --allow-candidate-lexicon")
+        raw.pop(CANDIDATE_KEY)
     section = raw.pop("entry_anchor", None) or {}
-    return LexiconExtension.model_validate(raw), AnchorLexicon.model_validate(section)
+    anchor = AnchorLexicon.model_validate(section)
+    return LexiconExtension.model_validate(raw), anchor
 
 class RuntimeService:
     def __init__(
@@ -238,13 +304,26 @@ class RuntimeService:
         clock: Callable[[], datetime] | None = None,
         store: RuntimeStore | None = None,
         allow_what_if_mapping: bool = False,
+        allow_candidate_lexicon: bool = False,
     ):
         if config.mode != "mock":
             raise ValueError("only mock mode may run")
         if allow_what_if_mapping and not isinstance(source, ReplayFileSource):
             # A what-if mapping is an offline analysis aid: never with a live source.
             raise ValueError("a what-if mapping may only be used with a replay-file source")
+        if allow_candidate_lexicon and not isinstance(source, ReplayFileSource):
+            # A candidate lexicon is an experiment: never with a live source.
+            raise ConfigError("a candidate lexicon may only be used with a replay-file source")
+        _check_candidate_state_dir(config, allow_candidate_lexicon)
         self.config = config
+        # The owner's PRIVATE vocabulary review log (default off). Refused at start inside the
+        # repository or a git work tree, or when others may read it.
+        self.review_log: ReviewLog | None = None
+        if config.interpreter.review_log_path is not None:
+            try:
+                self.review_log = ReviewLog(config.interpreter.review_log_path)
+            except PrivatePathError as exc:
+                raise ConfigError(str(exc)) from None
         self.clock = clock or (lambda: datetime.now(UTC))
         self.source = source
         self.broker = broker
@@ -256,10 +335,14 @@ class RuntimeService:
         )
         self.mapping.check_policy(config.policy)  # an anchored entry always has a stop
         self.mapping.check_mode(config.mode)  # the entry rule: simulated (paper) modes only
+        # Private evidence rides on the decision only for the review log; never serialised.
+        self.mapping.collect_vocab_evidence = self.review_log is not None
         self.alerter = Alerter(
             self.store, self.notifier, realert_seconds=config.notify.realert_seconds,
             clock=self.clock,
         )
+        if self.review_log is not None:
+            self._warn_synced_private_paths()
         self.coordinator = ExecutionCoordinator(
             broker, config.execution_db, config.policy, execution_config(config), clock=self.clock
         )
@@ -271,7 +354,7 @@ class RuntimeService:
             lexicon = None
             if config.interpreter.lexicon_path is not None:
                 lexicon, self.mapping.anchor_lexicon = load_lexicons(
-                    config.interpreter.lexicon_path)
+                    config.interpreter.lexicon_path, allow_candidate=allow_candidate_lexicon)
             self.interpreter = TklInterpreter(context=self.store.load_context(), lexicon=lexicon)
         except BaseException:
             self.coordinator.close()
@@ -818,7 +901,47 @@ class RuntimeService:
             context=self.interpreter.context,
             at=decided_at,
         )
+        if self.review_log is not None and not result.duplicate:
+            self._write_review_log(post, result.outcomes, decision_by_id, decided_at)
         return len(exceptions), result.duplicate
+
+    def _warn_synced_private_paths(self) -> None:
+        """Review S5: a private file in a cloud-synced folder is allowed (the owner's choice) but
+        alerted once at start, by path class only."""
+        now = self.clock()
+        for label, path in (("review_log", self.config.interpreter.review_log_path),
+                            ("lexicon", self.config.interpreter.lexicon_path)):
+            cls = vocab_review.synced_folder_class(path) if path is not None else None
+            if cls is not None:
+                self.alerter.event(
+                    f"EVENT:{N.PRIVATE_PATH_IN_SYNCED_FOLDER}:{label}:{now.isoformat()}",
+                    N.PRIVATE_PATH_IN_SYNCED_FOLDER, "Private file in a cloud-synced folder",
+                    f"{N.PRIVATE_PATH_IN_SYNCED_FOLDER} {label} {cls}", now)
+
+    def _write_review_log(self, post: SourcePost, outcomes, decisions, at: datetime) -> None:
+        """The owner's PRIVATE review log: one line per held action whose mapping decision carries
+        vocabulary evidence. A failure raises an alert by code only and never stops the service;
+        the words never reach the journal, a log, an alert or the heartbeat."""
+        records = []
+        for o in outcomes:
+            d = decisions.get(o.action_id)
+            evidence = d.vocab_evidence if d is not None else None
+            if o.status in HELD_STATUSES and evidence is not None:
+                records.append(review_record(
+                    at=at, post_id=post.post_id, source_id=post.source_id,
+                    revision=post.revision, action_id=o.action_id, family=d.family,
+                    reason=d.reason, evidence=evidence))
+        if not records:
+            return
+        try:
+            for r in records:
+                self.review_log.append(r)
+        except Exception as exc:  # noqa: BLE001 - the private log never stops the service
+            self.alerter.raise_("REVIEW_LOG:WRITE", N.REVIEW_LOG_WRITE_FAILED,
+                                "Private review log not written",
+                                f"{N.REVIEW_LOG_WRITE_FAILED} ({type(exc).__name__})", at)
+            return
+        self.alerter.sweep("REVIEW_LOG:", set(), at)
 
     def _held_contracts(self) -> dict[str, ContractRef]:
         """Each open follower idea's contract: a follow-up acts on its own idea's contract."""
@@ -1254,6 +1377,46 @@ class RuntimeService:
         h.next_attempt_at = None
         h.last_success_at = now.isoformat()
         self.alerter.sweep(f"FAILURE:{component}", set(), now)
+
+
+def _check_candidate_state_dir(config: RuntimeConfig, candidate: bool) -> None:
+    """Review S7: a candidate replay never writes into production's journal. With the opt-in the
+    state directory must be new (no journal, execution, replay or broker store, no heartbeat) or
+    marked by an earlier candidate run, and is marked; without it a marked directory is
+    refused."""
+    state = config.paths.state_dir
+    marker = state / CANDIDATE_RUN_MARKER
+    if not candidate:
+        if marker.exists():
+            raise ConfigError(f"the state directory {state} was used by a candidate-lexicon "
+                              "replay: production never runs there; use another state_dir")
+        return
+    if marker.exists():
+        return
+    if _state_dir_used(config):
+        raise ConfigError(f"a candidate-lexicon replay needs a new state directory, not {state} "
+                          "(it holds a journal): experimental holds and trades never enter "
+                          "production's journal; set another [paths] state_dir")
+    state.mkdir(parents=True, exist_ok=True)
+    marker.write_text("state directory of a candidate-lexicon replay: not production\n")
+
+
+def _state_dir_used(config: RuntimeConfig) -> bool:
+    """A service has run on this state directory: a heartbeat, or any service event journaled
+    (every start journals SERVICE_START). Empty stores opened by the wiring do not count."""
+    if config.heartbeat_file.exists():
+        return True
+    if not config.runtime_db.exists():
+        return False
+    try:
+        con = sqlite3.connect(f"file:{config.runtime_db}?mode=ro", uri=True)
+        try:
+            return any(con.execute("SELECT 1 FROM service_events LIMIT 1").fetchall()
+                       + con.execute("SELECT 1 FROM signals LIMIT 1").fetchall())
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return True  # unreadable: assume it is production's
 
 
 def _json(value) -> str:

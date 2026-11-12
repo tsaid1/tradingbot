@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import re
 import tomllib
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from enum import Enum
@@ -40,6 +41,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import (
     Field,
+    PrivateAttr,
     StrictBool,
     StrictFloat,
     StrictInt,
@@ -93,6 +95,7 @@ from tradingbot.runtime.instruction_terms import (
     post_multi_leg,
     price_like_level,
     protective_sentence_problem,
+    protective_unknown_words,
     quote_clause_words,
     relative_contract_words,
     sentences,
@@ -209,6 +212,46 @@ class MappingEntry(StrictModel):
         )
 
 
+class VocabEvidence:
+    """PRIVATE: the words and sentences that made an entry-rule hold a vocabulary hold, for the
+    owner's local review log only (``[interpreter] review_log_path``). Never journaled, logged,
+    alerted or shown on a page other than the owner's review page: it is carried on
+    ``MappingDecision`` as a pydantic private attribute, which no serialisation reads, and its
+    ``repr`` shows counts only. ``tokens``: (word, kind); ``sentences``: (role, sentence)."""
+
+    __slots__ = ("sentences", "tokens")
+
+    def __init__(self, tokens=(), sentences=()):
+        self.tokens: tuple[tuple[str, str], ...] = tuple(dict.fromkeys(tokens))
+        self.sentences: tuple[tuple[str, str], ...] = tuple(dict.fromkeys(sentences))
+
+    def __repr__(self) -> str:
+        return f"VocabEvidence(<private: {len(self.tokens)} token(s)>)"
+
+    __str__ = __repr__
+
+    def __eq__(self, other) -> bool:
+        return isinstance(other, VocabEvidence) and (self.tokens, self.sentences) == (
+            other.tokens, other.sentences)
+
+    def __hash__(self) -> int:
+        return hash((self.tokens, self.sentences))
+
+
+@dataclass
+class _EvidenceSink:
+    """Collects private evidence while one action is decided (only when the policy collects)."""
+    tokens: list[tuple[str, str]] = field(default_factory=list)
+    sentences: list[tuple[str, str]] = field(default_factory=list)
+
+    def add(self, kind: str, words, role: str, *texts: str) -> None:
+        self.tokens += [(w, kind) for w in words]
+        self.sentences += [(role, t) for t in texts if t]
+
+    def frozen(self) -> VocabEvidence | None:
+        return VocabEvidence(self.tokens, self.sentences) if self.tokens else None
+
+
 class MappingDecision(StrictModel):
     action_id: str
     # NOT_APPROVED: a version-2 entry exists and is not approved. UNRESOLVED: the entry is approved
@@ -240,6 +283,14 @@ class MappingDecision(StrictModel):
     # (AnchorLevelKind value). Only MARKET_QUOTE anchors; set on a held anchor once a candidate
     # level was read, None when no level was classified.
     anchor_level_kind: str | None = None
+    # PRIVATE (owner's review tool): the words and sentences behind a vocabulary hold. A pydantic
+    # private attribute: never in model_dump, model_dump_json, repr, the schema or the journal.
+    # Set only when the policy collects evidence (``MappingPolicy.collect_vocab_evidence``).
+    _vocab_evidence: VocabEvidence | None = PrivateAttr(default=None)
+
+    @property
+    def vocab_evidence(self) -> VocabEvidence | None:
+        return self._vocab_evidence
 
 
 class MappingFile(StrictModel):
@@ -1058,6 +1109,7 @@ class FamilyMapping(StrictModel):
         attribution: list[str] | None = None,
         post: dict | None = None,
         kind_out: list[AnchorLevelKind] | None = None,
+        evidence: _EvidenceSink | None = None,
     ) -> tuple[Decimal | None, str | None, list[str]]:
         """entry_rule = REFERENCE_AS_COLLAR: the stated market level that may anchor this action's
         entry, the text it is written in, or why none may. ``levels`` are the interpreter's price
@@ -1084,7 +1136,10 @@ class FamilyMapping(StrictModel):
         Every candidate level is classified (``kind_out``: one AnchorLevelKind) and only a
         MARKET_QUOTE anchors (``_level_kind``; ENTRY_ANCHOR_LEVEL_NOT_MARKET_QUOTE otherwise). The
         checks before it feed the classification: a refusal by them records the kind their words
-        show (a stop word STOP_OR_TARGET, a time word HISTORICAL, anything else AMBIGUOUS)."""
+        show (a stop word STOP_OR_TARGET, a time word HISTORICAL, anything else AMBIGUOUS).
+
+        ``evidence`` (the owner's local review tool only) receives the words and sentences of a
+        vocabulary hold; it changes nothing in the decision."""
         kind_out = kind_out if kind_out is not None else []
 
         def held(problems: list[str], kind: AnchorLevelKind | None = AnchorLevelKind.AMBIGUOUS,
@@ -1148,21 +1203,21 @@ class FamilyMapping(StrictModel):
         if self.entry_anchor.anchor_scope == "SINGLE_MARKET_POST":
             problems = self._single_market_problems(action, asset, anchor, source, post_text,
                                                     markers, post or {}, lexicon,
-                                                    own_clause=terms.clause)
+                                                    own_clause=terms.clause, evidence=evidence)
             if problems:
                 return held(problems, None)  # the post, not the level, is in doubt
         attributed: list[str] = []
         unknown: list[str] = []
         problems = self._sentence_problems(action, anchor, source, terms, levels, post_text,
                                            markers, own, lexicon, unknown_out=unknown,
-                                           attribution=attributed)
+                                           attribution=attributed, evidence=evidence)
         if problems:
             return held(problems, words=unknown)
         if why:  # the disqualifying words: a second, redundant check
             return held([ENTRY_ANCHOR_NOT_CURRENT, *why], words=bad_words)
         kind, detail = self._level_kind(anchor, source, post_text, own, markers, action=action,
                                         levels=levels, terms=terms, lexicon=lexicon,
-                                        attribution=attributed)
+                                        attribution=attributed, evidence=evidence)
         if kind != AnchorLevelKind.MARKET_QUOTE:
             return held([ENTRY_ANCHOR_LEVEL_NOT_MARKET_QUOTE, f"LEVEL_KIND:{kind.value}", detail],
                         kind)
@@ -1181,6 +1236,8 @@ class FamilyMapping(StrictModel):
             allowed = set(own) | set(markers) | {"at"}
             foreign = foreign_words(source, anchor, allowed, self._month_spans(source))
             if foreign:
+                if evidence is not None:
+                    evidence.add("LEVEL_LINE_WORD", foreign, "LEVEL_LINE", source)
                 return held([ENTRY_ANCHOR_INSTRUMENT_UNCLEAR, f"OTHER_WORDS:{len(foreign)}"])
         if attribution is not None:
             attribution += attributed
@@ -1189,7 +1246,8 @@ class FamilyMapping(StrictModel):
     def _level_kind(self, anchor: Decimal, source: str, post_text: str | None, own: list[str],
                     markers, *, action: TradeAction | None = None, levels=None,
                     terms: InstructionTerms | None = None, lexicon: AnchorLexicon | None = None,
-                    attribution: list[str] | None = None) -> tuple[AnchorLevelKind, str]:
+                    attribution: list[str] | None = None,
+                    evidence: _EvidenceSink | None = None) -> tuple[AnchorLevelKind, str]:
         """The owner's ambiguity safeguard: what the candidate level is, as one closed kind. Only
         an explicit contemporaneous market quotation (MARKET_QUOTE) may anchor.
 
@@ -1213,9 +1271,30 @@ class FamilyMapping(StrictModel):
            only with ``standalone_level_sentence``, its own protective levels, else
            NEIGHBOUR_NOT_UNDERSTOOD (also at the start of the post). The level- and cost-word
            deny-list (``context_problem``) remains a second check that can only add a hold.
-        A sentence that cannot be located in the post has no known context: AMBIGUOUS."""
+        A sentence that cannot be located in the post has no known context: AMBIGUOUS.
+        ``evidence`` (the owner's local review tool only) receives the words of a neighbour or
+        instruction sentence that only vocabulary keeps from being understood; it decides
+        nothing."""
         lexicon = lexicon or AnchorLexicon()
         allowed = [*markers, *own]
+
+        def neighbour_evidence(level_sentence: str, neighbour: str, question: bool,
+                               require_key: bool) -> None:
+            """Only when the private context words alone could make the neighbour a
+            protective-levels sentence: otherwise no vocabulary would resolve it."""
+            if evidence is None or question:
+                return
+            words = protective_unknown_words(neighbour, lexicon.context_words)
+            if not words:
+                return
+            widened = AnchorLexicon.model_construct(
+                present_markers=lexicon.present_markers, family_aliases=lexicon.family_aliases,
+                non_market_words=lexicon.non_market_words,
+                context_words=[*lexicon.context_words, *words])
+            if self._own_protective_levels(neighbour, question, anchor, action, widened,
+                                           require_key=require_key):
+                evidence.add("NEIGHBOUR_WORD", words, "NEIGHBOUR", neighbour)
+                evidence.add("NEIGHBOUR_WORD", (), "LEVEL", level_sentence)
         own_block = {s for s, _ in sentences(terms.clause)} if terms is not None else set()
         instruction = list(SIDE_WORDS.get(getattr(getattr(action, "position_side", None),
                                                   "value", ""), ()))
@@ -1256,6 +1335,7 @@ class FamilyMapping(StrictModel):
                 after, question = whole_q[at + 1]
                 if not (instruction_sentence(after) or self._own_protective_levels(
                         after, question, anchor, action, lexicon, require_key=False)):
+                    neighbour_evidence(sentence, after, question, require_key=False)
                     return AnchorLevelKind.AMBIGUOUS, "FOLLOWING_NOT_UNDERSTOOD"
             if self._names_family(clause, own):
                 continue  # an explicit quotation
@@ -1278,6 +1358,13 @@ class FamilyMapping(StrictModel):
             if not own_instructions or any(
                     self._whole_sentence_problem(t, q, allowed_all, consumed | {anchor}, fractions)
                     for t, q in own_instructions):
+                if evidence is not None:
+                    for t, q in own_instructions:
+                        words: list[str] = []
+                        self._whole_sentence_problem(t, q, allowed_all, consumed | {anchor},
+                                                     fractions, words)
+                        evidence.add("UNKNOWN_WORD", words, "INSTRUCTION", t)
+                    evidence.add("UNKNOWN_WORD", (), "LEVEL", sentence)
                 return AnchorLevelKind.AMBIGUOUS, "INSTRUCTION_NOT_UNDERSTOOD"
             # R2, an elliptical level: its preceding neighbour (the earlier clauses of its
             # sentence, else the sentence before) is the action's own instruction sentence or,
@@ -1294,6 +1381,7 @@ class FamilyMapping(StrictModel):
                     attribution.append("AFTER_OWN_PROTECTIVE_LEVELS")
                 continue
             if earlier or not instruction_sentence(neighbour):
+                neighbour_evidence(sentence, neighbour, question, require_key=True)
                 return AnchorLevelKind.AMBIGUOUS, "NEIGHBOUR_NOT_UNDERSTOOD"
             # The deny-list, a second check that can only add a hold.
             problem = context_problem([neighbour])
@@ -1336,7 +1424,8 @@ class FamilyMapping(StrictModel):
 
     def _single_market_problems(self, action, asset, anchor, source, post_text, markers,
                                 post, lexicon: AnchorLexicon | None = None,
-                                own_clause: str | None = None) -> list[str]:
+                                own_clause: str | None = None,
+                                evidence: _EvidenceSink | None = None) -> list[str]:
         """anchor_scope = SINGLE_MARKET_POST: the post as a whole attributes the level. (c) this is
         the post's only action besides commentary, and no action is conditional, retrospective or
         uncertain; (b) every action is this family's, no instrument is unresolved, and the post
@@ -1377,7 +1466,8 @@ class FamilyMapping(StrictModel):
         # The owner's decision (DECIDED 7): a competing market holds the post only when the post
         # "may contain multiple actionable instruments".
         problem = self._competing_instrument(text, asset, mine, mine_lower, markers,
-                                             lexicon or AnchorLexicon(), own_clause)
+                                             lexicon or AnchorLexicon(), own_clause,
+                                             evidence)
         if problem:
             return problem
         marked = [s for s, _ in sentences(text) if marked_numbers(s, markers)]
@@ -1393,7 +1483,7 @@ class FamilyMapping(StrictModel):
         return []
 
     def _competing_instrument(self, text, asset, mine, mine_lower, markers, lexicon,
-                              own_clause) -> list[str]:
+                              own_clause, evidence: _EvidenceSink | None = None) -> list[str]:
         """(a) a mention the bot cannot tie to this family (``unresolved_market_mentions``, and a
         sentence-initial unknown capitalised word) holds only when its own sentence gives it a
         trading context: an instruction, stop or target word (``ACTION_SEMANTIC_WORDS``), a
@@ -1401,7 +1491,10 @@ class FamilyMapping(StrictModel):
         acquisition verb (``MENTION_ACTION_WORDS``). (d) the sentence directly after an own
         instruction sentence holds a mention and an additive word ("Qorvex too."). (b) a sentence
         outside this action's own clause sentences that holds an instruction word (hyphen and
-        slash parts included) holds, whatever it names. Plain commentary holds none of them."""
+        slash parts included) holds, whatever it names. Plain commentary holds none of them.
+        ``evidence`` (the owner's local review tool only) receives the mention words and their
+        sentence of a MENTION_WITH_CONTEXT hold, and nothing for (d) or (b), which no vocabulary
+        decision can or should remove; it changes nothing in the result."""
         own_sentences = {s for s, _ in sentences(own_clause or "")}
         own = set(self.anchor_names(asset, lexicon)) | mine_lower
         understood = understood_words([*lexicon.present_markers, *lexicon.context_words])
@@ -1409,17 +1502,22 @@ class FamilyMapping(StrictModel):
         non_market = set(lexicon.non_market_words)
         texts = [s for s, _ in sentences(text)]
         for k, sentence in enumerate(texts):
+            words: list | None = [] if evidence is not None else None
             kinds = set(unresolved_market_mentions(
                 sentence, own, codes, self._roots(), understood=understood,
-                non_market=non_market, futures=self.execution.sec_type == "FUT"))
+                non_market=non_market, futures=self.execution.sec_type == "FUT",
+                found_out=words))
             initial = first_word_mention(sentence, own, understood, non_market, codes,
-                                         self._roots())
+                                         self._roots(), found_out=words)
             mention = kinds or initial is not None
             context = (instruction_word_in(sentence, ACTION_SEMANTIC_WORDS)
                        or price_like_level(sentence, markers)
                        or instruction_word_in(sentence, MENTION_ACTION_WORDS)
                        or has_phrase(sentence, MENTION_ACTION_PHRASES))
             if mention and context:
+                if evidence is not None:
+                    for word, kind in words or ():
+                        evidence.add(kind.value, [word], "MENTION", sentence)
                 found = sorted({*kinds, *([initial] if initial else [])}, key=lambda m: m.value)
                 return [ENTRY_ANCHOR_POST_UNRESOLVED_MARKET, "RULE:MENTION_WITH_CONTEXT",
                         *(f"MENTION:{m.value}" for m in found)]
@@ -1462,7 +1560,8 @@ class FamilyMapping(StrictModel):
 
     def _sentence_problems(self, action, anchor, source, terms, levels, post_text, markers, own,
                            lexicon, unknown_out: list[str] | None = None,
-                           attribution: list[str] | None = None) -> list[str]:
+                           attribution: list[str] | None = None,
+                           evidence: _EvidenceSink | None = None) -> list[str]:
         """The final rule (last review pass): the scope of the marked number is its whole
         sentence. Every alphabetic token in it must be on the allow-list (markers, connectors,
         function words, units, this family's names, the action's own side, verb and level words,
@@ -1478,9 +1577,14 @@ class FamilyMapping(StrictModel):
             return [ENTRY_ANCHOR_NOT_IN_POST]
         whole = sentences(post_text) if post_text else sentences(source)
         for sentence, question in found:
+            words: list[str] = []
             problem = self._whole_sentence_problem(sentence, question, allowed, consumed,
-                                                   fractions, unknown_out)
+                                                   fractions, words)
+            if unknown_out is not None:
+                unknown_out += words
             if problem:
+                if evidence is not None:
+                    evidence.add("UNKNOWN_WORD", words, "LEVEL", sentence)
                 return problem
             if unknown_words(sentence, instruction) == unknown_words(sentence, []):
                 # A level sentence: the one before it must not name anything else.
@@ -1500,6 +1604,8 @@ class FamilyMapping(StrictModel):
                         if other:
                             if unknown_out is not None:
                                 unknown_out += other
+                            if evidence is not None:
+                                evidence.add("UNKNOWN_WORD", other, "INSTRUCTION", s)
                             return [ENTRY_ANCHOR_CONTEXT_UNCLEAR, "OWN_CLAUSE"]
                     # The interpreter delimited this action's clause; the level sentence follows it
                     # with nothing in between. Which sentence its stop or target came from is not
@@ -1511,6 +1617,8 @@ class FamilyMapping(StrictModel):
                     if other:
                         if unknown_out is not None:
                             unknown_out += other
+                        if evidence is not None:
+                            evidence.add("UNKNOWN_WORD", other, "PRECEDING", before, sentence)
                         return [ENTRY_ANCHOR_INSTRUMENT_UNCLEAR, "PRECEDING_SENTENCE"]
                     case = "AFTER_ALLOW_LISTED_SENTENCE"
             else:
@@ -1642,6 +1750,35 @@ def _allow_list(action, levels, markers, own, lexicon):
     return allowed, instruction, consumed, fractions
 
 
+# The holds a word in the private lexicon can resolve (the owner's review tool): only these ever
+# carry private evidence or are proposed for review. An unattributed action sentence, an additive
+# ellipsis, a stop refusal or long-only never is: no vocabulary decision may remove them.
+_VOCABULARY_DETAILS = {
+    ENTRY_ANCHOR_CONTEXT_UNCLEAR: None,  # any detail: WORDS:<n>, OWN_CLAUSE
+    ENTRY_ANCHOR_INSTRUMENT_UNCLEAR: {"PRECEDING_SENTENCE"},  # or OTHER_WORDS:<n>
+    ENTRY_ANCHOR_LEVEL_NOT_MARKET_QUOTE: {"FOLLOWING_NOT_UNDERSTOOD", "INSTRUCTION_NOT_UNDERSTOOD",
+                                          "NEIGHBOUR_NOT_UNDERSTOOD"},
+    ENTRY_ANCHOR_POST_UNRESOLVED_MARKET: {"RULE:MENTION_WITH_CONTEXT"},
+}
+
+
+def vocabulary_hold(code: str, detail) -> bool:
+    """Is a hold with this public reason code and detail one a lexicon word can resolve?"""
+    if code not in _VOCABULARY_DETAILS:
+        return False
+    wanted = _VOCABULARY_DETAILS[code]
+    detail = [str(d) for d in detail or ()]
+    if wanted is None:
+        return True
+    if code == ENTRY_ANCHOR_INSTRUMENT_UNCLEAR and any(d.startswith("OTHER_WORDS:")
+                                                       for d in detail):
+        return True
+    if code == ENTRY_ANCHOR_POST_UNRESOLVED_MARKET and not any(d.startswith("RULE:")
+                                                               for d in detail):
+        return True  # a line logged before the rule detail existed
+    return bool(wanted & set(detail))
+
+
 def _post_lines(text: str | None) -> list[str]:
     """The post's lines and sentences, where a level line ("41.20 now.") stands on its own."""
     return [p.strip() for p in _LINE_SPLIT_RE.split(text or "") if p and p.strip()]
@@ -1703,6 +1840,10 @@ class MappingPolicy:
         # The private lexicon extension's entry-anchor section (markers, aliases); empty unless
         # the runtime loads one.
         self.anchor_lexicon = AnchorLexicon()
+        # The owner's review log (``[interpreter] review_log_path``): when True, a vocabulary
+        # hold carries its private words and sentences on the decision (``vocab_evidence``, never
+        # serialised). Off by default; it never changes a decision.
+        self.collect_vocab_evidence = False
 
     def vocabulary(self) -> dict[str, tuple[set[str], set[str]]]:
         """Every family the mapping file and the private lexicon know: its codes and series
@@ -1875,14 +2016,18 @@ class MappingPolicy:
         ).date()
         attribution: list[str] = []
         kind: list[AnchorLevelKind] = []
+        sink = _EvidenceSink() if self.collect_vocab_evidence else None
         anchor, source, problems = (None, None, []) if revoked else entry.entry_anchor_for(
             action, asset, terms, levels, others, post_text, self.anchor_lexicon, attribution,
             {"actions": post_actions, "vocabulary": self.vocabulary(),
-             "trading_values": trading_values}, kind_out=kind)
+             "trading_values": trading_values}, kind_out=kind, evidence=sink)
         if kind:
             out["anchor_level_kind"] = kind[0].value
         if problems:
-            return MappingDecision(status="UNRESOLVED", reason=",".join(problems), **out), None
+            d = MappingDecision(status="UNRESOLVED", reason=",".join(problems), **out)
+            if sink is not None and vocabulary_hold(problems[0], problems[1:]):
+                d._vocab_evidence = sink.frozen()
+            return d, None
         instrument, problems = entry.select(action, asset, terms, today, held_contract, post_text,
                                             anchor, source)
         if instrument is None:

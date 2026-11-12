@@ -55,6 +55,10 @@ HEARTBEAT_RESTORED = "HEARTBEAT_RESTORED"
 OPERATOR_ACTION = "OPERATOR_ACTION"
 # The operator queue is missing, lost or corrupt: operator actions are disabled (review F3).
 OPERATOR_QUEUE_UNAVAILABLE = "OPERATOR_QUEUE_UNAVAILABLE"
+# The owner's private review log could not be written (code only; trading carries on).
+REVIEW_LOG_WRITE_FAILED = "REVIEW_LOG_WRITE_FAILED"
+# A private review file lies in a cloud-synced folder (path class only; allowed, warned).
+PRIVATE_PATH_IN_SYNCED_FOLDER = "PRIVATE_PATH_IN_SYNCED_FOLDER"
 
 
 @runtime_checkable
