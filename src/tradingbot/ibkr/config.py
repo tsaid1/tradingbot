@@ -132,7 +132,14 @@ def validate_config(data: dict) -> PaperConnectionConfig:
 def load_config(path: str | os.PathLike | None = None) -> PaperConnectionConfig:
     """Read and validate the private TOML file. Refuses symlinks, non-regular files, files not owned
     by the current user and any group/other permission bit."""
-    p = Path(path if path is not None else DEFAULT_CONFIG_PATH).expanduser()
+    return validate_config(read_private_toml(
+        path if path is not None else DEFAULT_CONFIG_PATH))
+
+
+def read_private_toml(path: str | os.PathLike) -> dict:
+    """The file-safety checks of ``load_config`` (no symlink, regular file, owned by the current
+    user, no group/other bit), then the parsed TOML table. Never echoes file content."""
+    p = Path(path).expanduser()
     try:
         st = os.lstat(p)
     except FileNotFoundError:
@@ -157,8 +164,7 @@ def load_config(path: str | os.PathLike | None = None) -> PaperConnectionConfig:
                 f"has mode {stat.S_IMODE(st.st_mode):o}")
         raw = fh.read()
     try:
-        data = tomllib.loads(raw.decode("utf-8"))
+        return tomllib.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
         # Do not echo file content: it contains the account ID.
         raise ConfigInvalid(f"config file is not valid UTF-8 TOML: {type(exc).__name__}") from None
-    return validate_config(data)
