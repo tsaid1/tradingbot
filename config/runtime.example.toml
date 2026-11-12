@@ -26,6 +26,14 @@ cadence_seconds = 5.0
 max_backoff_seconds = 300.0
 failure_alert_after = 3
 stuck_after_seconds = 60
+# Alerting only (optional; never sizes or bounds an order). SOURCE_STALLED when the source cursor
+# has not advanced for this long inside the window (UTC, Monday to Friday) the publisher posts in.
+source_stall_after_seconds = 14400
+activity_window_utc = "13:30-20:00"
+heartbeat_stale_after_seconds = 120   # the watchdog's limit (default max(120, 10 x cadence))
+# An identity lockout clears only through a full reconnect (default true). false also accepts an
+# identity read alone from an adapter that cannot reconnect (journaled IDENTITY_REREAD_ONLY).
+lockout_clear_requires_full_reconnect = true
 
 # Every size, cap, collar, freshness and timing value below is required: a missing one refuses to
 # start, naming it. Nothing that sizes or bounds an order runs on a default.
@@ -44,7 +52,10 @@ max_aggregate_exposure_usd = "10000"
 # lexicon_path = "/path/outside/the/repo/lexicon.json"   # optional private extension
 
 [notify]
-macos = false
+channels = ["log", "alerts_file"]   # registered channels (runtime/notify.py); no external one
+macos = false                       # true adds the local macOS notification centre
+realert_seconds = 3600              # an alert still open is notified again this often
+# alerts_file = "..."               # default <state_dir>/alerts.jsonl (the dashboard reads it)
 
 [execution]
 expected_account = "SIM-PAPER-0001"   # required: the coordinator refuses any other broker account

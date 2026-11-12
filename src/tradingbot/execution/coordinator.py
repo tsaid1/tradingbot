@@ -40,14 +40,17 @@ from tradingbot.execution.broker import (
     BrokerError,
     BrokerOrder,
     BrokerQuote,
+    ConditionDirection,
     ContractRef,
     OrderIntent,
     OrderNotFound,
     OrderSide,
     OrderStatus,
     OrderType,
+    PriceCondition,
     QuoteQuality,
     TimeInForce,
+    supports_price_conditions,
 )
 from tradingbot.execution.store import (
     LEDGER_REVERSAL,
@@ -61,6 +64,7 @@ from tradingbot.execution.store import (
 )
 from tradingbot.models import (
     Action,
+    ExecutionPlan,
     GateDecision,
     Instrument,
     MockPolicy,
@@ -74,6 +78,8 @@ UNPROTECTED_POSITION = "UNPROTECTED_POSITION"
 # The broker could not be read after a fill: protection is unknown, never assumed (review M1).
 PROTECTION_UNVERIFIED = "PROTECTION_UNVERIFIED"
 MODIFY_NOT_CONFIRMED = "MODIFY_NOT_CONFIRMED"
+# A mapped amendment kept a working protective level instead of loosening it (validator).
+PROTECTIVE_LEVEL_NOT_LOOSENED = "PROTECTIVE_LEVEL_NOT_LOOSENED"
 # An entry or add whose first submission outcome was unknown, that the broker shows no trace of,
 # and whose source post is no longer fresh enough to act on: it is never resent.
 STALE_AFTER_UNKNOWN_OUTCOME = "STALE_AFTER_UNKNOWN_OUTCOME"
@@ -109,6 +115,32 @@ ENTRY_REMAINDER_NOT_CANCELLED = "ENTRY_REMAINDER_NOT_CANCELLED"
 # The broker nets one position per contract: an idea on the opposite side of an open idea in the
 # same contract is never opened beside it. A publisher reversal is a close followed by an open.
 OPPOSITE_IDEA_IN_SAME_CONTRACT = "OPPOSITE_IDEA_IN_SAME_CONTRACT"
+# Multi-asset mapping: a REFERENCE_TRIGGER family needs broker-side price conditions; a broker that
+# does not report supporting them never receives a conditional order.
+CONDITIONS_UNSUPPORTED = "CONDITIONAL_ORDERS_UNSUPPORTED_BY_BROKER"
+# The contract the broker resolves now differs from the one the gateway decided on.
+CONTRACT_CHANGED = "CONTRACT_CHANGED_SINCE_DECISION"
+
+
+# An operator settled an intent of unknown outcome (execution.settlement): the instrument stays
+# blocked until a full broker sync and reconciliation after it show no open safety discrepancy in
+# that contract; only that evidence resolves it, never the operator.
+OPERATOR_SETTLEMENT_UNVERIFIED = "OPERATOR_SETTLEMENT_UNVERIFIED"
+# The broker later showed a fill, a working order or a completed order for an intent an operator
+# settled as NOT_AT_BROKER or CANCELLED (review F1): the fill is recorded as it happened, the intent
+# takes the broker's state, new exposure in the contract is blocked and reconciliation stays unclean
+# until a verified clear. Never a normal adoption.
+SETTLED_INTENT_CONTRADICTED = "SETTLED_INTENT_CONTRADICTED"
+# Review F10: the broker's own executions for an intent settled FILLED replaced the declaration and
+# differ from it (quantity or average price). Blocks new exposure in the contract only when the
+# quantity differs (its detail then starts QUANTITY_DIFFERS); CLEAR-class.
+SETTLEMENT_DIFFERS_FROM_BROKER = "SETTLEMENT_DIFFERS_FROM_BROKER"
+QUANTITY_DIFFERS = "QUANTITY_DIFFERS"
+# The intent reasons an operator settlement that declared no (further) fill leaves behind.
+SETTLED_WITHOUT_FILL_REASONS = ("OPERATOR_SETTLED_NOT_AT_BROKER", "OPERATOR_SETTLED_CANCELLED")
+# The broker session dropped (runtime service): new exposure everywhere is refused until the
+# session is back, a full sync has succeeded and a reconciliation shows nothing unexplained.
+BROKER_RECONNECT_PENDING = "BROKER_RECONNECT_PENDING"
 
 
 class BrokerUnreadable(BrokerError):
@@ -121,7 +153,12 @@ INSTRUMENT_BLOCKING_KINDS = (
     UNPROTECTED_POSITION,
     PROTECTION_UNVERIFIED,
     ENTRY_STATE_UNKNOWN,
+    OPERATOR_SETTLEMENT_UNVERIFIED,
+    SETTLED_INTENT_CONTRADICTED,
+    SETTLEMENT_DIFFERS_FROM_BROKER,  # only with QUANTITY_DIFFERS (see _instrument_block)
 )
+# An open exception of one of these kinds (no idea) blocks every OPEN and ADD (BROKER_UNREADABLE).
+ACCOUNT_BLOCKING_KINDS = (BROKER_STATE_UNKNOWN, BROKER_RECONNECT_PENDING)
 
 
 def default_halt_file() -> Path:
@@ -207,6 +244,33 @@ def target_ref(entry_ref: str) -> str:
     return f"{entry_ref}.TGT"
 
 
+def backstop_ref(entry_ref: str) -> str:
+    return f"{entry_ref}.BKS"
+
+
+def _anchored_limit(plan: ExecutionPlan | None) -> Decimal | None:
+    """The gateway's anchored entry limit, when the entry was approved under REFERENCE_AS_COLLAR."""
+    if plan is not None and plan.entry_rule == "REFERENCE_AS_COLLAR":
+        return plan.entry_limit
+    return None
+
+
+def _plan_of(raw: str | None) -> ExecutionPlan | None:
+    return ExecutionPlan.model_validate_json(raw) if raw else None
+
+
+def _exit_condition(plan: ExecutionPlan, long: bool, level, kind: str) -> PriceCondition:
+    """The broker-side condition on the reference series that releases an exit: a long's stop
+    below / target above its level, a short's the other way round."""
+    below = (kind == "stop") == long
+    return PriceCondition(
+        contract=ContractRef.model_validate_json(plan.reference_contract),
+        direction=ConditionDirection.BELOW if below else ConditionDirection.ABOVE,
+        trigger_price=level,
+        released_order_type=OrderType.MKT,
+    )
+
+
 def _dec(value: str | None) -> Decimal | None:
     if value is None:
         return None
@@ -238,6 +302,13 @@ def _rule_problems(contract: ContractRef, quantity: int | None, **prices) -> lis
         if price is not None and not contract.on_tick(price):
             out.append(f"{name.upper()}_PRICE_OFF_TICK")
     return out
+
+
+def _field(order: BrokerOrder, name: str):
+    """A working order's amendable level: a price field, or its condition's trigger level."""
+    if name == "trigger_price":
+        return order.condition.trigger_price if order.condition else None
+    return getattr(order, name)
 
 
 def _intent_state(status: OrderStatus, filled: int, quantity: int) -> IntentState:
@@ -295,6 +366,9 @@ class ExecutionCoordinator:
         self.policy = policy or MockPolicy()
         self.config = config or ExecutionConfig()
         self.clock = clock or (lambda: datetime.now(UTC))
+        # Review N1: per contract, the consecutive successful position reads that differ from the
+        # ledger, as (time, net). In memory: a restart, a failed read or agreement restarts it.
+        self._position_runs: dict[str, list[tuple[datetime, int]]] = {}
 
     # ================================================================== public API
 
@@ -457,9 +531,12 @@ class ExecutionCoordinator:
             raise BrokerUnreadable("broker state could not be read; recovery incomplete")
         return out
 
-    def sync(self, *, _rerun: bool = True) -> bool:
+    def sync(self, *, _rerun: bool = True, record_only: bool = False) -> bool:
         """Apply new broker fills to the ledger, refresh working orders, keep protection sized.
-        Returns False when the broker could not be read (nothing is changed then)."""
+        Returns False when the broker could not be read (nothing is changed then).
+        ``record_only``: read the broker and record what it shows (fills, order states,
+        contradictions) but send, amend and cancel nothing; protective upkeep and housekeeping
+        cancels are left to the next normal sync (an operator settlement uses this)."""
         now = self.clock()
         try:
             fills = self.broker.executions()
@@ -504,6 +581,10 @@ class ExecutionCoordinator:
                     ledger_quantity=pos.quantity,
                 )
         self._refresh_orders(open_orders, now, completed)
+        touched |= self._settlement_contradictions(open_orders, fills, completed, now)
+        touched |= self._declared_fill_evidence(completed, now)
+        if record_only:
+            return True
         asked = self._cancel_stopped_out_entries(open_orders)
         if _rerun and self.halted() and self._cancel_entries_for_halt(open_orders):
             asked = True
@@ -523,7 +604,11 @@ class ExecutionCoordinator:
         Each is cancelled and the cancel confirmed at the broker; an unconfirmed cancel opens
         ENTRY_REMAINDER_NOT_CANCELLED, which blocks new exposure in the instrument. Returns True
         when a cancel was requested."""
-        stopped = {f["idea_id"] for f in self.store.fills() if f["role"] == Role.STOP.value}
+        stopped = {
+            f["idea_id"]
+            for f in self.store.fills()
+            if f["role"] in (Role.STOP.value, Role.BACKSTOP.value)
+        }
         stopped |= {
             p.idea_id for p in self.store.positions() if p.status in ("CLOSED", "REVERSED")
         }
@@ -577,16 +662,214 @@ class ExecutionCoordinator:
             )
         return asked
 
+    # ================================================================== operator settlements
+
+    def settled_without_fill(self) -> list[Intent]:
+        """Intents an operator settled as NOT_AT_BROKER or CANCELLED and that no broker evidence
+        has contradicted yet."""
+        return [
+            i for i in self.store.intents(frozenset({IntentState.CANCELLED}))
+            if any(r in SETTLED_WITHOUT_FILL_REASONS for r in i.reasons)
+            and SETTLED_INTENT_CONTRADICTED not in i.reasons
+        ]
+
+    def settlement_record(self, order_ref: str):
+        """The journal entry of the operator settlement of ``order_ref`` (None if none)."""
+        return next(
+            (e for e in reversed(self.store.journal(order_ref))
+             if e.event == "OPERATOR_SETTLEMENT"),
+            None,
+        )
+
+    def settlement_trace(self, intent: Intent, open_orders, fills, completed) -> list[str]:
+        """Broker evidence that contradicts a NOT_AT_BROKER or CANCELLED settlement of ``intent``
+        (empty: none). NOT_AT_BROKER: any working order, execution or completed order of its refs.
+        CANCELLED: the entry working, filled beyond what was applied when it was settled, or a
+        bracket child working or filled although nothing had filled; a cancelled, unfilled row is
+        the broker confirming the declaration, not a contradiction."""
+        record = self.settlement_record(intent.order_ref)
+        detail = record.detail if record is not None else {}
+        declared = int(
+            detail.get("declared_filled", detail.get("before", {}).get("intent", {}).get("filled", 0))
+            or 0
+        )
+        not_at_broker = "OPERATOR_SETTLED_NOT_AT_BROKER" in intent.reasons
+        refs = {r.order_ref for r in self.store.orders(intent.order_ref)}
+        out = []
+        for o in open_orders:
+            if o.order_ref in refs and (
+                o.order_ref == intent.order_ref or not_at_broker or declared == 0
+            ):
+                out.append(f"WORKING:{o.order_ref}:{o.status.value}")
+        entry_filled = self.store.filled_quantity(intent.order_ref)
+        broker_entry = sum(f.quantity for f in fills if f.order_ref == intent.order_ref)
+        if max(entry_filled, broker_entry) > declared:
+            out.append(f"FILLED:{intent.order_ref}:{max(entry_filled, broker_entry)}>{declared}")
+        if not_at_broker or declared == 0:
+            child_fills = sorted(
+                {f.order_ref for f in fills if f.order_ref in refs and f.order_ref
+                 != intent.order_ref}
+            )
+            out.extend(f"FILLED:{r}" for r in child_fills)
+        for o in completed:
+            if o.order_ref not in refs:
+                continue
+            if not_at_broker:
+                out.append(f"COMPLETED:{o.order_ref}:{o.status.value}")
+            elif o.order_ref == intent.order_ref:
+                if o.status == OrderStatus.FILLED or o.filled_quantity > declared:
+                    out.append(f"COMPLETED:{o.order_ref}:{o.status.value}:{o.filled_quantity}")
+            elif declared == 0 and (o.status == OrderStatus.FILLED or o.filled_quantity > 0):
+                # A child of a CANCELLED entry that had filled in part may legitimately fill.
+                out.append(f"COMPLETED:{o.order_ref}:{o.status.value}:{o.filled_quantity}")
+        return sorted(set(out))
+
+    def _settlement_contradictions(self, open_orders, fills, completed, now) -> set[str]:
+        """Review F1: broker evidence for an intent settled as NOT_AT_BROKER or CANCELLED is a
+        contradiction, never a normal adoption. The fills were applied as they happened (above);
+        the intent takes the broker's state, the verification block is superseded by a blocking
+        SETTLED_INTENT_CONTRADICTED and the journal shows the declaration and the evidence.
+        Returns the ideas touched."""
+        touched: set[str] = set()
+        for intent in self.settled_without_fill():
+            evidence = self.settlement_trace(intent, open_orders, fills, completed)
+            if not evidence:
+                continue
+            record = self.settlement_record(intent.order_ref)
+            detail = record.detail if record is not None else {}
+            declared = next(r for r in intent.reasons if r in SETTLED_WITHOUT_FILL_REASONS)
+            entry_open = next((o for o in open_orders if o.order_ref == intent.order_ref), None)
+            entry_done = next((o for o in completed if o.order_ref == intent.order_ref), None)
+            filled = self.store.filled_quantity(intent.order_ref)
+            if entry_open is not None:
+                state, status = IntentState.WORKING, entry_open.status.value
+            elif entry_done is not None:
+                state = _intent_state(
+                    entry_done.status, max(filled, entry_done.filled_quantity), intent.quantity
+                )
+                status = entry_done.status.value
+            elif filled >= intent.quantity:
+                state, status = IntentState.FILLED, OrderStatus.FILLED.value
+            else:
+                # Only the entry's own evidence decides it: looked up again by recover().
+                state, status = IntentState.UNRESOLVED, "Unknown"
+            self.store.set_state(
+                intent.order_ref, state, now, broker_status=status,
+                reasons=[declared, SETTLED_INTENT_CONTRADICTED],
+            )
+            pos = self.store.position(intent.idea_id)
+            if intent.action == Action.OPEN and pos is not None and pos.quantity == 0 \
+                    and pos.status == "NOT_FILLED" and state != IntentState.CANCELLED:
+                self.store.update_position(intent.idea_id, now, status="PENDING")
+            self.store.resolve_exceptions(
+                now, OPERATOR_SETTLEMENT_UNVERIFIED, idea_id=intent.idea_id,
+                order_ref=intent.order_ref,
+            )
+            text = (
+                f"operator request {detail.get('request_id')} declared {intent.order_ref} "
+                f"{declared.removeprefix('OPERATOR_SETTLED_')}; the broker now shows "
+                f"{', '.join(evidence)}. Recorded as it happened; new exposure in this contract is "
+                "blocked and reconciliation stays unclean until this is cleared after a clean "
+                "reconciliation."
+            )
+            self.store.raise_exception(
+                now, SETTLED_INTENT_CONTRADICTED, text, idea_id=intent.idea_id,
+                order_ref=intent.order_ref,
+            )
+            self.store.log(
+                now, SETTLED_INTENT_CONTRADICTED, order_ref=intent.order_ref,
+                idea_id=intent.idea_id, declared=declared, request_id=detail.get("request_id"),
+                operator=detail.get("operator"), evidence=evidence, filled=filled,
+                state=state.value,
+                rule="broker evidence contradicts an operator settlement: never adopted silently",
+            )
+            touched.add(intent.idea_id)
+        return touched
+
+    def _declared_fill_evidence(self, completed, now) -> set[str]:
+        """Review F10: broker executions for an intent an operator settled FILLED replace the
+        declaration, never add to it. While they cover only part of it and the order is not over,
+        the declared remainder still counts (the ledger holds the larger of declared and
+        evidenced) and the contract stays blocked. Once they cover it, or the entry's completed row
+        shows the order over, the ledger holds exactly the broker's fills; a quantity or average
+        price that differs from the declaration opens SETTLEMENT_DIFFERS_FROM_BROKER (blocking
+        only for a quantity), otherwise the verification block closes on that evidence. Returns
+        the ideas touched."""
+        touched: set[str] = set()
+        done = {o.order_ref for o in completed}
+        for d in self.store.declared_fills():
+            ref = d["order_ref"]
+            evidence = self.store.evidenced_fills(ref)
+            got = sum(f["quantity"] for f in evidence)
+            if got == 0:
+                continue
+            declared, price = int(d["declared_quantity"]), Decimal(d["price"])
+            intent = self.store.intent(ref)
+            idea = d["idea_id"]
+            if got < declared and ref not in done:
+                remainder = declared - got
+                if d["declared_state"] != "PARTIAL" or d["quantity"] != remainder:
+                    self.store.set_declared_remainder(d["exec_id"], remainder, "PARTIAL", now)
+                    self.store.raise_exception(
+                        now, OPERATOR_SETTLEMENT_UNVERIFIED,
+                        f"the broker shows {got} of the {declared} declared for {ref}; the "
+                        f"remaining {remainder} stays counted and the contract blocked until it "
+                        "is evidenced or the settlement corrected", idea_id=idea, order_ref=ref,
+                    )
+                    self.store.log(
+                        now, "DECLARED_FILL_PARTIAL", order_ref=ref, idea_id=idea,
+                        declared=declared, evidenced=got, still_counted=remainder,
+                        exec_ids=[f["exec_id"] for f in evidence],
+                        rule="evidenced part replaces the declaration; the rest stays counted",
+                    )
+                    touched.add(idea)
+                continue
+            avg = sum(Decimal(f["price"]) * f["quantity"] for f in evidence) / got
+            self.store.set_declared_remainder(d["exec_id"], 0, "REPLACED", now)
+            self.store.log(
+                now, "DECLARED_FILL_REPLACED", order_ref=ref, idea_id=idea, declared=declared,
+                declared_price=str(price), broker_quantity=got,
+                broker_avg_price=str(avg.quantize(Decimal("0.0001"))),
+                exec_ids=[f["exec_id"] for f in evidence],
+                rule="the broker's executions replace the operator's declaration",
+            )
+            if self.store.resolve_exceptions(now, OPERATOR_SETTLEMENT_UNVERIFIED, idea_id=idea,
+                                             order_ref=ref):
+                self.store.log(now, "OPERATOR_SETTLEMENT_VERIFIED", order_ref=ref, idea_id=idea,
+                               rule="the broker's own executions for the settled intent")
+            if got != declared or avg != price:
+                what = QUANTITY_DIFFERS if got != declared else "PRICE_DIFFERS"
+                self.store.raise_exception(
+                    now, SETTLEMENT_DIFFERS_FROM_BROKER,
+                    f"{what}: operator declared {declared} @ {price} for {ref}; the broker's "
+                    f"executions show {got} @ {avg.quantize(Decimal('0.0001'))}. The ledger now "
+                    "holds the broker's fills" + (
+                        "; new exposure in this contract is blocked until cleared"
+                        if got != declared else ""),
+                    idea_id=idea, order_ref=ref,
+                )
+            if intent is not None and got < intent.quantity and intent.state == IntentState.FILLED:
+                self.store.set_state(ref, IntentState.CANCELLED, now)
+            touched.add(idea)
+        return touched
+
     def _broker_state_unknown(self) -> bool:
         return any(
-            e.kind == BROKER_STATE_UNKNOWN for e in self.store.exceptions(open_only=True)
+            e.kind in ACCOUNT_BLOCKING_KINDS for e in self.store.exceptions(open_only=True)
         )
+
+    def mark_broker_unreadable(self, read: str, exc: BaseException) -> None:
+        """A caller (the runtime service's broker probe) saw the broker unreadable: protection
+        becomes UNKNOWN and new exposure is blocked until a full sync succeeds, exactly as when a
+        read of the coordinator's own fails (review F1)."""
+        self._broker_unreadable(read, exc)
 
     def _broker_unreadable(self, read: str, exc: BaseException) -> None:
         """A broker read failed: every open position's protection becomes UNKNOWN and an open
         BROKER_STATE_UNKNOWN exception blocks new exposure until a full sync succeeds (F1)."""
         now = self.clock()
         self.store.log(now, "SYNC_FAILED", read=read, error=str(exc))
+        self._position_runs.clear()  # a failed read is never a quantity: corroboration restarts
         for p in self.store.positions():
             if p.quantity > 0 and p.stop_price is not None and p.protection != "UNKNOWN":
                 self.store.update_position(p.idea_id, now, protection="UNKNOWN")
@@ -611,17 +894,33 @@ class ExecutionCoordinator:
         contract, problem = self._resolve_contract(action.instrument)
         if problem:
             return self._refuse(source, action, gate, ref, account, [problem], now)
+        plan = gate.plan
+        problem = self._plan_problem(plan, contract)
+        if problem:
+            return self._refuse(source, action, gate, ref, account, [problem], now)
         long = action.position_side == PositionSide.LONG
         side = OrderSide.BUY if long else OrderSide.SELL
-        qty = fill_quantity(Action.OPEN, self.policy, None)
+        qty = fill_quantity(
+            Action.OPEN, self.policy, None, per_signal=plan.quantity if plan else None
+        )
+        if plan is None:
+            stop, target = _dec(action.stop_price), _dec(action.target_price)
+            entry_level = action.entry_reference
+        else:  # the gateway's prices, each in its own series
+            stop, target = plan.stop, plan.target
+            entry_level = str(plan.execution_reference)
+        reference_series = plan is not None and plan.protection_series == "REFERENCE"
         rules = _rule_problems(
-            contract, qty, stop=_dec(action.stop_price), target=_dec(action.target_price)
+            contract,
+            qty,
+            stop=None if reference_series else stop,
+            target=None if reference_series else target,
+            backstop=plan.backstop_stop if plan else None,
         )
         if rules:
             return self._refuse(source, action, gate, ref, account, rules, now)
-        limit, reasons = self._entry_checks(
-            contract, side, qty, action.entry_reference, idea_id, now
-        )
+        limit, reasons = self._entry_checks(contract, side, qty, entry_level, idea_id, now,
+                                            fixed_limit=_anchored_limit(plan))
         if reasons:
             return self._refuse(source, action, gate, ref, account, reasons, now, idea_id=idea_id)
         exit_side = OrderSide.SELL if long else OrderSide.BUY
@@ -635,8 +934,14 @@ class ExecutionCoordinator:
             tif=TimeInForce.DAY,
         )
         children = []
-        stop, target = _dec(action.stop_price), _dec(action.target_price)
-        if stop is not None:
+        if reference_series:
+            children = self._reference_children(ref, contract, exit_side, qty, plan, long)
+            if not supports_price_conditions(self.broker):
+                return self._refuse(
+                    source, action, gate, ref, account, [CONDITIONS_UNSUPPORTED], now,
+                    idea_id=idea_id,
+                )
+        elif stop is not None:
             children.append(
                 OrderIntent(
                     order_ref=stop_ref(ref),
@@ -650,7 +955,7 @@ class ExecutionCoordinator:
                     reduce_only=True,
                 )
             )
-        if target is not None:
+        if target is not None and not reference_series:
             children.append(
                 OrderIntent(
                     order_ref=target_ref(ref),
@@ -692,10 +997,88 @@ class ExecutionCoordinator:
             target_ref=target_ref(ref) if target is not None else None,
             status="PENDING",
             updated_at=now,
+            protection_series=plan.protection_series if plan else None,
+            reference_key=plan.reference_contract_key if reference_series else None,
+            backstop_ref=backstop_ref(ref) if plan and plan.backstop_stop else None,
+            backstop_price=str(plan.backstop_stop) if plan and plan.backstop_stop else None,
+            publisher_stop=str(plan.publisher_stop) if plan and plan.publisher_stop else None,
         )
         self._record(intent, [entry, *children], ledger)
         self._submit(intent, entry, children)
         return self._outcome(ref)
+
+    @staticmethod
+    def _idea_contract_problem(pos: LedgerPosition, contract: ContractRef) -> str | None:
+        """A follow-up acts only on the idea's own contract (two months are never confused)."""
+        if pos.contract_key and contract.contract_key != pos.contract_key:
+            return "IDEA_CONTRACT_MISMATCH"
+        return None
+
+    def _plan_problem(self, plan: ExecutionPlan | None, contract: ContractRef) -> str | None:
+        """A mapped action executes only in the contract the gateway decided on."""
+        if plan is None:
+            return None
+        if self._key_for_plan(contract) != plan.execution_key:
+            return CONTRACT_CHANGED
+        return None
+
+    @staticmethod
+    def _key_for_plan(contract: ContractRef) -> str:
+        """``Instrument.quote_key`` of a resolved contract (stocks: the symbol)."""
+        if contract.sec_type == "STK":
+            return contract.symbol
+        month = contract.expiry or "-"
+        if contract.asset_class.value == "FUTURE":
+            month = month[:6]
+        elif month != "-" and len(month) == 8:
+            month = f"{month[:4]}-{month[4:6]}-{month[6:]}"
+        strike = format(contract.strike.normalize(), "f") if contract.strike is not None else "-"
+        right = {"C": "CALL", "P": "PUT"}.get(contract.right or "", "-")
+        return f"{contract.asset_class.value}:{contract.symbol}:{month}:{strike}:{right}"
+
+    def _reference_children(
+        self, ref: str, contract: ContractRef, exit_side: OrderSide, qty: int,
+        plan: ExecutionPlan, long: bool,
+    ) -> list[OrderIntent]:
+        """REFERENCE_TRIGGER: the stop and target are exits held at the broker as conditions on
+        the reference series, released as market orders in the execution contract; a backstop
+        stop in the execution contract (BASIS_SHIFT priced) may work beside them. All reduce-only
+        children of one bracket (one-cancels-other)."""
+        out = []
+        for level, kind, child_ref in (
+            (plan.stop, "stop", stop_ref(ref)),
+            (plan.target, "target", target_ref(ref)),
+        ):
+            if level is None:
+                continue
+            out.append(
+                OrderIntent(
+                    order_ref=child_ref,
+                    contract=contract,
+                    side=exit_side,
+                    quantity=qty,
+                    order_type=OrderType.MKT,
+                    tif=self.config.protective_tif,
+                    parent_ref=ref,
+                    reduce_only=True,
+                    condition=_exit_condition(plan, long, level, kind),
+                )
+            )
+        if plan.backstop_stop is not None:
+            out.append(
+                OrderIntent(
+                    order_ref=backstop_ref(ref),
+                    contract=contract,
+                    side=exit_side,
+                    quantity=qty,
+                    order_type=OrderType.STP,
+                    stop_price=plan.backstop_stop,
+                    tif=self.config.protective_tif,
+                    parent_ref=ref,
+                    reduce_only=True,
+                )
+            )
+        return out
 
     def _add(self, source, action, gate, ref, account, now) -> ExecutionOutcome:
         pos = self._open_position(action.idea_reference)
@@ -707,14 +1090,22 @@ class ExecutionCoordinator:
         contract, problem = self._resolve_contract(action.instrument)
         if problem:
             return self._refuse(source, action, gate, ref, account, [problem], now)
+        plan = gate.plan
+        problem = self._plan_problem(plan, contract) or self._idea_contract_problem(pos, contract)
+        if problem:
+            return self._refuse(source, action, gate, ref, account, [problem], now)
         long = pos.position_side == PositionSide.LONG
         side = OrderSide.BUY if long else OrderSide.SELL
-        qty = fill_quantity(Action.ADD, self.policy, self._as_position(pos))
+        qty = fill_quantity(
+            Action.ADD, self.policy, self._as_position(pos),
+            per_signal=plan.quantity if plan else None,
+        )
         rules = _rule_problems(contract, qty)
         if rules:
             return self._refuse(source, action, gate, ref, account, rules, now, idea_id=pos.idea_id)
+        entry_level = str(plan.execution_reference) if plan else action.entry_reference
         limit, reasons = self._entry_checks(
-            contract, side, qty, action.entry_reference, pos.idea_id, now
+            contract, side, qty, entry_level, pos.idea_id, now, fixed_limit=_anchored_limit(plan)
         )
         if reasons:
             return self._refuse(
@@ -756,6 +1147,11 @@ class ExecutionCoordinator:
             )
         assert action.instrument is not None
         contract, problem = self._resolve_contract(action.instrument)
+        if problem:
+            return self._refuse(source, action, gate, ref, account, [problem], now)
+        problem = self._plan_problem(gate.plan, contract) or self._idea_contract_problem(
+            pos, contract
+        )
         if problem:
             return self._refuse(source, action, gate, ref, account, [problem], now)
         try:
@@ -849,9 +1245,35 @@ class ExecutionCoordinator:
                 source, action, gate, ref, account, ["NO_TARGET_ORDER_TO_AMEND"], now
             )
         contract = _contract_from(pos.contract)
+        plan = gate.plan
+        if plan is None:
+            stop, target = action.stop_price, action.target_price
+        else:  # the gateway's levels, in the series the idea's protection lives in
+            stop = str(plan.stop) if plan.stop is not None else None
+            target = str(plan.target) if plan.target is not None else None
+            if (plan.protection_series == "REFERENCE") != (pos.protection_series == "REFERENCE"):
+                return self._refuse(
+                    source, action, gate, ref, account, ["PROTECTION_SERIES_MISMATCH"], now,
+                    idea_id=pos.idea_id,
+                )
+            if pos.backstop_ref and stop is not None and plan.backstop_stop is None:
+                return self._refuse(
+                    source, action, gate, ref, account, ["BACKSTOP_NOT_PRICED"], now,
+                    idea_id=pos.idea_id,
+                )
+            if contract is not None and self._key_for_plan(contract) != plan.execution_key:
+                return self._refuse(
+                    source, action, gate, ref, account, [CONTRACT_CHANGED], now,
+                    idea_id=pos.idea_id,
+                )
         if contract is not None:
+            reference_series = pos.protection_series == "REFERENCE"
             rules = _rule_problems(
-                contract, None, stop=_dec(action.stop_price), target=_dec(action.target_price)
+                contract,
+                None,
+                stop=None if reference_series else _dec(stop),
+                target=None if reference_series else _dec(target),
+                backstop=plan.backstop_stop if plan else None,
             )
             if rules:
                 return self._refuse(
@@ -867,8 +1289,9 @@ class ExecutionCoordinator:
             now,
             contract=contract,
             quantity=0,
-            stop_price=action.stop_price,
-            target_price=action.target_price,
+            stop_price=stop,
+            target_price=target,
+            plan=plan.model_dump_json() if plan else None,
         )
         with self.store.tx() as c:
             self.store.insert_intent(c, intent)
@@ -879,9 +1302,18 @@ class ExecutionCoordinator:
                 idea_id=pos.idea_id,
                 c=c,
                 action="MODIFY",
-                stop=action.stop_price,
-                target=action.target_price,
+                stop=stop,
+                target=target,
+                backstop=str(plan.backstop_stop) if plan and plan.backstop_stop else None,
+                basis=str(plan.basis_value) if plan and plan.basis_value is not None else None,
                 gate=gate.reasons,
+            )
+        if plan is not None and plan.protective_levels_kept:
+            # The publisher tightened, but a broker-side level would have loosened: the working
+            # level is kept (the plan says which) and a human sees the divergence.
+            self.store.raise_exception(
+                now, PROTECTIVE_LEVEL_NOT_LOOSENED, "; ".join(plan.protective_levels_kept),
+                idea_id=pos.idea_id, order_ref=ref,
             )
         self._apply_modify(self.store.intent(ref))
         return self._outcome(ref)
@@ -977,7 +1409,7 @@ class ExecutionCoordinator:
             open_by_ref = {o.order_ref: o for o in self.broker.open_orders()}
         except BrokerError:
             return ["BROKER_OPEN_ORDERS_UNAVAILABLE"]
-        for ref in (pos.stop_ref, pos.target_ref):
+        for ref in (pos.stop_ref, pos.target_ref, pos.backstop_ref):
             o = open_by_ref.get(ref) if ref else None
             if o is None:
                 continue
@@ -1535,11 +1967,14 @@ class ExecutionCoordinator:
                     stop_price=_dec(r.stop_price),
                     tif=(
                         self.config.protective_tif
-                        if r.role in (Role.STOP, Role.TARGET)
+                        if r.role in (Role.STOP, Role.TARGET, Role.BACKSTOP)
                         else TimeInForce.DAY
                     ),
                     parent_ref=r.parent_ref,
                     reduce_only=r.role != Role.ENTRY,
+                    condition=(
+                        PriceCondition.model_validate_json(r.condition) if r.condition else None
+                    ),
                 )
             )
         return built[0], built[1:]
@@ -1582,7 +2017,7 @@ class ExecutionCoordinator:
             self._protection_unverified(pos, str(exc))
             self._broker_unreadable("open_orders", exc)
             return
-        refs = [r for r in (pos.stop_ref, pos.target_ref) if r]
+        refs = [r for r in (pos.stop_ref, pos.target_ref, pos.backstop_ref) if r]
         if pos.quantity == 0:
             if pos.status == "PENDING":
                 return
@@ -1600,31 +2035,57 @@ class ExecutionCoordinator:
             self.store.resolve_exceptions(now, PROTECTION_UNVERIFIED, idea_id=idea_id)
             return
         cover = max(pos.quantity - self.store.committed_exit_quantity(idea_id), 0)
+        # Review N1: the cover is also capped at what the BROKER holds in the contract, whatever
+        # the ledger believes. None: the broker position could not be read (never size up then).
+        broker_cover, floor, differs, attributed = self._broker_cover(pos, cover)
+        reduced = False
+        target = cover if broker_cover is None else min(cover, broker_cover)
         changed = False
         for ref in refs:
             o = open_by_ref.get(ref)
             if o is None or o.status == OrderStatus.PENDING_CANCEL:
                 continue
-            if cover == 0:
-                # Everything held is committed to working exits: a child would over-commit.
-                changed |= self._try(
+            if broker_cover is None:
+                want = min(cover, o.remaining)  # positions unreadable: never sized up
+            else:
+                # Up only to what the broker holds; down below the ledger only as far as the
+                # corroborated floor (an exit fill in executions, or a lower position confirmed
+                # over the settle period). A position read alone never reduces protection.
+                want = min(max(target, floor), max(o.remaining, target))
+            if want == 0:
+                # Everything held is committed to working exits, or the broker holds nothing to
+                # cover: a child would over-commit (it could open a position if it triggered).
+                done = self._try(
                     lambda r=ref: self.broker.cancel(r),
                     "PROTECTIVE_CANCELLED",
                     idea_id,
                     ref,
-                    reason="position fully committed to working exits",
+                    reason="position fully committed to working exits" if cover == 0
+                    else "the broker holds nothing this order may cover",
                 )
+                changed |= done
+                reduced |= done and cover > 0
                 continue
             # Allowed under the halt: sizing protection to the position never adds exposure.
-            if o.remaining != cover and self._try(
-                lambda o=o: self.broker.modify(o.order_ref, quantity=o.filled_quantity + cover),
+            if o.remaining != want and self._try(
+                lambda o=o, w=want: self.broker.modify(o.order_ref, quantity=o.filled_quantity + w),
                 "PROTECTIVE_RESIZED",
                 idea_id,
                 ref,
                 before=o.remaining,
-                after=cover,
+                after=want,
+                ledger_cover=cover,
+                broker_cover=broker_cover,
             ):
                 changed = True
+                reduced |= want < min(o.remaining, cover)
+        if reduced and attributed:
+            # Each execution explains one reduction, for one idea, once (review P1).
+            self.store.log(
+                now, "EXECUTION_ATTRIBUTED", idea_id=idea_id, exec_ids=attributed,
+                rule="an exit execution after the idea's last ledger change explained this "
+                "reduction of its cover; it explains nothing again",
+            )
         if changed:
             try:
                 open_by_ref = {o.order_ref: o for o in self.broker.open_orders()}
@@ -1637,6 +2098,9 @@ class ExecutionCoordinator:
             if o is not None:
                 self.store.update_order(ref, now, status=o.status.value, quantity=o.quantity)
         if pos.stop_price is None:
+            return
+        if broker_cover is None:
+            self._protection_unverified(pos, "broker positions unreadable: cover never sized up")
             return
         # This check succeeded after every fill applied so far: its verdict is the protection.
         self.store.resolve_exceptions(now, PROTECTION_UNVERIFIED, idea_id=idea_id)
@@ -1666,23 +2130,27 @@ class ExecutionCoordinator:
             return
         stop = open_by_ref.get(pos.stop_ref) if pos.stop_ref else None
         exit_side = OrderSide.SELL if pos.position_side == PositionSide.LONG else OrderSide.BUY
-        # Review F3: type, side, quantity AND price against the ledger's confirmed stop.
-        price_ok = stop is not None and stop.stop_price == _dec(pos.stop_price)
+        # Review F3: type, side, quantity AND price against the ledger's confirmed stop. A
+        # reference-triggered stop is confirmed only as a working conditional exit in the right
+        # contract, on the right reference series, direction and trigger level (multi-asset).
+        price_ok = stop is not None and self._stop_matches(stop, pos)
         # A PreSubmitted child is present only once its parent's fill is established by the
         # parent's own executions (at IBKR it is PreSubmitted before the fill as well).
         parent_ok = stop is not None and (
             stop.status != OrderStatus.PRE_SUBMITTED
             or self.store.filled_quantity(stop.parent_ref or pos.stop_ref.rsplit(".", 1)[0]) > 0
         )
+        backstop_problem = self._backstop_problem(pos, open_by_ref, target, exit_side)
         if (
-            stop is not None
+            differs is None
+            and stop is not None
             and stop.working
             and stop.status != OrderStatus.PENDING_CANCEL
             and stop.remaining == cover
-            and stop.order_type == OrderType.STP
             and stop.side == exit_side
             and price_ok
             and parent_ok
+            and backstop_problem is None
         ):
             self.store.update_position(idea_id, now, protection="CONFIRMED")
             if self.store.resolve_exceptions(now, UNPROTECTED_POSITION, idea_id=idea_id):
@@ -1694,15 +2162,196 @@ class ExecutionCoordinator:
             f"{stop.remaining if stop else 0} ({stop.status.value if stop else 'absent'})"
         )
         if stop is not None and not price_ok:
-            detail += (
-                f"; STOP_PRICE_MISMATCH: working stop {stop.stop_price}, ledger {pos.stop_price}"
+            working = (
+                f"condition {stop.condition.direction.value} {stop.condition.trigger_price} on "
+                f"{stop.condition.contract.contract_key}" if stop.condition
+                else f"{stop.order_type.value} {stop.stop_price}"
             )
+            detail += f"; STOP_PRICE_MISMATCH: working stop {working}, ledger {pos.stop_price}"
+        if backstop_problem:
+            detail += f"; {backstop_problem}"
+        if differs is not None:
+            detail += f"; {differs}"
         if self.store.raise_exception(
             now, UNPROTECTED_POSITION, detail, idea_id=idea_id, order_ref=pos.stop_ref
         ):
             self.store.log(
                 now, UNPROTECTED_POSITION, order_ref=pos.stop_ref, idea_id=idea_id, detail=detail
             )
+
+    def _broker_cover(
+        self, pos: LedgerPosition, cover: int
+    ) -> tuple[int | None, int | None, str | None, list[str]]:
+        """Review N1, asymmetric. Returns (up, floor, differs):
+
+        * ``up``: the most protective cover the BROKER's position supports. The broker's position
+          in the contract, on the idea's side, less every exit that may be live, is shared among
+          the contract's open ideas in a fixed order, each taking at most its ledger cover. Cover
+          is never placed or sized above it.
+        * ``floor``: the least cover the evidence allows. The ledger cover, less the exit-side
+          executions in the contract the ledger has not applied (someone else's fill, visible at
+          the broker); or ``up`` once the same differing position has been read on at least
+          ``exit_no_trace_lookups`` consecutive successful reads spread over ``settle_seconds``.
+          A position read alone never lowers cover below the ledger.
+        * ``differs``: why the broker's position differs from the ledger (None when it does not).
+
+        (None, None, None) when the positions cannot be read: nothing is sized up then."""
+        key = self._key_of(pos.symbol, pos.asset_class, pos.contract_key)
+        now = self.clock()
+        try:
+            net = sum(
+                p.quantity for p in self.broker.positions() if p.contract.contract_key == key
+            )
+        except BrokerError as exc:
+            self._broker_unreadable("positions", exc)
+            return None, None, None, []
+        sign = 1 if pos.position_side == PositionSide.LONG else -1
+        same = sorted(
+            (
+                p for p in self.store.positions()
+                if p.quantity > 0 and p.position_side == pos.position_side
+                and self._key_of(p.symbol, p.asset_class, p.contract_key) == key
+            ),
+            key=lambda p: p.idea_id,
+        )
+        ledger_net = sum(
+            (1 if p.position_side == PositionSide.LONG else -1) * p.quantity
+            for p in self.store.positions()
+            if p.quantity > 0 and self._key_of(p.symbol, p.asset_class, p.contract_key) == key
+        )
+        committed = {p.idea_id: self.store.committed_exit_quantity(p.idea_id) for p in same}
+        # Review P1: an execution explains a reduction only if it is on the exit side, in this
+        # contract, unapplied by the ledger, after the idea's last ledger change (by its own
+        # broker timestamp), never attributed before, and only up to the ledger/broker gap.
+        exit_side = OrderSide.SELL if sign == 1 else OrderSide.BUY
+        gap = max(sign * (ledger_net - net), 0)
+        candidates = []
+        if gap:  # only a broker position below the ledger needs explaining
+            consumed = self._attributed_executions()
+            try:
+                candidates = sorted(
+                    (
+                        f for f in self.broker.executions()
+                        if f.contract.contract_key == key and f.side == exit_side
+                        and not self.store.has_fill(f.exec_id) and f.exec_id not in consumed
+                    ),
+                    key=lambda f: (f.executed_at, f.exec_id),
+                )
+            except BrokerError:
+                candidates = []  # no corroboration from executions this time
+        budget = max(sign * net, 0) - sum(committed.values())
+        mine = mine_explained = 0
+        mine_used: list[str] = []
+        taken: set[str] = set()
+        for p in same:
+            own = max(p.quantity - committed[p.idea_id], 0)
+            share = max(min(own, budget), 0)
+            budget -= share
+            changed_at = self._last_ledger_change(p.idea_id) if candidates else None
+            took, used = 0, []
+            for f in candidates:
+                if f.exec_id in taken or (changed_at is not None and f.executed_at <= changed_at):
+                    continue
+                room = min(own - took, gap)
+                if room <= 0:
+                    break
+                took += min(f.quantity, room)
+                gap -= min(f.quantity, room)
+                used.append(f.exec_id)
+                taken.add(f.exec_id)
+            if p.idea_id == pos.idea_id:
+                mine, mine_explained, mine_used = share, took, used
+        run = self._position_runs.get(key)
+        if net == ledger_net:
+            self._position_runs.pop(key, None)
+        elif run is None or run[-1][1] != net:
+            self._position_runs[key] = run = [(now, net)]
+        elif run[-1][0] != now:
+            run.append((now, net))
+        confirmed = (
+            net != ledger_net
+            and len(run) >= self.config.exit_no_trace_lookups
+            and (run[-1][0] - run[0][0]).total_seconds() >= self.config.settle_seconds
+        )
+        floor = mine if confirmed else max(cover - mine_explained, 0)
+        differs = None
+        if net != ledger_net:
+            if confirmed:
+                how = (f"the lower position is confirmed by {len(run)} reads over "
+                       f"{(run[-1][0] - run[0][0]).total_seconds():g} s")
+            elif mine_explained:
+                how = f"{mine_explained} of the reduction is explained by broker executions"
+            else:
+                how = (f"a position read alone never reduces cover; {len(run)} consecutive reads "
+                       "so far")
+            differs = (
+                f"BROKER_POSITION_DIFFERS: broker holds {net} in {key}, ledger {ledger_net}; "
+                f"cover is never sized above what both show ({mine}) and never reduced below "
+                f"{floor} ({how}); anything held beyond the ledger is left uncovered"
+            )
+        return mine, floor, differs, (mine_used if mine_explained else [])
+
+    def _attributed_executions(self) -> set[str]:
+        """Executions already used to explain a reduction of cover (each explains one, once)."""
+        out: set[str] = set()
+        for e in self.store.journal():
+            if e.event == "EXECUTION_ATTRIBUTED":
+                out.update(e.detail.get("exec_ids", []))
+        return out
+
+    def _last_ledger_change(self, idea_id: str) -> datetime | None:
+        """When the quantity being protected was last set: the idea's latest fill (by broker
+        time) or operator settlement or correction of it."""
+        times = [
+            datetime.fromisoformat(f["executed_at"]) for f in self.store.fills()
+            if f["idea_id"] == idea_id
+        ]
+        times += [
+            e.at for e in self.store.journal()
+            if e.idea_id == idea_id and e.event in (
+                "OPERATOR_SETTLEMENT", "OPERATOR_SETTLEMENT_CORRECTED",
+                "DECLARED_FILL_PARTIAL", "DECLARED_FILL_REPLACED",
+            )
+        ]
+        return max(times) if times else None
+
+    @staticmethod
+    def _stop_matches(stop: BrokerOrder, pos: LedgerPosition) -> bool:
+        level = _dec(pos.stop_price)
+        if pos.protection_series != "REFERENCE":
+            return stop.order_type == OrderType.STP and stop.condition is None \
+                and stop.stop_price == level
+        c = stop.condition
+        long = pos.position_side == PositionSide.LONG
+        want = ConditionDirection.BELOW if long else ConditionDirection.ABOVE
+        return (
+            c is not None
+            and c.contract.contract_key == pos.reference_key
+            and c.direction == want
+            and c.trigger_price == level
+            and stop.order_type == c.released_order_type
+            and (pos.contract_key is None or stop.contract.contract_key == pos.contract_key)
+        )
+
+    @staticmethod
+    def _backstop_problem(pos, open_by_ref, cover: int, exit_side: OrderSide) -> str | None:
+        """A required backstop counts only as a working STP in the execution contract at the
+        ledger's backstop price covering the same quantity as the stop."""
+        if not pos.backstop_ref:
+            return None
+        b = open_by_ref.get(pos.backstop_ref)
+        if (
+            b is None
+            or not b.working
+            or b.status == OrderStatus.PENDING_CANCEL
+            or b.order_type != OrderType.STP
+            or b.side != exit_side
+            or b.remaining != cover
+            or b.stop_price != _dec(pos.backstop_price)
+        ):
+            have = f"{b.order_type.value} {b.stop_price} x{b.remaining}" if b else "absent"
+            return f"BACKSTOP_NOT_CONFIRMED: want STP {pos.backstop_price} x{cover}, have {have}"
+        return None
 
     def _protection_unverified(self, pos: LedgerPosition, error: str) -> None:
         """The broker could not be read: protection is UNKNOWN until a later check succeeds."""
@@ -1742,9 +2391,14 @@ class ExecutionCoordinator:
         """
         pos = self.store.position(intent.idea_id)
         now = self.clock()
+        reference_series = pos.protection_series == "REFERENCE"
+        level_field = "trigger_price" if reference_series else "stop_price"
+        plan = _plan_of(intent.plan)
         wanted = [
-            (pos.stop_ref, "stop_price", _dec(intent.stop_price)),
-            (pos.target_ref, "limit_price", _dec(intent.target_price)),
+            (pos.stop_ref, level_field, _dec(intent.stop_price)),
+            (pos.target_ref, "trigger_price" if reference_series else "limit_price",
+             _dec(intent.target_price)),
+            (pos.backstop_ref, "stop_price", plan.backstop_stop if plan else None),
         ]
         wanted = [(ref, field, price) for ref, field, price in wanted if price is not None and ref]
         try:
@@ -1753,7 +2407,7 @@ class ExecutionCoordinator:
             self._mark_unresolved(intent, "LOOKUP_FAILED", str(exc))
             return
         pending = [
-            (r, f, p) for r, f, p in wanted if r in open_by_ref and getattr(open_by_ref[r], f) != p
+            (r, f, p) for r, f, p in wanted if r in open_by_ref and _field(open_by_ref[r], f) != p
         ]
         missing = [r for r, _, _ in wanted if r not in open_by_ref]
         if missing:
@@ -1774,7 +2428,13 @@ class ExecutionCoordinator:
             for ref, field, price in pending:
                 self.store.log(self.clock(), "AMEND_SUBMIT", order_ref=ref, idea_id=intent.idea_id)
                 try:
-                    self.broker.modify(ref, **{field: price})
+                    if field == "trigger_price":
+                        amend = getattr(self.broker, "modify_condition", None)
+                        if not callable(amend):
+                            raise BrokerError("broker cannot amend price conditions")
+                        amend(ref, trigger_price=price)
+                    else:
+                        self.broker.modify(ref, **{field: price})
                     self.store.log(
                         self.clock(),
                         "AMEND",
@@ -1796,20 +2456,25 @@ class ExecutionCoordinator:
                 self._mark_unresolved(intent, "LOOKUP_FAILED", str(exc))
                 return
         unconfirmed = [
-            r for r, f, p in wanted if r not in open_by_ref or getattr(open_by_ref[r], f) != p
+            r for r, f, p in wanted if r not in open_by_ref or _field(open_by_ref[r], f) != p
         ]
         if unconfirmed:
             self._modify_failed(intent, f"amendment not visible at broker: {unconfirmed}")
             return
         fields = {}
         for ref, field, price in wanted:
+            column = "limit_price" if field == "limit_price" else "stop_price"
             self.store.update_order(
-                ref,
-                now,
-                status=open_by_ref[ref].status.value,
-                **{"stop_price" if field == "stop_price" else "limit_price": str(price)},
+                ref, now, status=open_by_ref[ref].status.value, **{column: str(price)}
             )
-            fields["stop_price" if field == "stop_price" else "target_price"] = str(price)
+            if ref == pos.backstop_ref:
+                fields["backstop_price"] = str(price)
+            elif ref == pos.stop_ref:
+                fields["stop_price"] = str(price)
+            else:
+                fields["target_price"] = str(price)
+        if plan is not None and plan.publisher_stop is not None:
+            fields["publisher_stop"] = str(plan.publisher_stop)
         self.store.update_position(intent.idea_id, now, **fields)
         self.store.set_state(intent.order_ref, IntentState.APPLIED, now)
         self.store.log(
@@ -1847,9 +2512,13 @@ class ExecutionCoordinator:
         idea_id: str,
         now: datetime,
         exclude_ref: str | None = None,
+        fixed_limit: Decimal | None = None,
     ) -> tuple[Decimal | None, list[str]]:
         """Broker-quote sanity, the price collar and exposure caps, before any entry or add.
-        Returns the collar-bounded limit price, or the reasons to refuse."""
+        Returns the collar-bounded limit price, or the reasons to refuse. ``fixed_limit`` is the
+        gateway's anchored entry limit (entry_rule REFERENCE_AS_COLLAR): the marketable side of
+        the quote it decided on. It is sent as it is; the fresh quote must still lie inside the
+        policy collar around it, so a market that moved since the decision is refused."""
         key = contract.contract_key
         blocked = self._instrument_block(contract)
         if blocked:
@@ -1875,7 +2544,8 @@ class ExecutionCoordinator:
             return None, ["BROKER_QUOTE_OUTSIDE_COLLAR"]
         # Snapped to the contract's tick inside the collar: a buy limit down, a sell limit up.
         limit = (
-            snap_to_tick(ref * (1 + band), contract.min_tick, ROUND_FLOOR)
+            fixed_limit if fixed_limit is not None
+            else snap_to_tick(ref * (1 + band), contract.min_tick, ROUND_FLOOR)
             if buy
             else snap_to_tick(ref * (1 - band), contract.min_tick, ROUND_CEILING)
         )
@@ -1958,6 +2628,8 @@ class ExecutionCoordinator:
         }
         open_ = [
             e for e in self.store.exceptions(open_only=True) if e.idea_id in in_instrument
+            and not (e.kind == SETTLEMENT_DIFFERS_FROM_BROKER
+                     and not e.detail.startswith(QUANTITY_DIFFERS))
         ]
         for kind in INSTRUMENT_BLOCKING_KINDS:
             if any(e.kind == kind for e in open_):
@@ -2050,6 +2722,8 @@ class ExecutionCoordinator:
         assert action.instrument is not None
         if contract is not None:
             fields.update(contract_key=contract.contract_key, contract=contract.model_dump_json())
+        if gate.plan is not None:
+            fields.setdefault("plan", gate.plan.model_dump_json())
         return Intent(
             order_ref=ref,
             source_id=source.source_id,
@@ -2085,11 +2759,14 @@ class ExecutionCoordinator:
             if ledger is not None:
                 self.store.insert_position(c, ledger)
             for o in orders:
-                r = (
-                    role
-                    if o.parent_ref is None
-                    else (Role.STOP if o.order_type == OrderType.STP else Role.TARGET)
-                )
+                if o.parent_ref is None:
+                    r = role
+                elif o.order_ref == backstop_ref(o.parent_ref):
+                    r = Role.BACKSTOP
+                elif o.condition is not None:
+                    r = Role.STOP if o.order_ref == stop_ref(o.parent_ref) else Role.TARGET
+                else:
+                    r = Role.STOP if o.order_type == OrderType.STP else Role.TARGET
                 self.store.insert_order(
                     c,
                     OrderRow(
@@ -2104,9 +2781,13 @@ class ExecutionCoordinator:
                         quantity=o.quantity,
                         order_type=o.order_type.value,
                         limit_price=str(o.limit_price) if o.limit_price else None,
-                        stop_price=str(o.stop_price) if o.stop_price else None,
+                        stop_price=(
+                            str(o.stop_price) if o.stop_price
+                            else str(o.condition.trigger_price) if o.condition else None
+                        ),
                         status="Recorded",
                         updated_at=intent.created_at,
+                        condition=o.condition.model_dump_json() if o.condition else None,
                     ),
                 )
             self.store.log(

@@ -133,6 +133,12 @@ class Role(str, Enum):
     EXIT = "EXIT"  # reduce-only REDUCE / CLOSE
     STOP = "STOP"  # protective stop child
     TARGET = "TARGET"  # protective target child
+    # A stop in the execution instrument beside a reference-triggered stop (multi-asset mapping):
+    # it protects the hours the reference series does not update.
+    BACKSTOP = "BACKSTOP"
+
+
+PROTECTIVE_ROLES = frozenset({Role.STOP, Role.TARGET, Role.BACKSTOP})
 
 
 class Intent(StrictModel):
@@ -168,6 +174,8 @@ class Intent(StrictModel):
     # and on intents recorded before round 2.
     contract_key: str | None = None
     contract: str | None = None
+    # The gateway's execution plan for an action in a mapped family (models.ExecutionPlan JSON).
+    plan: str | None = None
 
 
 class OrderRow(StrictModel):
@@ -186,6 +194,8 @@ class OrderRow(StrictModel):
     filled_quantity: int = 0
     updated_at: datetime
     contract_key: str | None = None
+    # A broker-side price condition on a reference series (broker.PriceCondition JSON).
+    condition: str | None = None
 
 
 class LedgerPosition(StrictModel):
@@ -212,6 +222,20 @@ class LedgerPosition(StrictModel):
     # reconciliation key on this, never on the symbol alone.
     contract_key: str | None = None
     contract: str | None = None
+    # Multi-asset mapping. EXECUTION: stop and target are execution prices (as before). REFERENCE:
+    # they are reference-series levels held as broker-side conditions on ``reference_key``; a
+    # ``backstop_ref`` stop at ``backstop_price`` (execution prices) may work beside them.
+    protection_series: str | None = None
+    reference_key: str | None = None
+    backstop_ref: str | None = None
+    backstop_price: str | None = None
+    # The publisher's own stop level when ``stop_price`` is a converted one (BASIS_SHIFT), so an
+    # amendment can tell a publisher tightening from a loosening.
+    publisher_stop: str | None = None
+    # The version-2 mapping entry (runtime.mapping.FamilyMapping JSON) the idea was opened under.
+    # Approval governs new exposure only: exits and protective amendments on this idea use these
+    # terms if the family later loses its approval or its entry.
+    mapping_terms: str | None = None
 
 
 class JournalEntry(StrictModel):
@@ -250,16 +274,26 @@ class ExecutionStore:
             for col in ("source_published_at", "entry_reference", "submitted_at"):
                 if col not in cols:  # a store created before this column existed
                     c.execute(f"ALTER TABLE exec_intents ADD COLUMN {col} TEXT")
-            for col in ("contract_key", "contract"):  # round 2, Part B: contract identity
+            # round 2, Part B: contract identity; multi-asset mapping: the gateway's plan
+            for col in ("contract_key", "contract", "plan"):
                 if col not in cols:
                     c.execute(f"ALTER TABLE exec_intents ADD COLUMN {col} TEXT")
             pcols = {r["name"] for r in c.execute("PRAGMA table_info(exec_positions)")}
-            for col in ("protection", "contract_key", "contract"):
+            for col in ("protection", "contract_key", "contract", "protection_series",
+                        "reference_key", "backstop_ref", "backstop_price", "publisher_stop", "mapping_terms"):
                 if col not in pcols:
                     c.execute(f"ALTER TABLE exec_positions ADD COLUMN {col} TEXT")
             ocols = {r["name"] for r in c.execute("PRAGMA table_info(exec_orders)")}
-            if "contract_key" not in ocols:
-                c.execute("ALTER TABLE exec_orders ADD COLUMN contract_key TEXT")
+            for col in ("contract_key", "condition"):
+                if col not in ocols:
+                    c.execute(f"ALTER TABLE exec_orders ADD COLUMN {col} TEXT")
+            # Review F10: a fill an operator declared (not broker evidence). declared_quantity is
+            # what was declared; quantity is the part not yet replaced by broker executions;
+            # declared_state DECLARED | PARTIAL | REPLACED.
+            fcols = {r["name"] for r in c.execute("PRAGMA table_info(exec_fills)")}
+            for col, kind in (("declared_quantity", "INTEGER"), ("declared_state", "TEXT")):
+                if col not in fcols:
+                    c.execute(f"ALTER TABLE exec_fills ADD COLUMN {col} {kind}")
 
     @contextmanager
     def tx(self) -> Iterator[sqlite3.Connection]:
@@ -428,87 +462,167 @@ class ExecutionStore:
         price: Decimal,
         executed_at: datetime,
         at: datetime,
+        c: sqlite3.Connection | None = None,
+        declared: bool = False,
     ) -> LedgerPosition | None:
         """The only writer of follower quantities: one broker execution, applied exactly once.
         An exit fill larger than the position is recorded as it happened; the ledger stops at zero,
         the idea becomes REVERSED and a LEDGER_REVERSAL exception is opened in the same
-        transaction (safety review R2)."""
-        with self.tx() as c:
-            if c.execute("SELECT 1 FROM exec_fills WHERE exec_id=?", (exec_id,)).fetchone():
-                return None
+        transaction (safety review R2). With ``c`` it runs inside the caller's transaction (an
+        operator settlement applies its declared fill and its journal entry atomically)."""
+        if c is None:
+            with self.tx() as conn:
+                return self.apply_fill(
+                    exec_id=exec_id, order=order, quantity=quantity, price=price,
+                    executed_at=executed_at, at=at, c=conn, declared=declared,
+                )
+        if c.execute("SELECT 1 FROM exec_fills WHERE exec_id=?", (exec_id,)).fetchone():
+            return None
+        c.execute(
+            """INSERT INTO exec_fills
+            (exec_id,order_ref,idea_id,role,side,quantity,price,executed_at)
+            VALUES (?,?,?,?,?,?,?,?)""",
+            (
+                exec_id,
+                order.order_ref,
+                order.idea_id,
+                order.role.value,
+                order.side,
+                quantity,
+                str(price),
+                executed_at.isoformat(),
+            ),
+        )
+        if declared:
             c.execute(
-                """INSERT INTO exec_fills
-                (exec_id,order_ref,idea_id,role,side,quantity,price,executed_at)
-                VALUES (?,?,?,?,?,?,?,?)""",
-                (
-                    exec_id,
-                    order.order_ref,
-                    order.idea_id,
-                    order.role.value,
-                    order.side,
-                    quantity,
-                    str(price),
-                    executed_at.isoformat(),
-                ),
+                "UPDATE exec_fills SET declared_quantity=?, declared_state='DECLARED' "
+                "WHERE exec_id=?", (quantity, exec_id),
+            )
+        c.execute(
+            "UPDATE exec_orders SET filled_quantity=filled_quantity+?, updated_at=? "
+            "WHERE order_ref=?",
+            (quantity, at.isoformat(), order.order_ref),
+        )
+        pos = c.execute(
+            "SELECT * FROM exec_positions WHERE idea_id=?", (order.idea_id,)
+        ).fetchone()
+        if pos is None:
+            raise RuntimeError(f"fill for unknown idea {order.idea_id}")
+        qty = pos["quantity"]
+        avg = Decimal(pos["avg_price"]) if pos["avg_price"] else None
+        excess = 0
+        if order.role == Role.ENTRY:
+            new_qty = qty + quantity
+            avg = ((avg or Decimal(0)) * qty + price * quantity) / new_qty
+        else:
+            new_qty = qty - quantity
+            if new_qty < 0:
+                excess, new_qty = -new_qty, 0
+        status = "OPEN" if new_qty > 0 else ("REVERSED" if excess else "CLOSED")
+        if excess:
+            detail = (
+                f"{order.role.value} {order.side} {quantity} @ {price} ({exec_id}) against a "
+                f"follower position of {qty}: the account went through flat by {excess}. "
+                "New exposure in this instrument is blocked until a human resolves this."
+            )
+            c.execute(
+                "INSERT INTO exec_exceptions (at,kind,idea_id,order_ref,detail) "
+                "VALUES (?,?,?,?,?)",
+                (at.isoformat(), LEDGER_REVERSAL, order.idea_id, order.order_ref, detail),
+            )
+            self.log(
+                at,
+                LEDGER_REVERSAL,
+                order_ref=order.order_ref,
+                idea_id=order.idea_id,
+                c=c,
+                exec_id=exec_id,
+                fill_quantity=quantity,
+                ledger_before=qty,
+                excess=excess,
+            )
+        c.execute(
+            "UPDATE exec_positions SET quantity=?, avg_price=?, status=?, "
+            "protection='UNKNOWN', updated_at=? WHERE idea_id=?",
+            (
+                new_qty,
+                str(avg.quantize(Decimal("0.0001"))) if avg is not None else None,
+                status,
+                at.isoformat(),
+                order.idea_id,
+            ),
+        )
+        row = c.execute(
+            "SELECT * FROM exec_positions WHERE idea_id=?", (order.idea_id,)
+        ).fetchone()
+        return _row(LedgerPosition, row)
+
+    # ------------------------------------------------------------------ declared fills (F10)
+
+    def declared_fills(self, states=("DECLARED", "PARTIAL")) -> list[dict]:
+        marks = ",".join("?" * len(states))
+        with self.tx() as c:
+            rows = c.execute(
+                f"SELECT * FROM exec_fills WHERE declared_quantity IS NOT NULL "
+                f"AND declared_state IN ({marks}) ORDER BY rowid", tuple(states),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def declared_fill(self, order_ref: str) -> dict | None:
+        with self.tx() as c:
+            row = c.execute(
+                "SELECT * FROM exec_fills WHERE order_ref=? AND declared_quantity IS NOT NULL "
+                "ORDER BY rowid DESC", (order_ref,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def evidenced_fills(self, order_ref: str) -> list[dict]:
+        """The broker's own executions applied for ``order_ref`` (declared fills excluded)."""
+        with self.tx() as c:
+            rows = c.execute(
+                "SELECT * FROM exec_fills WHERE order_ref=? AND declared_quantity IS NULL "
+                "ORDER BY executed_at, rowid", (order_ref,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def set_declared_remainder(self, exec_id: str, remainder: int, state: str, at: datetime, *,
+                               declared_quantity: int | None = None,
+                               price: str | None = None) -> int:
+        """Replace (part of) a declared fill by broker evidence: its counted quantity becomes
+        ``remainder`` and the order row and the idea's position move by the difference; the
+        position's average is recomputed from the fills still counted. Returns the change."""
+        with self.tx() as c:
+            f = c.execute("SELECT * FROM exec_fills WHERE exec_id=?", (exec_id,)).fetchone()
+            delta = remainder - f["quantity"]
+            c.execute(
+                "UPDATE exec_fills SET quantity=?, declared_state=?, "
+                "declared_quantity=COALESCE(?, declared_quantity), price=COALESCE(?, price) "
+                "WHERE exec_id=?", (remainder, state, declared_quantity, price, exec_id),
             )
             c.execute(
                 "UPDATE exec_orders SET filled_quantity=filled_quantity+?, updated_at=? "
-                "WHERE order_ref=?",
-                (quantity, at.isoformat(), order.order_ref),
+                "WHERE order_ref=?", (delta, at.isoformat(), f["order_ref"]),
             )
             pos = c.execute(
-                "SELECT * FROM exec_positions WHERE idea_id=?", (order.idea_id,)
+                "SELECT quantity, status FROM exec_positions WHERE idea_id=?", (f["idea_id"],)
             ).fetchone()
-            if pos is None:
-                raise RuntimeError(f"fill for unknown idea {order.idea_id}")
-            qty = pos["quantity"]
-            avg = Decimal(pos["avg_price"]) if pos["avg_price"] else None
-            excess = 0
-            if order.role == Role.ENTRY:
-                new_qty = qty + quantity
-                avg = ((avg or Decimal(0)) * qty + price * quantity) / new_qty
-            else:
-                new_qty = qty - quantity
-                if new_qty < 0:
-                    excess, new_qty = -new_qty, 0
-            status = "OPEN" if new_qty > 0 else ("REVERSED" if excess else "CLOSED")
-            if excess:
-                detail = (
-                    f"{order.role.value} {order.side} {quantity} @ {price} ({exec_id}) against a "
-                    f"follower position of {qty}: the account went through flat by {excess}. "
-                    "New exposure in this instrument is blocked until a human resolves this."
-                )
-                c.execute(
-                    "INSERT INTO exec_exceptions (at,kind,idea_id,order_ref,detail) "
-                    "VALUES (?,?,?,?,?)",
-                    (at.isoformat(), LEDGER_REVERSAL, order.idea_id, order.order_ref, detail),
-                )
-                self.log(
-                    at,
-                    LEDGER_REVERSAL,
-                    order_ref=order.order_ref,
-                    idea_id=order.idea_id,
-                    c=c,
-                    exec_id=exec_id,
-                    fill_quantity=quantity,
-                    ledger_before=qty,
-                    excess=excess,
-                )
+            entries = c.execute(
+                "SELECT quantity, price FROM exec_fills WHERE idea_id=? AND role=? AND "
+                "quantity>0", (f["idea_id"], Role.ENTRY.value),
+            ).fetchall()
+            total = sum(r["quantity"] for r in entries)
+            avg = (sum(Decimal(r["price"]) * r["quantity"] for r in entries) / total
+                   if total else None)
+            qty = max(pos["quantity"] + delta, 0)
+            status = pos["status"] if qty > 0 or pos["status"] != "OPEN" else "CLOSED"
             c.execute(
-                "UPDATE exec_positions SET quantity=?, avg_price=?, status=?, "
-                "protection='UNKNOWN', updated_at=? WHERE idea_id=?",
-                (
-                    new_qty,
-                    str(avg.quantize(Decimal("0.0001"))) if avg is not None else None,
-                    status,
-                    at.isoformat(),
-                    order.idea_id,
-                ),
+                "UPDATE exec_positions SET quantity=?, avg_price=COALESCE(?, avg_price), "
+                "status=?, protection=CASE WHEN ?=0 THEN protection ELSE 'UNKNOWN' END, "
+                "updated_at=? WHERE idea_id=?",
+                (qty, str(avg.quantize(Decimal("0.0001"))) if avg is not None else None,
+                 "OPEN" if qty > 0 else status, delta, at.isoformat(), f["idea_id"]),
             )
-            row = c.execute(
-                "SELECT * FROM exec_positions WHERE idea_id=?", (order.idea_id,)
-            ).fetchone()
-        return _row(LedgerPosition, row)
+        return delta
 
     def insert_position(self, c: sqlite3.Connection, pos: LedgerPosition) -> None:
         d = pos.model_dump(mode="json")
@@ -528,7 +642,8 @@ class ExecutionStore:
         return [_row(LedgerPosition, r) for r in rows]
 
     def update_position(self, idea_id: str, at: datetime, **fields) -> None:
-        allowed = {"status", "stop_price", "target_price", "protection"}
+        allowed = {"status", "stop_price", "target_price", "protection", "backstop_price",
+                   "publisher_stop", "mapping_terms"}
         if not fields or set(fields) - allowed:
             raise ValueError(f"only {allowed} may be set directly; quantities change through fills")
         sets = ",".join(f"{k}=?" for k in fields)
@@ -629,3 +744,15 @@ class ExecutionStore:
             rows = c.execute("SELECT * FROM exec_exceptions ORDER BY id").fetchall()
         out = [ExceptionRecord.model_validate(dict(r)) for r in rows]
         return [e for e in out if not open_only or e.resolved_at is None]
+
+    def exception(self, exc_id: int) -> ExceptionRecord | None:
+        with self.tx() as c:
+            row = c.execute("SELECT * FROM exec_exceptions WHERE id=?", (exc_id,)).fetchone()
+        return ExceptionRecord.model_validate(dict(row)) if row else None
+
+    def resolve_exception_id(self, exc_id: int, at: datetime, c: sqlite3.Connection) -> bool:
+        """Resolve one open exception record (operator actions; inside the caller's transaction)."""
+        return c.execute(
+            "UPDATE exec_exceptions SET resolved_at=? WHERE id=? AND resolved_at IS NULL",
+            (at.isoformat(), exc_id),
+        ).rowcount == 1

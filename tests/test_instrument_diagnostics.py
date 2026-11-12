@@ -11,7 +11,7 @@ import json
 import re
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal, getcontext
 from pathlib import Path
 
@@ -43,7 +43,7 @@ REPO = Path(__file__).resolve().parents[1]
 FIXTURES = REPO / "fixtures" / "instrument_mapping_synthetic"
 SCRIPT = REPO / "scripts" / "inspect_instrument_mapping.py"
 SRC = REPO / "src"
-NOW = datetime(2026, 11, 6, 14, 30, tzinfo=timezone.utc)
+NOW = datetime(2026, 11, 6, 14, 30, tzinfo=UTC)
 
 
 def record(**overrides) -> MappingRecord:
@@ -438,7 +438,7 @@ def test_fixture_report_is_deterministic_and_matches_the_committed_golden():
     assert first == (FIXTURES / "expected_report.json").read_text(encoding="utf-8")
     report = json.loads(first)
     assert [r["record_id"] for r in report["records"]] == [r.record_id for r in records]
-    assert report["record_count"] == len(records) == 26
+    assert report["record_count"] == len(records) == 29
     assert report["rules_version"] == diag.RULES_VERSION
     assert sum(report["headlines"].values()) == len(records)
     assert sum(report["totals"].values()) == sum(len(r["findings"]) for r in report["records"])
@@ -551,7 +551,7 @@ def test_cli_text_summary_json_and_out(tmp_path):
     text = _cli("--examples")
     assert text.returncode == 0 and text.stdout.startswith("INSTRUMENT MAPPING DIAGNOSTIC") and "NON_AUTHORITATIVE" in text.stdout
     summary = _cli("--examples", "--summary")
-    assert summary.returncode == 0 and sum(line.startswith("[") for line in summary.stdout.splitlines()) == 26
+    assert summary.returncode == 0 and sum(line.startswith("[") for line in summary.stdout.splitlines()) == 29
     as_json = _cli("--examples", "--json")
     assert as_json.returncode == 0
     assert as_json.stdout == (FIXTURES / "expected_report.json").read_text(encoding="utf-8")

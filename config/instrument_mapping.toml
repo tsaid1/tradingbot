@@ -1,50 +1,128 @@
-# Source-series-to-broker-contract mapping policy (tradingbot.runtime.mapping).
+# Source-series-to-broker-contract mapping policy, version 2 (tradingbot.runtime.mapping).
+# See docs/MULTI_ASSET_MAPPING.md.
 #
-# Each [[mapping]] entry names the asset the publisher quotes (source_asset), the broker contract
-# an order would be placed in (broker_symbol, broker_asset_class, optional broker_exchange) and how
-# the publisher's price levels relate to that contract's price (basis):
+# One [[mapping]] entry per source asset family: the asset code the interpreter emits for what the
+# publisher named (an option family is "<UNDERLYING>.OPT"). Each entry states the reference series
+# the publisher's levels are quoted in, the execution instrument, exactly one price-basis
+# treatment, and the owner's approval:
 #
-#   DIRECT         levels are the traded instrument's own price            -> may execute
-#   INDEX_LEVEL    levels are index points, not the instrument's price     -> HOLD
-#   SPOT_LEVEL     levels are a spot rate or commodity price               -> HOLD
-#   FUTURES_LEVEL  levels are a futures contract's price                   -> HOLD
-#   PROXY          a related instrument with a different price             -> HOLD
-#   UNKNOWN        not established                                         -> HOLD
+#   DIRECT             levels are the execution instrument's own prices
+#   BASIS_SHIFT        levels are converted with the basis observed at the decision moment from
+#                      simultaneous live reference and execution quotes (capped, recorded)
+#   REFERENCE_TRIGGER  the entry is priced from the execution quote; stop and target are held as
+#                      broker-side conditions on the reference series
+#   UNSUPPORTED        always HOLD (documents why a family is held)
 #
-# Anything not listed here is also HELD with reason UNSUPPORTED_INSTRUMENT_MAPPING and never reaches
-# the broker. A DIRECT entry must use the same symbol on both sides. An index or spot level is never
-# interchangeable with an ETF or futures price: do not mark such a pair DIRECT.
+# An entry with approved = false never executes (HOLD, MAPPING_NOT_APPROVED). A family with no entry
+# is HELD with UNSUPPORTED_INSTRUMENT_MAPPING. An index, spot or futures level is never sent as the
+# price of another instrument. The version-1 vocabulary (INDEX_LEVEL, SPOT_LEVEL, FUTURES_LEVEL,
+# PROXY) is retired: such relationships are BASIS_SHIFT or REFERENCE_TRIGGER entries, approved per
+# family, or UNSUPPORTED. Loading fails closed: an unknown key, a missing required field, an
+# inconsistent combination or two entries for one family refuses to start.
+#
+# Two further rules are owner decisions per family and are OFF unless an approved entry says so
+# (see docs/MULTI_ASSET_MAPPING.md, "Entry rule" and "Level contract rule"):
+#
+#   entry_rule = "EXPLICIT_ENTRY_ONLY"   (default) only explicit execution language sets an entry
+#   entry_rule = "REFERENCE_AS_COLLAR"   a current open or add stating exactly one market level
+#                                        enters with a LIMIT at the live marketable price, the
+#                                        stated level an anchor bounded by [entry_anchor]
+#                                        max_adverse_move / max_favourable_move ("2.5" or "0.5%")
+#                                        and max_signal_age_seconds; all three required
+#   level_contract_rule = "EXPLICIT_MONTH_ONLY"  (default) a futures level needs a named month
+#   level_contract_rule = "FRONT_MONTH"  a DIRECT futures level with no month means the front
+#                                        contract of the entry's own list; HOLD in its roll window
 
-version = 1
+version = 2
 
 [[mapping]]
-source_asset = "TLT"
-broker_symbol = "TLT"
-broker_asset_class = "ETF"
+family = "TLT"
 basis = "DIRECT"
-note = "Publisher levels for TLT are quoted in the ETF's own share price."
+approved = true
+approved_by = "owner"
+approved_at = 2026-06-01T00:00:00Z
+note = "Publisher levels for TLT are quoted in the ETF's own share price. Version-1 behaviour."
+# entry_rule is not set: EXPLICIT_ENTRY_ONLY. A stated market level ("long here, TLT 88.40 now")
+# is a REFERENCE and the OPEN is held (OPEN_ENTRY_PRICE_MISSING) until the owner decides otherwise.
+reference = { sec_type = "STK", asset_class = "ETF", symbol = "TLT", exchange = "SMART", currency = "USD" }
+execution = { sec_type = "STK", asset_class = "ETF", symbol = "TLT", exchange = "SMART", currency = "USD" }
 
 # ------------------------------------------------------------------ templates (not active)
-# Uncomment only after the relationship has been reviewed. These bases never execute; listing them
-# documents why the asset is held.
+# EXAMPLES ONLY. Every symbol, exchange, multiplier, tick, date, hour and cap below is a placeholder
+# to show the shape of an entry, not a contract specification. Replace each value with the broker's
+# own contract details (verified against the paper account) before uncommenting, then set
+# approved = true with approved_by and approved_at only once the owner has reviewed the entry.
 #
+# --- an index family quoted in index points, executed in an index future, exits on the index
 # [[mapping]]
-# source_asset = "SPX"            # S&P 500 index points
-# broker_symbol = "SPY"
-# broker_asset_class = "ETF"
-# basis = "INDEX_LEVEL"
-# note = "Index points are not the ETF's price (ratio, dividends, tracking error)."
+# family = "SPX"                                   # the interpreter's code for the index
+# basis = "REFERENCE_TRIGGER"
+# approved = false
+# note = "EXAMPLE: index levels; entry priced from the future's quote; stop/target as conditions."
+# reference = { sec_type = "IND", symbol = "EXIDX", exchange = "EXAMPLE", currency = "USD" }
+# execution = { sec_type = "FUT", symbol = "EXFUT", exchange = "EXAMPLE", currency = "USD", multiplier = "5", min_tick = "0.25", size_increment = 1 }
+# contract_selection = { rule = "EXPLICIT_OR_NEAREST", min_business_days_to_roll = 6 }
+# contracts = [ { month = "202612", roll_date = 2026-12-10 }, { month = "202703", roll_date = 2027-03-11 } ]
+# sizing = { units_per_signal = 1, max_units = 2, max_notional = "50000" }
+# session = { policy = "REGULAR_ONLY", timezone = "America/New_York", days = ["MON", "TUE", "WED", "THU", "FRI"], regular = ["09:30-16:00"] }
+# roll = { business_days_before = 3, action = "FLATTEN" }
+# reference_trigger = { released_order_type = "MKT", reference_hours = ["09:30-16:00"], require_backstop = true }
+# basis_shift = { max_abs_basis = "40", max_age_seconds = 5, scale_ratio = "1" }   # prices the backstop stop
+# entry_rule = "REFERENCE_AS_COLLAR"               # owner decision: a stated index level anchors the entry
+# entry_anchor = { max_adverse_move = "10", max_favourable_move = "25", max_signal_age_seconds = 60, anchor_scope = "SENTENCE_STRICT" }   # index points
 #
+# --- an energy future quoted in its own contract month's price, executed in a micro contract
+# --- on the same underlying that trades at that same price (same_series asserts this)
 # [[mapping]]
-# source_asset = "GOLD"           # spot gold
-# broker_symbol = "GLD"
-# broker_asset_class = "ETF"
-# basis = "SPOT_LEVEL"
-# note = "Spot price per ounce is not the ETF's share price."
+# family = "WTI"
+# basis = "DIRECT"
+# approved = false
+# note = "EXAMPLE: the publisher quotes the named contract month itself."
+# same_series = true
+# same_series_reason = "EXAMPLE: the micro trades at the standard contract month's own price"
+# equivalent_roots = ["EXOIL", "EXMOIL"]   # same_series joins two futures of one underlying only
+# reference = { sec_type = "FUT", symbol = "EXOIL", exchange = "EXAMPLE", currency = "USD" }
+# execution = { sec_type = "FUT", symbol = "EXMOIL", exchange = "EXAMPLE", currency = "USD", multiplier = "100", min_tick = "0.01" }
+# contract_selection = { rule = "EXPLICIT_ONLY", min_business_days_to_roll = 6 }
+# contracts = [ { month = "202612", roll_date = 2026-11-16 }, { month = "202701", roll_date = 2026-12-15 } ]
+# sizing = { units_per_signal = 1, max_units = 2, max_notional = "20000" }
+# session = { policy = "EXTENDED", timezone = "America/New_York", days = ["MON", "TUE", "WED", "THU", "FRI"], regular = ["09:00-14:30"], extended = ["00:00-09:00", "14:30-17:00", "18:00-24:00"] }
+# roll = { business_days_before = 3, action = "FLATTEN", holidays = [2026-11-26] }
+# level_contract_rule = "FRONT_MONTH"              # owner decision: a level with no month is the front contract's
+# entry_rule = "REFERENCE_AS_COLLAR"               # owner decision: a stated level anchors the entry
+# entry_anchor = { max_adverse_move = "0.5%", max_favourable_move = "1.5%", max_signal_age_seconds = 60, anchor_scope = "SENTENCE_STRICT" }
 #
+# --- a metal quoted as spot and executed in a future
 # [[mapping]]
-# source_asset = "WTI"            # crude oil futures level
-# broker_symbol = "USO"
-# broker_asset_class = "ETF"
-# basis = "FUTURES_LEVEL"
-# note = "Front-month futures level is not the ETF's price (roll, contango)."
+# family = "GOLD"
+# basis = "BASIS_SHIFT"
+# approved = false
+# note = "EXAMPLE: spot levels converted with the observed spot-to-future basis."
+# reference = { sec_type = "CMDTY", symbol = "EXSPOT", exchange = "EXAMPLE", currency = "USD" }
+# execution = { sec_type = "FUT", symbol = "EXMTL", exchange = "EXAMPLE", currency = "USD", multiplier = "10", min_tick = "0.10" }
+# contract_selection = { rule = "EXPLICIT_OR_NEAREST", min_business_days_to_roll = 6 }
+# contracts = [ { month = "202612", roll_date = 2026-11-23 } ]
+# sizing = { units_per_signal = 1, max_units = 2, max_notional = "50000" }
+# session = { policy = "REGULAR_ONLY", timezone = "America/New_York", days = ["MON", "TUE", "WED", "THU", "FRI"], regular = ["08:20-13:30"] }
+# roll = { business_days_before = 3, action = "FLATTEN" }
+# basis_shift = { max_abs_basis = "30", max_age_seconds = 5, scale_ratio = "1" }
+#
+# --- another ETF, quoted in its own price, with its own sizing and session
+# [[mapping]]
+# family = "EXETF"
+# basis = "DIRECT"
+# approved = false
+# reference = { sec_type = "STK", asset_class = "ETF", symbol = "EXETF", exchange = "SMART", currency = "USD" }
+# execution = { sec_type = "STK", asset_class = "ETF", symbol = "EXETF", exchange = "SMART", currency = "USD" }
+# sizing = { units_per_signal = 10, max_units = 20, max_notional = "5000" }
+# session = { policy = "REGULAR_ONLY", timezone = "America/New_York", days = ["MON", "TUE", "WED", "THU", "FRI"], regular = ["09:30-16:00"] }
+#
+# --- a single-leg option: underlying, expiry (YYYY-MM-DD), strike and right must all be explicit
+# [[mapping]]
+# family = "EXUND.OPT"
+# basis = "DIRECT"                                 # the publisher quotes the option premium
+# approved = false
+# reference = { sec_type = "OPT", symbol = "EXUND", exchange = "SMART", currency = "USD" }
+# execution = { sec_type = "OPT", symbol = "EXUND", exchange = "SMART", currency = "USD", multiplier = "100", min_tick = "0.05" }
+# sizing = { units_per_signal = 1, max_units = 2, max_notional = "2000" }
+# session = { policy = "REGULAR_ONLY", timezone = "America/New_York", days = ["MON", "TUE", "WED", "THU", "FRI"], regular = ["09:30-16:00"] }

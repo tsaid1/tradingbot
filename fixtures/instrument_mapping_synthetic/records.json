@@ -240,6 +240,35 @@
       "description": "A source series with nothing to map to.",
       "source": {"symbol": "SPX", "kind": "INDEX", "currency": "USD", "unit": "INDEX_POINT", "quoted_level": "6000.00"},
       "price_basis": "SOURCE_SERIES"
+    },
+    {
+      "record_id": "cmdty_spot_quoted_complete",
+      "synthetic": true,
+      "description": "A synthetic spot commodity quoted on itself: complete, undated, held without an approved mapping.",
+      "as_of": "2026-11-06",
+      "source": {"symbol": "SYNSPOT", "kind": "SPOT", "currency": "USD", "unit": "USD_PER_UNIT", "quoted_level": "1850.20"},
+      "instrument": {"asset_class": "COMMODITY", "symbol": "SYNSPOT", "exchange": "SYNTH-SPOT"},
+      "price_basis": "TRADED_CONTRACT",
+      "contract": {"currency": "USD", "unit": "USD_PER_UNIT", "multiplier": "1", "tick_size": "0.01"}
+    },
+    {
+      "record_id": "cfd_quoted_complete",
+      "synthetic": true,
+      "description": "A synthetic CFD quoted on itself: complete, undated, held without an approved mapping.",
+      "as_of": "2026-11-06",
+      "source": {"symbol": "SYNCFD", "kind": "CFD", "currency": "USD", "unit": "INDEX_POINT", "quoted_level": "5010.0"},
+      "instrument": {"asset_class": "CFD", "symbol": "SYNCFD", "exchange": "SYNTH-CFD"},
+      "price_basis": "TRADED_CONTRACT",
+      "contract": {"currency": "USD", "unit": "INDEX_POINT", "multiplier": "1", "tick_size": "0.1"}
+    },
+    {
+      "record_id": "index_reference_only",
+      "synthetic": true,
+      "description": "A synthetic cash index as an instrument: a reference series, never orderable.",
+      "as_of": "2026-11-06",
+      "source": {"symbol": "SYNIDX", "kind": "INDEX", "currency": "USD", "unit": "INDEX_POINT", "quoted_level": "5010.0"},
+      "instrument": {"asset_class": "INDEX", "symbol": "SYNIDX", "exchange": "SYNTH-IDX"},
+      "price_basis": "SOURCE_SERIES"
     }
   ]
 }

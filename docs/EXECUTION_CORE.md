@@ -38,10 +38,10 @@ SourcePost -> PaperEventReplay.process  (gate_source, gate_action, atomic groups
     the gateway cannot see. Unreadable broker positions refuse the entry.
   * no open exception in the instrument of a blocking kind (`INSTRUMENT_BLOCKED_<KIND>`):
     `LEDGER_REVERSAL`, `ENTRY_REMAINDER_NOT_CANCELLED`, `UNPROTECTED_POSITION`,
-    `PROTECTION_UNVERIFIED`, `ENTRY_STATE_UNKNOWN`; and no entry or add of unknown outcome in the
-    instrument (`UNRESOLVED_ENTRY_IN_INSTRUMENT`).
-  * no open `BROKER_STATE_UNKNOWN` (see Broker reads below): OPEN and ADD refuse with
-    `BROKER_UNREADABLE`.
+    `PROTECTION_UNVERIFIED`, `ENTRY_STATE_UNKNOWN`, `OPERATOR_SETTLEMENT_UNVERIFIED`; and no entry
+    or add of unknown outcome in the instrument (`UNRESOLVED_ENTRY_IN_INSTRUMENT`).
+  * no open `BROKER_STATE_UNKNOWN` (see Broker reads below) or `BROKER_RECONNECT_PENDING` (the
+    runtime service's session policy): OPEN and ADD refuse with `BROKER_UNREADABLE`.
   * one net position per contract: an OPEN on the opposite side of an open or pending idea in the
     same contract is held by `BrokerEventReplay` (`HOLD`, `OPPOSITE_IDEA_IN_SAME_CONTRACT`) and
     refused by the coordinator. A publisher reversal is a CLOSE followed by an OPEN.
@@ -84,6 +84,25 @@ SourcePost -> PaperEventReplay.process  (gate_source, gate_action, atomic groups
   `UNPROTECTED_POSITION`. Either way the outcome is `EXCEPTION`, not `EXECUTED`, and new exposure
   in the instrument is blocked. `EXITING` means everything held is committed to working exits and
   no stop works beside them.
+* **Cover follows the broker's position, asymmetrically (review N1).** Upward, a protective
+  order is never placed or sized above what the broker shows held in the contract (each idea's
+  share of the broker's position on its side, less the working exits), so cover grows only once
+  the ledger and the broker both show it; when the positions cannot be read nothing is sized up.
+  Downward, cover is never reduced below the ledger, or cancelled, on a position read alone: only
+  as far as qualifying executions explain (review P1: exit side for the idea, in the contract,
+  not applied by the ledger, executed by the broker's own timestamp after the idea's last fill or
+  settlement, never attributed before, each attributed once to one idea and journaled
+  `EXECUTION_ATTRIBUTED`, and together capped at the ledger/broker gap), or to the lower position
+  once `exit_no_trace_lookups` consecutive successful reads spread over
+  `settle_seconds` all show it (a failed read restarts that run, and is never a quantity). Until
+  then the working order stays as it is. Whenever the broker's position differs from the ledger,
+  in either direction, `UNPROTECTED_POSITION` opens with `BROKER_POSITION_DIFFERS`, it is alerted,
+  and new exposure in the contract is blocked. A broker holding more than the ledger is covered
+  only for the ledger's quantity; the excess is reconciliation's unexplained `QUANTITY_MISMATCH` /
+  `UNEXPLAINED_BROKER_POSITION` (a stop the system invented for it would be an order no one
+  approved). The trade-off: an oversized stop risks a small reversal if it triggers before the
+  discrepancy is resolved; a missing stop risks an unbounded loss on what is really held; so cover
+  is reduced only on corroborated evidence, and an operator is alerted immediately in either case.
 * **Stop-outs (review F2).** Once a protective stop has filled for an idea, or the idea is closed,
   every working remainder of its entry and add orders is cancelled and the cancel confirmed
   (`ENTRY_REMAINDER_CANCELLED`). An unconfirmed cancel opens `ENTRY_REMAINDER_NOT_CANCELLED`, which
@@ -124,9 +143,14 @@ built, stop and target prices must be multiples of `min_tick` (`STOP_PRICE_OFF_T
 `TARGET_PRICE_OFF_TICK`) and quantities multiples of `size_increment` (`QUANTITY_OFF_INCREMENT`).
 Those are refused, never rounded, so a protective stop is never loosened. Only collar-bounded
 limits are snapped, always inside the collar: a buy limit down, a sell limit up. Sessions, rollover,
-margin and option chains are future asset policies and are not implemented. `BrokerPosition.avg_cost`
-is per unit, before the multiplier. The gateway still quotes by symbol and accepts stocks and ETFs
-only, so a future reaches the coordinator only in tests.
+margin and option chains are not implemented beyond what the multi-asset mapping states.
+`BrokerPosition.avg_cost` is per unit, before the multiplier. A future, option, CFD or spot
+commodity reaches the coordinator only through an approved version-2 mapping entry. The gateway
+then approves with an `ExecutionPlan`, and the coordinator follows it: units per signal, the entry
+level in execution prices, and stop and target in their own series. A REFERENCE_TRIGGER plan
+produces conditional exits (`OrderIntent.condition`) and an optional backstop (role `BACKSTOP`,
+ref `<entry>.BKS`). A follow-up executes only in its idea's own contract. See
+`docs/MULTI_ASSET_MAPPING.md`.
 
 ## Exit netting
 
@@ -251,6 +275,30 @@ Duplicate delivery of a post revision is stopped twice:
 
 `HALTED` and `REFUSED` intents are terminal. A redelivered post does not retry them.
 
+## Operator settlement
+
+`execution/settlement.py` lets a human end what the coordinator never ends by itself (an entry or
+add of unknown outcome, above all one beyond the lookup horizon). `settle_intent` declares one
+intent `NOT_AT_BROKER`, `CANCELLED` or `FILLED` (quantity, average price) after the operator
+checked the broker. Its own call only reads and records: it sends, amends and cancels nothing,
+not even protective upkeep, which the next normal sync does. It reads first
+(`sync(record_only=True)`), then refuses a declaration the broker
+contradicts (the order or its fills visible, a fill outside the limit, off tick or increment, or a
+resulting follower position the broker's cannot equal, allowing only for other intents of unknown
+outcome in the contract). A declared fill goes through `apply_fill` (`exec_id = OPERATOR:<request>`)
+so protection must then be confirmed at the broker like any fill. The settlement opens
+`OPERATOR_SETTLEMENT_UNVERIFIED`, a blocking kind that only `lift_verified_blocks` resolves, never
+in the call that records the settlement, after a full successful sync and a reconciliation with no
+blocking discrepancy in that contract. After `NOT_AT_BROKER` or `CANCELLED` it also needs the
+exit-resend evidence rule after the settlement (settle period, `exit_no_trace_lookups` no-trace
+lookups spread over it). Broker evidence for such an intent later opens
+`SETTLED_INTENT_CONTRADICTED` (blocking, a safety discrepancy in reconciliation, CLEAR-class;
+cleared only once the contradicting order is terminal at the broker and the contract reconciles
+clean).
+`clear_exception` (a `LEDGER_REVERSAL`, verified the same way) and `acknowledge_exception`
+(records that block nothing) complete the set; `operator_catalog.py` classes every exception kind.
+Every action, applied or refused, is journaled with its before and after state.
+
 ## Integration seam
 
 `PaperEventReplay._execute_group(...)` is the seam. It is a no-op in the base class and is called
@@ -342,5 +390,13 @@ should settle before answering. Entries are never resent after an unknown outcom
 the lookups described above. Fill `ContractRef.multiplier`, `min_tick` (IBKR `minTick`),
 `size_increment`, `expiry` (`lastTradeDateOrContractMonth`), `strike`, `right` and `con_id` from
 `reqContractDetails`, and report `BrokerPosition.avg_cost` per unit (IBKR multiplies it).
+
+Price conditions are optional (`broker.ConditionalOrders`). A broker that offers them implements
+`supports_price_conditions()` (True), `reference_quote(contract)` (a quote of an index, spot or
+other reference contract) and `modify_condition(order_ref, trigger_price=...)`. It also echoes
+`BrokerOrder.condition` on open orders. Without these, REFERENCE_TRIGGER entries are refused
+before submission, reference quotes read as UNAVAILABLE, and protection is never confirmed for such
+a position. `PriceCondition` maps to IBKR `PriceCondition` (conId, exchange, isMore, price) on an
+order whose type is the condition's `released_order_type`.
 
 Run the demonstration with `PYTHONPATH=src python scripts/run_mock_lifecycle.py`.

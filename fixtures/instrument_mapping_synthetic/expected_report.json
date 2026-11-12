@@ -4,12 +4,12 @@
     "AMBIGUOUS": 3,
     "INFO": 2,
     "INVALID": 3,
-    "MISMATCH": 11,
+    "MISMATCH": 14,
     "MISSING": 5,
     "UNSUPPORTED": 2
   },
   "notice": "Non-authoritative offline diagnostic over synthetic mapping records. It reports metadata gaps, ambiguities, mismatches and invalid economics only. It performs no price conversion, roll choice, source-to-contract selection, sizing, order construction or authorization. INFO findings are not trading permission; the deterministic gateway is unchanged and still decides every action.",
-  "record_count": 26,
+  "record_count": 29,
   "records": [
     {
       "asset_class": "EQUITY",
@@ -1060,6 +1060,126 @@
       "identity": "UNDETERMINED",
       "record_id": "no_instrument",
       "runtime_scope": "UNDETERMINED"
+    },
+    {
+      "asset_class": "COMMODITY",
+      "authority": "NON_AUTHORITATIVE",
+      "counts": {
+        "AMBIGUOUS": 0,
+        "INFO": 0,
+        "INVALID": 0,
+        "MISMATCH": 2,
+        "MISSING": 0,
+        "UNSUPPORTED": 1
+      },
+      "findings": [
+        {
+          "code": "PRICE_BASIS_CLAIM_CONFLICT",
+          "detail": "price_basis claims TRADED_CONTRACT but the source series kind is SPOT, which cannot be the price of an orderable contract.",
+          "field": "price_basis",
+          "kind": "MISMATCH"
+        },
+        {
+          "code": "SOURCE_KIND_NOT_ORDERABLE",
+          "detail": "Same label on both sides, but the source series kind is SPOT; such a series cannot be ordered as an instrument.",
+          "field": "source.kind",
+          "kind": "MISMATCH"
+        },
+        {
+          "code": "RUNTIME_ASSET_CLASS_UNSUPPORTED",
+          "detail": "COMMODITY cannot be acted on by the current paper adapter: the gateway holds it as ASSET_CLASS_PAPER_ADAPTER_UNSUPPORTED however complete the contract metadata is.",
+          "field": "instrument.asset_class",
+          "kind": "UNSUPPORTED"
+        }
+      ],
+      "headline": "MISMATCH",
+      "identity": "DIRECT",
+      "record_id": "cmdty_spot_quoted_complete",
+      "runtime_scope": "ASSET_CLASS_UNSUPPORTED_IN_CURRENT_RUNTIME"
+    },
+    {
+      "asset_class": "CFD",
+      "authority": "NON_AUTHORITATIVE",
+      "counts": {
+        "AMBIGUOUS": 0,
+        "INFO": 0,
+        "INVALID": 0,
+        "MISMATCH": 2,
+        "MISSING": 0,
+        "UNSUPPORTED": 1
+      },
+      "findings": [
+        {
+          "code": "PRICE_BASIS_CLAIM_CONFLICT",
+          "detail": "price_basis claims TRADED_CONTRACT but the source series kind is CFD, which cannot be the price of an orderable contract.",
+          "field": "price_basis",
+          "kind": "MISMATCH"
+        },
+        {
+          "code": "SOURCE_KIND_NOT_ORDERABLE",
+          "detail": "Same label on both sides, but the source series kind is CFD; such a series cannot be ordered as an instrument.",
+          "field": "source.kind",
+          "kind": "MISMATCH"
+        },
+        {
+          "code": "RUNTIME_ASSET_CLASS_UNSUPPORTED",
+          "detail": "CFD cannot be acted on by the current paper adapter: the gateway holds it as ASSET_CLASS_PAPER_ADAPTER_UNSUPPORTED however complete the contract metadata is.",
+          "field": "instrument.asset_class",
+          "kind": "UNSUPPORTED"
+        }
+      ],
+      "headline": "MISMATCH",
+      "identity": "DIRECT",
+      "record_id": "cfd_quoted_complete",
+      "runtime_scope": "ASSET_CLASS_UNSUPPORTED_IN_CURRENT_RUNTIME"
+    },
+    {
+      "asset_class": "INDEX",
+      "authority": "NON_AUTHORITATIVE",
+      "counts": {
+        "AMBIGUOUS": 0,
+        "INFO": 0,
+        "INVALID": 0,
+        "MISMATCH": 2,
+        "MISSING": 1,
+        "UNSUPPORTED": 2
+      },
+      "findings": [
+        {
+          "code": "PRICE_BASIS_NOT_TRADED_CONTRACT",
+          "detail": "The quoted level is a source-series level, not the instrument's own price. No conversion is performed; the gateway holds such actions as SOURCE_TO_BROKER_PRICE_BASIS_UNRESOLVED.",
+          "field": "price_basis",
+          "kind": "MISMATCH"
+        },
+        {
+          "code": "SOURCE_KIND_NOT_ORDERABLE",
+          "detail": "Same label on both sides, but the source series kind is INDEX; such a series cannot be ordered as an instrument.",
+          "field": "source.kind",
+          "kind": "MISMATCH"
+        },
+        {
+          "code": "CONTRACT_SPEC_MISSING",
+          "detail": "No contract economics (currency, unit, multiplier, tick) are stated for the instrument.",
+          "field": "contract",
+          "kind": "MISSING"
+        },
+        {
+          "code": "INDEX_NOT_ORDERABLE",
+          "detail": "An index is a reference series: it can be quoted and used in a broker-side condition, never ordered.",
+          "field": "instrument.asset_class",
+          "kind": "UNSUPPORTED"
+        },
+        {
+          "code": "RUNTIME_ASSET_CLASS_UNSUPPORTED",
+          "detail": "INDEX cannot be acted on by the current paper adapter: the gateway holds it as ASSET_CLASS_PAPER_ADAPTER_UNSUPPORTED however complete the contract metadata is.",
+          "field": "instrument.asset_class",
+          "kind": "UNSUPPORTED"
+        }
+      ],
+      "headline": "MISMATCH",
+      "identity": "DIRECT",
+      "record_id": "index_reference_only",
+      "runtime_scope": "ASSET_CLASS_UNSUPPORTED_IN_CURRENT_RUNTIME"
     }
   ],
   "report_kind": "INSTRUMENT_MAPPING_DIAGNOSTIC",
@@ -1068,8 +1188,8 @@
     "AMBIGUOUS": 14,
     "INFO": 18,
     "INVALID": 9,
-    "MISMATCH": 24,
-    "MISSING": 20,
-    "UNSUPPORTED": 12
+    "MISMATCH": 30,
+    "MISSING": 21,
+    "UNSUPPORTED": 16
   }
 }

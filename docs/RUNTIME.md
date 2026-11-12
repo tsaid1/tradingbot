@@ -46,8 +46,11 @@ resolve against the config file.
   `max_submit_attempts`, `settle_seconds`, `exit_no_trace_lookups` (at least 3),
   `max_intent_age_seconds`, `max_exit_intent_age_seconds`, `lookup_horizon_seconds`,
   `confirm_attempts`, `confirm_wait_seconds`.
-* Optional: `[interpreter] lexicon_path`, `[notify] macos`, `[mock] account, quotes` (a static
-  simulated market).
+* Optional: `[interpreter] lexicon_path`, `[notify] channels, macos, realert_seconds,
+  alerts_file`, `[service] source_stall_after_seconds, activity_window_utc,
+  heartbeat_stale_after_seconds` (alerting only), `[service]
+  lockout_clear_requires_full_reconnect` (default `true`, see `docs/OPERATIONS.md`), `[mock]
+  account, quotes` (a static simulated market).
 
 ## Sources and the cursor
 
@@ -64,12 +67,17 @@ records its first-start time and never acts on a live post published before it
 
 ## Mapping policy
 
-`config/instrument_mapping.toml` names, per source asset, the broker contract and the price-basis
-relationship. Only `DIRECT` (levels quoted in the traded instrument's own price, same symbol)
-executes; one entry ships: TLT. Unmapped assets and every other basis (`INDEX_LEVEL`,
-`SPOT_LEVEL`, `FUTURES_LEVEL`, `PROXY`, `UNKNOWN`) get the ambiguity
-`UNSUPPORTED_INSTRUMENT_MAPPING`, so the gateway HOLDs them. An index or spot level is never treated
-as an ETF or futures price.
+`config/instrument_mapping.toml` (version 2) maps each source asset family to a reference series,
+an execution instrument and one price-basis treatment (`DIRECT`, `BASIS_SHIFT`,
+`REFERENCE_TRIGGER`, `UNSUPPORTED`), with an owner approval. Only an approved entry executes. One
+ships approved: TLT, quoted in its own price, with the version-1 behaviour unchanged. An unmapped
+family is held with `UNSUPPORTED_INSTRUMENT_MAPPING`, an unapproved one with `MAPPING_NOT_APPROVED`,
+and an unselectable contract with `CONTRACT_SELECTION_AMBIGUOUS`, `CONTRACT_MONTH_UNRECOGNISED`,
+`OPTION_TERMS_INCOMPLETE` or `OPTION_STRATEGY_NOT_SINGLE_LEG`. Approval governs new exposure only:
+an open idea whose family loses approval can still be reduced, closed and protected on the terms
+recorded when it was opened (`OPEN_UNDER_REVOKED_MAPPING` on the Execution page). An index or spot
+level is never sent as the price of another instrument. The Execution page lists each family's
+coverage. See `docs/MULTI_ASSET_MAPPING.md`.
 
 ## What is held, and why
 
@@ -90,9 +98,27 @@ the cursor. Unknown order outcomes are looked up again every cycle; an entry or 
 outcome is never resent (see `docs/EXECUTION_CORE.md`). While the halt file exists, nothing that could add exposure is
 submitted or amended, and posts are still journaled (`HALTED`). Working entry and add orders are
 cancelled, and protective orders are still resized to the position. A second service on the same
-state directory refuses to start: the execution store is locked. Notifications (log file, optional macOS): reconciliation discrepancy,
-unprotected position, halt engaged, repeated source or broker failure, stuck intent; each once per
-occurrence. Every publisher-driven REDUCE, CLOSE or MODIFY refused because the halt is engaged sends
+state directory refuses to start: the execution store is locked.
+
+**Alerts** (`runtime/alerts.py`): at the end of every cycle, also when the broker is down, the
+service derives every state that needs a human and alerts in that cycle: an entry of unknown
+outcome, an unprotected or unverified position, the broker unreadable, a reconciliation
+discrepancy, a reversal, a refused exit, every other open execution exception, the halt engaged or
+cleared, a revoked mapping with an open position, a roll due, repeated source or pipeline failure,
+a stalled cursor, a broker identity lockout. One alert per key; notified when it opens, again every
+`realert_seconds` while open, resolved when its cause is gone. Channels are registered by name
+(`log`, `alerts_file`, `macos`); a new one is a module in `tradingbot/runtime/channels/` and a
+config entry. `scripts/tb_watchdog.py` alerts on a stale heartbeat.
+
+**Broker session:** a failed probe marks the session lost (`BROKER_RECONNECT_PENDING` refuses
+every OPEN and ADD, protection becomes UNKNOWN). Reconnection is retried on the broker backoff and
+re-runs the adapter's identity checks; a session under another account locks the service out of
+the broker and engages the halt. The block lifts only after a full sync and a reconciliation with
+nothing unexplained; what changed meanwhile is adopted from broker evidence and reported
+(`BROKER_RECONNECTED`).
+
+**Operator actions** (`scripts/tb_operator.py`, dashboard page *Exceptions*) are queued and applied
+at the start of the next cycle; see `docs/OPERATIONS.md`. Every publisher-driven REDUCE, CLOSE or MODIFY refused because the halt is engaged sends
 `HALTED_ACTION_REFUSED` naming the idea, action and order ref (identifiers and reason codes only). Post text is never stored; the journal keeps hashes, identities, reason codes and
 timestamps for every stage (published, received, interpreted, gate decided, submitted,
 acknowledged, filled).

@@ -9,12 +9,23 @@ One cycle (``run_once``):
    source this cycle (a signal is never burned on a broker outage) and the broker backs off.
 3. Source poll. For each new post, in order: ``TklInterpreter.interpret`` ->
    ``group_linked_actions``
-   -> ``MappingPolicy.apply`` (unmapped or non-DIRECT assets are marked for HOLD) ->
+   -> ``MappingPolicy.apply`` (unmapped, unapproved or unresolved families are marked for HOLD;
+   a supported one gets its execution instrument) -> the broker's quotes (a ``MappedQuote`` with
+   both legs for a mapped family) ->
    ``BrokerEventReplay.process`` (``recover()`` first, then ``gate_source`` / ``gate_action`` and
    the ``ExecutionCoordinator``) -> ``interpreter.observe`` -> one journal transaction (signal,
    actions, held-signal exceptions, interpreter context) -> ``source.commit(post)``. A failure stops
    the cycle before the cursor moves past the failing post.
-4. Reconciliation (read-only), alerts and notifications, a broker snapshot and the heartbeat.
+4. Reconciliation (read-only), verification of operator settlements, alerts and notifications, a
+   broker snapshot and the heartbeat.
+
+Before step 3, queued operator requests are applied (``runtime.operator_apply``; they only record
+what a human established at the broker). Broker session policy (``docs/OPERATIONS.md``): any failed
+probe marks the session lost (BROKER_RECONNECT_PENDING blocks every OPEN and ADD, protection becomes
+UNKNOWN); reconnection is retried on the bounded broker backoff, re-running the adapter's identity
+checks; a session under another account identity locks the service out of the broker and engages
+the halt; otherwise a full sync and a reconciliation with nothing unexplained must succeed before
+the block lifts, and what changed at the broker meanwhile is reported.
 
 The service decides nothing itself. Every order comes from an action the gateway approved through
 the replay path; the mapping policy can only add a HOLD reason.
@@ -24,14 +35,36 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 
 from tradingbot.event_models import ParsedPost
-from tradingbot.execution.broker import Broker, BrokerError, QuoteQuality
+from tradingbot.execution import settlement
+from tradingbot.execution.broker import (
+    Broker,
+    BrokerError,
+    BrokerIdentityError,
+    ContractRef,
+    QuoteQuality,
+    broker_connected,
+    reference_quote,
+    session_identity,
+)
 from tradingbot.execution.coordinator import (
+    BROKER_RECONNECT_PENDING,
+    BROKER_STATE_UNKNOWN,
+    ENTRY_STATE_UNKNOWN,
+    EXIT_NOT_NETTED,
+    EXIT_WITHOUT_QUOTE,
+    OPERATOR_SETTLEMENT_UNVERIFIED,
     PROTECTION_UNVERIFIED,
+    SETTLED_INTENT_CONTRADICTED,
+    SETTLEMENT_DIFFERS_FROM_BROKER,
+    UNKNOWN_OUTCOME_BEYOND_LOOKUP_HORIZON,
+    UNKNOWN_OUTCOME_ENTRY_NOT_RESENT,
     ExecutionConfig,
     ExecutionCoordinator,
 )
@@ -40,29 +73,100 @@ from tradingbot.execution.coordinator import (
 )
 from tradingbot.execution.reconcile import DiscrepancyKind, ReconciliationReport
 from tradingbot.execution.replay import BrokerEventReplay
-from tradingbot.execution.store import UNRESOLVED_STATES
-from tradingbot.models import Action, Quote
+from tradingbot.execution.store import LEDGER_REVERSAL, UNRESOLVED_STATES
+from tradingbot.models import Action, Instrument, LegQuote, MappedQuote, Quote
 from tradingbot.runtime import notify as N
+from tradingbot.runtime.alerts import Alerter
 from tradingbot.runtime.config import RuntimeConfig
-from tradingbot.runtime.mapping import MappingDecision, MappingPolicy
+from tradingbot.runtime.mapping import (
+    AnchorLexicon,
+    FamilyMapping,
+    MappingDecision,
+    MappingPolicy,
+)
 from tradingbot.runtime.notify import Notifier
-from tradingbot.runtime.sources import SourceAdapter, SourceError
+from tradingbot.runtime.operator_actions import OperatorQueue, OperatorQueueUnavailable
+from tradingbot.runtime.operator_apply import (
+    CONNECTED,
+    DISCONNECTED,
+    LOCKED_OUT,
+    SESSION_KEY,
+    apply_pending,
+    session_state,
+)
+from tradingbot.runtime.sources import ReplayFileSource, SourceAdapter, SourceError
 from tradingbot.runtime.store import RuntimeStore, write_json_atomic
 from tradingbot.source_events import SourcePost
 from tradingbot.tkl_interpreter import LexiconExtension, TklInterpreter, group_linked_actions
+from tradingbot.validator import in_roll_window
 
 # Outcomes that mean "this signal was not traded as instructed": each becomes an exception record.
 HELD_STATUSES = frozenset(
     {"HOLD", "BLOCK", "REFUSED", "HALTED", "UNRESOLVED", "EXCEPTION", "REJECTED"}
 )
 COMPONENTS = ("source", "broker", "pipeline")
+# A follower position in a futures contract inside its configured roll window (multi-asset).
+ROLL_DUE = N.ROLL_DUE
+RESYNCING = "RESYNCING"
+# The alert kind each open execution exception raises (anything else: EXECUTION_EXCEPTION).
+EXCEPTION_ALERT_KIND = {
+    LEDGER_REVERSAL: N.REVERSAL,
+    EXIT_NOT_NETTED: N.EXIT_REFUSED,
+    EXIT_WITHOUT_QUOTE: N.EXIT_REFUSED,
+    UNKNOWN_OUTCOME_ENTRY_NOT_RESENT: N.ENTRY_UNKNOWN_OUTCOME,
+    UNKNOWN_OUTCOME_BEYOND_LOOKUP_HORIZON: N.ENTRY_UNKNOWN_OUTCOME,
+    ENTRY_STATE_UNKNOWN: N.ENTRY_UNKNOWN_OUTCOME,
+    OPERATOR_SETTLEMENT_UNVERIFIED: N.SETTLEMENT_UNVERIFIED,
+    SETTLED_INTENT_CONTRADICTED: N.SETTLEMENT_CONTRADICTED,
+    SETTLEMENT_DIFFERS_FROM_BROKER: N.SETTLEMENT_DIFFERS,
+}
+# Alerted under their own keys (unprotected position, broker state), not as EXC:<id>.
+SEPARATELY_ALERTED = frozenset(
+    {"UNPROTECTED_POSITION", PROTECTION_UNVERIFIED, BROKER_STATE_UNKNOWN, BROKER_RECONNECT_PENDING}
+)
+# Held signals of these kinds for an exit or amendment are alerted as refused exits.
+REFUSED_SIGNAL_KINDS = frozenset({"SIGNAL_REFUSED", "SIGNAL_REJECTED", "SIGNAL_HOLD", "SIGNAL_BLOCK"})
+# Journal events that describe something adopted from the broker after a reconnect.
+ADOPTED_EVENTS = frozenset(
+    {"FILL", "INTENT_FILLED", "INTENT_CANCELLED", "INTENT_REJECTED", "ADOPTED_FROM_BROKER",
+     "ENTRY_STATE_UNKNOWN", "ENTRY_REMAINDER_CANCELLED", "PROTECTIVE_CANCELLED", LEDGER_REVERSAL,
+     "UNPROTECTED_POSITION"}
+)
 # Bounds the arithmetic only; max_backoff_seconds still bounds the wait itself.
 MAX_BACKOFF_EXPONENT = 32
 FAILURE_KIND = {
     "source": N.SOURCE_FAILURE,
     "broker": N.BROKER_FAILURE,
-    "pipeline": "PIPELINE_FAILURE",
+    "pipeline": N.PIPELINE_FAILURE,
 }
+
+
+def execution_config(config: RuntimeConfig) -> ExecutionConfig:
+    """The coordinator's settings from the runtime config (service and operator CLI alike)."""
+    return ExecutionConfig(
+        halt_file=config.paths.halt_file,
+        expected_account=config.execution.expected_account,
+        max_submit_attempts=config.execution.max_submit_attempts,
+        stuck_after_seconds=config.service.stuck_after_seconds,
+        settle_seconds=config.execution.settle_seconds,
+        exit_no_trace_lookups=config.execution.exit_no_trace_lookups,
+        max_intent_age_seconds=config.execution.max_intent_age_seconds,
+        max_exit_intent_age_seconds=config.execution.max_exit_intent_age_seconds,
+        lookup_horizon_seconds=config.execution.lookup_horizon_seconds,
+        confirm_attempts=config.execution.confirm_attempts,
+        confirm_wait_seconds=config.execution.confirm_wait_seconds,
+    )
+
+
+def in_activity_window(window: str | None, now: datetime) -> bool:
+    """``HH:MM-HH:MM`` UTC, Monday to Friday; None means always."""
+    if window is None:
+        return True
+    if now.astimezone(UTC).weekday() >= 5:
+        return False
+    start, end = window.split("-")
+    hm = now.astimezone(UTC).strftime("%H:%M")
+    return start <= hm < end if start <= end else (hm >= start or hm < end)
 
 
 @dataclass
@@ -113,6 +217,16 @@ def _safe_error(exc: BaseException) -> str:
     return type(exc).__name__
 
 
+
+def load_lexicons(path) -> tuple[LexiconExtension, AnchorLexicon]:
+    """The private lexicon extension: the interpreter's patterns, and its optional
+    ``entry_anchor`` section (present-market markers and family aliases), which only the mapping
+    policy reads. The interpreter never sees that section."""
+    with open(path, encoding="utf-8") as f:
+        raw = json.load(f)
+    section = raw.pop("entry_anchor", None) or {}
+    return LexiconExtension.model_validate(raw), AnchorLexicon.model_validate(section)
+
 class RuntimeService:
     def __init__(
         self,
@@ -123,9 +237,13 @@ class RuntimeService:
         notifier: Notifier | None = None,
         clock: Callable[[], datetime] | None = None,
         store: RuntimeStore | None = None,
+        allow_what_if_mapping: bool = False,
     ):
         if config.mode != "mock":
             raise ValueError("only mock mode may run")
+        if allow_what_if_mapping and not isinstance(source, ReplayFileSource):
+            # A what-if mapping is an offline analysis aid: never with a live source.
+            raise ValueError("a what-if mapping may only be used with a replay-file source")
         self.config = config
         self.clock = clock or (lambda: datetime.now(UTC))
         self.source = source
@@ -133,31 +251,26 @@ class RuntimeService:
         self.notifier = notifier or N.LogFileNotifier(config.notification_log, self.clock)
         config.paths.state_dir.mkdir(parents=True, exist_ok=True)
         self.store = store or RuntimeStore(config.runtime_db)
-        self.mapping = MappingPolicy.from_toml(config.paths.mapping_file)
-        self.coordinator = ExecutionCoordinator(
-            broker,
-            config.execution_db,
-            config.policy,
-            ExecutionConfig(
-                halt_file=config.paths.halt_file,
-                expected_account=config.execution.expected_account,
-                max_submit_attempts=config.execution.max_submit_attempts,
-                stuck_after_seconds=config.service.stuck_after_seconds,
-                settle_seconds=config.execution.settle_seconds,
-                exit_no_trace_lookups=config.execution.exit_no_trace_lookups,
-                max_intent_age_seconds=config.execution.max_intent_age_seconds,
-                max_exit_intent_age_seconds=config.execution.max_exit_intent_age_seconds,
-                lookup_horizon_seconds=config.execution.lookup_horizon_seconds,
-                confirm_attempts=config.execution.confirm_attempts,
-                confirm_wait_seconds=config.execution.confirm_wait_seconds,
-            ),
+        self.mapping = MappingPolicy.from_toml(
+            config.paths.mapping_file, allow_what_if=allow_what_if_mapping
+        )
+        self.mapping.check_policy(config.policy)  # an anchored entry always has a stop
+        self.alerter = Alerter(
+            self.store, self.notifier, realert_seconds=config.notify.realert_seconds,
             clock=self.clock,
         )
+        self.coordinator = ExecutionCoordinator(
+            broker, config.execution_db, config.policy, execution_config(config), clock=self.clock
+        )
+        # Review F3: never created here; a missing or broken queue disables operator actions only.
+        self.queue: OperatorQueue | None = None
+        self.queue_problem: str | None = None
         try:
             self.replay = _StampingReplay(config.replay_db, self.coordinator, self.clock)
             lexicon = None
             if config.interpreter.lexicon_path is not None:
-                lexicon = LexiconExtension.from_json(config.interpreter.lexicon_path)
+                lexicon, self.mapping.anchor_lexicon = load_lexicons(
+                    config.interpreter.lexicon_path)
             self.interpreter = TklInterpreter(context=self.store.load_context(), lexicon=lexicon)
         except BaseException:
             self.coordinator.close()
@@ -167,6 +280,8 @@ class RuntimeService:
         self.cycles = int(self.store.get("cycles", 0) or 0)
         self.last_reconciliation: ReconciliationReport | None = None
         now = self.clock()
+        # This process opened its broker session no earlier than now (review N2).
+        self.started_at = now
         # Review F7: a live post published before the service first ever started is never acted on.
         first = self.store.get("first_start_at")
         if first is None:
@@ -179,6 +294,7 @@ class RuntimeService:
             source=source.name,
             cursor=source.cursor(),
             restart=self.cycles > 0,
+            what_if_mapping=self.mapping.what_if is not None,
         )
 
     # ================================================================== cycle
@@ -196,18 +312,30 @@ class RuntimeService:
         report = CycleReport(started_at=now)
         self.cycles += 1
         report.halted = self._check_halt(now)
+        if session_state(self.store)["state"] == LOCKED_OUT:
+            # Another account identity: no broker call at all (not even a cancel) until an
+            # operator clears the lockout against the expected account.
+            report.skipped = "identity_lockout"
+            self._apply_operator_requests(locked_out=True)
+            self._raise_alerts(self.clock(), report)
+            self._heartbeat(report)
+            return report
         broker_ok = False
         if not self.health["broker"].due(now):
             report.skipped = "broker_backoff"
         else:
             broker_ok = self._probe_broker(now)
             if not broker_ok:
-                report.skipped = "broker_unavailable"
+                locked = session_state(self.store)["state"] == LOCKED_OUT
+                report.skipped = "identity_lockout" if locked else "broker_unavailable"
         if broker_ok:
             broker_ok = self._recover(now)
             if not broker_ok:
                 report.skipped = "broker_unavailable"
+        if broker_ok and session_state(self.store)["state"] != CONNECTED:
+            self._complete_resync(now)
         if broker_ok:
+            self._apply_operator_requests()
             self._refresh_runtime_exceptions(now)
             if not (self.health["source"].due(now) and self.health["pipeline"].due(now)):
                 report.skipped = "source_backoff"
@@ -215,6 +343,10 @@ class RuntimeService:
                 self._poll_and_process(now, report)
             # Read-only; skipped while the broker is unreachable (the last report stays in view).
             self._reconcile(report)
+            settlement.lift_verified_blocks(self.coordinator)
+            self._check_roll_windows(now)
+        report.halted = self._check_halt(self.clock()) or report.halted
+        self._raise_alerts(self.clock(), report)
         self._heartbeat(report)
         return report
 
@@ -253,22 +385,45 @@ class RuntimeService:
     def _check_halt(self, now: datetime) -> bool:
         halted = self.halted
         if halted:
-            if self.store.open_alert("HALT", N.HALT_ENGAGED, str(self.config.paths.halt_file), now):
+            was_open = any(a["key"] == "HALT" for a in self.store.alerts(open_only=True))
+            self.alerter.raise_(
+                "HALT",
+                N.HALT_ENGAGED,
+                "Emergency halt engaged",
+                "Halt file present: no new order or amendment; working entries are "
+                "cancelled and protective orders still follow the position.",
+                now,
+            )
+            if not was_open:
                 self.store.event(now, "HALT_ENGAGED", halt_file=str(self.config.paths.halt_file))
-                self.notifier.notify(
-                    N.HALT_ENGAGED,
-                    "Emergency halt engaged",
-                    "Halt file present: no new order or amendment; working entries are "
-                    "cancelled and protective orders still follow the position.",
-                )
-        elif self.store.resolve_alerts(now, keep=set(), prefix="HALT"):
+        elif self.alerter.sweep("HALT", set(), now, cleared_kind=N.HALT_CLEARED,
+                                cleared_title="Emergency halt cleared"):
             self.store.event(now, "HALT_CLEARED")
         return halted
 
     def _probe_broker(self, now: datetime) -> bool:
         try:
+            if not broker_connected(self.broker):
+                reconnect = getattr(self.broker, "reconnect", None)
+                if not callable(reconnect):
+                    raise BrokerError("broker session is down")
+                self.store.event(now, "BROKER_RECONNECT_ATTEMPT",
+                                 after_failures=self.health["broker"].consecutive_failures)
+                reconnect()  # the adapter's own identity checks run again here
+            identity = session_identity(self.broker)
+        except BrokerIdentityError as exc:
+            self._lockout(now, "IDENTITY_CHECK_FAILED", _safe_error(exc))
+            return False
+        except Exception as exc:  # noqa: BLE001 - any broker fault is a broker failure
+            self._failure("broker", exc, now)
+            self._session_lost(now, exc)
+            return False
+        problem = self._identity_problem(identity, now)
+        if problem:
+            self._lockout(now, problem, f"session account {identity.get('account')}")
+            return False
+        try:
             # Every read the coordinator depends on (review F1), not only open orders.
-            self.broker.account_id()
             self.broker.open_orders()
             self.broker.executions()
             self.broker.completed_orders(since=now)
@@ -277,6 +432,7 @@ class RuntimeService:
                 self._publish_mock_quotes(now)
         except Exception as exc:  # noqa: BLE001 - any broker fault is a broker failure
             self._failure("broker", exc, now)
+            self._session_lost(now, exc)
             return False
         self._success("broker", now)
         return True
@@ -288,8 +444,200 @@ class RuntimeService:
             self.coordinator.recover()
         except Exception as exc:  # noqa: BLE001
             self._failure("broker", exc, now)
+            self._session_lost(now, exc)
             return False
         return True
+
+    # ================================================================== broker session
+
+    def _identity_problem(self, identity: dict[str, str], now: datetime) -> str | None:
+        """The session must be the configured account, and the same session identity as the last
+        one this service accepted (an operator lockout clear re-accepts it)."""
+        if identity.get("account") != self.config.execution.expected_account:
+            return "ACCOUNT_MISMATCH"
+        known = self.store.get("broker_identity")
+        if known is None:
+            self.store.put("broker_identity", identity, now)
+            return None
+        return None if known == identity else "SESSION_IDENTITY_CHANGED"
+
+    def _session_lost(self, now: datetime, exc: BaseException) -> None:
+        """The broker is unreadable: block new exposure until reconnect and resync complete."""
+        session = session_state(self.store)
+        if session["state"] == LOCKED_OUT:
+            return
+        if session["state"] in (CONNECTED, RESYNCING):
+            # Review F4: a loss during the resync is a new outage: reported, back to
+            # DISCONNECTED, and everything adopted since the last report is reported again on
+            # the next reconnect.
+            during = session["state"] == RESYNCING
+            mark = (
+                int(session.get("reported_through", session.get("journal_mark", 0)))
+                if during else max((e.seq for e in self.coordinator.store.journal()), default=0)
+            )
+            self.store.put(SESSION_KEY, {"state": DISCONNECTED, "since": now.isoformat(),
+                                         "journal_mark": mark, "reason": _safe_error(exc)}, now)
+            self.store.event(now, "BROKER_SESSION_LOST", error=_safe_error(exc),
+                             during_resync=during)
+        self.coordinator.store.raise_exception(
+            now, BROKER_RECONNECT_PENDING,
+            "broker session lost; every OPEN and ADD is refused until it is back, a full sync "
+            "succeeded and a reconciliation shows nothing unexplained",
+        )
+        self.coordinator.mark_broker_unreadable("probe", BrokerError(_safe_error(exc)))
+
+    def _complete_resync(self, now: datetime) -> None:
+        """After a reconnect (recover() has just completed a full sync): reconcile, report what
+        changed at the broker meanwhile, and lift the block only when nothing is unexplained."""
+        session = session_state(self.store)
+        rec = self.coordinator.reconcile(now)
+        if any(d.kind == DiscrepancyKind.BROKER_UNREADABLE for d in rec.discrepancies):
+            return
+        if not session.get("reported"):
+            changes = self._changes_since(int(session.get("journal_mark", 0)))
+            down = (now - datetime.fromisoformat(session["since"])).total_seconds() \
+                if session.get("since") else None
+            self.store.event(now, "BROKER_RECONNECTED", down_seconds=down, **changes)
+            self.alerter.event(
+                f"EVENT:RECONNECTED:{now.isoformat()}",
+                N.BROKER_RECONNECTED,
+                "Broker session restored",
+                f"down {down:.0f} s; adopted from broker evidence: "
+                f"{len(changes['fills'])} fill(s) {changes['fills']}, ended {changes['ended']}"
+                if down is not None else f"adopted: {changes}",
+                now,
+            )
+            session = {**session, "state": RESYNCING, "reported": True, "reported_through": max(
+                (e.seq for e in self.coordinator.store.journal()), default=0)}
+            self.store.put(SESSION_KEY, session, now)
+        unexplained = [d.kind.value for d in rec.unexplained]
+        if unexplained:
+            if session.get("waiting_on") != unexplained:
+                self.store.event(now, "BROKER_RESYNC_WAITING", unexplained=unexplained)
+                self.store.put(SESSION_KEY, {**session, "waiting_on": unexplained}, now)
+            return
+        self.coordinator.store.resolve_exceptions(now, BROKER_RECONNECT_PENDING, idea_id=None)
+        self.store.put(SESSION_KEY, {"state": CONNECTED, "since": now.isoformat()}, now)
+        self.store.event(now, "BROKER_RESYNCED", rule="full sync and reconciliation succeeded")
+
+    def _changes_since(self, mark: int) -> dict:
+        fills, ended = [], {}
+        for e in self.coordinator.store.journal():
+            if e.seq <= mark or e.event not in ADOPTED_EVENTS:
+                continue
+            if e.event == "FILL":
+                fills.append(f"{e.order_ref}:{e.detail.get('quantity')}")
+            elif e.event.startswith("INTENT_"):
+                ended[e.order_ref] = e.event.removeprefix("INTENT_")
+            elif e.order_ref:
+                ended.setdefault(e.order_ref, e.event)
+        return {"fills": fills, "ended": ended}
+
+    def _lockout(self, now: datetime, reason: str, detail: str) -> None:
+        """Another account identity (or a failed identity check): stop touching the broker, engage
+        the halt, block exposure, alert. Only an operator request clears it."""
+        session = session_state(self.store)
+        mark = session.get("journal_mark") or max(
+            (e.seq for e in self.coordinator.store.journal()), default=0
+        )
+        self.store.put(SESSION_KEY, {"state": LOCKED_OUT, "since": now.isoformat(),
+                                     "reason": reason, "journal_mark": mark}, now)
+        halt = self.config.paths.halt_file
+        if not halt.exists():
+            halt.parent.mkdir(parents=True, exist_ok=True)
+            halt.write_text(f"engaged by the service at {now.isoformat()}: {reason}\n")
+        self.coordinator.store.raise_exception(
+            now, BROKER_RECONNECT_PENDING, f"broker identity lockout: {reason}"
+        )
+        self.store.event(now, "BROKER_IDENTITY_LOCKOUT", reason=reason, detail=detail)
+        self._check_halt(now)
+
+    def _open_queue(self) -> OperatorQueue | None:
+        """The operator queue, or None with ``queue_problem`` set: QUEUE_NOT_INITIALISED (never
+        created), QUEUE_LOST (missing, or lacking a request the execution journal shows applied,
+        although the journal references requests from it)
+        or QUEUE_UNREADABLE (unreadable or corrupt). Never recreated here (review F3)."""
+        try:
+            if self.queue is not None:
+                self.queue.check()
+            else:
+                self.queue = OperatorQueue(self.config.operator_db)
+            # Review N3: a valid queue that lacks a request the execution journal shows applied
+            # (swapped for another file, an empty one above all) is treated as lost.
+            missing = self._journal_request_ids() - self.queue.known_uids()
+            if not missing:
+                return self.queue
+            self.queue = None
+            problem = "QUEUE_LOST"
+            if self.queue_problem != problem:
+                self.store.event(self.clock(), "OPERATOR_QUEUE_LACKS_APPLIED_REQUESTS",
+                                 missing=len(missing), path=str(self.config.operator_db))
+        except OperatorQueueUnavailable as exc:
+            self.queue = None
+            problem = exc.reason
+        except (sqlite3.DatabaseError, OSError):
+            self.queue = None
+            problem = "UNREADABLE"
+        if problem == "NOT_INITIALISED":
+            problem = "QUEUE_LOST" if self._journal_request_ids() else "QUEUE_NOT_INITIALISED"
+        elif problem != "QUEUE_LOST":
+            problem = "QUEUE_UNREADABLE"
+        self._queue_unavailable(problem)
+        return None
+
+    def _journal_request_ids(self) -> set[str]:
+        """The ids of every operator request the execution journal records a result for."""
+        return {
+            str(e.detail["request_id"]) for e in self.coordinator.store.journal()
+            if e.event.startswith("OPERATOR_") and e.detail.get("request_id")
+        }
+
+    def _queue_unavailable(self, problem: str) -> None:
+        now = self.clock()
+        if problem != self.queue_problem:
+            self.store.event(now, "OPERATOR_QUEUE_UNAVAILABLE", problem=problem,
+                             path=str(self.config.operator_db))
+        self.queue_problem = problem
+        self.queue = None
+        self.alerter.raise_(
+            "OPERATOR:QUEUE", N.OPERATOR_QUEUE_UNAVAILABLE, "Operator actions disabled",
+            f"{problem}: the operator queue {self.config.operator_db} is unusable, so no operator "
+            "request is applied; the trading loop, exits, protection upkeep and the heartbeat "
+            "keep running. " + (
+                "Run `scripts/tb_operator.py init` once." if problem == "QUEUE_NOT_INITIALISED"
+                else "Restore the queue file, or move the file aside and initialise a new one "
+                "with `scripts/tb_operator.py init --replace-lost` after checking the request "
+                "history."
+            ), now,
+        )
+
+    def _apply_operator_requests(self, *, locked_out: bool = False) -> None:
+        queue = self._open_queue()
+        if queue is None:
+            return
+        try:
+            results = apply_pending(
+                coordinator=self.coordinator, runtime_store=self.store, queue=queue,
+                expected_account=self.config.execution.expected_account, clock=self.clock,
+                locked_out=locked_out,
+                require_full_reconnect=self.config.service.lockout_clear_requires_full_reconnect,
+                session_opened_at=self.started_at,
+            )
+        except (OperatorQueueUnavailable, sqlite3.DatabaseError, OSError):
+            self._queue_unavailable("QUEUE_UNREADABLE")
+            return
+        if self.queue_problem is not None:
+            self.store.event(self.clock(), "OPERATOR_QUEUE_RESTORED", was=self.queue_problem)
+            self.queue_problem = None
+        self.alerter.sweep("OPERATOR:QUEUE", set(), self.clock())
+        for r in results:
+            self.alerter.event(
+                f"EVENT:OPERATOR:{r['uid']}",
+                N.OPERATOR_ACTION,
+                f"Operator {r['action']} {r['status']}",
+                f"request {r['request_id']} {r['action']} {r['target']} {r['outcome'] or ''}: "
+                f"{r['status']} {', '.join(r['reasons'])}".strip(),
+            )
 
     def _publish_mock_quotes(self, at: datetime) -> None:
         """Mock mode only: a static simulated market, republished so quotes stay fresh."""
@@ -301,6 +649,15 @@ class RuntimeService:
 
     def _poll_and_process(self, now: datetime, report: CycleReport) -> None:
         report.polled = True
+        before = self.source.cursor()
+        try:
+            self._poll_and_process_inner(now, report)
+        finally:
+            after = self.source.cursor()
+            if after != before or self.store.get("cursor_changed_at") is None:
+                self.store.put("cursor_changed_at", self.clock().isoformat(), self.clock())
+
+    def _poll_and_process_inner(self, now: datetime, report: CycleReport) -> None:
         try:
             posts = self.source.poll()
         except SourceError as exc:
@@ -358,10 +715,24 @@ class RuntimeService:
             self._publish_mock_quotes(decision_now)
         interpreted = self.interpreter.interpret(post)
         interpreted_at = self.clock()
-        mapped, decisions = self.mapping.apply(group_linked_actions(interpreted))
-        quotes = self._gate_quotes(mapped, decisions)
+        recorded = self._recorded_mappings()
+        mapped, decisions = self.mapping.apply(
+            group_linked_actions(interpreted),
+            clauses={c.action_id: c.clause for c in interpreted.classifications},
+            now=decision_now,
+            held=self._held_contracts(),
+            recorded=recorded,
+            post_text=post.text,  # an option must be one leg across the whole post
+            # The interpreter's price mentions per action, as (role, value): read only by an
+            # entry with entry_rule = REFERENCE_AS_COLLAR, for its entry anchor.
+            levels={c.action_id: [(m.role.value, m.value) for m in c.prices]
+                    for c in interpreted.classifications},
+        )
+        quotes = self._gate_quotes(mapped, decisions, decision_now, recorded)
         self.replay.gate_stamps = {}
-        result = self.replay.process(post.to_replay_source(), mapped, quotes, now=decision_now)
+        source = post.to_replay_source()
+        result = self.replay.process(source, mapped, quotes, now=decision_now)
+        self._record_idea_mappings(source.source_id, mapped, decisions)
         decided_at = self.clock()
         self.interpreter.observe(post, interpreted)
 
@@ -385,6 +756,7 @@ class RuntimeService:
                     "mapping_status": d.status if d else None,
                     "mapping_basis": d.basis if d else None,
                     "mapping_reason": d.reason if d else None,
+                    "mapping_family": d.family if d else None,
                     "broker_symbol": d.broker_symbol if d else None,
                     "status": o.status,
                     "reasons": _json(o.reasons),
@@ -447,15 +819,75 @@ class RuntimeService:
         )
         return len(exceptions), result.duplicate
 
+    def _held_contracts(self) -> dict[str, ContractRef]:
+        """Each open follower idea's contract: a follow-up acts on its own idea's contract."""
+        out = {}
+        for p in self.coordinator.ledger():
+            if p.contract and p.status in ("OPEN", "PENDING"):
+                out[p.idea_id] = ContractRef.model_validate_json(p.contract)
+        return out
+
+    def _recorded_mappings(self) -> dict[str, FamilyMapping]:
+        """The mapping entry each open idea was opened under (approval governs new exposure only:
+        its exits and protective amendments keep working if the family loses approval)."""
+        out = {}
+        for p in self.coordinator.ledger():
+            if p.mapping_terms and p.status in ("OPEN", "PENDING"):
+                try:
+                    out[p.idea_id] = FamilyMapping.model_validate_json(p.mapping_terms)
+                except ValueError:  # unreadable terms: the idea's exits HOLD as before
+                    continue
+        return out
+
+    def _record_idea_mappings(
+        self, source_id: str, parsed: ParsedPost, decisions: list[MappingDecision]
+    ) -> None:
+        """Record on each idea opened by this post the version-2 entry it was opened under."""
+        by_id = {a.action_id: a for a in parsed.actions}
+        store = self.coordinator.store
+        for d in decisions:
+            a = by_id.get(d.action_id)
+            entry = self.mapping.entries.get(d.family or "")
+            if d.status != "SUPPORTED" or a is None or a.action != Action.OPEN \
+                    or not isinstance(entry, FamilyMapping):
+                continue
+            idea_id = f"{source_id}:{a.action_id}"
+            pos = store.position(idea_id)
+            if pos is not None and pos.mapping_terms is None:
+                store.update_position(idea_id, self.clock(), mapping_terms=entry.model_dump_json())
+
     def _gate_quotes(
-        self, parsed: ParsedPost, decisions: list[MappingDecision]
+        self,
+        parsed: ParsedPost,
+        decisions: list[MappingDecision],
+        now: datetime | None = None,
+        recorded: dict[str, FamilyMapping] | None = None,
     ) -> dict[str, Quote]:
         """The broker's own quote for every instrument the mapping policy lets through. A missing or
-        unusable quote is simply absent; the gateway then blocks with QUOTE_UNAVAILABLE."""
-        supported = {d.action_id for d in decisions if d.status == "SUPPORTED"}
+        unusable quote is simply absent; the gateway then blocks with QUOTE_UNAVAILABLE. A mapped
+        family gets a ``MappedQuote``: its terms and both legs (the gateway decides on them)."""
+        now = now or self.clock()
+        supported = {d.action_id: d for d in decisions if d.status == "SUPPORTED"}
         quotes: dict[str, Quote] = {}
         for a in parsed.actions:
-            if a.action_id not in supported or a.instrument is None:
+            d = supported.get(a.action_id)
+            if d is None or a.instrument is None:
+                continue
+            if d.mapped:
+                key = a.instrument.quote_key
+                if key not in quotes:
+                    if d.under_revoked_mapping:  # the idea's own recorded terms, exits only
+                        entry, exits_only = (recorded or {})[a.idea_reference], True
+                    else:
+                        entry, exits_only = self.mapping.entries[d.family], False
+                    quotes[key] = self._mapped_quote(entry, a.instrument, now,
+                                                     exits_only=exits_only)
+                if d.entry_anchor is not None:
+                    # The anchor the mapping policy accepted for this action (REFERENCE_AS_COLLAR):
+                    # the gateway compares it with the live price in its own series.
+                    q = quotes[key]
+                    quotes[key] = q.model_copy(update={"entry_anchors": {
+                        **q.entry_anchors, a.action_id: Decimal(d.entry_anchor)}})
                 continue
             symbol = a.instrument.symbol
             if symbol in quotes:
@@ -468,6 +900,85 @@ class RuntimeService:
                 continue
             quotes[symbol] = Quote(symbol=symbol, bid=q.bid, ask=q.ask, observed_at=q.received_at)
         return quotes
+
+    def _mapped_quote(
+        self, entry: FamilyMapping, instrument, now: datetime, *, exits_only: bool = False
+    ) -> MappedQuote:
+        """Resolve the execution and reference contracts and read both quotes. Nothing is dropped:
+        a contract that does not resolve, a missing quote or a specification that differs from the
+        approved entry is carried in the terms, and the gateway holds on it."""
+        contract = reference = None
+        problems: list[str] = []
+        try:
+            contract = self.broker.resolve(instrument)
+        except BrokerError:
+            pass
+        ref_instrument = entry.reference_instrument()
+        if entry.basis in ("BASIS_SHIFT", "REFERENCE_TRIGGER") and ref_instrument is not None:
+            try:
+                reference = self.broker.resolve(ref_instrument)
+            except BrokerError:
+                pass
+        elif entry.basis == "DIRECT":
+            reference = contract
+        terms = entry.terms(instrument, contract, reference, problems, exits_only=exits_only)
+        bid = ask = None
+        quality, observed = QuoteQuality.UNAVAILABLE.value, now
+        if contract is not None:
+            try:
+                q = self.broker.quote(contract)
+                bid, ask, quality, observed = q.bid, q.ask, q.quality.value, q.received_at
+            except BrokerError:
+                pass
+        if bid is None or ask is None:
+            bid = ask = Decimal(0)
+            quality = QuoteQuality.UNAVAILABLE.value
+        leg = None
+        if reference is not None and entry.basis != "DIRECT":
+            rq = reference_quote(self.broker, reference, now)
+            leg = LegQuote(contract_key=reference.contract_key, bid=rq.bid, ask=rq.ask,
+                           last=rq.last, observed_at=rq.received_at, quality=rq.quality.value,
+                           # Freshness only from the series' own update time (None: HOLD).
+                           updated_at=rq.updated_at)
+        return MappedQuote(symbol=instrument.symbol, bid=bid, ask=ask, observed_at=observed,
+                           quality=quality, terms=terms, reference=leg)
+
+    def _check_roll_windows(self, now: datetime) -> None:
+        """A follower position in a contract inside its roll window is flagged (alert and
+        notification) for a human to flatten or roll by a new instruction. The service never
+        sends an order the gateway did not approve from a publisher action."""
+        keep: set[str] = set()
+        for p in self.coordinator.ledger():
+            if p.quantity <= 0 or not p.contract:
+                continue
+            contract = ContractRef.model_validate_json(p.contract)
+            entry = self.mapping.entry_for_contract(contract)
+            if entry is None and p.mapping_terms:  # a family that lost its entry: recorded terms
+                try:
+                    entry = FamilyMapping.model_validate_json(p.mapping_terms)
+                except ValueError:
+                    entry = None
+            if entry is None or entry.roll is None or not contract.expiry:
+                continue
+            month = contract.expiry[:6]
+            roll = next((c.roll_date for c in entry.contracts if c.month == month), None)
+            if roll is None:
+                continue
+            terms = entry.terms(
+                Instrument(asset_class=contract.asset_class, symbol=contract.symbol,
+                           futures_contract=month), contract, None)
+            if not in_roll_window(terms, now):
+                continue
+            key = f"ROLL:{p.idea_id}"
+            keep.add(key)
+            detail = (
+                f"{p.idea_id} holds {p.quantity} {contract.contract_key}; roll date {roll}, "
+                f"{entry.roll.business_days_before} business days before it the position must be "
+                "flattened (never held into a delivery window)"
+            )
+            if self.alerter.raise_(key, ROLL_DUE, "Contract inside its roll window", detail, now):
+                self.store.event(now, ROLL_DUE, idea_id=p.idea_id, contract=contract.contract_key)
+        self.alerter.sweep("ROLL:", keep, now)
 
     def _refresh_runtime_exceptions(self, now: datetime) -> None:
         """A signal held as UNRESOLVED is closed once its intent's outcome is known."""
@@ -499,28 +1010,15 @@ class RuntimeService:
                 DiscrepancyKind.INTENT_STUCK_UNRESOLVED: N.STUCK_INTENT,
                 DiscrepancyKind.POSITION_WITHOUT_PROTECTIVE_STOP: N.UNPROTECTED_POSITION,
             }.get(d.kind, N.RECONCILIATION_DISCREPANCY)
-            if self.store.open_alert(key, kind, d.detail, now):
-                self.notifier.notify(
-                    kind,
-                    d.kind.value.replace("_", " ").capitalize(),
-                    f"{d.symbol or '-'} idea {d.idea_id or '-'} ref {d.order_ref or '-'}: "
-                    f"{d.detail}",
-                )
+            self.alerter.raise_(
+                key,
+                kind,
+                d.kind.value.replace("_", " ").capitalize(),
+                f"{d.symbol or '-'} idea {d.idea_id or '-'} ref {d.order_ref or '-'}: {d.detail}",
+                now,
+            )
         if not unreadable:
-            self.store.resolve_alerts(now, keep=keep_recon, prefix="RECON:")
-        keep_unprot: set[str] = set()
-        for e in self.coordinator.store.exceptions(open_only=True):
-            if e.kind not in (EXEC_UNPROTECTED, PROTECTION_UNVERIFIED):
-                continue
-            key = f"UNPROTECTED:{e.idea_id}"
-            keep_unprot.add(key)
-            if self.store.open_alert(key, N.UNPROTECTED_POSITION, e.detail, now):
-                self.notifier.notify(
-                    N.UNPROTECTED_POSITION,
-                    "Position without confirmed stop",
-                    f"{e.idea_id}: {e.detail}",
-                )
-        self.store.resolve_alerts(now, keep=keep_unprot, prefix="UNPROTECTED:")
+            self.alerter.sweep("RECON:", keep_recon, now)
         snapshot: dict = {"at": now.isoformat(), "account": rec.account}
         if not unreadable:
             try:
@@ -545,16 +1043,140 @@ class RuntimeService:
             now,
         )
 
+    # ================================================================== alerts
+
+    def _raise_alerts(self, now: datetime, report: CycleReport) -> None:
+        """Every state that needs a human, derived from the stores at the end of every cycle (also
+        when the broker is down), so an alert goes out in the cycle that caused it. See
+        runtime/alerts.py for the de-duplication and re-alert rule."""
+        ex = self.coordinator.store
+        open_exc = ex.exceptions(open_only=True)
+        self.alerter.retry_undelivered(now)  # one-off events no channel accepted yet (note c)
+        # 1. Entries and adds of unknown outcome: at once, not after the settle or stuck period.
+        keep: set[str] = set()
+        unknown_refs = set()
+        for i in ex.intents(UNRESOLVED_STATES):
+            if i.action not in (Action.OPEN, Action.ADD):
+                continue
+            unknown_refs.add(i.order_ref)
+            key = f"UNKNOWN_ENTRY:{i.order_ref}"
+            keep.add(key)
+            self.alerter.raise_(
+                key, N.ENTRY_UNKNOWN_OUTCOME, "Entry of unknown outcome",
+                f"{i.action.value} ref {i.order_ref} idea {i.idea_id} {i.contract_key or i.symbol}"
+                f": {i.state.value}, {i.attempts} submission(s); never resent, new exposure in "
+                "this contract blocked; check the broker and settle it",
+                now,
+            )
+        self.alerter.sweep("UNKNOWN_ENTRY:", keep, now)
+        # 2. Unprotected or unverified positions.
+        keep = set()
+        for e in open_exc:
+            if e.kind not in (EXEC_UNPROTECTED, PROTECTION_UNVERIFIED):
+                continue
+            key = f"UNPROTECTED:{e.idea_id}"
+            keep.add(key)
+            self.alerter.raise_(key, N.UNPROTECTED_POSITION, "Position without confirmed stop",
+                                f"{e.idea_id}: {e.kind}: {e.detail}", now)
+        self.alerter.sweep("UNPROTECTED:", keep, now)
+        # 3. Every other open execution exception (reversal, refused exits, settlements, ...).
+        keep = set()
+        for e in open_exc:
+            if e.kind in SEPARATELY_ALERTED:
+                continue
+            kind = EXCEPTION_ALERT_KIND.get(e.kind, N.EXECUTION_EXCEPTION)
+            if kind == N.ENTRY_UNKNOWN_OUTCOME and e.order_ref in unknown_refs:
+                continue  # already alerted under UNKNOWN_ENTRY for the same intent
+            key = f"EXC:{e.id}"
+            keep.add(key)
+            self.alerter.raise_(key, kind, e.kind.replace("_", " ").capitalize(),
+                                f"exception {e.id} {e.kind} idea {e.idea_id or '-'} ref "
+                                f"{e.order_ref or '-'}: {e.detail[:300]}", now)
+        self.alerter.sweep("EXC:", keep, now)
+        # 4. Broker state unknown (a read failed inside the coordinator) or a session to resync.
+        #    While the probe itself fails, FAILURE:broker already says so (one alert, not three).
+        keep = set()
+        state = [e for e in open_exc if e.kind in (BROKER_STATE_UNKNOWN, BROKER_RECONNECT_PENDING)]
+        if state and self.health["broker"].consecutive_failures == 0:
+            keep.add("BROKER:STATE")
+            self.alerter.raise_(
+                "BROKER:STATE", N.BROKER_FAILURE, "Broker state not verified",
+                "; ".join(f"{e.kind}: {e.detail[:200]}" for e in state), now,
+            )
+        session = session_state(self.store)
+        if session["state"] == LOCKED_OUT:
+            keep.add("BROKER:IDENTITY")
+            self.alerter.raise_(
+                "BROKER:IDENTITY", N.BROKER_IDENTITY_MISMATCH, "Broker identity lockout",
+                f"{session.get('reason')}: the service no longer touches the broker and the halt "
+                "is engaged; clear the lockout once the expected account is connected", now,
+            )
+        self.alerter.sweep("BROKER:", keep, now)
+        # 5. Exits and amendments the gateway or the coordinator refused (halted ones are
+        #    notified at once as HALTED_ACTION_REFUSED).
+        keep = set()
+        for e in self.store.exceptions(open_only=True):
+            action = (e["detail"] or "").split(" ", 1)[0]
+            if e["kind"] in REFUSED_SIGNAL_KINDS and action in ("REDUCE", "CLOSE", "MODIFY"):
+                key = f"EXIT_REFUSED:{e['id']}"
+                keep.add(key)
+                self.alerter.raise_(
+                    key, N.EXIT_REFUSED, "Exit or amendment not executed",
+                    f"held signal {e['id']} {e['kind']} {action} source {e['source_id']} "
+                    f"r{e['revision']} {e['action_id']} ref {e['order_ref'] or '-'}: "
+                    f"{', '.join(e['reasons'])}", now,
+                )
+        self.alerter.sweep("EXIT_REFUSED:", keep, now)
+        # 6. Open positions whose family lost its approval (exits and protection only).
+        keep = set()
+        for p in self.coordinator.ledger():
+            if p.quantity <= 0 or not p.mapping_terms:
+                continue
+            try:
+                family = FamilyMapping.model_validate_json(p.mapping_terms).family
+            except ValueError:
+                family = None
+            entry = self.mapping.entries.get(family or "")
+            if family is not None and (entry is None or not entry.executable):
+                key = f"REVOKED:{p.idea_id}"
+                keep.add(key)
+                self.alerter.raise_(
+                    key, N.MAPPING_REVOKED_OPEN_POSITION, "Open position under a withdrawn mapping",
+                    f"{p.idea_id} holds {p.quantity} {p.contract_key}; family {family} is no "
+                    "longer approved: it can be reduced, closed and protected, never added to",
+                    now,
+                )
+        self.alerter.sweep("REVOKED:", keep, now)
+        # 7. The source cursor not advancing while the publisher is expected to post.
+        keep = set()
+        stall = self.config.service.source_stall_after_seconds
+        changed = self.store.get("cursor_changed_at")
+        if stall and changed and in_activity_window(self.config.service.activity_window_utc, now):
+            quiet = (now - datetime.fromisoformat(changed)).total_seconds()
+            if quiet >= stall:
+                keep.add("SOURCE:STALLED")
+                self.alerter.raise_(
+                    "SOURCE:STALLED", N.SOURCE_STALLED, "Source cursor not advancing",
+                    f"{self.source.name} cursor {self.source.cursor()} unchanged for {quiet:.0f} s "
+                    "inside the expected activity window", now,
+                )
+        self.alerter.sweep("SOURCE:", keep, now)
+
     def _heartbeat(self, report: CycleReport) -> None:
         now = self.clock()
         rec = self.last_reconciliation
+        session = session_state(self.store)
         payload = {
             "at": now.isoformat(),
             "mode": self.config.mode,
             "pid": os.getpid(),
             "cycle": self.cycles,
             "halted": report.halted,
+            "broker_session": {"state": session["state"], "since": session.get("since"),
+                               "reason": session.get("reason")},
             "halt_file": str(self.config.paths.halt_file),
+            "operator_queue": {"state": "UNAVAILABLE" if self.queue_problem else "AVAILABLE",
+                               "problem": self.queue_problem},
             "last_cycle": {
                 "started_at": report.started_at.isoformat(),
                 "skipped": report.skipped,
@@ -609,14 +1231,17 @@ class RuntimeService:
             consecutive=h.consecutive_failures,
             backoff_seconds=backoff,
         )
-        if h.consecutive_failures >= cfg.failure_alert_after:
-            kind = FAILURE_KIND[component]
-            if self.store.open_alert(f"FAILURE:{component}", kind, h.last_error, now):
-                self.notifier.notify(
-                    kind,
-                    f"Repeated {component} failure",
-                    f"{h.consecutive_failures} consecutive failures; last: {h.last_error}",
-                )
+        # An unreadable broker needs a human at once (exposure is blocked meanwhile); the source
+        # and the pipeline alert once they fail repeatedly.
+        threshold = 1 if component == "broker" else cfg.failure_alert_after
+        if h.consecutive_failures >= threshold:
+            self.alerter.raise_(
+                f"FAILURE:{component}",
+                FAILURE_KIND[component],
+                "Broker unreadable" if component == "broker" else f"Repeated {component} failure",
+                f"{h.consecutive_failures} consecutive failures; last: {h.last_error}",
+                now,
+            )
 
     def _success(self, component: str, now: datetime) -> None:
         h = self.health[component]
@@ -625,7 +1250,7 @@ class RuntimeService:
         h.consecutive_failures = 0
         h.next_attempt_at = None
         h.last_success_at = now.isoformat()
-        self.store.resolve_alerts(now, keep=set(), prefix=f"FAILURE:{component}")
+        self.alerter.sweep(f"FAILURE:{component}", set(), now)
 
 
 def _json(value) -> str:

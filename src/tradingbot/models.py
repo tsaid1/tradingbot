@@ -5,7 +5,7 @@ silently rounded by JSON float serialization.
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from enum import Enum
 from typing import Literal
@@ -31,6 +31,10 @@ class AssetClass(str, Enum):
     ETF = "ETF"
     OPTION = "OPTION"
     FUTURE = "FUTURE"
+    # Multi-asset mapping (runtime/mapping.py, version 2). Additive: a stock or ETF is unchanged.
+    CFD = "CFD"
+    COMMODITY = "COMMODITY"  # a spot commodity (IBKR secType CMDTY)
+    INDEX = "INDEX"  # a reference series only (IBKR secType IND): quoted, never ordered
 
 
 class PositionSide(str, Enum):
@@ -47,6 +51,18 @@ class Instrument(StrictModel):
     option_right: Literal["CALL", "PUT"] | None = None
     exchange: str | None = None
     futures_contract: str | None = None
+
+    @property
+    def quote_key(self) -> str:
+        """The key a gateway quote is filed under. A stock or ETF keeps its symbol (unchanged); a
+        derivative adds its contract month, expiry, strike and right, so two months of one future
+        (or two strikes of one option) never share a quote."""
+        if self.asset_class in (AssetClass.EQUITY, AssetClass.ETF):
+            return self.symbol
+        month = self.futures_contract or self.expiry or "-"
+        return ":".join(
+            (self.asset_class.value, self.symbol, month, self.strike or "-", self.option_right or "-")
+        )
 
 
 class SignalCandidate(StrictModel):
@@ -70,14 +86,14 @@ class SourceEvent(StrictModel):
     source_type: Literal["manual_demo", "public_feed", "protected_feed"] = "manual_demo"
     provider: str = "synthetic_test"
     text: str = Field(min_length=1, max_length=20000)
-    published_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    published_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
 class Quote(StrictModel):
     symbol: str
     bid: Decimal
     ask: Decimal
-    observed_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    observed_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
 class MockPolicy(StrictModel):
@@ -99,7 +115,7 @@ class MockPolicy(StrictModel):
         validation_alias=AliasChoices("max_price_deviation_pct", "max_deviation_pct"),
     )
     max_spread_pct: Decimal = Field(default=Decimal("1.0"), ge=0, le=100)
-    max_notional_usd: Decimal = Field(default=Decimal("2000"), gt=0)
+    max_notional_usd: Decimal = Field(default=Decimal(2000), gt=0)
     max_signal_age_seconds: int = Field(
         default=90, gt=0, validation_alias=AliasChoices("max_signal_age_seconds", "max_source_age_seconds"),
     )
@@ -116,14 +132,150 @@ class MockPolicy(StrictModel):
     allow_stop_widening: Literal[False] = False
 
 
+# ----------------------------------------------------------------------------- multi-asset mapping
+#
+# What the gateway needs to decide an action in a mapped family (runtime/mapping.py, version 2):
+# the owner-approved mapping terms, the selected execution contract and the broker's quotes of
+# both the execution instrument and the reference series. Built by the runtime from the mapping
+# file and broker reads, never by a model; handed to ``validator.gate_action`` as a ``MappedQuote``.
+
+BasisTreatment = Literal["DIRECT", "BASIS_SHIFT", "REFERENCE_TRIGGER", "UNSUPPORTED"]
+# How an OPEN or ADD gets its entry price (docs/MULTI_ASSET_MAPPING.md, "Entry rule"). The default,
+# EXPLICIT_ENTRY_ONLY, is the product decision of 5 Nov 2026: only explicit execution language sets
+# an entry. REFERENCE_AS_COLLAR, approved per family, lets a current instruction that states exactly
+# one market level enter at the live marketable price, with that level as a bounded anchor.
+EntryRule = Literal["EXPLICIT_ENTRY_ONLY", "REFERENCE_AS_COLLAR"]
+
+
+class LegQuote(StrictModel):
+    """One broker quote (execution instrument or reference series) as the broker reported it."""
+    contract_key: str
+    bid: Decimal | None = None
+    ask: Decimal | None = None
+    last: Decimal | None = None
+    observed_at: datetime
+    quality: str  # execution.broker.QuoteQuality value: LIVE | DELAYED | FROZEN | UNAVAILABLE
+    # When the series itself last updated: the broker's own stamp, or the receipt time at which
+    # the runtime saw the value change. None when neither is known: a reference leg then HOLDs.
+    updated_at: datetime | None = None
+
+
+class MarketTerms(StrictModel):
+    """One mapping entry's terms, frozen for one decision, with the selected contract's rules."""
+    family: str
+    approved: bool
+    basis: BasisTreatment
+    execution_symbol: str
+    execution_key: str  # Instrument.quote_key of the selected execution instrument
+    execution_contract_key: str | None = None  # ContractRef.contract_key, once resolved
+    asset_class: AssetClass
+    multiplier: Decimal = Field(default=Decimal(1), gt=0)
+    min_tick: Decimal = Field(default=Decimal("0.01"), gt=0)
+    size_increment: int = Field(default=1, ge=1)
+    units_per_signal: int = Field(ge=1)
+    max_units: int = Field(ge=1)
+    max_notional: Decimal = Field(gt=0)
+    allow_short: bool = True
+    # Session: weekdays (0 = Monday) and [start, end) minute windows in ``session_timezone``.
+    session_timezone: str = "UTC"
+    session_days: list[int] = Field(default_factory=lambda: [0, 1, 2, 3, 4])
+    permitted_windows: list[tuple[int, int]] = Field(default_factory=list)
+    # Roll: no new exposure within ``roll_business_days`` business days of ``roll_date``.
+    roll_date: date | None = None
+    roll_business_days: int | None = None
+    holidays: list[date] = Field(default_factory=list)
+    # Reference series and the basis rules (BASIS_SHIFT, and a REFERENCE_TRIGGER backstop).
+    reference_contract_key: str | None = None
+    reference_contract: str | None = None  # ContractRef JSON of the reference series
+    reference_windows: list[tuple[int, int]] = Field(default_factory=list)
+    max_abs_basis: Decimal | None = None
+    max_basis_age_seconds: float | None = None
+    require_backstop: bool = False
+    released_order_type: Literal["MKT"] = "MKT"
+    accepted_qualities: list[str] = Field(default_factory=lambda: ["LIVE"])
+    # The terms an idea was opened under, used after its family lost approval: exits and protective
+    # amendments only, never new exposure.
+    exits_only: bool = False
+    # DIRECT with same_series = true: the owner declared the reference series and the execution
+    # price one series, so levels tagged as source-series levels are execution prices.
+    same_series: bool = False
+    # The entry rule (additive). With REFERENCE_AS_COLLAR the three limits are set (from the
+    # approved entry; never defaulted): a move as "<decimal>" (the anchor's own price units) or
+    # "<decimal>%" (of the anchor), and the oldest source post the rule may act on.
+    entry_rule: EntryRule = "EXPLICIT_ENTRY_ONLY"
+    anchor_max_adverse_move: str | None = None
+    anchor_max_favourable_move: str | None = None
+    anchor_max_signal_age_seconds: float | None = None
+    # The anchor's own basis cap (additive), for a reference-series family with no basis_shift
+    # (max_abs_basis above is then None): execution prices, and the quotes' oldest age and skew.
+    anchor_max_abs_basis: Decimal | None = None
+    anchor_max_basis_age_seconds: float | None = None
+    # Problems found while building these terms (contract unresolved, specification differs).
+    problems: list[str] = Field(default_factory=list)
+
+
+class MappedQuote(Quote):
+    """The gateway quote for an action in a mapped family: the execution instrument's quote (bid
+    and ask are 0 when the broker had none; ``quality`` then says why), the reference series'
+    quote and the terms. Filed under ``Instrument.quote_key``."""
+    quality: str
+    terms: MarketTerms
+    reference: LegQuote | None = None
+    # REFERENCE_AS_COLLAR only (additive): the stated market level the mapping policy accepted as
+    # the entry anchor of each action of this post, by action id. Empty otherwise.
+    entry_anchors: dict[str, Decimal] = Field(default_factory=dict)
+
+
+class ExecutionPlan(StrictModel):
+    """What the gateway approved for a mapped action, in the series each price belongs to.
+
+    ``execution_reference`` is the entry level in execution prices (the collar centre the
+    execution core re-checks); ``stop`` and ``target`` are in ``protection_series``: EXECUTION
+    prices for DIRECT and BASIS_SHIFT, REFERENCE levels for REFERENCE_TRIGGER (held as broker-side
+    conditions). A BASIS_SHIFT conversion records the basis it used."""
+    family: str
+    basis: BasisTreatment
+    execution_key: str
+    quantity: int | None = None
+    entry_reference: Decimal | None = None
+    execution_reference: Decimal | None = None
+    stop: Decimal | None = None
+    target: Decimal | None = None
+    protection_series: Literal["EXECUTION", "REFERENCE"] = "EXECUTION"
+    reference_contract_key: str | None = None
+    reference_contract: str | None = None
+    backstop_stop: Decimal | None = None
+    basis_value: Decimal | None = None
+    basis_execution_mid: Decimal | None = None
+    basis_reference_mid: Decimal | None = None
+    basis_observed_at: datetime | None = None
+    publisher_stop: Decimal | None = None
+    publisher_target: Decimal | None = None
+    # An amendment that tightened the publisher's level but would have moved a broker-side
+    # protective level the loosening way keeps the working level instead; each kept level is
+    # recorded here ("BACKSTOP: computed 4980.00 looser than working 4995.00; kept 4995.00").
+    protective_levels_kept: list[str] = Field(default_factory=list)
+    # REFERENCE_AS_COLLAR (additive): the publisher's stated level (the anchor), the series it was
+    # compared in and the live price it was compared with, and the entry limit: the marketable
+    # side of the live execution quote, snapped to tick never past it. The execution core sends
+    # exactly this limit.
+    entry_rule: EntryRule = "EXPLICIT_ENTRY_ONLY"
+    entry_anchor: Decimal | None = None
+    anchor_series: Literal["EXECUTION", "REFERENCE"] | None = None
+    anchor_live: Decimal | None = None
+    entry_limit: Decimal | None = None
+
+
 class GateDecision(StrictModel):
     """Canonical output of the deterministic authorization gateway (validator.py).
 
     APPROVE never means an order exists; an engine must still apply a fictional fill.
     The Sprint 1 pipeline sees this translated to the legacy Decision vocabulary.
+    ``plan`` is set only on the approval of an action in a mapped family (multi-asset mapping).
     """
     status: Literal["APPROVE", "HOLD", "BLOCK", "NO_TRADE", "RECONCILE"]
     reasons: list[str] = Field(default_factory=list)
+    plan: ExecutionPlan | None = None
 
 
 class Decision(StrictModel):
@@ -140,6 +292,14 @@ class Position(StrictModel):
     # Protection levels known to the ledger (Sprint 1.1 ideas); None when the ledger does not track them.
     stop_price: str | None = None
     target_price: str | None = None
+    # The idea's broker contract identity (ContractRef.contract_key) when the ledger knows it, so
+    # two months of one future are never confused by a follow-up (multi-asset mapping).
+    contract_key: str | None = None
+    # Multi-asset mapping (additive). The working backstop stop (execution prices) beside a
+    # reference-triggered stop, and the publisher's own stop level when ``stop_price`` is a
+    # converted one (BASIS_SHIFT): an amendment is judged in both series.
+    backstop_price: str | None = None
+    publisher_stop: str | None = None
 
 
 class MockOrder(StrictModel):

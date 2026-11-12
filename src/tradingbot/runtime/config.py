@@ -69,6 +69,19 @@ class ServiceConfig(StrictModel):
     failure_alert_after: int = Field(default=3, ge=1, le=100)
     # Reconciliation reports an intent of unknown outcome older than this as stuck.
     stuck_after_seconds: int = Field(default=60, gt=0)
+    # Alerting only (never sizes or bounds an order), so optional. SOURCE_STALLED is raised when
+    # the source cursor has not advanced for this long inside the activity window (unset: off).
+    source_stall_after_seconds: float | None = Field(default=None, gt=0)
+    # "HH:MM-HH:MM" in UTC, Monday to Friday, when the publisher is expected to post; unset:
+    # always expected. Only used with source_stall_after_seconds.
+    activity_window_utc: str | None = Field(default=None, pattern=r"^\d{2}:\d{2}-\d{2}:\d{2}$")
+    # The watchdog reports the heartbeat stale after this long (unset: max(120, 10 x cadence)).
+    heartbeat_stale_after_seconds: float | None = Field(default=None, gt=0)
+    # Review N2. True (strict): an identity lockout is cleared only through a full reconnect of
+    # the session (the adapter's reconnect, or a session this process opened after the lockout
+    # began); an adapter that cannot reconnect stays locked out until the service is restarted.
+    # False also accepts an identity read alone, journaled IDENTITY_REREAD_ONLY.
+    lockout_clear_requires_full_reconnect: bool = True
 
 
 class InterpreterConfig(StrictModel):
@@ -78,7 +91,12 @@ class InterpreterConfig(StrictModel):
 
 class NotifyConfig(StrictModel):
     log_file: Path | None = None  # default: <state_dir>/notifications.log
+    alerts_file: Path | None = None  # default: <state_dir>/alerts.jsonl (the dashboard reads it)
+    # Registered channel names (runtime.notify); "macos = true" adds "macos" for compatibility.
+    channels: list[str] = Field(default_factory=lambda: ["log", "alerts_file"])
     macos: bool = False
+    # An alert still open is notified again this often (one condition never alerts every cycle).
+    realert_seconds: float = Field(default=3600.0, ge=60)
 
 
 class ExecutionSettings(StrictModel):
@@ -145,6 +163,19 @@ class RuntimeConfig(StrictModel):
     def notification_log(self) -> Path:
         return self.notify.log_file or self.paths.state_dir / "notifications.log"
 
+    @property
+    def alerts_file(self) -> Path:
+        return self.notify.alerts_file or self.paths.state_dir / "alerts.jsonl"
+
+    @property
+    def operator_db(self) -> Path:
+        return self.paths.state_dir / "operator.sqlite3"
+
+    @property
+    def heartbeat_stale_after(self) -> float:
+        explicit = self.service.heartbeat_stale_after_seconds
+        return explicit or max(120.0, 10 * self.service.cadence_seconds)
+
 
 REQUIRED_TABLES = ("paths", "source", "service", "policy", "execution")
 # Keys that must be present even where the model has a default; alternatives are accepted
@@ -203,7 +234,7 @@ def _resolve_paths(raw: dict, base: Path) -> None:
     fix(raw.get("paths"), "state_dir", "halt_file", "mapping_file")
     fix(raw.get("source"), "file", "token_file", "client_file")
     fix(raw.get("interpreter"), "lexicon_path")
-    fix(raw.get("notify"), "log_file")
+    fix(raw.get("notify"), "log_file", "alerts_file")
 
 
 def parse_config(raw: dict, *, base: Path) -> RuntimeConfig:

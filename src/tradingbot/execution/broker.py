@@ -132,11 +132,43 @@ class BrokerQuote(StrictModel):
     last: Decimal | None = None
     received_at: datetime
     quality: QuoteQuality
+    # The series' own last-update time when the broker supplies it (IBKR lastTimestamp); additive.
+    # A reference series' freshness is judged by it, never by ``received_at`` alone.
+    updated_at: datetime | None = None
+
+
+class ConditionDirection(str, Enum):
+    ABOVE = "ABOVE"  # released when the reference trades at or above the trigger
+    BELOW = "BELOW"  # released when the reference trades at or below the trigger
+
+
+class PriceCondition(StrictModel):
+    """A broker-side price condition on a REFERENCE series (IBKR PriceCondition: conId, exchange,
+    isMore, price). The order it is attached to is held at the broker and released, as
+    ``released_order_type`` in the order's own (execution) contract, once the reference's last
+    price crosses ``trigger_price``. Additive (multi-asset mapping): an order without a condition
+    behaves exactly as before. A broker that does not implement conditions must refuse such an
+    order; the execution core checks ``supports_price_conditions`` before sending one."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    contract: ContractRef
+    direction: ConditionDirection
+    trigger_price: Decimal = Field(gt=0)
+    released_order_type: OrderType = OrderType.MKT
+
+    def met(self, last: Decimal | None) -> bool:
+        if last is None:
+            return False
+        if self.direction == ConditionDirection.ABOVE:
+            return last >= self.trigger_price
+        return last <= self.trigger_price
 
 
 class OrderIntent(StrictModel):
     """One order as the caller wants it placed. ``order_ref`` is the idempotency key: the caller
-    derives it deterministically and the broker stores and echoes it (IBKR ``Order.orderRef``)."""
+    derives it deterministically and the broker stores and echoes it (IBKR ``Order.orderRef``).
+    ``condition`` (optional, additive) holds the order at the broker until a reference series
+    crosses a level; ``order_type`` must then equal the condition's ``released_order_type``."""
 
     order_ref: str = Field(min_length=1, max_length=64)
     contract: ContractRef
@@ -150,9 +182,12 @@ class OrderIntent(StrictModel):
     parent_ref: str | None = None
     # May only reduce an existing position, never open or reverse one.
     reduce_only: bool = False
+    condition: PriceCondition | None = None
 
     @model_validator(mode="after")
     def _prices_match_type(self):
+        if self.condition is not None and self.order_type != self.condition.released_order_type:
+            raise ValueError("a conditional order's type must be its condition's released type")
         if self.order_type == OrderType.LMT and (self.limit_price is None or self.limit_price <= 0):
             raise ValueError("LMT order needs a positive limit_price")
         if self.order_type == OrderType.STP and (self.stop_price is None or self.stop_price <= 0):
@@ -176,6 +211,8 @@ class BrokerOrder(StrictModel):
     stop_price: Decimal | None = None
     tif: TimeInForce = TimeInForce.DAY
     reduce_only: bool = False
+    # The broker-side price condition the order is held on, as the broker reports it (additive).
+    condition: PriceCondition | None = None
     status: OrderStatus
     filled_quantity: int = Field(default=0, ge=0)
     avg_fill_price: Decimal | None = None
@@ -228,6 +265,85 @@ class OrderNotFound(BrokerError):
     """No working order with that order_ref (it is unknown or already terminal)."""
 
 
+class BrokerDisconnected(BrokerError):
+    """The session to the broker is down (additive): nothing was sent or read. An adapter whose
+    connection can drop (a Trader Workstation restarts daily) raises this from every call."""
+
+
+class BrokerIdentityError(BrokerError):
+    """The adapter's own identity checks failed on (re)connection (additive): the session is not
+    the one it is configured for. The caller must treat the broker as unusable."""
+
+
+@runtime_checkable
+class ReconnectableBroker(Protocol):
+    """Optional session control (additive; kept out of ``Broker`` so an adapter without it still
+    satisfies the protocol). ``reconnect`` re-establishes the session and runs the adapter's own
+    identity checks again (account, paper session, server); it raises ``BrokerIdentityError`` when
+    they fail and ``BrokerError`` when the session cannot be re-established. ``session_identity``
+    describes the session with stable identifiers only (account, paper or live, never a client id,
+    time or credential): the runtime service locks itself out of a broker whose identity differs
+    from the last one it accepted."""
+
+    def connected(self) -> bool: ...
+
+    def reconnect(self) -> None: ...
+
+    def session_identity(self) -> dict[str, str]: ...
+
+
+def broker_connected(broker) -> bool:
+    """False only when the broker reports its session down; a broker without session control is
+    taken as connected (its reads then decide)."""
+    probe = getattr(broker, "connected", None)
+    try:
+        return bool(probe()) if callable(probe) else True
+    except BrokerError:
+        return False
+
+
+def session_identity(broker) -> dict[str, str]:
+    """The session's identity: the adapter's own description when it offers one, else the
+    account. Raises BrokerError when it cannot be read."""
+    get = getattr(broker, "session_identity", None)
+    if callable(get):
+        return {str(k): str(v) for k, v in get().items()}
+    return {"account": broker.account_id()}
+
+
+@runtime_checkable
+class ConditionalOrders(Protocol):
+    """Optional broker capabilities for REFERENCE_TRIGGER families (multi-asset mapping). Kept out
+    of ``Broker`` so an implementation without them still satisfies the protocol; the helpers
+    below give each one a safe default (no conditions, no reference quote)."""
+
+    def supports_price_conditions(self) -> bool: ...
+
+    def reference_quote(self, contract: ContractRef) -> BrokerQuote: ...
+
+    def modify_condition(self, order_ref: str, *, trigger_price: Decimal) -> BrokerOrder: ...
+
+
+def supports_price_conditions(broker) -> bool:
+    """True only when the broker says it places, reports and amends price conditions."""
+    probe = getattr(broker, "supports_price_conditions", None)
+    try:
+        return bool(probe()) if callable(probe) else False
+    except BrokerError:
+        return False
+
+
+def reference_quote(broker, contract: ContractRef, now: datetime) -> BrokerQuote:
+    """The broker's quote of a reference series; UNAVAILABLE when it cannot supply one."""
+    get = getattr(broker, "reference_quote", None)
+    if not callable(get):
+        return BrokerQuote(contract=contract, received_at=now, quality=QuoteQuality.UNAVAILABLE)
+    try:
+        return get(contract)
+    except BrokerError:
+        return BrokerQuote(contract=contract, received_at=now, quality=QuoteQuality.UNAVAILABLE)
+
+
 @runtime_checkable
 class Broker(Protocol):
     def account_id(self) -> str: ...
@@ -267,4 +383,7 @@ class Broker(Protocol):
         has left ``open_orders()``."""
         ...
 
-    def positions(self) -> list[BrokerPosition]: ...
+    def positions(self) -> list[BrokerPosition]:
+        """Every position on the account (IBKR reqPositions). A partial or still-loading read must
+        raise BrokerError, never return: an incomplete list would be taken as the account."""
+        ...
