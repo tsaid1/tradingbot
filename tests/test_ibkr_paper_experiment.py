@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import socket
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -44,6 +46,8 @@ def tws(monkeypatch):
     monkeypatch.setattr(X, "POLL_SECONDS", 0.05)
     monkeypatch.setattr(X, "FILL_TIMEOUT_SECONDS", 3.0)
     monkeypatch.setattr(X, "PROTECTION_SETTLE_SECONDS", 3.0)
+    monkeypatch.setattr(X, "POSITION_SETTLE_SECONDS", 2.0)
+    monkeypatch.setattr(X, "RECONCILE_SETTLE_SECONDS", 3.0)
     monkeypatch.setattr(X, "_wall_clock", lambda: MIDDAY)  # before the start cut-off
     return server
 
@@ -213,7 +217,7 @@ def test_an_unexpected_stage2_fill_keeps_the_stop_and_blocks_stage3(tws, cfg_pat
     tws.ask = 70.00  # invented: the "unfillable" limit (90% of the bid) is above the ask
     ev = run("stage2-unfillable-bracket", cfg_path)
     assert not ev["passed"] and ev["result"] == "STAGE2_UNEXPECTED_FILL"
-    assert "abort" in ev["why_failed"] and "by hand" in ev["why_failed"]
+    assert "abort" in ev["why_failed"] and X.TWS_SELL in ev["why_failed"]
     assert ev["held"]["quantity"] == "1" and ev["held"]["stop_working"] is True
     child = max(o.order_id for o in tws.orders.values())
     assert tws.orders[child].status == "Submitted"  # the protective stop was left working
@@ -243,7 +247,7 @@ def test_a_stage2_fill_whose_stop_the_broker_cancelled_reports_it_unprotected(tw
     assert ev["result"] == "STAGE2_UNEXPECTED_FILL" and not ev["passed"]
     assert ev["held"]["stop_working"] is False and ev["held"]["stop_status"] == "Cancelled"
     assert "NOT working" in ev["why_failed"] and "UNPROTECTED" in ev["why_failed"]
-    assert "left working" not in ev["why_failed"] and "is working" not in ev["why_failed"]
+    assert "is NOT working" in ev["why_failed"] and "is working (" not in ev["why_failed"]
     assert tws.count("CANCEL_ORDER") == 0  # the stage itself cancelled nothing
     with pytest.raises(X.StageRefused):
         X.run_stage("stage3-lifecycle", cfg_path)
@@ -322,7 +326,7 @@ def test_a_stage2_stop_that_is_not_submitted_is_never_reported_working(tws, cfg_
     ev = run("stage2-unfillable-bracket", cfg_path)
     assert ev["result"] == "STAGE2_UNEXPECTED_FILL"
     assert ev["held"]["stop_working"] is False and ev["held"]["stop_status"] == child_status
-    assert "NOT working" in ev["why_failed"] and "Do NOT run abort first" not in ev["why_failed"]
+    assert "NOT working" in ev["why_failed"] and "is working (" not in ev["why_failed"]
 
 
 def _to_stage3(tws, cfg_path):
@@ -351,9 +355,9 @@ def test_a_refused_close_is_reported_refused_and_never_says_abort_first(tws, cfg
     assert "REFUSED" in ev["why_failed"] and "did not fill" not in ev["why_failed"]
     assert "EXIT_WITHOUT_QUOTE" in ev["why_failed"]
     assert ev["state"]["stop_working"] is True and ev["state"]["held"] == "1"
-    assert "close by hand first, then run abort" in ev["why_failed"]
+    assert X.TWS_PROCEDURE in ev["why_failed"]
     assert "run abort, then" not in ev["why_failed"]
-    assert "Do NOT run abort first" in ev["why_failed"]
+    assert "Never run abort while TWS shows 1 and a working stop" in ev["why_failed"]
     assert placed(tws) == 5  # the close was never sent
 
 
@@ -373,7 +377,7 @@ def test_a_position_read_that_keeps_lagging_says_what_is_known(tws, cfg_path):
     ev = run("stage3-lifecycle", cfg_path)
     assert not ev["passed"] and ev["result"] == "STAGE3_PROTECTION_UNCONFIRMED"
     assert ev["state"]["stop_working"] is True
-    assert "close by hand first, then run abort" in ev["why_failed"]
+    assert X.TWS_PROCEDURE in ev["why_failed"]
     assert placed(tws) == 4  # the bracket only: no raise, no close
     assert tws.count("CANCEL_ORDER") == 1  # stage 2's parent cancel only: nothing new
 
@@ -393,6 +397,9 @@ def test_stages_that_place_refuse_to_start_after_the_cut_off(tws, cfg_path, monk
     assert not ev["passed"] and "15:00" in ev["why_failed"]
     assert tws.names() == names and placed(tws) == frames  # refused before connecting
     monkeypatch.setattr(X, "_wall_clock", lambda: datetime(2026, 7, 1, 18, 59, tzinfo=UTC))
+    from _ibkr_fake_tws_orders import all_day_hours
+    july = datetime(2026, 7, 1, 18, 59, tzinfo=UTC)
+    tws.liquid_hours = all_day_hours() + ";" + all_day_hours(july)  # both clocks inside
     assert run(stage, cfg_path)["passed"]  # 14:59 EDT: allowed
 
 
@@ -405,3 +412,171 @@ def test_stage1_reminds_to_run_the_full_suite_with_the_sdk(tws, cfg_path, capsys
     assert mod.main(["stage1-lookups", "--config", str(cfg_path)]) == 0
     out = capsys.readouterr().out
     assert "WITH the SDK" in out and "before stage 2" in out
+
+
+# --- final fix round after the review of fb0f645 -------------------------------------------------
+
+
+def _state(read, fills, *, stop=False, close=False, own=0, errors=()):
+    agree = read is not None and fills is not None and read == fills
+    return {"position_read": read, "own_fills": fills, "agree": agree,
+            "held": read if agree else None, "stop_working": stop,
+            "stop_status": "Submitted" if stop else None, "close_working": close,
+            "own_working": None if "orders" in errors else own, "read_errors": list(errors)}
+
+
+STATES = {
+    "held-stop": _state("1", "1", stop=True, own=1),
+    "held-stop-and-close": _state("1", "1", stop=True, close=True, own=2),
+    "held-close-no-stop": _state("1", "1", close=True, own=1),
+    "held-no-stop": _state("1", "1"),
+    "flat-working": _state("0", "0", own=2),
+    "flat-nothing": _state("0", "0"),
+    "read-1-fills-0": _state("1", "0"),  # the reviewer's probe: the close filled, the read lags
+    "read-0-fills-1-stop": _state("0", "1", stop=True, own=1),
+    "positions-unreadable": _state(None, None, stop=True, own=1, errors=("positions",)),
+    "orders-unreadable": _state("1", "1", errors=("orders",)),
+}
+
+
+def _assert_no_unconditional_sell(text: str) -> None:
+    assert "Only if it shows 1" in X.TWS_SELL and "If it shows 0: do NOT sell" in X.TWS_SELL
+    rest = text.replace(X.TWS_SELL, "").replace(X.NO_SELL_ON_NUMBERS, "")
+    assert not re.search(r"\bsell", rest, re.IGNORECASE), rest
+    assert "by hand" not in rest.lower(), rest
+
+
+@pytest.mark.parametrize("ending", sorted(X.ABNORMAL_ENDINGS))
+@pytest.mark.parametrize("name", sorted(STATES))
+def test_no_ending_prints_an_unconditional_sell_or_a_disputed_position_as_fact(ending, name):
+    state = STATES[name]
+    text = X._ending_message(ending, "invented cause", state)
+    assert text.startswith(ending)
+    _assert_no_unconditional_sell(text)
+    if not state["agree"]:
+        assert not re.search(r"\d+ TLT (is )?held", text), text
+        assert "do not sell on this script's numbers" in text
+    if state["position_read"] is not None and not state["agree"] and state["own_fills"]:
+        assert f"position read {state['position_read']}" in text
+        assert f"own fills {state['own_fills']}" in text and "disagree" in text
+
+
+def test_every_result_code_in_the_experiment_is_a_known_ending():
+    src = (ROOT / "src/tradingbot/ibkr_orders/experiment.py").read_text()
+    codes = set(re.findall(r'"(STAGE[23]_[A-Z_]+)"', src))
+    assert codes - {"STAGE2_PASSED", "STAGE3_PASSED"} <= X.ABNORMAL_ENDINGS
+    assert X.ABNORMAL_ENDINGS <= codes
+
+
+def _lag_the_close(tws, *, resolve_after: float | None):
+    from _ibkr_fake_tws_orders import FakeOrderTws
+
+    def place(s, conn, req):
+        o = req.order
+        if req.orderId not in s.orders and o.action == "SELL" and o.orderType == "LMT":
+            s.positions_lag = True  # the close fills; the position read still says 1
+            if resolve_after is not None:
+                threading.Timer(resolve_after, s.catch_up_positions).start()
+        FakeOrderTws.place(s, conn, req)
+
+    tws.on["PLACE_ORDER"] = place
+
+
+def test_a_close_filled_while_the_read_lags_passes_once_the_read_agrees(tws, cfg_path):
+    """N1, the reviewer's probe, the lag resolving inside the retry: flat, clean, PASS."""
+    _to_stage3(tws, cfg_path)
+    _lag_the_close(tws, resolve_after=1.0)
+    ev = run("stage3-lifecycle", cfg_path)
+    assert ev["passed"], ev
+    assert ev["result"] == "STAGE3_PASSED" and placed(tws) == 6
+
+
+def test_a_close_filled_while_the_read_keeps_lagging_never_says_sell(tws, cfg_path):
+    """N1, the lag not resolving: both numbers, 'they disagree', no sell on these numbers."""
+    _to_stage3(tws, cfg_path)
+    _lag_the_close(tws, resolve_after=None)
+    ev = run("stage3-lifecycle", cfg_path)
+    assert not ev["passed"] and ev["result"] == "STAGE3_NOT_CLEAN", ev
+    assert ev["state"]["position_read"] == "1" and ev["state"]["own_fills"] == "0"
+    text = ev["why_failed"]
+    assert "position read 1" in text and "own fills 0" in text and "disagree" in text
+    assert "do not sell on this script's numbers" in text
+    assert not re.search(r"\d+ TLT (is )?held", text)
+    _assert_no_unconditional_sell(text)
+    assert placed(tws) == 6
+
+
+def test_the_stage2_fill_endings_carry_only_the_tws_conditioned_sell(tws, cfg_path):
+    from _ibkr_fake_tws_orders import FakeOrderTws
+    stage0(tws, cfg_path)
+    run("stage1-lookups", cfg_path)
+    tws.autofill = True
+    tws.ask = 70.00
+
+    def place_then_broker_cancels_child(s, conn, req):
+        FakeOrderTws.place(s, conn, req)
+        fo = s.orders[req.orderId]
+        if fo.order.parentId and s.orders[fo.order.parentId].status == "Filled":
+            s._set(fo, "Cancelled")
+            conn.push(s._status(fo))
+
+    tws.on["PLACE_ORDER"] = place_then_broker_cancels_child
+    ev = run("stage2-unfillable-bracket", cfg_path)
+    assert ev["result"] == "STAGE2_UNEXPECTED_FILL"
+    _assert_no_unconditional_sell(ev["why_failed"])
+    assert X.TWS_SELL in ev["why_failed"]
+
+
+# --- S1: today's broker-reported liquid hours must last 60 more minutes ---------------------------
+def _contract(hours, tz="US/Eastern"):
+    return SimpleNamespace(liquid_hours=hours, time_zone_id=tz)
+
+
+@pytest.mark.parametrize(("now", "minutes"), [
+    (datetime(2026, 3, 9, 19, 30, tzinfo=UTC), 30),  # 15:30 EDT, the day after DST starts
+    (datetime(2026, 3, 6, 20, 30, tzinfo=UTC), 30),  # 15:30 EST, the Friday before
+    (datetime(2026, 11, 2, 20, 30, tzinfo=UTC), 30),  # 15:30 EST, the day after DST ends
+    (datetime(2026, 10, 30, 19, 30, tzinfo=UTC), 30),  # 15:30 EDT, the Friday before
+])
+def test_minutes_to_the_close_follow_daylight_saving(now, minutes):
+    d = now.astimezone(X.NEW_YORK).strftime("%Y%m%d")
+    assert X._minutes_to_close(_contract(f"{d}:0930-{d}:1600"), now) == minutes
+
+
+def test_a_half_day_refuses_a_start_less_than_an_hour_before_its_close():
+    half = _contract("20261127:0930-20261127:1300;20261130:0930-20261130:1600")
+    assert X.MIN_MINUTES_TO_CLOSE == 60
+    with pytest.raises(X.StageRefused, match="liquid hours"):
+        X._check_time_to_close(half, "stage3-lifecycle", datetime(2026, 11, 27, 17, 1, tzinfo=UTC))
+    X._check_time_to_close(half, "stage3-lifecycle", datetime(2026, 11, 27, 16, 59, tzinfo=UTC))
+
+
+def test_a_normal_day_allows_a_start_at_1459():
+    day = _contract("20261111:0930-20261111:1600")
+    X._check_time_to_close(day, "stage3-lifecycle", datetime(2026, 11, 11, 19, 59, tzinfo=UTC))
+
+
+@pytest.mark.parametrize("hours,tz", [("", "US/Eastern"), ("garbage", "US/Eastern"),
+                                      (None, "US/Eastern"), ("20261111:CLOSED", "US/Eastern"),
+                                      ("20261111:0930-20261111:1600", "Nowhere/Invented"),
+                                      ("20261112:0930-20261112:1600", "US/Eastern")])
+def test_unknown_or_missing_liquid_hours_refuse(hours, tz):
+    with pytest.raises(X.StageRefused):
+        X._check_time_to_close(_contract(hours, tz), "stage2-unfillable-bracket",
+                               datetime(2026, 11, 11, 17, 0, tzinfo=UTC))
+
+
+@pytest.mark.parametrize("stage", ["stage2-unfillable-bracket", "stage3-lifecycle"])
+def test_stages_check_the_brokers_liquid_hours_after_connecting(tws, cfg_path, monkeypatch,
+                                                                stage):
+    stage0(tws, cfg_path)
+    run("stage1-lookups", cfg_path)
+    if stage == "stage3-lifecycle":
+        assert run("stage2-unfillable-bracket", cfg_path)["passed"]
+        tws.autofill = True
+    tws.liquid_hours = "20261127:0930-20261127:1300"  # invented half day
+    monkeypatch.setattr(X, "_wall_clock", lambda: datetime(2026, 11, 27, 17, 1, tzinfo=UTC))
+    frames = placed(tws)
+    ev = run(stage, cfg_path)
+    assert not ev["passed"] and "liquid hours" in ev["why_failed"]
+    assert placed(tws) == frames
