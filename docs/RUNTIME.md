@@ -69,9 +69,12 @@ an execution instrument and one price-basis treatment (`DIRECT`, `BASIS_SHIFT`,
 `REFERENCE_TRIGGER`, `UNSUPPORTED`), with an owner approval. Only an approved entry executes. One
 ships approved: TLT, quoted in its own price, with the version-1 behaviour unchanged. An unmapped
 family is held with `UNSUPPORTED_INSTRUMENT_MAPPING`, an unapproved one with `MAPPING_NOT_APPROVED`,
-and an unselectable contract with `CONTRACT_SELECTION_AMBIGUOUS` or `OPTION_TERMS_INCOMPLETE`. An
-index or spot level is never sent as the price of another instrument. The Execution page lists each
-family's coverage. See `docs/MULTI_ASSET_MAPPING.md`.
+and an unselectable contract with `CONTRACT_SELECTION_AMBIGUOUS`, `CONTRACT_MONTH_UNRECOGNISED`,
+`OPTION_TERMS_INCOMPLETE` or `OPTION_STRATEGY_NOT_SINGLE_LEG`. Approval governs new exposure only:
+an open idea whose family loses approval can still be reduced, closed and protected on the terms
+recorded when it was opened (`OPEN_UNDER_REVOKED_MAPPING` on the Execution page). An index or spot
+level is never sent as the price of another instrument. The Execution page lists each family's
+coverage. See `docs/MULTI_ASSET_MAPPING.md`.
 
 ## What is held, and why
 
