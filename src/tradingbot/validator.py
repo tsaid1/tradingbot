@@ -622,6 +622,10 @@ def _mapped_follow_up(a: TradeAction, q: MappedQuote, policy: MockPolicy,
                 return _gate("HOLD", "REDUCTION_OFF_SIZE_INCREMENT")
         return _gate_plan(base, "PAPER_REDUCE_ONLY", f"MAPPING_{t.basis}")
     # The series the position's protection lives in, and the market it is compared against.
+    if reference_series and a.action == Action.ADD and not in_windows(
+            t.reference_windows, t.session_days, t.session_timezone, now):
+        # New exposure while the reference cannot trigger its exits, exactly as for an OPEN.
+        return _gate("HOLD", "REFERENCE_SERIES_NOT_UPDATING")
     if reference_series:
         held = _reference_leg(q, policy, now)
         if held:

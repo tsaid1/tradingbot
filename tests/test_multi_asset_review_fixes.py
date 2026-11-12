@@ -558,3 +558,18 @@ def test_f7_compact_strikes_count_towards_the_single_leg_rule(tmp_path):
         opening("QSTK"), clause="We are now long $QSTK 2026-09-18 105C 110C at 4.22.",
         now=MAP_NOW)
     assert d.status == "UNRESOLVED" and d.reason.startswith("OPTION_STRATEGY_NOT_SINGLE_LEG")
+
+
+# ================================================================== F8: reference hours on ADD
+
+def test_f8_a_reference_trigger_add_outside_reference_hours_holds():
+    """Reviewer probe P7b: an ADD at 13:10 (session open, index not yet updating) approved."""
+    from tradingbot.models import MockPolicy
+
+    t13 = NOW.replace(hour=13, minute=10)
+    t = terms("REFERENCE_TRIGGER", max_units=6, max_notional=Decimal(10**7))
+    q = mq(t, at=t13, reference=leg(at=t13))
+    g = gate(act(Action.ADD, idea="9:a1", entry="5010", stop=None, target=None), q,
+             position(qty=2, stop="4995"), now=t13,
+             policy=MockPolicy(max_notional_usd=Decimal(10**7)))
+    assert g.status == "HOLD" and g.reasons == ["REFERENCE_SERIES_NOT_UPDATING"]
