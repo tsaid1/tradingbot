@@ -24,7 +24,7 @@ import threading
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -122,6 +122,9 @@ ORDER_MODE_CLIENT_METHODS = ALLOWED_CLIENT_METHODS | frozenset({
 })
 # An earlier session's submission found in no lookup counts as possibly live for this long.
 JOURNAL_SETTLE_SECONDS = 120.0
+# The exit dry check judges the liquid-hours rule this far ahead: between a stop's cancel and the
+# close, the binding and the core each wait for a quote (up to the stream and quote timeouts).
+EXIT_HOURS_MARGIN_SECONDS = 60
 REQ_ID_BASE = 1_900_000_000  # request ids live above every order id, so error routing is exact
 
 # Order-proto fields this session sets itself; every other field must equal the SDK default.
@@ -701,12 +704,14 @@ class PaperOrderSession(IbkrSession):
                 return self._snap(t)
 
     def dry_check_exit(self, order_id: int, *, limit_price: Decimal | None) -> None:
-        """Before a protective SELL of this client is cancelled or shrunk for an exit: would the
-        closing SELL LMT at ``limit_price`` (the exit limit that is actually to be sent, never
-        the stop price) for what is held pass the guard once this order is gone? Same inputs as
-        at send time (fresh position, own fills, working orders without this one, the count, the
-        clock and hours). Raises ``OrderRefused`` if not, and when something is held but the exit
-        limit is unknown (``None``). Sends nothing, counts nothing."""
+        """Before a protective SELL of this client is cancelled or shrunk for an exit: would a
+        closing SELL LMT at ``limit_price`` for what is held pass the guard once this order is
+        gone? ``limit_price`` is the binding's own estimate of the core's exit limit, priced the
+        same way from a FRESH quote (``IbkrPaperBroker.exit_limit``), not the price the core
+        computed earlier and not the stop price. Same inputs as at send time (fresh position, own
+        fills, working orders without this one, the count), except that the liquid-hours rule is
+        judged at now + ``EXIT_HOURS_MARGIN_SECONDS``. Raises ``OrderRefused`` if not, and when
+        something is held but the limit is unknown (``None``). Sends nothing, counts nothing."""
         with self._order_lock:
             self._require_order_mode()
             with self._cond:
@@ -733,7 +738,10 @@ class PaperOrderSession(IbkrSession):
                 action="SELL", quantity=qty, order_type="LMT", limit_price=price,
                 stop_price=None, tif="DAY", outside_rth=False)
             rest = [w for w in working if w.order_id != order_id]
-            decision = self._evaluate(probe, facts, position, rest, 0)
+            # the hours rule at now + margin: the close must still be inside liquid hours
+            # when it is sent, after the cancel and the quotes in between
+            decision = self._evaluate(probe, facts, position, rest, 0,
+                                      ahead_seconds=EXIT_HOURS_MARGIN_SECONDS)
             if not decision:
                 raise OrderRefused(decision)
 
@@ -976,13 +984,13 @@ class PaperOrderSession(IbkrSession):
 
     def _evaluate(self, p: ProposedOrder, facts: ContractFacts,
                   position: tuple[Decimal | None, Decimal | None], working: list[WorkingOrder], still: int, *, parent: ProposedOrder | None = None,
-                  original: ProposedOrder | None = None) -> object:
+                  original: ProposedOrder | None = None, ahead_seconds: int = 0) -> object:
         return order_guard(p, GuardContext(
             caps=self._caps, submissions_used=self._counter.used,
             broker_submissions=self._broker_count, contract=facts,
             expected_account=self._cfg.account, position=position[0], working=tuple(working),
-            now=self._now(), implied_position=position[1], still_to_send=still, parent=parent,
-            original=original))
+            now=self._now() + timedelta(seconds=ahead_seconds), implied_position=position[1],
+            still_to_send=still, parent=parent, original=original))
 
     def _proto(self, p: ProposedOrder) -> PlaceOrderRequest:
         c = Contract()

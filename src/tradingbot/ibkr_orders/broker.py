@@ -163,9 +163,11 @@ class IbkrPaperBroker:
         return True
 
     def exit_limit(self) -> Decimal | None:
-        """The closing SELL limit the execution core would send now (``_exit_limit``): the bid
-        of a fresh quote less the collar, snapped UP to the min tick. None when it cannot be
-        priced (no collar, no quote, no positive bid)."""
+        """An ESTIMATE of the closing SELL limit the execution core will send: priced the way the
+        core's ``_exit_limit`` prices it (bid less the collar, snapped UP to the min tick), but
+        from a fresh quote taken now, so it can differ from the limit the core computed a moment
+        earlier and from the one finally sent. None when it cannot be priced (no collar, no
+        quote, no positive bid, a malformed quote)."""
         if self._exit_collar_pct is None:
             return None
         pinned = self._s.contract
@@ -233,16 +235,18 @@ class IbkrPaperBroker:
             report = self._s.quote(pinned)
         except IbkrError as exc:
             raise BrokerError(f"quote failed: {exc}") from exc
-        attempts = list(report.attempts)
-        best = next((a for a in reversed(attempts) if a.two_sided_valid), attempts[-1])
-        quality = QuoteQuality(best.quality.value)
 
         def dec(v: float | None) -> Decimal | None:
             return None if v is None else Decimal(str(v))
 
-        return BrokerQuote(contract=contract, bid=dec(best.bid), ask=dec(best.ask),
-                           last=dec(best.last), received_at=datetime.fromisoformat(
-                               best.received_at), quality=quality)
+        try:  # a malformed report (e.g. no attempt at all) is a failed read, never an escape
+            attempts = list(report.attempts)
+            best = next((a for a in reversed(attempts) if a.two_sided_valid), attempts[-1])
+            return BrokerQuote(contract=contract, bid=dec(best.bid), ask=dec(best.ask),
+                               last=dec(best.last), received_at=datetime.fromisoformat(
+                                   best.received_at), quality=QuoteQuality(best.quality.value))
+        except Exception as exc:  # mapped: nothing was sent or cancelled
+            raise BrokerError(f"quote unreadable: {type(exc).__name__}: {exc}") from exc
 
     def submit(self, order: OrderIntent, children: Sequence[OrderIntent] = ()) -> list[BrokerOrder]:
         if order.parent_ref is not None or any(c.parent_ref != order.order_ref for c in children):

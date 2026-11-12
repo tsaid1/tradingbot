@@ -1285,3 +1285,51 @@ def test_a_bracket_that_does_not_fit_the_remaining_budget_sends_nothing(tws, tmp
         assert s.submissions_used == 5 and placed(tws) == 5
     finally:
         s.disconnect()
+
+
+# --- fix round after the review of f272640 -------------------------------------------------------
+def test_the_exit_dry_check_needs_liquid_hours_a_minute_ahead(tws, tmp_path):
+    """SHOULD FIX 3: a cancel waits for a quote; the close must not land after the close of the
+    liquid hours. The dry check evaluates the hours at now + EXIT_HOURS_MARGIN_SECONDS."""
+    tws.liquid_hours = "20261111:0930-20261111:1600;20261112:0930-20261112:1600"
+    clock = [datetime(2026, 11, 11, 20, 0, tzinfo=UTC)]  # 15:00 ET (EST)
+    s = make(tws, tmp_path, clock=lambda: clock[0])
+    try:
+        assert order_session_module.EXIT_HOURS_MARGIN_SECONDS == 60
+        snaps = s.place([buy(), stop()])
+        tws.fill(snaps[0].order_id, 1, 88.11)
+        assert settle(lambda: s.positions() and s.positions()[0].quantity == 1)
+        clock[0] = datetime(2026, 11, 11, 20, 58, 30, tzinfo=UTC)  # 15:58:30: +60 s is inside
+        s.dry_check_exit(snaps[1].order_id, limit_price=D("87.22"))
+        clock[0] = datetime(2026, 11, 11, 20, 59, 30, tzinfo=UTC)  # 15:59:30: +60 s is outside
+        with pytest.raises(OrderRefused) as info:
+            s.dry_check_exit(snaps[1].order_id, limit_price=D("87.22"))
+        assert info.value.refusal.reason == RefusalReason.OUTSIDE_LIQUID_HOURS
+        b = IbkrPaperBroker(s, exit_collar_pct=D(1))
+        with pytest.raises(BrokerError, match="EXIT_WOULD_BE_REFUSED"):
+            b.cancel("TB-0001.STP")
+        assert tws.count("CANCEL_ORDER") == 0
+    finally:
+        s.disconnect()
+
+
+def test_a_malformed_quote_is_a_broker_error_and_cancels_no_held_stop(tws, tmp_path, monkeypatch):
+    """NOTE 6: a non-IbkrError from the quote (an empty attempt list) is mapped to BrokerError;
+    a held stop is then not cancelled."""
+    from types import SimpleNamespace
+    s = make(tws, tmp_path)
+    try:
+        snaps = s.place([buy(), stop()])
+        tws.fill(snaps[0].order_id, 1, 88.11)
+        assert settle(lambda: s.positions() and s.positions()[0].quantity == 1)
+        monkeypatch.setattr(s, "quote", lambda contract: SimpleNamespace(attempts=()))
+        b = IbkrPaperBroker(s, exit_collar_pct=D(1))
+        contract = b.resolve(Instrument(asset_class=AssetClass.ETF, symbol="TLT"))
+        with pytest.raises(BrokerError):
+            b.quote(contract)
+        assert b.exit_limit() is None
+        with pytest.raises(BrokerError, match="EXIT_WOULD_BE_REFUSED"):
+            b.cancel("TB-0001.STP")
+        assert tws.count("CANCEL_ORDER") == 0
+    finally:
+        s.disconnect()
