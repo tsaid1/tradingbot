@@ -185,6 +185,9 @@ class MarketTerms(StrictModel):
     require_backstop: bool = False
     released_order_type: Literal["MKT"] = "MKT"
     accepted_qualities: list[str] = Field(default_factory=lambda: ["LIVE"])
+    # The terms an idea was opened under, used after its family lost approval: exits and protective
+    # amendments only, never new exposure.
+    exits_only: bool = False
     # Problems found while building these terms (contract unresolved, specification differs).
     problems: list[str] = Field(default_factory=list)
 

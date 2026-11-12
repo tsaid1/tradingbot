@@ -19,6 +19,7 @@ from tradingbot.models import Action, AssetClass, Instrument, PositionSide
 from tradingbot.runtime.mapping import MappingPolicy
 from tradingbot.runtime.mock_multi_asset import (
     QIF_JUN,
+    START,
     STATIC,
     MockMultiAssetRun,
     Scenario,
@@ -246,4 +247,115 @@ def test_f3_reviewer_probe_spread_never_reaches_the_broker(tmp_path):
     [a] = traded(run)
     assert a["status"] == "HOLD" and "OPTION_STRATEGY_NOT_SINGLE_LEG" in a["reasons"]
     assert run.broker.submit_calls == 0
+    run.close()
+
+
+# ================================================================== F4: approval governs new exposure
+
+OIL_OPEN = "We are now long $QOIL Jul 2026 at 71.50. Stop 69.80. Target 75.00."
+
+
+def revoke_at(seconds, text_of=lambda: mapping_toml(approved=False)):
+    """A hook that rewrites the mapping file and reloads it, as an owner withdrawing approval."""
+
+    def hook(run):
+        if (run.clock.now() - START).total_seconds() >= seconds and not getattr(
+                run, "_revoked", False):
+            run._revoked = True
+            run.mapping_file.write_text(text_of())
+            run.service.mapping = MappingPolicy.from_toml(run.mapping_file)
+
+    return hook
+
+
+def without_family(family):
+    text = mapping_toml(approved=True)
+    head, _, rest = text.partition(f'[[mapping]]\nfamily = "{family}"')
+    _, sep, tail = rest.partition("[[mapping]]")
+    return head + (sep + tail if sep else "")
+
+
+@pytest.mark.parametrize("change", ["unapproved", "removed"])
+def test_f4_a_position_can_still_be_closed_after_its_family_loses_approval(tmp_path, change):
+    """Reviewer probe E2: QOIL opened, approval withdrawn, CLOSE held. It now executes on the
+    mapping terms recorded on the idea when it was opened."""
+    text_of = (lambda: mapping_toml(approved=False)) if change == "unapproved" else (
+        lambda: without_family("QOIL"))
+    run = run_steps(tmp_path, [
+        Step(0, OIL_OPEN, "EXECUTED"),
+        Step(60, "Raising our $QOIL stop to 70.40.", "EXECUTED"),
+        Step(120, "Adding to our $QOIL long at 71.50.", "HOLD"),
+        Step(180, "Closing the rest of our $QOIL long.", "EXECUTED")],
+        family="QOIL", hook=revoke_at(30, text_of))
+    by = {a["action"]: a for a in traded(run)}
+    assert by["OPEN"]["status"] == "EXECUTED"
+    assert by["MODIFY"]["status"] == "EXECUTED", by["MODIFY"]["reasons"]
+    assert by["ADD"]["status"] == "HOLD"  # approval governs new exposure
+    assert {"MAPPING_NOT_APPROVED", "UNSUPPORTED_INSTRUMENT_MAPPING"} & set(by["ADD"]["reasons"])
+    assert by["CLOSE"]["status"] == "EXECUTED", by["CLOSE"]["reasons"]
+    assert all(p.quantity == 0 for p in run.service.coordinator.ledger())
+    run.close()
+
+
+def test_f4_mapping_terms_are_recorded_on_the_idea(tmp_path):
+    run = run_steps(tmp_path, [Step(0, OIL_OPEN, "EXECUTED")], family="QOIL")
+    [p] = run.service.coordinator.ledger()
+    from tradingbot.runtime.mapping import FamilyMapping
+
+    recorded = FamilyMapping.model_validate_json(p.mapping_terms)
+    assert recorded.family == "QOIL" and recorded.approved
+    run.close()
+
+
+def test_f4_an_open_under_revoked_mapping_is_shown_in_coverage_and_on_the_page(tmp_path):
+    run = run_steps(tmp_path, [Step(0, OIL_OPEN, "EXECUTED")], family="QOIL",
+                    hook=revoke_at(10))
+    from tradingbot.runtime import lifecycle
+
+    view = lifecycle.load(run.config)
+    row = next(c for c in view["coverage"] if c["family"] == "QOIL")
+    assert row["position_status"] == "OPEN_UNDER_REVOKED_MAPPING"
+    assert row["open_positions"] == 1
+    [p] = [p for p in view["protection"] if p["quantity"] > 0]
+    assert p["mapping_status"] == "OPEN_UNDER_REVOKED_MAPPING"
+    run.close()
+
+
+def test_f4_terms_for_exits_only_never_approve_new_exposure():
+    from tradingbot.models import PositionSide as Side
+
+    t = terms(exits_only=True)
+    g = gate(act(), mq(t))
+    assert g.status == "HOLD" and g.reasons[0] == "MAPPING_NOT_APPROVED"
+    g = gate(act(Action.ADD, idea="9:a1", stop=None, target=None), mq(t), position())
+    assert g.status == "HOLD" and g.reasons[0] == "MAPPING_NOT_APPROVED"
+    g = gate(act(Action.CLOSE, idea="9:a1", side=Side.LONG), mq(t), position())
+    assert g.status == "APPROVE"
+
+
+def test_f4_the_execution_page_shows_an_open_under_revoked_mapping(tmp_path, monkeypatch):
+    from streamlit.testing.v1 import AppTest
+    from test_multi_asset_execution import REPO, _exe, _pol, _svc
+
+    run = run_steps(tmp_path, [Step(0, OIL_OPEN, "EXECUTED")], family="QOIL",
+                    hook=revoke_at(10))
+    cfg = tmp_path / "runtime.toml"
+    c = run.config
+    cfg.write_text(
+        f'mode = "mock"\n[paths]\nstate_dir = "{c.paths.state_dir}"\n'
+        f'halt_file = "{c.paths.halt_file}"\nmapping_file = "{run.mapping_file}"\n'
+        f'[source]\nkind = "replay"\nfile = "{c.source.file}"\n'
+        + "".join(
+            f"[{t}]\n" + "".join(f"{k} = {v!r}\n".replace("'", '"') for k, v in vals.items())
+            for t, vals in (("service", _svc()), ("policy", _pol()), ("execution", _exe()))
+        )
+    )
+    monkeypatch.setenv("TRADINGBOT_RUNTIME_CONFIG", str(cfg))
+    at = AppTest.from_file(str(REPO / "dashboard" / "pages" / "8_Execution.py"),
+                           default_timeout=60)
+    at.run()
+    assert not at.exception
+    text = " ".join(str(e.value) for kind in ("markdown", "warning") for e in at.get(kind))
+    assert "| QOIL | NOT APPROVED |" in text
+    assert "OPEN_UNDER_REVOKED_MAPPING" in text and "withdrawn mapping" in text
     run.close()

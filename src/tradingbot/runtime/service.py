@@ -371,15 +371,19 @@ class RuntimeService:
             self._publish_mock_quotes(decision_now)
         interpreted = self.interpreter.interpret(post)
         interpreted_at = self.clock()
+        recorded = self._recorded_mappings()
         mapped, decisions = self.mapping.apply(
             group_linked_actions(interpreted),
             clauses={c.action_id: c.clause for c in interpreted.classifications},
             now=decision_now,
             held=self._held_contracts(),
+            recorded=recorded,
         )
-        quotes = self._gate_quotes(mapped, decisions, decision_now)
+        quotes = self._gate_quotes(mapped, decisions, decision_now, recorded)
         self.replay.gate_stamps = {}
-        result = self.replay.process(post.to_replay_source(), mapped, quotes, now=decision_now)
+        source = post.to_replay_source()
+        result = self.replay.process(source, mapped, quotes, now=decision_now)
+        self._record_idea_mappings(source.source_id, mapped, decisions)
         decided_at = self.clock()
         self.interpreter.observe(post, interpreted)
 
@@ -474,8 +478,41 @@ class RuntimeService:
                 out[p.idea_id] = ContractRef.model_validate_json(p.contract)
         return out
 
+    def _recorded_mappings(self) -> dict[str, FamilyMapping]:
+        """The mapping entry each open idea was opened under (approval governs new exposure only:
+        its exits and protective amendments keep working if the family loses approval)."""
+        out = {}
+        for p in self.coordinator.ledger():
+            if p.mapping_terms and p.status in ("OPEN", "PENDING"):
+                try:
+                    out[p.idea_id] = FamilyMapping.model_validate_json(p.mapping_terms)
+                except ValueError:  # unreadable terms: the idea's exits HOLD as before
+                    continue
+        return out
+
+    def _record_idea_mappings(
+        self, source_id: str, parsed: ParsedPost, decisions: list[MappingDecision]
+    ) -> None:
+        """Record on each idea opened by this post the version-2 entry it was opened under."""
+        by_id = {a.action_id: a for a in parsed.actions}
+        store = self.coordinator.store
+        for d in decisions:
+            a = by_id.get(d.action_id)
+            entry = self.mapping.entries.get(d.family or "")
+            if d.status != "SUPPORTED" or a is None or a.action != Action.OPEN \
+                    or not isinstance(entry, FamilyMapping):
+                continue
+            idea_id = f"{source_id}:{a.action_id}"
+            pos = store.position(idea_id)
+            if pos is not None and pos.mapping_terms is None:
+                store.update_position(idea_id, self.clock(), mapping_terms=entry.model_dump_json())
+
     def _gate_quotes(
-        self, parsed: ParsedPost, decisions: list[MappingDecision], now: datetime | None = None
+        self,
+        parsed: ParsedPost,
+        decisions: list[MappingDecision],
+        now: datetime | None = None,
+        recorded: dict[str, FamilyMapping] | None = None,
     ) -> dict[str, Quote]:
         """The broker's own quote for every instrument the mapping policy lets through. A missing or
         unusable quote is simply absent; the gateway then blocks with QUOTE_UNAVAILABLE. A mapped
@@ -490,8 +527,12 @@ class RuntimeService:
             if d.mapped:
                 key = a.instrument.quote_key
                 if key not in quotes:
-                    quotes[key] = self._mapped_quote(self.mapping.entries[d.family], a.instrument,
-                                                     now)
+                    if d.under_revoked_mapping:  # the idea's own recorded terms, exits only
+                        entry, exits_only = (recorded or {})[a.idea_reference], True
+                    else:
+                        entry, exits_only = self.mapping.entries[d.family], False
+                    quotes[key] = self._mapped_quote(entry, a.instrument, now,
+                                                     exits_only=exits_only)
                 continue
             symbol = a.instrument.symbol
             if symbol in quotes:
@@ -505,7 +546,9 @@ class RuntimeService:
             quotes[symbol] = Quote(symbol=symbol, bid=q.bid, ask=q.ask, observed_at=q.received_at)
         return quotes
 
-    def _mapped_quote(self, entry: FamilyMapping, instrument, now: datetime) -> MappedQuote:
+    def _mapped_quote(
+        self, entry: FamilyMapping, instrument, now: datetime, *, exits_only: bool = False
+    ) -> MappedQuote:
         """Resolve the execution and reference contracts and read both quotes. Nothing is dropped:
         a contract that does not resolve, a missing quote or a specification that differs from the
         approved entry is carried in the terms, and the gateway holds on it."""
@@ -523,7 +566,7 @@ class RuntimeService:
                 pass
         elif entry.basis == "DIRECT":
             reference = contract
-        terms = entry.terms(instrument, contract, reference, problems)
+        terms = entry.terms(instrument, contract, reference, problems, exits_only=exits_only)
         bid = ask = None
         quality, observed = QuoteQuality.UNAVAILABLE.value, now
         if contract is not None:
@@ -553,6 +596,11 @@ class RuntimeService:
                 continue
             contract = ContractRef.model_validate_json(p.contract)
             entry = self.mapping.entry_for_contract(contract)
+            if entry is None and p.mapping_terms:  # a family that lost its entry: recorded terms
+                try:
+                    entry = FamilyMapping.model_validate_json(p.mapping_terms)
+                except ValueError:
+                    entry = None
             if entry is None or entry.roll is None or not contract.expiry:
                 continue
             month = contract.expiry[:6]

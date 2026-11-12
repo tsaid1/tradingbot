@@ -401,6 +401,10 @@ def _gate_mapped(a: TradeAction, published_at: datetime, q: MappedQuote, policy:
     assert inst is not None
     if not t.approved:
         return _gate("HOLD", MAPPING_NOT_APPROVED, f"FAMILY:{t.family}")
+    if t.exits_only and a.action in (Action.OPEN, Action.ADD):
+        # The idea's recorded terms let it be reduced, closed and protected; approval governs new
+        # exposure and has been withdrawn.
+        return _gate("HOLD", MAPPING_NOT_APPROVED, f"FAMILY:{t.family}", "EXITS_ONLY")
     if t.basis == "UNSUPPORTED":
         return _gate("HOLD", UNSUPPORTED_MAPPING, f"FAMILY:{t.family}")
     if t.problems:

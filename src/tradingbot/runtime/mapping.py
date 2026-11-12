@@ -115,6 +115,9 @@ class MappingDecision(StrictModel):
     # receive a ``MappedQuote`` (False for a stock or ETF quoted in its own price, as in v1).
     family: str | None = None
     mapped: bool = False
+    # The family's entry is no longer approved (or no longer present) and this exit or protective
+    # amendment uses the terms recorded on its idea when it was opened.
+    under_revoked_mapping: bool = False
 
 
 class MappingFile(StrictModel):
@@ -404,6 +407,8 @@ class FamilyMapping(StrictModel):
         contract: ContractRef | None,
         reference: ContractRef | None,
         problems: list[str] = (),
+        *,
+        exits_only: bool = False,
     ) -> MarketTerms:
         """The terms the gateway decides with, for one selected execution instrument."""
         x = self.execution
@@ -461,6 +466,7 @@ class FamilyMapping(StrictModel):
             max_abs_basis=self.basis_shift.max_abs_basis if self.basis_shift else None,
             max_basis_age_seconds=self.basis_shift.max_age_seconds if self.basis_shift else None,
             require_backstop=bool(rt and rt.require_backstop),
+            exits_only=exits_only,
             problems=out,
         )
 
@@ -633,10 +639,14 @@ class MappingPolicy:
         clause: str | None = None,
         now: datetime | None = None,
         held: dict[str, ContractRef] | None = None,
+        recorded: dict[str, FamilyMapping] | None = None,
     ) -> tuple[MappingDecision, Instrument | None]:
         """One action's mapping decision and, when SUPPORTED, its execution instrument.
         ``clause`` is the instruction text the action came from (contract terms are read from it);
-        ``held`` maps follower idea ids to their contracts, so a follow-up acts on its own."""
+        ``held`` maps follower idea ids to their contracts, so a follow-up acts on its own;
+        ``recorded`` maps them to the entry each was opened under. Approval governs new exposure
+        only: a REDUCE, CLOSE or MODIFY on an open idea whose family is no longer approved (or no
+        longer has an entry) uses its recorded entry, marked exits-only."""
         if action.action == Action.NO_TRADE:
             return MappingDecision(action_id=action.action_id, status="NOT_APPLICABLE"), None
         asset = action.source_market_symbol or (
@@ -649,6 +659,12 @@ class MappingPolicy:
         terms = extract_terms(clause)
         family = f"{asset}.OPT" if terms.option_language else asset
         entry = self.entries.get(family)
+        revoked = False
+        idea_entry = (recorded or {}).get(action.idea_reference) if action.action in (
+            Action.REDUCE, Action.CLOSE, Action.MODIFY) else None
+        if idea_entry is not None and idea_entry.family == family and (
+                entry is None or not entry.executable):
+            entry, revoked = idea_entry, True
         if entry is None:
             return MappingDecision(
                 action_id=action.action_id,
@@ -684,9 +700,8 @@ class MappingPolicy:
             return MappingDecision(
                 status="UNRESOLVED", reason=",".join(problems), **out
             ), None
-        return MappingDecision(status="SUPPORTED", mapped=not entry.legacy_equivalent, **out), (
-            instrument
-        )
+        return MappingDecision(status="SUPPORTED", mapped=not entry.legacy_equivalent,
+                               under_revoked_mapping=revoked, **out), instrument
 
     def _decide_v1(self, action: TradeAction, asset: str, entry: MappingEntry) -> MappingDecision:
         if not entry.executable:
@@ -722,6 +737,7 @@ class MappingPolicy:
         clauses: dict[str, str] | None = None,
         now: datetime | None = None,
         held: dict[str, ContractRef] | None = None,
+        recorded: dict[str, FamilyMapping] | None = None,
     ) -> tuple[ParsedPost, list[MappingDecision]]:
         """Return the post with every action that may not execute marked for HOLD, and one
         decision per action. A supported action gets its execution instrument. ``clauses`` maps
@@ -730,7 +746,7 @@ class MappingPolicy:
         decisions: list[MappingDecision] = []
         for a in parsed.actions:
             d, instrument = self.resolve(
-                a, clause=(clauses or {}).get(a.action_id), now=now, held=held
+                a, clause=(clauses or {}).get(a.action_id), now=now, held=held, recorded=recorded
             )
             decisions.append(d)
             marks: list[str] = []

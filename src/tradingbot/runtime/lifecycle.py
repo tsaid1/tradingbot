@@ -16,7 +16,7 @@ from pathlib import Path
 
 from tradingbot.execution.broker import ContractRef
 from tradingbot.runtime.config import RuntimeConfig
-from tradingbot.runtime.coverage import coverage_report
+from tradingbot.runtime.coverage import OPEN_UNDER_REVOKED_MAPPING, coverage_report
 from tradingbot.runtime.mapping import MappingPolicy
 
 STAGES = (
@@ -90,6 +90,16 @@ def _key(contract: dict | None, symbol: str) -> str:
     if not contract:
         return f"SYMBOL:{symbol}"
     return ContractRef.model_validate(contract).contract_key
+
+
+def _recorded_family(mapping_terms: str | None) -> str | None:
+    """The family an idea was opened under (its recorded mapping entry), if any."""
+    if not mapping_terms:
+        return None
+    try:
+        return json.loads(mapping_terms).get("family")
+    except (ValueError, AttributeError):
+        return None
 
 
 def load(config: RuntimeConfig) -> dict:
@@ -286,10 +296,22 @@ def load(config: RuntimeConfig) -> dict:
         if e["kind"] in ("UNPROTECTED_POSITION", "PROTECTION_UNVERIFIED")
         and e["resolved_at"] is None
     }
+    try:
+        policy, coverage_error = MappingPolicy.from_toml(config.paths.mapping_file), None
+    except ValueError as exc:  # the view still loads; the page says why coverage is missing
+        policy, coverage_error = None, str(exc)
     protection = []
+    open_families = []
     for p in ledger:
         if p["quantity"] <= 0:
             continue
+        family = _recorded_family(p.get("mapping_terms"))
+        open_families.append({"idea_id": p["idea_id"], "family": family})
+        revoked = (
+            family is not None
+            and policy is not None
+            and (policy.entries.get(family) is None or not policy.entries[family].executable)
+        )
         stop = working.get(p["stop_ref"]) if p["stop_ref"] else None
         covered = (stop["quantity"] - stop["filled_quantity"]) if stop else 0
         confirmed = (
@@ -318,15 +340,14 @@ def load(config: RuntimeConfig) -> dict:
                 "protection": "CONFIRMED"
                 if confirmed
                 else ("NOT_REQUIRED" if p["stop_price"] is None else "UNPROTECTED"),
+                "family": family,
+                # Exits and protection only: the family's approval was withdrawn after opening.
+                "mapping_status": OPEN_UNDER_REVOKED_MAPPING if revoked else None,
             }
         )
     for e in runtime_exceptions:
         e["reasons"] = json.loads(e["reasons"]) if isinstance(e["reasons"], str) else e["reasons"]
-    try:
-        coverage = coverage_report(MappingPolicy.from_toml(config.paths.mapping_file), actions)
-        coverage_error = None
-    except ValueError as exc:  # the view still loads; the page says why coverage is missing
-        coverage, coverage_error = [], str(exc)
+    coverage = coverage_report(policy, actions, open_families) if policy is not None else []
     return {
         "coverage": coverage,
         "coverage_error": coverage_error,

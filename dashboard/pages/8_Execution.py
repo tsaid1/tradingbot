@@ -167,7 +167,9 @@ if view["protection"]:
                     p["avg_price"],
                     p["stop_price"],
                     p["stop_covers"],
-                    p["protection"] if p["protection"] != "UNPROTECTED" else "**UNPROTECTED**",
+                    (p["protection"] if p["protection"] != "UNPROTECTED" else "**UNPROTECTED**")
+                    # Approval withdrawn after opening: exits and protection only.
+                    + (f" / **{p['mapping_status']}**" if p.get("mapping_status") else ""),
                 ]
                 for p in view["protection"]
             ],
@@ -312,7 +314,7 @@ elif view.get("coverage"):
     st.markdown(
         table(
             ["Family", "Mapping", "Execution instrument", "Basis", "Signals", "Executed", "Held",
-             "Exceptions", "Held by reason"],
+             "Exceptions", "Held by reason", "Open positions"],
             [
                 [
                     c["family"],
@@ -324,6 +326,8 @@ elif view.get("coverage"):
                     c["held"],
                     c["exceptions"],
                     ", ".join(f"{k} x{n}" for k, n in c["held_by_reason"].items()),
+                    f"{c.get('open_positions', 0)}"
+                    + (f" **{c['position_status']}**" if c.get("position_status") else ""),
                 ]
                 for c in cov
             ],
@@ -332,6 +336,13 @@ elif view.get("coverage"):
     unsupported = [c["family"] for c in cov if c["mapping_status"] != "APPROVED" and c["signals"]]
     if unsupported:
         st.warning("Signals held for families that cannot trade: " + ", ".join(unsupported))
+    revoked = [c["family"] for c in cov if c.get("position_status")]
+    if revoked:
+        st.warning(
+            "Open positions under a withdrawn mapping (OPEN_UNDER_REVOKED_MAPPING; they can be "
+            "reduced, closed and protected on their recorded terms, never added to): "
+            + ", ".join(revoked)
+        )
 else:
     st.info("No mapping entry and no signal yet.")
 

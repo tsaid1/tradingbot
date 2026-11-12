@@ -4,7 +4,9 @@ Read-only. For every family that has a mapping entry, and every family the publi
 named in a signal, it reports the mapping status (APPROVED / NOT APPROVED / UNSUPPORTED), the
 execution instrument and basis treatment, and counts of signals executed, held (by reason) and
 exceptions. A family with no entry shows as UNSUPPORTED with what was held, so the universe the
-bot does not trade is visible rather than silently ignored.
+bot does not trade is visible rather than silently ignored. An open position in a family whose
+entry is no longer approved (or no longer present) is shown as OPEN_UNDER_REVOKED_MAPPING: it can
+still be reduced, closed and protected on the terms recorded when it was opened, but not added to.
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ NOT_COUNTED = frozenset({"NO_TRADE", "RECONCILE"})  # commentary, summaries, pas
 EXCEPTION_STATUSES = frozenset({"EXCEPTION", "UNRESOLVED", "REJECTED", "REFUSED", "HALTED"})
 # Gateway reasons that carry no information about why (they prefix the specific ones).
 _GENERIC = frozenset({"SOURCE_AMBIGUITIES"})
+OPEN_UNDER_REVOKED_MAPPING = "OPEN_UNDER_REVOKED_MAPPING"
 
 
 def _family_of(row: dict) -> str | None:
@@ -29,8 +32,11 @@ def _hold_reason(row: dict) -> str:
     return reasons[0] if reasons else row.get("status") or "-"
 
 
-def coverage_report(policy: MappingPolicy, actions: list[dict]) -> list[dict]:
-    """One row per family, sorted: entries first (by family), then families seen but unmapped."""
+def coverage_report(
+    policy: MappingPolicy, actions: list[dict], positions: list[dict] | None = None
+) -> list[dict]:
+    """One row per family, sorted: entries first (by family), then families seen but unmapped.
+    ``positions`` are the open ideas as ``{"idea_id", "family"}`` (the family recorded on each)."""
     rows: dict[str, dict] = {}
 
     def row_for(family: str) -> dict:
@@ -57,6 +63,8 @@ def coverage_report(policy: MappingPolicy, actions: list[dict]) -> list[dict]:
                 "held": 0,
                 "exceptions": 0,
                 "held_by_reason": Counter(),
+                "open_positions": 0,
+                "position_status": None,
             }
         return rows[family]
 
@@ -77,6 +85,14 @@ def coverage_report(policy: MappingPolicy, actions: list[dict]) -> list[dict]:
         else:
             r["held"] += 1
             r["held_by_reason"][_hold_reason(a)] += 1
+    for p in positions or []:
+        if not p.get("family"):
+            continue
+        r = row_for(p["family"])
+        r["open_positions"] += 1
+        entry = policy.entries.get(p["family"])
+        if entry is None or not entry.executable:
+            r["position_status"] = OPEN_UNDER_REVOKED_MAPPING
     out = sorted(rows.values(), key=lambda r: (not r["mapped"], r["family"]))
     for r in out:
         r["held_by_reason"] = dict(sorted(r["held_by_reason"].items()))
