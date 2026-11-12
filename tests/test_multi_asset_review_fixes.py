@@ -573,3 +573,19 @@ def test_f8_a_reference_trigger_add_outside_reference_hours_holds():
              position(qty=2, stop="4995"), now=t13,
              policy=MockPolicy(max_notional_usd=Decimal(10**7)))
     assert g.status == "HOLD" and g.reasons == ["REFERENCE_SERIES_NOT_UPDATING"]
+
+
+# ================================================================== F9: DIRECT means traded prices
+
+@pytest.mark.parametrize("action", [Action.OPEN, Action.MODIFY, Action.CLOSE])
+def test_f9_direct_refuses_levels_marked_as_the_source_series(action):
+    """Reviewer probe P3: DIRECT with price_basis SOURCE_SERIES approved; the stock path refuses."""
+    a = act(action, basis=PriceBasis.SOURCE_SERIES, entry="5025", stop="5000", target="5085",
+            idea=None if action == Action.OPEN else "9:a1")
+    g = gate(a, mq(terms()), None if action == Action.OPEN else position())
+    assert g.status == "HOLD" and g.reasons == ["SOURCE_TO_BROKER_PRICE_BASIS_UNRESOLVED"]
+
+
+def test_f9_other_treatments_still_take_source_series_levels():
+    a = act(basis=PriceBasis.SOURCE_SERIES, entry="5010", stop="4980", target="5070")
+    assert gate(a, mq(terms("REFERENCE_TRIGGER"), reference=leg())).status == "APPROVE"
