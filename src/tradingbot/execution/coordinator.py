@@ -122,6 +122,15 @@ CONDITIONS_UNSUPPORTED = "CONDITIONAL_ORDERS_UNSUPPORTED_BY_BROKER"
 CONTRACT_CHANGED = "CONTRACT_CHANGED_SINCE_DECISION"
 
 
+# An operator settled an intent of unknown outcome (execution.settlement): the instrument stays
+# blocked until a full broker sync and reconciliation after it show no open safety discrepancy in
+# that contract; only that evidence resolves it, never the operator.
+OPERATOR_SETTLEMENT_UNVERIFIED = "OPERATOR_SETTLEMENT_UNVERIFIED"
+# The broker session dropped (runtime service): new exposure everywhere is refused until the
+# session is back, a full sync has succeeded and a reconciliation shows nothing unexplained.
+BROKER_RECONNECT_PENDING = "BROKER_RECONNECT_PENDING"
+
+
 class BrokerUnreadable(BrokerError):
     """A full broker sync failed: the coordinator cannot tell what the account holds."""
 
@@ -132,7 +141,10 @@ INSTRUMENT_BLOCKING_KINDS = (
     UNPROTECTED_POSITION,
     PROTECTION_UNVERIFIED,
     ENTRY_STATE_UNKNOWN,
+    OPERATOR_SETTLEMENT_UNVERIFIED,
 )
+# An open exception of one of these kinds (no idea) blocks every OPEN and ADD (BROKER_UNREADABLE).
+ACCOUNT_BLOCKING_KINDS = (BROKER_STATE_UNKNOWN, BROKER_RECONNECT_PENDING)
 
 
 def default_halt_file() -> Path:
@@ -621,8 +633,14 @@ class ExecutionCoordinator:
 
     def _broker_state_unknown(self) -> bool:
         return any(
-            e.kind == BROKER_STATE_UNKNOWN for e in self.store.exceptions(open_only=True)
+            e.kind in ACCOUNT_BLOCKING_KINDS for e in self.store.exceptions(open_only=True)
         )
+
+    def mark_broker_unreadable(self, read: str, exc: BaseException) -> None:
+        """A caller (the runtime service's broker probe) saw the broker unreadable: protection
+        becomes UNKNOWN and new exposure is blocked until a full sync succeeds, exactly as when a
+        read of the coordinator's own fails (review F1)."""
+        self._broker_unreadable(read, exc)
 
     def _broker_unreadable(self, read: str, exc: BaseException) -> None:
         """A broker read failed: every open position's protection becomes UNKNOWN and an open

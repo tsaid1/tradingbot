@@ -455,86 +455,93 @@ class ExecutionStore:
         price: Decimal,
         executed_at: datetime,
         at: datetime,
+        c: sqlite3.Connection | None = None,
     ) -> LedgerPosition | None:
         """The only writer of follower quantities: one broker execution, applied exactly once.
         An exit fill larger than the position is recorded as it happened; the ledger stops at zero,
         the idea becomes REVERSED and a LEDGER_REVERSAL exception is opened in the same
-        transaction (safety review R2)."""
-        with self.tx() as c:
-            if c.execute("SELECT 1 FROM exec_fills WHERE exec_id=?", (exec_id,)).fetchone():
-                return None
-            c.execute(
-                """INSERT INTO exec_fills
-                (exec_id,order_ref,idea_id,role,side,quantity,price,executed_at)
-                VALUES (?,?,?,?,?,?,?,?)""",
-                (
-                    exec_id,
-                    order.order_ref,
-                    order.idea_id,
-                    order.role.value,
-                    order.side,
-                    quantity,
-                    str(price),
-                    executed_at.isoformat(),
-                ),
+        transaction (safety review R2). With ``c`` it runs inside the caller's transaction (an
+        operator settlement applies its declared fill and its journal entry atomically)."""
+        if c is None:
+            with self.tx() as conn:
+                return self.apply_fill(
+                    exec_id=exec_id, order=order, quantity=quantity, price=price,
+                    executed_at=executed_at, at=at, c=conn,
+                )
+        if c.execute("SELECT 1 FROM exec_fills WHERE exec_id=?", (exec_id,)).fetchone():
+            return None
+        c.execute(
+            """INSERT INTO exec_fills
+            (exec_id,order_ref,idea_id,role,side,quantity,price,executed_at)
+            VALUES (?,?,?,?,?,?,?,?)""",
+            (
+                exec_id,
+                order.order_ref,
+                order.idea_id,
+                order.role.value,
+                order.side,
+                quantity,
+                str(price),
+                executed_at.isoformat(),
+            ),
+        )
+        c.execute(
+            "UPDATE exec_orders SET filled_quantity=filled_quantity+?, updated_at=? "
+            "WHERE order_ref=?",
+            (quantity, at.isoformat(), order.order_ref),
+        )
+        pos = c.execute(
+            "SELECT * FROM exec_positions WHERE idea_id=?", (order.idea_id,)
+        ).fetchone()
+        if pos is None:
+            raise RuntimeError(f"fill for unknown idea {order.idea_id}")
+        qty = pos["quantity"]
+        avg = Decimal(pos["avg_price"]) if pos["avg_price"] else None
+        excess = 0
+        if order.role == Role.ENTRY:
+            new_qty = qty + quantity
+            avg = ((avg or Decimal(0)) * qty + price * quantity) / new_qty
+        else:
+            new_qty = qty - quantity
+            if new_qty < 0:
+                excess, new_qty = -new_qty, 0
+        status = "OPEN" if new_qty > 0 else ("REVERSED" if excess else "CLOSED")
+        if excess:
+            detail = (
+                f"{order.role.value} {order.side} {quantity} @ {price} ({exec_id}) against a "
+                f"follower position of {qty}: the account went through flat by {excess}. "
+                "New exposure in this instrument is blocked until a human resolves this."
             )
             c.execute(
-                "UPDATE exec_orders SET filled_quantity=filled_quantity+?, updated_at=? "
-                "WHERE order_ref=?",
-                (quantity, at.isoformat(), order.order_ref),
+                "INSERT INTO exec_exceptions (at,kind,idea_id,order_ref,detail) "
+                "VALUES (?,?,?,?,?)",
+                (at.isoformat(), LEDGER_REVERSAL, order.idea_id, order.order_ref, detail),
             )
-            pos = c.execute(
-                "SELECT * FROM exec_positions WHERE idea_id=?", (order.idea_id,)
-            ).fetchone()
-            if pos is None:
-                raise RuntimeError(f"fill for unknown idea {order.idea_id}")
-            qty = pos["quantity"]
-            avg = Decimal(pos["avg_price"]) if pos["avg_price"] else None
-            excess = 0
-            if order.role == Role.ENTRY:
-                new_qty = qty + quantity
-                avg = ((avg or Decimal(0)) * qty + price * quantity) / new_qty
-            else:
-                new_qty = qty - quantity
-                if new_qty < 0:
-                    excess, new_qty = -new_qty, 0
-            status = "OPEN" if new_qty > 0 else ("REVERSED" if excess else "CLOSED")
-            if excess:
-                detail = (
-                    f"{order.role.value} {order.side} {quantity} @ {price} ({exec_id}) against a "
-                    f"follower position of {qty}: the account went through flat by {excess}. "
-                    "New exposure in this instrument is blocked until a human resolves this."
-                )
-                c.execute(
-                    "INSERT INTO exec_exceptions (at,kind,idea_id,order_ref,detail) "
-                    "VALUES (?,?,?,?,?)",
-                    (at.isoformat(), LEDGER_REVERSAL, order.idea_id, order.order_ref, detail),
-                )
-                self.log(
-                    at,
-                    LEDGER_REVERSAL,
-                    order_ref=order.order_ref,
-                    idea_id=order.idea_id,
-                    c=c,
-                    exec_id=exec_id,
-                    fill_quantity=quantity,
-                    ledger_before=qty,
-                    excess=excess,
-                )
-            c.execute(
-                "UPDATE exec_positions SET quantity=?, avg_price=?, status=?, "
-                "protection='UNKNOWN', updated_at=? WHERE idea_id=?",
-                (
-                    new_qty,
-                    str(avg.quantize(Decimal("0.0001"))) if avg is not None else None,
-                    status,
-                    at.isoformat(),
-                    order.idea_id,
-                ),
+            self.log(
+                at,
+                LEDGER_REVERSAL,
+                order_ref=order.order_ref,
+                idea_id=order.idea_id,
+                c=c,
+                exec_id=exec_id,
+                fill_quantity=quantity,
+                ledger_before=qty,
+                excess=excess,
             )
-            row = c.execute(
-                "SELECT * FROM exec_positions WHERE idea_id=?", (order.idea_id,)
-            ).fetchone()
+        c.execute(
+            "UPDATE exec_positions SET quantity=?, avg_price=?, status=?, "
+            "protection='UNKNOWN', updated_at=? WHERE idea_id=?",
+            (
+                new_qty,
+                str(avg.quantize(Decimal("0.0001"))) if avg is not None else None,
+                status,
+                at.isoformat(),
+                order.idea_id,
+            ),
+        )
+        row = c.execute(
+            "SELECT * FROM exec_positions WHERE idea_id=?", (order.idea_id,)
+        ).fetchone()
         return _row(LedgerPosition, row)
 
     def insert_position(self, c: sqlite3.Connection, pos: LedgerPosition) -> None:
@@ -657,3 +664,15 @@ class ExecutionStore:
             rows = c.execute("SELECT * FROM exec_exceptions ORDER BY id").fetchall()
         out = [ExceptionRecord.model_validate(dict(r)) for r in rows]
         return [e for e in out if not open_only or e.resolved_at is None]
+
+    def exception(self, exc_id: int) -> ExceptionRecord | None:
+        with self.tx() as c:
+            row = c.execute("SELECT * FROM exec_exceptions WHERE id=?", (exc_id,)).fetchone()
+        return ExceptionRecord.model_validate(dict(row)) if row else None
+
+    def resolve_exception_id(self, exc_id: int, at: datetime, c: sqlite3.Connection) -> bool:
+        """Resolve one open exception record (operator actions; inside the caller's transaction)."""
+        return c.execute(
+            "UPDATE exec_exceptions SET resolved_at=? WHERE id=? AND resolved_at IS NULL",
+            (at.isoformat(), exc_id),
+        ).rowcount == 1
