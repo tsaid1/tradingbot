@@ -170,6 +170,11 @@ class MappingDecision(StrictModel):
     # How a futures month was chosen: NAMED (the clause), IDEA (a follow-up's own contract),
     # NEAREST (EXPLICIT_OR_NEAREST) or FRONT_MONTH (level_contract_rule). None for other families.
     month_source: Literal["NAMED", "IDEA", "NEAREST", "FRONT_MONTH"] | None = None
+    # How the accepted anchor was attributed to this action (additive): OWN_SENTENCE (the
+    # instruction's own sentence), AFTER_OWN_INSTRUCTION (ACTION_BLOCK: a level sentence right
+    # after the action's own clause), AFTER_ALLOW_LISTED_SENTENCE (a level sentence after an
+    # entirely allow-listed one, such as "Stop 48.90."), FIRST_SENTENCE (nothing before it).
+    anchor_attribution: str | None = None
 
 
 class MappingFile(StrictModel):
@@ -356,6 +361,12 @@ class EntryAnchorRules(StrictModel):
     # each quote (and their skew) may be. Otherwise [basis_shift]'s cap is the one used.
     max_abs_basis: Decimal | None = Field(default=None, gt=0)
     max_basis_age_seconds: float | None = Field(default=None, gt=0, le=60)
+    # How much textual certainty an anchor needs (the owner's choice; no default). Both
+    # allow-list the marked number's whole sentence. SENTENCE_STRICT: a standalone level sentence
+    # also needs the sentence before it entirely allow-listed. ACTION_BLOCK: it is also accepted
+    # when the sentence immediately before it is this action's own clause as the interpreter
+    # delimited it (docs/MULTI_ASSET_MAPPING.md, "Anchor scope").
+    anchor_scope: Literal["SENTENCE_STRICT", "ACTION_BLOCK"]
 
     @field_validator("max_adverse_move", "max_favourable_move")
     @classmethod
@@ -914,6 +925,7 @@ class FamilyMapping(StrictModel):
         others: list[tuple[str | None, str | None, set[Decimal]]] = (),
         post_text: str | None = None,
         lexicon: AnchorLexicon | None = None,
+        attribution: list[str] | None = None,
     ) -> tuple[Decimal | None, str | None, list[str]]:
         """entry_rule = REFERENCE_AS_COLLAR: the stated market level that may anchor this action's
         entry, the text it is written in, or why none may. ``levels`` are the interpreter's price
@@ -988,8 +1000,9 @@ class FamilyMapping(StrictModel):
         if "NO_PRESENT_MARKER" in why:  # no positive evidence at all
             return None, None, [ENTRY_ANCHOR_NOT_CURRENT, *why]
         own = self.anchor_names(asset, lexicon)
+        attributed: list[str] = []
         problems = self._sentence_problems(action, anchor, source, terms, levels, post_text,
-                                           markers, own, lexicon)
+                                           markers, own, lexicon, attribution=attributed)
         if problems:
             return None, None, problems
         if why:  # the disqualifying words: a second, redundant check
@@ -1009,6 +1022,8 @@ class FamilyMapping(StrictModel):
             foreign = foreign_words(source, anchor, allowed, self._month_spans(source))
             if foreign:
                 return None, None, [ENTRY_ANCHOR_INSTRUMENT_UNCLEAR, f"OTHER_WORDS:{len(foreign)}"]
+        if attribution is not None:
+            attribution += attributed
         return anchor, source, []
 
     def _month_spans(self, text: str) -> list[tuple[int, int]]:
@@ -1019,7 +1034,8 @@ class FamilyMapping(StrictModel):
                 *(m.span() for m in MONTH_WORD_RE.finditer(text))]
 
     def _sentence_problems(self, action, anchor, source, terms, levels, post_text, markers, own,
-                           lexicon, unknown_out: list[str] | None = None) -> list[str]:
+                           lexicon, unknown_out: list[str] | None = None,
+                           attribution: list[str] | None = None) -> list[str]:
         """The final rule (last review pass): the scope of the marked number is its whole
         sentence. Every alphabetic token in it must be on the allow-list (markers, connectors,
         function words, units, this family's names, the action's own side, verb and level words,
@@ -1066,12 +1082,26 @@ class FamilyMapping(StrictModel):
                 texts = [s for s, _ in whole]
                 at = texts.index(sentence) if sentence in texts else -1
                 before = texts[at - 1] if at > 0 else None
-                other = (unknown_tokens(before, allowed, self._month_spans(before))
-                         if before is not None else [])
-                if other:
-                    if unknown_out is not None:
-                        unknown_out += other
-                    return [ENTRY_ANCHOR_INSTRUMENT_UNCLEAR, "PRECEDING_SENTENCE"]
+                own_block = {s for s, _ in sentences(terms.clause)}
+                if before is None:
+                    case = "FIRST_SENTENCE"
+                elif (self.entry_anchor.anchor_scope == "ACTION_BLOCK" and before in own_block):
+                    # The interpreter delimited this action's clause; the level sentence follows it
+                    # with nothing in between. Which sentence its stop or target came from is not
+                    # exposed (PriceMention has no sentence index), so those are attributed only
+                    # as allow-listed sentences, below.
+                    case = "AFTER_OWN_INSTRUCTION"
+                else:
+                    other = unknown_tokens(before, allowed, self._month_spans(before))
+                    if other:
+                        if unknown_out is not None:
+                            unknown_out += other
+                        return [ENTRY_ANCHOR_INSTRUMENT_UNCLEAR, "PRECEDING_SENTENCE"]
+                    case = "AFTER_ALLOW_LISTED_SENTENCE"
+            else:
+                case = "OWN_SENTENCE"
+            if attribution is not None and case not in attribution:
+                attribution.append(case)
         return []
 
     def anchor_names(self, asset: str, lexicon: AnchorLexicon | None = None) -> list[str]:
@@ -1340,8 +1370,9 @@ class MappingPolicy:
         today = (now or datetime.now(UTC)).astimezone(
             ZoneInfo(entry.session.timezone if entry.session else "UTC")
         ).date()
+        attribution: list[str] = []
         anchor, source, problems = (None, None, []) if revoked else entry.entry_anchor_for(
-            action, asset, terms, levels, others, post_text, self.anchor_lexicon)
+            action, asset, terms, levels, others, post_text, self.anchor_lexicon, attribution)
         if problems:
             return MappingDecision(status="UNRESOLVED", reason=",".join(problems), **out), None
         instrument, problems = entry.select(action, asset, terms, today, held_contract, post_text,
@@ -1369,6 +1400,9 @@ class MappingPolicy:
         return MappingDecision(status="SUPPORTED", mapped=not entry.legacy_equivalent,
                                under_revoked_mapping=revoked,
                                entry_anchor=str(anchor) if anchor is not None else None,
+                               anchor_attribution=(",".join(attribution)
+                                                   if anchor is not None and attribution
+                                                   else None),
                                month_source=month_source, **out), instrument
 
     def _decide_v1(self, action: TradeAction, asset: str, entry: MappingEntry) -> MappingDecision:
