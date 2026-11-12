@@ -254,6 +254,18 @@ class Roll(StrictModel):
 class BasisShiftRules(StrictModel):
     max_abs_basis: Decimal = Field(gt=0)  # execution prices
     max_age_seconds: float = Field(gt=0, le=60)  # each quote's age and their skew
+    # Execution price per reference price. The basis is a difference, so the two series must be
+    # on the same price scale: exactly 1 is the only supported value (a ratio, such as an ETF
+    # against its index, is UNSUPPORTED for now). Required, so the owner states it.
+    scale_ratio: Decimal
+
+    @field_validator("scale_ratio")
+    @classmethod
+    def _same_scale(cls, v):
+        if v != 1:
+            raise ValueError(f"scale_ratio {v}: only series on the same price scale (scale_ratio = "
+                             "1) can be BASIS_SHIFT; any other ratio is UNSUPPORTED")
+        return v
 
 
 class ReferenceTriggerRules(StrictModel):
@@ -279,6 +291,10 @@ class FamilyMapping(StrictModel):
     approved_by: str | None = None
     approved_at: datetime | None = None
     note: str = ""
+    # DIRECT only: the reference and execution identities differ but are one price series (for
+    # example one ETF listed on two venues). Needs a stated reason.
+    same_series: bool = False
+    same_series_reason: str = ""
     reference: SeriesSpec | None = None
     execution: ExecutionSpec | None = None
     contract_selection: ContractSelection | None = None
@@ -313,9 +329,24 @@ class FamilyMapping(StrictModel):
             bad("a stock entry without sizing takes no session, roll or contracts")
         if self.approved and x.currency != "USD":
             bad("caps are in USD and no FX conversion exists: only USD execution may be approved")
-        if self.basis == "DIRECT" and not ref.same_series(x):
-            bad("DIRECT means the levels are the execution instrument's own prices: the reference "
-                "must be the execution series")
+        if self.same_series and self.basis != "DIRECT":
+            bad("same_series is only for DIRECT")
+        if self.same_series and not self.same_series_reason.strip():
+            bad("same_series = true needs a same_series_reason")
+        # A stock or ETF is never priced from an index, a spot rate or a CFD: their scales differ
+        # (review F10). Only REFERENCE_TRIGGER without a backstop keeps its levels in the
+        # reference series and never converts them.
+        cross_scale = x.sec_type == "STK" and ref.sec_type in ("IND", "CMDTY", "CFD")
+        if cross_scale and (self.basis in ("DIRECT", "BASIS_SHIFT") or self.basis_shift):
+            bad(f"a {ref.sec_type} reference and a STK execution are not on one price scale")
+        if self.basis == "DIRECT" and not self.same_series:
+            if not ref.same_series(x):
+                bad("DIRECT means the levels are the execution instrument's own prices: the "
+                    "reference must be the execution series (or declare same_series = true "
+                    "with a same_series_reason)")
+            if x.sec_type == "STK" and self.family != x.symbol:
+                bad(f"DIRECT family {self.family} is not the same price series as the stock "
+                    f"{x.symbol} it executes (declare same_series = true with a reason if it is)")
         if self.basis in ("BASIS_SHIFT", "REFERENCE_TRIGGER") and ref.same_series(x):
             bad(f"{self.basis} needs a reference series other than the execution instrument")
         if ref.sec_type == "FUT" and self.basis != "DIRECT":

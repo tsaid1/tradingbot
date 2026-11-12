@@ -159,7 +159,7 @@ def test_option_family_rules(tmp_path):
 
 def test_a_reference_trigger_backstop_needs_basis_rules(tmp_path):
     text = mapping_toml(approved=True).replace(
-        'basis_shift = { max_abs_basis = "40", max_age_seconds = 5 }\n', "")
+        'basis_shift = { max_abs_basis = "40", max_age_seconds = 5, scale_ratio = "1" }\n', "")
     with pytest.raises(ValueError, match="require_backstop"):
         policy(tmp_path, text)
 

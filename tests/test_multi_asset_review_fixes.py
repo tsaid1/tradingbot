@@ -589,3 +589,69 @@ def test_f9_direct_refuses_levels_marked_as_the_source_series(action):
 def test_f9_other_treatments_still_take_source_series_levels():
     a = act(basis=PriceBasis.SOURCE_SERIES, entry="5010", stop="4980", target="5070")
     assert gate(a, mq(terms("REFERENCE_TRIGGER"), reference=leg())).status == "APPROVE"
+
+
+# ================================================================== F10 / F11: the loader
+
+APP = 'approved = true\napproved_by = "o"\napproved_at = 2026-01-01T00:00:00Z\n'
+SIZE = ('sizing = { units_per_signal = 1, max_units = 1, max_notional = "100000" }\n'
+        'session = { policy = "REGULAR_ONLY", timezone = "UTC", days = ["MON"], '
+        'regular = ["13:00-21:00"] }\n')
+SPY = 'sec_type = "STK", asset_class = "ETF", symbol = "SPY", exchange = "SMART", currency = "USD"'
+IDX = 'sec_type = "IND", symbol = "SPX", exchange = "CBOE", currency = "USD"'
+
+
+def load(tmp_path, text):
+    p = tmp_path / "m.toml"
+    p.write_text(text)
+    return MappingPolicy.from_toml(p)
+
+
+def entry(family, basis, reference, execution, extra="", approval=APP):
+    return (f'version = 2\n[[mapping]]\nfamily = "{family}"\nbasis = "{basis}"\n{approval}'
+            f"reference = {{ {reference} }}\nexecution = {{ {execution} }}\n{SIZE}{extra}")
+
+
+@pytest.mark.parametrize("text,match", [
+    # Reviewer probe: the publisher's SPX mapped DIRECT onto SPY.
+    (entry("SPX", "DIRECT", SPY, SPY), "same price series"),
+    # Reviewer probe: an index-to-ETF BASIS_SHIFT with a cap of 6000 (a ratio treated as a gap).
+    (entry("SPX", "BASIS_SHIFT", IDX, SPY,
+           'basis_shift = { max_abs_basis = "6000", max_age_seconds = 5, scale_ratio = "1" }\n'),
+     "price scale"),
+    (entry("SPX", "BASIS_SHIFT", IDX, SPY,
+           'basis_shift = { max_abs_basis = "60", max_age_seconds = 5, scale_ratio = "0.1" }\n'),
+     "scale_ratio"),
+    # BASIS_SHIFT must declare its scale ratio.
+    (entry("QMTL", "BASIS_SHIFT",
+           'sec_type = "CMDTY", symbol = "QMS", exchange = "X", currency = "USD"',
+           'sec_type = "CFD", symbol = "QMC", exchange = "X", currency = "USD"',
+           'basis_shift = { max_abs_basis = "20", max_age_seconds = 5 }\n'), "scale_ratio"),
+    # A declared same series needs its reason.
+    (entry("SPX", "DIRECT", SPY, SPY, 'same_series = true\n'), "same_series_reason"),
+    (entry("SPX", "DIRECT", IDX, SPY, 'same_series = true\nsame_series_reason = "x"\n'),
+     "price scale"),
+    (entry("QMTL", "BASIS_SHIFT",
+           'sec_type = "CMDTY", symbol = "QMS", exchange = "X", currency = "USD"',
+           'sec_type = "CFD", symbol = "QMC", exchange = "X", currency = "USD"',
+           'basis_shift = { max_abs_basis = "20", max_age_seconds = 5, scale_ratio = "1" }\n'
+           'same_series = true\nsame_series_reason = "x"\n'), "only for DIRECT"),
+])
+def test_f10_the_loader_refuses_pairs_that_are_not_the_same_series_or_scale(tmp_path, text,
+                                                                          match):
+    with pytest.raises(ValueError, match=match):
+        load(tmp_path, text)
+
+
+def test_f10_legal_pairs_still_load(tmp_path):
+    ok = load(tmp_path, entry("SPY", "DIRECT", SPY, SPY))
+    assert ok.entries["SPY"].approved
+    spy_arca = SPY.replace('"SMART"', '"ARCA"')
+    ok = load(tmp_path, entry("SPY", "DIRECT", spy_arca, SPY,
+                              'same_series = true\nsame_series_reason = "one ETF, two venues"\n'))
+    assert ok.entries["SPY"].same_series
+    ok = load(tmp_path, entry(
+        "QMTL", "BASIS_SHIFT", 'sec_type = "CMDTY", symbol = "QMS", exchange = "X", currency = "USD"',
+        'sec_type = "CFD", symbol = "QMC", exchange = "X", currency = "USD"',
+        'basis_shift = { max_abs_basis = "20", max_age_seconds = 5, scale_ratio = "1" }\n'))
+    assert ok.entries["QMTL"].basis_shift.scale_ratio == 1

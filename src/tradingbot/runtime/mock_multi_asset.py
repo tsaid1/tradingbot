@@ -91,7 +91,7 @@ sizing = {{{{ units_per_signal = 2, max_units = 4, max_notional = "60000" }}}}
 {SESSION}
 roll = {{{{ business_days_before = 3, action = "FLATTEN" }}}}
 reference_trigger = {{{{ released_order_type = "MKT", reference_hours = ["13:30-20:00"], require_backstop = true }}}}
-basis_shift = {{{{ max_abs_basis = "40", max_age_seconds = 5 }}}}
+basis_shift = {{{{ max_abs_basis = "40", max_age_seconds = 5, scale_ratio = "1" }}}}
 
 [[mapping]]
 family = "QOIL"
@@ -118,7 +118,7 @@ contracts = [ {{{{ month = "202608", roll_date = 2026-07-28 }}}} ]
 sizing = {{{{ units_per_signal = 2, max_units = 4, max_notional = "50000" }}}}
 {SESSION}
 roll = {{{{ business_days_before = 3, action = "FLATTEN" }}}}
-basis_shift = {{{{ max_abs_basis = "20", max_age_seconds = 5 }}}}
+basis_shift = {{{{ max_abs_basis = "20", max_age_seconds = 5, scale_ratio = "1" }}}}
 
 [[mapping]]
 family = "QSTK.OPT"

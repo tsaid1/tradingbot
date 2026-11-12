@@ -52,7 +52,7 @@ execution = { sec_type = "STK", asset_class = "ETF", symbol = "TLT", exchange = 
 # session = { policy = "REGULAR_ONLY", timezone = "America/New_York", days = ["MON", "TUE", "WED", "THU", "FRI"], regular = ["09:30-16:00"] }
 # roll = { business_days_before = 3, action = "FLATTEN" }
 # reference_trigger = { released_order_type = "MKT", reference_hours = ["09:30-16:00"], require_backstop = true }
-# basis_shift = { max_abs_basis = "40", max_age_seconds = 5 }   # prices the backstop stop
+# basis_shift = { max_abs_basis = "40", max_age_seconds = 5, scale_ratio = "1" }   # prices the backstop stop
 #
 # --- an energy future quoted in its own contract month's price
 # [[mapping]]
@@ -81,7 +81,7 @@ execution = { sec_type = "STK", asset_class = "ETF", symbol = "TLT", exchange = 
 # sizing = { units_per_signal = 1, max_units = 2, max_notional = "50000" }
 # session = { policy = "REGULAR_ONLY", timezone = "America/New_York", days = ["MON", "TUE", "WED", "THU", "FRI"], regular = ["08:20-13:30"] }
 # roll = { business_days_before = 3, action = "FLATTEN" }
-# basis_shift = { max_abs_basis = "30", max_age_seconds = 5 }
+# basis_shift = { max_abs_basis = "30", max_age_seconds = 5, scale_ratio = "1" }
 #
 # --- another ETF, quoted in its own price, with its own sizing and session
 # [[mapping]]
