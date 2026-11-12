@@ -34,7 +34,10 @@ sends an order.
 
 Each alert notifies once when it opens, again every `[notify] realert_seconds` (default 1 h) while
 it stays open, and closes when its cause is gone. Channels: the notifications log, the alerts file
-(`<state_dir>/alerts.jsonl`, shown on *Exceptions*) and, optionally, macOS.
+(`<state_dir>/alerts.jsonl`, shown on *Exceptions*) and, optionally, macOS. An alert counts as
+notified only once a durable channel (the log or the alerts file) has accepted it; if none did, it
+stays open and un-notified and is sent again on the next cycle, so a failed channel never loses
+an alert.
 
 | Alert | Meaning | Action |
 |---|---|---|

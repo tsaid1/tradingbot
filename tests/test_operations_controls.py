@@ -9,6 +9,7 @@ from datetime import timedelta
 
 import pytest
 from runtime_harness import CLOSE, COMMENTARY, ENTRY, MAPPING, Runtime, post
+from runtime_harness import START as START_AT
 
 from tradingbot.execution import operator_catalog as cat
 from tradingbot.execution.coordinator import BROKER_RECONNECT_PENDING
@@ -551,3 +552,88 @@ def test_a_day_entry_that_expired_while_disconnected_is_adopted_and_reported(tmp
     assert ev["detail"]["ended"][a["order_ref"]] == "CANCELLED"
     assert session_state(rt.store)["state"] == "CONNECTED"
     assert rt.broker.open_orders() == []  # the waiting children were cancelled with it
+
+
+# ------------------------------------------------------------------------------ alert delivery
+
+
+class FlakyChannel:
+    """A durable channel that refuses while ``down`` (review note c)."""
+
+    durable = True
+
+    def __init__(self):
+        self.down = True
+        self.sent: list[tuple[str, str]] = []
+
+    def notify(self, kind, title, message):
+        if self.down:
+            raise OSError("invented: disk full")
+        self.sent.append((kind, title))
+        return True
+
+
+def test_an_alert_is_marked_notified_only_after_a_durable_channel_accepted_it(tmp_path):
+    from tradingbot.runtime.alerts import Alerter
+    from tradingbot.runtime.store import RuntimeStore
+
+    store = RuntimeStore(tmp_path / "runtime.sqlite3")
+    channel = FlakyChannel()
+    alerter = Alerter(store, N.FanoutNotifier([N.MacOSNotifier(platform="linux"), channel]),
+                      realert_seconds=3600, clock=lambda: START_AT)
+    assert alerter.raise_("X:1", N.BROKER_FAILURE, "Broker unreadable", "invented") is False
+    [row] = store.alerts(open_only=True)
+    assert row["last_notified_at"] is None and not row["notified"]
+    assert alerter.raise_("X:1", N.BROKER_FAILURE, "Broker unreadable", "invented") is False
+    channel.down = False
+    assert alerter.raise_("X:1", N.BROKER_FAILURE, "Broker unreadable", "invented") is True
+    assert channel.sent == [(N.BROKER_FAILURE, "Broker unreadable")]  # first delivery, no prefix
+    assert alerter.raise_("X:1", N.BROKER_FAILURE, "Broker unreadable", "invented") is False
+    assert store.alerts(open_only=True)[0]["notified"] == 1
+
+
+def test_a_one_off_event_whose_delivery_failed_is_retried_next_cycle(tmp_path):
+    from tradingbot.runtime.alerts import Alerter
+    from tradingbot.runtime.store import RuntimeStore
+
+    store = RuntimeStore(tmp_path / "runtime.sqlite3")
+    channel = FlakyChannel()
+    alerter = Alerter(store, N.FanoutNotifier([channel]), realert_seconds=3600,
+                      clock=lambda: START_AT)
+    alerter.event("EVENT:RECONNECTED:1", N.BROKER_RECONNECTED, "Broker session restored", "x")
+    assert [a["key"] for a in store.alerts(open_only=True)] == ["EVENT:RECONNECTED:1"]
+    assert alerter.retry_undelivered() == []
+    channel.down = False
+    assert alerter.retry_undelivered() == ["EVENT:RECONNECTED:1"]
+    assert store.alerts(open_only=True) == [] and channel.sent[0][0] == N.BROKER_RECONNECTED
+
+
+def test_the_service_retries_an_undelivered_alert_without_losing_it(tmp_path):
+    rt = Runtime(tmp_path, [])
+    channel = FlakyChannel()
+    rt.service.notifier = rt.service.alerter.notifier = N.FanoutNotifier([channel])
+    rt.step()
+    rt.halt()
+    rt.step()
+    assert channel.sent == []
+    assert any(a["key"] == "HALT" and not a["notified"] for a in rt.store.alerts(open_only=True))
+    channel.down = False
+    rt.step()
+    assert channel.sent == [(N.HALT_ENGAGED, "Emergency halt engaged")]
+    rt.run(3)
+    assert len(channel.sent) == 1
+
+
+def test_the_built_in_file_channels_report_whether_they_accepted(tmp_path):
+    ok = N.LogFileNotifier(tmp_path / "n.log")
+    assert ok.notify("K", "t", "m") is True
+    blocked = tmp_path / "blocked"
+    blocked.write_text("a file, not a directory")
+    assert N.LogFileNotifier(blocked / "n.log").notify("K", "t", "m") is False
+    assert N.AlertsFileNotifier(blocked / "a.jsonl").notify("K", "t", "m") is False
+    fan = N.FanoutNotifier([N.LogFileNotifier(blocked / "n.log"), N.AlertsFileNotifier(
+        tmp_path / "a.jsonl")])
+    assert fan.notify("K", "t", "m") is True
+    assert N.FanoutNotifier([N.LogFileNotifier(blocked / "n.log"),
+                             N.MacOSNotifier(runner=lambda *a, **k: None, platform="darwin")
+                             ]).notify("K", "t", "m") is False

@@ -996,6 +996,7 @@ class RuntimeService:
         runtime/alerts.py for the de-duplication and re-alert rule."""
         ex = self.coordinator.store
         open_exc = ex.exceptions(open_only=True)
+        self.alerter.retry_undelivered(now)  # one-off events no channel accepted yet (note c)
         # 1. Entries and adds of unknown outcome: at once, not after the settle or stuck period.
         keep: set[str] = set()
         unknown_refs = set()

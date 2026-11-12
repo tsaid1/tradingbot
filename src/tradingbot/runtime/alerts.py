@@ -11,6 +11,10 @@ store's ``alerts`` table. De-duplication rule:
 
 ``event`` is for one-off facts (a reconnect report, an operator action): notified once and kept
 in the alert history already resolved.
+
+Delivery (review note c): an alert counts as notified only once a durable channel has accepted it
+(``deliver``); until then it stays open and un-notified, ``raise_`` retries it on the next cycle
+and ``retry_undelivered`` retries one-off events, so a failed channel never loses an alert.
 """
 
 from __future__ import annotations
@@ -18,7 +22,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from datetime import datetime
 
-from tradingbot.runtime.notify import Notifier
+from tradingbot.runtime.notify import Notifier, deliver
 from tradingbot.runtime.store import RuntimeStore
 
 
@@ -34,11 +38,17 @@ class Alerter:
                now: datetime | None = None) -> bool:
         """Open (or keep open) the alert ``key`` and notify when due. True when notified."""
         now = now or self.clock()
-        new = self.store.open_alert(key, kind, message, now)
+        self.store.open_alert(key, kind, message, now)
         if not self.store.alert_notify_due(key, now, self.realert_seconds):
             return False
-        self.notifier.notify(kind, title if new else f"Still open: {title}", message)
+        first = not self._notified(key)
+        if not deliver(self.notifier, kind, title if first else f"Still open: {title}", message):
+            return False  # stays open and due: retried next cycle
+        self.store.mark_alert_notified(key, now)
         return True
+
+    def _notified(self, key: str) -> bool:
+        return any(a["key"] == key and a["notified"] for a in self.store.alerts(open_only=True))
 
     def sweep(self, prefix: str, keep: set[str], now: datetime | None = None, *,
               cleared_kind: str | None = None, cleared_title: str = "") -> list[str]:
@@ -55,6 +65,22 @@ class Alerter:
         """A one-off fact: notified once, kept in the history already resolved."""
         now = now or self.clock()
         self.store.open_alert(key, kind, message, now)
-        self.store.alert_notify_due(key, now, self.realert_seconds)
-        self.store.resolve_alerts(now, keep=set(), prefix=key)
-        self.notifier.notify(kind, title, message)
+        if deliver(self.notifier, kind, title, message):
+            self.store.mark_alert_notified(key, now)
+            self.store.resolve_alerts(now, keep=set(), prefix=key)
+        # Otherwise it stays open and un-notified until retry_undelivered delivers it.
+
+    def retry_undelivered(self, now: datetime | None = None) -> list[str]:
+        """Deliver every one-off event (``EVENT:`` key) still open because no channel accepted it.
+        Returns the keys delivered now."""
+        now = now or self.clock()
+        done = []
+        for a in self.store.alerts(open_only=True):
+            if not a["key"].startswith("EVENT:") or a["notified"]:
+                continue
+            title = a["kind"].replace("_", " ").capitalize() + " (delivery retried)"
+            if deliver(self.notifier, a["kind"], title, a["detail"]):
+                self.store.mark_alert_notified(a["key"], now)
+                self.store.resolve_alerts(now, keep=set(), prefix=a["key"])
+                done.append(a["key"])
+        return done

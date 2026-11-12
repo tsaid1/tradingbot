@@ -402,7 +402,8 @@ class RuntimeStore:
 
     def alert_notify_due(self, key: str, at: datetime, every_seconds: float) -> bool:
         """True when the open alert ``key`` was never notified, or last notified at least
-        ``every_seconds`` ago; it is then marked notified at ``at``."""
+        ``every_seconds`` ago. It is not marked here: ``mark_alert_notified`` does that once a
+        channel has accepted the notification (review note c)."""
         with self.tx() as c:
             row = c.execute(
                 "SELECT last_notified_at, resolved_at FROM alerts WHERE key=?", (key,)
@@ -410,13 +411,14 @@ class RuntimeStore:
             if row is None or row["resolved_at"] is not None:
                 return False
             last = _dt(row["last_notified_at"])
-            if last is not None and (at - last).total_seconds() < every_seconds:
-                return False
+            return last is None or (at - last).total_seconds() >= every_seconds
+
+    def mark_alert_notified(self, key: str, at: datetime) -> None:
+        with self.tx() as c:
             c.execute(
                 "UPDATE alerts SET last_notified_at=?, notified=COALESCE(notified,0)+1 WHERE key=?",
                 (at.isoformat(), key),
             )
-            return True
 
     def resolve_alerts(self, at: datetime, *, keep: set[str], prefix: str) -> list[str]:
         """Resolve every open alert under ``prefix`` whose key is not in ``keep``."""

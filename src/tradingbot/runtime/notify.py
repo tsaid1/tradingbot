@@ -57,15 +57,26 @@ OPERATOR_QUEUE_UNAVAILABLE = "OPERATOR_QUEUE_UNAVAILABLE"
 
 @runtime_checkable
 class Notifier(Protocol):
-    def notify(self, kind: str, title: str, message: str) -> None: ...
+    def notify(self, kind: str, title: str, message: str) -> bool | None: ...
+
+
+def deliver(notifier, kind: str, title: str, message: str) -> bool:
+    """Notify and say whether it was accepted (review note c): False when the notifier raised or
+    returned False; a notifier that returns nothing is taken as accepted unless it raised."""
+    try:
+        return notifier.notify(kind, title, message) is not False
+    except Exception:  # noqa: BLE001 - a notification never stops the service
+        return False
 
 
 class LogFileNotifier:
+    durable = True
+
     def __init__(self, path: str | Path, clock: Callable[[], datetime] | None = None):
         self.path = Path(path)
         self.clock = clock or (lambda: datetime.now(UTC))
 
-    def notify(self, kind: str, title: str, message: str) -> None:
+    def notify(self, kind: str, title: str, message: str) -> bool:
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             line = {
@@ -77,7 +88,8 @@ class LogFileNotifier:
             with self.path.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(line, sort_keys=True) + "\n")
         except OSError:
-            pass
+            return False
+        return True
 
 
 def _applescript_string(value: str) -> str:
@@ -104,18 +116,29 @@ class MacOSNotifier:
 
 
 class FanoutNotifier:
+    """Every channel, in order. Accepted (True) when at least one durable channel (``durable =
+    True``: the log, the alerts file) accepted it; with no durable channel configured, any
+    channel's acceptance counts."""
+
     def __init__(self, notifiers: Sequence[Notifier]):
         self.notifiers = list(notifiers)
 
-    def notify(self, kind: str, title: str, message: str) -> None:
+    def notify(self, kind: str, title: str, message: str) -> bool:
+        any_durable = any(getattr(n, "durable", False) for n in self.notifiers)
+        accepted = False
         for n in self.notifiers:
-            with contextlib.suppress(Exception):
-                n.notify(kind, title, message)
+            if deliver(n, kind, title, message) and (
+                getattr(n, "durable", False) or not any_durable
+            ):
+                accepted = True
+        return accepted
 
 
 class AlertsFileNotifier:
     """A durable local alerts file (JSON lines) the dashboard reads. Rotated by size: at
     ``max_bytes`` the file moves to ``.1`` (older ones to ``.2`` ... ``.<keep>``)."""
+
+    durable = True
 
     def __init__(self, path: str | Path, clock: Callable[[], datetime] | None = None, *,
                  max_bytes: int = 1_000_000, keep: int = 3):
@@ -133,7 +156,7 @@ class AlertsFileNotifier:
                 older.replace(self.path.with_name(f"{self.path.name}.{n + 1}"))
         self.path.replace(self.path.with_name(f"{self.path.name}.1"))
 
-    def notify(self, kind: str, title: str, message: str) -> None:
+    def notify(self, kind: str, title: str, message: str) -> bool:
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self._rotate()
@@ -142,7 +165,8 @@ class AlertsFileNotifier:
             with self.path.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(line, sort_keys=True) + "\n")
         except OSError:
-            pass
+            return False
+        return True
 
 
 def read_alerts_file(path: str | Path, limit: int = 200) -> list[dict]:
