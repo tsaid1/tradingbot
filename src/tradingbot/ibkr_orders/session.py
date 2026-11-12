@@ -700,6 +700,38 @@ class PaperOrderSession(IbkrSession):
                     raise CancelFailed(f"cancel of order {order_id} refused: {t.cancel_error}")
                 return self._snap(t)
 
+    def dry_check_exit(self, order_id: int) -> None:
+        """Before a protective SELL of this client is cancelled or shrunk for an exit: would a
+        closing SELL LMT for what is held pass the guard once this order is gone? Same inputs as
+        at send time (fresh position, own fills, working orders without this one, the count, the
+        clock and hours). Raises ``OrderRefused`` if not. Sends nothing, counts nothing."""
+        with self._order_lock:
+            self._require_order_mode()
+            with self._cond:
+                t = self._tracks.get(order_id)
+                if t is None or not t.own:
+                    raise OrderNotWorking(f"order {order_id} is not an order of this client")
+                price = t.stop_price or t.limit_price
+            facts, position, working = self._fresh_state()
+            held = position[0]
+            if held is not None and held <= 0 and position[1] == held:
+                return  # nothing held: the cancel only reduces risk
+            qty = min(held if held is not None and held > 0 else Decimal(1),
+                      Decimal(self._caps.max_order_quantity))
+            c = self.contract
+            with self._cond:
+                probe_id = max(self._next_local_id, self._counter.max_order_id + 1,
+                               max(self._tracks, default=0) + 1, 1)
+            probe = ProposedOrder(
+                order_id=probe_id, order_ref="EXIT-DRY-CHECK", account=self._cfg.account,
+                con_id=c.con_id, symbol=c.symbol, sec_type=c.sec_type, currency=c.currency,
+                action="SELL", quantity=qty, order_type="LMT", limit_price=price,
+                stop_price=None, tif="DAY", outside_rth=False)
+            rest = [w for w in working if w.order_id != order_id]
+            decision = self._evaluate(probe, facts, position, rest, 0)
+            if not decision:
+                raise OrderRefused(decision)
+
     # ------------------------------------------------------------------ reads
     def open_orders(self, *, timeout: float | None = None) -> list[OrderSnapshot]:
         """``reqAllOpenOrders`` (every client and TWS) until ``openOrderEnd``. Raises on failure.

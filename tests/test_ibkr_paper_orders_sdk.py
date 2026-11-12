@@ -1008,3 +1008,103 @@ def test_contract_refs_carry_mains_contract_fields_and_key(tws, tmp_path):
             (OrderStatus.SUBMITTED, 1, 0, 1)
     finally:
         s.disconnect()
+
+
+# --- confirmation review: the cross-check survives a restart -----------------------------------
+def test_probe_restart_while_the_read_lags_an_entry_fill_refuses_a_second_buy(tws, tmp_path):
+    s = make(tws, tmp_path)
+    try:
+        snaps = s.place([buy(), stop()])
+        tws.positions_lag = True
+        tws.fill(snaps[0].order_id, 1, 88.11)  # long 1; the read still says 0
+        assert settle(lambda: s._tracks[snaps[0].order_id].status == OrderStatus.FILLED)
+    finally:
+        s.disconnect()
+    again = make(tws, tmp_path)  # restart while the read still lags
+    try:
+        with pytest.raises(OrderRefused) as info:
+            again.place([buy("TB-0002")])
+        assert info.value.refusal.reason == RefusalReason.POSITION_DISAGREEMENT
+        tws.catch_up_positions()  # the read agrees again: the cap decides
+        with pytest.raises(OrderRefused) as info:
+            again.place([buy("TB-0003")])
+        assert info.value.refusal.reason == RefusalReason.POSITION_CAP
+        assert placed(tws) == 2
+    finally:
+        again.disconnect()
+
+
+def test_probe_restart_while_the_read_lags_a_closing_fill_refuses_a_second_sell(tws, tmp_path):
+    s = make(tws, tmp_path)
+    try:
+        _long_one_without_stop(tws, s)
+        close = s.place([_sell("TB-C1")])
+        tws.positions_lag = True
+        tws.fill(close[0].order_id, 1, 88.00)  # flat; the read still says 1
+        assert settle(lambda: s._tracks[close[0].order_id].status == OrderStatus.FILLED)
+    finally:
+        s.disconnect()
+    again = make(tws, tmp_path)
+    try:
+        with pytest.raises(OrderRefused) as info:
+            again.place([_sell("TB-C2")])
+        assert info.value.refusal.reason == RefusalReason.POSITION_DISAGREEMENT
+        assert placed(tws) == 3
+    finally:
+        again.disconnect()
+
+
+# --- confirmation review: never cancel the stop for an exit the guard would refuse --------------
+def _held_with_stop(tws, tmp_path):
+    s, broker, coord = coordinator(tws, tmp_path)
+    out = run(coord, "p1", tlt_open())
+    tws.fill(fake_id(tws, out.order_ref), 1, 88.11)
+    assert settle(lambda: coord.sync() and coord.ledger()[0].quantity == 1)
+    return s, broker, coord, out
+
+
+def test_a_close_the_guard_would_refuse_cancels_nothing(tws, tmp_path):
+    s, _broker, coord, out = _held_with_stop(tws, tmp_path)
+    try:
+        idea = coord.ledger()[0].idea_id
+        for i, price in enumerate(("87.10", "87.20", "87.30", "87.40")):
+            assert run(coord, f"m{i}", action(f"raise{i}", Action.MODIFY, idea=idea, stop=price,
+                                              symbol="TLT")).state == IntentState.APPLIED
+        assert s.submissions_used == 6  # the close would be EXPERIMENT_FINISHED
+        close = run(coord, "c1", action("close", Action.CLOSE, idea=idea, symbol="TLT"))
+        assert close.state != IntentState.WORKING
+        stop_id = fake_id(tws, f"{out.order_ref}.STP")
+        assert tws.orders[stop_id].status == "Submitted"  # the stop still protects the share
+        assert tws.count("CANCEL_ORDER") == 0 and placed(tws) == 6
+    finally:
+        coord.close()
+        s.disconnect()
+
+
+def test_a_close_refused_after_the_stop_was_cancelled_reports_protection_absent(
+        tws, tmp_path, monkeypatch):
+    from tradingbot.ibkr_orders.broker import ProtectionLost
+    from tradingbot.ibkr_orders.guard import Refusal
+    s, broker, coord, _out = _held_with_stop(tws, tmp_path)
+    try:
+        real_place = s.place
+
+        def refuse_sells(specs):
+            if specs[0].action == "SELL":  # the real send is refused after the dry check passed
+                raise OrderRefused(Refusal(RefusalReason.OUTSIDE_LIQUID_HOURS, "invented"))
+            return real_place(specs)
+
+        monkeypatch.setattr(s, "place", refuse_sells)
+        idea = coord.ledger()[0].idea_id
+        close = run(coord, "c1", action("close", Action.CLOSE, idea=idea, symbol="TLT"))
+        assert close.state != IntentState.WORKING
+        journal = coord.store.journal(close.order_ref)
+        assert any("POSITION_OPEN_PROTECTION_ABSENT" in str(e.detail) for e in journal)
+        assert broker.protection_lost and "TLT" in broker.protection_lost
+        coord.sync()  # the next read raises the core's own exception
+        assert any(e.kind == "UNPROTECTED_POSITION" for e in coord.store.exceptions(
+            open_only=True))
+        assert issubclass(ProtectionLost, BrokerError)
+    finally:
+        coord.close()
+        s.disconnect()

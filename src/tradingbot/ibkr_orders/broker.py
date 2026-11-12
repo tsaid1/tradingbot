@@ -48,6 +48,13 @@ from tradingbot.ibkr_orders.timefmt import parse_broker_time
 from tradingbot.models import AssetClass, Instrument
 
 
+class ProtectionLost(BrokerError):
+    """POSITION OPEN, PROTECTION ABSENT: an exit was refused or failed (definitely not sent)
+    after this binding had cancelled the protective stop for it, and no working stop covers the
+    held position. The execution core records it as a submit error; its next ``sync`` raises
+    UNPROTECTED_POSITION (``IbkrPaperBroker.protection_lost`` holds the message)."""
+
+
 class PartialBracket(AckLost):
     """Part of a bracket was accepted and part was not. The parent's cancel has been requested;
     the coordinator must treat the entry as of unknown outcome (look it up), never as success."""
@@ -70,6 +77,8 @@ class IbkrPaperBroker:
     def __init__(self, session: Any) -> None:
         self._s = session
         self._asset_class: dict[int, AssetClass] = {}
+        self._stops_cancelled: set[str] = set()  # protective stops this binding cancelled
+        self.protection_lost = ""  # set when an exit failed after its stop was cancelled
 
     # ------------------------------------------------------------------ helpers
     def _contract_for(self, con_id: int, symbol: str, sec_type: str, currency: str,
@@ -117,16 +126,56 @@ class IbkrPaperBroker:
             avg_fill_price=s.avg_fill_price, reason=reason, updated_at=s.updated_at,
         )
 
-    def _find(self, order_ref: str) -> int:
-        """The newest order id of this client carrying ``order_ref`` that is not terminal."""
+    def _find_snap(self, order_ref: str) -> OrderSnapshot:
+        """The newest order of this client carrying ``order_ref`` that is not terminal."""
         try:
             snaps = self._s.open_orders()
         except IbkrError as exc:
             raise BrokerError(f"open orders unreadable: {exc}") from exc
-        ids = [s.order_id for s in snaps if s.own and s.order_ref == order_ref]
-        if not ids:
+        mine = [s for s in snaps if s.own and s.order_ref == order_ref]
+        if not mine:
             raise OrderNotFound(f"no working order with ref {order_ref}")
-        return max(ids)
+        return max(mine, key=lambda s: s.order_id)
+
+    def _find(self, order_ref: str) -> int:
+        return self._find_snap(order_ref).order_id
+
+    def _dry_check_exit(self, snap: OrderSnapshot) -> bool:
+        """For a protective SELL stop: refuse to cancel or shrink it when the exit it makes room
+        for would be refused by the guard. True when the order is such a stop."""
+        if snap.action != "SELL" or snap.order_type != "STP":
+            return False
+        try:
+            self._s.dry_check_exit(snap.order_id)
+        except OrderRefused as exc:
+            raise BrokerError(f"EXIT_WOULD_BE_REFUSED: {exc}; the protective stop "
+                              f"{snap.order_ref} was NOT cancelled or resized") from exc
+        except IbkrError as exc:
+            raise BrokerError(f"exit dry check failed: {exc}; the protective stop "
+                              f"{snap.order_ref} was NOT cancelled or resized") from exc
+        return True
+
+    def _exit_failed(self, order: OrderIntent, children: Sequence[OrderIntent],
+                     exc: Exception) -> BrokerError:
+        """A definite failure (nothing sent). For an exit after a stop was cancelled for it,
+        report POSITION OPEN, PROTECTION ABSENT unambiguously."""
+        if order.side != OrderSide.SELL or children or not self._stops_cancelled:
+            return BrokerError(str(exc))
+        try:
+            held = sum((p.quantity for p in self._s.positions()
+                        if p.con_id == self._s.contract.con_id), Decimal(0))
+            stops = [s for s in self._s.open_orders()
+                     if s.own and s.action == "SELL" and s.order_type == "STP"]
+        except IbkrError as read:
+            held, stops = None, []
+            exc = Exception(f"{exc}; and the position/orders are unreadable: {read}")
+        if held is not None and (held <= 0 or stops):
+            return BrokerError(str(exc))
+        self.protection_lost = (
+            f"POSITION_OPEN_PROTECTION_ABSENT: {held if held is not None else 'unknown'} "
+            f"{self._s.contract.symbol} held and no working protective stop (cancelled for this "
+            f"exit); the exit {order.order_ref} was not sent: {exc}")
+        return ProtectionLost(self.protection_lost)
 
     def _sent_since(self, before: int | None) -> bool:
         after = self._s.submissions_used
@@ -184,7 +233,7 @@ class IbkrPaperBroker:
         except OrderRefused as exc:
             if self._sent_since(before):
                 raise PartialBracket(f"refused mid-bracket: {exc}") from exc
-            raise BrokerError(str(exc)) from exc
+            raise self._exit_failed(order, children, exc) from exc
         except _SessionPartialBracket as exc:
             raise PartialBracket(str(exc)) from exc
         except OrderOutcomeUnknown as exc:
@@ -192,12 +241,17 @@ class IbkrPaperBroker:
         except IbkrError as exc:
             if self._sent_since(before):
                 raise AckLost(f"outcome unknown after sending: {exc}") from exc
-            raise BrokerError(str(exc)) from exc
+            raise self._exit_failed(order, children, exc) from exc
+        if order.side == OrderSide.SELL and not children:
+            self._stops_cancelled.clear()  # the exit is at the broker: it is the protection now
         return [self._order(s) for s in snaps]
 
     def modify(self, order_ref: str, *, limit_price: Decimal | None = None,
                stop_price: Decimal | None = None, quantity: int | None = None) -> BrokerOrder:
-        order_id = self._find(order_ref)
+        snap = self._find_snap(order_ref)
+        order_id = snap.order_id
+        if quantity is not None and quantity < snap.total_quantity:
+            self._dry_check_exit(snap)  # a protective stop shrunk for an exit
         before = self._s.submissions_used
         try:
             snap = self._s.modify(order_id, limit_price=limit_price, stop_price=stop_price,
@@ -217,9 +271,14 @@ class IbkrPaperBroker:
         return self._order(snap)
 
     def cancel(self, order_ref: str) -> BrokerOrder:
-        order_id = self._find(order_ref)
+        snap = self._find_snap(order_ref)
+        order_id = snap.order_id
+        stop = self._dry_check_exit(snap)  # never remove protection for a refused exit
         try:
-            return self._order(self._s.cancel(order_id))
+            out = self._order(self._s.cancel(order_id))
+            if stop:
+                self._stops_cancelled.add(order_ref)
+            return out
         except OrderNotWorking as exc:
             raise OrderNotFound(str(exc)) from exc
         except IbkrError as exc:

@@ -393,6 +393,13 @@ def _stage3(cfg: PaperOrderConfig, ev: dict) -> None:
                                                   stop_price=str(stop + STOP_RAISE)), gate))
         step("close", coord.execute(src, act("close", Action.CLOSE,
                                              idea_reference=ledger.idea_id), gate))
+        if broker.protection_lost:  # the close was refused after its stop was cancelled
+            coord.sync()  # the core raises UNPROTECTED_POSITION now, not at a later read
+            ev.update(passed=False, protection_lost=broker.protection_lost,
+                      why_failed="POSITION OPEN, PROTECTION ABSENT: the close was not sent after "
+                      "the stop was cancelled. Close the share by hand in TWS now (runbook: "
+                      "Emergency stop).")
+            return
         if not _wait(lambda: coord.sync() and coord.ledger()[0].quantity == 0,
                      FILL_TIMEOUT_SECONDS):
             ev.update(passed=False, why_failed="the closing limit did not fill in time: run "
