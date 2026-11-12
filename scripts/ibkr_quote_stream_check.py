@@ -3,7 +3,7 @@ the paper TWS and approved the run, and only after the independent review).
 
     python scripts/ibkr_quote_stream_check.py [--config PATH] [--report-dir PATH]
         [--contract symbol=TLT,sec_type=STK,exchange=SMART,currency=USD,primary_exchange=NASDAQ]...
-        [--seconds 20] [--market-data-type 3] [--max-age 3]
+        [--seconds 20] [--market-data-type 1|3] [--max-age 3]
 
 Loads the private paper config exactly as ``ibkr_paper_check.py`` does and connects (preflight,
 identity gate and read-only verification all apply). For each contract in turn (default: TLT;
@@ -55,7 +55,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--seconds", type=float, default=DEFAULT_HOLD_SECONDS,
                         help="hold time per stream (default 20, maximum 120)")
     parser.add_argument("--market-data-type", type=int, default=3,
-                        help="reqMarketDataType for every stream (default 3)")
+                        help="reqMarketDataType for every stream: 1 or 3 (default 3)")
     parser.add_argument("--max-age", type=float, default=DEFAULT_MAX_AGE_SECONDS,
                         help="per-side age limit for the entry freshness check (default 3)")
     args = parser.parse_args(argv)

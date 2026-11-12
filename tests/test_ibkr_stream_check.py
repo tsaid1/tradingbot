@@ -193,7 +193,7 @@ def test_unverified_read_only_is_failed_and_opens_nothing():
 
 @pytest.mark.parametrize(("seconds", "mdt", "age", "n"), [
     (0.5, 3, 3, 1), (121, 3, 3, 1), (True, 3, 3, 1), (20, 5, 3, 1), (20, 3, 0, 1), (20, 3, 61, 1),
-    (20, 3, 3, 0), (20, 3, 3, 11)])
+    (20, 3, 3, 0), (20, 3, 3, 11), (20, 2, 3, 1), (20, 4, 3, 1)])
 def test_arguments_validated_before_anything(seconds, mdt, age, n):
     with pytest.raises(QueryFileInvalid):
         validate_args([TLT_QUERY] * n, seconds, mdt, age)
@@ -201,6 +201,7 @@ def test_arguments_validated_before_anything(seconds, mdt, age, n):
 
 def test_hold_has_a_hard_maximum():
     validate_args([TLT_QUERY], 120, 3, 3)
+    validate_args([TLT_QUERY], 120, 1, 3)
     with pytest.raises(QueryFileInvalid):
         run_stream_check([TLT_QUERY], None, hold_seconds=600,
                          loader=lambda p: pytest.fail("config read"))
@@ -228,7 +229,8 @@ def _script():
 
 
 @pytest.mark.parametrize("argv", [["--seconds", "500"], ["--contract", "bogus=1"],
-                                  ["--market-data-type", "9"]])
+                                  ["--market-data-type", "9"], ["--market-data-type", "2"],
+                                  ["--market-data-type", "4"]])
 def test_script_refuses_bad_arguments_before_reading_config(argv, tmp_path, monkeypatch, capsys):
     mod = _script()
     monkeypatch.setattr(mod, "run_stream_check", lambda *a, **k: pytest.fail("ran"))

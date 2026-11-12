@@ -31,6 +31,7 @@ STREAM_CHECK_SCHEMA = "tradingbot.ibkr.quote_stream_check/1"
 STREAM_CHECK_PREFIX = "ibkr_quote_stream_check"
 DEFAULT_HOLD_SECONDS, MAX_HOLD_SECONDS = 20.0, 120.0
 MAX_CONTRACTS = 10
+STREAM_CHECK_TYPES = (1, 3)  # live, or live-if-entitled-else-delayed
 DEFAULT_MAX_AGE_SECONDS = 3.0  # the approved entry rule's per-side limit
 POLL_SECONDS = 0.25
 COMPLETE, FAILED = "COMPLETE", "FAILED"
@@ -75,8 +76,8 @@ def validate_args(queries: Sequence[ContractQuery], hold_seconds: float, market_
     if (isinstance(hold_seconds, bool) or not isinstance(hold_seconds, (int, float))
             or not 1 <= hold_seconds <= MAX_HOLD_SECONDS):
         raise QueryFileInvalid(f"--seconds must be in 1..{MAX_HOLD_SECONDS:.0f}")
-    if market_data_type not in MARKET_DATA_TYPE_NAMES:
-        raise QueryFileInvalid("--market-data-type must be 1, 2, 3 or 4")
+    if market_data_type not in STREAM_CHECK_TYPES:  # 2 / 4 (frozen) can never be LIVE
+        raise QueryFileInvalid("--market-data-type must be 1 or 3")
     if (isinstance(max_age_seconds, bool) or not isinstance(max_age_seconds, (int, float))
             or not 0 < max_age_seconds <= 60):
         raise QueryFileInvalid("--max-age must be in (0, 60]")
