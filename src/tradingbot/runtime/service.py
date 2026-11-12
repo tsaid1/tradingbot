@@ -78,7 +78,12 @@ from tradingbot.models import Action, Instrument, LegQuote, MappedQuote, Quote
 from tradingbot.runtime import notify as N
 from tradingbot.runtime.alerts import Alerter
 from tradingbot.runtime.config import RuntimeConfig
-from tradingbot.runtime.mapping import FamilyMapping, MappingDecision, MappingPolicy
+from tradingbot.runtime.mapping import (
+    AnchorLexicon,
+    FamilyMapping,
+    MappingDecision,
+    MappingPolicy,
+)
 from tradingbot.runtime.notify import Notifier
 from tradingbot.runtime.operator_actions import OperatorQueue, OperatorQueueUnavailable
 from tradingbot.runtime.operator_apply import (
@@ -89,7 +94,7 @@ from tradingbot.runtime.operator_apply import (
     apply_pending,
     session_state,
 )
-from tradingbot.runtime.sources import SourceAdapter, SourceError
+from tradingbot.runtime.sources import ReplayFileSource, SourceAdapter, SourceError
 from tradingbot.runtime.store import RuntimeStore, write_json_atomic
 from tradingbot.source_events import SourcePost
 from tradingbot.tkl_interpreter import LexiconExtension, TklInterpreter, group_linked_actions
@@ -212,6 +217,16 @@ def _safe_error(exc: BaseException) -> str:
     return type(exc).__name__
 
 
+
+def load_lexicons(path) -> tuple[LexiconExtension, AnchorLexicon]:
+    """The private lexicon extension: the interpreter's patterns, and its optional
+    ``entry_anchor`` section (present-market markers and family aliases), which only the mapping
+    policy reads. The interpreter never sees that section."""
+    with open(path, encoding="utf-8") as f:
+        raw = json.load(f)
+    section = raw.pop("entry_anchor", None) or {}
+    return LexiconExtension.model_validate(raw), AnchorLexicon.model_validate(section)
+
 class RuntimeService:
     def __init__(
         self,
@@ -222,9 +237,13 @@ class RuntimeService:
         notifier: Notifier | None = None,
         clock: Callable[[], datetime] | None = None,
         store: RuntimeStore | None = None,
+        allow_what_if_mapping: bool = False,
     ):
         if config.mode != "mock":
             raise ValueError("only mock mode may run")
+        if allow_what_if_mapping and not isinstance(source, ReplayFileSource):
+            # A what-if mapping is an offline analysis aid: never with a live source.
+            raise ValueError("a what-if mapping may only be used with a replay-file source")
         self.config = config
         self.clock = clock or (lambda: datetime.now(UTC))
         self.source = source
@@ -232,7 +251,10 @@ class RuntimeService:
         self.notifier = notifier or N.LogFileNotifier(config.notification_log, self.clock)
         config.paths.state_dir.mkdir(parents=True, exist_ok=True)
         self.store = store or RuntimeStore(config.runtime_db)
-        self.mapping = MappingPolicy.from_toml(config.paths.mapping_file)
+        self.mapping = MappingPolicy.from_toml(
+            config.paths.mapping_file, allow_what_if=allow_what_if_mapping
+        )
+        self.mapping.check_policy(config.policy)  # an anchored entry always has a stop
         self.alerter = Alerter(
             self.store, self.notifier, realert_seconds=config.notify.realert_seconds,
             clock=self.clock,
@@ -247,7 +269,8 @@ class RuntimeService:
             self.replay = _StampingReplay(config.replay_db, self.coordinator, self.clock)
             lexicon = None
             if config.interpreter.lexicon_path is not None:
-                lexicon = LexiconExtension.from_json(config.interpreter.lexicon_path)
+                lexicon, self.mapping.anchor_lexicon = load_lexicons(
+                    config.interpreter.lexicon_path)
             self.interpreter = TklInterpreter(context=self.store.load_context(), lexicon=lexicon)
         except BaseException:
             self.coordinator.close()
@@ -271,6 +294,7 @@ class RuntimeService:
             source=source.name,
             cursor=source.cursor(),
             restart=self.cycles > 0,
+            what_if_mapping=self.mapping.what_if is not None,
         )
 
     # ================================================================== cycle
@@ -699,6 +723,10 @@ class RuntimeService:
             held=self._held_contracts(),
             recorded=recorded,
             post_text=post.text,  # an option must be one leg across the whole post
+            # The interpreter's price mentions per action, as (role, value): read only by an
+            # entry with entry_rule = REFERENCE_AS_COLLAR, for its entry anchor.
+            levels={c.action_id: [(m.role.value, m.value) for m in c.prices]
+                    for c in interpreted.classifications},
         )
         quotes = self._gate_quotes(mapped, decisions, decision_now, recorded)
         self.replay.gate_stamps = {}
@@ -854,6 +882,12 @@ class RuntimeService:
                         entry, exits_only = self.mapping.entries[d.family], False
                     quotes[key] = self._mapped_quote(entry, a.instrument, now,
                                                      exits_only=exits_only)
+                if d.entry_anchor is not None:
+                    # The anchor the mapping policy accepted for this action (REFERENCE_AS_COLLAR):
+                    # the gateway compares it with the live price in its own series.
+                    q = quotes[key]
+                    quotes[key] = q.model_copy(update={"entry_anchors": {
+                        **q.entry_anchors, a.action_id: Decimal(d.entry_anchor)}})
                 continue
             symbol = a.instrument.symbol
             if symbol in quotes:

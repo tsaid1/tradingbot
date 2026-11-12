@@ -35,6 +35,8 @@ ETF. An entry states:
 | `roll` | `business_days_before` the roll date, and `action = "FLATTEN"` |
 | `basis_shift` | `max_abs_basis`, `max_age_seconds` and `scale_ratio` (for BASIS_SHIFT, or for a backstop). `scale_ratio` must be declared and must be exactly `1`: any other ratio is UNSUPPORTED |
 | `reference_trigger` | `released_order_type = "MKT"`, the `reference_hours` when the reference updates, and `require_backstop` |
+| `entry_rule`, `entry_anchor` | `EXPLICIT_ENTRY_ONLY` (default) or `REFERENCE_AS_COLLAR` with its required limits `max_adverse_move`, `max_favourable_move` (`"2.5"` in the anchor's own price units, or `"0.5%"` of it) and `max_signal_age_seconds`. See "Entry rule" below |
+| `level_contract_rule` | `EXPLICIT_MONTH_ONLY` (default) or `FRONT_MONTH`, for a DIRECT future whose levels are a futures series. See "Level contract rule" below |
 
 A family with no entry is marked `UNSUPPORTED_INSTRUMENT_MAPPING`. An entry that is not approved is
 marked `MAPPING_NOT_APPROVED`. An approved entry that cannot select exactly one contract gets
@@ -56,7 +58,10 @@ after removing the recognised month forms and the numbers the interpreter alread
 action (its entry, stop and target, and a reduction percentage), any token still left that carries
 a digit (a percentage, a date, a time, a count, a second price, `09/26`, `U 26`), any month name, or
 any token shaped like a contract code for the family's roots in any case (`qifu6`, `QIFU`) HOLDs
-with `CONTRACT_MONTH_UNRECOGNISED`. `EXPLICIT_OR_NEAREST` uses the nearest month only for a clause
+with `CONTRACT_MONTH_UNRECOGNISED`. Shaped like a code means the root followed by a month code, a
+month name or a digit; an ordinary word that merely starts with the root's letters ("stop" for a
+root `STO`) is not one. The number in an index's own name ("S&P 500", "Nasdaq 100", "Russell 2000")
+is part of the market's name and is skipped, like a recognised month. `EXPLICIT_OR_NEAREST` uses the nearest month only for a clause
 with no such leftover token at all. A follow-up on an open idea uses the idea's own contract. "May" and "march" count as months only in one of the forms
 above. A month name with a two-digit number is read as a year: "Dec 18" is December 2018.
 
@@ -88,7 +93,11 @@ the execution series or a stock family that is not its own ticker (unless `same_
 with a reason), an index, spot or CFD reference with a stock or ETF execution under DIRECT,
 BASIS_SHIFT or a backstop (their price scales differ), BASIS_SHIFT rules without
 `scale_ratio = 1`, a selection rule that would pick a contract already in its roll window, or an
-option that is not DIRECT. A stock or ETF entry quoted in its own price, with no sizing and no
+option that is not DIRECT, or a file with a top-level `what_if` key. A `what_if` file is an offline
+analysis aid (an invented mapping for a historical replay), never an owner's approval: only a caller
+that passes `allow_what_if=True` may load it, `RuntimeService` accepts it only with
+`allow_what_if_mapping=True` and a replay-file source, and `build_service` and the scripts never
+pass either. A stock or ETF entry quoted in its own price, with no sizing and no
 session, keeps the version-1 behaviour exactly: policy sizing, the gateway's stock path, a plain
 quote. Version-1 files still load.
 
@@ -144,6 +153,248 @@ trigger day must trigger again on a later day.
 
 **UNSUPPORTED** always HOLDs. It documents why a family is not traded.
 
+## Entry rule
+
+By default (`entry_rule = "EXPLICIT_ENTRY_ONLY"`, the product decision of 5 November 2026) only
+explicit execution language sets an entry price. A market level the publisher states when opening
+("long here, the index 5,010 now") is a REFERENCE, so such an OPEN or ADD HOLDs
+(`OPEN_ENTRY_PRICE_MISSING`, `ADD_ENTRY_REFERENCE_MISSING`). The shipped file keeps this for every
+entry.
+
+`entry_rule = "REFERENCE_AS_COLLAR"`, approved per family with its three limits (no defaults),
+changes one thing. A **current** OPEN or ADD (timing CURRENT: never a retrospective report, a
+conditional, commentary or an uncertain one) that states **exactly one** market level for its
+instrument and **no** explicit entry price enters with a **limit order at the marketable side of the
+live execution quote** (the ask for a long, the bid for a short, snapped to the tick never past it),
+never a market order. The stated level is the **anchor**. An explicit entry price or range is
+decided exactly as before; the rule never touches it.
+
+*How the stated level travels.* The interpreter classifies each price in a clause with a role
+(`PriceMention`: ENTRY, STOP, TARGET, EXIT, TRIGGER, REFERENCE). The typed action carries only
+ENTRY (`entry_reference`), STOP and TARGET; a REFERENCE level is not on it. The service passes each
+action's classified mentions, as (role, value) pairs, to `MappingPolicy.apply(levels=...)`, beside
+the clause text and post text it already passes for contract months and option legs. Only an entry with the rule on reads them
+(`FamilyMapping.entry_anchor_for`). The level becomes the anchor only if all of these hold, and
+otherwise the action HOLDs at the mapping stage with the reason shown:
+
+| Condition | Otherwise |
+|---|---|
+| exactly one distinct REFERENCE value for the action | `ENTRY_ANCHOR_SEVERAL_LEVELS` |
+| no other classified price (trigger, exit) beside the stop and target | `ENTRY_ANCHOR_SECOND_PRICE` |
+| the value is a number | `ENTRY_ANCHOR_UNREADABLE` |
+| no other action of the post for another instrument shares the clause or states the same value | `ENTRY_ANCHOR_INSTRUMENT_AMBIGUOUS` |
+| the value is written somewhere: the action's own clause, else another clause of the post (a commentary line quoting the market), else a line of the post that is no action's clause (a level line such as "41.20 now.", which the interpreter attaches to the instruction it follows) | `ENTRY_ANCHOR_NOT_IN_POST` |
+| ...and in exactly one such place | `ENTRY_ANCHOR_SOURCE_AMBIGUOUS` |
+| neither the clause nor that source names another cashtag | `ENTRY_ANCHOR_INSTRUMENT_AMBIGUOUS` |
+| the value is the market **now** (see *What makes a level an anchor* below) | `ENTRY_ANCHOR_NOT_CURRENT` |
+| a separate level line or attached quote names only this family | `ENTRY_ANCHOR_INSTRUMENT_UNCLEAR` |
+| for a future, the clause and the source pass the contract checks of the *Level contract rule*, and a month the source names is the order's month | `CONTRACT_MONTH_UNRECOGNISED` |
+| after the contract is selected, neither the clause nor the source holds another number once months, an index's own name, the anchor, the stop, the target and a reduction percentage are read | `ENTRY_ANCHOR_UNEXPLAINED_PRICE` |
+
+### What makes a level an anchor
+
+Default HOLD: a number is the market's level at the time of the post only with **positive
+evidence** next to it. A level without it is simply not an anchor, and the open holds as it does
+with the rule off (`ENTRY_ANCHOR_NOT_CURRENT`; `OPEN_ENTRY_PRICE_MISSING` when no level was
+tagged at all). The checks run on the number's **own clause**: the part of the clause or line it
+is written in between punctuation (`,` `;` `.` `:` `!` `?`, a line break, a spaced dash).
+
+1. **A present-market marker is attached to it**, from a closed public list
+   (`instruction_terms.PRESENT_MARKERS`): `now`, `right now`, `currently`, `here at`, `trading at`,
+   `at the market`. Attached means written directly after the number ("41.20 now") or directly
+   before it ("now 41.20", "trading at 41.20", also with "at" between: "currently at 41.20").
+   "We are now long $X, 41.20" has a "now", but not attached to the number: not an anchor.
+2. **Its whole sentence is entirely understood** (the final rule; `ENTRY_ANCHOR_CONTEXT_UNCLEAR`).
+   There is no window: the scope is the entire sentence that holds the number. Only a full stop
+   (not a decimal point), an exclamation mark, a question mark, a line break or the end of the
+   post ends a sentence; commas, colons, semicolons, dashes, slashes and brackets do not, and
+   nothing resets the scope. Every alphabetic token in the sentence must be a present-market
+   marker (public or private), a connector (`CONNECTOR_WORDS`: at, is, are, around, near, here,
+   the, a, it, @), a generic function word (`FUNCTION_WORDS`: we, i, are, am, is, and, our, my, a,
+   the, this, new, position, positions, trade; no preposition that could make the number a goal,
+   a condition, a comparison or another thing's price, such as "for", "to", "on", "of", "with" or
+   "in"), a currency or unit, a
+   name or alias of this family, the action's own words (long, buy, buying or short, shorting,
+   sell, selling; add, adding for an ADD; stop and target when the action has them), or a
+   private `context_words` entry. One unknown word anywhere refuses the anchor ("cost basis long
+   $X 41.20 now", "long $X avg cost, 41.20 now", "goal: 41.20 now"). A sentence ending in a
+   question mark never supplies an anchor (`QUESTION`), nor does one holding another number than
+   the action's own stop, target, reduction or contract month (`SECOND_NUMBER`). For a family
+   whose anchor is compared in a reference series (BASIS_SHIFT, REFERENCE_TRIGGER) the names are
+   the reference series' only: "QIF 5,025 now" for an index family is never compared with the
+   index. A level sentence without the action's own words (a standalone "41.20 now.") also needs
+   the sentence before it to be entirely on the allow-list (`ENTRY_ANCHOR_INSTRUMENT_UNCLEAR`,
+   `PRECEDING_SENTENCE`). A second marked number elsewhere in the post that belongs to no other
+   action holds (`ENTRY_ANCHOR_SEVERAL_LEVELS`). Phrasings that pass include "We are now long $X,
+   41.20 now.", "We are long $X here at 41.20.", "I am buying $X, currently 41.20.", "New
+   position: long $X, trading at 41.20.", "We are now long $X, 41.20 now, stop 40.10.", "Short
+   $X, 41.20 right now, stop 42.30.", and "We are now long $X." followed by "41.20 now.".
+3. **Nothing in its own clause makes it something else** (a second, redundant check) (`NOT_CURRENT_WORDS`): a time other than
+   now (yesterday, earlier, last, next, was, will, a weekday, overnight, ...), a chart, session or
+   order level (high, low, open, close, settlement, resistance, support, target, objective, stop,
+   level, entry, exit, ...), a condition or a level to cross (from, to, above, below, over, under,
+   through, break, if, when, once, until, unless), a range or a comparison (between, range, vs,
+   than, higher, lower, up, down, or, `<`, `>`). A marker never overrides them. Every place the
+   number is written must pass.
+4. **A separate level line or attached quote** (not the action's own clause) may hold only: the
+   number and other numbers (which `ENTRY_ANCHOR_UNEXPLAINED_PRICE` then checks), the markers, the
+   connector "at", a currency or unit (`UNIT_WORDS`: usd, $, points, ticks, bbl, oz, ...), and a
+   name of **this** family: its code, its reference and execution symbols (with or without `$`),
+   and its `aliases` (one to three words, in the mapping entry). Any other word means the bot does
+   not know whose level it is (`ENTRY_ANCHOR_INSTRUMENT_UNCLEAR`): "Brent 71.45 now." is never the
+   anchor of an oil family that does not list "brent". For a future, a month or contract code on
+   the line is left to the contract check instead (rule 3 of the *Level contract rule*).
+
+*Anchor scope* (`entry_anchor.anchor_scope`, required with the rule, no default: how much textual
+certainty the owner requires). All values apply rules 1 to 3 to the marked number's own sentence
+unchanged; there is no windowed option (a window's start and end could be gamed inside one
+sentence). They differ only in how a standalone level sentence is attributed ("41.20 now." on its own):
+
+* `"SENTENCE_STRICT"` trusts only words: the sentence immediately before the level sentence must be
+  entirely on the allow-list (`ENTRY_ANCHOR_INSTRUMENT_UNCLEAR`, `PRECEDING_SENTENCE` otherwise).
+* `"ACTION_BLOCK"` also trusts the interpreter's delimitation: the level sentence is attributed
+  when the sentence immediately before it is one of this action's own clause sentences
+  (`Classification.clause`, the text the service passes as the action's clause), with nothing in
+  between; otherwise it falls back to the SENTENCE_STRICT test. The typed action exposes only that
+  clause. Which sentence a stop or target came from is not exposed (`PriceMention` carries a role
+  and a value, no sentence index), so a stop or target sentence counts as part of the block only
+  when it is itself entirely allow-listed ("Stop 40.10." is; "Stop below 40.10." is not). To
+  attribute more, the interpreter would have to expose the sentence span of the action's block.
+
+* `"SINGLE_MARKET_POST"` trusts the post as a whole. The level's own sentence is checked exactly
+  as above; nothing is asked of its neighbours. Instead the anchor is accepted only if all hold:
+  (a) exactly one sentence of the post carries a marked number (`ENTRY_ANCHOR_POST_SEVERAL_LEVELS`);
+  (b) every action of the post is this family's, no action carries an unresolved-instrument flag
+  (`ASSET_UNRESOLVED`, `MIXED_SERIES_AND_TICKER`, `MULTIPLE_TICKERS_IN_CLAUSE`), and the post holds
+  no cashtag but this family's and no code, series symbol or alias of any other family the mapping
+  file or the private lexicon (`family_aliases`) knows (`ENTRY_ANCHOR_POST_SEVERAL_MARKETS`); (c)
+  this is the post's only action besides commentary, and no action is conditional, retrospective
+  or uncertain (`ENTRY_ANCHOR_POST_SEVERAL_ACTIONS`); (d) for a reference-series family the level's
+  sentence does not name the execution instrument (`ENTRY_ANCHOR_REFERENCE_UNNAMED`). Every gateway
+  protection is unchanged.
+
+The decision records how the anchor was attributed (`anchor_attribution`: `OWN_SENTENCE`,
+`AFTER_OWN_INSTRUCTION`, `AFTER_ALLOW_LISTED_SENTENCE`, `FIRST_SENTENCE`, `SINGLE_MARKET_POST`).
+
+*Private extension.* A publisher's own present-market phrasing, and further names of a family,
+are never added to the public lists. They go in the optional `entry_anchor` section of the private
+lexicon file (`[interpreter] lexicon_path`, git-ignored):
+`{"entry_anchor": {"present_markers": ["..."], "family_aliases": {"<FAMILY>": ["..."]},
+"context_words": ["..."]}}` (context words: a publisher's plain instruction phrasing). The
+interpreter never sees that section. A marker (one to four words) or an alias (one to three) is
+letters only and may not contain any disqualifying word; an alias may not contain a marker word.
+Loading refuses anything else. The extension can only turn a held level into an anchor where the
+publisher's wording is positive evidence; it cannot override rules 2 and 3.
+
+*What this rule cannot know.* When a post discusses several markets, a correctly marked current
+level in a clean sentence may still belong to a different market than the instruction: the words
+around it are all understood, but the publisher's intent is not. The protections that bound that
+case are the live-quote collar (`max_adverse_move`, `max_favourable_move`, within the code
+ceilings), the signal-age limit, the mandatory protective stop and the size caps (`max_units`,
+`max_notional`). The interpreter must also still tag the right number REFERENCE.
+Under `SINGLE_MARKET_POST` specifically: a market named only in plain words that neither the
+mapping file nor the lexicon's vocabulary knows is invisible to check (b), so a marked level that
+really belongs to such a market could be attributed to the post's family. The protections that
+bound that case are the same: the collar against the live quote, the signal-age limit, the
+mandatory stop and the size caps; and the vocabulary can be extended privately
+(`entry_anchor.family_aliases`).
+
+No stated level at all leaves the action as today (`OPEN_ENTRY_PRICE_MISSING`, with
+`ENTRY_ANCHOR_NOT_STATED`). For a futures family the accepted anchor is the one extra level the
+contract-month leftover rule counts as read; without the rule, or for any other number, that rule is
+unchanged. The accepted anchor is recorded on the mapping decision (`entry_anchor`), handed to the
+gateway on the `MappedQuote` (`entry_anchors`, by action id), and the gateway decides:
+
+* the limits are within the hard ceilings below and the policy's own entry collar, as a
+  percentage of the anchor (`ENTRY_ANCHOR_LIMIT_ABOVE_CEILING`);
+* the source post is no older than `max_signal_age_seconds` (`ENTRY_ANCHOR_SIGNAL_TOO_OLD`), on top
+  of the policy's own signal age;
+* the anchor is compared **in its own series**: with the live reference quote for BASIS_SHIFT and
+  REFERENCE_TRIGGER (which must be LIVE and fresh by the reference-freshness rules; it HOLDs
+  otherwise), with the execution quote for DIRECT and a same-series future (whose quote checks
+  already refuse a delayed, frozen, stale or absent quote);
+* **the basis cap** (review F4): when the anchor is compared in a reference series (BASIS_SHIFT,
+  REFERENCE_TRIGGER) it bounds the reference price only, so the absolute difference between the
+  live execution and reference mids, from two fresh, near-simultaneous quotes, must be within the
+  family's cap: `[basis_shift] max_abs_basis` (and `max_age_seconds`) where the family has one,
+  otherwise `entry_anchor.max_abs_basis` and `max_basis_age_seconds` (a REFERENCE_TRIGGER without
+  a backstop). It HOLDs when the cap is exceeded (`BASIS_EXCEEDS_CAP`), the basis cannot be
+  computed (`BASIS_QUOTE_UNUSABLE`), or no cap reached the gateway
+  (`ENTRY_ANCHOR_BASIS_CAP_MISSING`). The loader refuses the rule on such a family without a cap,
+  a second cap beside `[basis_shift]`'s, and an anchor cap on a DIRECT family;
+* the live side the entry trades against may be worse than the anchor (above it for a long) by at
+  most `max_adverse_move` (`ENTRY_ANCHOR_ADVERSE_MOVE`: do not chase) and better by at most
+  `max_favourable_move` (`ENTRY_ANCHOR_FAVOURABLE_MOVE`: the market moved so far the signal may be
+  stale or misread);
+* a protective stop is **always** required, whatever `require_stop_on_open` says
+  (`PROTECTIVE_STOP_MISSING`); an anchored ADD needs its idea to have a stop. The service refuses to
+  start with the rule on any family and `policy.require_stop_on_open = false`. Its side is checked
+  against the anchor in the publisher's series, and it must not already be crossed by the live market in the series it will be held in
+  (converted by the basis for BASIS_SHIFT, in reference levels for REFERENCE_TRIGGER, with the
+  backstop as before);
+* the policy's percentage collar between the entry level and the quote is replaced by the two
+  limits above; sizing, caps, session and roll window are unchanged.
+
+The approved plan records `entry_rule`, `entry_anchor`, `anchor_series`, `anchor_live` and
+`entry_limit`; the execution core sends exactly that limit, after re-checking that a fresh quote
+still lies inside the policy collar around it. An anchored entry whose first submission has an
+unknown outcome is never re-sent (as for every entry). A resend recomputes the limit, so an anchored
+entry is never resent at all (`RESEND_LIMIT_WOULD_DIFFER`); the resend's age check is the policy's,
+not the anchor's.
+
+*Hard ceilings.* Constants in `validator.py`, raised only by a code change and its review:
+
+| Limit | Ceiling |
+|---|---|
+| `max_adverse_move` | `ANCHOR_MAX_ADVERSE_PCT_CEILING` = 1 % of the anchor |
+| `max_favourable_move` | `ANCHOR_MAX_FAVOURABLE_PCT_CEILING` = 2 % of the anchor |
+| `max_signal_age_seconds` | `ANCHOR_MAX_SIGNAL_AGE_CEILING_SECONDS` = 120 s |
+
+The loader refuses a percentage above its ceiling, an age above 120 s, and an absolute move above
+its ceiling percentage of the highest entry price the family's sizing can buy
+(`max_notional / (units_per_signal x multiplier)`). The gateway refuses either move above its
+ceiling, or above the policy's `max_price_deviation_pct`, as a percentage of the actual anchor.
+
+*What the owner accepts.* Buying at the market some seconds after the post, with the slippage from
+the publisher's level bounded by the two limits; that a misread level would be used as an anchor
+(the checks above refuse a level without positive present-market evidence and every ambiguity
+listed, but not a single level the interpreter misread that also carries a marker); and that the limits are in the anchor's series, so for a basis-shifted family the
+execution price can differ from the anchor by the basis.
+
+## Level contract rule
+
+A DIRECT future whose levels are a futures series (its own, or `same_series`) is selected
+`EXPLICIT_ONLY`: a level is used only in the month the instruction names. The publisher often
+quotes an energy level without a month, so such an instruction HOLDs
+(`CONTRACT_SELECTION_AMBIGUOUS`). `level_contract_rule = "FRONT_MONTH"` declares that a level
+stated without a month refers to the **front contract** of the entry's own list: the first listed
+contract whose roll date has not been reached. Execution is in that same month (or its
+`equivalent_roots` micro). A month the instruction names always wins; a follow-up keeps its idea's
+contract; the other same-series constraints stay.
+
+`FRONT_MONTH` applies only when the instruction says **nothing at all** about which contract:
+
+1. **Relative or descriptive wording holds** (`CONTRACT_MONTH_UNRECOGNISED`, `RELATIVE_CONTRACT:<word>`)
+   for every futures family and every OPEN or ADD, whatever the selection rule and with or without
+   an entry price or the entry rule: back, next, following, second (2nd), deferred, far, nearby,
+   front, spot month, calendar, spread, roll (rolls, rolled, rolling, rollover), in the clause or on
+   the level line the anchor is taken from. "the back month at 71.50" is never the front.
+   (`front` holds too: the publisher's front may not be the list's.)
+2. **The leftover-token rule** is unchanged: anything month-like or contract-code-like left in the
+   clause after its recognised months and levels holds.
+3. **The level line** an anchor comes from passes the same contract-month and leftover-token checks
+   as the clause, and a month or contract code it names must resolve to the same contract the
+   order uses (`LEVEL_LINE_MONTH`); "QOFQ6 71.60 now." never anchors a July order.
+
+It also HOLDs when the front is fewer than
+`min_business_days_to_roll` business days from its roll date (`FRONT_MONTH_IN_ROLL_WINDOW`: the
+publisher may be quoting either month, and the next one is never assumed), and when the front
+cannot be determined uniquely (`FRONT_MONTH_AMBIGUOUS`: months not listed in order, roll dates not
+strictly increasing, or no listed contract before its roll date). *Risk:* near a roll the
+publisher's "oil" may already be the next month while the list's front is still the old one; the
+roll margin is the only protection, so set it no shorter than the period in which the market's own
+front-month convention changes.
+
 ## Protective levels are never loosened
 
 An amendment in which the publisher's own stop loosens follows the gateway's rule for widened stops,
@@ -188,6 +439,11 @@ Approve the following for each family:
 * The contract months and their roll dates, with the business-day margin.
 * The units per signal and the caps.
 * The trading session.
+* The entry rule. `REFERENCE_AS_COLLAR` only with its anchor scope, its adverse and favourable
+  move limits and its signal age, chosen for the family within the code ceilings (1 %, 2 %, 120 s); for a
+  reference-series family without `[basis_shift]`, also its basis cap; and the family's plain-word
+  `aliases` a level line may name it by.
+* For a DIRECT future, whether a level without a month means the front contract (`FRONT_MONTH`).
 
 Then set `approved = true` (the TOML boolean) with `approved_by` and `approved_at`. The shipped file approves only the
 bond ETF. Its other entries are commented templates with placeholder values.

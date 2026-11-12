@@ -19,6 +19,7 @@ from tradingbot.event_models import (
     ParsedPost,
     ReplayResult,
     ReplaySource,
+    Timing,
     TradeAction,
 )
 from tradingbot.event_replay import Idea, PaperEventReplay
@@ -114,9 +115,12 @@ class BrokerEventReplay(PaperEventReplay):
                                   supported_actions=ALL_ACTIONS)
             if decided.status == "APPROVE" and decided.plan is not None:
                 self._plans[a.action_id] = decided.plan
-        if a.action == Action.OPEN and a.instrument is not None and a.position_side is not None:
+        if (a.action == Action.OPEN and a.timing == Timing.CURRENT and a.instrument is not None
+                and a.position_side is not None):
             # Review F9: the broker nets one position per contract; never open against an open
-            # idea on the other side (a reversal is a CLOSE, then the OPEN).
+            # idea on the other side (a reversal is a CLOSE, then the OPEN). Only a current
+            # instruction can open anything: a retrospective report of an opposite entry is the
+            # gateway's to RECONCILE, not a held signal.
             clash = self.coordinator.opposite_idea(a.instrument, a.position_side, ideas.values())
             if clash is not None:
                 return ActionOutcome(

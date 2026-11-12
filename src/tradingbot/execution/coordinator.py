@@ -248,6 +248,13 @@ def backstop_ref(entry_ref: str) -> str:
     return f"{entry_ref}.BKS"
 
 
+def _anchored_limit(plan: ExecutionPlan | None) -> Decimal | None:
+    """The gateway's anchored entry limit, when the entry was approved under REFERENCE_AS_COLLAR."""
+    if plan is not None and plan.entry_rule == "REFERENCE_AS_COLLAR":
+        return plan.entry_limit
+    return None
+
+
 def _plan_of(raw: str | None) -> ExecutionPlan | None:
     return ExecutionPlan.model_validate_json(raw) if raw else None
 
@@ -912,7 +919,8 @@ class ExecutionCoordinator:
         )
         if rules:
             return self._refuse(source, action, gate, ref, account, rules, now)
-        limit, reasons = self._entry_checks(contract, side, qty, entry_level, idea_id, now)
+        limit, reasons = self._entry_checks(contract, side, qty, entry_level, idea_id, now,
+                                            fixed_limit=_anchored_limit(plan))
         if reasons:
             return self._refuse(source, action, gate, ref, account, reasons, now, idea_id=idea_id)
         exit_side = OrderSide.SELL if long else OrderSide.BUY
@@ -1097,7 +1105,7 @@ class ExecutionCoordinator:
             return self._refuse(source, action, gate, ref, account, rules, now, idea_id=pos.idea_id)
         entry_level = str(plan.execution_reference) if plan else action.entry_reference
         limit, reasons = self._entry_checks(
-            contract, side, qty, entry_level, pos.idea_id, now
+            contract, side, qty, entry_level, pos.idea_id, now, fixed_limit=_anchored_limit(plan)
         )
         if reasons:
             return self._refuse(
@@ -2504,9 +2512,13 @@ class ExecutionCoordinator:
         idea_id: str,
         now: datetime,
         exclude_ref: str | None = None,
+        fixed_limit: Decimal | None = None,
     ) -> tuple[Decimal | None, list[str]]:
         """Broker-quote sanity, the price collar and exposure caps, before any entry or add.
-        Returns the collar-bounded limit price, or the reasons to refuse."""
+        Returns the collar-bounded limit price, or the reasons to refuse. ``fixed_limit`` is the
+        gateway's anchored entry limit (entry_rule REFERENCE_AS_COLLAR): the marketable side of
+        the quote it decided on. It is sent as it is; the fresh quote must still lie inside the
+        policy collar around it, so a market that moved since the decision is refused."""
         key = contract.contract_key
         blocked = self._instrument_block(contract)
         if blocked:
@@ -2532,7 +2544,8 @@ class ExecutionCoordinator:
             return None, ["BROKER_QUOTE_OUTSIDE_COLLAR"]
         # Snapped to the contract's tick inside the collar: a buy limit down, a sell limit up.
         limit = (
-            snap_to_tick(ref * (1 + band), contract.min_tick, ROUND_FLOOR)
+            fixed_limit if fixed_limit is not None
+            else snap_to_tick(ref * (1 + band), contract.min_tick, ROUND_FLOOR)
             if buy
             else snap_to_tick(ref * (1 - band), contract.min_tick, ROUND_CEILING)
         )
