@@ -61,13 +61,14 @@ from tradingbot.runtime.instruction_terms import (
     check_phrase,
     clause_numbers,
     code_shaped,
-    context_unclear,
     extract_terms,
     foreign_words,
     leftover_tokens,
     marked_numbers,
     post_multi_leg,
     relative_contract_words,
+    sentences,
+    unknown_words,
 )
 from tradingbot.validator import (
     ANCHOR_MAX_ADVERSE_PCT_CEILING,
@@ -401,6 +402,14 @@ class AnchorLexicon(StrictModel):
     anchor."""
     present_markers: list[str] = Field(default_factory=list)
     family_aliases: dict[str, list[str]] = Field(default_factory=dict)
+    # A publisher's own plain instruction phrasing ("adding exposure"): words an anchor's
+    # sentence may also hold. Never a disqualifying word.
+    context_words: list[str] = Field(default_factory=list)
+
+    @field_validator("context_words")
+    @classmethod
+    def _context(cls, v):
+        return [check_phrase(m, "context word", 4) for m in v]
 
     @field_validator("present_markers")
     @classmethod
@@ -977,21 +986,11 @@ class FamilyMapping(StrictModel):
         why = anchor_not_current(source, anchor, markers)
         if "NO_PRESENT_MARKER" in why:  # no positive evidence at all
             return None, None, [ENTRY_ANCHOR_NOT_CURRENT, *why]
-        # The allow-list (confirmation review): every word around the number is understood. A
-        # reference-series anchor may be attributed only to the reference series (rule 3): the
-        # execution instrument's own symbol is not one of its names.
         own = self.anchor_names(asset, lexicon)
-        instruction = list(SIDE_WORDS.get(getattr(action.position_side, "value", ""), ()))
-        if action.action == Action.ADD:
-            instruction += ADD_WORDS
-        skip = []
-        if self.execution.sec_type == "FUT":  # the contract check reads these instead
-            months = extract_terms(source)
-            skip = [*months.month_spans, *(m.span() for m in MONTH_WORD_RE.finditer(source))]
-        unclear = context_unclear(source, anchor, markers=markers, names=own,
-                                  instruction=instruction, skip_spans=skip)
-        if unclear:
-            return None, None, [ENTRY_ANCHOR_CONTEXT_UNCLEAR, f"WORDS:{unclear}"]
+        problems = self._sentence_problems(action, anchor, source, terms, levels, post_text,
+                                           markers, own, lexicon)
+        if problems:
+            return None, None, problems
         if why:  # the disqualifying words: a second, redundant check
             return None, None, [ENTRY_ANCHOR_NOT_CURRENT, *why]
         # Another marked level elsewhere in the post that is no other action's: which is meant?
@@ -1006,10 +1005,68 @@ class FamilyMapping(StrictModel):
             return None, None, [ENTRY_ANCHOR_SEVERAL_LEVELS, "MARKED_ELSEWHERE"]
         if source != terms.clause:
             allowed = set(own) | set(markers) | {"at"}
-            foreign = foreign_words(source, anchor, allowed, skip)
+            foreign = foreign_words(source, anchor, allowed, self._month_spans(source))
             if foreign:
                 return None, None, [ENTRY_ANCHOR_INSTRUMENT_UNCLEAR, f"OTHER_WORDS:{len(foreign)}"]
         return anchor, source, []
+
+    def _month_spans(self, text: str) -> list[tuple[int, int]]:
+        """A future's contract months in ``text``: left to the contract check."""
+        if self.execution.sec_type != "FUT":
+            return []
+        return [*extract_terms(text).month_spans,
+                *(m.span() for m in MONTH_WORD_RE.finditer(text))]
+
+    def _sentence_problems(self, action, anchor, source, terms, levels, post_text, markers, own,
+                           lexicon) -> list[str]:
+        """The final rule (last review pass): the scope of the marked number is its whole
+        sentence. Every alphabetic token in it must be on the allow-list (markers, connectors,
+        function words, units, this family's names, the action's own side, verb and level words,
+        the private lexicon's context words); it may not be a question; and it may hold no other
+        number than the action's own levels and contract months. A level sentence without the
+        action's own instruction words also needs the sentence before it to be entirely on the
+        allow-list: otherwise whose level it is cannot be told."""
+        instruction = list(SIDE_WORDS.get(getattr(action.position_side, "value", ""), ()))
+        if action.action == Action.ADD:
+            instruction += ADD_WORDS
+        consumed, fractions = _consumed(action)
+        for role, raw in levels or ():
+            v = _level(raw) if role in ("STOP", "TARGET") else None
+            if v is not None:
+                consumed.add(v)
+                instruction += ["stop", "stops"] if role == "STOP" else ["target", "targets"]
+        if action.stop_price is not None:
+            instruction += ["stop", "stops"]
+        if action.target_price is not None:
+            instruction += ["target", "targets"]
+        consumed.add(anchor)
+        allowed = [*markers, *own, *instruction, *lexicon.context_words]
+        found = [(s, q) for s, q in sentences(source) if anchor in clause_numbers(s)]
+        if not found:
+            return [ENTRY_ANCHOR_NOT_IN_POST]
+        whole = sentences(post_text) if post_text else sentences(source)
+        for sentence, question in found:
+            if question:
+                return [ENTRY_ANCHOR_CONTEXT_UNCLEAR, "QUESTION"]
+            unknown = unknown_words(sentence, allowed, self._month_spans(sentence))
+            if unknown:
+                return [ENTRY_ANCHOR_CONTEXT_UNCLEAR, f"WORDS:{unknown}"]
+            extra = [x for x in leftover_tokens(extract_terms(sentence), consumed, fractions,
+                                                self._roots())
+                     if any(ch.isdigit() for ch in x)
+                     and not (x.startswith("~") and clause_numbers(x[1:]) <= consumed
+                              and clause_numbers(x[1:]))]
+            if extra:
+                return [ENTRY_ANCHOR_CONTEXT_UNCLEAR, "SECOND_NUMBER"]
+            if unknown_words(sentence, instruction) == unknown_words(sentence, []):
+                # A level sentence: the one before it must not name anything else.
+                texts = [s for s, _ in whole]
+                at = texts.index(sentence) if sentence in texts else -1
+                before = texts[at - 1] if at > 0 else None
+                if before is not None and unknown_words(before, allowed,
+                                                        self._month_spans(before)):
+                    return [ENTRY_ANCHOR_INSTRUMENT_UNCLEAR, "PRECEDING_SENTENCE"]
+        return []
 
     def anchor_names(self, asset: str, lexicon: AnchorLexicon | None = None) -> list[str]:
         """Lower-case names an anchor may be attributed to: the family, its reference series and

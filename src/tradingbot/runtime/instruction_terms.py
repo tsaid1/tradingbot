@@ -402,19 +402,6 @@ SIDE_WORDS = {"LONG": ("long", "buy", "buying"),
 ADD_WORDS = ("add", "adding")
 
 
-def _tokens(text: str):
-    """(start, end, token) of every token in every clause of ``text``, one list per clause."""
-    out, start = [], 0
-    for m in [*_SEGMENT_RE.finditer(text), None]:
-        end = m.start() if m else len(text)
-        seg = [(start + t.start(), start + t.end(), t.group(0))
-               for t in _TOKEN_RE.finditer(text[start:end])]
-        if seg:
-            out.append(seg)
-        start = m.end() if m else end
-    return out
-
-
 def _tag(words: list[str], phrases, tag: str, tags: list[str | None]) -> None:
     for phrase in sorted({p for p in phrases if p}, key=lambda p: -len(p.split())):
         pw = phrase.split()
@@ -424,39 +411,48 @@ def _tag(words: list[str], phrases, tag: str, tags: list[str | None]) -> None:
                 tags[k:k + n] = [tag] * n
 
 
-def context_unclear(text: str, value: Decimal, *, markers, names, instruction,
-                    skip_spans: list[tuple[int, int]] = ()) -> int:
-    """How many words in the context window of ``value`` the bot does not understand (zero: the
-    window is entirely understood). The window runs from the start of the number's own clause, or
-    from the last of this action's instruction words or this family's names before the number if
-    there is one, to the number, and from the number to the end of its clause. Every alphabetic
-    token in it must be a present-market marker, a connector (``CONNECTOR_WORDS``), a currency or
-    unit, a name or alias of this family (``names``, lower case, without "$"), or one of the
-    action's own instruction words (``instruction``). ``skip_spans`` (a future's contract months)
-    are left to the contract check. Other numbers are left to the unexplained-price check."""
+# The final rule (last review pass): the scope of a marked number is its whole SENTENCE. Only a
+# full stop (not a decimal point), an exclamation mark, a question mark or a line break ends one;
+# commas, colons, semicolons, dashes, slashes and brackets do not. Besides markers, connectors,
+# units, the family's names and the action's own words, only these generic function words of a
+# plain instruction may stand in it. Publisher phrasing is added only by the private lexicon.
+FUNCTION_WORDS = frozenset((
+    "we", "i", "are", "am", "is", "in", "on", "of", "to", "for", "with", "and", "our", "my",
+    "a", "the", "this", "new", "position", "positions", "trade",
+))
+_SENTENCE_END_RE = re.compile(r"\n|[!?]|\.(?!\d)")
+
+
+def sentences(text: str) -> list[tuple[str, bool]]:
+    """The sentences of ``text`` and whether each ends in a question mark."""
+    out, start = [], 0
+    for m in [*_SENTENCE_END_RE.finditer(text or ""), None]:
+        end = m.start() if m else len(text or "")
+        s = (text or "")[start:end].strip()
+        if s:
+            out.append((s, bool(m and m.group(0) == "?")))
+        start = m.end() if m else end
+    return out
+
+
+def unknown_words(sentence: str, allowed, skip_spans: list[tuple[int, int]] = ()) -> int:
+    """How many alphabetic tokens of ``sentence`` are not on the allow-list: ``allowed`` phrases
+    (markers, the family's names, the action's own words, private additions; lower case), the
+    connectors, the function words and the units. Tokens with a digit are left to the number
+    check, ``skip_spans`` (a future's contract months) to the contract check."""
+    seg = [(t.start(), t.end(), t.group(0)) for t in _TOKEN_RE.finditer(sentence or "")]
+    words = [_word(tok).lstrip("~").lstrip("$") for _, _, tok in seg]
+    tags: list[str | None] = [None] * len(words)
+    _tag(words, allowed, "allowed", tags)
     unknown = 0
-    for seg in _tokens(text or ""):
-        words = [_word(t).lstrip("~").lstrip("$") for _, _, t in seg]
-        hits = [i for i, (_, _, t) in enumerate(seg) if _value(t) == value]
-        if not hits:
+    for (a, b, tok), w, tag in zip(seg, words, tags, strict=True):
+        if tag is not None or any(x <= a and b <= y for x, y in skip_spans):
             continue
-        tags: list[str | None] = [None] * len(words)
-        _tag(words, markers, "marker", tags)
-        _tag(words, names, "name", tags)
-        _tag(words, instruction, "instruction", tags)
-        for i in hits:
-            starts = [j for j in range(i) if tags[j] in ("name", "instruction")]
-            first = starts[-1] + 1 if starts else 0
-            for k in (*range(first, i), *range(i + 1, len(seg))):
-                a, b, token = seg[k]
-                w = words[k]
-                if tags[k] is not None or any(x <= a and b <= y for x, y in skip_spans):
-                    continue
-                if not any(ch.isalpha() for ch in w) or w in CONNECTOR_WORDS or w in UNIT_WORDS:
-                    continue
-                if _value(token) is not None or any(ch.isdigit() for ch in w):
-                    continue
-                unknown += 1
+        if not any(ch.isalpha() for ch in w) or any(ch.isdigit() for ch in w):
+            continue
+        if w in CONNECTOR_WORDS or w in FUNCTION_WORDS or w in UNIT_WORDS:
+            continue
+        unknown += 1
     return unknown
 
 
