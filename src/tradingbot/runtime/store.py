@@ -224,6 +224,10 @@ class RuntimeStore:
             cols = {r["name"] for r in c.execute("PRAGMA table_info(signal_actions)")}
             if "mapping_family" not in cols:  # multi-asset mapping: the family the action fell in
                 c.execute("ALTER TABLE signal_actions ADD COLUMN mapping_family TEXT")
+            acols = {r["name"] for r in c.execute("PRAGMA table_info(alerts)")}
+            for col, kind in (("last_notified_at", "TEXT"), ("notified", "INTEGER DEFAULT 0")):
+                if col not in acols:  # operations controls: re-alert schedule
+                    c.execute(f"ALTER TABLE alerts ADD COLUMN {col} {kind}")
 
     @contextmanager
     def tx(self) -> Iterator[sqlite3.Connection]:
@@ -391,8 +395,26 @@ class RuntimeStore:
                 """INSERT INTO alerts (key,kind,detail,opened_at,last_seen_at) VALUES (?,?,?,?,?)
                 ON CONFLICT(key) DO UPDATE SET kind=excluded.kind, detail=excluded.detail,
                 opened_at=excluded.opened_at, last_seen_at=excluded.last_seen_at,
-                resolved_at=NULL""",
+                resolved_at=NULL, last_notified_at=NULL""",
                 (key, kind, detail, at.isoformat(), at.isoformat()),
+            )
+            return True
+
+    def alert_notify_due(self, key: str, at: datetime, every_seconds: float) -> bool:
+        """True when the open alert ``key`` was never notified, or last notified at least
+        ``every_seconds`` ago; it is then marked notified at ``at``."""
+        with self.tx() as c:
+            row = c.execute(
+                "SELECT last_notified_at, resolved_at FROM alerts WHERE key=?", (key,)
+            ).fetchone()
+            if row is None or row["resolved_at"] is not None:
+                return False
+            last = _dt(row["last_notified_at"])
+            if last is not None and (at - last).total_seconds() < every_seconds:
+                return False
+            c.execute(
+                "UPDATE alerts SET last_notified_at=?, notified=COALESCE(notified,0)+1 WHERE key=?",
+                (at.isoformat(), key),
             )
             return True
 
