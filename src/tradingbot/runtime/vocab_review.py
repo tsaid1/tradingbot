@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import errno
 import hashlib
 import json
 import os
@@ -293,28 +294,148 @@ def _check_mode(mode: int, what: str) -> None:
                                f"{stat.S_IMODE(mode):o}); run chmod 600 on it")
 
 
+class PrivateDir:
+    """Open-then-verify for writes into one private folder (review S: no time-of-check /
+    time-of-use gap). The folder passes ``check_private_path`` and is held open as a directory
+    descriptor; every file is opened RELATIVE to that descriptor with ``O_NOFOLLOW`` and checked
+    by ``fstat`` (a regular file, link count 1, not group- or world-readable). ``verify`` re-runs
+    the private-path check on the resolved path and requires the folder at that path to be the one
+    held (device and inode): a folder swapped for a symlink, moved or replaced is refused."""
+
+    def __init__(self, path: str | Path, what: str, *, create: bool = False):
+        self.raw, self.what = Path(path).expanduser(), what
+        self.target = check_private_path(self.raw, what)
+        if create:
+            self.target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.fd = os.open(self.target.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            self.verify()
+        except BaseException:
+            self.close()
+            raise
+
+    @property
+    def name(self) -> str:
+        return self.target.name
+
+    def verify(self) -> None:
+        if self.fd is None:
+            raise PrivatePathError(f"the {self.what} is closed")
+        again = check_private_path(self.raw, self.what)
+        st = os.fstat(self.fd)
+        if again != self.target or _identity(again.parent) != (st.st_dev, st.st_ino):
+            raise PrivatePathError(f"the folder of the {self.what} changed since it was checked "
+                                   "(moved, replaced or swapped for a link); refused")
+
+    def check_open(self, fd: int) -> None:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise PrivatePathError(f"the {self.what} is not a regular file")
+        if st.st_nlink != 1:
+            raise PrivatePathError(f"the {self.what} is hard-linked elsewhere (link count "
+                                   f"{st.st_nlink}); refused")
+        _check_mode(st.st_mode, self.what)
+
+    def open(self, name: str, flags: int) -> int:
+        """Open ``name`` in the held folder (never through a link), verified before and after."""
+        self.verify()
+        fd = os.open(name, flags | os.O_NOFOLLOW, 0o600, dir_fd=self.fd)
+        try:
+            self.check_open(fd)
+            self.verify()
+        except BaseException:
+            os.close(fd)
+            raise
+        return fd
+
+    def check_existing(self, name: str) -> None:
+        """An existing file about to be replaced may not be a link or hard-linked elsewhere."""
+        try:
+            st = os.stat(name, dir_fd=self.fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+            raise PrivatePathError(f"the {self.what} is not a regular file")
+        if st.st_nlink != 1:
+            raise PrivatePathError(f"the {self.what} is hard-linked elsewhere (link count "
+                                   f"{st.st_nlink}); refused")
+
+    def create(self, name: str, data: bytes) -> None:
+        """A new file ``name`` (never an existing one), written and flushed."""
+        fd = self.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+        try:
+            os.write(fd, data)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    def write_atomic(self, data: bytes) -> None:
+        """Replace this folder's target file with ``data``: a new temporary file, verified, then
+        renamed over it within the held folder."""
+        self.check_existing(self.name)
+        tmp = f".{self.name}.tmp-{os.getpid()}-{os.urandom(4).hex()}"
+        self.create(tmp, data)
+        try:
+            self.verify()
+            self.check_existing(self.name)
+            os.replace(tmp, self.name, src_dir_fd=self.fd, dst_dir_fd=self.fd)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp, dir_fd=self.fd)
+            raise
+        with contextlib.suppress(OSError):
+            os.fsync(self.fd)
+
+    def unlink(self, name: str) -> None:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(name, dir_fd=self.fd)
+
+    def close(self) -> None:
+        if getattr(self, "fd", None) is not None:
+            with contextlib.suppress(OSError):
+                os.close(self.fd)
+            self.fd = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    def __del__(self):
+        self.close()
+
+
 class ReviewLog:
-    """The service's append-only private review log. Refuses at construction a path inside the
-    repository or a git work tree, a symbolic link, and an existing file others may read; every
-    append re-checks the mode of the open file."""
+    """The service's append-only private review log. Refuses at construction a path inside this
+    program's repository (``check_private_path``), a symbolic link, a file that is hard-linked
+    elsewhere and an existing file others may read. Its folder is held open from start
+    (``PrivateDir``): every append opens the file relative to it, never through a link, and
+    re-checks the path, the folder's identity, the link count and the mode."""
 
     WHAT = "review log ([interpreter] review_log_path)"
 
     def __init__(self, path: str | Path):
-        self.path = check_private_path(path, self.WHAT)
+        self.dir = PrivateDir(path, self.WHAT, create=True)
+        self.path = self.dir.target
         self._seen: set[tuple] = set()
-        if self.path.is_symlink():
-            raise PrivatePathError(f"the {self.WHAT} may not be a symbolic link")
-        if self.path.exists():
-            if not self.path.is_file():
-                raise PrivatePathError(f"the {self.WHAT} is not a regular file")
-            _check_mode(self.path.stat().st_mode, self.WHAT)
-            entries, _ = read_review_log(self.path)
-            self._seen = {record_key(e) for e in entries}
-        else:
-            self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-            fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-            os.close(fd)
+        try:
+            try:
+                fd = self.dir.open(self.dir.name, os.O_RDONLY)
+            except FileNotFoundError:
+                self.dir.create(self.dir.name, b"")
+            else:
+                with os.fdopen(fd, "rb") as f:
+                    text = f.read().decode("utf-8", "replace")
+                self._seen = {record_key(e) for e in _parse_log(text)[0]}
+        except OSError as exc:
+            self.dir.close()
+            if exc.errno == errno.ELOOP:
+                raise PrivatePathError(f"the {self.WHAT} may not be a symbolic link") from None
+            raise
+        except BaseException:
+            self.dir.close()
+            raise
 
     def append(self, record: dict) -> bool:
         """Append one hold, unless the same hold (post, revision, action, reason code and
@@ -324,14 +445,16 @@ class ReviewLog:
         if key in self._seen:
             return False
         line = (json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
-        fd = os.open(self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        fd = self.dir.open(self.dir.name, os.O_WRONLY | os.O_APPEND | os.O_CREAT)
         try:
-            _check_mode(os.fstat(fd).st_mode, self.WHAT)
             os.write(fd, line)
         finally:
             os.close(fd)
         self._seen.add(key)
         return True
+
+    def close(self) -> None:
+        self.dir.close()
 
 
 def record_key(record: dict) -> tuple:
@@ -376,8 +499,12 @@ def read_review_log(path: str | Path) -> tuple[list[dict], int]:
     p = Path(path).expanduser()
     if not p.exists():
         return [], 0
+    return _parse_log(p.read_text(encoding="utf-8", errors="replace"))
+
+
+def _parse_log(text: str) -> tuple[list[dict], int]:
     entries, bad = [], 0
-    for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
+    for line in text.splitlines():
         if not line.strip():
             continue
         try:
@@ -840,39 +967,10 @@ def _glob_escape(name: str) -> str:
     return re.sub(r"([*?\[])", r"[\1]", name)
 
 
-def _write_private(path: Path, data: bytes) -> Path:
-    """A new temporary file beside ``path`` with mode 0600, flushed to disk."""
-    tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}-{os.urandom(4).hex()}")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-    try:
-        os.write(fd, data)
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-    return tmp
-
-
-def _sync_dir(folder: Path) -> None:
-    with contextlib.suppress(OSError):
-        fd = os.open(folder, os.O_RDONLY)
-        try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-
-
-def _replace(tmp: Path, path: Path) -> None:
-    try:
-        os.replace(tmp, path)
-    except BaseException:
-        tmp.unlink(missing_ok=True)
-        raise
-    _sync_dir(path.parent)
-
-
-def _write_atomic(path: Path, data: bytes) -> None:
-    _replace(_write_private(path, data), path)
-    os.chmod(path, 0o600)
+def _write_atomic(path: Path, data: bytes, what: str = "private file") -> None:
+    """Replace a private file atomically, open-then-verify (``PrivateDir.write_atomic``)."""
+    with PrivateDir(path, what) as d:
+        d.write_atomic(data)
 
 
 def loader_problem(path: Path, *, allow_candidate: bool = False) -> str | None:
@@ -941,14 +1039,17 @@ def _add(raw: dict, item: BatchItem) -> tuple[str, str] | str:
 
 
 def _check(path: Path, raw: dict, *, allow_candidate: bool = False) -> str | None:
+    """The loader's verdict on ``raw``, from a temporary private file beside ``path``."""
+    tmp = f".{path.name}.check-{os.getpid()}-{os.urandom(4).hex()}"
     try:
-        tmp = _write_private(path, _serialise(raw))
-    except OSError as exc:
+        with PrivateDir(path, "private lexicon") as d:
+            d.create(tmp, _serialise(raw))
+            try:
+                return loader_problem(d.target.parent / tmp, allow_candidate=allow_candidate)
+            finally:
+                d.unlink(tmp)
+    except (OSError, PrivatePathError) as exc:
         return f"could not write beside the lexicon ({type(exc).__name__})"
-    try:
-        return loader_problem(tmp, allow_candidate=allow_candidate)
-    finally:
-        tmp.unlink(missing_ok=True)
 
 
 def _build(path: Path, raw: dict, items: list[BatchItem], result: BatchResult,
@@ -999,15 +1100,15 @@ def apply_batch(lexicon_path: str | Path, items: list[BatchItem], *,
         while backup.exists():
             backup, n = path.with_name(f"{path.name}.bak-{batch}-{n}"), n + 1
         try:
-            fd = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-            try:
-                os.write(fd, before)
-                os.fsync(fd)
-            finally:
-                os.close(fd)
-            _write_atomic(path, _serialise(new))
-        except OSError as exc:
-            backup.unlink(missing_ok=True)
+            with PrivateDir(path, "private lexicon") as d:
+                d.check_existing(d.name)
+                d.create(backup.name, before)
+                try:
+                    d.write_atomic(_serialise(new))
+                except BaseException:
+                    d.unlink(backup.name)
+                    raise
+        except (OSError, PrivatePathError) as exc:
             return BatchResult("REFUSED", f"the lexicon was not replaced ({type(exc).__name__}); "
                                           "it is unchanged", refused=result.refused)
         result.backup, result.status = backup, "WRITTEN"
@@ -1048,8 +1149,8 @@ def _record_batch(path, batch, items, result, keep, now) -> bool:
          "batch": batch, "backup": result.backup.name if result.backup else None}
         for where, words in result.added.items() for w in words if w in written)
     try:
-        _write_atomic(decisions_path(path), _serialise(raw))
-    except OSError:
+        _write_atomic(decisions_path(path), _serialise(raw), "decisions file")
+    except (OSError, PrivatePathError):
         return False
     return True
 
@@ -1078,9 +1179,9 @@ def undo_last(lexicon_path: str | Path) -> BatchResult:
     if problem is not None:
         return BatchResult("REFUSED", f"the latest backup {latest.name} does not load: {problem}")
     try:
-        _write_atomic(path, latest.read_bytes())
+        _write_atomic(path, latest.read_bytes(), "private lexicon")
         latest.unlink()
-    except OSError as exc:
+    except (OSError, PrivatePathError) as exc:
         return BatchResult("REFUSED", f"the backup was not restored ({type(exc).__name__})")
     batches = {d.get("batch") for d in raw.get("writes") or ()
                if isinstance(d, dict) and d.get("backup") == latest.name}
@@ -1088,8 +1189,8 @@ def undo_last(lexicon_path: str | Path) -> BatchResult:
         for key in ("applied", "keep_holding", "writes"):
             raw[key] = [d for d in raw.get(key) or ()
                         if not (isinstance(d, dict) and d.get("batch") in batches)]
-        with contextlib.suppress(OSError):
-            _write_atomic(decisions_path(path), _serialise(raw))
+        with contextlib.suppress(OSError, PrivatePathError):
+            _write_atomic(decisions_path(path), _serialise(raw), "decisions file")
     return BatchResult("RESTORED", f"Restored {latest.name}. It takes effect when the service (or "
                                    "a replay) is restarted.", backup=latest, path=path)
 
@@ -1143,8 +1244,8 @@ def write_candidate(lexicon_path: str | Path, items: list[BatchItem], out_path: 
         return BatchResult("REFUSED", f"the candidate is refused by the loader: {problem}",
                            refused=result.refused)
     try:
-        _write_atomic(out, _serialise(new))
-    except OSError as exc:
+        _write_atomic(out, _serialise(new), "candidate lexicon")
+    except (OSError, PrivatePathError) as exc:
         return BatchResult("REFUSED", f"the candidate was not written ({type(exc).__name__})")
     result.status = "WRITTEN"
     result.message = (f"Candidate written with {new[CANDIDATE_KEY]['added']} proposal(s); the "

@@ -384,7 +384,13 @@ remain as an extra refusal, and any error while checking refuses. A repository n
 this program's main checkout is therefore refused too, also when the service runs from a linked
 worktree. When this program's repository cannot be determined (an installed package, no git
 checkout, a git directory that does not exist), every git work tree is refused (fail closed); so is
-another work tree whose own git directory cannot be found.
+another work tree whose own git directory cannot be found. After start nothing is trusted either:
+every private write (review log appends, lexicon, backups, decisions, candidate) opens its file
+relative to a held descriptor of its checked folder, never through a link (`O_NOFOLLOW`), re-runs
+the path check and requires the folder to be the same directory (device and inode) before and
+after opening, and refuses a file whose link count is above 1 (a hard link elsewhere, checked with
+`fstat` on the open file). A refused review-log append raises `REVIEW_LOG_WRITE_FAILED` by code
+only; the service and the hold are unaffected.
 A path inside **any other** git work tree is allowed (the Product Owner's decision: the owner's
 workspace is itself a private repository) and warned: a banner on the page saying the file could
 be committed to that repository by mistake and that the tool cannot prevent it, and, when the

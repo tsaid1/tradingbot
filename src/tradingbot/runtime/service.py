@@ -427,6 +427,8 @@ class RuntimeService:
                 failures = self.broker.close()
                 self.store.event(self.clock(), "SHADOW_SESSION_CLOSED", cleanup_failures=failures)
         finally:
+            if self.review_log is not None:
+                self.review_log.close()  # its held folder descriptor
             self.coordinator.close()
 
     @property
