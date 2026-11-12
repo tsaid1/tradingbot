@@ -41,7 +41,9 @@ from tradingbot.execution.broker import (
     TERMINAL_STATUSES,
     WORKING_STATUSES,
     AckLost,
+    BrokerDisconnected,
     BrokerError,
+    BrokerIdentityError,
     BrokerOrder,
     BrokerPosition,
     BrokerQuote,
@@ -225,6 +227,14 @@ class SimBroker:
         # Whether quotes carry the series' own last-update time (IBKR lastTimestamp). A test turns
         # this off to model a broker that reports only when it received the quote.
         self.reports_update_time = True
+        # Session control (a Trader Workstation restarts daily): while disconnected every Broker
+        # call raises BrokerDisconnected; the market and the account keep moving (test controls
+        # such as fill, set_quote and expire_day_orders still act). See disconnect / reconnect.
+        self._connected = True
+        self.reconnect_failures = 0  # the next N reconnect() calls fail (bounded backoff tests)
+        self.next_session_account: str | None = None  # the account the next session comes back as
+        self.fail_identity_check = False  # the adapter's own identity check fails on reconnect
+        self.identity_checks = 0
         with self._tx() as c:
             c.executescript(SCHEMA)
             cols = {r["name"] for r in c.execute("PRAGMA table_info(sim_orders)")}
@@ -441,12 +451,48 @@ class SimBroker:
             rows = c.execute("SELECT * FROM sim_orders ORDER BY broker_order_id").fetchall()
         return [self._order(r) for r in rows]
 
+    # ------------------------------------------------------------------ session (additive)
+
+    def _check_session(self) -> None:
+        if not self._connected:
+            raise BrokerDisconnected("simulated: broker session is down")
+
+    def disconnect(self) -> None:
+        """Test control: the session drops (as a Trader Workstation restart does). Orders already
+        at the broker keep working and can fill, expire or be cancelled meanwhile."""
+        self._connected = False
+
+    def connected(self) -> bool:
+        return self._connected
+
+    def reconnect(self) -> None:
+        """Re-establish the session and run the adapter's own identity checks again. Raises
+        BrokerError while ``reconnect_failures`` remain and BrokerIdentityError when the identity
+        check fails. ``next_session_account`` models a session that comes back under another
+        account (the service must halt on it)."""
+        if self.reconnect_failures > 0:
+            self.reconnect_failures -= 1
+            raise BrokerDisconnected("simulated: reconnect failed")
+        self.identity_checks += 1
+        if self.fail_identity_check:
+            raise BrokerIdentityError("simulated: session identity check failed")
+        if self.next_session_account is not None:
+            self.account, self.next_session_account = self.next_session_account, None
+        self._connected = True
+
+    def session_identity(self) -> dict[str, str]:
+        self._check_session()
+        return {"account": self.account, "session": "SIMULATED_PAPER"}
+
     # ------------------------------------------------------------------ Broker protocol
 
     def account_id(self) -> str:
+        self._check_session()
         return self.account
 
     def resolve(self, instrument: Instrument) -> ContractRef:
+        if self is not None:  # tests call SimBroker.resolve(None, ...) for a stock's contract
+            self._check_session()
         if instrument.asset_class not in (AssetClass.EQUITY, AssetClass.ETF):
             month = instrument.futures_contract or (
                 instrument.expiry.replace("-", "") if instrument.expiry else None
@@ -479,6 +525,7 @@ class SimBroker:
         )
 
     def quote(self, contract: ContractRef) -> BrokerQuote:
+        self._check_session()
         with self._tx() as c:
             row = self._quote_for(c, contract)
         if row is None:
@@ -505,12 +552,14 @@ class SimBroker:
     def reference_quote(self, contract: ContractRef) -> BrokerQuote:
         """The quote of a reference series (an index, a spot price or another contract), published
         with ``set_quote(..., contract=...)``. Price conditions are evaluated on these."""
+        self._check_session()
         return self.quote(contract)
 
     def modify_condition(self, order_ref: str, *, trigger_price: Decimal) -> BrokerOrder:
         """Amend the trigger level of a working conditional order. Strict: the amendment is pending
         (the order keeps its old trigger) until the next broker interaction after
         ``pending_seconds``."""
+        self._check_session()
         behaviour = self._modify_script.popleft() if self._modify_script else "APPLY"
         if behaviour == "LOST_ACK_NOT_APPLIED":
             raise AckLost("simulated: modify lost before reaching the broker")
@@ -545,6 +594,7 @@ class SimBroker:
         return self._order(out)
 
     def submit(self, order: OrderIntent, children: Sequence[OrderIntent] = ()) -> list[BrokerOrder]:
+        self._check_session()
         self.submit_calls += 1
         if self.lookup_failures_after_submit:
             self.lookup_failures, self.lookup_failures_after_submit = (
@@ -645,6 +695,7 @@ class SimBroker:
         stop_price: Decimal | None = None,
         quantity: int | None = None,
     ) -> BrokerOrder:
+        self._check_session()
         behaviour = self._modify_script.popleft() if self._modify_script else "APPLY"
         if behaviour == "LOST_ACK_NOT_APPLIED":
             raise AckLost("simulated: modify lost before reaching the broker")
@@ -704,6 +755,7 @@ class SimBroker:
         return self._order(out)
 
     def cancel(self, order_ref: str) -> BrokerOrder:
+        self._check_session()
         behaviour = self._cancel_script.popleft() if self._cancel_script else "APPLY"
         with self._tx() as c:
             self._settle(c)
@@ -739,6 +791,7 @@ class SimBroker:
         return self._order(out)
 
     def open_orders(self) -> list[BrokerOrder]:
+        self._check_session()
         self._maybe_fail_lookup()
         placeholders = ",".join("?" * len(WORKING_STATUSES))
         with self._tx() as c:
@@ -767,6 +820,7 @@ class SimBroker:
         return floor if since is None or since < floor else since
 
     def executions(self, since: datetime | None = None) -> list[Fill]:
+        self._check_session()
         self._maybe_fail_lookup()
         with self._tx() as c:
             self._settle(c)
@@ -792,6 +846,7 @@ class SimBroker:
         return [f for f in fills if since is None or f.executed_at >= since]
 
     def completed_orders(self, since: datetime | None = None) -> list[BrokerOrder]:
+        self._check_session()
         self._maybe_fail_lookup()
         placeholders = ",".join("?" * len(TERMINAL_STATUSES))
         with self._tx() as c:
@@ -806,6 +861,7 @@ class SimBroker:
         return [o for o in orders if since is None or o.updated_at >= since]
 
     def positions(self) -> list[BrokerPosition]:
+        self._check_session()
         with self._tx() as c:
             self._settle(c)
             rows = c.execute(
