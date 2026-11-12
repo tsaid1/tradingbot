@@ -299,6 +299,42 @@ if lat:
         )
     )
 
+# ------------------------------------------------------------------ coverage
+st.subheader("Instrument coverage by source family")
+st.caption(
+    "Every family with a mapping entry, and every family the publisher named. Only an APPROVED "
+    "family can execute; NOT APPROVED and UNSUPPORTED families are held, never ignored."
+)
+if view.get("coverage_error"):
+    st.error(f"Mapping file unreadable: {view['coverage_error']}")
+elif view.get("coverage"):
+    cov = view["coverage"]
+    st.markdown(
+        table(
+            ["Family", "Mapping", "Execution instrument", "Basis", "Signals", "Executed", "Held",
+             "Exceptions", "Held by reason"],
+            [
+                [
+                    c["family"],
+                    c["mapping_status"],
+                    c["execution"],
+                    c["basis"],
+                    c["signals"],
+                    c["executed"],
+                    c["held"],
+                    c["exceptions"],
+                    ", ".join(f"{k} x{n}" for k, n in c["held_by_reason"].items()),
+                ]
+                for c in cov
+            ],
+        )
+    )
+    unsupported = [c["family"] for c in cov if c["mapping_status"] != "APPROVED" and c["signals"]]
+    if unsupported:
+        st.warning("Signals held for families that cannot trade: " + ", ".join(unsupported))
+else:
+    st.info("No mapping entry and no signal yet.")
+
 # ------------------------------------------------------------------ exceptions
 st.subheader("Held signals and exceptions")
 held = [e for e in view["runtime_exceptions"]]

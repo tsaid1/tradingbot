@@ -16,6 +16,8 @@ from pathlib import Path
 
 from tradingbot.execution.broker import ContractRef
 from tradingbot.runtime.config import RuntimeConfig
+from tradingbot.runtime.coverage import coverage_report
+from tradingbot.runtime.mapping import MappingPolicy
 
 STAGES = (
     "published",
@@ -196,6 +198,7 @@ def load(config: RuntimeConfig) -> dict:
                     "asset": a["asset"],
                     "mapping": a["mapping_status"],
                     "mapping_reason": a["mapping_reason"],
+                    "mapping_family": a.get("mapping_family"),
                     "broker_symbol": a["broker_symbol"],
                     "status": a["status"],
                     "reasons": a["reasons"],
@@ -292,7 +295,11 @@ def load(config: RuntimeConfig) -> dict:
         confirmed = (
             p["stop_price"] is not None
             and stop is not None
-            and stop["order_type"] == "STP"
+            and (
+                stop["order_type"] == "STP"
+                # A reference-triggered stop is a conditional exit (multi-asset mapping).
+                or (p.get("protection_series") == "REFERENCE" and stop.get("condition"))
+            )
             and covered == p["quantity"]
             and p["idea_id"] not in open_unprotected
         )
@@ -315,7 +322,14 @@ def load(config: RuntimeConfig) -> dict:
         )
     for e in runtime_exceptions:
         e["reasons"] = json.loads(e["reasons"]) if isinstance(e["reasons"], str) else e["reasons"]
+    try:
+        coverage = coverage_report(MappingPolicy.from_toml(config.paths.mapping_file), actions)
+        coverage_error = None
+    except ValueError as exc:  # the view still loads; the page says why coverage is missing
+        coverage, coverage_error = [], str(exc)
     return {
+        "coverage": coverage,
+        "coverage_error": coverage_error,
         "heartbeat": heartbeat,
         "halted": config.paths.halt_file.exists(),
         "halt_file": str(config.paths.halt_file),

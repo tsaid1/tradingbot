@@ -403,6 +403,7 @@ class RuntimeService:
                     "mapping_status": d.status if d else None,
                     "mapping_basis": d.basis if d else None,
                     "mapping_reason": d.reason if d else None,
+                    "mapping_family": d.family if d else None,
                     "broker_symbol": d.broker_symbol if d else None,
                     "status": o.status,
                     "reasons": _json(o.reasons),
