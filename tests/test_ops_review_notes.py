@@ -76,3 +76,61 @@ def test_n2_when_allowed_an_identity_read_alone_clears_and_says_so(tmp_path):
     detail = cleared_event(rt)
     assert detail["mode"] == "IDENTITY_REREAD_ONLY"
     assert "full reconnect" not in detail["rule"]
+
+
+# ------------------------------------------------------------------------------------------ N3
+
+
+def journaled_request(rt) -> str:
+    """One operator request applied (here refused) and recorded in the execution journal."""
+    queue = Q.OperatorQueue(rt.config.operator_db)
+    queue.enqueue(at=rt.clock.now(), operator="tester", origin="test", action=Q.SETTLE,
+                  target="TB-invented-unknown", outcome="NOT_AT_BROKER", note=NOTE,
+                  confirmation=cat.settle_phrase("TB-invented-unknown", "NOT_AT_BROKER"))
+    rt.step()
+    [req] = queue.requests()
+    assert req["status"] == "REFUSED"
+    assert any(e.detail.get("request_id") == req["uid"]
+               for e in rt.service.coordinator.store.journal())
+    return req["uid"]
+
+
+def swap_for_empty(rt) -> None:
+    rt.config.operator_db.unlink()
+    Q.OperatorQueue.initialise(rt.config.operator_db)  # an empty, perfectly valid queue
+
+
+def queue_alert(rt) -> list[dict]:
+    return [a for a in rt.store.alerts(open_only=True) if a["key"] == "OPERATOR:QUEUE"]
+
+
+def test_n3_a_queue_swapped_for_an_empty_valid_one_is_treated_as_lost(tmp_path):
+    from runtime_harness import CLOSE, ENTRY, post
+
+    rt = Runtime(tmp_path, [post("1", 0, ENTRY), post("2", 60, CLOSE)])
+    journaled_request(rt)
+    swap_for_empty(rt)
+    queue = Q.OperatorQueue(rt.config.operator_db)
+    queue.enqueue(at=rt.clock.now(), operator="tester", origin="test", action=Q.SETTLE,
+                  target="TB-invented-other", outcome="NOT_AT_BROKER", note=NOTE,
+                  confirmation=cat.settle_phrase("TB-invented-other", "NOT_AT_BROKER"))
+    rt.step()
+    [alert] = queue_alert(rt)
+    assert "QUEUE_LOST" in alert["detail"]
+    assert rt.heartbeat()["operator_queue"]["state"] == "UNAVAILABLE"
+    assert queue.pending()  # nothing from the swapped queue is applied
+    # At start-up too, and the trading loop carries on meanwhile.
+    rt.restart()
+    rt.run(20, 5)
+    assert queue_alert(rt) and queue.pending()
+    assert rt.service.coordinator.store.position("1:a1").status == "CLOSED"
+
+
+def test_n3_a_replacement_initialised_for_the_lost_requests_is_accepted(tmp_path):
+    rt = Runtime(tmp_path, [])
+    uid = journaled_request(rt)
+    rt.config.operator_db.unlink()
+    Q.OperatorQueue.initialise(rt.config.operator_db, replaces_lost=[uid])
+    rt.step()
+    assert not queue_alert(rt)
+    assert rt.heartbeat()["operator_queue"]["state"] != "UNAVAILABLE"

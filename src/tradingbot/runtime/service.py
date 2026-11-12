@@ -530,29 +530,43 @@ class RuntimeService:
 
     def _open_queue(self) -> OperatorQueue | None:
         """The operator queue, or None with ``queue_problem`` set: QUEUE_NOT_INITIALISED (never
-        created), QUEUE_LOST (missing although the execution journal references requests from it)
+        created), QUEUE_LOST (missing, or lacking a request the execution journal shows applied,
+        although the journal references requests from it)
         or QUEUE_UNREADABLE (unreadable or corrupt). Never recreated here (review F3)."""
-        if self.queue is not None:
-            try:
+        try:
+            if self.queue is not None:
                 self.queue.check()
-                return self.queue
-            except OperatorQueueUnavailable as exc:
-                self.queue = None
-                problem = exc.reason
-        else:
-            try:
+            else:
                 self.queue = OperatorQueue(self.config.operator_db)
+            # Review N3: a valid queue that lacks a request the execution journal shows applied
+            # (swapped for another file, an empty one above all) is treated as lost.
+            missing = self._journal_request_ids() - self.queue.known_uids()
+            if not missing:
                 return self.queue
-            except OperatorQueueUnavailable as exc:
-                problem = exc.reason
+            self.queue = None
+            problem = "QUEUE_LOST"
+            if self.queue_problem != problem:
+                self.store.event(self.clock(), "OPERATOR_QUEUE_LACKS_APPLIED_REQUESTS",
+                                 missing=len(missing), path=str(self.config.operator_db))
+        except OperatorQueueUnavailable as exc:
+            self.queue = None
+            problem = exc.reason
+        except (sqlite3.DatabaseError, OSError):
+            self.queue = None
+            problem = "UNREADABLE"
         if problem == "NOT_INITIALISED":
-            used = any(e.event.startswith("OPERATOR_") and e.detail.get("request_id")
-                       for e in self.coordinator.store.journal())
-            problem = "QUEUE_LOST" if used else "QUEUE_NOT_INITIALISED"
-        else:
+            problem = "QUEUE_LOST" if self._journal_request_ids() else "QUEUE_NOT_INITIALISED"
+        elif problem != "QUEUE_LOST":
             problem = "QUEUE_UNREADABLE"
         self._queue_unavailable(problem)
         return None
+
+    def _journal_request_ids(self) -> set[str]:
+        """The ids of every operator request the execution journal records a result for."""
+        return {
+            str(e.detail["request_id"]) for e in self.coordinator.store.journal()
+            if e.event.startswith("OPERATOR_") and e.detail.get("request_id")
+        }
 
     def _queue_unavailable(self, problem: str) -> None:
         now = self.clock()
@@ -567,8 +581,9 @@ class RuntimeService:
             "request is applied; the trading loop, exits, protection upkeep and the heartbeat "
             "keep running. " + (
                 "Run `scripts/tb_operator.py init` once." if problem == "QUEUE_NOT_INITIALISED"
-                else "Restore the queue file, or initialise a new one with `scripts/tb_operator.py "
-                "init --replace-lost` after checking the request history."
+                else "Restore the queue file, or move the file aside and initialise a new one "
+                "with `scripts/tb_operator.py init --replace-lost` after checking the request "
+                "history."
             ), now,
         )
 

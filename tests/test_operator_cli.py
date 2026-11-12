@@ -13,6 +13,7 @@ from test_execution_page import write_config
 
 from tradingbot.execution import operator_catalog as cat
 from tradingbot.execution.store import ExecutionStore, IntentState
+from tradingbot.runtime import operator_actions as Q
 
 REPO = Path(__file__).resolve().parents[1]
 ENV = {**os.environ, "PYTHONPATH": str(REPO / "src")}
@@ -104,6 +105,10 @@ def test_cli_init_is_the_only_way_to_create_the_queue_and_refuses_to_hide_a_lost
     assert not rt.config.operator_db.exists()
     out = run("scripts/tb_operator.py", "--config", str(cfg), "init", "--replace-lost")
     assert out.returncode == 0 and rt.config.operator_db.exists()
+    # Review N3: the replacement accounts for the lost requests, so the service accepts it.
+    journaled = {str(e.detail["request_id"]) for e in rt.service.coordinator.store.journal()
+                 if e.event.startswith("OPERATOR_") and e.detail.get("request_id")}
+    assert journaled and journaled <= Q.OperatorQueue(rt.config.operator_db).known_uids()
 
 
 def test_cli_reports_a_corrupt_queue_instead_of_crashing(tmp_path):

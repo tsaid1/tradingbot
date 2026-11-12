@@ -22,9 +22,9 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 from tradingbot.execution import operator_catalog as cat
@@ -61,6 +61,17 @@ CREATE TABLE IF NOT EXISTS operator_results (
     before TEXT NOT NULL,
     after TEXT NOT NULL
 );
+-- Review N3: requests of a lost queue this one was initialised to replace (init --replace-lost).
+CREATE TABLE IF NOT EXISTS operator_replaced_lost (
+    uid TEXT PRIMARY KEY,
+    at TEXT NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS operator_replaced_lost_append_only_u BEFORE UPDATE
+ON operator_replaced_lost
+BEGIN SELECT RAISE(ABORT, 'operator_replaced_lost is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS operator_replaced_lost_append_only_d BEFORE DELETE
+ON operator_replaced_lost
+BEGIN SELECT RAISE(ABORT, 'operator_replaced_lost is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS operator_requests_append_only_u BEFORE UPDATE ON operator_requests
 BEGIN SELECT RAISE(ABORT, 'operator_requests is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS operator_requests_append_only_d BEFORE DELETE ON operator_requests
@@ -117,19 +128,36 @@ class OperatorQueue:
         self.check()
 
     @classmethod
-    def initialise(cls, path: str | Path) -> OperatorQueue:
+    def initialise(cls, path: str | Path, *, replaces_lost: Iterable[str] = ()) -> OperatorQueue:
         """The explicit initialisation step: create the queue if it does not exist (an existing
-        one is opened and checked, never replaced)."""
+        one is opened and checked, never replaced). ``replaces_lost``: the ids of the requests
+        the execution journal shows were applied from a lost queue this one replaces (review N3);
+        recorded only when the queue is created."""
         path = Path(path)
         if not path.exists():
             path.parent.mkdir(parents=True, exist_ok=True)
             conn = sqlite3.connect(str(path), timeout=10.0)
             try:
                 conn.executescript(SCHEMA)
+                at = datetime.now(UTC).isoformat()
+                conn.executemany(
+                    "INSERT OR IGNORE INTO operator_replaced_lost (uid, at) VALUES (?, ?)",
+                    [(uid, at) for uid in sorted(set(replaces_lost))],
+                )
                 conn.commit()
             finally:
                 conn.close()
         return cls(path)
+
+    def known_uids(self) -> set[str]:
+        """Every request id this queue accounts for: its own requests and those of a lost queue
+        it was initialised to replace."""
+        with self._tx() as c:
+            uids = {r[0] for r in c.execute("SELECT uid FROM operator_requests")}
+            if c.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                         "AND name='operator_replaced_lost'").fetchone():
+                uids |= {r[0] for r in c.execute("SELECT uid FROM operator_replaced_lost")}
+        return uids
 
     def check(self) -> None:
         """Raise OperatorQueueUnavailable(UNREADABLE) unless the file is a readable queue
