@@ -40,7 +40,7 @@ def unresolved(tmp_path) -> tuple[Runtime, Path, str]:
 
 
 def test_register_lists_the_exception_its_action_and_the_unresolved_intent(monkeypatch, tmp_path):
-    rt, cfg, ref = unresolved(tmp_path)
+    _rt, cfg, ref = unresolved(tmp_path)
     text = shown(page(monkeypatch, cfg))
     for needle in (
         "MOCK MODE", "Open exceptions", "UNKNOWN_OUTCOME_ENTRY_NOT_RESENT", "SETTLE",
@@ -76,7 +76,7 @@ def test_settlement_is_queued_only_with_the_exact_words_and_applied_by_the_servi
 
 
 def test_a_held_signal_is_acknowledged_through_the_queue(monkeypatch, tmp_path):
-    rt, cfg, ref = unresolved(tmp_path)
+    rt, cfg, _ref = unresolved(tmp_path)
     at = page(monkeypatch, cfg)
     [label] = [o for o in at.selectbox(key="ack_pick").options if "SIGNAL_UNRESOLVED" in o]
     at.selectbox(key="ack_pick").select(label).run()
