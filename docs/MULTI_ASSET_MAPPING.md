@@ -204,23 +204,29 @@ is written in between punctuation (`,` `;` `.` `:` `!` `?`, a line break, a spac
    `at the market`. Attached means written directly after the number ("41.20 now") or directly
    before it ("now 41.20", "trading at 41.20", also with "at" between: "currently at 41.20").
    "We are now long $X, 41.20" has a "now", but not attached to the number: not an anchor.
-2. **Its context window is entirely understood** (an allow-list, `ENTRY_ANCHOR_CONTEXT_UNCLEAR`).
-   The window runs from the start of the number's own clause, or from the last of this action's
-   instruction words or this family's names before the number, up to the number, and from the
-   number to the end of its clause. Every word in it must be a present-market marker (public or
-   private), a connector (`CONNECTOR_WORDS`: at, is, are, around, near, here, the, a, it, @), a
-   currency or unit, a name or alias of this family, or one of the action's own instruction
-   words (long, buy, buying for a long; short, shorting, sell, selling for a short; add, adding for
-   an ADD). Anything else holds: "71.60 now is the goal", "avg 71.60 now", "sold some at 71.50
-   now", "Dubai 71.45 now". For a family whose anchor is compared in a reference series
-   (BASIS_SHIFT, REFERENCE_TRIGGER) the names are the reference series' only: a number labelled
-   with the execution instrument's symbol ("QIF 5,025 now" for an index family) is never compared
-   with the reference. A future's contract months in the window are left to the contract check,
-   and other numbers to `ENTRY_ANCHOR_UNEXPLAINED_PRICE`. A second marked number elsewhere in the
-   post that belongs to no other action holds (`ENTRY_ANCHOR_SEVERAL_LEVELS`). Phrasings that pass
-   include "long $X, 41.20 now", "long $X here at 41.20", "buying $X, currently 41.20", "$X is at
-   41.20 now, we are long", "short $X, 41.20 right now", "long $X ~41.20 now", "adding $X here at
-   41.20", and an alias: "long the bond fund, currently 41.20 USD".
+2. **Its whole sentence is entirely understood** (the final rule; `ENTRY_ANCHOR_CONTEXT_UNCLEAR`).
+   There is no window: the scope is the entire sentence that holds the number. Only a full stop
+   (not a decimal point), an exclamation mark, a question mark, a line break or the end of the
+   post ends a sentence; commas, colons, semicolons, dashes, slashes and brackets do not, and
+   nothing resets the scope. Every alphabetic token in the sentence must be a present-market
+   marker (public or private), a connector (`CONNECTOR_WORDS`: at, is, are, around, near, here,
+   the, a, it, @), a generic function word (`FUNCTION_WORDS`: we, i, are, am, is, in, on, of, to,
+   for, with, and, our, my, a, the, this, new, position, positions, trade), a currency or unit, a
+   name or alias of this family, the action's own words (long, buy, buying or short, shorting,
+   sell, selling; add, adding for an ADD; stop and target when the action has them), or a
+   private `context_words` entry. One unknown word anywhere refuses the anchor ("cost basis long
+   $X 41.20 now", "long $X avg cost, 41.20 now", "goal: 41.20 now"). A sentence ending in a
+   question mark never supplies an anchor (`QUESTION`), nor does one holding another number than
+   the action's own stop, target, reduction or contract month (`SECOND_NUMBER`). For a family
+   whose anchor is compared in a reference series (BASIS_SHIFT, REFERENCE_TRIGGER) the names are
+   the reference series' only: "QIF 5,025 now" for an index family is never compared with the
+   index. A level sentence without the action's own words (a standalone "41.20 now.") also needs
+   the sentence before it to be entirely on the allow-list (`ENTRY_ANCHOR_INSTRUMENT_UNCLEAR`,
+   `PRECEDING_SENTENCE`). A second marked number elsewhere in the post that belongs to no other
+   action holds (`ENTRY_ANCHOR_SEVERAL_LEVELS`). Phrasings that pass include "We are now long $X,
+   41.20 now.", "We are long $X here at 41.20.", "I am buying $X, currently 41.20.", "New
+   position: long $X, trading at 41.20.", "We are now long $X, 41.20 now, stop 40.10.", "Short
+   $X, 41.20 right now, stop 42.30.", and "We are now long $X." followed by "41.20 now.".
 3. **Nothing in its own clause makes it something else** (a second, redundant check) (`NOT_CURRENT_WORDS`): a time other than
    now (yesterday, earlier, last, next, was, will, a weekday, overnight, ...), a chart, session or
    order level (high, low, open, close, settlement, resistance, support, target, objective, stop,
@@ -240,14 +246,19 @@ is written in between punctuation (`,` `;` `.` `:` `!` `?`, a line break, a spac
 *Private extension.* A publisher's own present-market phrasing, and further names of a family,
 are never added to the public lists. They go in the optional `entry_anchor` section of the private
 lexicon file (`[interpreter] lexicon_path`, git-ignored):
-`{"entry_anchor": {"present_markers": ["..."], "family_aliases": {"<FAMILY>": ["..."]}}}`. The
+`{"entry_anchor": {"present_markers": ["..."], "family_aliases": {"<FAMILY>": ["..."]},
+"context_words": ["..."]}}` (context words: a publisher's plain instruction phrasing). The
 interpreter never sees that section. A marker (one to four words) or an alias (one to three) is
 letters only and may not contain any disqualifying word; an alias may not contain a marker word.
 Loading refuses anything else. The extension can only turn a held level into an anchor where the
 publisher's wording is positive evidence; it cannot override rules 2 and 3.
 
-*Residual.* The interpreter must still tag the right number REFERENCE; a word outside the
-number's own clause is not read by the window.
+*What this rule cannot know.* When a post discusses several markets, a correctly marked current
+level in a clean sentence may still belong to a different market than the instruction: the words
+around it are all understood, but the publisher's intent is not. The protections that bound that
+case are the live-quote collar (`max_adverse_move`, `max_favourable_move`, within the code
+ceilings), the signal-age limit, the mandatory protective stop and the size caps (`max_units`,
+`max_notional`). The interpreter must also still tag the right number REFERENCE.
 
 No stated level at all leaves the action as today (`OPEN_ENTRY_PRICE_MISSING`, with
 `ENTRY_ANCHOR_NOT_STATED`). For a futures family the accepted anchor is the one extra level the
