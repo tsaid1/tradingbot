@@ -138,7 +138,9 @@ def test_the_existing_checks_feed_the_classification(tmp_path, scope):
     past = run(p, LONG, f"{LONG}\n50.10 now, last week.")
     assert past.status == "UNRESOLVED" and past.anchor_level_kind == "HISTORICAL", past.reason
     stop = run(p, LONG, f"{LONG}\nStop 50.10 now.")
-    assert stop.status == "UNRESOLVED" and stop.anchor_level_kind == "STOP_OR_TARGET"
+    # PR #70 fix round: a second stop value in the post holds first (STOP_NOT_UNIQUE).
+    assert stop.status == "UNRESOLVED" and (stop.anchor_level_kind == "STOP_OR_TARGET" or
+                                            stop.reason.startswith("ENTRY_ANCHOR_STOP_NOT_UNIQUE"))
 
 
 PASS = [

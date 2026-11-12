@@ -894,7 +894,8 @@ def protective_sentence_problem(sentence: str, own_values: set[Decimal], extra=(
 # Instruction words: a side, add, reduce or exit word in its present or imperative form. A past
 # form ("bought", "sold") reports, it does not instruct; "close" is a chart level for the anchor rule
 # (NOT_CURRENT_WORDS) and is not counted; a hyphenated token ("long-term", "short-dated") is one
-# word and is not counted.
+# word for this list's purposes only in the text above; since the review of PR #70 a hyphenated or
+# slashed token is split first ("long-term" then counts: documented over-blocking).
 INSTRUCTION_WORDS = frozenset((
     *(w for ws in SIDE_WORDS.values() for w in ws), *ADD_WORDS,
     "reduce", "reducing", "trim", "trimming", "exit", "exiting", "cover", "covering",
@@ -905,8 +906,9 @@ _YEAR_RE = re.compile(r"^(?:19|20)\d{2}$")
 
 
 def instruction_word_in(sentence: str, words=INSTRUCTION_WORDS) -> bool:
-    """Whether ``sentence`` holds one of ``words`` as a whole token (case-insensitive)."""
-    return any(_word(t).lstrip("#") in words for t in _TOKEN_RE.findall(sentence or ""))
+    """Whether ``sentence`` holds one of ``words`` as a whole token or as a part of a hyphenated
+    or slashed token (case-insensitive; review of PR #70: "Qorvex-long", "Long/short")."""
+    return any(_parts(t) & set(words) for t in _TOKEN_RE.findall(sentence or ""))
 
 
 def price_like_level(sentence: str, markers) -> bool:
@@ -930,3 +932,80 @@ def price_like_level(sentence: str, markers) -> bool:
         if written_as_price or after_at:
             return True
     return False
+
+
+# Review of PR #70 (510350e). Stop words for the text-level uniqueness check of an anchored entry's
+# stop: "stop" in any hyphenated or qualified form ("stop-loss", "hard stop", "mental stop",
+# "trailing stop", "stop at"), "stoploss", "stops" and "sl". "stopped" reports a past exit and is
+# not a stop price.
+STOP_PRICE_WORDS = frozenset(("stop", "stops", "stoploss", "sl"))
+# With an unresolved mention in the same sentence only (rule b of the fix round): past forms of the
+# instruction words, close / closing / closed, and a small set of acquisition verbs.
+MENTION_ACTION_WORDS = frozenset((
+    "bought", "added", "sold", "shorted", "trimmed", "reduced", "exited", "covered",
+    "close", "closing", "closed", "entering", "accumulating", "grabbing", "loading",
+))
+MENTION_ACTION_PHRASES = ("picking up",)
+# An additive ellipsis right after the instruction ("Qorvex too.").
+ADDITIVE_WORDS = frozenset(("too", "also", "same", "likewise"))
+ADDITIVE_PHRASES = ("as well",)
+
+
+def _parts(token: str) -> set[str]:
+    w = _word(token).lstrip("#")
+    return {p for p in (w, *re.split(r"[-/]", w)) if p}
+
+
+def words_with_parts(sentence: str) -> set[str]:
+    """Every word of ``sentence``, and each part of a hyphenated or slashed token."""
+    out: set[str] = set()
+    for t in _TOKEN_RE.findall(sentence or ""):
+        out |= _parts(t)
+    return out
+
+
+def has_phrase(sentence: str, phrases) -> bool:
+    low = " ".join(_word(t) for t in _TOKEN_RE.findall(sentence or ""))
+    return any(re.search(rf"(?<![\w]){re.escape(p)}(?![\w])", low) for p in phrases)
+
+
+def stop_values(text: str) -> set[Decimal]:
+    """Every number written in the same clause as a stop word, anywhere in ``text``; in a clause
+    that also names a target, only the numbers after a stop word and before the target word."""
+    out: set[Decimal] = set()
+    profit = STOP_TARGET_WORDS - STOP_PRICE_WORDS
+    for sentence, _ in sentences(text):
+        for seg in _SEGMENT_RE.split(sentence):
+            if not seg or not words_with_parts(seg) & STOP_PRICE_WORDS:
+                continue
+            spans = extract_terms(seg).month_spans
+            has_target = bool(words_with_parts(seg) & profit)
+            collecting = not has_target
+            for m in _TOKEN_RE.finditer(seg):
+                parts = _parts(m.group(0))
+                if parts & STOP_PRICE_WORDS:
+                    collecting = True
+                elif parts & profit:
+                    collecting = False
+                elif collecting and not any(a <= m.start() < b for a, b in spans):
+                    v = _value(m.group(0))
+                    if v is not None:
+                        out.add(v)
+    return out
+
+
+def first_word_mention(sentence: str, own, understood, non_market, own_codes, roots):
+    """The mention kind of a sentence-initial capitalised word that the bot cannot tie to this
+    family, or None. Used only together with a trading context in the same sentence."""
+    tokens = _TOKEN_RE.findall(sentence or "")
+    if not tokens:
+        return None
+    word = tokens[0].strip(_EDGE).lstrip("#").replace("’", "'")
+    bare = word[:-2] if word.lower().endswith("'s") else word
+    if not bare or bare.lower() in {o.lower() for o in own}:
+        return None
+    if bare.lower() in PROTECTIVE_WORDS or (understood and all(
+            p in understood or p in PROTECTIVE_WORDS for p in _parts(bare))):
+        return None  # "Stop-loss", "Protective": the anchor rule's own words
+    return _mention_kind(bare, understood or understood_words(), non_market, own_codes, roots,
+                         initial=False)

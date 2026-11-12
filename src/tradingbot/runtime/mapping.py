@@ -64,8 +64,12 @@ from tradingbot.models import (
 from tradingbot.runtime.instruction_terms import (
     ACTION_SEMANTIC_WORDS,
     ADD_WORDS,
+    ADDITIVE_PHRASES,
+    ADDITIVE_WORDS,
     INSTRUMENT_NOUNS,
     MARKET_NOUNS,
+    MENTION_ACTION_PHRASES,
+    MENTION_ACTION_WORDS,
     MONTH_WORD_RE,
     PRESENT_MARKERS,
     SIDE_WORDS,
@@ -78,7 +82,9 @@ from tradingbot.runtime.instruction_terms import (
     code_shaped,
     context_problem,
     extract_terms,
+    first_word_mention,
     foreign_words,
+    has_phrase,
     instruction_word_in,
     leftover_tokens,
     level_kind_of_words,
@@ -90,10 +96,12 @@ from tradingbot.runtime.instruction_terms import (
     quote_clause_words,
     relative_contract_words,
     sentences,
+    stop_values,
     understood_words,
     unknown_tokens,
     unknown_words,
     unresolved_market_mentions,
+    words_with_parts,
 )
 from tradingbot.validator import (
     ANCHOR_MAX_ADVERSE_PCT_CEILING,
@@ -1117,7 +1125,17 @@ class FamilyMapping(StrictModel):
             if own_stop is not None and tagged and own_stop not in tagged:
                 return None, None, [ENTRY_ANCHOR_STOP_NOT_UNIQUE, "STOP_DIFFERS_FROM_ACTION"]
             stop_value = own_stop if own_stop is not None else next(iter(tagged), None)
-            if stop_value is not None and any(stop_value in vals for _, _, vals in others):
+            # Review of PR #70: every number in a clause with a stop word, anywhere in the post
+            # (a second stop in its own sentence; a repeated identical value is not a second one).
+            written = stop_values(post_text or terms.clause)
+            if len(written) > 1:
+                return None, None, [ENTRY_ANCHOR_STOP_NOT_UNIQUE, "SEVERAL_STOP_VALUES"]
+            if written and stop_value is not None and written != {stop_value}:
+                return None, None, [ENTRY_ANCHOR_STOP_NOT_UNIQUE, "STOP_TEXT_DIFFERS"]
+            # Another TRADING action's stated values (commentary does not share a stop).
+            trading = (post or {}).get("trading_values")
+            pool = trading if trading is not None else [vals for _, _, vals in others]
+            if stop_value is not None and any(stop_value in vals for vals in pool):
                 return None, None, [ENTRY_ANCHOR_STOP_NOT_UNIQUE,
                                     "STOP_SHARED_WITH_ANOTHER_ACTION"]
         if anchor in clause_numbers(terms.clause):
@@ -1395,25 +1413,40 @@ class FamilyMapping(StrictModel):
 
     def _competing_instrument(self, text, asset, mine, mine_lower, markers, lexicon,
                               own_clause) -> list[str]:
-        """(a) a mention the bot cannot tie to this family (``unresolved_market_mentions``) holds
-        only when its own sentence gives it a trading context: an instruction, stop or target word
-        (``ACTION_SEMANTIC_WORDS``) or a price-like level (``price_like_level``). (b) a sentence
-        outside this action's own clause sentences that holds an instruction word
-        (``INSTRUCTION_WORDS``) holds, whatever it names: the interpreter did not attribute it to
-        this action. Plain commentary holds neither."""
+        """(a) a mention the bot cannot tie to this family (``unresolved_market_mentions``, and a
+        sentence-initial unknown capitalised word) holds only when its own sentence gives it a
+        trading context: an instruction, stop or target word (``ACTION_SEMANTIC_WORDS``), a
+        price-like level (``price_like_level``) or, with the mention only, a past form, close or
+        acquisition verb (``MENTION_ACTION_WORDS``). (d) the sentence directly after an own
+        instruction sentence holds a mention and an additive word ("Qorvex too."). (b) a sentence
+        outside this action's own clause sentences that holds an instruction word (hyphen and
+        slash parts included) holds, whatever it names. Plain commentary holds none of them."""
         own_sentences = {s for s, _ in sentences(own_clause or "")}
         own = set(self.anchor_names(asset, lexicon)) | mine_lower
         understood = understood_words([*lexicon.present_markers, *lexicon.context_words])
-        for sentence, _ in sentences(text):
-            kinds = unresolved_market_mentions(
-                sentence, own, {m.upper() for m in mine}, self._roots(), understood=understood,
-                non_market=set(lexicon.non_market_words),
-                futures=self.execution.sec_type == "FUT")
-            if kinds and (instruction_word_in(sentence, ACTION_SEMANTIC_WORDS)
-                          or price_like_level(sentence, markers)):
+        codes = {m.upper() for m in mine}
+        non_market = set(lexicon.non_market_words)
+        texts = [s for s, _ in sentences(text)]
+        for k, sentence in enumerate(texts):
+            kinds = set(unresolved_market_mentions(
+                sentence, own, codes, self._roots(), understood=understood,
+                non_market=non_market, futures=self.execution.sec_type == "FUT"))
+            initial = first_word_mention(sentence, own, understood, non_market, codes,
+                                         self._roots())
+            mention = kinds or initial is not None
+            context = (instruction_word_in(sentence, ACTION_SEMANTIC_WORDS)
+                       or price_like_level(sentence, markers)
+                       or instruction_word_in(sentence, MENTION_ACTION_WORDS)
+                       or has_phrase(sentence, MENTION_ACTION_PHRASES))
+            if mention and context:
+                found = sorted({*kinds, *([initial] if initial else [])}, key=lambda m: m.value)
                 return [ENTRY_ANCHOR_POST_UNRESOLVED_MARKET, "RULE:MENTION_WITH_CONTEXT",
-                        *(f"MENTION:{k.value}" for k in kinds)]
-        for sentence, _ in sentences(text):
+                        *(f"MENTION:{m.value}" for m in found)]
+            if mention and k > 0 and texts[k - 1] in own_sentences and (
+                    words_with_parts(sentence) & ADDITIVE_WORDS
+                    or has_phrase(sentence, ADDITIVE_PHRASES)):
+                return [ENTRY_ANCHOR_POST_UNRESOLVED_MARKET, "RULE:ADDITIVE_ELLIPSIS"]
+        for sentence in texts:
             if sentence not in own_sentences and instruction_word_in(sentence):
                 return [ENTRY_ANCHOR_POST_UNATTRIBUTED_ACTION, "RULE:UNATTRIBUTED_ACTION_SENTENCE"]
         return []
@@ -1753,6 +1786,7 @@ class MappingPolicy:
         levels: list[tuple[str, str]] | None = None,
         others: list[tuple[str | None, str | None, set[Decimal]]] = (),
         post_actions: list[TradeAction] | None = None,
+        trading_values: list[set[Decimal]] | None = None,
     ) -> tuple[MappingDecision, Instrument | None]:
         """One action's mapping decision and, when SUPPORTED, its execution instrument.
         ``clause`` is the instruction text the action came from (contract terms are read from it);
@@ -1831,7 +1865,8 @@ class MappingPolicy:
         kind: list[AnchorLevelKind] = []
         anchor, source, problems = (None, None, []) if revoked else entry.entry_anchor_for(
             action, asset, terms, levels, others, post_text, self.anchor_lexicon, attribution,
-            {"actions": post_actions, "vocabulary": self.vocabulary()}, kind_out=kind)
+            {"actions": post_actions, "vocabulary": self.vocabulary(),
+             "trading_values": trading_values}, kind_out=kind)
         if kind:
             out["anchor_level_kind"] = kind[0].value
         if problems:
@@ -1921,6 +1956,8 @@ class MappingPolicy:
                 a, clause=clauses.get(a.action_id), now=now, held=held, recorded=recorded,
                 post_text=post_text, levels=levels.get(a.action_id), others=others,
                 post_actions=list(parsed.actions),
+                trading_values=[stated[b.action_id] for b in parsed.actions
+                                if b.action_id != a.action_id and b.action != Action.NO_TRADE],
             )
             decisions.append(d)
             marks: list[str] = []

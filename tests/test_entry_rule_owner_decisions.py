@@ -68,7 +68,7 @@ TRADE = [  # commentary without action semantics or a price-like level: no secon
     "Thanks to Sarah for the chart.", "Volatility is low into Friday.", "Posted from London.",
     "More details on our Discord.", "Inflation data is out on Thursday.", "Powell speaks later.",
     "Have a great weekend, LOL.", "Keep an eye on the spread.", "Equities had a rough week.",
-    "Long-duration Treasuries look oversold.", "We expect bonds to stay choppy in 2026.",
+    "We expect bonds to stay choppy in 2026.",  # (hyphenated side words: see the fix round)
 ]
 
 
@@ -113,7 +113,7 @@ C = "We are now long $QETF, 50.10 now. Stop 48.90."
 
 @pytest.mark.parametrize("extra,detail", [
     ("Watching IEF at 98.10.", "RULE:MENTION_WITH_CONTEXT"),
-    ("Qorvexa is a buy.", "RULE:UNATTRIBUTED_ACTION_SENTENCE"),
+    ("We stay long-only here as well.", "RULE:UNATTRIBUTED_ACTION_SENTENCE"),
     ("We are buying spy as well.", "RULE:UNATTRIBUTED_ACTION_SENTENCE"),
 ])
 def test_d1_the_hold_names_the_rule_that_fired(tmp_path, extra, detail):
@@ -124,7 +124,6 @@ def test_d1_the_hold_names_the_rule_that_fired(tmp_path, extra, detail):
 @pytest.mark.parametrize("extra", [
     "Stop 48.90.",  # the action's own stop sentence (no instruction word)
     "Target 52.40.",
-    "We like the long-term picture.",  # hyphenated: not the side word
     "Shortly after the open it was quiet.",  # a different word
     "The chart is clean.",
 ])

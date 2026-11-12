@@ -182,7 +182,12 @@ only (they do not authorize order submission):**
   uniquely this action's (`ENTRY_ANCHOR_STOP_NOT_UNIQUE`, at the mapping stage, on the
   interpreter's facts: more than one value tagged STOP for the action `TWO_STOP_VALUES`, the
   action's own stop not among them `STOP_DIFFERS_FROM_ACTION`, or the value stated by another
-  action of the post `STOP_SHARED_WITH_ANOTHER_ACTION`), farther than the limit from the stated
+  trading action of the post, commentary aside, `STOP_SHARED_WITH_ANOTHER_ACTION`; and on the
+  text: every number in a clause with a stop word anywhere in the post, "stop" in any hyphenated
+  or qualified form, "stoploss", "stops" or "sl", but not "stopped", which reports an exit; in a
+  clause that also names a target, only the numbers between the stop word and the target word:
+  more than one distinct value `SEVERAL_STOP_VALUES`, one value other than the action's stop
+  `STOP_TEXT_DIFFERS`; a repeated identical value is not a second stop), farther than the limit from the stated
   reference (`ENTRY_ANCHOR_STOP_TOO_FAR_FROM_REFERENCE`, the anchor in its own series) or from the
   proposed limit (`ENTRY_ANCHOR_STOP_TOO_FAR_FROM_LIMIT`, in the series the stop is held in). The
   gateway checks it; the execution core checks the limit distance again on the limit it sends.
@@ -412,9 +417,22 @@ sentence). They differ only in how a standalone level sentence is attributed ("4
     that holds an instruction word (`INSTRUCTION_WORDS`: the side words long, buy, buying, short,
     shorting, sell, selling; add, adding; reduce, reducing, trim, trimming; exit, exiting, cover,
     covering) holds, whatever it names ("We are buying spy as well.", "Also long the ten-year.").
-    A past form ("bought"), "close" (a chart level for the anchor rule) and hyphenated tokens
-    ("long-term") are not instruction words; stop and target words are not either, so the action's
-    own stop sentence never fires it. A post whose commentary the interpreter itself reads as
+    A past form ("bought") and "close" (a chart level for the anchor rule) are not instruction
+    words here; stop and target words are not either, so the action's own stop sentence never
+    fires it. Hyphenated and slashed tokens are split first ("Qorvex-long", "Long/short"). What
+    this costs, pinned in tests and not fixed: "The long end is bid.", "In short, we like it.",
+    "Enjoy the long weekend.", "Add to that the CPI print.", "Buy the dip, as always.", "Exit plan:
+    below the stop.", "Long story short", "Do not sell in panic.", "long-term", "Long-duration".
+  - Narrow additions for missed second instruments (review of PR #70): a sentence-initial unknown
+    capitalised word counts as a mention when its sentence has a trading context; with a mention
+    in the same sentence, past forms of the instruction words (bought, added, sold, shorted,
+    trimmed, reduced, exited, covered), close / closing / closed and the acquisition verbs
+    entering, accumulating, picking up, grabbing, loading count as context (alone they do not);
+    and the sentence directly after an own instruction sentence that holds a mention and "too",
+    "also", "as well", "same" or "likewise" holds (`RULE:ADDITIVE_ELLIPSIS`). Residual, pinned: a
+    lowercase unknown market with another verb ("Get qorvex.", "Load qorvex.") is not detected; a
+    sentence that opens with an ordinary capitalised word outside the understood vocabulary and
+    holds a context word counts as a mention (over-blocking). A post whose commentary the interpreter itself reads as
     another family's action still holds on the action rule (`ACTION_FOR_ANOTHER_FAMILY`).
   The mention detectors are closed public lists of generic words (`instruction_terms`), never a publisher's:
   `TICKER_SHAPED` (2 to 5 capital letters, optionally with a futures month and year, or any
