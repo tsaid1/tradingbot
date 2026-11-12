@@ -47,12 +47,16 @@ def decide(tmp_path, rule, post, clause=OWN, others=()):
 
 
 def test_a_level_sentence_right_after_the_actions_own_instruction_anchors(tmp_path):
-    post = f"{OWN}\n50.10 now."
-    d = decide(tmp_path, BLOCK, post)
+    clean = "We are now long $QETF."
+    d = decide(tmp_path, BLOCK, f"{clean}\n50.10 now.", clause=clean)
     assert d.status == "SUPPORTED" and d.entry_anchor == "50.10", d.reason
     assert d.anchor_attribution == "AFTER_OWN_INSTRUCTION"
-    # SENTENCE_STRICT does not trust the block: "from the lows" is not on the allow-list.
-    d = decide(tmp_path, STRICT, post)
+    # Every sentence of the action's own clause is allow-listed too (final review): "from the
+    # lows" is not on the list, so neither scope attributes the level.
+    d = decide(tmp_path, BLOCK, f"{OWN}\n50.10 now.")
+    assert d.status == "UNRESOLVED" and d.reason.split(",")[:2] == [
+        "ENTRY_ANCHOR_CONTEXT_UNCLEAR", "OWN_CLAUSE"]
+    d = decide(tmp_path, STRICT, f"{OWN}\n50.10 now.")
     assert d.status == "UNRESOLVED" and d.reason.startswith("ENTRY_ANCHOR_INSTRUMENT_UNCLEAR")
 
 
@@ -99,3 +103,17 @@ def test_a_level_sentence_that_is_itself_unclear_holds_under_both(tmp_path, rule
     for line in ("50.10 now is the goal.", "Avg 50.10 now.", "50.10 now?"):
         d = decide(tmp_path, rule, f"{OWN}\n{line}")
         assert d.status == "UNRESOLVED", (line, d.reason)
+
+
+@pytest.mark.parametrize("remark", ["Dubai looks heavy.", "The other fund is weak.",
+                                    "Gold for 52 next."])
+def test_action_block_allow_lists_every_sentence_of_the_actions_own_clause(tmp_path, remark):
+    clause = f"We are now long $QETF. {remark}"
+    d = decide(tmp_path, BLOCK, f"{clause}\n50.10 now.", clause=clause)
+    assert d.status == "UNRESOLVED" and d.entry_anchor is None, d.reason
+
+
+def test_action_block_accepts_a_clean_clause_with_its_own_stop(tmp_path):
+    clause = "We are now long $QETF. Stop 48.90."
+    d = decide(tmp_path, BLOCK, f"{clause}\n50.10 now.", clause=clause)
+    assert d.status == "SUPPORTED", d.reason

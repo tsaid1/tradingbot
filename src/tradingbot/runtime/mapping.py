@@ -1155,6 +1155,14 @@ class FamilyMapping(StrictModel):
                 elif before is None:
                     case = "FIRST_SENTENCE"
                 elif (self.entry_anchor.anchor_scope == "ACTION_BLOCK" and before in own_block):
+                    # Final review: every sentence the interpreter folded into the action's clause
+                    # passes the same whole-sentence allow-list as the level's sentence.
+                    for s in own_block:
+                        other = unknown_tokens(s, allowed, self._month_spans(s))
+                        if other:
+                            if unknown_out is not None:
+                                unknown_out += other
+                            return [ENTRY_ANCHOR_CONTEXT_UNCLEAR, "OWN_CLAUSE"]
                     # The interpreter delimited this action's clause; the level sentence follows it
                     # with nothing in between. Which sentence its stop or target came from is not
                     # exposed (PriceMention has no sentence index), so those are attributed only
