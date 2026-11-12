@@ -1144,24 +1144,36 @@ class FamilyMapping(StrictModel):
            and a name of this family; a holder, position or trade word reads as an entry price or
            a cost basis (ENTRY_OR_COST_BASIS), a pronoun, a quotation or approximation mark or any
            other word as AMBIGUOUS.
-        B. A clause that does not name this family is elliptical: it takes its topic from its
-           neighbour, the earlier clauses of its sentence or, when it opens its sentence, the
-           sentence immediately before. The neighbour is decided by an ALLOW-list (review B1):
-           (i) a sentence of this action's own clause, or (ii) a neighbour entirely on the
-           whole-sentence allow-list SENTENCE_STRICT applies to a preceding sentence
-           (``unknown_tokens``), or (iii) with ``level_after_own_protective_levels`` only, a
-           sentence stating only this action's own stop and target on their protective and profit
-           sides. Anything else HOLDs (AMBIGUOUS, NEIGHBOUR_NOT_UNDERSTOOD): the bot does not know
-           what the level is about. The level- and cost-word deny-list (``context_problem``) is a
-           second, independent check that can only add a hold ("Stop 40.10. 41.20 now." without
-           the key: the level may be the stop, since ``PriceMention`` has no sentence index).
-           A clause that names this family ("$X 41.20 now.") is an explicit quotation.
+        B. Understood neighbours (final review round: paths removed, not patterns added). An
+           understood neighbour of the level's sentence is the post's boundary, one of this
+           action's own instruction sentences (an own clause sentence naming this family or
+           carrying the action's side or add word), or a sentence stating only the action's own
+           stop and target on their protective and profit sides. R1, every anchored level: the
+           sentence AFTER the level's sentence is understood (a protective-levels sentence counts
+           whatever the key), else FOLLOWING_NOT_UNDERSTOOD. R2, an elliptical level (its clause
+           does not name this family and its sentence is not the instruction): the earlier clauses
+           of its sentence, else the sentence BEFORE, are the action's own instruction sentence or,
+           only with ``level_after_own_protective_levels``, its own protective levels, else
+           NEIGHBOUR_NOT_UNDERSTOOD (also at the start of the post). The level- and cost-word
+           deny-list (``context_problem``) remains a second check that can only add a hold.
         A sentence that cannot be located in the post has no known context: AMBIGUOUS."""
         lexicon = lexicon or AnchorLexicon()
         allowed = [*markers, *own]
-        sentence_allowed = (_allow_list(action, levels, markers, own, lexicon)[0]
-                            if action is not None else allowed)
         own_block = {s for s, _ in sentences(terms.clause)} if terms is not None else set()
+        instruction = list(SIDE_WORDS.get(getattr(getattr(action, "position_side", None),
+                                                  "value", ""), ()))
+        if action is not None and action.action == Action.ADD:
+            instruction += ADD_WORDS
+
+        def instruction_sentence(text: str) -> bool:
+            """One of this action's own clause sentences that is the instruction itself: it names
+            this family or carries the action's own side or add word (final review round: a
+            holder or pronoun line folded into the clause is not the instruction)."""
+            if text not in own_block:
+                return False
+            words = {w.lower().strip("()[]{}.,;:!?\"'") for w in text.split()}
+            return self._names_family(text, own) or bool(words & set(instruction))
+
         whole_q = sentences(post_text or source)
         whole = [s for s, _ in whole_q]
         places = level_places(source, anchor)
@@ -1171,8 +1183,6 @@ class FamilyMapping(StrictModel):
             kind = clause_kind(quote_clause_words(clause, allowed, self._month_spans(clause)))
             if kind is not None:
                 return kind, "OWN_CLAUSE"
-            if self._names_family(clause, own):
-                continue  # names this family: an explicit quotation
             at = next((i for i, w in enumerate(whole) if w == sentence), None)
             if at is None:
                 at = next((i for i, w in enumerate(whole) if sentence in w), None)
@@ -1181,37 +1191,56 @@ class FamilyMapping(StrictModel):
                 # The source is a part of a longer post sentence: its earlier clauses count too.
                 earlier = [*next((e for s, c, e in level_places(whole[at], anchor)
                                   if c.strip() == clause.strip()), []), *earlier]
-            before = whole[at - 1] if at > 0 else None
+                sentence = whole[at]
+            # R1, every anchored level: the sentence after the level's sentence is understood (the
+            # post's end, the action's own instruction sentence, or its own protective levels,
+            # whatever the key).
+            if at + 1 < len(whole):
+                after, question = whole_q[at + 1]
+                if not (instruction_sentence(after) or self._own_protective_levels(
+                        after, question, anchor, action, lexicon, require_key=False)):
+                    return AnchorLevelKind.AMBIGUOUS, "FOLLOWING_NOT_UNDERSTOOD"
+            if self._names_family(clause, own):
+                continue  # an explicit quotation
+            if instruction_sentence(sentence):
+                # The level inside the instruction itself; the deny-list still reads the clauses
+                # before it ("We are long $X, stop 40.10, 41.20 now." holds as before).
+                problem = context_problem(earlier)
+                if problem:
+                    return problem
+                continue
+            # R2, an elliptical level: its preceding neighbour (the earlier clauses of its
+            # sentence, else the sentence before) is the action's own instruction sentence or,
+            # only with level_after_own_protective_levels, its own protective levels. Nothing
+            # else: the generic allow-listed neighbour no longer counts.
             if earlier:
-                neighbour = " ".join(earlier)
-                if not (neighbour in own_block or all(e in own_block for e in earlier)
-                        or not unknown_tokens(neighbour, sentence_allowed,
-                                              self._month_spans(neighbour))):
-                    return AnchorLevelKind.AMBIGUOUS, "NEIGHBOUR_NOT_UNDERSTOOD"
-            elif before is not None:
-                if self._own_protective_levels(before, whole_q[at - 1][1], anchor, action,
-                                               lexicon):
-                    if attribution is not None and "AFTER_OWN_PROTECTIVE_LEVELS" not in \
-                            attribution:
-                        attribution.append("AFTER_OWN_PROTECTIVE_LEVELS")
-                    continue
-                if not (before in own_block
-                        or not unknown_tokens(before, sentence_allowed,
-                                              self._month_spans(before))):
-                    return AnchorLevelKind.AMBIGUOUS, "NEIGHBOUR_NOT_UNDERSTOOD"
-            problem = context_problem([*earlier, *([before] if before is not None else [])])
+                neighbour, question = " ".join(earlier), False
+            elif at > 0:
+                neighbour, question = whole_q[at - 1]
+            else:
+                return AnchorLevelKind.AMBIGUOUS, "NEIGHBOUR_NOT_UNDERSTOOD"
+            if self._own_protective_levels(neighbour, question, anchor, action, lexicon):
+                if attribution is not None and "AFTER_OWN_PROTECTIVE_LEVELS" not in attribution:
+                    attribution.append("AFTER_OWN_PROTECTIVE_LEVELS")
+                continue
+            if earlier or not instruction_sentence(neighbour):
+                return AnchorLevelKind.AMBIGUOUS, "NEIGHBOUR_NOT_UNDERSTOOD"
+            # The deny-list, a second check that can only add a hold.
+            problem = context_problem([neighbour])
             if problem:
                 return problem
         return AnchorLevelKind.MARKET_QUOTE, ""
 
     def _own_protective_levels(self, sentence: str, question: bool, anchor: Decimal,
-                               action: TradeAction | None, lexicon: AnchorLexicon) -> bool:
+                               action: TradeAction | None, lexicon: AnchorLexicon, *,
+                               require_key: bool = True) -> bool:
         """B1b (``level_after_own_protective_levels``, default false): ``sentence`` states only
         this action's own stop (and target): every word on the public protective-levels list or
         the private context words, every number exactly the action's own stop or target, the stop
         on the protective side of the level (below it for a long), a target on the profit side,
         no time, condition or cost-basis word, no month, not a question."""
-        if not (self.entry_anchor and self.entry_anchor.level_after_own_protective_levels) \
+        if (require_key and not (self.entry_anchor
+                                 and self.entry_anchor.level_after_own_protective_levels)) \
                 or action is None or question:
             return False
         stop, target = _level(action.stop_price), _level(action.target_price)

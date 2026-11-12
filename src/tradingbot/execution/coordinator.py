@@ -1764,8 +1764,9 @@ class ExecutionCoordinator:
                 return [ANCHOR_RULE_INCOMPLETE]
             if (now - intent.source_published_at).total_seconds() > limit_age:
                 return [ANCHOR_SIGNAL_TOO_OLD]
-        # As at the first attempt: a mapped plan's entry level is its execution reference.
-        reference = (str(plan.execution_reference) if plan is not None
+        # An anchored entry is checked against its plan's execution reference, as at the first
+        # attempt; every other entry exactly as before (its own entry reference).
+        reference = (str(plan.execution_reference) if fixed is not None
                      and plan.execution_reference is not None else intent.entry_reference)
         limit, reasons = self._entry_checks(
             contract, OrderSide(intent.side), intent.quantity, reference,

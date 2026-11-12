@@ -61,10 +61,11 @@ def test_a_level_sentence_right_after_the_actions_own_instruction_anchors(tmp_pa
 
 
 @pytest.mark.parametrize("rule", [STRICT, BLOCK])
-def test_a_level_sentence_after_an_allow_listed_sentence_anchors(tmp_path, rule):
+def test_a_level_sentence_after_an_allow_listed_sentence_now_holds(tmp_path, rule):
+    """Final review round: an allow-listed sentence that is not the action's own instruction is
+    no longer a neighbour that attributes an elliptical level (NEIGHBOUR_NOT_UNDERSTOOD)."""
     d = decide(tmp_path, rule, f"{OWN} We are long.\n50.10 now.")
-    assert d.status == "SUPPORTED", d.reason
-    assert d.anchor_attribution == "AFTER_ALLOW_LISTED_SENTENCE"
+    assert d.status == "UNRESOLVED", d.reason
 
 
 @pytest.mark.parametrize("rule", [STRICT, BLOCK])
@@ -72,8 +73,7 @@ def test_a_level_sentence_after_a_stop_sentence_now_holds(tmp_path, rule):
     """Owner's safeguard (12 Nov 2026): "Stop 48.90." then "50.10 now." may be the stop."""
     d = decide(tmp_path, rule, f"{OWN} Stop 48.90.\n50.10 now.")
     assert d.status == "UNRESOLVED", d.reason
-    assert d.reason.split(",")[:2] == ["ENTRY_ANCHOR_LEVEL_NOT_MARKET_QUOTE",
-                                       "LEVEL_KIND:STOP_OR_TARGET"]
+    assert d.reason.split(",")[0] == "ENTRY_ANCHOR_LEVEL_NOT_MARKET_QUOTE", d.reason
 
 
 def test_a_stop_sentence_with_other_words_holds_because_its_block_is_not_exposed(tmp_path):

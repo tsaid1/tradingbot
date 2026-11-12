@@ -71,8 +71,9 @@ def test_the_reviewers_case_a_position_level_is_a_possible_cost_basis(tmp_path, 
     (LONG, f"{LONG}\nThis is 50.10 now.", "AMBIGUOUS"),
     ("We are now long $QETF, it is 50.10 now.", None, "AMBIGUOUS"),
     # B: the level sentence right after a stop or target sentence
-    (LONG, f"{LONG} Stop is 48.90.\n50.10 now.", "STOP_OR_TARGET"),
-    (LONG, f"{LONG} Stop 48.90.\n50.10 now.", "STOP_OR_TARGET"),
+    # final round: a stop sentence is not the instruction, so the neighbour rule decides first
+    (LONG, f"{LONG} Stop is 48.90.\n50.10 now.", "AMBIGUOUS"),
+    (LONG, f"{LONG} Stop 48.90.\n50.10 now.", "AMBIGUOUS"),
     ("We are now long $QETF, stop 48.90, 50.10 now.", None, "STOP_OR_TARGET"),
 ])
 def test_a_level_that_may_be_something_else_holds_in_every_scope(tmp_path, scope, clause, post,
@@ -87,8 +88,7 @@ def test_a_level_after_a_target_sentence_holds(tmp_path):
     for scope in SCOPES:
         d = run(scoped(tmp_path, scope), LONG, f"{LONG} Target 52.40.\n50.10 now.",
                 levels=[("REFERENCE", "50.10"), ("STOP", "48.90"), ("TARGET", "52.40")])
-        assert d.reason.split(",")[:2] == [NOT_QUOTE, "LEVEL_KIND:STOP_OR_TARGET"], (scope,
-                                                                                   d.reason)
+        assert d.reason.split(",")[0] == NOT_QUOTE, (scope, d.reason)
 
 
 def test_a_level_after_a_raised_stop_holds_even_where_only_the_post_attributes_it(tmp_path):

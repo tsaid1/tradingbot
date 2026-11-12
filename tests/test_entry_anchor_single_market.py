@@ -21,12 +21,12 @@ from tradingbot.models import Action
 from tradingbot.runtime.mapping import AnchorLexicon, MappingPolicy
 
 SMP = ANCHOR_RULE.replace('"SENTENCE_STRICT"', '"SINGLE_MARKET_POST"')
-OWN = "We are now long $QETF from the lows."
+OWN = "We are now long $QETF on a dip."  # final round: no level word before the level
 NOTE = "The fund has been basing for weeks."
 STOP = "Stop 48.90."
-# Review B1 (12 Nov): the sentence before an elliptical level must be understood (the action's
-# own clause or entirely allow-listed), so the level line follows "We are long." here.
-POST = f"{OWN} {NOTE}\n{STOP}\nThe chart looks constructive.\nWe are long.\n50.10 now."
+# Final review round: the sentence before an elliptical level must be the action's own
+# instruction and the sentence after it understood (here: the end of the post).
+POST = f"{NOTE}\n{STOP}\nThe chart looks constructive.\n{OWN}\n50.10 now."
 
 
 def two_families(tmp_path) -> MappingPolicy:
@@ -60,15 +60,15 @@ def test_a_closing_level_sentence_in_a_one_market_post_anchors(tmp_path):
 
 
 def test_the_neighbour_rule_is_the_same_in_every_scope(tmp_path):
-    """Review B1 (12 Nov): SINGLE_MARKET_POST attributes no level the other scopes would not; it
-    adds the post-level checks (one marked level, one market, one current entry)."""
+    """Final review round: the neighbour rule is applied in every scope; SENTENCE_STRICT and
+    ACTION_BLOCK keep their stricter whole-sentence checks on top (OWN holds "from the lows"), so
+    they are never looser than SINGLE_MARKET_POST."""
+    assert decide(two_families(tmp_path)).status == "SUPPORTED"
     for scope in ("SENTENCE_STRICT", "ACTION_BLOCK"):
         p = policy(tmp_path, etf_entry(rule=ANCHOR_RULE.replace("SENTENCE_STRICT", scope)))
-        assert decide(p).status == "SUPPORTED", scope
-        chart = POST.replace("We are long.\n", "")
-        assert decide(p, post=chart).status == "UNRESOLVED", scope
-    assert decide(two_families(tmp_path), post=POST.replace("We are long.\n", "")).status == \
-        "UNRESOLVED"
+        assert decide(p).status == "UNRESOLVED", scope
+    chart = POST.replace(f"\n{OWN}", "").replace("The chart", f"{OWN} The chart")
+    assert decide(two_families(tmp_path), post=chart).status == "UNRESOLVED"
 
 
 @pytest.mark.parametrize("extra", [

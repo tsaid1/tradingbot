@@ -384,7 +384,9 @@ def test_a_commentary_clause_quoting_the_market_may_be_the_source(tmp_path):
     note = TradeAction(action_id="a2", action=Action.NO_TRADE, timing=Timing.COMMENTARY,
                        source_market_symbol="QETF", evidence=[])
     parsed = ParsedPost(actions=[action(), note])
-    post = "We are now long $QETF. $QETF is trading at 50.10."
+    # Final review round: the commentary clause must be located in the post to read its
+    # neighbours (a clause written differently from the post holds with CONTEXT_UNKNOWN).
+    post = "We are now long $QETF. $QETF trading at 50.10."
     _, [d, _] = p.apply(parsed, clauses={"a1": LONG, "a2": "$QETF trading at 50.10."},
                         now=MAP_NOW, post_text=post, levels={"a1": [("REFERENCE", "50.10")],
                                                              "a2": [("REFERENCE", "50.10")]})

@@ -100,12 +100,13 @@ def decide(p, clause, post_text, a=None, levels=(("REFERENCE", "50.10"), ("STOP"
 
 
 def test_b1_the_deny_list_only_adds_holds(tmp_path):
-    """An allow-listed neighbour holding a stop word still holds (STOP_OR_TARGET)."""
+    """A stop sentence before an elliptical level holds without the key; a level right after the
+    action's own instruction sentence anchors."""
     p = policy(tmp_path, etf_entry(rule=ANCHOR_RULE.replace("SENTENCE_STRICT",
                                                             "SINGLE_MARKET_POST")))
     d = decide(p, "We are now long $QETF.", "We are now long $QETF.\nStop 48.90.\n50.10 now.")
-    assert d.reason.split(",")[:2] == [NOT_QUOTE, "LEVEL_KIND:STOP_OR_TARGET"], d.reason
-    ok = decide(p, "We are now long $QETF.", "We are now long $QETF.\nWe are long.\n50.10 now.")
+    assert d.reason.split(",")[0] == NOT_QUOTE, d.reason
+    ok = decide(p, "We are now long $QETF.", "We are now long $QETF.\n50.10 now.")
     assert ok.status == "SUPPORTED", ok.reason
 
 
