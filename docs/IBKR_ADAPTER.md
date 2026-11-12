@@ -527,7 +527,9 @@ own `now`: if either side's latest change or latest price change is then older t
 `BID_TICKS_NOT_LIVE`, `ASK_TICKS_NOT_LIVE`, `BID_TIME_UNKNOWN`, `ASK_TIME_UNKNOWN`,
 `BID_FROM_FUTURE`, `ASK_FROM_FUTURE`, `BID_STALE`, `ASK_STALE`, `BID_NOT_FINITE`,
 `ASK_NOT_FINITE`, `HALTED`, `UNREPORTED_EVIDENCE_EXPIRED`. Wall-clock times are never used
-for age. Wiring it into the entry rule belongs to the execution workstream.
+for age. The runtime's shadow mode (docs/RUNTIME.md, "Shadow mode") maps held-stream snapshots
+into execution quotes so the gateway's anchored-entry rule refuses everything this check refuses
+(`execution/shadow_quotes.py`, property-tested); it uses the session exactly as documented here.
 
 ### Run the stream check (only after the independent review, with the owner's approval and paper TWS running)
 

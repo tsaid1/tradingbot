@@ -1,4 +1,4 @@
-# Runtime service (mock mode)
+# Runtime service (mock and shadow modes)
 
 `src/tradingbot/runtime/` runs the pipeline as one restart-safe service:
 
@@ -8,7 +8,9 @@ source -> TklInterpreter -> mapping policy -> BrokerEventReplay.process -> SimBr
            lexicon)        not DIRECT)          gate_action, coordinator)                 dashboard
 ```
 
-Only `mode = "mock"` (the simulated broker) is accepted. There is no route to a real broker.
+Two modes are accepted, and in both every order, fill, position and the account are simulated by
+the strict `SimBroker`: `mode = "mock"` (a static invented market) and `mode = "shadow"` (real
+read-only IBKR paper quotes, see "Shadow mode" below). There is no route to an order-capable broker.
 
 ## Run it
 
@@ -26,8 +28,8 @@ by `TRADINGBOT_RUNTIME_CONFIG` (default `~/.config/tradingbot/runtime.toml`).
 ## Config
 
 One TOML file; `config/runtime.example.toml` documents every key. Unknown keys, a missing required
-table (`paths`, `source`, `service`, `policy`, `execution`) or any mode other than `mock` refuse to
-start. **The config fails closed (review F4):** every size, cap, collar, freshness and timing value
+table (`paths`, `source`, `service`, `policy`, `execution`) or any mode other than `mock` or
+`shadow` refuse to start. **The config fails closed (review F4):** every size, cap, collar, freshness and timing value
 the service uses must be written out, or the service refuses to start and names each missing key
 (`config.REQUIRED_KEYS`). Nothing that sizes or bounds an order runs on a default. Relative paths
 resolve against the config file.
@@ -122,3 +124,101 @@ at the start of the next cycle; see `docs/OPERATIONS.md`. Every publisher-driven
 `HALTED_ACTION_REFUSED` naming the idea, action and order ref (identifiers and reason codes only). Post text is never stored; the journal keeps hashes, identities, reason codes and
 timestamps for every stage (published, received, interpreted, gate decided, submitted,
 acknowledged, filled).
+
+## Shadow mode
+
+`mode = "shadow"` runs the whole product (source, interpreter, mapping policy, gateway, execution
+core, reconciliation, alerts, dashboard) on **real read-only quotes** with **simulated fills**.
+
+**What it is.** The broker is `tradingbot.execution.shadow_broker.ShadowBroker`. Orders, fills,
+positions, open orders, executions and the account are the strict `SimBroker`, unchanged, on a
+simulated account (`SIM-SHADOW-0001`; it declares `BrokerEnvironment.SIM`). Contract resolution
+(stocks and ETFs) and quotes come from ONE read-only `IbkrSession`
+(`docs/IBKR_ADAPTER.md`): preflight, identity gate, Read-Only verified from TWS's own settings,
+the deny-by-default outgoing allowlist. Quotes are held streams, market-data type 3 (live when
+entitled, honestly labelled delayed otherwise). The simulator fills working orders against each
+real quote with its existing rules.
+
+**What it is not.** It sends no order, amendment or cancel to any broker: the only messages a
+shadow run can send are the read-only adapter's (market data, contract details, account and
+position reads, the config read; `tests/test_shadow_mode_sdk.py` asserts this on the wire for full
+lifecycles). It does not use `tradingbot.ibkr_orders` and is not a second market-data source. It
+proves nothing about broker-side order handling (acks, rejections, real fills, queue position).
+
+**The quote mapping** (`execution/shadow_quotes.py`, pure). Quality maps one to one (anything
+unknown is UNAVAILABLE). Each side's age is measured only on the adapter's monotonic clock (its
+image or latest value change, never a repeat) and subtracted from a service-clock anchor, rounded
+up to the microsecond; the adapter's wall stamps are never read. The anchor is never later than
+any `now` a decision uses (the service sets it at each cycle start and to each post's decision
+time), so the gateway measures at least the adapter's age. A side that is missing, a placeholder,
+not finite or flagged off-tick, and both sides of a halted series, arrive absent; a side with
+non-live ticks or an observation-time problem arrives without a time; an unreported-type LIVE
+quote whose evidence has expired at the read arrives FROZEN. A property test checks that the
+gateway's anchored rule refuses every quote `entry_quote_check` refuses.
+
+**Streams.** One per contract, opened on demand and reused, at most the session's
+`max_quote_streams` (4); at the cap the least recently read stream is closed first. A contract
+with no stream yet does not block the loop: its stream is opened and that read returns what has
+arrived (normally nothing: UNAVAILABLE, journaled `NO_STREAM_YET`), so a decision on it holds.
+The approved stock and ETF families of the mapping (TLT) are opened at start and after every
+reconnect, so a post normally meets a warm stream. A failed stream (request error, 1100
+connectivity loss) is cancelled and reopened at once; the new subscription must earn LIVE from
+its own evidence. Every unusable read is published to the simulator as UNAVAILABLE with no sides:
+nothing is filled on an older quote.
+
+**Configure and start.**
+
+```toml
+mode = "shadow"
+[shadow]
+paper_config = "~/.config/tradingbot/ibkr/paper.toml"   # loaded exactly as the paper check does
+account = "SIM-SHADOW-0001"                             # optional; the simulated account
+[execution]
+expected_account = "SIM-SHADOW-0001"                    # must equal it
+```
+
+`config/runtime.shadow.example.toml` is complete (invented posts). Shadow mode refuses to start
+without `[shadow] paper_config`, with a `[mock]` table (no invented market), with a historical
+replay (a replay needs `compression`: decisions are taken on today's market), with any other
+`expected_account`, on a state directory that mock mode used (and mock mode refuses a shadow one),
+and whenever the session cannot be positively identified as the approved paper environment:
+config file unsafe, profile not paper, listener absent or owned by another user, server too old,
+identity mismatch, Read-Only not verified, the SDK missing, or the watched families not
+streamable. Exit code 2, nothing left connected.
+
+```
+PYTHONPATH=src python scripts/run_service.py --config <private>/runtime.shadow.toml
+```
+
+**What the owner sees.** The heartbeat carries `mode = "shadow"` and a `shadow` block (quote
+session state, masked paper account, requested market-data type, open streams with their label and
+reason, reconnects, `fills = SIMULATED_AT_REAL_QUOTE`). The journal's `SERVICE_START` carries the
+mode; every post records `SHADOW_DECISION_QUOTES` (for each quote read during its decision: label,
+adapter reason, market-data type, per-side ages, problem codes); every simulated fill records
+`SHADOW_SIMULATED_FILL` with the quote it was computed from. The Execution page shows a shadow
+banner, labels positions, orders and fills `SIMULATED at real quotes`, and lists the quotes each
+decision was made on. The paper account appears only masked.
+
+**Delayed or quiet quotes.** Anchored entries need a LIVE quote with each side changed within
+`max_quote_age_seconds` (3 s for TLT). A delayed (this account's US stocks answer 2186 with delayed
+ids), frozen, unreported-and-unchanging, one-sided-stale, failed or unavailable quote HOLDs or
+BLOCKs the entry (`QUOTE_QUALITY_DELAYED`, `ENTRY_ANCHOR_QUOTE_NOT_LIVE`,
+`ENTRY_ANCHOR_QUOTE_SIDE_STALE`, `QUOTE_UNAVAILABLE`, ...). Explicit-price entries follow the
+gateway's quality rules as in mock mode. A simulated stop is checked against every real quote read,
+including a delayed one, exactly as the simulator does today; the fill records the label.
+
+**Session loss.** A connectivity interruption (1100) fails the streams: quotes UNAVAILABLE, entries
+held, streams reopened once TWS answers again. A dropped socket, poison or disconnect marks the
+broker disconnected: the existing policy applies (`BROKER_RECONNECT_PENDING`, every OPEN and ADD
+refused, the broker alert, no post consumed), and `reconnect()` opens a NEW session with every
+check again on the broker backoff; an identity, paper-environment or read-only failure locks the
+service out and engages the halt. Clean shutdown closes every stream and disconnects
+(`SHADOW_SESSION_CLOSED`).
+
+**What remains to verify against a real TWS.** Whether TLT's live quote is entitled at all on this
+account (if it stays DELAYED, every anchored entry holds, by design); how often each side changes
+in a quiet session against the 3 s limit; how soon a new stream earns LIVE; whether TWS sends -1/0
+placeholders before the first quote (a placeholder never counts; the current value must be valid);
+how 2186 / 10090 / 10167 attach to a stream; how a TWS restart surfaces (socket close vs 1100) and
+how long reconnect takes; contract resolution for TLT with `exchange = "SMART"` and no primary
+exchange returning exactly one contract.

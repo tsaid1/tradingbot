@@ -458,8 +458,9 @@ gateway on the `MappedQuote` (`entry_anchors`, by action id), and the gateway de
   (`ANCHOR_QUOTE_FUTURE_TOLERANCE_SECONDS`, its own small bound; review S1)
   (`ENTRY_ANCHOR_QUOTE_SIDE_FUTURE`). The detail names the side (`SIDE:BID`, `SIDE:ASK`) and the leg
   (`LEG:EXECUTION`, `LEG:REFERENCE`). A broker that cannot report per-side times can never anchor.
-  The simulated broker stamps both sides (its receipt time unless a test says otherwise); the IBKR
-  adapter does not yet, so through it the rule always holds. The execution core applies the same
+  The simulated broker stamps both sides (its receipt time unless a test says otherwise); in shadow
+  mode the per-side times come from the read-only adapter's held streams, converted so the gateway
+  measures at least the adapter's own monotonic age (docs/RUNTIME.md, "Shadow mode"). The execution core applies the same
   rule again to the quote it re-reads just before sending the anchored limit;
 * **the basis cap** (review F4): when the anchor is compared in a reference series (BASIS_SHIFT,
   REFERENCE_TRIGGER) it bounds the reference price only, so the absolute difference between the
@@ -516,8 +517,8 @@ ceiling, or above the policy's `max_price_deviation_pct`, as a percentage of the
 1. The mapping file must state `environment = "PAPER"` in `[entry_anchor]`; it is required and
    "PAPER" is its only accepted value, so no value can mean a funded account.
 2. The runtime refuses to start with the rule on any family in a runtime mode outside the
-   allow-list `mapping.ANCHOR_RULE_MODES` (today only `"mock"`), so a future mode never inherits the
-   rule silently.
+   allow-list `mapping.ANCHOR_RULE_MODES` (`"mock"` and `"shadow"`: both simulate every order and
+   fill; shadow at read-only real quotes), so a future mode never inherits the rule silently.
 3. A broker declares what it trades through an optional `environment()` (`BrokerEnvironment`: `SIM`,
    `PAPER`, `LIVE`; additive, outside the `Broker` protocol). The simulated broker declares `SIM`.
    The execution core refuses an anchored entry unless the broker positively declares `SIM` or

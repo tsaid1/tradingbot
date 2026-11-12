@@ -285,10 +285,13 @@ def test_the_quote_age_is_required_and_capped_on_load(tmp_path):
 
 
 def test_the_rule_runs_only_in_allow_listed_modes():
-    assert ANCHOR_RULE_MODES == ("mock",)
+    # Both allow-listed modes simulate every order and fill (shadow: at read-only real quotes);
+    # tests/test_ibkr_paper_disabled_by_default.py proves neither can build an order path.
+    assert ANCHOR_RULE_MODES == ("mock", "shadow")
     p = MappingPolicy.from_toml(MAPPING)
     p.check_mode("mock")
-    for mode in ("paper", "live", "ibkr", "MOCK"):
+    p.check_mode("shadow")
+    for mode in ("paper", "live", "ibkr", "MOCK", "SHADOW", "shadow-live", "paper-test-1"):
         with pytest.raises(ValueError, match="paper and simulation only"):
             p.check_mode(mode)
 

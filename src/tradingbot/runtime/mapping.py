@@ -138,8 +138,9 @@ ENTRY_ANCHOR_POST_UNRESOLVED_MARKET = "ENTRY_ANCHOR_POST_UNRESOLVED_MARKET"
 # CONTEXT_UNKNOWN).
 ENTRY_ANCHOR_LEVEL_NOT_MARKET_QUOTE = "ENTRY_ANCHOR_LEVEL_NOT_MARKET_QUOTE"
 # Runtime modes in which a family may carry entry_rule = REFERENCE_AS_COLLAR: an allow-list, so a
-# future mode never inherits the rule silently. Only the simulated mode exists today.
-ANCHOR_RULE_MODES = ("mock",)
+# future mode never inherits the rule silently. Both modes simulate every order and fill: "mock"
+# on an invented market, "shadow" at read-only real quotes (no order capability).
+ANCHOR_RULE_MODES = ("mock", "shadow")
 # Interpreter flags meaning it did not resolve one instrument.
 _UNRESOLVED_INSTRUMENT_FLAGS = ("ASSET_UNRESOLVED", "MIXED_SERIES_AND_TICKER",
                                 "MULTIPLE_TICKERS_IN_CLAUSE")
@@ -1627,8 +1628,8 @@ class MappingPolicy:
 
     def check_mode(self, mode: str) -> None:
         """Refuse a runtime mode in which the entry rule may not run (an allow-list,
-        ``ANCHOR_RULE_MODES``: only the simulated mode exists today, and a future mode never
-        inherits the rule silently)."""
+        ``ANCHOR_RULE_MODES``: the two simulated modes, and a future mode never inherits the rule
+        silently)."""
         collar = sorted(f for f, e in self.entries.items()
                         if getattr(e, "entry_rule", None) == "REFERENCE_AS_COLLAR")
         if collar and mode not in ANCHOR_RULE_MODES:
