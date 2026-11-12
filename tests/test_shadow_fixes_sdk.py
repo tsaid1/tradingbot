@@ -279,3 +279,59 @@ def test_s4_a_start_up_failure_after_connecting_leaves_nothing_connected(tmp_pat
     with pytest.raises((ConfigError, OSError)):
         Shadow(tmp_path, tws, mono)
     assert not [c for c in tws.connections if c.isConnected()]
+
+
+# ------------------------------------------------------------------ N1 (confirmation review)
+def _failed_bad_opening(sh):
+    """An opening order on a read with no live data (refused), and a transient error between
+    the refusal and the simulator call."""
+    b = sh.broker
+    c = next(iter(b._by_query.values()))
+    calls = {"n": 0}
+    orig = b._cancel_unqualified_openings
+
+    def flaky(*a, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("transient store error")
+        return orig(*a, **k)
+
+    b._cancel_unqualified_openings = flaky
+    opening = OrderIntent(order_ref="TB-open", contract=c, side=OrderSide.BUY, quantity=1,
+                          order_type=OrderType.LMT, limit_price=Decimal("88.42"))
+    with pytest.raises(RuntimeError):
+        b.submit(opening)
+    assert list(b._sim._submit_script) == []  # nothing left behind by the failed call
+    return b, c
+
+
+def test_n1_a_failed_bad_opening_leaves_no_reject_for_the_next_exit(shadow):
+    sh = shadow()
+    b, c = _failed_bad_opening(sh)
+    sh.live(88.40, 88.42)
+    exit_ = OrderIntent(order_ref="TB-exit", contract=c, side=OrderSide.SELL, quantity=1,
+                        order_type=OrderType.LMT, limit_price=Decimal("88.00"), reduce_only=True)
+    [o] = b.submit(exit_)
+    assert o.status.value == "Filled" and o.reason == "", (o.status, o.reason)
+    assert list(b._sim._submit_script) == []
+    sh.close()
+
+
+def test_n1_a_failed_bad_opening_leaves_nothing_for_a_stop_amendment(shadow):
+    sh = shadow()
+    b, c = _failed_bad_opening(sh)
+    sh.live(88.40, 88.42)
+    stop = OrderIntent(order_ref="TB-stop", contract=c, side=OrderSide.SELL, quantity=1,
+                       order_type=OrderType.STP, stop_price=Decimal("80.00"), reduce_only=True)
+    b._sim.submit(stop)  # a working protective stop, placed in the simulator directly
+    b._sim.script_next_submit("REJECT", reason="STALE")  # a stale script, however it got there
+    amended = b.modify("TB-stop", stop_price=Decimal("81.00"))
+    assert amended.status.value != "Rejected"
+    assert list(b._sim._submit_script) == []  # drained at the start of the call, and journaled
+    [d] = sh.events("SHADOW_STALE_SCRIPT_DRAINED")
+    assert d["codes"] == ["STALE"] and d["where"] == "modify"
+    exit_ = OrderIntent(order_ref="TB-exit", contract=c, side=OrderSide.SELL, quantity=1,
+                        order_type=OrderType.LMT, limit_price=Decimal("88.00"), reduce_only=True)
+    [o] = b.submit(exit_)
+    assert o.status.value == "Filled"
+    sh.close()

@@ -553,29 +553,51 @@ class ShadowBroker:
         """Review B1: an opening order (not reduce-only) is checked against this very read; if
         it is not LIVE with each side within the order's approved age, the (simulated) broker
         rejects the whole bracket with a public code: nothing rests, nothing fills."""
+        self._drain_stale_scripts("submit")
         quote, simulated, evidence, at = self._take(order.contract)
+        code = None
         if not order.reduce_only:
             code = opening_problem(quote, at, self.opening_limit(order.order_ref))
             if code is not None:
                 self._record("SHADOW_OPENING_ORDER_REJECTED", {
                     "order_ref": order.order_ref, "contract_key": order.contract.contract_key,
                     "code": code, "quote": evidence.as_dict()})
-                self._sim.script_next_submit(Behaviour.REJECT, reason=code)
-        return self._with_quote(quote, simulated, evidence, at,
-                                action=lambda: self._sim.submit(order, children))
+
+        def place() -> list[BrokerOrder]:
+            # Review N1: the rejection is queued immediately before the simulator call that
+            # consumes it, and never outlives that call, whatever raises.
+            try:
+                if code is not None:
+                    self._sim.script_next_submit(Behaviour.REJECT, reason=code)
+                return self._sim.submit(order, children)
+            finally:
+                self._sim._submit_script.clear()
+
+        return self._with_quote(quote, simulated, evidence, at, action=place)
+
+    def _drain_stale_scripts(self, where: str) -> None:
+        """Only this broker queues simulator scripts, and only for the call that consumes them;
+        one still pending at the start of a call is stale: drained and journaled by code."""
+        stale = [s.reason or s.behaviour.value for s in self._sim._submit_script]
+        if stale:
+            self._sim._submit_script.clear()
+            self._record("SHADOW_STALE_SCRIPT_DRAINED", {"where": where, "codes": stale})
 
     def modify(self, order_ref: str, *, limit_price: Decimal | None = None,
                stop_price: Decimal | None = None, quantity: int | None = None) -> BrokerOrder:
+        self._drain_stale_scripts("modify")
         return self._on_contract_of(order_ref, lambda: self._sim.modify(
             order_ref, limit_price=limit_price, stop_price=stop_price, quantity=quantity))
 
     def cancel(self, order_ref: str) -> BrokerOrder:
+        self._drain_stale_scripts("cancel")
         return self._on_contract_of(order_ref, lambda: self._sim.cancel(order_ref))
 
     def supports_price_conditions(self) -> bool:
         return self._sim.supports_price_conditions()
 
     def modify_condition(self, order_ref: str, *, trigger_price: Decimal) -> BrokerOrder:
+        self._drain_stale_scripts("modify_condition")
         return self._on_contract_of(order_ref, lambda: self._sim.modify_condition(
             order_ref, trigger_price=trigger_price))
 
