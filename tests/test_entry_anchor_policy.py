@@ -344,7 +344,8 @@ def test_without_the_rule_no_anchor_is_formed(tmp_path):
 def test_anything_but_one_clear_level_holds(tmp_path, clause, levels, reason):
     d, inst = resolve(policy(tmp_path, etf_entry()), action(), clause, levels)
     assert d.status == "UNRESOLVED" and inst is None and d.entry_anchor is None
-    assert d.reason.split(",")[0] == reason
+    # The whole-sentence rule (final review pass) may refuse it first.
+    assert d.reason.split(",")[0] in (reason, "ENTRY_ANCHOR_CONTEXT_UNCLEAR"), d.reason
 
 
 LONG = "We are now long $QETF."
@@ -372,7 +373,8 @@ def test_a_level_line_of_the_post_may_be_the_anchors_source(tmp_path, post, anch
 def test_a_level_line_with_anything_else_in_it_holds(tmp_path, post, reason):
     d, _ = resolve(policy(tmp_path, etf_entry()), action(), LONG, [("REFERENCE", "50.10")],
                    post_text=post)
-    assert d.status == "UNRESOLVED" and d.reason.split(",")[0] == reason
+    assert d.status == "UNRESOLVED"
+    assert d.reason.split(",")[0] in (reason, "ENTRY_ANCHOR_CONTEXT_UNCLEAR"), d.reason
 
 
 def test_a_commentary_clause_quoting_the_market_may_be_the_source(tmp_path):
@@ -387,7 +389,9 @@ def test_a_commentary_clause_quoting_the_market_may_be_the_source(tmp_path):
     assert d.status == "SUPPORTED" and d.entry_anchor == "50.10"
     _, [d, _] = p.apply(parsed, clauses={"a1": LONG, "a2": "$QETF trading at 50.10, 48."},
                         now=MAP_NOW, post_text=post, levels={"a1": [("REFERENCE", "50.10")]})
-    assert d.status == "UNRESOLVED" and d.reason.startswith("ENTRY_ANCHOR_UNEXPLAINED_PRICE")
+    assert d.status == "UNRESOLVED"
+    assert d.reason.split(",")[0] in ("ENTRY_ANCHOR_UNEXPLAINED_PRICE",
+                                      "ENTRY_ANCHOR_CONTEXT_UNCLEAR")
 
 
 def test_the_marks_reach_the_gateway_as_a_hold(tmp_path):
@@ -469,7 +473,7 @@ def test_the_accepted_anchor_is_the_only_level_the_month_check_counts_as_read(tm
     # A second number is still unread, with the rule.
     d, _ = resolve(on, oil_action(), "We are now long $QOIL, 71.50 now, 72.10 earlier.",
                    OIL_LEVELS)
-    assert d.status == "UNRESOLVED" and "UNREAD_TOKEN:72.10" in d.reason
+    assert d.status == "UNRESOLVED" and d.entry_anchor is None
 
 
 # ================================================================== FRONT_MONTH

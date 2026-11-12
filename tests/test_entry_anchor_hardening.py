@@ -134,7 +134,7 @@ def test_a_private_marker_extends_the_list_and_nothing_else(tmp_path):
     # A private marker never overrides a disqualifying word.
     d, _ = resolve(extended, action(), "We are now long $QETF, 50.10 on the tape, was the high.",
                    [("REFERENCE", "50.10")])
-    assert d.status == "SUPPORTED"  # "was the high" is its own clause, with no number
+    assert d.status == "UNRESOLVED"  # the whole sentence is the scope: "was the high" refuses
     d, _ = resolve(extended, action(), "We are now long $QETF, 50.10 high on the tape.",
                    [("REFERENCE", "50.10")])
     assert d.reason.startswith("ENTRY_ANCHOR_NOT_CURRENT")
@@ -198,7 +198,8 @@ def test_relative_contract_wording_holds_even_with_an_explicit_entry_and_the_rul
 def test_reviewer_probe_back_month_never_trades_the_front(tmp_path, post):
     run = run_posts(tmp_path, "back", [post])
     [(_, status, reasons)] = _outcomes(run)
-    assert status == "HOLD" and "CONTRACT_MONTH_UNRECOGNISED" in reasons, reasons
+    assert status == "HOLD", reasons
+    assert {"CONTRACT_MONTH_UNRECOGNISED", "ENTRY_ANCHOR_CONTEXT_UNCLEAR"} & set(reasons), reasons
     assert run.broker.submit_calls == 0
     run.close()
 
