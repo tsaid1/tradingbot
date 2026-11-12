@@ -600,3 +600,32 @@ def test_a_settlement_only_reads_and_records_and_leaves_upkeep_to_the_normal_cyc
     assert "HALT_ENTRY_CANCELLED" not in h.events(working.order_ref)
     h.coord.sync()  # the normal cycle
     assert "cancel" in calls and "HALT_ENTRY_CANCELLED" in h.events(working.order_ref)
+
+
+def test_a_partial_group_is_cleared_on_evidence_never_acknowledged(h):
+    """Review note (b): an open PARTIAL_GROUP keeps reconciliation unclean, so closing it can lift
+    blocks that wait on a clean reconciliation. It is therefore CLEAR-class, verified like any
+    clear, not a plain acknowledgement."""
+    out = h.execute("p1", open_action())
+    assert out.state == IntentState.FILLED and h.coord.reconcile().clean
+    h.coord.store.raise_exception(h.clock.now(), R.PARTIAL_GROUP, "invented: group half done",
+                                  idea_id="p1:open")
+    [e] = [x for x in h.coord.store.exceptions(open_only=True) if x.kind == R.PARTIAL_GROUP]
+    assert not h.coord.reconcile().clean
+    assert cat.action_for(R.PARTIAL_GROUP)[0] == cat.CLEAR
+    ack = S.acknowledge_exception(h.coord, request_id="ack-pg", exc_id=e.id, kind=e.kind,
+                                  confirmation=cat.acknowledge_phrase(e.id, e.kind), note=NOTE,
+                                  operator="tester")
+    assert ack.reasons == ["NOT_ACKNOWLEDGEABLE:CLEAR"]
+    foreign = foreign_contract(h)
+    h.broker.submit(OrderIntent(order_ref="FOREIGN-PG", contract=foreign, side=OrderSide.BUY,
+                                quantity=1, order_type=OrderType.MKT))
+    phrase = cat.clear_phrase(e.id, e.kind)
+    refused = S.clear_exception(h.coord, request_id="clr-pg-1", exc_id=e.id, kind=e.kind,
+                                confirmation=phrase, note=NOTE, operator="tester")
+    assert refused.status == "REFUSED" and refused.reasons[0].startswith("CONTRACT_NOT_CLEAN:")
+    h.broker.submit(OrderIntent(order_ref="FOREIGN-PG2", contract=foreign, side=OrderSide.SELL,
+                                quantity=1, order_type=OrderType.MKT))
+    done = S.clear_exception(h.coord, request_id="clr-pg-2", exc_id=e.id, kind=e.kind,
+                             confirmation=phrase, note=NOTE, operator="tester")
+    assert done.status == "APPLIED" and h.coord.reconcile().clean

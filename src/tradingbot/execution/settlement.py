@@ -13,8 +13,9 @@ protective orders and cancel working entries under the halt (risk-reducing only)
   at the broker like any other fill. A settlement that contradicts what the broker shows now is
   refused (the order or a fill is visible, a limit was violated, the resulting follower position
   cannot match the broker's).
-* ``clear_exception``: a CLEAR-class record (LEDGER_REVERSAL, SETTLED_INTENT_CONTRADICTED) closes
-  only when a full sync and reconciliation made now show the contract clean.
+* ``clear_exception``: a CLEAR-class record (LEDGER_REVERSAL, SETTLED_INTENT_CONTRADICTED,
+  PARTIAL_GROUP) closes only when a full sync and reconciliation made now show the contract clean
+  (the record's own reconciliation line excepted).
 * ``acknowledge_exception``: an informational record that blocks no exposure.
 * ``lift_verified_blocks``: a settled intent leaves OPERATOR_SETTLEMENT_UNVERIFIED open, which
   blocks new exposure in its contract until a full successful sync and reconciliation show no

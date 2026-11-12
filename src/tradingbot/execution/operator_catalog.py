@@ -39,7 +39,11 @@ EXCEPTION_ACTIONS: dict[str, tuple[str, str]] = {
     "STALE_AFTER_UNKNOWN_OUTCOME": (ACKNOWLEDGE, "nothing was sent; acknowledge"),
     "MODIFY_NOT_CONFIRMED": (ACKNOWLEDGE, "compare the working stop with the ledger; acknowledge"),
     "PROTECTIVE_LEVEL_NOT_LOOSENED": (ACKNOWLEDGE, "review the kept level; acknowledge"),
-    "PARTIAL_GROUP": (ACKNOWLEDGE, "review the half-executed group; acknowledge"),
+    # An open PARTIAL_GROUP keeps reconciliation unclean (a safety discrepancy), so closing it can
+    # lift blocks that wait on a clean reconciliation: it needs the evidence of a clear (note b).
+    "PARTIAL_GROUP": (
+        CLEAR, ("fix the half-executed group at the broker by hand if needed, then clear "
+                "(verified by reconciliation)")),
     "UNPROTECTED_POSITION": (
         EVIDENCE, "restore the stop or exit the position; clears when the stop is confirmed"),
     "PROTECTION_UNVERIFIED": (EVIDENCE, "clears on the next successful broker check"),

@@ -88,11 +88,13 @@ is applied exactly once and never answered with another request's result.
   If the order shows up later anyway, that is `SETTLED_INTENT_CONTRADICTED` (above), never a
   normal adoption; the intent's journal shows your declaration and the evidence that
   contradicted it.
-* `clear <id> LEDGER_REVERSAL | SETTLED_INTENT_CONTRADICTED`: applied only if a sync and
-  reconciliation made at that moment show the contract clean (the record's own line excepted).
+* `clear <id> LEDGER_REVERSAL | SETTLED_INTENT_CONTRADICTED | PARTIAL_GROUP`: applied only if a
+  sync and reconciliation made at that moment show the contract clean (the record's own line
+  excepted). `PARTIAL_GROUP` is here, not under `ack`: while it is open reconciliation is not
+  clean, so closing it can lift other blocks and needs the same evidence.
 * `ack <id> <kind>`: closes a record that blocks nothing (`EXIT_NOT_NETTED`, `EXIT_WITHOUT_QUOTE`,
-  `STALE_AFTER_UNKNOWN_OUTCOME`, `MODIFY_NOT_CONFIRMED`, `PROTECTIVE_LEVEL_NOT_LOOSENED`,
-  `PARTIAL_GROUP`). `ack-signal <id> <kind>` closes a held signal.
+  `STALE_AFTER_UNKNOWN_OUTCOME`, `MODIFY_NOT_CONFIRMED`, `PROTECTIVE_LEVEL_NOT_LOOSENED`).
+  `ack-signal <id> <kind>` closes a held signal.
 * `clear-lockout <expected account>`: forces a full reconnect through the adapter, so every
   identity check it has runs again, even if the session looks connected. It is applied only if
   that reconnect succeeds with the expected account and the same session identity the service
