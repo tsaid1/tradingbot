@@ -257,6 +257,8 @@ class RuntimeService:
         self.cycles = int(self.store.get("cycles", 0) or 0)
         self.last_reconciliation: ReconciliationReport | None = None
         now = self.clock()
+        # This process opened its broker session no earlier than now (review N2).
+        self.started_at = now
         # Review F7: a live post published before the service first ever started is never acted on.
         first = self.store.get("first_start_at")
         if first is None:
@@ -579,6 +581,8 @@ class RuntimeService:
                 coordinator=self.coordinator, runtime_store=self.store, queue=queue,
                 expected_account=self.config.execution.expected_account, clock=self.clock,
                 locked_out=locked_out,
+                require_full_reconnect=self.config.service.lockout_clear_requires_full_reconnect,
+                session_opened_at=self.started_at,
             )
         except (OperatorQueueUnavailable, sqlite3.DatabaseError, OSError):
             self._queue_unavailable("QUEUE_UNREADABLE")

@@ -112,8 +112,14 @@ of the queue; write what you checked, never a credential or a full account numbe
   that reconnect succeeds with the expected account and the same session identity the service
   last accepted (account and paper or live; a session that changed kind is never accepted by a
   typed word). Otherwise it is refused with the reason (`IDENTITY_CHECK_FAILED`,
-  `BROKER_STILL_SHOWS_ANOTHER_ACCOUNT`, `SESSION_IDENTITY_NOT_ACCEPTED`, `BROKER_UNREADABLE`) and
-  the lockout stays. Once applied, the next cycle runs the full resync. The halt stays engaged.
+  `BROKER_STILL_SHOWS_ANOTHER_ACCOUNT`, `SESSION_IDENTITY_NOT_ACCEPTED`, `BROKER_UNREADABLE`,
+  `FULL_RECONNECT_UNAVAILABLE`) and the lockout stays. Once applied, the next cycle runs the full
+  resync. The halt stays engaged. The journal (`IDENTITY_LOCKOUT_CLEARED`) states what was done:
+  `mode` `FULL_RECONNECT` (the adapter reconnected, or this process opened its session after the
+  lockout began) or `IDENTITY_REREAD_ONLY` (an adapter that cannot reconnect, cleared on an
+  identity read alone). With `[service] lockout_clear_requires_full_reconnect = true` (the
+  default) the latter is refused with `FULL_RECONNECT_UNAVAILABLE`: such an adapter stays locked
+  out until the service is restarted, after which the clear is accepted on the new session.
 * Never operator-clearable, because only evidence resolves them: `UNPROTECTED_POSITION`,
   `PROTECTION_UNVERIFIED`, `ENTRY_REMAINDER_NOT_CANCELLED`, `BROKER_STATE_UNKNOWN`,
   `BROKER_RECONNECT_PENDING`, `OPERATOR_SETTLEMENT_UNVERIFIED`.

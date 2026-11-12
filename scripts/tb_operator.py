@@ -76,6 +76,7 @@ def _apply_now(config) -> list[dict] | None:
 
     if config.mode != "mock":
         raise ConfigError("only mock mode may run")
+    opened_at = datetime.now(UTC)  # this process opens its own broker session (review N2)
     try:
         broker = SimBroker(config.broker_db, account=config.mock.account)
         coordinator = ExecutionCoordinator(
@@ -89,6 +90,8 @@ def _apply_now(config) -> list[dict] | None:
             coordinator=coordinator, runtime_store=store, queue=Q.OperatorQueue(config.operator_db),
             expected_account=config.execution.expected_account, clock=lambda: datetime.now(UTC),
             locked_out=session_state(store)["state"] == LOCKED_OUT,
+            require_full_reconnect=config.service.lockout_clear_requires_full_reconnect,
+            session_opened_at=opened_at,
         )
     finally:
         coordinator.close()
