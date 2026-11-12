@@ -453,9 +453,9 @@ def test_read_only_on_at_the_broker_rejects_orders(tws, tmp_path):
 # --- lifecycle through the real coordinator ----------------------------------------------------
 def coordinator(tws, tmp_path, **cfg):
     s = make(tws, tmp_path)
-    broker = IbkrPaperBroker(s)
     policy = MockPolicy(quantity=1, quantity_per_add=1, max_notional_usd=D(150),
                         max_price_deviation_pct=D(1))
+    broker = IbkrPaperBroker(s, exit_collar_pct=policy.max_price_deviation_pct)
     config = ExecutionConfig(halt_file=tmp_path / "HALT", expected_account=PAPER,
                              protective_tif=TimeInForce.DAY, confirm_attempts=10,
                              confirm_wait_seconds=0.05, **cfg)
@@ -1135,5 +1135,73 @@ def test_the_binding_satisfies_mains_protocol_and_places_no_conditional_order(tw
         with pytest.raises(BrokerError, match="PRICE_CONDITION_NOT_SUPPORTED"):
             b.submit(intent)
         assert placed(tws) == 0 and s.submissions_used == 0
+    finally:
+        s.disconnect()
+
+
+# --- note (a): the exit dry check prices the exit limit actually to be sent --------------------
+def test_the_exit_dry_check_prices_the_exit_limit_not_the_stop(tws, tmp_path, monkeypatch):
+    from tradingbot.execution.coordinator import snap_to_tick
+    s, broker, coord, _out = _held_with_stop(tws, tmp_path)
+    try:
+        seen = []
+        real = s.dry_check_exit
+
+        def spy(order_id, *, limit_price):
+            seen.append(limit_price)
+            return real(order_id, limit_price=limit_price)
+
+        monkeypatch.setattr(s, "dry_check_exit", spy)
+        expected = snap_to_tick(D(str(tws.bid)) * (1 - D(1) / 100), D("0.01"), "ROUND_CEILING")
+        assert broker.exit_limit() == expected == D("87.22")  # bid 88.10 less 1 %, up to tick
+        idea = coord.ledger()[0].idea_id
+        close = run(coord, "c1", action("close", Action.CLOSE, idea=idea, symbol="TLT"))
+        assert close.state == IntentState.WORKING, close
+        assert seen == [expected]  # the dry run used the limit that was then sent
+        sent = tws.placed()[-1]
+        assert sent.order.action == "SELL" and D(str(sent.order.lmtPrice)) == expected
+        assert D(str(sent.order.lmtPrice)) != D("87.00")  # not the stop price
+    finally:
+        coord.close()
+        s.disconnect()
+
+
+def test_an_exit_limit_the_guard_refuses_keeps_the_stop_even_if_the_stop_price_passes(
+        tws, tmp_path):
+    """The stop (87.00) is inside the 150 USD cap, but the close the core would send now (the bid
+    160.00 less 1 %) is not: the stop is never cancelled for it."""
+    s, broker, coord, out = _held_with_stop(tws, tmp_path)
+    try:
+        tws.bid, tws.ask, tws.last = 160.00, 160.02, 160.01  # invented
+        idea = coord.ledger()[0].idea_id
+        close = run(coord, "c1", action("close", Action.CLOSE, idea=idea, symbol="TLT"))
+        assert close.state != IntentState.WORKING
+        stop_id = fake_id(tws, f"{out.order_ref}.STP")
+        assert tws.orders[stop_id].status == "Submitted"
+        assert tws.count("CANCEL_ORDER") == 0 and placed(tws) == 2
+        journal = " ".join(str(e.detail) for e in coord.store.journal(close.order_ref))
+        assert "PROTECTIVE_CANCEL_UNCONFIRMED" in journal  # the core: nothing sent
+        assert not broker.protection_lost
+        own_stop = next(i for i, r in s.order_ids().items() if r.endswith(".STP"))
+        with pytest.raises(OrderRefused) as info:  # what the binding's dry run saw
+            s.dry_check_exit(own_stop, limit_price=broker.exit_limit())
+        assert info.value.refusal.reason == RefusalReason.NOTIONAL_CAP
+        s.dry_check_exit(own_stop, limit_price=D("87.00"))  # the stop price would have passed
+    finally:
+        coord.close()
+        s.disconnect()
+
+
+def test_without_an_exit_collar_no_held_stop_can_be_cancelled(tws, tmp_path):
+    s = make(tws, tmp_path)
+    try:
+        snaps = s.place([buy(), stop()])
+        tws.fill(snaps[0].order_id, 1, 88.11)
+        assert settle(lambda: s.positions() and s.positions()[0].quantity == 1)
+        b = IbkrPaperBroker(s)  # a read-only use of the binding: no collar
+        assert b.exit_limit() is None
+        with pytest.raises(BrokerError, match="EXIT_WOULD_BE_REFUSED"):
+            b.cancel("TB-0001.STP")
+        assert tws.count("CANCEL_ORDER") == 0
     finally:
         s.disconnect()

@@ -335,9 +335,10 @@ def _stage3(cfg: PaperOrderConfig, ev: dict) -> None:
     coord = None
     try:
         _require_count(s, STAGES[3])
-        broker = IbkrPaperBroker(s)
         policy = MockPolicy(quantity=1, quantity_per_add=1, max_notional_usd=Decimal(150),
                             max_price_deviation_pct=Decimal(1))
+        # the exit dry check prices the close exactly as the core will (bid less this collar)
+        broker = IbkrPaperBroker(s, exit_collar_pct=policy.max_price_deviation_pct)
         config = ExecutionConfig(halt_file=evidence_dir(cfg) / "HALT",
                                  expected_account=s.account_id,
                                  accepted_quote_qualities=frozenset({QuoteQuality(quality)}),

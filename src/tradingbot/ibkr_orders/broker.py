@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from datetime import datetime
-from decimal import Decimal
+from decimal import ROUND_CEILING, Decimal
 from typing import Any
 
 from tradingbot.execution.broker import (
@@ -33,6 +33,7 @@ from tradingbot.execution.broker import (
     QuoteQuality,
     TimeInForce,
 )
+from tradingbot.execution.coordinator import snap_to_tick
 from tradingbot.ibkr.errors import IbkrError
 from tradingbot.ibkr_orders.records import (
     AmendRejected,
@@ -74,8 +75,14 @@ def _int_qty(value: Decimal, what: str) -> int:
 
 
 class IbkrPaperBroker:
-    def __init__(self, session: Any) -> None:
+    """``exit_collar_pct`` is the execution core's ``MockPolicy.max_price_deviation_pct``: the
+    core prices a close as a marketable SELL limit at the bid less this collar, snapped up to the
+    tick, and the exit dry check prices its probe the same way. Without it (a binding used only
+    for reads) no protective stop can be cancelled or shrunk while a position is held."""
+
+    def __init__(self, session: Any, *, exit_collar_pct: Decimal | None = None) -> None:
         self._s = session
+        self._exit_collar_pct = exit_collar_pct
         self._asset_class: dict[int, AssetClass] = {}
         self._stops_cancelled: set[str] = set()  # protective stops this binding cancelled
         self.protection_lost = ""  # set when an exit failed after its stop was cancelled
@@ -146,7 +153,7 @@ class IbkrPaperBroker:
         if snap.action != "SELL" or snap.order_type != "STP":
             return False
         try:
-            self._s.dry_check_exit(snap.order_id)
+            self._s.dry_check_exit(snap.order_id, limit_price=self.exit_limit())
         except OrderRefused as exc:
             raise BrokerError(f"EXIT_WOULD_BE_REFUSED: {exc}; the protective stop "
                               f"{snap.order_ref} was NOT cancelled or resized") from exc
@@ -154,6 +161,23 @@ class IbkrPaperBroker:
             raise BrokerError(f"exit dry check failed: {exc}; the protective stop "
                               f"{snap.order_ref} was NOT cancelled or resized") from exc
         return True
+
+    def exit_limit(self) -> Decimal | None:
+        """The closing SELL limit the execution core would send now (``_exit_limit``): the bid
+        of a fresh quote less the collar, snapped UP to the min tick. None when it cannot be
+        priced (no collar, no quote, no positive bid)."""
+        if self._exit_collar_pct is None:
+            return None
+        pinned = self._s.contract
+        try:
+            q = self.quote(self._contract_for(pinned.con_id, pinned.symbol, pinned.sec_type,
+                                              pinned.currency))
+        except BrokerError:
+            return None
+        if q.quality == QuoteQuality.UNAVAILABLE or q.bid is None or q.bid <= 0:
+            return None
+        band = self._exit_collar_pct / Decimal(100)
+        return snap_to_tick(q.bid * (1 - band), Decimal(str(pinned.min_tick)), ROUND_CEILING)
 
     def _exit_failed(self, order: OrderIntent, children: Sequence[OrderIntent],
                      exc: Exception) -> BrokerError:

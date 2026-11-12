@@ -700,22 +700,27 @@ class PaperOrderSession(IbkrSession):
                     raise CancelFailed(f"cancel of order {order_id} refused: {t.cancel_error}")
                 return self._snap(t)
 
-    def dry_check_exit(self, order_id: int) -> None:
-        """Before a protective SELL of this client is cancelled or shrunk for an exit: would a
-        closing SELL LMT for what is held pass the guard once this order is gone? Same inputs as
+    def dry_check_exit(self, order_id: int, *, limit_price: Decimal | None) -> None:
+        """Before a protective SELL of this client is cancelled or shrunk for an exit: would the
+        closing SELL LMT at ``limit_price`` (the exit limit that is actually to be sent, never
+        the stop price) for what is held pass the guard once this order is gone? Same inputs as
         at send time (fresh position, own fills, working orders without this one, the count, the
-        clock and hours). Raises ``OrderRefused`` if not. Sends nothing, counts nothing."""
+        clock and hours). Raises ``OrderRefused`` if not, and when something is held but the exit
+        limit is unknown (``None``). Sends nothing, counts nothing."""
         with self._order_lock:
             self._require_order_mode()
             with self._cond:
                 t = self._tracks.get(order_id)
                 if t is None or not t.own:
                     raise OrderNotWorking(f"order {order_id} is not an order of this client")
-                price = t.stop_price or t.limit_price
             facts, position, working = self._fresh_state()
             held = position[0]
             if held is not None and held <= 0 and position[1] == held:
                 return  # nothing held: the cancel only reduces risk
+            if limit_price is None:
+                raise OrderRefused(Refusal(RefusalReason.PRICE_INVALID,
+                                           "the exit limit to be sent is unknown"))
+            price = limit_price
             qty = min(held if held is not None and held > 0 else Decimal(1),
                       Decimal(self._caps.max_order_quantity))
             c = self.contract
