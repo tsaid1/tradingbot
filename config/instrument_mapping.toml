@@ -33,10 +33,10 @@
 #                                        quote; ceiling 5 s) and environment = "PAPER" (its only
 #                                        value): all required, no defaults. Paper and simulation
 #                                        only; never a funded account; never a market order.
-#                                        Optional level_after_own_protective_levels (strict
-#                                        boolean, default false; an owner decision): a level line
-#                                        may also follow a sentence stating only the action's own
-#                                        stop and target
+#                                        A level written on its own ("41.20 now.") never
+#                                        anchors unless the optional standalone_level_sentence
+#                                        (strict boolean, default false; an owner decision) is
+#                                        true
 #   level_contract_rule = "EXPLICIT_MONTH_ONLY"  (default) a futures level needs a named month
 #   level_contract_rule = "FRONT_MONTH"  a DIRECT futures level with no month means the front
 #                                        contract of the entry's own list; HOLD in its roll window

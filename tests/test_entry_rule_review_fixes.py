@@ -3,7 +3,7 @@
 B1  the neighbour of an elliptical level is decided by an ALLOW-list (the action's own clause, or
     the whole-sentence allow-list SENTENCE_STRICT applies to a preceding sentence); the level- and
     cost-word deny-list only adds holds.
-B1b optional ``level_after_own_protective_levels`` (default false): a sentence stating only the
+B1b optional ``standalone_level_sentence`` (default false): a sentence stating only the
     action's own stop and target may precede the level.
 B2  an unknown market in the neighbour holds; the mention detector reads all-caps words of six or
     more letters, ``/`` and ``.`` parts and ``#WORD``.
@@ -84,7 +84,8 @@ def test_b1_the_single_market_hold_names_the_neighbour(tmp_path):
 
 
 @pytest.mark.parametrize("text", [
-    "We are now long $TLT.\n88.42 now.\nStop 87.20.",  # after the action's own clause
+    # Fallback round: on the shipped file (switch off) only the level inside the instruction
+    # sentence trades; the level line after it is in test_entry_rule_standalone.
     "We are now long $TLT, 88.42 now. Stop 87.20.",  # in the instruction's own sentence
 ])
 def test_b1_the_plain_shapes_still_trade(text):
@@ -100,26 +101,27 @@ def decide(p, clause, post_text, a=None, levels=(("REFERENCE", "50.10"), ("STOP"
 
 
 def test_b1_the_deny_list_only_adds_holds(tmp_path):
-    """A stop sentence before an elliptical level holds without the key; a level right after the
-    action's own instruction sentence anchors."""
+    """With the switch on: a level line after an instruction that carries its own stop holds on the
+    deny-list (STOP_OR_TARGET); after a plain instruction it anchors."""
     p = policy(tmp_path, etf_entry(rule=ANCHOR_RULE.replace("SENTENCE_STRICT",
                                                             "SINGLE_MARKET_POST")))
-    d = decide(p, "We are now long $QETF.", "We are now long $QETF.\nStop 48.90.\n50.10 now.")
-    assert d.reason.split(",")[0] == NOT_QUOTE, d.reason
+    c = "We are now long $QETF, stop 48.90."
+    d = decide(p, c, f"{c}\n50.10 now.")
+    assert d.reason.split(",")[:2] == [NOT_QUOTE, "LEVEL_KIND:STOP_OR_TARGET"], d.reason
     ok = decide(p, "We are now long $QETF.", "We are now long $QETF.\n50.10 now.")
     assert ok.status == "SUPPORTED", ok.reason
 
 
 # ================================================================== B1b: own protective levels
 
-KEY = ANCHOR_RULE.replace("SENTENCE_STRICT", "SINGLE_MARKET_POST").replace(
-    'environment = "PAPER"', 'environment = "PAPER", level_after_own_protective_levels = true')
+# Fallback round: the switch is now standalone_level_sentence (ANCHOR_RULE carries it, true).
+KEY = ANCHOR_RULE.replace("SENTENCE_STRICT", "SINGLE_MARKET_POST")
 LONG = "We are now long $QETF."
 
 
 def keyed(tmp_path, on=True):
     return policy(tmp_path, etf_entry(rule=KEY if on else KEY.replace(
-        "level_after_own_protective_levels = true", "level_after_own_protective_levels = false")))
+        "standalone_level_sentence = true", "standalone_level_sentence = false")))
 
 
 def with_target(target="52.40"):
@@ -185,12 +187,12 @@ def test_b1b_a_short_needs_its_stop_above_and_target_below(tmp_path):
 @pytest.mark.parametrize("value,ok", [("true", True), ("false", True), ('"yes"', False),
                                       ("1", False)])
 def test_b1b_the_key_is_a_strict_boolean(tmp_path, value, ok):
-    text = etf_entry(rule=KEY.replace("level_after_own_protective_levels = true",
-                                      f"level_after_own_protective_levels = {value}"))
+    text = etf_entry(rule=KEY.replace("standalone_level_sentence = true",
+                                      f"standalone_level_sentence = {value}"))
     if ok:
         policy(tmp_path, text)
     else:
-        with pytest.raises(ValueError, match="level_after_own_protective_levels"):
+        with pytest.raises(ValueError, match="standalone_level_sentence"):
             policy(tmp_path, text)
 
 
@@ -198,7 +200,7 @@ def test_b1b_the_key_needs_the_rule(tmp_path):
     rule = ('entry_anchor = { max_adverse_move = "0.5%", max_favourable_move = "1%", '
             'max_signal_age_seconds = 60, anchor_scope = "SINGLE_MARKET_POST", '
             'max_quote_age_seconds = 3, environment = "PAPER", '
-            'level_after_own_protective_levels = true }')
+            'standalone_level_sentence = true }')
     with pytest.raises(ValueError, match="REFERENCE_AS_COLLAR"):
         policy(tmp_path, etf_entry(rule=rule))
 
@@ -206,7 +208,7 @@ def test_b1b_the_key_needs_the_rule(tmp_path):
 def test_b1b_the_key_is_off_for_every_shipped_family():
     for e in MappingPolicy.from_toml(MAPPING).entries.values():
         if getattr(e, "entry_anchor", None) is not None:
-            assert e.entry_anchor.level_after_own_protective_levels is False
+            assert e.entry_anchor.standalone_level_sentence is False
 
 
 # ================================================================== B2: unknown markets

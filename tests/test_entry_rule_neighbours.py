@@ -4,7 +4,7 @@ Understood neighbour of the level's sentence: the boundary of the post, one of t
 instruction sentences, or a sentence stating only the action's own stop and target (the
 protective-levels sentence). R1: the sentence AFTER every anchored level must be understood (a
 protective-levels sentence counts whatever the key). R2: the sentence BEFORE an elliptical level
-must be an own instruction sentence, or, only with ``level_after_own_protective_levels``, a
+must be an own instruction sentence, or, only with ``standalone_level_sentence``, a
 protective-levels sentence; the generic allow-listed neighbour no longer counts. Invented text, the
 whole mock service, the shipped mapping and a copy with the key on.
 """
@@ -28,7 +28,7 @@ def keyed_mapping(folder: Path) -> Path:
     head, tail = MAPPING.read_text().split(CUT, 1)
     assert head.count('environment = "PAPER" }') == 1
     head = head.replace('environment = "PAPER" }',
-                        'environment = "PAPER", level_after_own_protective_levels = true }')
+                        'environment = "PAPER", standalone_level_sentence = true }')
     f = folder / "keyed.toml"
     f.write_text(head + CUT + tail)
     return f
@@ -78,10 +78,11 @@ def test_with_the_key_a_protective_sentence_before_and_commentary_after_holds(te
 PLAIN = [
     "We are now long $TLT, 88.42 now. Stop 87.20.",  # instruction sentence, own stop after
     "We are now long $TLT, 88.42 now, stop 87.20.",
+]
+# Fallback round: an elliptical level line anchors only with standalone_level_sentence on.
+KEY_PLAIN = [
     "We are now long $TLT.\n88.42 now.\nStop 87.20.",  # elliptical after the instruction
     "We are now long $TLT.\n88.42 now.\nStop 87.20, target 89.50.",
-]
-KEY_PLAIN = [
     "We are now long $TLT.\nStop 87.20, target 89.50.\n88.42 now.",  # at the end of the post
 ]
 # Not tradable, and not by this rule: a stop written BEFORE the instruction is not attached to it
@@ -96,7 +97,8 @@ STILL_HELD = ["We are now long $TLT, stop 87.20.\n88.42 now.",
 @pytest.mark.parametrize("text", STILL_HELD)
 def test_an_elliptical_level_after_an_instruction_with_its_stop_stays_held(text, key):
     sent, out = run(text, key)
-    assert sent == 0 and "LEVEL_KIND:STOP_OR_TARGET" in out[0][1], out
+    # switch on: the deny-list (STOP_OR_TARGET); switch off: no level line anchors at all
+    assert sent == 0 and out[0][0] != "EXECUTED", out
 
 
 @pytest.mark.parametrize("key", [False, True])

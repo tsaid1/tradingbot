@@ -126,7 +126,9 @@ def test_action_block_accepts_a_clean_clause_and_its_own_stop_after_the_level(tm
     clause = "We are now long $QETF."
     d = decide(tmp_path, BLOCK, f"{clause}\n50.10 now.\nStop 48.90.", clause=clause)
     assert d.status == "SUPPORTED", d.reason
-    # Owner's safeguard (12 Nov 2026): a level sentence right after the stop sentence holds.
+    # Fallback round: with standalone_level_sentence on (as in BLOCK here), a level line right
+    # after the action's own stop sentence is accepted (AFTER_OWN_PROTECTIVE_LEVELS); with it
+    # off, no level line anchors (test_entry_rule_standalone).
     clause = "We are now long $QETF. Stop 48.90."
     d = decide(tmp_path, BLOCK, f"{clause}\n50.10 now.", clause=clause)
-    assert d.reason.split(",")[0] == "ENTRY_ANCHOR_LEVEL_NOT_MARKET_QUOTE", d.reason
+    assert d.status == "SUPPORTED" and "AFTER_OWN_PROTECTIVE_LEVELS" in d.anchor_attribution

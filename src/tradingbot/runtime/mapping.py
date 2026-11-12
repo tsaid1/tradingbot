@@ -419,10 +419,20 @@ class EntryAnchorRules(StrictModel):
     # Required, and "PAPER" is its only value: the rule is for simulation and the paper account,
     # never a funded account. The file states the limitation; no value could mean anything else.
     environment: Literal["PAPER"]
-    # An owner decision, default false (shipped false): an elliptical level ("88.42 now.") may
-    # also follow a sentence that states only this action's own stop and target, on their
-    # protective and profit sides (docs/MULTI_ASSET_MAPPING.md, "What the level is", B1b).
-    level_after_own_protective_levels: StrictBool = False
+    # An owner decision, default false (shipped false). Off: a level written on its own
+    # ("88.42 now.") never anchors. On: it may, only after the action's own instruction sentence
+    # or its own stop-and-target sentence, when every own instruction sentence passes the
+    # whole-sentence allow-list (docs/MULTI_ASSET_MAPPING.md, "What the level is").
+    standalone_level_sentence: StrictBool = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def _renamed(cls, data):
+        if isinstance(data, dict) and "level_after_own_protective_levels" in data:
+            raise ValueError("level_after_own_protective_levels was renamed to "
+                             "standalone_level_sentence (an elliptical level may anchor only "
+                             "with it, default false)")
+        return data
 
     @field_validator("max_adverse_move", "max_favourable_move")
     @classmethod
@@ -1150,10 +1160,13 @@ class FamilyMapping(StrictModel):
            carrying the action's side or add word), or a sentence stating only the action's own
            stop and target on their protective and profit sides. R1, every anchored level: the
            sentence AFTER the level's sentence is understood (a protective-levels sentence counts
-           whatever the key), else FOLLOWING_NOT_UNDERSTOOD. R2, an elliptical level (its clause
-           does not name this family and its sentence is not the instruction): the earlier clauses
+           whatever the key), else FOLLOWING_NOT_UNDERSTOOD. An elliptical level (its clause does
+           not name this family and its sentence is not the instruction) never anchors unless
+           ``standalone_level_sentence`` is on (STANDALONE_LEVEL_NOT_ENABLED); then every own
+           instruction sentence must pass the whole-sentence allow-list a level's own sentence
+           passes (INSTRUCTION_NOT_UNDERSTOOD), and R2: the earlier clauses
            of its sentence, else the sentence BEFORE, are the action's own instruction sentence or,
-           only with ``level_after_own_protective_levels``, its own protective levels, else
+           only with ``standalone_level_sentence``, its own protective levels, else
            NEIGHBOUR_NOT_UNDERSTOOD (also at the start of the post). The level- and cost-word
            deny-list (``context_problem``) remains a second check that can only add a hold.
         A sentence that cannot be located in the post has no known context: AMBIGUOUS."""
@@ -1209,9 +1222,22 @@ class FamilyMapping(StrictModel):
                 if problem:
                     return problem
                 continue
+            # Fallback (review F1): an elliptical level never anchors unless the owner enables
+            # standalone_level_sentence; then (c) every own instruction sentence must pass the
+            # whole-sentence allow-list a level's own sentence must pass, so the level is
+            # accepted only where it would have been accepted inside the instruction sentence.
+            if not (self.entry_anchor and self.entry_anchor.standalone_level_sentence):
+                return AnchorLevelKind.AMBIGUOUS, "STANDALONE_LEVEL_NOT_ENABLED"
+            allowed_all, _, consumed, fractions = _allow_list(action, levels, markers, own,
+                                                              lexicon)
+            own_instructions = [(t, q) for t, q in whole_q if instruction_sentence(t)]
+            if not own_instructions or any(
+                    self._whole_sentence_problem(t, q, allowed_all, consumed | {anchor}, fractions)
+                    for t, q in own_instructions):
+                return AnchorLevelKind.AMBIGUOUS, "INSTRUCTION_NOT_UNDERSTOOD"
             # R2, an elliptical level: its preceding neighbour (the earlier clauses of its
             # sentence, else the sentence before) is the action's own instruction sentence or,
-            # only with level_after_own_protective_levels, its own protective levels. Nothing
+            # only with standalone_level_sentence, its own protective levels. Nothing
             # else: the generic allow-listed neighbour no longer counts.
             if earlier:
                 neighbour, question = " ".join(earlier), False
@@ -1234,13 +1260,13 @@ class FamilyMapping(StrictModel):
     def _own_protective_levels(self, sentence: str, question: bool, anchor: Decimal,
                                action: TradeAction | None, lexicon: AnchorLexicon, *,
                                require_key: bool = True) -> bool:
-        """B1b (``level_after_own_protective_levels``, default false): ``sentence`` states only
+        """``standalone_level_sentence`` (default false): ``sentence`` states only
         this action's own stop (and target): every word on the public protective-levels list or
         the private context words, every number exactly the action's own stop or target, the stop
         on the protective side of the level (below it for a long), a target on the profit side,
         no time, condition or cost-basis word, no month, not a question."""
         if (require_key and not (self.entry_anchor
-                                 and self.entry_anchor.level_after_own_protective_levels)) \
+                                 and self.entry_anchor.standalone_level_sentence)) \
                 or action is None or question:
             return False
         stop, target = _level(action.stop_price), _level(action.target_price)
@@ -1331,6 +1357,27 @@ class FamilyMapping(StrictModel):
         return [*extract_terms(text).month_spans,
                 *(m.span() for m in MONTH_WORD_RE.finditer(text))]
 
+    def _whole_sentence_problem(self, sentence: str, question: bool, allowed, consumed,
+                                fractions, unknown_out: list[str] | None = None) -> list[str]:
+        """The whole-sentence allow-list a level's own sentence must pass (and, with
+        ``standalone_level_sentence``, every own instruction sentence): not a question, every
+        alphabetic token allow-listed, no number but the action's own levels and months."""
+        if question:
+            return [ENTRY_ANCHOR_CONTEXT_UNCLEAR, "QUESTION"]
+        unknown = unknown_tokens(sentence, allowed, self._month_spans(sentence))
+        if unknown:
+            if unknown_out is not None:  # a local analysis tool's hook; never logged
+                unknown_out += unknown
+            return [ENTRY_ANCHOR_CONTEXT_UNCLEAR, f"WORDS:{len(unknown)}"]
+        extra = [x for x in leftover_tokens(extract_terms(sentence), consumed, fractions,
+                                            self._roots())
+                 if any(ch.isdigit() for ch in x)
+                 and not (x.startswith("~") and clause_numbers(x[1:]) <= consumed
+                          and clause_numbers(x[1:]))]
+        if extra:
+            return [ENTRY_ANCHOR_CONTEXT_UNCLEAR, "SECOND_NUMBER"]
+        return []
+
     def _sentence_problems(self, action, anchor, source, terms, levels, post_text, markers, own,
                            lexicon, unknown_out: list[str] | None = None,
                            attribution: list[str] | None = None) -> list[str]:
@@ -1349,20 +1396,10 @@ class FamilyMapping(StrictModel):
             return [ENTRY_ANCHOR_NOT_IN_POST]
         whole = sentences(post_text) if post_text else sentences(source)
         for sentence, question in found:
-            if question:
-                return [ENTRY_ANCHOR_CONTEXT_UNCLEAR, "QUESTION"]
-            unknown = unknown_tokens(sentence, allowed, self._month_spans(sentence))
-            if unknown:
-                if unknown_out is not None:  # a local analysis tool's hook; never logged
-                    unknown_out += unknown
-                return [ENTRY_ANCHOR_CONTEXT_UNCLEAR, f"WORDS:{len(unknown)}"]
-            extra = [x for x in leftover_tokens(extract_terms(sentence), consumed, fractions,
-                                                self._roots())
-                     if any(ch.isdigit() for ch in x)
-                     and not (x.startswith("~") and clause_numbers(x[1:]) <= consumed
-                              and clause_numbers(x[1:]))]
-            if extra:
-                return [ENTRY_ANCHOR_CONTEXT_UNCLEAR, "SECOND_NUMBER"]
+            problem = self._whole_sentence_problem(sentence, question, allowed, consumed,
+                                                   fractions, unknown_out)
+            if problem:
+                return problem
             if unknown_words(sentence, instruction) == unknown_words(sentence, []):
                 # A level sentence: the one before it must not name anything else.
                 texts = [s for s, _ in whole]

@@ -300,7 +300,7 @@ sizing = {{ units_per_signal = 2, max_units = 4, max_notional = "60000" }}
 roll = {{ business_days_before = 3, action = "FLATTEN" }}
 reference_trigger = {{ released_order_type = "MKT", reference_hours = ["13:30-20:00"], require_backstop = false }}
 entry_rule = "REFERENCE_AS_COLLAR"
-entry_anchor = {{ max_adverse_move = "0.5%", max_favourable_move = "1%", max_signal_age_seconds = 60, anchor_scope = "SENTENCE_STRICT"{cap}, max_quote_age_seconds = 3, environment = "PAPER" }}
+entry_anchor = {{ max_adverse_move = "0.5%", max_favourable_move = "1%", max_signal_age_seconds = 60, anchor_scope = "SENTENCE_STRICT"{cap}, max_quote_age_seconds = 3, environment = "PAPER", standalone_level_sentence = true }}
 """
 
 

@@ -847,7 +847,7 @@ def _mention_kind(bare: str, understood, non_market, own_codes, roots, *, initia
     return None
 
 
-# entry_anchor.level_after_own_protective_levels (an owner decision, default false): the only words
+# entry_anchor.standalone_level_sentence (an owner decision, default false): the only words
 # a "protective-levels sentence" may hold, besides numbers that are exactly the action's own stop
 # and target and the private context words. Closed and generic on purpose.
 PROTECTIVE_WORDS = frozenset((

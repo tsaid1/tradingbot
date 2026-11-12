@@ -21,7 +21,7 @@ from tradingbot.models import Action
 from tradingbot.runtime.mapping import AnchorLexicon, MappingPolicy
 
 SMP = ANCHOR_RULE.replace('"SENTENCE_STRICT"', '"SINGLE_MARKET_POST"')
-OWN = "We are now long $QETF on a dip."  # final round: no level word before the level
+OWN = "We are now long $QETF."  # fallback round: the instruction must be understood
 NOTE = "The fund has been basing for weeks."
 STOP = "Stop 48.90."
 # Final review round: the sentence before an elliptical level must be the action's own
@@ -64,9 +64,12 @@ def test_the_neighbour_rule_is_the_same_in_every_scope(tmp_path):
     ACTION_BLOCK keep their stricter whole-sentence checks on top (OWN holds "from the lows"), so
     they are never looser than SINGLE_MARKET_POST."""
     assert decide(two_families(tmp_path)).status == "SUPPORTED"
+    foreign = POST.replace(f"\n{OWN}", f"\n{OWN} The chart looks fine.")
+    assert decide(two_families(tmp_path), post=foreign).status == "UNRESOLVED"
     for scope in ("SENTENCE_STRICT", "ACTION_BLOCK"):
         p = policy(tmp_path, etf_entry(rule=ANCHOR_RULE.replace("SENTENCE_STRICT", scope)))
-        assert decide(p).status == "UNRESOLVED", scope
+        assert decide(p).status == "SUPPORTED", scope  # the same clean post
+        assert decide(p, post=foreign).status == "UNRESOLVED", scope
     chart = POST.replace(f"\n{OWN}", "").replace("The chart", f"{OWN} The chart")
     assert decide(two_families(tmp_path), post=chart).status == "UNRESOLVED"
 
@@ -146,13 +149,13 @@ def test_a_reference_series_level_names_nothing_or_the_reference(tmp_path):
     f.write_text(service_mapping(scope="SINGLE_MARKET_POST"))
     p = MappingPolicy.from_toml(f)
     from test_entry_anchor_context import idx_action
-    own = "We are now long $QIDX on a dip."
-    # Owner's safeguard (12 Nov 2026): a bare level line right after "Stop 4,980." holds (it may
-    # be the stop), so the stop line follows the level here.
+    own = "We are now long $QIDX."
+    # Fallback round: ANCHOR_RULE carries standalone_level_sentence = true, so a bare level line
+    # after the own stop sentence is accepted; the shipped default is in test_entry_rule_standalone.
     for line, reason, stop_first in (
             ("5,010 now.", None, False), ("QIDX 5,010 now.", None, False),
             ("QIDX 5,010 now.", None, True),  # names the reference: explicit, any neighbour
-            ("5,010 now.", "ENTRY_ANCHOR_LEVEL_NOT_MARKET_QUOTE", True),
+            ("5,010 now.", None, True),  # fallback round: after the own stop, switch on
             ("QIF 5,010 now.", "ENTRY_ANCHOR_REFERENCE_UNNAMED", False)):
         post = f"{own}\nStop 4,980.\n{line}" if stop_first else f"{own}\n{line}\nStop 4,980."
         parsed = ParsedPost(actions=[idx_action()])
