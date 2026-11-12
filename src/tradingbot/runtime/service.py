@@ -438,11 +438,19 @@ class RuntimeService:
         session = session_state(self.store)
         if session["state"] == LOCKED_OUT:
             return
-        if session["state"] == CONNECTED:
-            mark = max((e.seq for e in self.coordinator.store.journal()), default=0)
+        if session["state"] in (CONNECTED, RESYNCING):
+            # Review F4: a loss during the resync is a new outage: reported, back to
+            # DISCONNECTED, and everything adopted since the last report is reported again on
+            # the next reconnect.
+            during = session["state"] == RESYNCING
+            mark = (
+                int(session.get("reported_through", session.get("journal_mark", 0)))
+                if during else max((e.seq for e in self.coordinator.store.journal()), default=0)
+            )
             self.store.put(SESSION_KEY, {"state": DISCONNECTED, "since": now.isoformat(),
                                          "journal_mark": mark, "reason": _safe_error(exc)}, now)
-            self.store.event(now, "BROKER_SESSION_LOST", error=_safe_error(exc))
+            self.store.event(now, "BROKER_SESSION_LOST", error=_safe_error(exc),
+                             during_resync=during)
         self.coordinator.store.raise_exception(
             now, BROKER_RECONNECT_PENDING,
             "broker session lost; every OPEN and ADD is refused until it is back, a full sync "
@@ -471,7 +479,8 @@ class RuntimeService:
                 if down is not None else f"adopted: {changes}",
                 now,
             )
-            session = {**session, "state": RESYNCING, "reported": True}
+            session = {**session, "state": RESYNCING, "reported": True, "reported_through": max(
+                (e.seq for e in self.coordinator.store.journal()), default=0)}
             self.store.put(SESSION_KEY, session, now)
         unexplained = [d.kind.value for d in rec.unexplained]
         if unexplained:

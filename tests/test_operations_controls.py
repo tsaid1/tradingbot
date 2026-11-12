@@ -367,6 +367,44 @@ def test_exposure_stays_blocked_until_the_resync_shows_nothing_unexplained(tmp_p
     assert BROKER_RECONNECT_PENDING in exec_kinds(rt)
 
 
+def test_a_second_outage_during_the_resync_is_reported_and_keeps_exposure_blocked(tmp_path):
+    """Review F4: the session drops again while RESYNCING. It goes back to DISCONNECTED, the loss
+    is reported, and what changed in the second gap is reported on the next reconnect."""
+    from tradingbot.execution.broker import OrderIntent, OrderSide, OrderType
+    from tradingbot.models import AssetClass, Instrument
+
+    rt = Runtime(tmp_path, [post("1", 0, ENTRY)])
+    rt.step(5)
+    assert rt.service.coordinator.store.position("1:a1").quantity == 2
+    rt.broker.disconnect()
+    rt.broker.reconnect_failures = 1
+    rt.step(5)
+    rt.broker._connected = True  # someone trades the account by hand while we are away
+    foreign = rt.broker.resolve(Instrument(asset_class=AssetClass.ETF, symbol="IEF"))
+    rt.broker.submit(OrderIntent(order_ref="FOREIGN-1", contract=foreign, side=OrderSide.BUY,
+                                 quantity=1, order_type=OrderType.MKT))
+    rt.broker._connected = False
+    rt.clock.advance(60)
+    rt.step(5)
+    assert session_state(rt.store)["state"] == "RESYNCING"  # waits on the foreign position
+    # The second outage, during the resync; the stop triggers in that gap.
+    rt.broker.disconnect()
+    rt.broker.reconnect_failures = 1
+    lost_before = sum(e["event"] == "BROKER_SESSION_LOST" for e in rt.store.events())
+    rt.step(5)
+    assert session_state(rt.store)["state"] == "DISCONNECTED"
+    assert sum(e["event"] == "BROKER_SESSION_LOST" for e in rt.store.events()) == lost_before + 1
+    assert BROKER_RECONNECT_PENDING in exec_kinds(rt)
+    rt.broker.set_quote("TLT", "87.00", "87.02")
+    rt.clock.advance(60)
+    rt.step(5)
+    reports = [e for e in rt.store.events() if e["event"] == "BROKER_RECONNECTED"]
+    assert len(reports) == 2
+    assert any(f.endswith(".STP:2") for f in reports[-1]["detail"]["fills"])
+    assert kinds(rt).count(N.BROKER_RECONNECTED) == 2
+    assert BROKER_RECONNECT_PENDING in exec_kinds(rt)  # the foreign position still waits
+
+
 def test_a_session_under_another_account_halts_and_stops_touching_the_broker(tmp_path):
     rt = Runtime(tmp_path, [post("0", 0, COMMENTARY), post("1", 600, ENTRY)])
     rt.step()

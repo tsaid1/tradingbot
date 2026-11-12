@@ -111,6 +111,9 @@ is applied exactly once and never answered with another request's result.
   `max_backoff_seconds`) and re-runs the adapter's identity checks. A full sync and a reconciliation
   with nothing unexplained must succeed before new exposure is allowed. Fills, cancels and expired
   DAY orders from the gap are adopted from broker evidence and reported in `BROKER_RECONNECTED`.
+  If the session drops again while the resync is still waiting, that is a new outage: it is
+  reported (`BROKER_FAILURE`, `BROKER_SESSION_LOST`), the session goes back to `DISCONNECTED`,
+  exposure stays blocked, and the next reconnect reports everything adopted since the last report.
 * **Source outage:** nothing is consumed and the cursor stays put. Once the source is back, posts
   run in order, and stale ones are held by the freshness gate.
 * **A post that always fails:** `PIPELINE_FAILURE` repeats and every later post waits behind it,
