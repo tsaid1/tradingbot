@@ -364,7 +364,8 @@ def test_a_level_line_of_the_post_may_be_the_anchors_source(tmp_path, post, anch
 @pytest.mark.parametrize("post,reason", [
     ("We are now long $QETF.\n50.10 now.\nYesterday it was 50.10 now too.",
      "ENTRY_ANCHOR_SOURCE_AMBIGUOUS"),
-    ("We are now long $QETF.\n50.10 now, 49.20 support.", "ENTRY_ANCHOR_UNEXPLAINED_PRICE"),
+    ("We are now long $QETF.\n50.10 now, 49.20.", "ENTRY_ANCHOR_UNEXPLAINED_PRICE"),
+    ("We are now long $QETF.\n50.10 now, 49.20 support.", "ENTRY_ANCHOR_INSTRUMENT_UNCLEAR"),
     ("We are now long $QETF.\n$QBOND 50.10 now.", "ENTRY_ANCHOR_INSTRUMENT_AMBIGUOUS"),
     ("We are now long $QETF.", "ENTRY_ANCHOR_NOT_IN_POST"),
 ])
@@ -379,12 +380,12 @@ def test_a_commentary_clause_quoting_the_market_may_be_the_source(tmp_path):
     note = TradeAction(action_id="a2", action=Action.NO_TRADE, timing=Timing.COMMENTARY,
                        source_market_symbol="QETF", evidence=[])
     parsed = ParsedPost(actions=[action(), note])
-    post = "We are now long $QETF. The fund is at 50.10 now."
-    _, [d, _] = p.apply(parsed, clauses={"a1": LONG, "a2": "The fund is at 50.10 now."},
+    post = "We are now long $QETF. $QETF is trading at 50.10."
+    _, [d, _] = p.apply(parsed, clauses={"a1": LONG, "a2": "$QETF trading at 50.10."},
                         now=MAP_NOW, post_text=post, levels={"a1": [("REFERENCE", "50.10")],
                                                              "a2": [("REFERENCE", "50.10")]})
     assert d.status == "SUPPORTED" and d.entry_anchor == "50.10"
-    _, [d, _] = p.apply(parsed, clauses={"a1": LONG, "a2": "The fund is at 50.10 now, from 48."},
+    _, [d, _] = p.apply(parsed, clauses={"a1": LONG, "a2": "$QETF trading at 50.10, 48."},
                         now=MAP_NOW, post_text=post, levels={"a1": [("REFERENCE", "50.10")]})
     assert d.status == "UNRESOLVED" and d.reason.startswith("ENTRY_ANCHOR_UNEXPLAINED_PRICE")
 
