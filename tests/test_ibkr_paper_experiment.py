@@ -1,0 +1,582 @@
+"""The staged experiment (``tradingbot.ibkr_orders.experiment``, ``scripts/ibkr_paper_experiment.py``)
+on the fake transport. No socket is opened. Invented data only."""
+from __future__ import annotations
+
+import importlib.util
+import json
+import re
+import socket
+import threading
+from datetime import UTC, datetime
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+pytest.importorskip("ibapi")
+
+import ibapi.client
+from _ibkr_fake_tws_orders import PAPER, FakeOrderTws
+from _ibkr_paper_testing import OfflineTestSession
+from test_ibkr_paper_orders_pure import write_cfg
+
+from tradingbot.ibkr_orders import caps as C
+from tradingbot.ibkr_orders import experiment as X
+from tradingbot.ibkr_orders.config import load_order_config
+from tradingbot.ibkr_orders.counter import init_journal
+
+ROOT = Path(__file__).resolve().parents[1]
+MIDDAY = datetime(2026, 11, 11, 17, 0, tzinfo=UTC)  # 12:00 New York (EST), invented
+
+
+@pytest.fixture
+def tws(monkeypatch):
+    def no_network(*args, **kwargs):
+        raise AssertionError("network access attempted in an offline test")
+
+    monkeypatch.setattr(socket.socket, "connect", no_network)
+    monkeypatch.setattr(socket.socket, "connect_ex", no_network)
+    monkeypatch.setattr(socket, "create_connection", no_network)
+    server = FakeOrderTws()
+    server.server_version = 226
+    monkeypatch.setattr(ibapi.client, "Connection", server.connection_factory)
+    # test-only seams, reached by patching module attributes inside the test
+    monkeypatch.setattr(X, "PaperOrderSession", OfflineTestSession)
+    monkeypatch.setattr(X, "READ_BACK_WAIT_SECONDS", 0.1)
+    monkeypatch.setattr(X, "POLL_SECONDS", 0.05)
+    monkeypatch.setattr(X, "FILL_TIMEOUT_SECONDS", 3.0)
+    monkeypatch.setattr(X, "PROTECTION_SETTLE_SECONDS", 3.0)
+    monkeypatch.setattr(X, "POSITION_SETTLE_SECONDS", 2.0)
+    monkeypatch.setattr(X, "RECONCILE_SETTLE_SECONDS", 3.0)
+    monkeypatch.setattr(X, "_wall_clock", lambda: MIDDAY)  # before the start cut-off
+    return server
+
+
+@pytest.fixture
+def cfg_path(tmp_path):
+    p = write_cfg(tmp_path)
+    cfg = load_order_config(p)
+    init_journal(cfg.state_dir, cfg.experiment, cfg.connection.masked_account())
+    return p
+
+
+def placed(tws) -> int:
+    return tws.count("PLACE_ORDER")
+
+
+def run(stage, cfg_path):
+    ev, path = X.run_stage(stage, cfg_path)
+    assert PAPER not in path.read_text()  # masked account only
+    assert json.loads(path.read_text())["passed"] == ev["passed"]
+    return ev
+
+
+def stage0(tws, cfg_path):
+    tws.api_settings["readOnlyApi"] = True
+    ev = run("stage0-refusal", cfg_path)
+    tws.api_settings["readOnlyApi"] = False
+    return ev
+
+
+def test_submission_arithmetic_is_exactly_the_cap():
+    assert X.SUBMISSIONS_OF["stage2-unfillable-bracket"] == 2
+    assert X.SUBMISSIONS_OF["stage3-lifecycle"] == 4
+    assert sum(X.SUBMISSIONS_OF.values()) == C.PAPER_TEST_1.max_submissions == 6
+    for stage, before in X.SUBMISSIONS_BEFORE.items():
+        i = X.STAGES.index(stage)
+        assert before == sum(X.SUBMISSIONS_OF[s] for s in X.STAGES[:i])
+
+
+def test_stage0_passes_only_when_order_mode_refuses_and_sends_no_order_frame(tws, cfg_path):
+    ev = stage0(tws, cfg_path)
+    assert ev["passed"] and ev["refused"] and ev["order_frames_sent"] == 0
+    assert ev["read_only_settings"]["readOnlyApi"] is True
+    assert placed(tws) == 0 and "REQ_IDS" not in tws.names()
+    with pytest.raises(X.StageRefused):  # never repeated
+        X.run_stage("stage0-refusal", cfg_path)
+
+
+def test_stage0_with_read_only_off_fails_and_blocks_stage1(tws, cfg_path):
+    ev = run("stage0-refusal", cfg_path)
+    assert not ev["passed"] and not ev["refused"] and "OFF" in ev["why_failed"]
+    with pytest.raises(X.StageRefused):
+        X.run_stage("stage1-lookups", cfg_path)
+    assert placed(tws) == 0
+
+
+@pytest.mark.parametrize("stage", X.STAGES[1:])
+def test_every_stage_refuses_without_its_predecessor(tws, cfg_path, stage):
+    names = list(tws.names())
+    with pytest.raises(X.StageRefused):
+        X.run_stage(stage, cfg_path)
+    assert tws.names() == names  # refused before connecting
+
+
+def test_a_failed_predecessor_blocks_the_next_stage(tws, cfg_path):
+    assert stage0(tws, cfg_path)["passed"]
+    cfg = load_order_config(cfg_path)
+    path = X.evidence_path(cfg, "stage1-lookups")
+    path.write_text(json.dumps({"stage": "stage1-lookups", "passed": False}))
+    with pytest.raises(X.StageRefused):
+        X.run_stage("stage2-unfillable-bracket", cfg_path)
+    assert placed(tws) == 0
+
+
+def test_stage1_runs_every_lookup_and_places_nothing(tws, cfg_path):
+    stage0(tws, cfg_path)
+    ev = run("stage1-lookups", cfg_path)
+    assert ev["passed"], ev
+    assert set(ev["lookups"]) == {"open_orders", "executions", "completed_orders", "positions"}
+    assert all(v["completed"] for v in ev["lookups"].values())
+    assert ev["account_rows_checked"] and ev["order_frames_sent"] == 0
+    assert ev["quote"]["quality"] == "LIVE"
+    assert placed(tws) == 0 and ev["submissions_after"] == 0
+
+
+def test_stages_0_to_3_then_nothing_more(tws, cfg_path):
+    stage0(tws, cfg_path)
+    assert run("stage1-lookups", cfg_path)["passed"]
+    ev2 = run("stage2-unfillable-bracket", cfg_path)
+    assert ev2["passed"], ev2
+    assert ev2["submissions_before"] == 0 and ev2["submissions_after"] == 2
+    assert not ev2["filled"] and ev2["gone_from_open_orders"]
+    assert set(ev2["in_completed_orders"].values()) == {"Cancelled"}
+    assert ev2["parent_answered_before_child_sent"] is False
+    assert {e["event"] for e in ev2["events"]} >= {"SENT_PLACE", "openOrder", "orderStatus",
+                                                   "SENT_CANCEL"}
+    assert all("at" in e for e in ev2["events"])
+    assert placed(tws) == 2 and "REQ_GLOBAL_CANCEL" not in tws.names()
+    with pytest.raises(X.StageRefused):  # a stage that submitted can never repeat
+        X.run_stage("stage2-unfillable-bracket", cfg_path)
+
+    tws.autofill = True
+    ev3 = run("stage3-lifecycle", cfg_path)
+    assert ev3["passed"], ev3
+    assert [s["step"] for s in ev3["steps"]] == ["open", "raise-stop", "close"]
+    assert [s["submissions_used"] for s in ev3["steps"]] == [4, 5, 6]
+    assert ev3["submissions_before"] == 2 and ev3["submissions_after"] == 6
+    assert ev3["reconcile_clean"] and placed(tws) == 6
+    with pytest.raises(X.StageRefused):
+        X.run_stage("stage3-lifecycle", cfg_path)
+
+
+def test_a_failed_stage_that_submitted_cannot_run_again(tws, cfg_path):
+    stage0(tws, cfg_path)
+    run("stage1-lookups", cfg_path)
+    tws.bid = 200.0  # 90% of the bid is above the notional cap: the guard refuses, nothing sent
+    ev = run("stage2-unfillable-bracket", cfg_path)
+    assert not ev["passed"] and "NOTIONAL_CAP" in ev["error"] and placed(tws) == 0
+    tws.bid = 88.10  # nothing was submitted: it may run again
+    assert run("stage2-unfillable-bracket", cfg_path)["passed"]
+    cfg = load_order_config(cfg_path)
+    path = X.evidence_path(cfg, "stage2-unfillable-bracket")
+    data = json.loads(path.read_text())
+    path.write_text(json.dumps({**data, "passed": False}))  # even if its evidence says failed
+    ev = run("stage2-unfillable-bracket", cfg_path)
+    assert not ev["passed"] and "starts from 0" in ev["why_failed"]
+    assert placed(tws) == 2
+
+
+def test_abort_cancels_only_this_clients_orders_by_id(tws, cfg_path):
+    stage0(tws, cfg_path)
+    run("stage1-lookups", cfg_path)
+    s = OfflineTestSession(load_order_config(cfg_path))
+    s.connect()
+    from decimal import Decimal
+
+    from tradingbot.ibkr_orders.records import OrderSpec
+    try:
+        s.place([OrderSpec("TB-A", "BUY", 1, "LMT", limit_price=Decimal("80.00")),
+                 OrderSpec("TB-A.STP", "SELL", 1, "STP", stop_price=Decimal("79.00"))])
+    finally:
+        s.disconnect()
+    ev = run("abort", cfg_path)
+    assert ev["passed"], ev
+    assert len(ev["found"]) == 2 and ev["remaining_own_working"] == []
+    assert "REQ_GLOBAL_CANCEL" not in tws.names() and tws.count("CANCEL_ORDER") >= 1
+    assert all(o.status == "Cancelled" for o in tws.orders.values())
+
+
+def test_the_script_has_no_flag_to_skip_or_repeat(tws, cfg_path, capsys):
+    spec = importlib.util.spec_from_file_location("ibkr_paper_experiment",
+                                                  ROOT / "scripts" / "ibkr_paper_experiment.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert mod.main(["stage1-lookups", "--config", str(cfg_path)]) == 2  # refused
+    with pytest.raises(SystemExit):
+        mod.main(["stage2-unfillable-bracket", "--force", "--config", str(cfg_path)])
+    tws.api_settings["readOnlyApi"] = True
+    assert mod.main(["stage0-refusal", "--config", str(cfg_path)]) == 0
+    assert PAPER not in capsys.readouterr().out
+
+
+def test_an_unexpected_stage2_fill_keeps_the_stop_and_blocks_stage3(tws, cfg_path, capsys):
+    stage0(tws, cfg_path)
+    run("stage1-lookups", cfg_path)
+    tws.autofill = True
+    tws.ask = 70.00  # invented: the "unfillable" limit (90% of the bid) is above the ask
+    ev = run("stage2-unfillable-bracket", cfg_path)
+    assert not ev["passed"] and ev["result"] == "STAGE2_UNEXPECTED_FILL"
+    assert "abort" in ev["why_failed"] and X.TWS_SELL in ev["why_failed"]
+    assert ev["held"]["quantity"] == "1" and ev["held"]["stop_working"] is True
+    child = max(o.order_id for o in tws.orders.values())
+    assert tws.orders[child].status == "Submitted"  # the protective stop was left working
+    assert tws.count("CANCEL_ORDER") == 0
+    with pytest.raises(X.StageRefused):
+        X.run_stage("stage3-lifecycle", cfg_path)
+
+
+def test_a_stage2_fill_whose_stop_the_broker_cancelled_reports_it_unprotected(tws, cfg_path):
+    """Note (b): the stage never cancels the child after a fill, but the broker may have (with its
+    parent). The evidence and the text report the child's actual state, never 'left working'."""
+    from _ibkr_fake_tws_orders import FakeOrderTws
+    stage0(tws, cfg_path)
+    run("stage1-lookups", cfg_path)
+    tws.autofill = True
+    tws.ask = 70.00  # invented: the "unfillable" limit fills at once
+
+    def place_then_broker_cancels_child(s, conn, req):
+        FakeOrderTws.place(s, conn, req)
+        fo = s.orders[req.orderId]
+        if fo.order.parentId and s.orders[fo.order.parentId].status == "Filled":
+            s._set(fo, "Cancelled")
+            conn.push(s._status(fo))
+
+    tws.on["PLACE_ORDER"] = place_then_broker_cancels_child
+    ev = run("stage2-unfillable-bracket", cfg_path)
+    assert ev["result"] == "STAGE2_UNEXPECTED_FILL" and not ev["passed"]
+    assert ev["held"]["stop_working"] is False and ev["held"]["stop_status"] == "Cancelled"
+    assert "NOT working" in ev["why_failed"] and "UNPROTECTED" in ev["why_failed"]
+    assert "is NOT working" in ev["why_failed"] and "is working (" not in ev["why_failed"]
+    assert tws.count("CANCEL_ORDER") == 0  # the stage itself cancelled nothing
+    with pytest.raises(X.StageRefused):
+        X.run_stage("stage3-lifecycle", cfg_path)
+
+
+def test_stage3_refuses_without_a_live_or_delayed_quote_in_stage1(tws, cfg_path):
+    stage0(tws, cfg_path)
+    run("stage1-lookups", cfg_path)
+    assert run("stage2-unfillable-bracket", cfg_path)["passed"]
+    cfg = load_order_config(cfg_path)
+    p1 = X.evidence_path(cfg, "stage1-lookups")
+    data = json.loads(p1.read_text())
+    p1.write_text(json.dumps({**data, "quote": {"quality": "FROZEN"}}))
+    names = list(tws.names())
+    ev = run("stage3-lifecycle", cfg_path)
+    assert not ev["passed"] and "FROZEN" in ev["why_failed"]
+    assert tws.names() == names and placed(tws) == 2  # refused before connecting
+
+
+def test_stage3_refuses_when_the_journal_is_not_at_two(tws, cfg_path):
+    """Forged stage-2 evidence lets stage 3 start, but the durable count (0) is not the 2 it
+    starts from: it refuses before any order."""
+    stage0(tws, cfg_path)
+    run("stage1-lookups", cfg_path)
+    cfg = load_order_config(cfg_path)
+    X.evidence_path(cfg, "stage2-unfillable-bracket").write_text(json.dumps(
+        {"stage": "stage2-unfillable-bracket", "passed": True, "result": "STAGE2_PASSED"}))
+    ev = run("stage3-lifecycle", cfg_path)
+    assert not ev["passed"] and "starts from 2" in ev["why_failed"]
+    assert placed(tws) == 0 and ev["submissions_after"] == 0
+
+
+@pytest.mark.parametrize("argv", [[], ["--config", "x.toml"], ["--help"], ["stage4"],
+                                  ["all"], ["stage2-unfillable-bracket", "--count", "6"]])
+def test_the_script_does_nothing_without_one_explicit_stage(tws, monkeypatch, argv):
+    spec = importlib.util.spec_from_file_location("ibkr_paper_experiment",
+                                                  ROOT / "scripts" / "ibkr_paper_experiment.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    def never(*a, **k):
+        raise AssertionError("run_stage must not be reached")
+
+    monkeypatch.setattr(mod, "run_stage", never)
+    with pytest.raises(SystemExit):
+        mod.main(argv)
+    assert tws.names() == [] and tws.connections == []
+
+
+def test_stage_names_and_per_stage_budget_are_the_runbooks():
+    assert X.STAGES == ("stage0-refusal", "stage1-lookups", "stage2-unfillable-bracket",
+                        "stage3-lifecycle")
+    assert [X.SUBMISSIONS_OF[s] for s in X.STAGES] == [0, 0, 2, 4]
+    assert [X.SUBMISSIONS_BEFORE[s] for s in X.STAGES] == [0, 0, 0, 2]
+    assert X.SUBMISSIONS_OF.get(X.ABORT, 0) == 0
+
+
+# --- fix round after the review of f272640 -------------------------------------------------------
+@pytest.mark.parametrize("child_status", ["Inactive", "PendingCancel"])
+def test_a_stage2_stop_that_is_not_submitted_is_never_reported_working(tws, cfg_path,
+                                                                      child_status):
+    """SHOULD FIX 1: only Submitted or PreSubmitted AND visible in open orders is working."""
+    from _ibkr_fake_tws_orders import FakeOrderTws
+    stage0(tws, cfg_path)
+    run("stage1-lookups", cfg_path)
+    tws.autofill = True
+    tws.ask = 70.00
+
+    def place_then_child_status(s, conn, req):
+        FakeOrderTws.place(s, conn, req)
+        fo = s.orders[req.orderId]
+        if fo.order.parentId and s.orders[fo.order.parentId].status == "Filled":
+            s.set_status(fo.order_id, child_status)
+
+    tws.on["PLACE_ORDER"] = place_then_child_status
+    ev = run("stage2-unfillable-bracket", cfg_path)
+    assert ev["result"] == "STAGE2_UNEXPECTED_FILL"
+    assert ev["held"]["stop_working"] is False and ev["held"]["stop_status"] == child_status
+    assert "NOT working" in ev["why_failed"] and "is working (" not in ev["why_failed"]
+
+
+def _to_stage3(tws, cfg_path):
+    stage0(tws, cfg_path)
+    assert run("stage1-lookups", cfg_path)["passed"]
+    assert run("stage2-unfillable-bracket", cfg_path)["passed"]
+    tws.autofill = True
+
+
+def test_a_refused_close_is_reported_refused_and_never_says_abort_first(tws, cfg_path):
+    """SHOULD FIX 2 (i, ii): the close is refused for want of a bid: REFUSED with its reason;
+    the stop still works, so: close by hand first, then abort."""
+    from _ibkr_fake_tws_orders import FakeOrderTws
+    _to_stage3(tws, cfg_path)
+
+    def place_then_no_bid(s, conn, req):
+        amend = req.orderId in s.orders
+        FakeOrderTws.place(s, conn, req)
+        if amend:  # the stop raise: from now on the quote has no bid
+            s.bid = 0.0
+
+    tws.on["PLACE_ORDER"] = place_then_no_bid
+    ev = run("stage3-lifecycle", cfg_path)
+    assert not ev["passed"]
+    assert ev["result"] == "STAGE3_CLOSE_REFUSED", ev
+    assert "REFUSED" in ev["why_failed"] and "did not fill" not in ev["why_failed"]
+    assert "EXIT_WITHOUT_QUOTE" in ev["why_failed"]
+    assert ev["state"]["stop_working"] is True and ev["state"]["held"] == "1"
+    assert X.TWS_PROCEDURE in ev["why_failed"]
+    assert "run abort, then" not in ev["why_failed"]
+    assert "Never run abort while TWS shows 1 and a working stop" in ev["why_failed"]
+    assert placed(tws) == 5  # the close was never sent
+
+
+def test_a_position_read_lagging_the_entry_fill_is_waited_for_with_reads_only(tws, cfg_path):
+    """SHOULD FIX 2 (iii): the protection check is retried for a bounded time; no extra frame."""
+    _to_stage3(tws, cfg_path)
+    tws.positions_lag = True
+    threading.Timer(1.0, tws.catch_up_positions).start()
+    ev = run("stage3-lifecycle", cfg_path)
+    assert ev["passed"], ev
+    assert placed(tws) == 6 and ev["submissions_after"] == 6
+
+
+def test_a_position_read_that_keeps_lagging_says_what_is_known(tws, cfg_path):
+    _to_stage3(tws, cfg_path)
+    tws.positions_lag = True
+    ev = run("stage3-lifecycle", cfg_path)
+    assert not ev["passed"] and ev["result"] == "STAGE3_PROTECTION_UNCONFIRMED"
+    assert ev["state"]["stop_working"] is True
+    assert X.TWS_PROCEDURE in ev["why_failed"]
+    assert placed(tws) == 4  # the bracket only: no raise, no close
+    assert tws.count("CANCEL_ORDER") == 1  # stage 2's parent cancel only: nothing new
+
+
+@pytest.mark.parametrize("stage", ["stage2-unfillable-bracket", "stage3-lifecycle"])
+def test_stages_that_place_refuse_to_start_after_the_cut_off(tws, cfg_path, monkeypatch, stage):
+    """SHOULD FIX 3: no stage that can leave anything working starts after 15:00 New York."""
+    stage0(tws, cfg_path)
+    run("stage1-lookups", cfg_path)
+    if stage == "stage3-lifecycle":
+        assert run("stage2-unfillable-bracket", cfg_path)["passed"]
+        tws.autofill = True
+    assert X.LATEST_START_NEW_YORK == (15, 0)
+    monkeypatch.setattr(X, "_wall_clock", lambda: datetime(2026, 11, 11, 20, 1, tzinfo=UTC))
+    names, frames = list(tws.names()), placed(tws)
+    ev = run(stage, cfg_path)
+    assert not ev["passed"] and "15:00" in ev["why_failed"]
+    assert tws.names() == names and placed(tws) == frames  # refused before connecting
+    monkeypatch.setattr(X, "_wall_clock", lambda: datetime(2026, 7, 1, 18, 59, tzinfo=UTC))
+    from _ibkr_fake_tws_orders import all_day_hours
+    july = datetime(2026, 7, 1, 18, 59, tzinfo=UTC)
+    tws.liquid_hours = all_day_hours() + ";" + all_day_hours(july)  # both clocks inside
+    assert run(stage, cfg_path)["passed"]  # 14:59 EDT: allowed
+
+
+def test_stage1_reminds_to_run_the_full_suite_with_the_sdk(tws, cfg_path, capsys):
+    spec = importlib.util.spec_from_file_location("ibkr_paper_experiment",
+                                                  ROOT / "scripts" / "ibkr_paper_experiment.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    stage0(tws, cfg_path)
+    assert mod.main(["stage1-lookups", "--config", str(cfg_path)]) == 0
+    out = capsys.readouterr().out
+    assert "WITH the SDK" in out and "before stage 2" in out
+
+
+# --- final fix round after the review of fb0f645 -------------------------------------------------
+
+
+def _state(read, fills, *, stop=False, close=False, own=0, errors=()):
+    agree = read is not None and fills is not None and read == fills
+    return {"position_read": read, "own_fills": fills, "agree": agree,
+            "held": read if agree else None, "stop_working": stop,
+            "stop_status": "Submitted" if stop else None, "close_working": close,
+            "own_working": None if "orders" in errors else own, "read_errors": list(errors)}
+
+
+STATES = {
+    "held-stop": _state("1", "1", stop=True, own=1),
+    "held-stop-and-close": _state("1", "1", stop=True, close=True, own=2),
+    "held-close-no-stop": _state("1", "1", close=True, own=1),
+    "held-no-stop": _state("1", "1"),
+    "flat-working": _state("0", "0", own=2),
+    "flat-nothing": _state("0", "0"),
+    "read-1-fills-0": _state("1", "0"),  # the reviewer's probe: the close filled, the read lags
+    "read-0-fills-1-stop": _state("0", "1", stop=True, own=1),
+    "positions-unreadable": _state(None, None, stop=True, own=1, errors=("positions",)),
+    "orders-unreadable": _state("1", "1", errors=("orders",)),
+}
+
+
+def _assert_no_unconditional_sell(text: str) -> None:
+    assert "Only if it shows 1" in X.TWS_SELL and "If it shows 0: do NOT sell" in X.TWS_SELL
+    rest = text.replace(X.TWS_SELL, "").replace(X.NO_SELL_ON_NUMBERS, "")
+    assert not re.search(r"\bsell", rest, re.IGNORECASE), rest
+    assert "by hand" not in rest.lower(), rest
+
+
+@pytest.mark.parametrize("ending", sorted(X.ABNORMAL_ENDINGS))
+@pytest.mark.parametrize("name", sorted(STATES))
+def test_no_ending_prints_an_unconditional_sell_or_a_disputed_position_as_fact(ending, name):
+    state = STATES[name]
+    text = X._ending_message(ending, "invented cause", state)
+    assert text.startswith(ending)
+    _assert_no_unconditional_sell(text)
+    if not state["agree"]:
+        assert not re.search(r"\d+ TLT (is )?held", text), text
+        assert "do not sell on this script's numbers" in text
+    if state["position_read"] is not None and not state["agree"] and state["own_fills"]:
+        assert f"position read {state['position_read']}" in text
+        assert f"own fills {state['own_fills']}" in text and "disagree" in text
+
+
+def test_every_result_code_in_the_experiment_is_a_known_ending():
+    src = (ROOT / "src/tradingbot/ibkr_orders/experiment.py").read_text()
+    codes = set(re.findall(r'"(STAGE[23]_[A-Z_]+)"', src))
+    assert codes - {"STAGE2_PASSED", "STAGE3_PASSED"} <= X.ABNORMAL_ENDINGS
+    assert X.ABNORMAL_ENDINGS <= codes
+
+
+def _lag_the_close(tws, *, resolve_after: float | None):
+    from _ibkr_fake_tws_orders import FakeOrderTws
+
+    def place(s, conn, req):
+        o = req.order
+        if req.orderId not in s.orders and o.action == "SELL" and o.orderType == "LMT":
+            s.positions_lag = True  # the close fills; the position read still says 1
+            if resolve_after is not None:
+                threading.Timer(resolve_after, s.catch_up_positions).start()
+        FakeOrderTws.place(s, conn, req)
+
+    tws.on["PLACE_ORDER"] = place
+
+
+def test_a_close_filled_while_the_read_lags_passes_once_the_read_agrees(tws, cfg_path):
+    """N1, the reviewer's probe, the lag resolving inside the retry: flat, clean, PASS."""
+    _to_stage3(tws, cfg_path)
+    _lag_the_close(tws, resolve_after=1.0)
+    ev = run("stage3-lifecycle", cfg_path)
+    assert ev["passed"], ev
+    assert ev["result"] == "STAGE3_PASSED" and placed(tws) == 6
+
+
+def test_a_close_filled_while_the_read_keeps_lagging_never_says_sell(tws, cfg_path):
+    """N1, the lag not resolving: both numbers, 'they disagree', no sell on these numbers."""
+    _to_stage3(tws, cfg_path)
+    _lag_the_close(tws, resolve_after=None)
+    ev = run("stage3-lifecycle", cfg_path)
+    assert not ev["passed"] and ev["result"] == "STAGE3_NOT_CLEAN", ev
+    assert ev["state"]["position_read"] == "1" and ev["state"]["own_fills"] == "0"
+    text = ev["why_failed"]
+    assert "position read 1" in text and "own fills 0" in text and "disagree" in text
+    assert "do not sell on this script's numbers" in text
+    assert not re.search(r"\d+ TLT (is )?held", text)
+    _assert_no_unconditional_sell(text)
+    assert placed(tws) == 6
+
+
+def test_the_stage2_fill_endings_carry_only_the_tws_conditioned_sell(tws, cfg_path):
+    from _ibkr_fake_tws_orders import FakeOrderTws
+    stage0(tws, cfg_path)
+    run("stage1-lookups", cfg_path)
+    tws.autofill = True
+    tws.ask = 70.00
+
+    def place_then_broker_cancels_child(s, conn, req):
+        FakeOrderTws.place(s, conn, req)
+        fo = s.orders[req.orderId]
+        if fo.order.parentId and s.orders[fo.order.parentId].status == "Filled":
+            s._set(fo, "Cancelled")
+            conn.push(s._status(fo))
+
+    tws.on["PLACE_ORDER"] = place_then_broker_cancels_child
+    ev = run("stage2-unfillable-bracket", cfg_path)
+    assert ev["result"] == "STAGE2_UNEXPECTED_FILL"
+    _assert_no_unconditional_sell(ev["why_failed"])
+    assert X.TWS_SELL in ev["why_failed"]
+
+
+# --- S1: today's broker-reported liquid hours must last 60 more minutes ---------------------------
+def _contract(hours, tz="US/Eastern"):
+    return SimpleNamespace(liquid_hours=hours, time_zone_id=tz)
+
+
+@pytest.mark.parametrize(("now", "minutes"), [
+    (datetime(2026, 3, 9, 19, 30, tzinfo=UTC), 30),  # 15:30 EDT, the day after DST starts
+    (datetime(2026, 3, 6, 20, 30, tzinfo=UTC), 30),  # 15:30 EST, the Friday before
+    (datetime(2026, 11, 2, 20, 30, tzinfo=UTC), 30),  # 15:30 EST, the day after DST ends
+    (datetime(2026, 10, 30, 19, 30, tzinfo=UTC), 30),  # 15:30 EDT, the Friday before
+])
+def test_minutes_to_the_close_follow_daylight_saving(now, minutes):
+    d = now.astimezone(X.NEW_YORK).strftime("%Y%m%d")
+    assert X._minutes_to_close(_contract(f"{d}:0930-{d}:1600"), now) == minutes
+
+
+def test_a_half_day_refuses_a_start_less_than_an_hour_before_its_close():
+    half = _contract("20261127:0930-20261127:1300;20261130:0930-20261130:1600")
+    assert X.MIN_MINUTES_TO_CLOSE == 60
+    with pytest.raises(X.StageRefused, match="liquid hours"):
+        X._check_time_to_close(half, "stage3-lifecycle", datetime(2026, 11, 27, 17, 1, tzinfo=UTC))
+    X._check_time_to_close(half, "stage3-lifecycle", datetime(2026, 11, 27, 16, 59, tzinfo=UTC))
+
+
+def test_a_normal_day_allows_a_start_at_1459():
+    day = _contract("20261111:0930-20261111:1600")
+    X._check_time_to_close(day, "stage3-lifecycle", datetime(2026, 11, 11, 19, 59, tzinfo=UTC))
+
+
+@pytest.mark.parametrize("hours,tz", [("", "US/Eastern"), ("garbage", "US/Eastern"),
+                                      (None, "US/Eastern"), ("20261111:CLOSED", "US/Eastern"),
+                                      ("20261111:0930-20261111:1600", "Nowhere/Invented"),
+                                      ("20261112:0930-20261112:1600", "US/Eastern")])
+def test_unknown_or_missing_liquid_hours_refuse(hours, tz):
+    with pytest.raises(X.StageRefused):
+        X._check_time_to_close(_contract(hours, tz), "stage2-unfillable-bracket",
+                               datetime(2026, 11, 11, 17, 0, tzinfo=UTC))
+
+
+@pytest.mark.parametrize("stage", ["stage2-unfillable-bracket", "stage3-lifecycle"])
+def test_stages_check_the_brokers_liquid_hours_after_connecting(tws, cfg_path, monkeypatch,
+                                                                stage):
+    stage0(tws, cfg_path)
+    run("stage1-lookups", cfg_path)
+    if stage == "stage3-lifecycle":
+        assert run("stage2-unfillable-bracket", cfg_path)["passed"]
+        tws.autofill = True
+    tws.liquid_hours = "20261127:0930-20261127:1300"  # invented half day
+    monkeypatch.setattr(X, "_wall_clock", lambda: datetime(2026, 11, 27, 17, 1, tzinfo=UTC))
+    frames = placed(tws)
+    ev = run(stage, cfg_path)
+    assert not ev["passed"] and "liquid hours" in ev["why_failed"]
+    assert placed(tws) == frames

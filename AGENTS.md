@@ -13,7 +13,11 @@ Canonical repository: https://github.com/tsaid1/tradingbot (**public**).
    fixtures use invented data only. Logs, journals and notifications carry identifiers and reason
    codes, never post text.
 3. **No order submission without the owner's explicit authorization of a specific experiment.**
-   `main` runs the simulated broker only (`mode = "mock"`). The IBKR code on `main` is read-only.
+   `main` runs the simulated broker only (`mode = "mock"`). The read-only IBKR adapter
+   (`tradingbot.ibkr`) cannot send orders. An order-capable module (`tradingbot.ibkr_orders`,
+   `scripts/ibkr_paper_*`) exists for one capped paper experiment (`paper-test-1`); it is
+   disabled by default and may be run only with the Product Owner's explicit authorization of
+   that experiment (docs/IBKR_PAPER_ORDERS.md).
 4. **Independent review before any change to an order path.** That covers the coordinator, the
    broker protocol and adapters, reconciliation, settlement and the runtime service's broker
    handling. Protocol changes are additive.
