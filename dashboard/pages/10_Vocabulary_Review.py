@@ -4,8 +4,12 @@ holding, then apply in ONE action to the private production lexicon (with one ba
 write as a separate CANDIDATE lexicon for an offline replay experiment.
 
 It shows the publisher's own words and sentences: only the owner may run it, on their own machine,
-bound to localhost (it refuses otherwise). Nothing it shows is logged, cached, put in the URL or
-written anywhere but the owner's private files (``tradingbot.runtime.vocab_review``).
+bound to localhost with usage statistics off (it refuses otherwise). Every private or file-supplied
+string is rendered as plain text (``st.text``, ``st.code``, the final table), never as Markdown or
+HTML. Widgets are keyed by a stable proposal id and cleared after every write; Apply is bound to the
+digest of the final table shown and refused when the files changed since. Session state holds
+verdicts, ids and digests, never a sentence: sentences are loaded from the review log at render
+time. Nothing is logged, cached or put in the URL (``tradingbot.runtime.vocab_review``).
 
 The runtime config comes from ``TRADINGBOT_RUNTIME_CONFIG`` or ``~/.config/tradingbot/runtime.toml``;
 it must set ``[interpreter] review_log_path`` and ``lexicon_path``. A proposals file is read from
@@ -18,6 +22,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import pandas as pd
 import streamlit as st
 
 from tradingbot.runtime import vocab_review as V
@@ -28,11 +33,13 @@ RESTART_NOTE = ("A new word takes effect only when the service (or a replay) is 
                 "running service keeps the lexicon it loaded at start.")
 VERDICT_LABELS = {V.PENDING: "undecided", V.ACCEPT: "accept", V.REJECT: "reject (not now)",
                   V.KEEP_HOLDING: "keep holding (not offered again)"}
-HOW_TO = """```toml
-[interpreter]
+# Every widget whose state must not survive a write (keyed by proposal id or by digest).
+RESET_PREFIXES = ("vr_verdict_", "vr_group_", "vr_family_", "vr_meaning_", "vr_confirm")
+HOW_TO = """[interpreter]
 lexicon_path = "/Users/you/tradingbot-private/lexicon.json"       # outside any git work tree, chmod 600
-review_log_path = "/Users/you/tradingbot-private/review.jsonl"    # outside any git work tree
-```"""
+review_log_path = "/Users/you/tradingbot-private/review.jsonl"    # outside any git work tree"""
+STATUS = {"WRITTEN": st.success, "RECORDED": st.success, "RESTORED": st.success,
+          "NOTHING": st.info, "NOTHING_TO_UNDO": st.info}
 
 
 def _families(config) -> list[str]:
@@ -44,26 +51,51 @@ def _families(config) -> list[str]:
         return []
 
 
-def _measured(m: dict[str, int] | None) -> str:
-    if not m:
-        return "not measured"
-    return ", ".join(f"{k.replace('_', ' ')}: {v}" for k, v in sorted(m.items()))
+def _details(p: V.Proposal) -> str:
+    """A proposal's details as plain text (shown with st.code: nothing is interpreted)."""
+    return "\n".join([
+        f"word: {p.token}",
+        f"proposed group: {p.group}" + (f" (family {p.family})" if p.family else ""),
+        f"kind: {p.kind or '-'}",
+        f"evidence: {p.posts} held post(s), {p.holds} hold(s)",
+        f"families: {', '.join(p.families) or '-'}",
+        f"reason codes: {', '.join(p.reasons) or '-'}",
+    ])
 
 
 def _show_result(r: V.BatchResult) -> None:
-    show = st.success if r.status in ("WRITTEN", "RECORDED", "RESTORED") else (
-        st.info if r.status in ("NOTHING", "NOTHING_TO_UNDO") else st.error)
-    show(f"{r.status}: {r.message}")
+    STATUS.get(r.status, st.error)(f"Result: {r.status}")
+    st.text(r.message)
     if r.added:
-        st.markdown("\n".join(["| List | Words added |", "|---|---|"]
-                              + [f"| {k} | {len(v)}: {', '.join(v)} |"
-                                 for k, v in sorted(r.added.items())]))
+        st.dataframe(pd.DataFrame([{"list": f"entry_anchor.{k}", "words added": len(v),
+                                    "words": ", ".join(v)} for k, v in sorted(r.added.items())]),
+                     hide_index=True)
     if r.kept_holding:
-        st.markdown(f"Kept holding: {len(r.kept_holding)} ({', '.join(r.kept_holding)})")
-    for word, reason in r.refused:
-        st.error(f"Refused `{word}`: {reason}")
+        st.text(f"Kept holding: {len(r.kept_holding)} ({', '.join(r.kept_holding)})")
+    if r.refused:
+        st.error("Refused words, with the lexicon loader's reasons:")
+        st.code("\n".join(f"{w}: {reason}" for w, reason in r.refused), language=None)
     if r.backup is not None:
-        st.caption(f"Backup: {r.backup.name}")
+        st.text(f"Backup: {r.backup.name}")
+    if r.status == "WRITTEN" and r.path is not None and r.path.name.endswith(V.CANDIDATE_SUFFIX):
+        st.caption("Replay it offline, never with the running service: set lexicon_path to the "
+                   "candidate in a separate replay config with a new state_dir, then run:")
+        st.code(f"lexicon_path = \"{r.path}\"\nscripts/run_service.py --config <replay.toml> "
+                "--source replay:<posts.jsonl> --allow-candidate-lexicon", language=None)
+
+
+def _reset_selections() -> None:
+    for key in list(st.session_state):
+        if isinstance(key, str) and key.startswith(RESET_PREFIXES):
+            del st.session_state[key]
+
+
+def _done(result: V.BatchResult) -> None:
+    """After any write: keep the result (words and codes only, no sentence), clear every verdict
+    and confirmation, and render again from the files."""
+    st.session_state["vr_result"] = result
+    st.session_state["vr_reset"] = True
+    st.rerun()
 
 
 def main() -> None:
@@ -75,99 +107,144 @@ def main() -> None:
         "It shows the publisher's own text, privately, here on your machine only: never share "
         "this page, a screenshot of it or its files.\n\n"
         "Nothing changes until you apply the batch; you decide every word.")
-    address = st.get_option("server.address")
-    if address not in LOCAL_ADDRESSES:
+    if st.session_state.pop("vr_reset", False):
+        _reset_selections()
+    if st.get_option("server.address") not in LOCAL_ADDRESSES:
         st.error("Refusing to show private text: this Streamlit server is not bound to localhost. "
-                 "Start it with `--server.address 127.0.0.1`.")
+                 "Start it with --server.address 127.0.0.1 (another account on this Mac can "
+                 "still reach localhost).")
         st.stop()
     if st.get_option("browser.gatherUsageStats"):
-        st.warning("Streamlit usage statistics are on (they carry no page content). To turn them "
-                   "off, start with `--browser.gatherUsageStats false`.")
+        st.error("Refusing to show private text while Streamlit usage statistics are on. Start "
+                 "it with --browser.gatherUsageStats false.")
+        st.stop()
 
     config_path = Path(os.environ.get("TRADINGBOT_RUNTIME_CONFIG", str(DEFAULT_CONFIG_PATH)))
     try:
         config = load_config(config_path)
     except ConfigError as exc:
-        st.warning(f"No usable runtime config at `{config_path}`: {exc}")
+        st.warning("No usable runtime config at the configured path:")
+        st.text(f"{config_path}: {exc}")
         st.stop()
     lexicon = config.interpreter.lexicon_path
     log = config.interpreter.review_log_path
     if lexicon is None or log is None:
-        st.warning("Set both private paths in the runtime config, then restart the service:")
-        st.markdown(HOW_TO)
+        st.warning("Set both private paths (review_log_path and lexicon_path) in the runtime "
+                   "config, then restart the service:")
+        st.code(HOW_TO, language="toml")
         st.stop()
-    st.warning(RESTART_NOTE)
-
-    entries, bad = V.read_review_log(log)
     env = os.environ.get("TRADINGBOT_VOCAB_PROPOSALS")
     prop_path = Path(env).expanduser() if env else V.default_proposals_path(log)
-    if prop_path.exists():
-        proposals, bad_props = V.read_proposals(prop_path, entries=entries, lexicon_path=lexicon)
-        st.caption(f"Proposals from {prop_path.name} ({bad_props} unreadable line(s)).")
+    candidate_path = V.default_candidate_path(lexicon)
+    for label, path in (("private lexicon", lexicon), ("review log", log),
+                        ("proposals file", prop_path), ("candidate lexicon", candidate_path)):
+        cls = V.synced_folder_class(path)
+        if cls is not None:
+            st.error(f"PRIVATE_PATH_IN_SYNCED_FOLDER: the {label} is in a cloud-synced folder "
+                     f"({cls}): it is copied to that provider. Allowed by the owner's policy; a "
+                     "non-synced private directory is recommended for the review log, proposals, "
+                     "candidates and backups.")
+    st.warning(RESTART_NOTE)
+
+    proposals, entries, source, bad = V.load_batch(log, lexicon, prop_path)
+    if source == "file":
+        st.caption("Proposals from the proposals file:")
+        st.text(f"Proposals from {prop_path.name}")
     else:
-        proposals = V.proposals_from_log(entries, lexicon_path=lexicon)
         st.caption("No proposals file: a plain batch built from the review log by kind "
                    "(meaning empty, change not measured).")
     c1, c2, c3 = st.columns(3)
     c1.metric("Vocabulary holds logged", len(entries))
     c2.metric("Pending proposals", len(proposals))
-    c3.metric("Unreadable log lines", bad)
+    c3.metric("Unreadable lines", bad)
 
     families = _families(config)
-    items: list[V.BatchItem] = []
+    verdicts: dict[str, V.Verdict] = {}
+    n = 0
     for group, label in V.GROUPS.items():
-        mine = [(i, p) for i, p in enumerate(proposals) if p.group == group]
+        mine = [p for p in proposals if p.group == group]
         st.subheader(f"{label} ({len(mine)})")
         if not mine:
             st.caption("None proposed.")
-        for i, p in mine:
-            with st.expander(f"{p.token}: {p.posts} held post(s), {p.holds} hold(s)"):
-                st.markdown(f"Kind: {p.kind or '-'}; families: {', '.join(p.families) or '-'}; "
-                            f"reason codes: {', '.join(p.reasons) or '-'}")
-                st.markdown(f"Measured change: {_measured(p.measured)}")
-                for role, text in p.examples[:12]:
-                    st.markdown(f"- *{role.lower() or 'sentence'}*: {text}")
-                meaning = st.text_input("Meaning", value=p.meaning, key=f"vr_meaning_{i}")
-                verdict = st.radio("Decision", list(VERDICT_LABELS), key=f"vr_verdict_{i}",
+        for p in mine:
+            n += 1
+            pid = V.proposal_id(p)
+            with st.expander(f"Proposal {n}: {p.posts} held post(s), {p.holds} hold(s)"):
+                st.code(_details(p), language=None)
+                if p.measured:
+                    st.caption("Measured change (claimed by the proposals file; not verified by "
+                               "this page):")
+                    st.code("\n".join(f"{k}: {v}" for k, v in sorted(p.measured.items())),
+                            language=None)
+                else:
+                    st.caption("Measured change: not measured")
+                examples = V.example_sentences(p, entries)
+                if examples:
+                    st.caption(f"Example sentences (at most {V.MAX_EXAMPLES}):")
+                    st.code("\n".join(f"{role.lower() or 'sentence'}: {text}"
+                                      for role, text in examples), language=None)
+                meaning = st.text_input("Meaning", value=p.meaning, key=f"vr_meaning_{pid}")
+                verdict = st.radio("Decision", list(VERDICT_LABELS), key=f"vr_verdict_{pid}",
                                    format_func=VERDICT_LABELS.get, horizontal=True)
-                chosen = st.selectbox("Group", list(V.GROUPS), key=f"vr_group_{i}",
+                chosen = st.selectbox("Group", list(V.GROUPS), key=f"vr_group_{pid}",
                                       index=list(V.GROUPS).index(p.group),
                                       format_func=V.GROUPS.get)
                 family = None
                 if chosen == V.MARKET_NAME:
-                    options = families or ([p.family] if p.family else [])
-                    family = st.selectbox(
-                        "Family it names", options, key=f"vr_family_{i}",
-                        index=options.index(p.family) if p.family in options else 0)
-                items.append(V.BatchItem(p.token, verdict, chosen, family, meaning))
+                    options = ([p.family] if p.family else []) + [
+                        f for f in families if f != p.family]
+                    if p.family and p.family not in families:
+                        st.caption("The proposed family is not in the mapping file.")
+                    if options:
+                        family = st.selectbox("Family it names", options, key=f"vr_family_{pid}")
+                    else:
+                        st.caption("No family to choose: the mapping file has none.")
+                verdicts[pid] = V.Verdict(verdict, chosen, family, meaning)
 
-    st.subheader("Batch")
-    counts = {v: sum(1 for it in items if it.verdict == v) for v in VERDICT_LABELS}
-    st.markdown(", ".join(f"{VERDICT_LABELS[v]}: {n}" for v, n in counts.items()))
-    st.caption("Accepted words go to their group's list; an ambiguous expression must be moved to "
-               "a group first. A word wrongly marked as not a market removes a hold: your judgement "
-               "is the safeguard.")
-    confirmed = st.checkbox("I have reviewed every accepted word", key="vr_confirm")
+    items = V.batch_items(proposals, verdicts)
+    digest = V.batch_digest(items, lexicon)
+    short = digest[:16]
+    st.subheader("Final batch")
+    table = V.final_table(items)
+    if table:
+        st.dataframe(pd.DataFrame(table), hide_index=True)
+    else:
+        st.caption("Nothing accepted or kept holding yet.")
+    st.text(f"Batch digest: {short}")
+    st.caption("A word wrongly accepted removes a hold that protected against a second market or "
+               "an unclear instruction: your judgement is the safeguard.")
+    confirmed = st.checkbox(f"I have reviewed the final batch table above (digest {short})",
+                            key=f"vr_confirm_batch_{short}")
+    confirm_candidate = st.checkbox("Write the accepted words to a separate candidate file "
+                                    "(experiment only)", key="vr_confirm_candidate")
+    confirm_undo = st.checkbox(f"Undo the last batch ({len(V.backups(lexicon))} backup(s))",
+                               key="vr_confirm_undo")
+    previous = st.session_state.get("vr_shown_digest")
+    st.session_state["vr_shown_digest"] = digest
     b1, b2, b3 = st.columns(3)
     if b1.button("Apply batch to the production lexicon", key="vr_apply", type="primary"):
-        if not confirmed:
-            st.error("Not applied: tick the confirmation first.")
+        if previous != digest:
+            _show_result(V.BatchResult("REFUSED", "the batch changed since you reviewed it; "
+                                                  "nothing written. Review the final table "
+                                                  "again."))
+        elif not confirmed:
+            st.error("Not applied: tick the confirmation of the final table first.")
         else:
-            st.session_state["vr_result"] = V.apply_batch(lexicon, items)
+            _done(V.apply_reviewed(lexicon, log, prop_path, verdicts, previous))
     if b2.button("Write a candidate lexicon (experiment)", key="vr_candidate"):
-        out = V.default_candidate_path(lexicon)
-        st.session_state["vr_result"] = V.write_candidate(lexicon, items, out)
-    if b3.button(f"Undo last batch ({len(V.backups(lexicon))} backup(s))", key="vr_undo"):
-        st.session_state["vr_result"] = V.undo_last(lexicon)
+        if not confirm_candidate:
+            st.error("Not written: tick the candidate confirmation first.")
+        else:
+            _done(V.write_candidate(lexicon, items, candidate_path))
+    if b3.button("Undo last batch", key="vr_undo"):
+        if not confirm_undo:
+            st.error("Not undone: tick the undo confirmation first.")
+        else:
+            _done(V.undo_last(lexicon))
     result = st.session_state.get("vr_result")
     if result is not None:
         st.subheader("What was done")
         _show_result(result)
-        if result.status == "WRITTEN" and result.path is not None and result.path != lexicon:
-            st.markdown("Replay it offline (never the running service): set `lexicon_path` to "
-                        f"`{result.path}` in a separate replay config, then run "
-                        "`scripts/run_service.py --config <replay.toml> --source "
-                        "replay:<posts.jsonl> --allow-candidate-lexicon`.")
 
 
 try:

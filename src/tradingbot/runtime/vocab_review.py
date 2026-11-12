@@ -24,6 +24,20 @@ owner's private files, each outside the repository and every git work tree, mode
 
 Nothing here decides a trade: a word takes effect only when the service (or a replay) restarts
 and loads the lexicon through its own validators.
+
+The page binds an approval to what the owner reviewed: ``batch_digest`` covers the final table
+(word, verdict, group, family, meaning) and the production lexicon's bytes, and ``apply_reviewed``
+recomputes the batch from the current files at click time and refuses any difference.
+
+The review log is the ONE file that holds the publisher's sentences: proposals, candidates, the
+decisions file and backups carry words and public codes only; a plain batch refers to its examples
+by (source id, action id) and the page loads at most ``MAX_EXAMPLES`` sentences per proposal from
+the log at render time. ``ReviewLog`` never appends the same hold twice, and
+``truncate_review_log`` is the owner's way to bound it.
+
+Note: the private evidence rides on ``MappingDecision`` as a pydantic private attribute. ``pickle``,
+``copy.deepcopy``, ``model_copy`` and ``==`` on a decision DO carry or compare it; no code under
+``src/`` does any of these to a decision (tests/test_vocab_review_fixes.py scans for it).
 """
 
 from __future__ import annotations
@@ -67,7 +81,12 @@ VERDICTS = (PENDING, ACCEPT, REJECT, KEEP_HOLDING)
 PROPOSAL_SCHEMA = "tradingbot.vocab_proposal/1"
 # Marks a candidate (experimental) lexicon: the service's loader refuses such a file.
 CANDIDATE_KEY = "candidate_lexicon"
+CANDIDATE_SUFFIX = ".candidate.json"
+# Marks a state directory used by a candidate replay: production never runs there.
+CANDIDATE_RUN_MARKER = "CANDIDATE_RUN"
 _FAMILY_RE = re.compile(r"^[A-Z][A-Z0-9]{0,9}(\.OPT)?$")
+# At most this many example sentences per proposal are loaded for display.
+MAX_EXAMPLES = 5
 
 
 class PrivatePathError(ValueError):
@@ -82,10 +101,55 @@ class CandidateLexiconRefused(ConfigError):
 
 
 def git_work_tree(path: Path) -> Path | None:
-    """The git work tree holding ``path`` (a ``.git`` directory or file in it or an ancestor)."""
+    """The git work tree holding ``path`` (a ``.git`` directory or file in it or an ancestor, or
+    ``path`` inside a ``.git`` directory). A work tree whose git directory lives elsewhere with no
+    ``.git`` entry (``core.worktree``) cannot be detected."""
     for folder in (path, *path.parents):
-        if (folder / ".git").exists():
+        if (folder / ".git").exists() or folder.name == ".git":
             return folder
+    return None
+
+
+def bare_repository(path: Path) -> Path | None:
+    """A bare git repository holding ``path``: an ancestor with ``HEAD``, ``objects/``, ``refs/``."""
+    for folder in (path, *path.parents):
+        if (folder / "HEAD").is_file() and (folder / "objects").is_dir() \
+                and (folder / "refs").is_dir():
+            return folder
+    return None
+
+
+# Cloud-synced roots (macOS): a private file there is copied to a provider. Not refused (the owner
+# may choose it) but warned on the page and alerted at start, by class only.
+_SYNCED = (
+    ("Library/CloudStorage", "CLOUD_STORAGE"),
+    ("Library/Mobile Documents", "ICLOUD_DRIVE"),
+    ("Dropbox", "DROPBOX"),
+    ("OneDrive", "ONEDRIVE"),
+    ("Google Drive", "GOOGLE_DRIVE"),
+    ("Box", "BOX"),
+    ("Documents", "POSSIBLY_ICLOUD_DESKTOP_DOCUMENTS"),
+    ("Desktop", "POSSIBLY_ICLOUD_DESKTOP_DOCUMENTS"),
+)
+
+
+def synced_folder_class(path: str | Path) -> str | None:
+    """The class of cloud-synced folder holding ``path`` (a constant, never the path), or None."""
+    p = Path(path).expanduser()
+    target = Path(os.path.realpath(p.parent)) / p.name
+    home = Path(os.path.realpath(Path.home()))
+    try:
+        rel = target.relative_to(home)
+    except ValueError:
+        return None
+    first = rel.parts[0] if rel.parts else ""
+    for root, cls in _SYNCED:
+        parts = root.split("/")
+        if len(parts) == 2 and rel.parts[:2] == tuple(parts):
+            return cls
+        if len(parts) == 1 and (first == root or first.startswith(f"{root} - ")
+                                or (root in ("Dropbox", "OneDrive") and first.startswith(root))):
+            return cls
     return None
 
 
@@ -101,6 +165,10 @@ def check_private_path(path: str | Path, what: str) -> Path:
     if tree is not None:
         raise PrivatePathError(f"the {what} must lie outside any git work tree (found one at "
                                f"{tree}): private text must never be committable")
+    bare = bare_repository(target.parent)
+    if bare is not None:
+        raise PrivatePathError(f"the {what} must lie outside any bare git repository (found one "
+                               f"at {bare})")
     return target
 
 
@@ -119,18 +187,26 @@ class ReviewLog:
 
     def __init__(self, path: str | Path):
         self.path = check_private_path(path, self.WHAT)
+        self._seen: set[tuple] = set()
         if self.path.is_symlink():
             raise PrivatePathError(f"the {self.WHAT} may not be a symbolic link")
         if self.path.exists():
             if not self.path.is_file():
                 raise PrivatePathError(f"the {self.WHAT} is not a regular file")
             _check_mode(self.path.stat().st_mode, self.WHAT)
+            entries, _ = read_review_log(self.path)
+            self._seen = {record_key(e) for e in entries}
         else:
             self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
             fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
             os.close(fd)
 
-    def append(self, record: dict) -> None:
+    def append(self, record: dict) -> bool:
+        """Append one hold, unless the same hold (post, revision, action, reason) is already in
+        the log: a replay or a restart never duplicates it. True when appended."""
+        key = record_key(record)
+        if key in self._seen:
+            return False
         line = (json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
         fd = os.open(self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
         try:
@@ -138,6 +214,29 @@ class ReviewLog:
             os.write(fd, line)
         finally:
             os.close(fd)
+        self._seen.add(key)
+        return True
+
+
+def record_key(record: dict) -> tuple:
+    """One hold's identity in the review log (identifiers and public codes only)."""
+    return (str(record.get("source_id") or record.get("post_id")), record.get("revision"),
+            record.get("action_id"), record.get("reason_code"),
+            tuple(record.get("reason_detail") or ()))
+
+
+def truncate_review_log(path: str | Path, keep_last: int) -> int:
+    """The owner's way to bound the review log: keep only its last ``keep_last`` lines (atomic,
+    mode 0600). Returns how many lines were removed. Run it while the service is stopped."""
+    target = check_private_path(path, ReviewLog.WHAT)
+    if not target.is_file():
+        return 0
+    lines = target.read_bytes().splitlines(keepends=True)
+    keep = lines[-keep_last:] if keep_last > 0 else []
+    if len(keep) == len(lines):
+        return 0
+    _write_atomic(target, b"".join(keep))
+    return len(lines) - len(keep)
 
 
 def review_record(*, at: datetime, post_id: str, source_id: str, revision: int, action_id: str,
@@ -185,7 +284,8 @@ class Candidate:
     posts: int = 0  # distinct held posts
     families: list[str] = field(default_factory=list)
     reasons: list[str] = field(default_factory=list)
-    sentences: list[tuple[str, str]] = field(default_factory=list)  # (role, sentence)
+    sentences: list[tuple[str, str]] = field(default_factory=list)  # at most MAX_EXAMPLES
+    refs: list[dict] = field(default_factory=list)  # {source_id, action_id}, at most MAX_EXAMPLES
 
 
 def normalise(token: str) -> str:
@@ -235,8 +335,12 @@ def candidates(entries: list[dict], *, lexicon_path: str | Path | None = None) -
             texts = [(s.get("role", ""), s.get("text", "")) for s in e.get("sentences") or ()
                      if isinstance(s, dict)]
             for pair in [p for p in texts if pattern.search(p[1])] or texts:
-                if pair not in c.sentences:
+                if pair not in c.sentences and len(c.sentences) < MAX_EXAMPLES:
                     c.sentences.append(pair)
+            ref = {"source_id": str(e.get("source_id") or e.get("post_id")),
+                   "action_id": e.get("action_id")}
+            if ref not in c.refs and len(c.refs) < MAX_EXAMPLES:
+                c.refs.append(ref)
     for key, c in found.items():
         c.posts = len(posts[key])
         c.families.sort()
@@ -263,16 +367,21 @@ class Proposal:
     families: list[str] = field(default_factory=list)
     reasons: list[str] = field(default_factory=list)
     measured: dict[str, int] | None = None
+    # Inline example text a proposals file supplied (shown, never copied into another file).
     examples: list[tuple[str, str]] = field(default_factory=list)
+    # References into the review log ({source_id[, action_id]}), resolved at display time.
+    example_refs: list[dict] = field(default_factory=list)
 
 
-def _proposal(raw: dict, entries: list[dict]) -> Proposal | None:
+def _proposal(raw: dict) -> Proposal | None:
     token = raw.get("token")
     group = raw.get("group")
     if raw.get("schema") != PROPOSAL_SCHEMA or not isinstance(token, str) or not token.strip() \
             or group not in GROUPS:
         return None
-    family = raw.get("family") if isinstance(raw.get("family"), str) else None
+    family = raw.get("family")
+    if family is not None and not (isinstance(family, str) and _FAMILY_RE.match(family)):
+        return None
     evidence = raw.get("evidence") if isinstance(raw.get("evidence"), dict) else {}
     cats = raw.get("categories") if isinstance(raw.get("categories"), dict) else {}
     measured = raw.get("measured")
@@ -282,12 +391,17 @@ def _proposal(raw: dict, entries: list[dict]) -> Proposal | None:
         measured = dict(measured)
     else:
         measured = None  # not measured (or not public counts)
-    examples = []
+    examples, refs = [], []
     for ex in raw.get("examples") or ():
         if isinstance(ex, dict) and isinstance(ex.get("text"), str):
-            examples.append((str(ex.get("role", "")), ex["text"]))
+            if len(examples) < MAX_EXAMPLES:
+                examples.append((str(ex.get("role", "")), ex["text"]))
         elif isinstance(ex, dict) and (ex.get("source_id") or ex.get("post_id")):
-            examples += _referenced(ex, normalise(token), entries)
+            ref = {"source_id": str(ex.get("source_id") or ex.get("post_id"))}
+            if isinstance(ex.get("action_id"), str):
+                ref["action_id"] = ex["action_id"]
+            if len(refs) < MAX_EXAMPLES:
+                refs.append(ref)
     return Proposal(
         token=normalise(token), group=group, family=family,
         meaning=raw.get("meaning") if isinstance(raw.get("meaning"), str) else "",
@@ -295,11 +409,21 @@ def _proposal(raw: dict, entries: list[dict]) -> Proposal | None:
         posts=_count(evidence.get("posts")), holds=_count(evidence.get("holds")),
         families=sorted(str(f) for f in cats.get("families") or ()),
         reasons=sorted(str(r) for r in cats.get("reasons") or ()),
-        measured=measured, examples=list(dict.fromkeys(examples)))
+        measured=measured, examples=list(dict.fromkeys(examples)), example_refs=refs)
 
 
 def _count(v) -> int:
     return v if isinstance(v, int) and not isinstance(v, bool) and v >= 0 else 0
+
+
+def example_sentences(p: Proposal, entries: list[dict], limit: int = MAX_EXAMPLES
+                      ) -> list[tuple[str, str]]:
+    """The sentences to show for ``p`` (display only, loaded at render time): its inline examples,
+    then the review-log sentences its references point to, at most ``limit``."""
+    out = list(p.examples)
+    for ref in p.example_refs:
+        out += _referenced(ref, p.token, entries)
+    return list(dict.fromkeys(out))[:limit]
 
 
 def _referenced(ref: dict, token: str, entries: list[dict]) -> list[tuple[str, str]]:
@@ -322,10 +446,10 @@ def default_proposals_path(review_log_path: str | Path) -> Path:
     return p.with_name(f"{p.stem}.proposals.jsonl")
 
 
-def read_proposals(path: str | Path, *, entries: list[dict] = (),
-                   lexicon_path: str | Path | None = None) -> tuple[list[Proposal], int]:
+def read_proposals(path: str | Path, *, lexicon_path: str | Path | None = None
+                   ) -> tuple[list[Proposal], int]:
     """A proposals file's proposals (words already decided left out) and how many lines could
-    not be read. Example references are resolved against the review log ``entries``."""
+    not be read. Example references stay references (``example_sentences`` resolves them)."""
     p = Path(path).expanduser()
     if not p.exists():
         return [], 0
@@ -339,7 +463,7 @@ def read_proposals(path: str | Path, *, entries: list[dict] = (),
         except json.JSONDecodeError:
             bad += 1
             continue
-        prop = _proposal(raw, list(entries)) if isinstance(raw, dict) else None
+        prop = _proposal(raw) if isinstance(raw, dict) else None
         if prop is None:
             bad += 1
         elif prop.token not in known and prop.token not in seen:
@@ -371,7 +495,7 @@ def proposals_from_log(entries: list[dict], *, lexicon_path: str | Path | None =
             group = AMBIGUOUS
         out.append(Proposal(token=c.token, group=group, family=family, kind=c.kind,
                             posts=c.posts, holds=c.holds, families=list(c.families),
-                            reasons=list(c.reasons), examples=list(c.sentences)))
+                            reasons=list(c.reasons), example_refs=list(c.refs)))
     return out
 
 
@@ -400,6 +524,90 @@ class BatchResult:
     kept_holding: list[str] = field(default_factory=list)
     backup: Path | None = None
     path: Path | None = None
+
+
+def proposal_id(p: Proposal) -> str:
+    """A stable id of a proposal's identity (word, kind, group, family): the page keys every
+    widget by it, never by list position. Holds no private text."""
+    ident = json.dumps([p.token, p.kind, p.group, p.family], ensure_ascii=False)
+    return hashlib.sha256(ident.encode("utf-8")).hexdigest()[:16]
+
+
+@dataclass(frozen=True)
+class Verdict:
+    """The owner's choice for one proposal, as the page holds it."""
+    verdict: str = PENDING
+    group: str | None = None
+    family: str | None = None
+    meaning: str = ""
+
+
+def load_batch(review_log_path, lexicon_path, proposals_path) -> tuple[list[Proposal], list[dict],
+                                                                       str, int]:
+    """The proposals the page shows, from the current files: (proposals, review-log entries,
+    source ("file" or "log"), unreadable lines)."""
+    entries, bad = read_review_log(review_log_path)
+    path = Path(proposals_path).expanduser()
+    if path.exists():
+        props, bad_props = read_proposals(path, lexicon_path=lexicon_path)
+        return props, entries, "file", bad + bad_props
+    return proposals_from_log(entries, lexicon_path=lexicon_path), entries, "log", bad
+
+
+def batch_items(proposals: list[Proposal], verdicts: dict[str, Verdict]) -> list[BatchItem]:
+    """Each shown proposal with the owner's verdict (undecided when the owner chose nothing)."""
+    out = []
+    for p in proposals:
+        v = verdicts.get(proposal_id(p)) or Verdict()
+        group = v.group if v.group in GROUPS else p.group
+        family = (v.family or p.family) if group == MARKET_NAME else None
+        out.append(BatchItem(p.token, v.verdict, group, family, v.meaning))
+    return out
+
+
+def final_table(items: list[BatchItem]) -> list[dict[str, str]]:
+    """The final batch the owner confirms: every accepted or keep-holding word, the exact list it
+    is written to and its effect in plain words."""
+    rows = []
+    for i in items:
+        if i.verdict == ACCEPT and i.group in GROUP_LIST:
+            where = GROUP_LIST[i.group] + (f".{i.family}" if i.group == MARKET_NAME else "")
+            effect = "removes a hold: posts containing this word may become executable"
+        elif i.verdict == ACCEPT:
+            where, effect = "-", "refused: choose a list first"
+        elif i.verdict == KEEP_HOLDING:
+            where, effect = "review-decisions (keep holding)", "keeps holding"
+        else:
+            continue
+        rows.append({"word": normalise(i.token), "list": f"entry_anchor.{where}"
+                     if i.verdict == ACCEPT and i.group in GROUP_LIST else where,
+                     "family": i.family or "", "effect": effect, "meaning": i.meaning})
+    return sorted(rows, key=lambda r: (r["list"], r["word"]))
+
+
+def batch_digest(items: list[BatchItem], lexicon_path: str | Path) -> str:
+    """A digest of the final table and of the production lexicon's current bytes."""
+    try:
+        lex = Path(lexicon_path).expanduser().read_bytes()
+    except OSError:
+        lex = b""
+    rows = [[normalise(i.token), i.verdict, i.group, i.family or "", i.meaning]
+            for i in items if i.verdict in (ACCEPT, KEEP_HOLDING)]
+    blob = json.dumps([sorted(rows), hashlib.sha256(lex).hexdigest()], ensure_ascii=False)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def apply_reviewed(lexicon_path, review_log_path, proposals_path, verdicts: dict[str, Verdict],
+                   expected_digest: str | None, *, now: datetime | None = None) -> BatchResult:
+    """Apply exactly the batch the owner reviewed: recompute it from the current files and refuse
+    when its digest is not the one shown (a changed proposals file, review log or lexicon)."""
+    props, *_ = load_batch(review_log_path, lexicon_path, proposals_path)
+    items = batch_items(props, verdicts)
+    if not expected_digest or batch_digest(items, lexicon_path) != expected_digest:
+        return BatchResult("REFUSED", "the batch changed since you reviewed it (the proposals, "
+                                      "the review log or the lexicon changed); nothing written. "
+                                      "Review the final table again.")
+    return apply_batch(lexicon_path, items, now=now)
 
 
 def decisions_path(lexicon_path: str | Path) -> Path:
@@ -469,10 +677,11 @@ def _write_atomic(path: Path, data: bytes) -> None:
 
 def loader_problem(path: Path, *, allow_candidate: bool = False) -> str | None:
     """Why the runtime's own lexicon loader refuses ``path``, or None when it loads."""
-    from tradingbot.runtime.service import load_lexicons  # the real loader, not a copy
+    # The real loader, not a copy: its raw validation errors are for the owner's page only.
+    from tradingbot.runtime.service import read_lexicons
 
     try:
-        load_lexicons(path, allow_candidate=allow_candidate)
+        read_lexicons(path, allow_candidate=allow_candidate)
     except ValidationError as exc:
         return "; ".join(e["msg"].removeprefix("Value error, ") for e in exc.errors())
     except CandidateLexiconRefused:
@@ -602,22 +811,32 @@ def apply_batch(lexicon_path: str | Path, items: list[BatchItem], *,
             return BatchResult("REFUSED", f"the lexicon was not replaced ({type(exc).__name__}); "
                                           "it is unchanged", refused=result.refused)
         result.backup, result.status = backup, "WRITTEN"
+    recorded = True
     if result.added or keep:
-        _record_batch(path, batch, items, result, keep, now)
+        recorded = _record_batch(path, batch, items, result, keep, now)
         if result.status != "WRITTEN":
-            result.status = "RECORDED"
-    result.kept_holding = keep if result.status in ("WRITTEN", "RECORDED") else []
+            result.status = "RECORDED" if recorded else "REFUSED"
+    result.kept_holding = keep if recorded else []
     n_added = sum(len(v) for v in result.added.values())
     result.message = (f"{n_added} word(s) added, {len(result.kept_holding)} kept holding, "
                       f"{len(result.refused)} refused, {len(result.unchanged)} already present. "
                       "A new word takes effect when the service (or a replay) is restarted.")
+    if not recorded:
+        result.message += (" The decisions file could not be written: keep-holding words were "
+                           "not recorded" + (", and undo of this batch is not available."
+                                             if result.status == "WRITTEN" else "."))
     return result
 
 
-def _record_batch(path, batch, items, result, keep, now) -> None:
-    """Keep-holding words and the applied words (with the owner's meanings) beside the lexicon.
-    Best effort after the lexicon write: the lexicon is the authority."""
+def _record_batch(path, batch, items, result, keep, now) -> bool:
+    """Keep-holding words, the applied words (with the owner's meanings) and the sha256 of the
+    lexicon written, beside the lexicon. After the lexicon write: the lexicon is the authority.
+    False when the file could not be written."""
     raw = _read_decisions(path)
+    if result.backup is not None:
+        raw.setdefault("writes", []).append({
+            "batch": batch, "backup": result.backup.name, "at": now.isoformat(),
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest()})
     written = {w for words in result.added.values() for w in words}
     meanings = {normalise(i.token): i.meaning for i in items}
     held = raw.setdefault("keep_holding", [])
@@ -628,8 +847,11 @@ def _record_batch(path, batch, items, result, keep, now) -> None:
         {"token": w, "list": where, "meaning": meanings.get(w, ""), "at": now.isoformat(),
          "batch": batch, "backup": result.backup.name if result.backup else None}
         for where, words in result.added.items() for w in words if w in written)
-    with contextlib.suppress(OSError):
+    try:
         _write_atomic(decisions_path(path), _serialise(raw))
+    except OSError:
+        return False
+    return True
 
 
 def undo_last(lexicon_path: str | Path) -> BatchResult:
@@ -643,6 +865,15 @@ def undo_last(lexicon_path: str | Path) -> BatchResult:
     if not found:
         return BatchResult("NOTHING_TO_UNDO", "No backup to restore.")
     latest = found[-1]
+    raw = _read_decisions(path)
+    wrote = [w for w in raw.get("writes") or () if isinstance(w, dict)
+             and w.get("backup") == latest.name]
+    current = hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+    if not wrote or wrote[-1].get("sha256") != current:
+        return BatchResult("REFUSED", f"the lexicon is not the file this tool last wrote (it was "
+                                      f"edited by hand, or the write was not recorded): undo "
+                                      f"would discard that edit. Restore {latest.name} by hand "
+                                      "if that is what you want.", backup=latest, path=path)
     problem = loader_problem(latest)
     if problem is not None:
         return BatchResult("REFUSED", f"the latest backup {latest.name} does not load: {problem}")
@@ -651,11 +882,10 @@ def undo_last(lexicon_path: str | Path) -> BatchResult:
         latest.unlink()
     except OSError as exc:
         return BatchResult("REFUSED", f"the backup was not restored ({type(exc).__name__})")
-    raw = _read_decisions(path)
-    batches = {d.get("batch") for d in raw.get("applied") or ()
+    batches = {d.get("batch") for d in raw.get("writes") or ()
                if isinstance(d, dict) and d.get("backup") == latest.name}
     if batches:
-        for key in ("applied", "keep_holding"):
+        for key in ("applied", "keep_holding", "writes"):
             raw[key] = [d for d in raw.get(key) or ()
                         if not (isinstance(d, dict) and d.get("batch") in batches)]
         with contextlib.suppress(OSError):
@@ -687,9 +917,19 @@ def write_candidate(lexicon_path: str | Path, items: list[BatchItem], out_path: 
         out = check_private_path(out_path, "candidate lexicon")
     except PrivatePathError as exc:
         return BatchResult("REFUSED", str(exc))
-    if out == path or out.name.startswith(f"{path.name}.bak-"):
-        return BatchResult("REFUSED", "the candidate lexicon must be a separate file, never the "
-                                      "production lexicon or one of its backups")
+    if out == path or out.name.startswith(f"{path.name}.bak-") or \
+            out == decisions_path(path) or not out.name.endswith(CANDIDATE_SUFFIX):
+        return BatchResult("REFUSED", f"the candidate lexicon must be its own file ending in "
+                                      f"{CANDIDATE_SUFFIX}, never the production lexicon, a "
+                                      "backup, the decisions file or the review log")
+    if out.exists():
+        try:
+            marked = CANDIDATE_KEY in json.loads(out.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            marked = False
+        if not marked or out.is_symlink():
+            return BatchResult("REFUSED", "an existing file without the candidate marker is "
+                                          "never overwritten")
     result = BatchResult("NOTHING", "", path=out)
     new = _build(path, raw, items, result, allow_candidate=True)
     new[CANDIDATE_KEY] = {

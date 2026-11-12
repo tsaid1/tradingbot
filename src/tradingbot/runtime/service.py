@@ -41,6 +41,8 @@ from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
+from pydantic import ValidationError
+
 from tradingbot.event_models import ParsedPost
 from tradingbot.execution import settlement
 from tradingbot.execution.broker import (
@@ -76,6 +78,7 @@ from tradingbot.execution.replay import BrokerEventReplay
 from tradingbot.execution.store import LEDGER_REVERSAL, UNRESOLVED_STATES
 from tradingbot.models import Action, Instrument, LegQuote, MappedQuote, Quote
 from tradingbot.runtime import notify as N
+from tradingbot.runtime import vocab_review
 from tradingbot.runtime.alerts import Alerter
 from tradingbot.runtime.config import ConfigError, RuntimeConfig
 from tradingbot.runtime.mapping import (
@@ -98,6 +101,7 @@ from tradingbot.runtime.sources import ReplayFileSource, SourceAdapter, SourceEr
 from tradingbot.runtime.store import RuntimeStore, write_json_atomic
 from tradingbot.runtime.vocab_review import (
     CANDIDATE_KEY,
+    CANDIDATE_RUN_MARKER,
     CandidateLexiconRefused,
     PrivatePathError,
     ReviewLog,
@@ -227,6 +231,30 @@ def _safe_error(exc: BaseException) -> str:
 
 def load_lexicons(path, *, allow_candidate: bool = False
                   ) -> tuple[LexiconExtension, AnchorLexicon]:
+    """``read_lexicons``, with a refusal reported as a ``ConfigError`` that carries only the
+    error type, the field paths and the count, never an input value: a refused lexicon's words
+    never reach stderr, a log or an alert (review S6)."""
+    try:
+        return read_lexicons(path, allow_candidate=allow_candidate)
+    except ValidationError as exc:
+        errors = exc.errors()
+        prefix = "entry_anchor." if exc.title == AnchorLexicon.__name__ else ""
+        locs = sorted({prefix + ".".join(str(x) for x in e["loc"] if not isinstance(x, int))
+                       for e in errors})
+        raise ConfigError(f"the private lexicon {path} is refused by its validators: "
+                          f"{len(errors)} error(s) of type {type(exc).__name__} at "
+                          f"{', '.join(locs) or '-'}; open it on the owner's review page or "
+                          "check it by hand") from None
+    except json.JSONDecodeError as exc:
+        raise ConfigError(f"the private lexicon {path} is not valid JSON (line {exc.lineno}, "
+                          f"column {exc.colno})") from None
+    except (TypeError, AttributeError) as exc:
+        raise ConfigError(f"the private lexicon {path} is not a JSON object "
+                          f"({type(exc).__name__})") from None
+
+
+def read_lexicons(path, *, allow_candidate: bool = False
+                  ) -> tuple[LexiconExtension, AnchorLexicon]:
     """The private lexicon extension: the interpreter's patterns, and its optional
     ``entry_anchor`` section (present-market markers and family aliases), which only the mapping
     policy reads. The interpreter never sees that section.
@@ -244,7 +272,8 @@ def load_lexicons(path, *, allow_candidate: bool = False
                 "offline replay may load a candidate, with --allow-candidate-lexicon")
         raw.pop(CANDIDATE_KEY)
     section = raw.pop("entry_anchor", None) or {}
-    return LexiconExtension.model_validate(raw), AnchorLexicon.model_validate(section)
+    anchor = AnchorLexicon.model_validate(section)
+    return LexiconExtension.model_validate(raw), anchor
 
 class RuntimeService:
     def __init__(
@@ -267,6 +296,7 @@ class RuntimeService:
         if allow_candidate_lexicon and not isinstance(source, ReplayFileSource):
             # A candidate lexicon is an experiment: never with a live source.
             raise ConfigError("a candidate lexicon may only be used with a replay-file source")
+        _check_candidate_state_dir(config, allow_candidate_lexicon)
         self.config = config
         # The owner's PRIVATE vocabulary review log (default off). Refused at start inside the
         # repository or a git work tree, or when others may read it.
@@ -293,6 +323,8 @@ class RuntimeService:
             self.store, self.notifier, realert_seconds=config.notify.realert_seconds,
             clock=self.clock,
         )
+        if self.review_log is not None:
+            self._warn_synced_private_paths()
         self.coordinator = ExecutionCoordinator(
             broker, config.execution_db, config.policy, execution_config(config), clock=self.clock
         )
@@ -855,6 +887,19 @@ class RuntimeService:
             self._write_review_log(post, result.outcomes, decision_by_id, decided_at)
         return len(exceptions), result.duplicate
 
+    def _warn_synced_private_paths(self) -> None:
+        """Review S5: a private file in a cloud-synced folder is allowed (the owner's choice) but
+        alerted once at start, by path class only."""
+        now = self.clock()
+        for label, path in (("review_log", self.config.interpreter.review_log_path),
+                            ("lexicon", self.config.interpreter.lexicon_path)):
+            cls = vocab_review.synced_folder_class(path) if path is not None else None
+            if cls is not None:
+                self.alerter.event(
+                    f"EVENT:{N.PRIVATE_PATH_IN_SYNCED_FOLDER}:{label}:{now.isoformat()}",
+                    N.PRIVATE_PATH_IN_SYNCED_FOLDER, "Private file in a cloud-synced folder",
+                    f"{N.PRIVATE_PATH_IN_SYNCED_FOLDER} {label} {cls}", now)
+
     def _write_review_log(self, post: SourcePost, outcomes, decisions, at: datetime) -> None:
         """The owner's PRIVATE review log: one line per held action whose mapping decision carries
         vocabulary evidence. A failure raises an alert by code only and never stops the service;
@@ -1314,6 +1359,46 @@ class RuntimeService:
         h.next_attempt_at = None
         h.last_success_at = now.isoformat()
         self.alerter.sweep(f"FAILURE:{component}", set(), now)
+
+
+def _check_candidate_state_dir(config: RuntimeConfig, candidate: bool) -> None:
+    """Review S7: a candidate replay never writes into production's journal. With the opt-in the
+    state directory must be new (no journal, execution, replay or broker store, no heartbeat) or
+    marked by an earlier candidate run, and is marked; without it a marked directory is
+    refused."""
+    state = config.paths.state_dir
+    marker = state / CANDIDATE_RUN_MARKER
+    if not candidate:
+        if marker.exists():
+            raise ConfigError(f"the state directory {state} was used by a candidate-lexicon "
+                              "replay: production never runs there; use another state_dir")
+        return
+    if marker.exists():
+        return
+    if _state_dir_used(config):
+        raise ConfigError(f"a candidate-lexicon replay needs a new state directory, not {state} "
+                          "(it holds a journal): experimental holds and trades never enter "
+                          "production's journal; set another [paths] state_dir")
+    state.mkdir(parents=True, exist_ok=True)
+    marker.write_text("state directory of a candidate-lexicon replay: not production\n")
+
+
+def _state_dir_used(config: RuntimeConfig) -> bool:
+    """A service has run on this state directory: a heartbeat, or any service event journaled
+    (every start journals SERVICE_START). Empty stores opened by the wiring do not count."""
+    if config.heartbeat_file.exists():
+        return True
+    if not config.runtime_db.exists():
+        return False
+    try:
+        con = sqlite3.connect(f"file:{config.runtime_db}?mode=ro", uri=True)
+        try:
+            return any(con.execute("SELECT 1 FROM service_events LIMIT 1").fetchall()
+                       + con.execute("SELECT 1 FROM signals LIMIT 1").fetchall())
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return True  # unreadable: assume it is production's
 
 
 def _json(value) -> str:

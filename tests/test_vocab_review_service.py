@@ -97,8 +97,8 @@ def files_containing(root: Path, needles, skip: set[Path]) -> list[str]:
     for f in root.rglob("*"):
         if not f.is_file() or f.resolve() in skip:
             continue
-        blob = f.read_bytes()
-        hits += [f"{f.name}: {n}" for n in needles if n.encode() in blob]
+        blob = f.read_bytes().lower()  # review N5: any case
+        hits += [f"{f.name}: {n}" for n in needles if n.lower().encode() in blob]
     return hits
 
 
@@ -171,11 +171,11 @@ def test_a_journaled_held_decision_leaves_the_words_only_in_the_private_log(tmp_
     skip = {log.resolve(), rt.posts_file.resolve()}  # the private log and the invented input
     assert files_containing(tmp_path, PRIVATE, skip) == []
     out = capsys.readouterr()
-    for needle in PRIVATE:
-        assert needle not in caplog.text and needle not in out.out and needle not in out.err
-        assert needle not in json.dumps(rt.notifier.sent)
-        assert needle not in json.dumps(rt.actions(), default=str)
-        assert needle not in json.dumps(rt.store.events(), default=str)
+    for needle in (n.lower() for n in PRIVATE):  # review N5: any case
+        for blob in (caplog.text, out.out, out.err, json.dumps(rt.notifier.sent),
+                     json.dumps(rt.actions(), default=str),
+                     json.dumps(rt.store.events(), default=str)):
+            assert needle not in blob.lower()
     # The journal still records the public reason code and kinds as before.
     reasons = {a["mapping_reason"] for a in opens(rt)}
     assert "ENTRY_ANCHOR_CONTEXT_UNCLEAR,WORDS:1" in reasons
@@ -302,7 +302,7 @@ def test_a_different_market_keeps_holding_and_is_not_offered_again(tmp_path):
     assert statuses[0][1] == "ENTRY_ANCHOR_POST_UNRESOLVED_MARKET,MENTION:PROPER_NOUN"
     assert json.loads(lex.read_text()) == {"open_present": [], "entry_anchor": {}}
     entries, _ = V.read_review_log(log)
-    assert len(entries) == 2  # held twice
+    assert len(entries) == 1  # held twice, logged once (one record per hold)
     assert V.candidates(entries, lexicon_path=lex) == []
     assert V.proposals_from_log(entries, lexicon_path=lex) == []
 

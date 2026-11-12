@@ -140,15 +140,16 @@ def test_a_proposals_file_is_read_with_its_measured_change_and_example_reference
                     + proposal_line(token="kindly", group=V.INSTRUCTION_PHRASE, measured=None)
                     + proposal_line(token="x", group="NOT_A_GROUP")
                     + proposal_line(token="y", schema="other/1") + "{broken\n")
-    props, bad = V.read_proposals(path, entries=log_entries)
+    props, bad = V.read_proposals(path)
     assert bad == 3
     [zorbs, kindly] = props
     assert (zorbs.token, zorbs.group, zorbs.family, zorbs.posts, zorbs.holds) == \
         ("zorbs", V.MARKET_NAME, "TLT", 4, 5)
     assert zorbs.measured == {"holds_resolved": 4, "executable_gained": 3,
                               "false_executable_introduced": 0}
-    assert zorbs.examples == [("MENTION", "The zorbs look heavy."),
-                              ("MENTION", "Zorbs again: zorbs rally.")]
+    assert zorbs.example_refs == [{"source_id": "7"}]  # a reference, resolved at display time
+    assert V.example_sentences(zorbs, log_entries) == [("MENTION", "The zorbs look heavy."),
+                                                       ("MENTION", "Zorbs again: zorbs rally.")]
     assert kindly.measured is None  # shown as "not measured"
     # A word already in the lexicon is not proposed again.
     lex = lexicon(tmp_path)  # holds "kindly" as a context word
