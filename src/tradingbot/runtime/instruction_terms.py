@@ -416,9 +416,11 @@ def _tag(words: list[str], phrases, tag: str, tags: list[str | None]) -> None:
 # commas, colons, semicolons, dashes, slashes and brackets do not. Besides markers, connectors,
 # units, the family's names and the action's own words, only these generic function words of a
 # plain instruction may stand in it. Publisher phrasing is added only by the private lexicon.
+# Final review: no preposition that can make the number a goal, a condition, a comparison or the
+# price of something else ("for", "to", "on", "of", "with", "in") is on the list.
 FUNCTION_WORDS = frozenset((
-    "we", "i", "are", "am", "is", "in", "on", "of", "to", "for", "with", "and", "our", "my",
-    "a", "the", "this", "new", "position", "positions", "trade",
+    "we", "i", "are", "am", "is", "and", "our", "my", "a", "the", "this", "new", "position",
+    "positions", "trade",
 ))
 _SENTENCE_END_RE = re.compile(r"\n|[!?]|\.(?!\d)")
 

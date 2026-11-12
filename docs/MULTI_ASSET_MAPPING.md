@@ -210,8 +210,10 @@ is written in between punctuation (`,` `;` `.` `:` `!` `?`, a line break, a spac
    post ends a sentence; commas, colons, semicolons, dashes, slashes and brackets do not, and
    nothing resets the scope. Every alphabetic token in the sentence must be a present-market
    marker (public or private), a connector (`CONNECTOR_WORDS`: at, is, are, around, near, here,
-   the, a, it, @), a generic function word (`FUNCTION_WORDS`: we, i, are, am, is, in, on, of, to,
-   for, with, and, our, my, a, the, this, new, position, positions, trade), a currency or unit, a
+   the, a, it, @), a generic function word (`FUNCTION_WORDS`: we, i, are, am, is, and, our, my, a,
+   the, this, new, position, positions, trade; no preposition that could make the number a goal,
+   a condition, a comparison or another thing's price, such as "for", "to", "on", "of", "with" or
+   "in"), a currency or unit, a
    name or alias of this family, the action's own words (long, buy, buying or short, shorting,
    sell, selling; add, adding for an ADD; stop and target when the action has them), or a
    private `context_words` entry. One unknown word anywhere refuses the anchor ("cost basis long

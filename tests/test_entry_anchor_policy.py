@@ -444,7 +444,7 @@ def test_follow_ups_other_than_add_form_no_anchor(tmp_path):
     for kind in (Action.REDUCE, Action.CLOSE, Action.MODIFY):
         d, _ = resolve(p, action(kind=kind, idea="9:a1"), ETF_CLAUSE, [("REFERENCE", "50.10")])
         assert d.entry_anchor is None, kind
-    d, _ = resolve(p, action(kind=Action.ADD, idea="9:a1"), "Adding to our $QETF long, 50.30 now.",
+    d, _ = resolve(p, action(kind=Action.ADD, idea="9:a1"), "We are adding $QETF, 50.30 now.",
                    [("REFERENCE", "50.30")])
     assert d.status == "SUPPORTED" and d.entry_anchor == "50.30"
 
@@ -534,7 +534,7 @@ def test_a_follow_up_keeps_its_ideas_contract(tmp_path):
                                 exchange="SIMNRG", con_id=1, expiry="20260805")}
     p = policy(tmp_path, oil_entry())
     d, inst = resolve(p, oil_action(kind=Action.ADD, idea="9:a1"),
-                      "Adding to our $QOIL long, 71.60 now.", [("REFERENCE", "71.60")], held=held)
+                      "We are adding $QOIL, 71.60 now.", [("REFERENCE", "71.60")], held=held)
     assert d.status == "SUPPORTED" and inst.futures_contract == "202608"
     assert d.month_source == "IDEA" and d.entry_anchor == "71.60"
 

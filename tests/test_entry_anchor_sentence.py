@@ -87,7 +87,7 @@ PASS = [
     ("Buy $QETF at the market, around 50.10 now.", PositionSide.LONG),
     ("Short $QETF, 50.10 right now, stop 51.20.", PositionSide.SHORT),
     ("We are selling $QETF short here at 50.10.", PositionSide.SHORT),
-    ("Long $QETF for our trade, ~50.10 now.", PositionSide.LONG),
+    ("Long $QETF, our new trade, ~50.10 now.", PositionSide.LONG),
     ("This is a new trade: long $QETF, it is 50.10 now.", PositionSide.LONG),
 ]
 
@@ -135,3 +135,28 @@ def test_the_private_lexicon_may_add_instruction_phrasing(tmp_path):
 def test_a_private_context_word_may_not_be_a_qualifier(word):
     with pytest.raises(ValueError):
         AnchorLexicon(context_words=[word])
+
+
+@pytest.mark.parametrize("scope", ["SENTENCE_STRICT", "ACTION_BLOCK", "SINGLE_MARKET_POST"])
+@pytest.mark.parametrize("clause", [
+    "Long $QETF for 50.10 now.",  # a target-style phrase
+    "Long $QETF to 50.10 now.",
+    "Long $QETF on 50.10 now.",
+    "Long $QETF with 50.10 now.",
+    "Long $QETF in 50.10 now.",
+    "We are long $QETF, half of 50.10 now.",
+])
+def test_a_preposition_that_can_make_the_number_something_else_refuses(tmp_path, scope, clause):
+    from test_entry_anchor_policy import ANCHOR_RULE, MAP_NOW
+
+    from tradingbot.event_models import ParsedPost
+    p = policy(tmp_path, etf_entry(rule=ANCHOR_RULE.replace("SENTENCE_STRICT", scope)))
+    _, [d] = p.apply(ParsedPost(actions=[action()]), clauses={"a1": clause}, now=MAP_NOW,
+                     post_text=clause, levels={"a1": LEVELS})
+    assert d.status == "UNRESOLVED" and d.entry_anchor is None, d.reason
+
+
+def test_the_generic_function_words_are_the_closed_list():
+    from tradingbot.runtime.instruction_terms import FUNCTION_WORDS
+    assert FUNCTION_WORDS == frozenset(("we", "i", "are", "am", "is", "and", "our", "my", "a",
+                                        "the", "this", "new", "position", "positions", "trade"))
