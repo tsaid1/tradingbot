@@ -182,7 +182,11 @@ invariant is enforced where a read is published: before a read that fails the op
 published, every resting opening order of the contract is cancelled in the simulator, the one
 the core is cancelling in that same call included (its journal row is left to the core, and the
 core's cancel then finds it cancelled, a confirmed cancel). If a cancel is refused, the read is not
-published at all. Reduce-only orders (stops, closes, take-profits) keep the simulator's rules on any
+published at all, the refusal is journaled (`SHADOW_OPENING_CANCEL_REFUSED`, with the code) and the
+alert of the same name stays open until a later read qualifies the order, a later read cancels it,
+or the order has ended. The alert is kept in memory only: after a restart it is gone, and it comes
+back only if the next read that does not qualify the order is refused again. The journal row
+survives the restart. Reduce-only orders (stops, closes, take-profits) keep the simulator's rules on any
 real quote, and every simulated fill's label says what it was computed from:
 `SIMULATED_AT_LIVE_QUOTE`, `SIMULATED_AT_DELAYED_QUOTE` or `SIMULATED_AT_FROZEN_QUOTE`.
 
@@ -223,6 +227,13 @@ streamable. Exit code 2, nothing left connected (the simulator is opened before 
 ```
 PYTHONPATH=src python scripts/run_service.py --config <private>/runtime.shadow.toml
 ```
+
+**Start before the first post.** A post that arrives before the watched family's quote stream has
+delivered its first price is blocked with `QUOTE_UNAVAILABLE` (for a mapped family, an earlier gate
+such as its session window or roll window can name a different code first). The stream is opened at start and
+needs a moment to deliver, so start the service before the session's first expected post, and
+check the heartbeat's `shadow` block (each open stream with its label and reason) shows a usable
+quote before relying on it.
 
 **What the owner sees.** The heartbeat carries `mode = "shadow"` and a `shadow` block (quote
 session state, masked paper account, requested market-data type, open streams with their label and

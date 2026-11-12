@@ -41,6 +41,8 @@ PARTIAL_GROUP = "PARTIAL_GROUP"
 # is cancelled and the follow-up is held (a resting bracket is never amended).
 FOLLOW_UP_ON_UNFILLED_ENTRY = "FOLLOW_UP_ON_UNFILLED_ENTRY"
 FOLLOW_UPS = (Action.CLOSE, Action.REDUCE, Action.MODIFY, Action.ADD)
+# The EXIT_WHILE_ENTRY_UNKNOWN flag could not be recorded (journaled by exception type only).
+EXIT_FLAG_FAILED = "EXIT_FLAG_FAILED"
 
 
 @dataclass
@@ -111,6 +113,8 @@ class BrokerEventReplay(PaperEventReplay):
         # approved and reached execution, then died before the replay committed (a crash mid-order).
         # Its gate decision is on the intent; the coordinator adopts it rather than ordering again.
         self._plans.pop(a.action_id, None)  # action ids repeat across posts: never reuse a plan
+        if a.action in (Action.CLOSE, Action.REDUCE) and a.idea_reference:
+            self._flag_exit_while_entry_unknown(a)
         if self.coordinator.intent_for(source, a) is not None:
             return ActionOutcome(action_id=a.action_id, status="SIMULATED", reasons=[PRIOR_INTENT])
         if a.action in FOLLOW_UPS and a.idea_reference \
@@ -147,6 +151,20 @@ class BrokerEventReplay(PaperEventReplay):
                     reasons=[OPPOSITE_IDEA_IN_SAME_CONTRACT, f"OPEN_IDEA:{clash}"],
                 )
         return super()._simulate(source, a, quotes, ideas, now)
+
+    def _flag_exit_while_entry_unknown(self, a: TradeAction) -> None:
+        """A flag only (EXIT_WHILE_ENTRY_UNKNOWN): an entry of unknown acknowledgement is never
+        cancelled blind or resent, and the exit is decided after this exactly as before. Nothing
+        here may stop or alter it: any failure is journaled by code and exception type only."""
+        try:
+            self.coordinator.flag_exit_while_entry_unknown(a.idea_reference, a.action)
+        except Exception as exc:  # noqa: BLE001 - display only; the exit must go on
+            try:
+                self.coordinator.store.log(
+                    self.coordinator.clock(), EXIT_FLAG_FAILED, idea_id=a.idea_reference,
+                    action=a.action.value, error=type(exc).__name__)
+            except Exception:  # noqa: BLE001, S110 - not even the journal may stop the exit
+                pass
 
     def _follow_up_on_unfilled_entry(self, a: TradeAction, ideas) -> ActionOutcome | None:
         """Cancel the idea's working, unfilled entry (confirmed). A CLOSE or REDUCE is then handled:

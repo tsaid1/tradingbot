@@ -38,6 +38,8 @@ ENTRY_UNKNOWN_OUTCOME = "ENTRY_UNKNOWN_OUTCOME"
 REVERSAL = "LEDGER_REVERSAL"
 EXIT_REFUSED = "EXIT_REFUSED"
 EXECUTION_EXCEPTION = "EXECUTION_EXCEPTION"
+# A publisher exit arrived while an entry's acknowledgement was unknown (nothing sent for it).
+EXIT_WHILE_ENTRY_UNKNOWN = "EXIT_WHILE_ENTRY_UNKNOWN"
 SETTLEMENT_UNVERIFIED = "SETTLEMENT_UNVERIFIED"
 # The broker contradicts an operator settlement (a fill or an order of an intent declared never
 # filled): exposure the follower did not intend (review F1).
@@ -52,6 +54,9 @@ BROKER_RECONNECTED = "BROKER_RECONNECTED"
 # Shadow mode: the quote-stream cap is full of contracts the simulation depends on (no stream for
 # a new contract: its quote is unavailable and its entries hold).
 SHADOW_STREAM_CAP_REACHED = "SHADOW_STREAM_CAP_REACHED"
+# Shadow mode: the simulator refused the cancel of a resting opening order on a read that does not
+# qualify it (the read is then not published); open until the cancel succeeds or the order ends.
+SHADOW_OPENING_CANCEL_REFUSED = "SHADOW_OPENING_CANCEL_REFUSED"
 BROKER_IDENTITY_MISMATCH = "BROKER_IDENTITY_MISMATCH"
 HEARTBEAT_STALE = "HEARTBEAT_STALE"
 HEARTBEAT_RESTORED = "HEARTBEAT_RESTORED"

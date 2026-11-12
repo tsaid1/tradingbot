@@ -39,6 +39,10 @@ EXCEPTION_ACTIONS: dict[str, tuple[str, str]] = {
     "STALE_AFTER_UNKNOWN_OUTCOME": (ACKNOWLEDGE, "nothing was sent; acknowledge"),
     "MODIFY_NOT_CONFIRMED": (ACKNOWLEDGE, "compare the working stop with the ledger; acknowledge"),
     "PROTECTIVE_LEVEL_NOT_LOOSENED": (ACKNOWLEDGE, "review the kept level; acknowledge"),
+    # Closes on its own once the entry's outcome is known and the idea is flat.
+    "EXIT_WHILE_ENTRY_UNKNOWN": (
+        ACKNOWLEDGE, ("the publisher exited while the entry's outcome was unknown: check the "
+                      "position at the broker, exit by hand if one is held; acknowledge")),
     # An open PARTIAL_GROUP keeps reconciliation unclean (a safety discrepancy), so closing it can
     # lift blocks that wait on a clean reconciliation: it needs the evidence of a clear (note b).
     "PARTIAL_GROUP": (

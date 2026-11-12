@@ -68,6 +68,7 @@ from tradingbot.execution.coordinator import (
     BROKER_STATE_UNKNOWN,
     ENTRY_STATE_UNKNOWN,
     EXIT_NOT_NETTED,
+    EXIT_WHILE_ENTRY_UNKNOWN,
     EXIT_WITHOUT_QUOTE,
     OPERATOR_SETTLEMENT_UNVERIFIED,
     PROTECTION_UNVERIFIED,
@@ -84,7 +85,7 @@ from tradingbot.execution.coordinator import (
 from tradingbot.execution.reconcile import DiscrepancyKind, ReconciliationReport
 from tradingbot.execution.replay import BrokerEventReplay
 from tradingbot.execution.shadow_broker import FILL_LABEL, ShadowBroker
-from tradingbot.execution.store import LEDGER_REVERSAL, UNRESOLVED_STATES
+from tradingbot.execution.store import LEDGER_REVERSAL, UNRESOLVED_STATES, IntentState
 from tradingbot.models import Action, ExecutionPlan, Instrument, LegQuote, MappedQuote, Quote
 from tradingbot.runtime import notify as N
 from tradingbot.runtime import vocab_review
@@ -139,6 +140,7 @@ EXCEPTION_ALERT_KIND = {
     OPERATOR_SETTLEMENT_UNVERIFIED: N.SETTLEMENT_UNVERIFIED,
     SETTLED_INTENT_CONTRADICTED: N.SETTLEMENT_CONTRADICTED,
     SETTLEMENT_DIFFERS_FROM_BROKER: N.SETTLEMENT_DIFFERS,
+    EXIT_WHILE_ENTRY_UNKNOWN: N.EXIT_WHILE_ENTRY_UNKNOWN,
 }
 # Alerted under their own keys (unprotected position, broker state), not as EXC:<id>.
 SEPARATELY_ALERTED = frozenset(
@@ -230,6 +232,21 @@ class _StampingReplay(BrokerEventReplay):
         out = super()._simulate(source, a, quotes, ideas, now)
         self.gate_stamps[a.action_id] = self._clock()
         return out
+
+
+def _row_outcome(intent, filled: int) -> tuple[str, list[str], dict] | None:
+    """The journal status and reasons a WORKING row takes from its intent's terminal state (None
+    while it is not terminal), and any detail for the event."""
+    if intent.state == IntentState.FILLED:
+        return "EXECUTED", ["BROKER_FILLED", *intent.reasons], {}
+    if intent.state == IntentState.CANCELLED and filled:
+        # Part filled, the rest cancelled: the row shows the fill; why the remainder went is in
+        # the event (its reasons may say UNFILLED, which the fill contradicts).
+        return ("EXECUTED", ["BROKER_CANCELLED", "ENTRY_REMAINDER_CANCELLED"],
+                {"remainder_reasons": list(intent.reasons)})
+    if intent.state in (IntentState.CANCELLED, IntentState.REJECTED):
+        return intent.state.value, [f"BROKER_{intent.state.value}", *intent.reasons], {}
+    return None
 
 
 def _safe_error(exc: BaseException) -> str:
@@ -476,6 +493,7 @@ class RuntimeService:
             settlement.lift_verified_blocks(self.coordinator)
             self._check_roll_windows(now)
         report.halted = self._check_halt(self.clock()) or report.halted
+        self._settle_working_rows(self.clock())
         self._journal_shadow_fills()
         self._raise_alerts(self.clock(), report)
         self._heartbeat(report)
@@ -985,6 +1003,19 @@ class RuntimeService:
                 "contract with a working simulated order or position): its quote is "
                 "unavailable and its entries hold", now)
         self.alerter.sweep("SHADOW:CAP:", keep, now)
+        keep = set()
+        for ref, r in self.broker.open_cancel_refusals().items():
+            key = f"SHADOW:CANCEL_REFUSED:{ref}"
+            keep.add(key)
+            self.alerter.raise_(
+                key, N.SHADOW_OPENING_CANCEL_REFUSED, "Shadow opening cancel refused",
+                f"{ref} {r['contract_key']}: {r['code']}: the simulator refused the shadow "
+                f"cancel of this resting opening order on a read that did not qualify it (since "
+                f"{r['since']}); that read was not published, so nothing matched on it. The "
+                "cancel is tried again at the next read that does not qualify it; the alert "
+                "closes once a read qualifies the order, the cancel succeeds or the order ends",
+                now)
+        self.alerter.sweep("SHADOW:CANCEL_REFUSED:", keep, now)
 
     def _opening_limit(self, order_ref: str) -> float | None:
         """The per-side quote age an opening order was approved under: the anchored rule's
@@ -1215,6 +1246,45 @@ class RuntimeService:
             intent = self.coordinator.intent(e["order_ref"])
             if intent is not None and intent.state not in UNRESOLVED_STATES:
                 self.store.resolve_exception(e["id"], now, f"intent {intent.state.value}")
+
+    def _settle_working_rows(self, now: datetime) -> None:
+        """A journal row written WORKING (a resting order) shows the outcome its intent shows now,
+        read from the execution store (durable, so also after a restart): a fill reads EXECUTED,
+        a cancel with nothing filled CANCELLED with the intent's public reasons (for example
+        ENTRY_EXPIRED_UNFILLED or ENTRY_CANCELLED_BEFORE_FILL). A cancel after a partial fill reads
+        EXECUTED with ENTRY_REMAINDER_CANCELLED; the remainder's reasons are in the event. While a
+        cancel is not confirmed the intent is still WORKING, and so is the row. A settled row
+        follows its intent if that changes again (an operator settlement the broker contradicts):
+        back to WORKING, then to the new outcome; each change is journaled with the row in one
+        transaction. Display only: nothing is sent."""
+        ex = self.coordinator.store
+        rows = self.store.settleable_signal_actions()
+        if not rows:
+            return
+        intents = {i.order_ref: i for i in ex.intents()}
+        for row in rows:
+            intent = intents.get(row["order_ref"])
+            if intent is None:
+                continue
+            filled = ex.filled_quantity(intent.order_ref)
+            target = _row_outcome(intent, filled)
+            if target is None and row["settled_state"] is None:
+                continue  # still WORKING, as written
+            base = [r for r in row["reasons"] if r not in row["settled_reasons"]]
+            if target is None:
+                status, added, state, detail = "WORKING", [], None, {}
+            else:
+                status, extra, detail = target
+                added = [r for r in dict.fromkeys(extra) if r not in base]
+                state = intent.state.value
+            reasons = base + added
+            if (status, reasons, state) == (row["status"], row["reasons"], row["settled_state"]):
+                continue
+            self.store.settle_signal_action(
+                row["seq"], row["action_id"], expect=row["status"], status=status,
+                reasons=reasons, settled_state=state, settled_reasons=added, at=now,
+                detail={"order_ref": intent.order_ref, "intent_state": intent.state.value,
+                        "filled": filled, "quantity": intent.quantity, **detail})
 
     def _reconcile(self, report: CycleReport) -> None:
         now = self.clock()

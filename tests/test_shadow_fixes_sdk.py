@@ -580,3 +580,69 @@ def test_round3_a_restart_between_the_shadow_cancel_and_the_core_expiry(shadow, 
     finally:
         again.close()
     assert_only_read_only_messages(tws)
+
+
+# ------------------------------------------------------------------ a refused shadow cancel alerts
+def _refused_alerts(sh):
+    return [a for a in sh.service.store.alerts(open_only=True)
+            if a["kind"] == "SHADOW_OPENING_CANCEL_REFUSED"]
+
+
+def test_a_refused_shadow_opening_cancel_alerts_until_the_cancel_succeeds(shadow, tws):
+    sh = shadow([post("1", 0, RESTING)])
+    fresh = _above_the_limit(sh)
+    run_until_processed(sh, 1, before=fresh)
+    intent, _ = _entry_life(sh)
+    assert intent.state.value == "WORKING" and _refused_alerts(sh) == []
+    sh.sim().script_next_cancel("REJECT")  # the simulator refuses the shadow's own cancel
+    _delayed(sh, 88.38, 88.40)
+    sh.step()
+    [r] = sh.events("SHADOW_OPENING_CANCEL_REFUSED")
+    assert r["order_ref"] == intent.order_ref
+    [a] = _refused_alerts(sh)
+    assert a["key"] == f"SHADOW:CANCEL_REFUSED:{intent.order_ref}"
+    assert "SHADOW_OPENING_QUOTE_NOT_LIVE" in a["detail"]
+    assert sh.sim().executions() == []  # the read was never published
+    _delayed(sh, 88.38, 88.40)
+    sh.step()  # the next read cancels it: the alert is swept
+    assert len(sh.events("SHADOW_OPENING_ORDER_CANCELLED")) == 1
+    assert _refused_alerts(sh) == []
+    assert sh.sim().executions() == []
+    sh.close()
+    assert_only_read_only_messages(tws)
+
+
+def test_a_refused_shadow_cancel_alert_is_swept_once_the_order_is_otherwise_terminal(
+        shadow, tws):
+    sh = shadow([post("1", 0, RESTING)])
+    fresh = _above_the_limit(sh)
+    run_until_processed(sh, 1, before=fresh)
+    intent, _ = _entry_life(sh)
+    sh.sim().script_next_cancel("REJECT")
+    _delayed(sh, 88.38, 88.40)
+    sh.step()
+    assert _refused_alerts(sh)
+    sh.sim().cancel(intent.order_ref)  # the order ends by another path
+    sh.step()
+    assert _refused_alerts(sh) == []
+    sh.close()
+
+
+def test_a_refused_shadow_cancel_alert_is_swept_when_a_later_read_qualifies_the_order(
+        shadow, tws, monkeypatch):
+    sh = shadow([post("1", 0, RESTING)])
+    fresh = _above_the_limit(sh)
+    run_until_processed(sh, 1, before=fresh)
+    intent, _ = _entry_life(sh)
+    sh.sim().script_next_cancel("REJECT")
+    _delayed(sh, 88.39, 88.43)  # the ask stays above the 88.40 limit: nothing can fill
+    sh.step()
+    [a] = _refused_alerts(sh)
+    assert "next read that does not qualify it" in a["detail"]
+    # The next reads qualify the order (the opening test passes), so no cancel is needed now.
+    monkeypatch.setattr(SB, "opening_problem", lambda *a, **k: None)
+    sh.step()
+    assert intent.order_ref in {o.order_ref for o in sh.sim().open_orders()}
+    assert len(sh.events("SHADOW_OPENING_CANCEL_REFUSED")) == 1
+    assert _refused_alerts(sh) == []
+    sh.close()

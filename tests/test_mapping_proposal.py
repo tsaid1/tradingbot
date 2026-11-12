@@ -737,3 +737,70 @@ def test_n3_a_fully_filled_policy_loads_with_no_hand_edit_even_with_fractional_s
     assert loaded.entries["TLT"].execution.size_increment == 1
     with pytest.raises(mp.ProposalInputInvalid):
         mp.parse_policy(_policy_with_owner({"size_increment": 0}))
+
+
+def test_catalog_text_cannot_inject_markup_into_the_sheets(tmp_path):
+    """Invented catalog strings with HTML markup: every Markdown output shows them escaped (`<`
+    and `&`), while the TOML keeps the exact value and its self-check still holds."""
+    cat = catalog()
+    tlt = next(r for r in cat["results"] if r["name"] == "TLT")
+    tlt["contracts"][0]["long_name"] = "INVENTED <script>alert(1)</script> & Co"
+    tlt["contracts"][0]["primary_exchange"] = "<img src=x onerror=alert(1)>"
+    mes = next(r for r in cat["results"] if r["name"] == "MES fut")
+    for c in mes["contracts"]:
+        c["trading_class"] = "<img src=x>"
+    cat["failure"] = "<script>x</script>"
+    cat["overall"] = "PARTIAL<b>"
+    out = tmp_path / "o"
+    assert _load().main([str(_write_cat(tmp_path, cat)), "--out", str(out),
+                         "--roll-days", "5"]) == 0
+    _assert_written_equals_proposal(out, cat, shipped())
+    sheets = sorted(out.glob("*.md"))
+    assert sheets
+    seen = ""
+    for path in sheets:
+        text = path.read_text()
+        seen += text
+        assert "<script" not in text and "<img" not in text and "<b>" not in text, path.name
+    assert "&lt;script>alert(1)&lt;/script> &amp; Co" in seen
+    assert "&lt;img src=x onerror=alert(1)>" in seen
+    assert "&lt;img src=x>" in seen
+    assert "PARTIAL&lt;b>" in seen and "&lt;script>x&lt;/script>" in seen
+    toml = (out / "proposed_mapping.toml").read_text()
+    assert "&lt;" not in toml and "&amp;" not in toml  # the TOML is not Markdown: never escaped
+
+
+def test_catalog_text_reads_literally_in_code_spans_and_escaped_in_plain_text(tmp_path):
+    """Invented: a name with `&`, `<`, a back-tick and a pipe, once as a table cell (plain
+    text: entity-escaped) and once as a query name shown in code spans (literal: renderers
+    escape code-span content, and entities there would show as typed). "S&P 500" reads as
+    such in both; the content can never end its span or open a new line or cell."""
+    name = "S&P 500 <x> | `q`"
+    cat = catalog()
+    tlt = next(r for r in cat["results"] if r["name"] == "TLT")
+    tlt["contracts"][0]["long_name"] = name
+    mes = next(r for r in cat["results"] if r["name"] == "MES fut")
+    mes["name"] = "MES fut " + name
+    mes["truncated"] = True  # the truncation warning shows the query name in a code span
+    raw = tomllib.loads(POLICY.read_text())
+    spx = next(f for f in raw["family"] if f["family"] == "SPX")
+    spx["execution"] = mes["name"]
+    spx["candidates"] = [mes["name"]]
+    pol = mp.parse_policy(raw)
+    props = mp.build(cat, pol)
+    [p] = [p for p in props if p.plan.family == "SPX"]
+    sheet = mp.render_sheet(p, cat)
+    table = mp.render_contract_table(props, cat)
+    calendar = mp.render_calendar(props, pol, cat)
+    literal = "MES fut S&P 500 <x> | 'q'"
+    assert f"* execution query `{literal}`" in sheet
+    assert f"execution row `{literal}` is TRUNCATED" in sheet
+    assert f"execution row `{literal}` is TRUNCATED" in calendar
+    assert "&amp;amp;" not in sheet + table + calendar
+    for text in (sheet, table, calendar):
+        for line in text.splitlines():
+            assert line.count("`") % 2 == 0, line  # no span is left open or closed early
+    # plain text (a table cell): escaped, so "S&amp;P 500" renders as S&P 500
+    assert "| S&amp;P 500 &lt;x> \\| 'q' |" in table
+    toml = mp.render_toml(props, cat)  # the TOML is not Markdown: never entity-escaped
+    assert "&amp;" not in toml and "&lt;" not in toml

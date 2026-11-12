@@ -177,6 +177,9 @@ class ShadowBroker:
         self.opening_limit: Callable[[str], float | None] = lambda order_ref: None
         self.journal: Callable[[str, dict], None] | None = None
         self.cap_refusals: dict[str, str] = {}
+        # order_ref -> contract key, code and since when: an opening order whose shadow cancel
+        # the simulator refused (the read was not published); alerted by the runtime service.
+        self.cancel_refusals: dict[str, dict] = {}
         self._spared: set[str] = set()  # cancelled for the core within its own cancel call  # contract_key -> when the cap refused its stream
         with self._evidence_db() as c:  # write-ahead quote evidence for fills (review S3)
             c.execute("CREATE TABLE IF NOT EXISTS shadow_quote_evidence (contract_key TEXT "
@@ -518,7 +521,12 @@ class ShadowBroker:
                     and o.parent_ref is None
                     and (code := opening_problem(quote, at, self.opening_limit(o.order_ref)))]
 
-        for o, code in unqualified():
+        bad = unqualified()
+        refs = {o.order_ref for o, _ in bad}
+        for ref in [r for r, v in self.cancel_refusals.items()
+                    if v["contract_key"] == key and r not in refs]:
+            del self.cancel_refusals[ref]  # this read qualifies it: no cancel is needed now
+        for o, code in bad:
             if o.status.value == "PendingCancel":
                 continue
             try:
@@ -528,7 +536,10 @@ class ShadowBroker:
                     self._record("SHADOW_OPENING_CANCEL_REFUSED", {
                         "order_ref": o.order_ref, "contract_key": key, "code": code,
                         "error": _safe(exc)})
+                    self.cancel_refusals.setdefault(o.order_ref, {
+                        "contract_key": key, "code": code, "since": self.clock().isoformat()})
                 continue
+            self.cancel_refusals.pop(o.order_ref, None)
             if o.order_ref == spare:
                 self._spared.add(o.order_ref)
             else:
@@ -536,6 +547,16 @@ class ShadowBroker:
                     "order_ref": o.order_ref, "contract_key": key, "code": code,
                     "quote": evidence.as_dict()})
         return not unqualified()  # open_orders() settles the pending cancels first
+
+    def open_cancel_refusals(self) -> dict[str, dict]:
+        """The refused shadow cancels whose order is still working in the simulator (one that
+        has since ended, cancelled or otherwise, is dropped)."""
+        if not self.cancel_refusals:
+            return {}
+        working = {o.order_ref for o in self._sim.open_orders()}
+        for ref in [r for r in self.cancel_refusals if r not in working]:
+            del self.cancel_refusals[ref]
+        return dict(self.cancel_refusals)
 
     def _note_fills(self, label: str | None, evidence: QuoteEvidence | None) -> None:
         for f in self._sim.executions():
