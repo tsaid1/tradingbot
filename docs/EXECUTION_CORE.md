@@ -124,9 +124,14 @@ built, stop and target prices must be multiples of `min_tick` (`STOP_PRICE_OFF_T
 `TARGET_PRICE_OFF_TICK`) and quantities multiples of `size_increment` (`QUANTITY_OFF_INCREMENT`).
 Those are refused, never rounded, so a protective stop is never loosened. Only collar-bounded
 limits are snapped, always inside the collar: a buy limit down, a sell limit up. Sessions, rollover,
-margin and option chains are future asset policies and are not implemented. `BrokerPosition.avg_cost`
-is per unit, before the multiplier. The gateway still quotes by symbol and accepts stocks and ETFs
-only, so a future reaches the coordinator only in tests.
+margin and option chains are not implemented beyond what the multi-asset mapping states.
+`BrokerPosition.avg_cost` is per unit, before the multiplier. A future, option, CFD or spot
+commodity reaches the coordinator only through an approved version-2 mapping entry. The gateway
+then approves with an `ExecutionPlan`, and the coordinator follows it: units per signal, the entry
+level in execution prices, and stop and target in their own series. A REFERENCE_TRIGGER plan
+produces conditional exits (`OrderIntent.condition`) and an optional backstop (role `BACKSTOP`,
+ref `<entry>.BKS`). A follow-up executes only in its idea's own contract. See
+`docs/MULTI_ASSET_MAPPING.md`.
 
 ## Exit netting
 
@@ -342,5 +347,13 @@ should settle before answering. Entries are never resent after an unknown outcom
 the lookups described above. Fill `ContractRef.multiplier`, `min_tick` (IBKR `minTick`),
 `size_increment`, `expiry` (`lastTradeDateOrContractMonth`), `strike`, `right` and `con_id` from
 `reqContractDetails`, and report `BrokerPosition.avg_cost` per unit (IBKR multiplies it).
+
+Price conditions are optional (`broker.ConditionalOrders`). A broker that offers them implements
+`supports_price_conditions()` (True), `reference_quote(contract)` (a quote of an index, spot or
+other reference contract) and `modify_condition(order_ref, trigger_price=...)`. It also echoes
+`BrokerOrder.condition` on open orders. Without these, REFERENCE_TRIGGER entries are refused
+before submission, reference quotes read as UNAVAILABLE, and protection is never confirmed for such
+a position. `PriceCondition` maps to IBKR `PriceCondition` (conId, exchange, isMore, price) on an
+order whose type is the condition's `released_order_type`.
 
 Run the demonstration with `PYTHONPATH=src python scripts/run_mock_lifecycle.py`.

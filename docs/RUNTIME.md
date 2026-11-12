@@ -64,12 +64,14 @@ records its first-start time and never acts on a live post published before it
 
 ## Mapping policy
 
-`config/instrument_mapping.toml` names, per source asset, the broker contract and the price-basis
-relationship. Only `DIRECT` (levels quoted in the traded instrument's own price, same symbol)
-executes; one entry ships: TLT. Unmapped assets and every other basis (`INDEX_LEVEL`,
-`SPOT_LEVEL`, `FUTURES_LEVEL`, `PROXY`, `UNKNOWN`) get the ambiguity
-`UNSUPPORTED_INSTRUMENT_MAPPING`, so the gateway HOLDs them. An index or spot level is never treated
-as an ETF or futures price.
+`config/instrument_mapping.toml` (version 2) maps each source asset family to a reference series,
+an execution instrument and one price-basis treatment (`DIRECT`, `BASIS_SHIFT`,
+`REFERENCE_TRIGGER`, `UNSUPPORTED`), with an owner approval. Only an approved entry executes. One
+ships approved: TLT, quoted in its own price, with the version-1 behaviour unchanged. An unmapped
+family is held with `UNSUPPORTED_INSTRUMENT_MAPPING`, an unapproved one with `MAPPING_NOT_APPROVED`,
+and an unselectable contract with `CONTRACT_SELECTION_AMBIGUOUS` or `OPTION_TERMS_INCOMPLETE`. An
+index or spot level is never sent as the price of another instrument. The Execution page lists each
+family's coverage. See `docs/MULTI_ASSET_MAPPING.md`.
 
 ## What is held, and why
 
