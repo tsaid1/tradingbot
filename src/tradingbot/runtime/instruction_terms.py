@@ -18,6 +18,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import date
 from decimal import Decimal, InvalidOperation
+from enum import Enum
 
 _MONTH_NAMES = {
     "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
@@ -312,22 +313,30 @@ PRESENT_MARKERS: tuple[str, ...] = (
 # Any of these words in the number's own clause makes the number something other than the market
 # now: a time other than now, a chart or order level, a condition, a range or a comparison. A
 # marker never overrides them, and no marker or alias may contain one.
-NOT_CURRENT_WORDS = frozenset((
-    # a time other than now
+# a time other than now
+TIME_WORDS = frozenset((
     "yesterday", "today", "tonight", "tomorrow", "earlier", "later", "ago", "before", "after",
     "previously", "previous", "prior", "last", "next", "was", "were", "been", "had", "will",
     "would", "could", "should", "might", "shall", "going", "gonna", "morning", "afternoon",
     "evening", "overnight", "weekend", "week", "weeks", "monday", "tuesday", "wednesday",
     "thursday", "friday", "saturday", "sunday", "premarket", "pre", "postmarket", "hours",
     "session", "yesterdays",
-    # a chart, session or order level
+))
+# a chart, session or order level; the first group is a protective or profit level
+STOP_TARGET_WORDS = frozenset((
+    "target", "targets", "objective", "objectives", "tp", "stop", "stops", "sl",
+))
+LEVEL_WORDS = STOP_TARGET_WORDS | frozenset((
     "high", "highs", "low", "lows", "open", "opening", "opened", "close", "closing", "closed",
-    "settle", "settled", "settlement", "resistance", "support", "target", "targets",
-    "objective", "objectives", "tp", "stop", "stops", "sl", "level", "levels", "pivot", "zone",
+    "settle", "settled", "settlement", "resistance", "support", "level", "levels", "pivot", "zone",
     "area", "entry", "exit",
-    # a condition or a level to cross
+))
+# a condition or a level to cross
+CONDITION_WORDS = frozenset((
     "from", "to", "above", "below", "over", "under", "through", "break", "breaks", "broke",
     "breakout", "breakdown", "if", "when", "once", "until", "unless", "whenever",
+))
+NOT_CURRENT_WORDS = TIME_WORDS | LEVEL_WORDS | CONDITION_WORDS | frozenset((
     # a range or a comparison
     "between", "range", "vs", "versus", "than", "higher", "lower", "up", "down", "more",
     "less", "or",
@@ -556,3 +565,321 @@ def post_multi_leg(post_text: str | None) -> list[str]:
     if m:
         out.append(f"SECOND_LEG_LANGUAGE:{m.group('word').lower()}")
     return out
+
+
+# ------------------------------------------------------------------ entry anchor: what the level is
+#
+# The owner's ambiguity safeguard (12 November 2026): a candidate level is classified into one
+# closed kind, and only an explicit contemporaneous market quotation may anchor. Two tightenings,
+# in every anchor scope: (A) the number's own clause is a pure market quotation; (B) a level whose
+# own clause does not name the family takes its topic from the words just before it, which must not
+# be about another level. See docs/MULTI_ASSET_MAPPING.md, "What the level is".
+class AnchorLevelKind(str, Enum):
+    MARKET_QUOTE = "MARKET_QUOTE"  # an explicit contemporaneous market quotation: may anchor
+    ENTRY_OR_COST_BASIS = "ENTRY_OR_COST_BASIS"  # an entry price or an average cost basis
+    STOP_OR_TARGET = "STOP_OR_TARGET"
+    HISTORICAL = "HISTORICAL"  # a historical or retrospective level
+    AMBIGUOUS = "AMBIGUOUS"  # any other numerical reference
+
+
+# The only plain words a market quotation's own clause may hold besides the number, its attached
+# marker, a currency or unit and a name of this family ("here" only as part of "here at").
+QUOTE_CONNECTORS = frozenset(("at", "is", "are", "around", "near", "@"))
+QUOTATION_MARKS = frozenset("\"'`\u2018\u2019\u201a\u201b\u201c\u201d\u201e\u201f\u00ab\u00bb\u2039\u203a")
+APPROXIMATION_MARKS = frozenset("~\u2248\u00b1<>\u2243\u2245\u223c")
+# A holder, position or trade word: the number may be the holder's entry price or average cost.
+HOLDER_WORDS = frozenset((
+    "we", "i", "us", "me", "our", "my", "position", "positions", "trade", "trades", "long",
+    "longs", "buy", "buying", "bought", "short", "shorts", "shorting", "sell", "selling", "sold",
+    "add", "adding", "added",
+))
+# A pronoun subject: the number may be some other thing's level.
+PRONOUN_WORDS = frozenset(("it", "its", "this", "that", "these", "those", "they"))
+# Cost-basis words (added to the order and chart level words for the context check).
+COST_BASIS_WORDS = frozenset((
+    "cost", "costs", "basis", "average", "averaged", "averaging", "avg", "breakeven", "paid",
+    "fill", "filled", "fills", "entered",
+))
+CONTEXT_LEVEL_WORDS = LEVEL_WORDS | COST_BASIS_WORDS
+
+
+def level_kind_of_words(words) -> AnchorLevelKind | None:
+    """The kind a set of words makes a level, or None when there are none."""
+    ws = set(words)
+    if not ws:
+        return None
+    if ws & STOP_TARGET_WORDS:
+        return AnchorLevelKind.STOP_OR_TARGET
+    if ws & (HOLDER_WORDS | COST_BASIS_WORDS | {"entry", "exit"}):
+        return AnchorLevelKind.ENTRY_OR_COST_BASIS
+    if ws & TIME_WORDS:
+        return AnchorLevelKind.HISTORICAL
+    return AnchorLevelKind.AMBIGUOUS
+
+
+def level_places(text: str, value: Decimal) -> list[tuple[str, str, list[str]]]:
+    """Each place ``value`` is written in ``text``: (its sentence, its own clause, the earlier
+    clauses of that sentence). A clause is delimited as in ``anchor_not_current``."""
+    out = []
+    for sentence, _ in sentences(text):
+        segs = [s for s in _SEGMENT_RE.split(sentence) if s and s.strip()]
+        for k, seg in enumerate(segs):
+            if any(_value(t) == value for t in seg.split()):
+                out.append((sentence, seg, segs[:k]))
+    return out
+
+
+def quote_clause_words(clause: str, allowed, skip_spans: list[tuple[int, int]] = ()) -> list[str]:
+    """Rule A: the words of a number's own clause that a pure market quotation does not hold.
+    ``allowed`` (lower-case phrases) are the present-market markers and this family's names; the
+    quote connectors and units are always allowed; numbers are left to the number checks and
+    ``skip_spans`` (a future's months) to the contract check."""
+    seg = [(t.start(), t.end(), t.group(0)) for t in _TOKEN_RE.finditer(clause or "")]
+    words = [_word(tok).lstrip("~").lstrip("$") for _, _, tok in seg]
+    tags: list[str | None] = [None] * len(words)
+    _tag(words, allowed, "allowed", tags)
+    out = []
+    for (a, b, tok), w, tag in zip(seg, words, tags, strict=True):
+        # Review S4: quotation marks make the clause someone's words, an approximation or a sign
+        # mark makes the number something else; neither is interpreted (HOLD).
+        if any(ch in QUOTATION_MARKS for ch in tok):
+            out.append("quotation-mark")
+            continue
+        if any(ch in APPROXIMATION_MARKS for ch in tok) or re.match(r"^[+\-\u2212]\$?\d", tok):
+            out.append("approximation-mark")
+            continue
+        if tag is not None or any(x <= a and b <= y for x, y in skip_spans):
+            continue
+        if not any(ch.isalpha() for ch in w) or any(ch.isdigit() for ch in w):
+            continue
+        if w in QUOTE_CONNECTORS or w in UNIT_WORDS:
+            continue
+        out.append(w)
+    return out
+
+
+def clause_kind(words: list[str]) -> AnchorLevelKind | None:
+    """Rule A's kind for the foreign words of a number's own clause: a holder, position or trade
+    word reads as an entry price or a cost basis, a pronoun subject (or any other word) as
+    ambiguous; None when the clause is a pure quotation."""
+    if not words:
+        return None
+    ws = set(words)
+    if ws & STOP_TARGET_WORDS:
+        return AnchorLevelKind.STOP_OR_TARGET
+    if ws & (HOLDER_WORDS | COST_BASIS_WORDS):
+        return AnchorLevelKind.ENTRY_OR_COST_BASIS
+    return AnchorLevelKind.AMBIGUOUS
+
+
+def context_problem(texts: list[str], exempt=frozenset()) -> tuple[AnchorLevelKind, str] | None:
+    """Rule B's second, independent check (it can only add a hold): the words before an elliptical
+    level hold no order, chart or cost-basis word (``exempt`` words aside). The deciding test is
+    the neighbour allow-list (``FamilyMapping._level_kind``); another number in the context is no
+    rule of its own (review B1: the allow-list's own checks cover it)."""
+    words = set()
+    for t in texts:
+        for tok in (t or "").split():
+            w = _word(tok)
+            words |= {p for p in (w, *w.split("-"), *w.split("/")) if p}
+    hit = (words & CONTEXT_LEVEL_WORDS) - set(exempt)
+    if hit:
+        return level_kind_of_words(hit), f"CONTEXT_WORD:{min(hit)}"
+    return None
+
+
+# ------------------------------------------------------------------ unresolved market references
+#
+# anchor_scope = SINGLE_MARKET_POST: a mention of a market the bot cannot resolve rejects the post
+# (fail closed: an unknown candidate means HOLD). Closed, public, generic lists only; a publisher's
+# own vocabulary goes in the private lexicon. Not named-entity recognition: a market named only by a
+# lower-case word outside these lists, or by a sentence-initial unknown word, stays invisible.
+class MarketMention(str, Enum):
+    CASHTAG = "CASHTAG"
+    TICKER_SHAPED = "TICKER_SHAPED"
+    MARKET_NOUN = "MARKET_NOUN"
+    INSTRUMENT_PHRASE = "INSTRUMENT_PHRASE"
+    PROPER_NOUN = "PROPER_NOUN"
+
+
+# Generic market and asset nouns, written from general knowledge (lower case, whole words).
+MARKET_NOUNS = frozenset((
+    # energy
+    "oil", "crude", "brent", "wti", "gasoline", "gas", "natural gas", "natgas", "nat gas",
+    "diesel", "heating oil", "energy", "lng", "propane",
+    # metals
+    "gold", "silver", "copper", "platinum", "palladium", "aluminium", "aluminum", "nickel",
+    "zinc", "metals", "bullion", "iron ore",
+    # rates and bonds
+    "bond", "bonds", "treasury", "treasuries", "bund", "bunds", "gilt", "gilts", "jgb", "jgbs",
+    "t-bill", "t-bills", "t-note", "t-notes", "fed funds", "sofr",
+    # equity indices and equities
+    "s&p", "spx", "nasdaq", "dow", "russell", "dax", "ftse", "nikkei", "hang seng", "stoxx",
+    "cac", "small caps", "large caps", "equities", "equity", "indices",
+    # currencies
+    "dollar index", "dxy", "euro", "yen", "sterling", "franc", "yuan", "renminbi", "peso",
+    "rupee", "loonie", "aussie", "forex", "fx", "currency", "currencies",
+    # crypto
+    "bitcoin", "btc", "ethereum", "ether", "eth", "crypto", "cryptos", "cryptocurrency",
+    "solana", "altcoin", "altcoins",
+    # agricultural commodities
+    "corn", "wheat", "soybean", "soybeans", "soy", "soymeal", "coffee", "cocoa", "sugar",
+    "cotton", "cattle", "hogs", "oats", "rice", "orange juice", "lumber", "grains", "softs",
+    # volatility and other asset classes
+    "vix", "volatility", "commodity", "commodities", "real estate", "reit", "reits", "miners",
+    "semis", "semiconductors",
+))
+# Instrument-kind nouns: each must have a name of this family directly before it.
+INSTRUMENT_NOUNS = frozenset((
+    "futures", "calls", "puts", "options", "shares", "stock", "stocks", "etf", "etfs", "index",
+    "contract", "contracts", "yield", "yields", "spread", "spreads",
+))
+# Upper-case acronyms that are not instruments: times, reports, institutions, chart studies.
+NON_INSTRUMENT_ACRONYMS = frozenset((
+    "ok", "am", "pm", "et", "est", "edt", "ct", "cst", "utc", "gmt", "eod", "eow", "ytd", "mtd",
+    "qtd", "yoy", "qoq", "imo", "imho", "fyi", "tbd", "tba", "eta", "asap", "pnl", "rsi", "macd",
+    "ema", "sma", "ma", "vwap", "atr", "ath", "atl", "dca", "ceo", "cfo", "us", "usa", "uk",
+    "eu", "ny", "nyc", "fed", "fomc", "ecb", "boj", "boe", "snb", "rba", "boc", "pboc", "cpi",
+    "ppi", "pce", "gdp", "nfp", "pmi", "ism",
+))
+# Capitalised words that are not markets: weekdays, months, institutions, macro releases, holidays.
+NON_MARKET_PROPER_NOUNS = frozenset((
+    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+    "january", "february", "march", "april", "may", "june", "july", "august", "september",
+    "october", "november", "december", "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep",
+    "sept", "oct", "nov", "dec", "fed", "federal", "reserve", "fomc", "congress", "senate",
+    "christmas", "thanksgiving", "easter", "i'm", "i've", "i'll", "i'd",
+))
+_TICKER_RE = re.compile(r"^[A-Z]{2,5}(?:[FGHJKMNQUVXZ]\d{1,2})?$")
+_PROPER_RE = re.compile(r"^[A-Z][A-Za-z&'.-]*$")
+
+
+def understood_words(extra=()) -> frozenset[str]:
+    """Every word the anchor rule already understands (connectors, function words, units, markers,
+    side and add words, the disqualifying words, holder, pronoun and cost-basis words), plus the
+    private additions ``extra``: such a word in capitals is emphasis, not a market."""
+    marker_words = {w for m in PRESENT_MARKERS for w in m.split()}
+    side = {w for ws in SIDE_WORDS.values() for w in ws}
+    return frozenset(
+        CONNECTOR_WORDS | FUNCTION_WORDS | UNIT_WORDS | NOT_CURRENT_WORDS | marker_words | side
+        | set(ADD_WORDS) | HOLDER_WORDS | PRONOUN_WORDS | COST_BASIS_WORDS
+        | {w for p in extra for w in p.split()}
+    )
+
+
+def unresolved_market_mentions(text: str, own: set[str], own_codes: set[str], roots: set[str],
+                               *, understood: frozenset[str] = frozenset(),
+                               non_market: set[str] = frozenset(),
+                               futures: bool = False) -> list[MarketMention]:
+    """The kinds of market mention in ``text`` that do not resolve to this family. ``own`` are the
+    family's lower-case names and aliases (public and private), ``own_codes`` its upper-case codes
+    and symbols, ``roots`` its futures roots (a contract code of its own is its own). Cashtags are
+    decided by the caller. Kinds only: never the words."""
+    text = (text or "").replace("’", "'").replace("‘", "'")
+    own = {o.lower() for o in own if o}
+    understood = understood or understood_words()
+    starts = {0}
+    for m in _SENTENCE_END_RE.finditer(text):
+        starts.add(m.end())
+    first_tokens = set()
+    for s in starts:
+        m = _TOKEN_RE.search(text, s)
+        if m:
+            first_tokens.add(m.start())
+    masked = text
+    for phrase in sorted(own, key=len, reverse=True):
+        masked = re.sub(rf"(?<![\w])\$?{re.escape(phrase)}(?![\w])",
+                        lambda m: " " * len(m.group(0)), masked, flags=re.IGNORECASE)
+    found: set[MarketMention] = set()
+    low = masked.lower()
+    for noun in MARKET_NOUNS:
+        if re.search(rf"(?<![\w]){re.escape(noun)}(?![\w])", low):
+            found.add(MarketMention.MARKET_NOUN)
+            break
+    head_re = (rf"(?<![\w])\$?(?:{'|'.join(re.escape(o) for o in sorted(own, key=len, reverse=True))})"
+               r"(?:'s)?[\s-]+$") if own else None
+    for m in _TOKEN_RE.finditer(masked):
+        raw = m.group(0)
+        word = raw.strip(_EDGE).lstrip("#")  # a hashtag is read as its word
+        if not word or word.startswith(("$", "@")):
+            continue
+        start = m.start() + raw.index(word[0])
+        whole = word[:-2] if word.lower().endswith("'s") else word
+        if whole.lower() in INSTRUMENT_NOUNS:
+            before = text[:start]
+            head = before.split()[-1].strip(_EDGE) if before.split() else ""
+            own_head = bool(head_re and re.search(head_re, before, re.IGNORECASE))
+            month_head = futures and (MONTH_WORD_RE.fullmatch(head) is not None or any(
+                head.upper() == r or code_shaped(head.upper(), r) for r in roots))
+            if not (own_head or month_head):
+                found.add(MarketMention.INSTRUMENT_PHRASE)
+            continue
+        # "EUR/USD", "BRK.B": each part is a candidate (review B2); only the first part can be
+        # sentence-initial.
+        offset = 0
+        for k, bare in enumerate(re.split(r"[/.]", whole)):
+            at, offset = start + offset, offset + len(bare) + 1
+            kind = _mention_kind(bare, understood, non_market, own_codes, roots,
+                                 initial=(k == 0 and at in first_tokens))
+            if kind is not None:
+                found.add(kind)
+    return sorted(found, key=lambda k: k.value)
+
+
+def _mention_kind(bare: str, understood, non_market, own_codes, roots, *, initial: bool):
+    """The kind of one capitalised candidate token, or None when it is understood or this
+    family's: a 2-5 capital ticker shape (with an optional month and year), any all-capitals word
+    of six or more letters wherever it sits, or a capitalised word that is not sentence-initial."""
+    if not bare or bare.startswith(("$", "@")) or not bare[:1].isupper():
+        return None
+    lw = bare.lower()
+    if lw in understood or lw in non_market or bare.upper() in own_codes \
+            or any(code_shaped(bare.upper(), r) for r in roots):
+        return None
+    if _TICKER_RE.match(bare) or (bare.isalpha() and bare.isupper() and len(bare) >= 6):
+        if lw not in NON_INSTRUMENT_ACRONYMS and lw not in NON_MARKET_PROPER_NOUNS:
+            return MarketMention.TICKER_SHAPED
+        return None
+    if not _PROPER_RE.match(bare) or initial:
+        return None
+    if lw not in NON_MARKET_PROPER_NOUNS and lw not in NON_INSTRUMENT_ACRONYMS:
+        return MarketMention.PROPER_NOUN
+    return None
+
+
+# entry_anchor.standalone_level_sentence (an owner decision, default false): the only words
+# a "protective-levels sentence" may hold, besides numbers that are exactly the action's own stop
+# and target and the private context words. Closed and generic on purpose.
+PROTECTIVE_WORDS = frozenset((
+    "stop", "stops", "stop-loss", "stoploss", "protective", "target", "targets", "targeting",
+    "objective", "with", "a", "an", "the", "and", "at", "is", "are", "our", "my", "set", "of",
+    "price", "level", "loss",
+))
+
+
+def protective_sentence_problem(sentence: str, own_values: set[Decimal], extra=()) -> str | None:
+    """Why ``sentence`` is not a protective-levels sentence, or None: every alphabetic token is in
+    ``PROTECTIVE_WORDS`` (or the private phrases ``extra``), none is a time, condition or
+    cost-basis word, it holds at least one number, every token with a digit is a plain number
+    equal to one of ``own_values``, and it names no contract month."""
+    if extract_terms(sentence).month_spans or MONTH_WORD_RE.search(sentence or ""):
+        return "MONTH"
+    seg = [t for t in _TOKEN_RE.findall(sentence or "")]
+    words = [_word(t) for t in seg]
+    tags: list[str | None] = [None] * len(words)
+    _tag(words, list(extra), "allowed", tags)
+    numbers = 0
+    for tok, w, tag in zip(seg, words, tags, strict=True):
+        if any(ch.isdigit() for ch in tok):
+            v = _value(tok)
+            if v is None or v not in own_values or "~" in tok:
+                return "NOT_OWN_LEVEL"
+            numbers += 1
+            continue
+        if not any(ch.isalpha() for ch in w):
+            continue
+        if w in TIME_WORDS or w in CONDITION_WORDS or w in COST_BASIS_WORDS:
+            return "QUALIFIER"
+        if tag is None and w not in PROTECTIVE_WORDS:
+            return "WORD"
+    return None if numbers else "NO_LEVEL"

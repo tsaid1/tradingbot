@@ -14,6 +14,7 @@ quantity, venue or account. Engines apply fictional fills only after an APPROVE.
 """
 from __future__ import annotations
 
+import math
 import re
 from datetime import UTC, date, datetime, timedelta
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, InvalidOperation
@@ -516,6 +517,16 @@ ANCHOR_ADVERSE_MOVE = "ENTRY_ANCHOR_ADVERSE_MOVE"  # the market ran away: do not
 ANCHOR_FAVOURABLE_MOVE = "ENTRY_ANCHOR_FAVOURABLE_MOVE"  # moved too far the other way: stale?
 ANCHOR_LIMIT_ABOVE_CEILING = "ENTRY_ANCHOR_LIMIT_ABOVE_CEILING"
 ANCHOR_BASIS_CAP_MISSING = "ENTRY_ANCHOR_BASIS_CAP_MISSING"
+# The live streaming quote an anchored entry is decided on (owner, 12 November 2026): the side
+# the order trades against is executable only on a LIVE quote with both sides present, positive,
+# on tick and not locked or crossed, and each side updated no longer ago than the rule allows.
+ANCHOR_QUOTE_NOT_LIVE = "ENTRY_ANCHOR_QUOTE_NOT_LIVE"  # delayed or frozen: never eligible
+ANCHOR_QUOTE_SIDE_MISSING = "ENTRY_ANCHOR_QUOTE_SIDE_MISSING"
+ANCHOR_QUOTE_OFF_TICK = "ENTRY_ANCHOR_QUOTE_OFF_TICK"
+ANCHOR_QUOTE_LOCKED_OR_CROSSED = "ENTRY_ANCHOR_QUOTE_LOCKED_OR_CROSSED"
+ANCHOR_QUOTE_SIDE_TIME_UNKNOWN = "ENTRY_ANCHOR_QUOTE_SIDE_TIME_UNKNOWN"
+ANCHOR_QUOTE_SIDE_STALE = "ENTRY_ANCHOR_QUOTE_SIDE_STALE"
+ANCHOR_QUOTE_SIDE_FUTURE = "ENTRY_ANCHOR_QUOTE_SIDE_FUTURE"
 # Hard ceilings of the entry rule's limits (review F6). Constants on purpose: raising one is a code
 # change and its review, never a configuration value. The mapping loader refuses limits above them
 # (an absolute move: above the ceiling percentage of the highest price the family's sizing can
@@ -524,6 +535,55 @@ ANCHOR_BASIS_CAP_MISSING = "ENTRY_ANCHOR_BASIS_CAP_MISSING"
 ANCHOR_MAX_ADVERSE_PCT_CEILING = Decimal(1)
 ANCHOR_MAX_FAVOURABLE_PCT_CEILING = Decimal(2)
 ANCHOR_MAX_SIGNAL_AGE_CEILING_SECONDS = 120
+# The oldest each side of the live streaming quote may be at an anchored decision (owner, 12
+# November 2026: per-side freshness; a delayed quote is never eligible).
+ANCHOR_MAX_QUOTE_AGE_CEILING_SECONDS = 5
+# How far in the future a side's own update time may be (clock skew) before it HOLDs (review S1):
+# a separate, small bound, so a stale side can never look fresh by a stamp ahead of the clock.
+ANCHOR_QUOTE_FUTURE_TOLERANCE_SECONDS = 0.5
+
+
+def finite_positive(value) -> bool:
+    """A limit that can switch a check on: a real, finite, positive number (never nan, inf or a
+    boolean). Review N1: a nan limit compares false and would turn the check off."""
+    if value is None or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(value) and value > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def anchor_quote_problem(bid: Decimal | None, ask: Decimal | None, bid_at: datetime | None,
+                         ask_at: datetime | None, quality, now: datetime, max_age: float,
+                         tick: Decimal | None = None) -> list[str]:
+    """Why a quote cannot carry an anchored entry, or []: quality LIVE (a delayed or frozen quote
+    is never eligible, whatever the accepted qualities); bid and ask present, positive and (when
+    ``tick`` is given) on tick; bid strictly below ask; each side's own update time known, no
+    older than ``max_age`` and not more than ``ANCHOR_QUOTE_FUTURE_TOLERANCE_SECONDS`` in the
+    future (and ``max_age`` itself finite and positive). A broker that cannot report
+    per-side times can never anchor. The gateway and the execution core's pre-submit re-check
+    both apply it."""
+    quality = getattr(quality, "value", quality)
+    if not finite_positive(max_age):
+        return [ANCHOR_RULE_INCOMPLETE]
+    if quality != "LIVE":
+        return [ANCHOR_QUOTE_NOT_LIVE, f"QUALITY:{quality}"]
+    if bid is None or ask is None or bid <= 0 or ask <= 0:
+        return [ANCHOR_QUOTE_SIDE_MISSING]
+    if tick is not None and (bid % tick or ask % tick):
+        return [ANCHOR_QUOTE_OFF_TICK]
+    if bid >= ask:
+        return [ANCHOR_QUOTE_LOCKED_OR_CROSSED]
+    for side, at in (("BID", bid_at), ("ASK", ask_at)):
+        if at is None or at.tzinfo is None:
+            return [ANCHOR_QUOTE_SIDE_TIME_UNKNOWN, f"SIDE:{side}"]
+        age = (now - at).total_seconds()
+        if age < -ANCHOR_QUOTE_FUTURE_TOLERANCE_SECONDS:
+            return [ANCHOR_QUOTE_SIDE_FUTURE, f"SIDE:{side}"]
+        if age > max_age:
+            return [ANCHOR_QUOTE_SIDE_STALE, f"SIDE:{side}", f"MAX_AGE:{max_age:g}"]
+    return []
 
 
 def move_limit(spec: str | None, anchor: Decimal) -> Decimal | None:
@@ -559,7 +619,9 @@ def _entry_anchor(a: TradeAction, q: MappedQuote, policy: MockPolicy, now: datet
         return None, None
     adverse = move_limit(t.anchor_max_adverse_move, anchor)
     favourable = move_limit(t.anchor_max_favourable_move, anchor)
-    if adverse is None or favourable is None or not t.anchor_max_signal_age_seconds:
+    if adverse is None or favourable is None or not adverse.is_finite() \
+            or not favourable.is_finite() or not finite_positive(t.anchor_max_signal_age_seconds) \
+            or not finite_positive(t.anchor_max_quote_age_seconds):
         return None, _gate("HOLD", ANCHOR_RULE_INCOMPLETE)
     collar = policy.max_price_deviation_pct
     for name, limit, ceiling in (("ADVERSE", adverse, ANCHOR_MAX_ADVERSE_PCT_CEILING),
@@ -569,9 +631,17 @@ def _entry_anchor(a: TradeAction, q: MappedQuote, policy: MockPolicy, now: datet
     if t.anchor_max_signal_age_seconds > ANCHOR_MAX_SIGNAL_AGE_CEILING_SECONDS:
         return None, _gate("HOLD", ANCHOR_LIMIT_ABOVE_CEILING,
                            f"SIGNAL_AGE:{t.anchor_max_signal_age_seconds:g}")
+    if t.anchor_max_quote_age_seconds > ANCHOR_MAX_QUOTE_AGE_CEILING_SECONDS:
+        return None, _gate("HOLD", ANCHOR_LIMIT_ABOVE_CEILING,
+                           f"QUOTE_AGE:{t.anchor_max_quote_age_seconds:g}")
     if (now - published_at).total_seconds() > t.anchor_max_signal_age_seconds:
         return None, _gate("HOLD", ANCHOR_SIGNAL_TOO_OLD,
                            f"MAX_AGE:{t.anchor_max_signal_age_seconds:g}")
+    # Live streaming quotes only, each side fresh (owner, 12 November 2026).
+    problem = anchor_quote_problem(q.bid, q.ask, q.bid_at, q.ask_at, q.quality, now,
+                                   t.anchor_max_quote_age_seconds, t.min_tick)
+    if problem:
+        return None, _gate("HOLD", *problem, "LEG:EXECUTION")
     if t.basis == "REFERENCE_TRIGGER" and not in_windows(
             t.reference_windows, t.session_days, t.session_timezone, now):
         return None, _gate("HOLD", "REFERENCE_SERIES_NOT_UPDATING")
@@ -579,6 +649,11 @@ def _entry_anchor(a: TradeAction, q: MappedQuote, policy: MockPolicy, now: datet
         held = _reference_leg(q, policy, now)
         if held:
             return None, held
+        r = q.reference
+        problem = anchor_quote_problem(r.bid, r.ask, r.bid_at, r.ask_at, r.quality, now,
+                                       t.anchor_max_quote_age_seconds)
+        if problem:
+            return None, _gate("HOLD", *problem, "LEG:REFERENCE")
         # Review F4: the anchor bounds the reference price only. The execution price is bounded
         # by the live basis, within the family's cap, or the entry does not happen.
         cap, age = ((t.max_abs_basis, t.max_basis_age_seconds) if t.max_abs_basis is not None
@@ -603,10 +678,13 @@ def _entry_anchor(a: TradeAction, q: MappedQuote, policy: MockPolicy, now: datet
         return None, _gate("BLOCK", "INVALID_BID_ASK")
     return ExecutionPlan(family=t.family, basis=t.basis, execution_key=t.execution_key,
                          entry_rule=REFERENCE_AS_COLLAR, entry_anchor=anchor,
-                         anchor_series=series, anchor_live=live, entry_limit=limit), None
+                         anchor_series=series, anchor_live=live, entry_limit=limit,
+                         anchor_max_quote_age_seconds=t.anchor_max_quote_age_seconds,
+                         anchor_max_signal_age_seconds=t.anchor_max_signal_age_seconds), None
 
 
-_ANCHOR_FIELDS = {"entry_rule", "entry_anchor", "anchor_series", "anchor_live", "entry_limit"}
+_ANCHOR_FIELDS = {"entry_rule", "entry_anchor", "anchor_series", "anchor_live", "entry_limit",
+                  "anchor_max_quote_age_seconds", "anchor_max_signal_age_seconds"}
 
 
 def _mapped_open(a: TradeAction, q: MappedQuote, policy: MockPolicy, now: datetime,

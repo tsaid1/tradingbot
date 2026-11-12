@@ -255,6 +255,7 @@ class RuntimeService:
             config.paths.mapping_file, allow_what_if=allow_what_if_mapping
         )
         self.mapping.check_policy(config.policy)  # an anchored entry always has a stop
+        self.mapping.check_mode(config.mode)  # the entry rule: simulated (paper) modes only
         self.alerter = Alerter(
             self.store, self.notifier, realert_seconds=config.notify.realert_seconds,
             clock=self.clock,
@@ -922,12 +923,13 @@ class RuntimeService:
         elif entry.basis == "DIRECT":
             reference = contract
         terms = entry.terms(instrument, contract, reference, problems, exits_only=exits_only)
-        bid = ask = None
+        bid = ask = bid_at = ask_at = None
         quality, observed = QuoteQuality.UNAVAILABLE.value, now
         if contract is not None:
             try:
                 q = self.broker.quote(contract)
                 bid, ask, quality, observed = q.bid, q.ask, q.quality.value, q.received_at
+                bid_at, ask_at = q.bid_at, q.ask_at
             except BrokerError:
                 pass
         if bid is None or ask is None:
@@ -939,9 +941,10 @@ class RuntimeService:
             leg = LegQuote(contract_key=reference.contract_key, bid=rq.bid, ask=rq.ask,
                            last=rq.last, observed_at=rq.received_at, quality=rq.quality.value,
                            # Freshness only from the series' own update time (None: HOLD).
-                           updated_at=rq.updated_at)
+                           updated_at=rq.updated_at, bid_at=rq.bid_at, ask_at=rq.ask_at)
         return MappedQuote(symbol=instrument.symbol, bid=bid, ask=ask, observed_at=observed,
-                           quality=quality, terms=terms, reference=leg)
+                           quality=quality, terms=terms, reference=leg, bid_at=bid_at,
+                           ask_at=ask_at)
 
     def _check_roll_windows(self, now: datetime) -> None:
         """A follower position in a contract inside its roll window is flagged (alert and

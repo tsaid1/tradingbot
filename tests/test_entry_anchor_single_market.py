@@ -21,10 +21,12 @@ from tradingbot.models import Action
 from tradingbot.runtime.mapping import AnchorLexicon, MappingPolicy
 
 SMP = ANCHOR_RULE.replace('"SENTENCE_STRICT"', '"SINGLE_MARKET_POST"')
-OWN = "We are now long $QETF from the lows."
+OWN = "We are now long $QETF."  # fallback round: the instruction must be understood
 NOTE = "The fund has been basing for weeks."
 STOP = "Stop 48.90."
-POST = f"{OWN} {NOTE}\n{STOP}\nThe chart looks constructive.\n50.10 now."
+# Final review round: the sentence before an elliptical level must be the action's own
+# instruction and the sentence after it understood (here: the end of the post).
+POST = f"{NOTE}\n{STOP}\nThe chart looks constructive.\n{OWN}\n50.10 now."
 
 
 def two_families(tmp_path) -> MappingPolicy:
@@ -57,10 +59,19 @@ def test_a_closing_level_sentence_in_a_one_market_post_anchors(tmp_path):
     assert d.anchor_attribution == "SINGLE_MARKET_POST"
 
 
-def test_the_other_scopes_refuse_the_same_post(tmp_path):
+def test_the_neighbour_rule_is_the_same_in_every_scope(tmp_path):
+    """Final review round: the neighbour rule is applied in every scope; SENTENCE_STRICT and
+    ACTION_BLOCK keep their stricter whole-sentence checks on top (OWN holds "from the lows"), so
+    they are never looser than SINGLE_MARKET_POST."""
+    assert decide(two_families(tmp_path)).status == "SUPPORTED"
+    foreign = POST.replace(f"\n{OWN}", f"\n{OWN} The chart looks fine.")
+    assert decide(two_families(tmp_path), post=foreign).status == "UNRESOLVED"
     for scope in ("SENTENCE_STRICT", "ACTION_BLOCK"):
         p = policy(tmp_path, etf_entry(rule=ANCHOR_RULE.replace("SENTENCE_STRICT", scope)))
-        assert decide(p).status == "UNRESOLVED", scope
+        assert decide(p).status == "SUPPORTED", scope  # the same clean post
+        assert decide(p, post=foreign).status == "UNRESOLVED", scope
+    chart = POST.replace(f"\n{OWN}", "").replace("The chart", f"{OWN} The chart")
+    assert decide(two_families(tmp_path), post=chart).status == "UNRESOLVED"
 
 
 @pytest.mark.parametrize("extra", [
@@ -138,10 +149,15 @@ def test_a_reference_series_level_names_nothing_or_the_reference(tmp_path):
     f.write_text(service_mapping(scope="SINGLE_MARKET_POST"))
     p = MappingPolicy.from_toml(f)
     from test_entry_anchor_context import idx_action
-    own = "We are now long $QIDX from support."
-    for line, reason in (("5,010 now.", None), ("QIDX 5,010 now.", None),
-                         ("QIF 5,010 now.", "ENTRY_ANCHOR_REFERENCE_UNNAMED")):
-        post = f"{own}\nStop 4,980.\n{line}"
+    own = "We are now long $QIDX."
+    # Fallback round: ANCHOR_RULE carries standalone_level_sentence = true, so a bare level line
+    # after the own stop sentence is accepted; the shipped default is in test_entry_rule_standalone.
+    for line, reason, stop_first in (
+            ("5,010 now.", None, False), ("QIDX 5,010 now.", None, False),
+            ("QIDX 5,010 now.", None, True),  # names the reference: explicit, any neighbour
+            ("5,010 now.", None, True),  # fallback round: after the own stop, switch on
+            ("QIF 5,010 now.", "ENTRY_ANCHOR_REFERENCE_UNNAMED", False)):
+        post = f"{own}\nStop 4,980.\n{line}" if stop_first else f"{own}\n{line}\nStop 4,980."
         parsed = ParsedPost(actions=[idx_action()])
         _, [d] = p.apply(parsed, clauses={"a1": own}, now=MAP_NOW, post_text=post,
                          levels={"a1": [("REFERENCE", "5010"), ("STOP", "4980")]})

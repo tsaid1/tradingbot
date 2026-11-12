@@ -96,13 +96,13 @@ ANCHORS = [
     ("We are now long $QETF, currently 50.10.", None),
     ("We are now long $QETF, currently at 50.10.", None),
     ("We are now long $QETF, trading at 50.10.", None),
-    ("We are now long $QETF here at 50.10.", None),
+    ("We are now long $QETF, here at 50.10.", None),  # owner's safeguard of 12 Nov 2026: see test_entry_rule_level_kind.py
     ("We are now long $QETF, 50.10 right now.", None),
     ("We are now long $QETF, 50.10 at the market.", None),
-    ("Long $QETF now 50.10.", None),
+    ("Long $QETF, now 50.10.", None),
     (LONG, "We are now long $QETF.\n50.10 now."),
     (LONG, "We are now long $QETF.\n$QETF currently 50.10."),
-    (LONG, "We are now long $QETF. Stop 48.90.\n~$50.10 now."),
+    (LONG, "We are now long $QETF.\n$50.10 now.\nStop 48.90."),  # review S4 (12 Nov): "~" holds
     (LONG, "We are now long $QETF.\nQETF trading at 50.10 USD."),
 ]
 
@@ -241,7 +241,11 @@ def test_reviewer_probe_a_level_line_for_another_month_holds(tmp_path, line):
                       [("REFERENCE", "71.60")], post_text=f"We are now long $QOIL. Stop 69.80.\n"
                                                           f"{line}")
     assert d.status == "UNRESOLVED" and inst is None, d.reason
-    assert d.reason.split(",")[0] == "CONTRACT_MONTH_UNRECOGNISED"
+    # A line naming the family's own contract code is an explicit quotation and reaches the
+    # contract check; a bare month line after "Stop 69.80." is held first by the owner's
+    # safeguard (its context is a stop).
+    assert d.reason.split(",")[0] in ("CONTRACT_MONTH_UNRECOGNISED",
+                                      "ENTRY_ANCHOR_LEVEL_NOT_MARKET_QUOTE"), d.reason
 
 
 def test_a_level_line_naming_the_orders_own_contract_is_accepted(tmp_path):
@@ -296,7 +300,7 @@ sizing = {{ units_per_signal = 2, max_units = 4, max_notional = "60000" }}
 roll = {{ business_days_before = 3, action = "FLATTEN" }}
 reference_trigger = {{ released_order_type = "MKT", reference_hours = ["13:30-20:00"], require_backstop = false }}
 entry_rule = "REFERENCE_AS_COLLAR"
-entry_anchor = {{ max_adverse_move = "0.5%", max_favourable_move = "1%", max_signal_age_seconds = 60, anchor_scope = "SENTENCE_STRICT"{cap} }}
+entry_anchor = {{ max_adverse_move = "0.5%", max_favourable_move = "1%", max_signal_age_seconds = 60, anchor_scope = "SENTENCE_STRICT"{cap}, max_quote_age_seconds = 3, environment = "PAPER", standalone_level_sentence = true }}
 """
 
 
@@ -372,7 +376,7 @@ def test_the_loader_refuses_limits_above_the_ceilings(change, message):
 def test_limits_at_the_ceilings_load():
     rule = ('entry_rule = "REFERENCE_AS_COLLAR"\nentry_anchor = { max_adverse_move = "1%", '
             'max_favourable_move = "2%", max_signal_age_seconds = 120, '
-            'anchor_scope = "SENTENCE_STRICT" }')
+            'anchor_scope = "SENTENCE_STRICT", max_quote_age_seconds = 3, environment = "PAPER" }')
     assert load(etf_entry(rule=rule)).entry_anchor.max_signal_age_seconds == 120
     # An absolute move within 1% of the highest price the family's sizing can buy (5000 / 10).
     assert load(etf_entry(rule=ANCHOR_RULE.replace('"0.5%"', '"5"'))).entry_anchor

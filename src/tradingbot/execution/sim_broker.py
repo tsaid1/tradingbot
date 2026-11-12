@@ -42,6 +42,7 @@ from tradingbot.execution.broker import (
     WORKING_STATUSES,
     AckLost,
     BrokerDisconnected,
+    BrokerEnvironment,
     BrokerError,
     BrokerIdentityError,
     BrokerOrder,
@@ -127,7 +128,9 @@ CREATE TABLE IF NOT EXISTS sim_quotes (
     bid TEXT, ask TEXT, last TEXT,
     received_at TEXT NOT NULL,
     quality TEXT NOT NULL,
-    updated_at TEXT
+    updated_at TEXT,
+    bid_at TEXT,
+    ask_at TEXT
 );
 """
 
@@ -188,6 +191,10 @@ def _s(value: Decimal | None) -> str | None:
     return str(value) if value is not None else None
 
 
+def _t(value: str | None) -> datetime | None:
+    return datetime.fromisoformat(value) if value else None
+
+
 class SimBroker:
     def __init__(
         self,
@@ -227,6 +234,9 @@ class SimBroker:
         # Whether quotes carry the series' own last-update time (IBKR lastTimestamp). A test turns
         # this off to model a broker that reports only when it received the quote.
         self.reports_update_time = True
+        # Whether quotes carry each side's own update time (a streaming quote). A test turns this
+        # off to model a broker that cannot say how old each side is.
+        self.reports_side_times = True
         # Session control (a Trader Workstation restarts daily): while disconnected every Broker
         # call raises BrokerDisconnected; the market and the account keep moving (test controls
         # such as fill, set_quote and expire_day_orders still act). See disconnect / reconnect.
@@ -258,6 +268,9 @@ class SimBroker:
             qcols = {r["name"] for r in c.execute("PRAGMA table_info(sim_quotes)")}
             if "updated_at" not in qcols:  # the series' own last-update time (multi-asset)
                 c.execute("ALTER TABLE sim_quotes ADD COLUMN updated_at TEXT")
+            for col in ("bid_at", "ask_at"):  # each side's own update time (entry rule)
+                if col not in qcols:
+                    c.execute(f"ALTER TABLE sim_quotes ADD COLUMN {col} TEXT")
             # A store written before positions were keyed by contract: move its rows once.
             for r in c.execute("SELECT * FROM sim_positions").fetchall():
                 contract = self.resolve(
@@ -385,22 +398,28 @@ class SimBroker:
         received_at: datetime | None = None,
         contract: ContractRef | None = None,
         updated_at: datetime | None = None,
+        bid_at: datetime | None = None,
+        ask_at: datetime | None = None,
     ) -> None:
         """Publish a quote and run every working order against it (stops, targets, limits). With
         ``contract`` the quote is for that exact contract; otherwise for the stock ``symbol``.
         ``updated_at`` is the series' own last-update time (default: the receipt time); a frozen
-        series is modelled by re-publishing its value with an old ``updated_at``."""
+        series is modelled by re-publishing its value with an old ``updated_at``. ``bid_at`` and
+        ``ask_at`` are each side's own update time (default: the receipt time); one side that has
+        not ticked is modelled by an old time for it."""
         at = received_at or self._now()
         updated = updated_at or at
         symbol = contract.contract_key if contract is not None else symbol
         with self._tx() as c:
             self._settle(c)
             c.execute(
-                """INSERT INTO sim_quotes (symbol,bid,ask,last,received_at,quality,updated_at)
-                VALUES (?,?,?,?,?,?,?)
+                """INSERT INTO sim_quotes
+                (symbol,bid,ask,last,received_at,quality,updated_at,bid_at,ask_at)
+                VALUES (?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(symbol) DO UPDATE SET bid=excluded.bid, ask=excluded.ask,
                 last=excluded.last, received_at=excluded.received_at, quality=excluded.quality,
-                updated_at=excluded.updated_at""",
+                updated_at=excluded.updated_at, bid_at=excluded.bid_at,
+                ask_at=excluded.ask_at""",
                 (
                     symbol,
                     _s(Decimal(bid)) if bid is not None else None,
@@ -409,6 +428,8 @@ class SimBroker:
                     at.isoformat(),
                     quality.value,
                     updated.isoformat(),
+                    (bid_at or at).isoformat(),
+                    (ask_at or at).isoformat(),
                 ),
             )
             self._match(c)
@@ -505,6 +526,10 @@ class SimBroker:
         self._check_session()
         return self.account
 
+    def environment(self) -> BrokerEnvironment:
+        """The simulated broker: no account exists (entry-rule paper-only declaration)."""
+        return BrokerEnvironment.SIM
+
     def resolve(self, instrument: Instrument) -> ContractRef:
         if self is not None:  # tests call SimBroker.resolve(None, ...) for a stock's contract
             self._check_session()
@@ -557,6 +582,8 @@ class SimBroker:
             updated_at=datetime.fromisoformat(row["updated_at"])
             if row["updated_at"] and self.reports_update_time
             else None,
+            bid_at=_t(row["bid_at"]) if self.reports_side_times else None,
+            ask_at=_t(row["ask_at"]) if self.reports_side_times else None,
         )
 
     # ------------------------------------------------------------------ conditional orders (additive)

@@ -20,7 +20,8 @@ from tradingbot.models import PositionSide
 from tradingbot.runtime.mapping import AnchorLexicon
 
 REFUSED = {"ENTRY_ANCHOR_CONTEXT_UNCLEAR", "ENTRY_ANCHOR_INSTRUMENT_UNCLEAR",
-           "ENTRY_ANCHOR_NOT_CURRENT", "ENTRY_ANCHOR_INSTRUMENT_AMBIGUOUS"}
+           "ENTRY_ANCHOR_NOT_CURRENT", "ENTRY_ANCHOR_INSTRUMENT_AMBIGUOUS",
+           "ENTRY_ANCHOR_LEVEL_NOT_MARKET_QUOTE"}
 LEVELS = [("REFERENCE", "50.10"), ("STOP", "48.90")]
 
 # ------------------------------------------------------------------ the reviewer's three classes
@@ -80,15 +81,15 @@ def test_a_question_has_its_own_reason(tmp_path):
 
 PASS = [
     ("We are now long $QETF, 50.10 now.", PositionSide.LONG),
-    ("We are long $QETF here at 50.10.", PositionSide.LONG),
+    ("We are long $QETF, here at 50.10.", PositionSide.LONG),  # owner's safeguard of 12 Nov 2026: see test_entry_rule_level_kind.py
     ("I am buying $QETF, currently 50.10.", PositionSide.LONG),
     ("New position: long $QETF, trading at 50.10.", PositionSide.LONG),
     ("We are now long $QETF, 50.10 now, stop 48.90.", PositionSide.LONG),
     ("Buy $QETF at the market, around 50.10 now.", PositionSide.LONG),
     ("Short $QETF, 50.10 right now, stop 51.20.", PositionSide.SHORT),
-    ("We are selling $QETF short here at 50.10.", PositionSide.SHORT),
-    ("Long $QETF, our new trade, ~50.10 now.", PositionSide.LONG),
-    ("This is a new trade: long $QETF, it is 50.10 now.", PositionSide.LONG),
+    ("We are selling $QETF short, here at 50.10.", PositionSide.SHORT),
+    ("Long $QETF, our new trade, 50.10 now.", PositionSide.LONG),  # review S4 (12 Nov): "~" holds
+    ("This is a new trade: long $QETF, $QETF is 50.10 now.", PositionSide.LONG),
 ]
 
 
@@ -107,7 +108,8 @@ def test_ordinary_plain_instructions_still_anchor(tmp_path, clause, side):
 
 @pytest.mark.parametrize("post,ok", [
     (f"{LONG}\n50.10 now.", True),
-    (f"{LONG} Stop 48.90.\n~$50.10 now.", True),
+    (f"{LONG} Stop 48.90.\n~$50.10 now.", False),  # owner's safeguard of 12 Nov 2026: see test_entry_rule_level_kind.py
+    (f"{LONG}\n$50.10 now. Stop 48.90.", True),
     (f"{LONG}\n$QETF trading at 50.10.", True),
     (f"{LONG}\nDubai looks heavy.\n50.10 now.", False),
     (f"{LONG}\nThe other fund is weak.\n50.10 now.", False),

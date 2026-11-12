@@ -35,7 +35,7 @@ ETF. An entry states:
 | `roll` | `business_days_before` the roll date, and `action = "FLATTEN"` |
 | `basis_shift` | `max_abs_basis`, `max_age_seconds` and `scale_ratio` (for BASIS_SHIFT, or for a backstop). `scale_ratio` must be declared and must be exactly `1`: any other ratio is UNSUPPORTED |
 | `reference_trigger` | `released_order_type = "MKT"`, the `reference_hours` when the reference updates, and `require_backstop` |
-| `entry_rule`, `entry_anchor` | `EXPLICIT_ENTRY_ONLY` (default) or `REFERENCE_AS_COLLAR` with its required limits `max_adverse_move`, `max_favourable_move` (`"2.5"` in the anchor's own price units, or `"0.5%"` of it) and `max_signal_age_seconds`. See "Entry rule" below |
+| `entry_rule`, `entry_anchor` | `EXPLICIT_ENTRY_ONLY` (default) or `REFERENCE_AS_COLLAR` with its required limits `max_adverse_move`, `max_favourable_move` (`"2.5"` in the anchor's own price units, or `"0.5%"` of it), `max_signal_age_seconds`, `anchor_scope`, `max_quote_age_seconds` and `environment = "PAPER"`. See "Entry rule" below |
 | `level_contract_rule` | `EXPLICIT_MONTH_ONLY` (default) or `FRONT_MONTH`, for a DIRECT future whose levels are a futures series. See "Level contract rule" below |
 
 A family with no entry is marked `UNSUPPORTED_INSTRUMENT_MAPPING`. An entry that is not approved is
@@ -158,8 +158,17 @@ trigger day must trigger again on a later day.
 By default (`entry_rule = "EXPLICIT_ENTRY_ONLY"`, the product decision of 5 November 2026) only
 explicit execution language sets an entry price. A market level the publisher states when opening
 ("long here, the index 5,010 now") is a REFERENCE, so such an OPEN or ADD HOLDs
-(`OPEN_ENTRY_PRICE_MISSING`, `ADD_ENTRY_REFERENCE_MISSING`). The shipped file keeps this for every
-entry.
+(`OPEN_ENTRY_PRICE_MISSING`, `ADD_ENTRY_REFERENCE_MISSING`).
+
+**The owner's decision of 12 November 2026.** The shipped file turns the rule on for **TLT only**:
+`anchor_scope = "SINGLE_MARKET_POST"`, `max_adverse_move = "0.3%"`, `max_favourable_move = "0.6%"`,
+`max_signal_age_seconds = 90` (from the original publication), `max_quote_age_seconds = 3` (each side
+of a live streaming quote), `environment = "PAPER"`, with the only exposure approved so far (1 share,
+150 USD notional) and the US regular session (09:30 to 16:00 America/New_York, Monday to Friday). It
+is for simulation, evaluation and shadow decisions on paper: it **does not authorize broker order
+submission**, and the only broker on `main` is the simulated one. Every other family keeps
+`EXPLICIT_ENTRY_ONLY`. The protective stop is mandatory and the order is always a limit, never a
+market order.
 
 `entry_rule = "REFERENCE_AS_COLLAR"`, approved per family with its three limits (no defaults),
 changes one thing. A **current** OPEN or ADD (timing CURRENT: never a retrospective report, a
@@ -189,6 +198,7 @@ otherwise the action HOLDs at the mapping stage with the reason shown:
 | the value is the market **now** (see *What makes a level an anchor* below) | `ENTRY_ANCHOR_NOT_CURRENT` |
 | a separate level line or attached quote names only this family | `ENTRY_ANCHOR_INSTRUMENT_UNCLEAR` |
 | for a future, the clause and the source pass the contract checks of the *Level contract rule*, and a month the source names is the order's month | `CONTRACT_MONTH_UNRECOGNISED` |
+| the level is an explicit contemporaneous market quotation (see *What the level is* below) | `ENTRY_ANCHOR_LEVEL_NOT_MARKET_QUOTE` |
 | after the contract is selected, neither the clause nor the source holds another number once months, an index's own name, the anchor, the stop, the target and a reduction percentage are read | `ENTRY_ANCHOR_UNEXPLAINED_PRICE` |
 
 ### What makes a level an anchor
@@ -225,10 +235,11 @@ is written in between punctuation (`,` `;` `.` `:` `!` `?`, a line break, a spac
    index. A level sentence without the action's own words (a standalone "41.20 now.") also needs
    the sentence before it to be entirely on the allow-list (`ENTRY_ANCHOR_INSTRUMENT_UNCLEAR`,
    `PRECEDING_SENTENCE`). A second marked number elsewhere in the post that belongs to no other
-   action holds (`ENTRY_ANCHOR_SEVERAL_LEVELS`). Phrasings that pass include "We are now long $X,
-   41.20 now.", "We are long $X here at 41.20.", "I am buying $X, currently 41.20.", "New
-   position: long $X, trading at 41.20.", "We are now long $X, 41.20 now, stop 40.10.", "Short
-   $X, 41.20 right now, stop 42.30.", and "We are now long $X." followed by "41.20 now.".
+   action holds (`ENTRY_ANCHOR_SEVERAL_LEVELS`). Phrasings that pass this rule and *What the
+   level is* below include "We are now long $X, 41.20 now.", "I am buying $X, currently 41.20.",
+   "New position: long $X, trading at 41.20.", "We are now long $X, 41.20 now, stop 40.10.",
+   "Short $X, 41.20 right now, stop 42.30.", and "We are now long $X." followed by "41.20 now.".
+   "We are long $X here at 41.20." passes this rule but holds there (rule A).
 3. **Nothing in its own clause makes it something else** (a second, redundant check) (`NOT_CURRENT_WORDS`): a time other than
    now (yesterday, earlier, last, next, was, will, a weekday, overnight, ...), a chart, session or
    order level (high, low, open, close, settlement, resistance, support, target, objective, stop,
@@ -245,6 +256,92 @@ is written in between punctuation (`,` `;` `.` `:` `!` `?`, a line break, a spac
    anchor of an oil family that does not list "brent". For a future, a month or contract code on
    the line is left to the contract check instead (rule 3 of the *Level contract rule*).
 
+### What the level is
+
+The owner's ambiguity safeguard (12 November 2026). Rules 1 to 4 decide whether a number is written
+as the market now; they do not decide what the number *is*. Every word of "Our position is 71.60
+now." is on the allow-list, yet 71.60 may be the position's average cost. So every candidate level is
+also classified into one closed kind (`AnchorLevelKind`, recorded on the decision as
+`anchor_level_kind`, beside `anchor_attribution`):
+
+| Kind | Meaning |
+|---|---|
+| `MARKET_QUOTE` | an explicit contemporaneous market quotation: the only kind that may anchor |
+| `ENTRY_OR_COST_BASIS` | possibly an entry price or an average cost basis |
+| `STOP_OR_TARGET` | possibly a stop or a target |
+| `HISTORICAL` | a historical or retrospective level |
+| `AMBIGUOUS` | any other numerical reference, or one the bot cannot classify |
+
+Any kind other than `MARKET_QUOTE` HOLDs with `ENTRY_ANCHOR_LEVEL_NOT_MARKET_QUOTE`,
+`LEVEL_KIND:<kind>` and what decided it. The existing checks feed the classification: a level refused
+by them records the kind their words show (a stop or target word `STOP_OR_TARGET`, a cost-basis or
+holder word `ENTRY_OR_COST_BASIS`, a time word `HISTORICAL`, anything else, a question or a second
+number `AMBIGUOUS`). None of them is loosened. Two tightenings apply in **every** anchor scope:
+
+* **A. The number's own clause is a pure market quotation** (`OWN_CLAUSE`). The clause, delimited
+  as in rule 3, may hold only the number, its attached marker, the connectors `at`, `is`, `are`,
+  `around`, `near`, `@` ("here" only inside "here at"), a currency or unit, and a name or alias of
+  this family. A holder, position, trade, side or add word there (we, I, our, my, position, trade,
+  long, buy, short, sell, add, ...) makes the number possibly an entry price or a cost basis
+  (`ENTRY_OR_COST_BASIS`): "Our position is 71.60 now." and "We are long $X here at 41.20." hold (a
+  "long at N" statement reads as an entry price). A pronoun subject (it, this, that, they) or any
+  other word makes it some other thing's level (`AMBIGUOUS`): "It is 41.20 now." holds. So do
+  quotation marks of any kind in the clause and an approximation or sign mark on the number (`~`,
+  `≈`, `±`, `<`, `>`, `+`, `-`): they are not interpreted.
+  "We are now long $X, 41.20 now.", "I am buying $X, currently 41.20.", "New position: long $X,
+  trading at 41.20." and "We are now long $X." followed by "41.20 now." still anchor, subject to B.
+* **B. Understood neighbours** (final review round, 12 November 2026: paths removed, not patterns
+  added). An *understood neighbour* of the level's sentence is one of: the boundary of the post;
+  one of this action's own instruction sentences (a sentence of the action's own clause that names
+  this family or carries the action's own side or add word); or a protective-levels sentence (one
+  stating only the action's own stop and target, defined below). Nothing else is understood.
+  - **R1, every anchored level, every scope, key on or off:** the sentence immediately AFTER the
+    level's sentence must be an understood neighbour (a protective-levels sentence counts here
+    whatever the key); otherwise HOLD (`AMBIGUOUS`, `FOLLOWING_NOT_UNDERSTOOD`). "... 41.20 now.
+    Stop 40.10." passes; "... 41.20 now. That is our average cost." and "... 41.20 now. The chart
+    looks constructive." hold.
+  - **An elliptical level never anchors by default** (fallback after review F1, 12 November
+    2026). A level written on its own ("41.20 now.", or a later clause of a sentence that is not
+    the instruction) whose clause does not name this family HOLDs with `AMBIGUOUS`,
+    `STANDALONE_LEVEL_NOT_ENABLED`, unless the owner sets `standalone_level_sentence = true`
+    (strict boolean, default false, shipped false for every family). The reason: the instruction
+    sentence can name another market in plain lower-case words ("long $X and spy", "like the long
+    end"), and the level on its own line could be that market's price. A level written inside the
+    instruction sentence, or naming this family, is decided as before.
+  - **With `standalone_level_sentence = true`**, an elliptical level may anchor only if (a) the
+    earlier clauses of its sentence, else the sentence BEFORE it, are the action's own instruction
+    sentence or a protective-levels sentence (`NEIGHBOUR_NOT_UNDERSTOOD` otherwise, also when the
+    level opens the post); (b) R1 holds; and (c) every one of the action's own instruction
+    sentences passes the same whole-sentence allow-list a level's own sentence must pass (not a
+    question, every word allow-listed, no other number), so the level is accepted only where it
+    would have been accepted inside the instruction sentence (`INSTRUCTION_NOT_UNDERSTOOD`
+    otherwise: "long $X and spy", "long $X, bought last week"). The old key name
+    `level_after_own_protective_levels` is refused with a message naming the new one.
+  - The level- and cost-word deny-list (`CONTEXT_WORD:<w>`) stays as a second check that can only
+    add a hold: on the neighbour before an elliptical level and on the clauses before a level in
+    the instruction sentence ("We are now long $X, stop 40.10, 41.20 now." holds).
+  - Rule A and the whole-sentence checks of `SENTENCE_STRICT` and `ACTION_BLOCK` stay on top, so
+    no scope is looser than `SINGLE_MARKET_POST`. A level that names this family ("$X 41.20 now.")
+    needs no preceding neighbour, but R1 still applies. A level sentence that cannot be located in
+    the post holds (`CONTEXT_UNKNOWN`).
+
+* **Protective-levels sentence** (used by R1 always, and before an elliptical level only with
+  `standalone_level_sentence = true`). It satisfies all of: every alphabetic token is on a small closed public list
+  (`instruction_terms.PROTECTIVE_WORDS`: stop, stops, stop-loss, stoploss, protective, target,
+  targets, targeting, objective, with, a, an, the, and, at, is, are, our, my, set, of, price, level,
+  loss) or the private `context_words`; it holds no time, condition or cost-basis word and no month;
+  it holds at least one number and every number is exactly the action's own stop or target; the stop
+  is on the protective side of the level (below it for a long, above for a short) and a target on the
+  profit side; it is not a question. Before an elliptical level (switch on) the attribution is then
+  `AFTER_OWN_PROTECTIVE_LEVELS`. "Stop 40.10. 41.20 now." is accepted with the switch on; "We
+  raised our stop.", "Stop moved to 40.10.", another value, a
+  stop on the wrong side, an extra number, "today", "if needed", an unknown word or a question still
+  hold, and so does such a sentence that is not the immediate neighbour. The switch lives in
+  `[entry_anchor]`, so it cannot exist without the rule.
+
+This is one classification function with a closed result (`FamilyMapping._level_kind`); there is no
+scoring, no weight and no window.
+
 *Anchor scope* (`entry_anchor.anchor_scope`, required with the rule, no default: how much textual
 certainty the owner requires). All values apply rules 1 to 3 to the marked number's own sentence
 unchanged; there is no windowed option (a window's start and end could be gamed inside one
@@ -260,6 +357,9 @@ sentence). They differ only in how a standalone level sentence is attributed ("4
   and a value, no sentence index), so a stop or target sentence counts as part of the block only
   when it is itself entirely allow-listed ("Stop 40.10." is; "Stop below 40.10." is not). To
   attribute more, the interpreter would have to expose the sentence span of the action's block.
+  Since 12 November 2026 a level sentence right after a stop or target sentence holds in every
+  scope (*What the level is*, rule B): the stop sentence still attributes, but the level may be
+  the stop.
 
 * `"SINGLE_MARKET_POST"` trusts the post as a whole. The level's own sentence is checked exactly
   as above; nothing is asked of its neighbours. Instead the anchor is accepted only if all hold:
@@ -273,14 +373,38 @@ sentence). They differ only in how a standalone level sentence is attributed ("4
   sentence does not name the execution instrument (`ENTRY_ANCHOR_REFERENCE_UNNAMED`). Every gateway
   protection is unchanged.
 
+  **Unresolved competing references** (part of (b); owner, 12 November 2026). A mention the bot
+  cannot resolve is never taken to mean that no second market exists: it HOLDs with
+  `ENTRY_ANCHOR_POST_UNRESOLVED_MARKET` and the mention kinds only (`MENTION:<MarketMention>`). The
+  detectors are closed public lists of generic words (`instruction_terms`), never a publisher's:
+  `TICKER_SHAPED` (2 to 5 capital letters, optionally with a futures month and year, or any
+  all-capitals word of six or more letters wherever it stands, that are not
+  this family's names, its own contract codes, a word the anchor rule already understands written
+  in capitals, such as "NOW" or "STOP", or a non-instrument acronym such as "CPI", "FOMC", "RSI");
+  `MARKET_NOUN` (a generic market or asset noun: energy, metals, rates and bonds, equity indices,
+  currencies, crypto, agricultural commodities, volatility, "equities", ...; any case, also as a
+  hashtag) that is not a name or alias of this family (a `#WORD` is read as `WORD`, and a token
+  is split on `/` and `.`, so "EUR/USD" and "BRK.B" are seen part by part); `INSTRUMENT_PHRASE` (futures, calls, puts,
+  options, shares, stock, ETF, index, contract, yield, spread) without a name of this family
+  directly before it ("$X shares" resolves, "the bond ETF" and "Zorb futures" do not; for a future,
+  its own month or contract code also resolves); `PROPER_NOUN` (a capitalised word that is not
+  sentence-initial, not this family's, not understood by the anchor rule and not on the small
+  public list of weekdays, months, institutions and holidays). A publisher's non-market proper
+  nouns (a person, a place) may be added privately as `entry_anchor.non_market_words` in the
+  lexicon file: one word of letters each, never a disqualifying word, a market noun or an
+  instrument noun; loading refuses anything else. A cashtag that is not this family's is check (b)
+  as before.
+
 The decision records how the anchor was attributed (`anchor_attribution`: `OWN_SENTENCE`,
-`AFTER_OWN_INSTRUCTION`, `AFTER_ALLOW_LISTED_SENTENCE`, `FIRST_SENTENCE`, `SINGLE_MARKET_POST`).
+`AFTER_OWN_INSTRUCTION`, `AFTER_ALLOW_LISTED_SENTENCE`, `FIRST_SENTENCE`, `SINGLE_MARKET_POST`) and
+what the level was classified as (`anchor_level_kind`).
 
 *Private extension.* A publisher's own present-market phrasing, and further names of a family,
 are never added to the public lists. They go in the optional `entry_anchor` section of the private
 lexicon file (`[interpreter] lexicon_path`, git-ignored):
 `{"entry_anchor": {"present_markers": ["..."], "family_aliases": {"<FAMILY>": ["..."]},
-"context_words": ["..."]}}` (context words: a publisher's plain instruction phrasing). The
+"context_words": ["..."], "non_market_words": ["..."]}}` (context words: a publisher's plain
+instruction phrasing; non-market words: see check (b)). The
 interpreter never sees that section. A marker (one to four words) or an alias (one to three) is
 letters only and may not contain any disqualifying word; an alias may not contain a marker word.
 Loading refuses anything else. The extension can only turn a held level into an anchor where the
@@ -292,12 +416,21 @@ around it are all understood, but the publisher's intent is not. The protections
 case are the live-quote collar (`max_adverse_move`, `max_favourable_move`, within the code
 ceilings), the signal-age limit, the mandatory protective stop and the size caps (`max_units`,
 `max_notional`). The interpreter must also still tag the right number REFERENCE.
-Under `SINGLE_MARKET_POST` specifically: a market named only in plain words that neither the
-mapping file nor the lexicon's vocabulary knows is invisible to check (b), so a marked level that
-really belongs to such a market could be attributed to the post's family. The protections that
-bound that case are the same: the collar against the live quote, the signal-age limit, the
-mandatory stop and the size caps; and the vocabulary can be extended privately
-(`entry_anchor.family_aliases`).
+Under `SINGLE_MARKET_POST` specifically, after the unresolved-reference check and the neighbour
+allow-list (B): a market named only by a lower-case common word outside the public lists ("the
+widget fund"), or by an unknown word at the start of a sentence ("Zorbex is heavy."), in a sentence
+that is **not** the level's neighbour, in an otherwise understood post, is still invisible, so a
+marked level that really belongs to it could be attributed to the post's family. (Directly before an
+elliptical level, or directly after any anchored level, such a sentence holds: it is not an
+understood neighbour.) This is not named-entity recognition and
+there is no dictionary. The protections that bound that case are the same: the collar against the
+live quote, the signal-age limit, the mandatory stop and the size caps; and the vocabulary can be
+extended privately (`entry_anchor.family_aliases`). The check also fails closed the other way: a
+capitalised ordinary word the rule does not understand ("We like STRONG setups"), or a family's
+plain-word name that is not one of its aliases ("bonds" in a TLT post), holds the post until the
+owner adds an alias or a non-market word. Classification residual: the level kind is read from
+words only. A level the interpreter misread, written as a pure quotation with a marker, is still a
+`MARKET_QUOTE`.
 
 No stated level at all leaves the action as today (`OPEN_ENTRY_PRICE_MISSING`, with
 `ENTRY_ANCHOR_NOT_STATED`). For a futures family the accepted anchor is the one extra level the
@@ -313,6 +446,21 @@ gateway on the `MappedQuote` (`entry_anchors`, by action id), and the gateway de
   REFERENCE_TRIGGER (which must be LIVE and fresh by the reference-freshness rules; it HOLDs
   otherwise), with the execution quote for DIRECT and a same-series future (whose quote checks
   already refuse a delayed, frozen, stale or absent quote);
+* **live streaming quotes only, each side fresh** (owner, 12 November 2026). The execution quote,
+  and the reference quote where the anchor is compared in a reference series, must be `LIVE` (a
+  delayed or frozen quote is never eligible, whatever `accepted_qualities` says:
+  `ENTRY_ANCHOR_QUOTE_NOT_LIVE`), with a bid and an ask both present and positive
+  (`ENTRY_ANCHOR_QUOTE_SIDE_MISSING`), on the contract's tick for the execution quote
+  (`ENTRY_ANCHOR_QUOTE_OFF_TICK`), the bid strictly below the ask (`ENTRY_ANCHOR_QUOTE_LOCKED_OR_CROSSED`),
+  and each side's own update time (`BrokerQuote.bid_at`, `ask_at`, additive) known
+  (`ENTRY_ANCHOR_QUOTE_SIDE_TIME_UNKNOWN`), no older than `max_quote_age_seconds`
+  (`ENTRY_ANCHOR_QUOTE_SIDE_STALE`) and not more than 0.5 s in the future
+  (`ANCHOR_QUOTE_FUTURE_TOLERANCE_SECONDS`, its own small bound; review S1)
+  (`ENTRY_ANCHOR_QUOTE_SIDE_FUTURE`). The detail names the side (`SIDE:BID`, `SIDE:ASK`) and the leg
+  (`LEG:EXECUTION`, `LEG:REFERENCE`). A broker that cannot report per-side times can never anchor.
+  The simulated broker stamps both sides (its receipt time unless a test says otherwise); the IBKR
+  adapter does not yet, so through it the rule always holds. The execution core applies the same
+  rule again to the quote it re-reads just before sending the anchored limit;
 * **the basis cap** (review F4): when the anchor is compared in a reference series (BASIS_SHIFT,
   REFERENCE_TRIGGER) it bounds the reference price only, so the absolute difference between the
   live execution and reference mids, from two fresh, near-simultaneous quotes, must be within the
@@ -335,12 +483,19 @@ gateway on the `MappedQuote` (`entry_anchors`, by action id), and the gateway de
 * the policy's percentage collar between the entry level and the quote is replaced by the two
   limits above; sizing, caps, session and roll window are unchanged.
 
-The approved plan records `entry_rule`, `entry_anchor`, `anchor_series`, `anchor_live` and
-`entry_limit`; the execution core sends exactly that limit, after re-checking that a fresh quote
-still lies inside the policy collar around it. An anchored entry whose first submission has an
-unknown outcome is never re-sent (as for every entry). A resend recomputes the limit, so an anchored
-entry is never resent at all (`RESEND_LIMIT_WOULD_DIFFER`); the resend's age check is the policy's,
-not the anchor's.
+The approved plan records `entry_rule`, `entry_anchor`, `anchor_series`, `anchor_live`,
+`entry_limit` and `anchor_max_quote_age_seconds`; the execution core sends exactly that limit,
+after re-checking that a fresh quote still lies inside the policy collar around it and passes the
+per-side rule above. An anchored entry whose first submission has an
+unknown outcome is never re-sent (as for every entry). An anchored intent that was recorded but
+never submitted (the process stopped in between) is recovered under its own rule (review S2): the
+plan's anchored limit, the per-side quote rule and the anchor's signal age
+(`anchor_max_signal_age_seconds` on the plan, `ENTRY_ANCHOR_SIGNAL_TOO_OLD`); otherwise it ends
+`REFUSED` with `STALE_AFTER_UNKNOWN_OUTCOME` and the reason. A mapped plan's recovery is checked
+against its execution reference, as at the first attempt. Every anchor limit the gateway and the
+execution core read must be a finite positive number (nan, infinity, zero or a boolean holds with
+`ENTRY_ANCHOR_RULE_INCOMPLETE`), and the loader accepts only strict numbers for them (no string,
+no boolean, no nan or infinity; review N1).
 
 *Hard ceilings.* Constants in `validator.py`, raised only by a code change and its review:
 
@@ -349,11 +504,30 @@ not the anchor's.
 | `max_adverse_move` | `ANCHOR_MAX_ADVERSE_PCT_CEILING` = 1 % of the anchor |
 | `max_favourable_move` | `ANCHOR_MAX_FAVOURABLE_PCT_CEILING` = 2 % of the anchor |
 | `max_signal_age_seconds` | `ANCHOR_MAX_SIGNAL_AGE_CEILING_SECONDS` = 120 s |
+| `max_quote_age_seconds` | `ANCHOR_MAX_QUOTE_AGE_CEILING_SECONDS` = 5 s |
 
 The loader refuses a percentage above its ceiling, an age above 120 s, and an absolute move above
 its ceiling percentage of the highest entry price the family's sizing can buy
 (`max_notional / (units_per_signal x multiplier)`). The gateway refuses either move above its
 ceiling, or above the policy's `max_price_deviation_pct`, as a percentage of the actual anchor.
+
+*Paper and simulation only; impossible against the funded account.* Three independent locks:
+
+1. The mapping file must state `environment = "PAPER"` in `[entry_anchor]`; it is required and
+   "PAPER" is its only accepted value, so no value can mean a funded account.
+2. The runtime refuses to start with the rule on any family in a runtime mode outside the
+   allow-list `mapping.ANCHOR_RULE_MODES` (today only `"mock"`), so a future mode never inherits the
+   rule silently.
+3. A broker declares what it trades through an optional `environment()` (`BrokerEnvironment`: `SIM`,
+   `PAPER`, `LIVE`; additive, outside the `Broker` protocol). The simulated broker declares `SIM`.
+   The execution core refuses an anchored entry unless the broker positively declares `SIM` or
+   `PAPER`: a `LIVE` broker, one without the declaration or one that answers anything else is
+   refused with `ENTRY_ANCHOR_PAPER_ONLY` (`ENVIRONMENT:<value or UNDECLARED>`) and an open
+   `ENTRY_ANCHOR_PAPER_ONLY` exception. It checks before the intent is recorded and again at the
+   last step before submission (an intent refused there ends `REFUSED`, its orders `NotSubmitted`).
+   A declaration that raises any exception counts as undeclared (review S3). Entries with an
+   explicit price are unaffected. A future order adapter for a real paper account must derive the
+   declaration from the managed account, not assert it.
 
 *What the owner accepts.* Buying at the market some seconds after the post, with the slippage from
 the publisher's level bounded by the two limits; that a misread level would be used as an anchor

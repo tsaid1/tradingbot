@@ -34,6 +34,9 @@ from tradingbot.runtime.mapping import UNSUPPORTED_INSTRUMENT_MAPPING
 
 REPO = Path(__file__).resolve().parents[1]
 FIXTURE = REPO / "fixtures" / "runtime" / "mock_service_posts.jsonl"
+# The demo's lifecycle (an add, a partial reduction) runs at 2 shares: the pre-decision copy of the
+# bond ETF entry, not the owner's 1-share mapping (see the fixture's header).
+MAPPING = REPO / "fixtures" / "runtime" / "mock_service_mapping.toml"
 
 CONFIG = """
 mode = "mock"
@@ -93,7 +96,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     cfg_path = root / "runtime.toml"
     cfg_path.write_text(
-        CONFIG.format(mapping=REPO / "config" / "instrument_mapping.toml", fixture=FIXTURE)
+        CONFIG.format(mapping=MAPPING, fixture=FIXTURE)
     )
     config = load_config(cfg_path)
     total_lines = sum(1 for line in FIXTURE.read_text().splitlines() if line.strip())

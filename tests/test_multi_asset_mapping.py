@@ -59,8 +59,14 @@ def test_shipped_file_is_version_2_with_only_the_bond_etf_approved():
     p = MappingPolicy.from_toml(SHIPPED)
     assert list(p.entries) == ["TLT"] and p.executable_assets == ["TLT"]
     e = p.entries["TLT"]
-    assert e.approved and e.basis == "DIRECT" and e.legacy_equivalent
-    assert e.approved_by and e.approved_at is not None
+    assert e.approved and e.basis == "DIRECT" and e.approved_by and e.approved_at is not None
+    # Owner, 12 Nov 2026: the entry rule needs the mapped path, with the only exposure approved so
+    # far (1 share, 150 USD) and the US regular session.
+    assert not e.legacy_equivalent
+    assert (e.sizing.units_per_signal, e.sizing.max_units, e.sizing.max_notional) == (1, 1, 150)
+    assert (e.session.policy, e.session.timezone, e.session.regular) == (
+        "REGULAR_ONLY", "America/New_York", ["09:30-16:00"])
+    assert e.session.days == ["MON", "TUE", "WED", "THU", "FRI"]
 
 
 def test_shipped_templates_are_valid_unapproved_examples(tmp_path):
