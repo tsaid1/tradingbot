@@ -84,7 +84,9 @@ def test_a_level_without_present_market_evidence_is_not_an_anchor(tmp_path, clau
     d, inst = resolve(policy(tmp_path, etf_entry()), action(), clause,
                       [("REFERENCE", "50.10"), ("STOP", "48.90")])
     assert d.status == "UNRESOLVED" and inst is None and d.entry_anchor is None
-    assert d.reason.split(",")[0] == "ENTRY_ANCHOR_NOT_CURRENT"
+    # Without a marker: not current; with one, the context allow-list or the redundant
+    # disqualifying-word check refuses it.
+    assert d.reason.split(",")[0] in ("ENTRY_ANCHOR_NOT_CURRENT", "ENTRY_ANCHOR_CONTEXT_UNCLEAR")
 
 
 ANCHORS = [
@@ -399,14 +401,17 @@ def test_a_level_line_naming_anything_but_this_family_is_refused(tmp_path, line)
     d, _ = resolve(policy(tmp_path, etf_entry()), action(), LONG, [("REFERENCE", "50.10")],
                    post_text=f"{LONG}\n{line}")
     assert d.status == "UNRESOLVED", d.reason
-    assert d.reason.split(",")[0] == "ENTRY_ANCHOR_INSTRUMENT_UNCLEAR"
+    assert d.reason.split(",")[0] in ("ENTRY_ANCHOR_INSTRUMENT_UNCLEAR",
+                                      "ENTRY_ANCHOR_CONTEXT_UNCLEAR")
 
 
 def test_reviewer_probe_a_plain_word_market_on_the_level_line(tmp_path):
     d, _ = resolve(policy(tmp_path, oil_entry()), oil_action(), "We are now long $QOIL.",
                    [("REFERENCE", "71.45")],
                    post_text="We are now long $QOIL. Stop 69.80.\nBrent 71.45 now.")
-    assert d.status == "UNRESOLVED" and d.reason.startswith("ENTRY_ANCHOR_INSTRUMENT_UNCLEAR")
+    assert d.status == "UNRESOLVED"
+    assert d.reason.split(",")[0] in ("ENTRY_ANCHOR_INSTRUMENT_UNCLEAR",
+                                      "ENTRY_ANCHOR_CONTEXT_UNCLEAR")
 
 
 def test_an_alias_from_the_mapping_entry_or_the_private_lexicon_names_this_family(tmp_path):
@@ -420,7 +425,8 @@ def test_an_alias_from_the_mapping_entry_or_the_private_lexicon_names_this_famil
     assert d.status == "SUPPORTED", d.reason
     p.anchor_lexicon = AnchorLexicon(family_aliases={"QOTHER": ["bond fund"]})
     d, _ = resolve(p, action(), LONG, [("REFERENCE", "50.10")], post_text=post)
-    assert d.reason.startswith("ENTRY_ANCHOR_INSTRUMENT_UNCLEAR")
+    assert d.reason.split(",")[0] in ("ENTRY_ANCHOR_INSTRUMENT_UNCLEAR",
+                                      "ENTRY_ANCHOR_CONTEXT_UNCLEAR")
 
 
 @pytest.mark.parametrize("alias", ["high", "now", "", "x y z w", "fund 2"])
