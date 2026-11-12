@@ -1961,7 +1961,7 @@ class MappingPolicy:
                 return t
             sh, orig = ascii_shadow(t)
             if not orig:
-                return t
+                return sh  # dashes and slashes folded, no non-ASCII word
             mapping = {}
             for ph, word in orig.items():
                 key = next((k for k, w in originals.items() if w == word), None)

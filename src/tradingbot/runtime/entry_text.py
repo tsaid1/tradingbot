@@ -18,9 +18,17 @@ holds the one definition the entry rule uses for such text. It only ever turns a
   and the other exotic spaces), line and paragraph separators, private-use and unassigned code
   points: the entry holds (``ENTRY_TEXT_INVISIBLE_CHARACTER``). Nothing is normalised away.
 * NUMBERS (fail closed): any digit or numeral outside ASCII 0-9 (full-width, Arabic-Indic,
-  superscripts, fractions, Roman numerals), and the Unicode minus or any non-ASCII dash next to a
-  digit: the entry holds (``ENTRY_TEXT_NUMBER_UNREADABLE``). Such a number is never an anchor or a
-  stop.
+  superscripts, fractions, Roman numerals); any non-ASCII character directly touching an ASCII
+  digit or inside what would otherwise be one number token (ASCII digits, full stops and commas):
+  a separator (full-width full stop, middle dot, Arabic decimal separator), a minus or dash, and
+  collaterally a currency, percent or degree sign; and the ASCII forms that the rule would read as
+  a different number than written ("88. 42", "88 .42", "88..42", "88.42.1"): the entry holds
+  (``ENTRY_TEXT_NUMBER_UNREADABLE``), wherever the number is in the post. Such a number is never
+  an anchor, an entry, a stop or a second stop.
+* DASHES AND SLASHES: in the shadow text every Unicode dash (category Pd, the minus sign) becomes
+  an ASCII hyphen and every slash-like character (fraction, division, full-width solidus) an ASCII
+  slash, so the second-market rules split "word\u2010word" and "word\u2044word" as they split
+  the ASCII forms. A dash touching a digit has already held by the number rule.
 """
 
 from __future__ import annotations
@@ -37,6 +45,14 @@ _NUMBER_CATEGORIES = frozenset({"Nd", "Nl", "No"})
 # Dashes and minus signs outside ASCII (a sign or a range next to a digit is not read).
 _DASHES = frozenset("‐‑‒–—―−﹘﹣－")
 _PLACEHOLDER_RE = re.compile(r"[Qq]zu[a-z]{3}x")
+_SLASHES = frozenset("\u2044\u2215\uff0f\u29f8")
+# A number token: ASCII digits, full stops and commas, and any non-ASCII character that is not a
+# letter or a space between them. One holding a non-ASCII character is not read.
+_NUMBER_TOKEN_RE = re.compile(r"[0-9.,\u0080-\U0010ffff]*[0-9][0-9.,\u0080-\U0010ffff]*")
+# ASCII forms read as a different number than written: a space inside ("88. 42", "88 .42"), a
+# doubled separator ("88..42", "87.."), a second decimal point ("88.42.1").
+_ODD_ASCII_NUMBER_RE = re.compile(
+    r"\d\.[ \t]+\d|\d[ \t]+[.,]\d|\d[.,]{2,}|\d\.\d+\.\d")
 
 
 def _invisible(ch: str) -> bool:
@@ -55,15 +71,23 @@ def entry_text_problem(*texts: str | None) -> str | None:
         if any(_invisible(ch) for ch in text):
             return ENTRY_TEXT_INVISIBLE_CHARACTER
     for text in texts:
-        if not text or text.isascii():
+        if not text:
+            continue
+        if _ODD_ASCII_NUMBER_RE.search(text):
+            return ENTRY_TEXT_NUMBER_UNREADABLE
+        if text.isascii():
             continue
         for i, ch in enumerate(text):
             if ch.isascii():
                 continue
             if unicodedata.category(ch) in _NUMBER_CATEGORIES:
                 return ENTRY_TEXT_NUMBER_UNREADABLE
-            if ch in _DASHES and any(
-                0 <= j < len(text) and text[j].isdigit() for j in (i - 1, i + 1)
+            if any(0 <= j < len(text) and text[j] in "0123456789" for j in (i - 1, i + 1)):
+                return ENTRY_TEXT_NUMBER_UNREADABLE  # touching an ASCII digit
+        for m in _NUMBER_TOKEN_RE.finditer(text):
+            token = m.group(0)
+            if not token.isascii() and any(
+                not ch.isascii() and not ch.isalpha() and not ch.isspace() for ch in token
             ):
                 return ENTRY_TEXT_NUMBER_UNREADABLE
     return None
@@ -88,7 +112,10 @@ def ascii_shadow(text: str | None) -> tuple[str | None, dict[str, str]]:
     kept, so no word is created that was not there."""
     if not text or text.isascii():
         return text, {}
-    text = unicodedata.normalize("NFC", text)
+    text = "".join(
+        "-" if ch in _DASHES or (not ch.isascii() and unicodedata.category(ch) == "Pd")
+        else "/" if ch in _SLASHES else ch
+        for ch in unicodedata.normalize("NFC", text))
     out, originals, i, n = [], {}, 0, len(text)
     while i < n:
         if not _letter_or_mark(text[i]):
@@ -118,4 +145,5 @@ def restore(value: str, originals: dict[str, str]) -> str:
 
 
 def has_non_ascii_word(*texts: str | None) -> bool:
-    return any(ascii_shadow(t)[1] for t in texts if t)
+    """True when the shadow text differs from the text: a non-ASCII word, dash or slash."""
+    return any(ascii_shadow(t)[0] != t for t in texts if t)

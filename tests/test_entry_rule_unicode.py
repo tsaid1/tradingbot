@@ -143,7 +143,7 @@ def test_the_helpers():
     assert entry_text_problem("at ８８") == ENTRY_TEXT_NUMBER_UNREADABLE
     assert entry_text_problem("café 88.42") is None  # a letter, not a number or an invisible
     shadow, originals = ascii_shadow("Zörbleflux and café, ΤLΤ's 12.40 — ok")
-    assert shadow.isascii() is False  # the em dash is not a letter: kept
+    assert shadow.endswith("12.40 - ok")  # the em dash is folded to an ASCII hyphen
     assert "Zörbleflux" not in shadow and "café" not in shadow
     words = sorted(originals.values())
     assert words == sorted(["Zörbleflux", "café", "ΤLΤ"])
