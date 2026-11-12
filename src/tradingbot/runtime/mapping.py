@@ -53,27 +53,38 @@ from tradingbot.models import (
 )
 from tradingbot.runtime.instruction_terms import (
     ADD_WORDS,
+    INSTRUMENT_NOUNS,
+    MARKET_NOUNS,
     MONTH_WORD_RE,
     PRESENT_MARKERS,
     SIDE_WORDS,
+    AnchorLevelKind,
     InstructionTerms,
     anchor_not_current,
     check_phrase,
+    clause_kind,
     clause_numbers,
     code_shaped,
+    context_problem,
     extract_terms,
     foreign_words,
     leftover_tokens,
+    level_kind_of_words,
+    level_places,
     marked_numbers,
     post_multi_leg,
+    quote_clause_words,
     relative_contract_words,
     sentences,
+    understood_words,
     unknown_tokens,
     unknown_words,
+    unresolved_market_mentions,
 )
 from tradingbot.validator import (
     ANCHOR_MAX_ADVERSE_PCT_CEILING,
     ANCHOR_MAX_FAVOURABLE_PCT_CEILING,
+    ANCHOR_MAX_QUOTE_AGE_CEILING_SECONDS,
     ANCHOR_MAX_SIGNAL_AGE_CEILING_SECONDS,
     business_days_until,
 )
@@ -109,6 +120,17 @@ ENTRY_ANCHOR_POST_SEVERAL_LEVELS = "ENTRY_ANCHOR_POST_SEVERAL_LEVELS"  # (a)
 ENTRY_ANCHOR_POST_SEVERAL_MARKETS = "ENTRY_ANCHOR_POST_SEVERAL_MARKETS"  # (b)
 ENTRY_ANCHOR_POST_SEVERAL_ACTIONS = "ENTRY_ANCHOR_POST_SEVERAL_ACTIONS"  # (c)
 ENTRY_ANCHOR_REFERENCE_UNNAMED = "ENTRY_ANCHOR_REFERENCE_UNNAMED"  # (d)
+# (b), owner's safeguard of 12 November 2026: the post mentions a market the bot cannot resolve
+# (an unknown ticker-shaped token, a generic market noun, an instrument phrase or a proper noun that
+# is not this family's). Detail: the mention kinds only (MENTION:<MarketMention>).
+ENTRY_ANCHOR_POST_UNRESOLVED_MARKET = "ENTRY_ANCHOR_POST_UNRESOLVED_MARKET"
+# The candidate level is not an explicit contemporaneous market quotation (every scope). Detail:
+# LEVEL_KIND:<AnchorLevelKind> and what decided it (OWN_CLAUSE, CONTEXT_WORD:<w>, CONTEXT_NUMBER,
+# CONTEXT_UNKNOWN).
+ENTRY_ANCHOR_LEVEL_NOT_MARKET_QUOTE = "ENTRY_ANCHOR_LEVEL_NOT_MARKET_QUOTE"
+# Runtime modes in which a family may carry entry_rule = REFERENCE_AS_COLLAR: an allow-list, so a
+# future mode never inherits the rule silently. Only the simulated mode exists today.
+ANCHOR_RULE_MODES = ("mock",)
 # Interpreter flags meaning it did not resolve one instrument.
 _UNRESOLVED_INSTRUMENT_FLAGS = ("ASSET_UNRESOLVED", "MIXED_SERIES_AND_TICKER",
                                 "MULTIPLE_TICKERS_IN_CLAUSE")
@@ -183,6 +205,10 @@ class MappingDecision(StrictModel):
     # after the action's own clause), AFTER_ALLOW_LISTED_SENTENCE (a level sentence after an
     # entirely allow-listed one, such as "Stop 48.90."), FIRST_SENTENCE (nothing before it).
     anchor_attribution: str | None = None
+    # entry_rule = REFERENCE_AS_COLLAR (additive): what the candidate level was classified as
+    # (AnchorLevelKind value). Only MARKET_QUOTE anchors; set on a held anchor once a candidate
+    # level was read, None when no level was classified.
+    anchor_level_kind: str | None = None
 
 
 class MappingFile(StrictModel):
@@ -377,6 +403,12 @@ class EntryAnchorRules(StrictModel):
     # SINGLE_MARKET_POST: the level's own sentence as SENTENCE_STRICT; attribution by the whole
     # post instead of a neighbouring sentence (one marked level, one market, one current entry).
     anchor_scope: Literal["SENTENCE_STRICT", "ACTION_BLOCK", "SINGLE_MARKET_POST"]
+    # The oldest each side of a live streaming quote (bid and ask, by their own update times) may
+    # be at an anchored decision. Required, no default; ceiling validator.ANCHOR_MAX_QUOTE_AGE_*.
+    max_quote_age_seconds: float = Field(gt=0)
+    # Required, and "PAPER" is its only value: the rule is for simulation and the paper account,
+    # never a funded account. The file states the limitation; no value could mean anything else.
+    environment: Literal["PAPER"]
 
     @field_validator("max_adverse_move", "max_favourable_move")
     @classmethod
@@ -397,6 +429,10 @@ class EntryAnchorRules(StrictModel):
         if self.max_signal_age_seconds > ANCHOR_MAX_SIGNAL_AGE_CEILING_SECONDS:
             raise ValueError(f"max_signal_age_seconds {self.max_signal_age_seconds} is above its "
                              f"ceiling of {ANCHOR_MAX_SIGNAL_AGE_CEILING_SECONDS} s (a code "
+                             "constant)")
+        if self.max_quote_age_seconds > ANCHOR_MAX_QUOTE_AGE_CEILING_SECONDS:
+            raise ValueError(f"max_quote_age_seconds {self.max_quote_age_seconds:g} is above its "
+                             f"ceiling of {ANCHOR_MAX_QUOTE_AGE_CEILING_SECONDS} s (a code "
                              "constant)")
         if (self.max_abs_basis is None) != (self.max_basis_age_seconds is None):
             raise ValueError("the anchor's basis cap states max_abs_basis and "
@@ -427,11 +463,26 @@ class AnchorLexicon(StrictModel):
     # A publisher's own plain instruction phrasing ("adding exposure"): words an anchor's
     # sentence may also hold. Never a disqualifying word.
     context_words: list[str] = Field(default_factory=list)
+    # SINGLE_MARKET_POST: capitalised words of a publisher's that are not markets (a person, a
+    # place), so check (b) does not hold on them. One word of letters each; never a disqualifying
+    # word, a generic market noun or an instrument noun.
+    non_market_words: list[str] = Field(default_factory=list)
 
     @field_validator("context_words")
     @classmethod
     def _context(cls, v):
         return [check_phrase(m, "context word", 4) for m in v]
+
+    @field_validator("non_market_words")
+    @classmethod
+    def _non_market(cls, v):
+        out = []
+        for w in v:
+            p = check_phrase(w, "non-market word", 1)
+            if p in MARKET_NOUNS or p in INSTRUMENT_NOUNS:
+                raise ValueError(f"non-market word {w!r} is a market or instrument noun")
+            out.append(p)
+        return out
 
     @field_validator("present_markers")
     @classmethod
@@ -937,6 +988,7 @@ class FamilyMapping(StrictModel):
         lexicon: AnchorLexicon | None = None,
         attribution: list[str] | None = None,
         post: dict | None = None,
+        kind_out: list[AnchorLevelKind] | None = None,
     ) -> tuple[Decimal | None, str | None, list[str]]:
         """entry_rule = REFERENCE_AS_COLLAR: the stated market level that may anchor this action's
         entry, the text it is written in, or why none may. ``levels`` are the interpreter's price
@@ -958,7 +1010,19 @@ class FamilyMapping(StrictModel):
         Default HOLD (review F1, F7): the value is an anchor only with positive evidence that it is
         the market now, a present-market marker attached to it, and nothing in its own clause
         making it something else (``anchor_not_current``: ENTRY_ANCHOR_NOT_CURRENT). A separate
-        line or quote may name only this family (ENTRY_ANCHOR_INSTRUMENT_UNCLEAR)."""
+        line or quote may name only this family (ENTRY_ANCHOR_INSTRUMENT_UNCLEAR).
+
+        Every candidate level is classified (``kind_out``: one AnchorLevelKind) and only a
+        MARKET_QUOTE anchors (``_level_kind``; ENTRY_ANCHOR_LEVEL_NOT_MARKET_QUOTE otherwise). The
+        checks before it feed the classification: a refusal by them records the kind their words
+        show (a stop word STOP_OR_TARGET, a time word HISTORICAL, anything else AMBIGUOUS)."""
+        kind_out = kind_out if kind_out is not None else []
+
+        def held(problems: list[str], kind: AnchorLevelKind | None = AnchorLevelKind.AMBIGUOUS,
+                 words=()):
+            kind_out[:] = [level_kind_of_words(words) or kind] if kind else []
+            return None, None, problems
+
         if not (self.entry_rule == "REFERENCE_AS_COLLAR"
                 and action.action in (Action.OPEN, Action.ADD)
                 and action.timing == Timing.CURRENT and action.entry_reference is None):
@@ -1008,21 +1072,29 @@ class FamilyMapping(StrictModel):
         lexicon = lexicon or AnchorLexicon()
         markers = (*PRESENT_MARKERS, *lexicon.present_markers)
         why = anchor_not_current(source, anchor, markers)
+        bad_words = [w.split(":", 1)[1] for w in why if w.startswith("NOT_CURRENT_WORD:")]
         if "NO_PRESENT_MARKER" in why:  # no positive evidence at all
-            return None, None, [ENTRY_ANCHOR_NOT_CURRENT, *why]
+            return held([ENTRY_ANCHOR_NOT_CURRENT, *why], words=bad_words)
         own = self.anchor_names(asset, lexicon)
         if self.entry_anchor.anchor_scope == "SINGLE_MARKET_POST":
             problems = self._single_market_problems(action, asset, anchor, source, post_text,
-                                                    markers, post or {})
+                                                    markers, post or {}, lexicon)
             if problems:
-                return None, None, problems
+                return held(problems, None)  # the post, not the level, is in doubt
         attributed: list[str] = []
+        unknown: list[str] = []
         problems = self._sentence_problems(action, anchor, source, terms, levels, post_text,
-                                           markers, own, lexicon, attribution=attributed)
+                                           markers, own, lexicon, unknown_out=unknown,
+                                           attribution=attributed)
         if problems:
-            return None, None, problems
+            return held(problems, words=unknown)
         if why:  # the disqualifying words: a second, redundant check
-            return None, None, [ENTRY_ANCHOR_NOT_CURRENT, *why]
+            return held([ENTRY_ANCHOR_NOT_CURRENT, *why], words=bad_words)
+        kind, detail = self._level_kind(anchor, source, post_text, own, markers)
+        if kind != AnchorLevelKind.MARKET_QUOTE:
+            return held([ENTRY_ANCHOR_LEVEL_NOT_MARKET_QUOTE, f"LEVEL_KIND:{kind.value}", detail],
+                        kind)
+        kind_out[:] = [AnchorLevelKind.MARKET_QUOTE]
         # Another marked level elsewhere in the post that is no other action's: which is meant?
         consumed, _ = _consumed(action)
         consumed |= {v for role, raw in levels or () if role in ("STOP", "TARGET")
@@ -1032,18 +1104,71 @@ class FamilyMapping(StrictModel):
             if not any(c and (c.strip() in line or line in c) for _, c, _ in others))]
         marked = set().union(*(marked_numbers(x, markers) for x in texts)) - consumed - {anchor}
         if marked:
-            return None, None, [ENTRY_ANCHOR_SEVERAL_LEVELS, "MARKED_ELSEWHERE"]
+            return held([ENTRY_ANCHOR_SEVERAL_LEVELS, "MARKED_ELSEWHERE"], None)
         if source != terms.clause:
             allowed = set(own) | set(markers) | {"at"}
             foreign = foreign_words(source, anchor, allowed, self._month_spans(source))
             if foreign:
-                return None, None, [ENTRY_ANCHOR_INSTRUMENT_UNCLEAR, f"OTHER_WORDS:{len(foreign)}"]
+                return held([ENTRY_ANCHOR_INSTRUMENT_UNCLEAR, f"OTHER_WORDS:{len(foreign)}"])
         if attribution is not None:
             attribution += attributed
         return anchor, source, []
 
+    def _level_kind(self, anchor: Decimal, source: str, post_text: str | None, own: list[str],
+                    markers) -> tuple[AnchorLevelKind, str]:
+        """The owner's ambiguity safeguard: what the candidate level is, as one closed kind. Only
+        an explicit contemporaneous market quotation (MARKET_QUOTE) may anchor.
+
+        A. The number's own clause (between punctuation, as ``anchor_not_current`` delimits it)
+           holds only the number, its attached marker, the quote connectors, a currency or unit
+           and a name of this family. A holder, position or trade word there makes the number
+           possibly an entry price or an average cost (ENTRY_OR_COST_BASIS: "Our position is 71.60
+           now.", "We are long $X here at 41.20."); a pronoun subject or any other word some other
+           thing's level (AMBIGUOUS: "It is 41.20 now.").
+        B. A clause that does not name this family is elliptical: it takes its topic from the
+           earlier clauses of its sentence and the sentence immediately before it, which must hold
+           no order, chart or cost-basis word and no other number ("We raised our stop. 86.50
+           now." is STOP_OR_TARGET). The interpreter's roles cannot show such a level to be the
+           market rather than the stop (``PriceMention`` has a role and a value, no sentence), so
+           it HOLDs. A clause that names this family ("$X 41.20 now.") is an explicit quotation
+           whatever its neighbours say.
+        A sentence that cannot be located in the post has no known context: AMBIGUOUS."""
+        allowed = [*markers, *own]
+        whole = [s for s, _ in sentences(post_text or source)]
+        places = level_places(source, anchor)
+        if not places:
+            return AnchorLevelKind.AMBIGUOUS, "NOT_FOUND"
+        for sentence, clause, earlier in places:
+            kind = clause_kind(quote_clause_words(clause, allowed, self._month_spans(clause)))
+            if kind is not None:
+                return kind, "OWN_CLAUSE"
+            if self._names_family(clause, own):
+                continue  # names this family: an explicit quotation
+            at = next((i for i, w in enumerate(whole) if w == sentence), None)
+            if at is None:
+                at = next((i for i, w in enumerate(whole) if sentence in w), None)
+                if at is None:
+                    return AnchorLevelKind.AMBIGUOUS, "CONTEXT_UNKNOWN"
+                # The source is a part of a longer post sentence: its earlier clauses count too.
+                earlier = [*next((e for s, c, e in level_places(whole[at], anchor)
+                                  if c.strip() == clause.strip()), []), *earlier]
+            problem = context_problem([*earlier, *whole[at - 1:at]])
+            if problem:
+                return problem
+        return AnchorLevelKind.MARKET_QUOTE, ""
+
+    def _names_family(self, clause: str, own: list[str]) -> bool:
+        """Does the clause name this family: one of its names or aliases, or a contract code of
+        one of its roots (the contract check then decides the month)?"""
+        low = clause.lower().replace("$", " ")
+        if any(re.search(rf"(?<![\w]){re.escape(n)}(?![\w])", low) for n in own):
+            return True
+        roots = {r.upper() for r in self._roots()} if self.execution.sec_type == "FUT" else set()
+        return any(code_shaped(t.strip("()[]{}.,;:!?\"'").lstrip("$").upper(), r)
+                   for t in clause.split() for r in roots)
+
     def _single_market_problems(self, action, asset, anchor, source, post_text, markers,
-                                post) -> list[str]:
+                                post, lexicon: AnchorLexicon | None = None) -> list[str]:
         """anchor_scope = SINGLE_MARKET_POST: the post as a whole attributes the level. (c) this is
         the post's only action besides commentary, and no action is conditional, retrospective or
         uncertain; (b) every action is this family's, no instrument is unresolved, and the post
@@ -1081,6 +1206,15 @@ class FamilyMapping(StrictModel):
                     continue
                 if re.search(rf"(?<!\w){re.escape(name)}(?!\w)", text, re.IGNORECASE):
                     return [ENTRY_ANCHOR_POST_SEVERAL_MARKETS, "OTHER_FAMILY_NAMED"]
+        # The owner's safeguard: a market mention the bot cannot resolve is not "no second market".
+        lexicon = lexicon or AnchorLexicon()
+        unresolved = unresolved_market_mentions(
+            text, set(self.anchor_names(asset, lexicon)) | mine_lower, {m.upper() for m in mine},
+            self._roots(),
+            understood=understood_words([*lexicon.present_markers, *lexicon.context_words]),
+            non_market=set(lexicon.non_market_words), futures=self.execution.sec_type == "FUT")
+        if unresolved:
+            return [ENTRY_ANCHOR_POST_UNRESOLVED_MARKET, *(f"MENTION:{k.value}" for k in unresolved)]
         marked = [s for s, _ in sentences(text) if marked_numbers(s, markers)]
         if len(marked) != 1:
             return [ENTRY_ANCHOR_POST_SEVERAL_LEVELS, f"MARKED_SENTENCES:{len(marked)}"]
@@ -1468,9 +1602,12 @@ class MappingPolicy:
             ZoneInfo(entry.session.timezone if entry.session else "UTC")
         ).date()
         attribution: list[str] = []
+        kind: list[AnchorLevelKind] = []
         anchor, source, problems = (None, None, []) if revoked else entry.entry_anchor_for(
             action, asset, terms, levels, others, post_text, self.anchor_lexicon, attribution,
-            {"actions": post_actions, "vocabulary": self.vocabulary()})
+            {"actions": post_actions, "vocabulary": self.vocabulary()}, kind_out=kind)
+        if kind:
+            out["anchor_level_kind"] = kind[0].value
         if problems:
             return MappingDecision(status="UNRESOLVED", reason=",".join(problems), **out), None
         instrument, problems = entry.select(action, asset, terms, today, held_contract, post_text,

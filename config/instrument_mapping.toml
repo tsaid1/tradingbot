@@ -69,7 +69,7 @@ execution = { sec_type = "STK", asset_class = "ETF", symbol = "TLT", exchange = 
 # reference_trigger = { released_order_type = "MKT", reference_hours = ["09:30-16:00"], require_backstop = true }
 # basis_shift = { max_abs_basis = "40", max_age_seconds = 5, scale_ratio = "1" }   # prices the backstop stop
 # entry_rule = "REFERENCE_AS_COLLAR"               # owner decision: a stated index level anchors the entry
-# entry_anchor = { max_adverse_move = "10", max_favourable_move = "25", max_signal_age_seconds = 60, anchor_scope = "SENTENCE_STRICT" }   # index points
+# entry_anchor = { max_adverse_move = "10", max_favourable_move = "25", max_signal_age_seconds = 60, anchor_scope = "SENTENCE_STRICT", max_quote_age_seconds = 3, environment = "PAPER" }   # index points
 #
 # --- an energy future quoted in its own contract month's price, executed in a micro contract
 # --- on the same underlying that trades at that same price (same_series asserts this)
@@ -90,7 +90,7 @@ execution = { sec_type = "STK", asset_class = "ETF", symbol = "TLT", exchange = 
 # roll = { business_days_before = 3, action = "FLATTEN", holidays = [2026-11-26] }
 # level_contract_rule = "FRONT_MONTH"              # owner decision: a level with no month is the front contract's
 # entry_rule = "REFERENCE_AS_COLLAR"               # owner decision: a stated level anchors the entry
-# entry_anchor = { max_adverse_move = "0.5%", max_favourable_move = "1.5%", max_signal_age_seconds = 60, anchor_scope = "SENTENCE_STRICT" }
+# entry_anchor = { max_adverse_move = "0.5%", max_favourable_move = "1.5%", max_signal_age_seconds = 60, anchor_scope = "SENTENCE_STRICT", max_quote_age_seconds = 3, environment = "PAPER" }
 #
 # --- a metal quoted as spot and executed in a future
 # [[mapping]]

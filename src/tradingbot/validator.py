@@ -524,6 +524,9 @@ ANCHOR_BASIS_CAP_MISSING = "ENTRY_ANCHOR_BASIS_CAP_MISSING"
 ANCHOR_MAX_ADVERSE_PCT_CEILING = Decimal(1)
 ANCHOR_MAX_FAVOURABLE_PCT_CEILING = Decimal(2)
 ANCHOR_MAX_SIGNAL_AGE_CEILING_SECONDS = 120
+# The oldest each side of the live streaming quote may be at an anchored decision (owner, 12
+# November 2026: per-side freshness; a delayed quote is never eligible).
+ANCHOR_MAX_QUOTE_AGE_CEILING_SECONDS = 5
 
 
 def move_limit(spec: str | None, anchor: Decimal) -> Decimal | None:

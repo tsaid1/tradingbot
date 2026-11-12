@@ -138,10 +138,15 @@ def test_a_reference_series_level_names_nothing_or_the_reference(tmp_path):
     f.write_text(service_mapping(scope="SINGLE_MARKET_POST"))
     p = MappingPolicy.from_toml(f)
     from test_entry_anchor_context import idx_action
-    own = "We are now long $QIDX from support."
-    for line, reason in (("5,010 now.", None), ("QIDX 5,010 now.", None),
-                         ("QIF 5,010 now.", "ENTRY_ANCHOR_REFERENCE_UNNAMED")):
-        post = f"{own}\nStop 4,980.\n{line}"
+    own = "We are now long $QIDX on a dip."
+    # Owner's safeguard (12 Nov 2026): a bare level line right after "Stop 4,980." holds (it may
+    # be the stop), so the stop line follows the level here.
+    for line, reason, stop_first in (
+            ("5,010 now.", None, False), ("QIDX 5,010 now.", None, False),
+            ("QIDX 5,010 now.", None, True),  # names the reference: explicit, any neighbour
+            ("5,010 now.", "ENTRY_ANCHOR_LEVEL_NOT_MARKET_QUOTE", True),
+            ("QIF 5,010 now.", "ENTRY_ANCHOR_REFERENCE_UNNAMED", False)):
+        post = f"{own}\nStop 4,980.\n{line}" if stop_first else f"{own}\n{line}\nStop 4,980."
         parsed = ParsedPost(actions=[idx_action()])
         _, [d] = p.apply(parsed, clauses={"a1": own}, now=MAP_NOW, post_text=post,
                          levels={"a1": [("REFERENCE", "5010"), ("STOP", "4980")]})

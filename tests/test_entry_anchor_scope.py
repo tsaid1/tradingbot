@@ -61,10 +61,19 @@ def test_a_level_sentence_right_after_the_actions_own_instruction_anchors(tmp_pa
 
 
 @pytest.mark.parametrize("rule", [STRICT, BLOCK])
-def test_a_level_sentence_after_an_allow_listed_stop_sentence_anchors(tmp_path, rule):
-    d = decide(tmp_path, rule, f"{OWN} Stop 48.90.\n50.10 now.")
+def test_a_level_sentence_after_an_allow_listed_sentence_anchors(tmp_path, rule):
+    d = decide(tmp_path, rule, f"{OWN} We are long.\n50.10 now.")
     assert d.status == "SUPPORTED", d.reason
     assert d.anchor_attribution == "AFTER_ALLOW_LISTED_SENTENCE"
+
+
+@pytest.mark.parametrize("rule", [STRICT, BLOCK])
+def test_a_level_sentence_after_a_stop_sentence_now_holds(tmp_path, rule):
+    """Owner's safeguard (12 Nov 2026): "Stop 48.90." then "50.10 now." may be the stop."""
+    d = decide(tmp_path, rule, f"{OWN} Stop 48.90.\n50.10 now.")
+    assert d.status == "UNRESOLVED", d.reason
+    assert d.reason.split(",")[:2] == ["ENTRY_ANCHOR_LEVEL_NOT_MARKET_QUOTE",
+                                       "LEVEL_KIND:STOP_OR_TARGET"]
 
 
 def test_a_stop_sentence_with_other_words_holds_because_its_block_is_not_exposed(tmp_path):
@@ -113,7 +122,11 @@ def test_action_block_allow_lists_every_sentence_of_the_actions_own_clause(tmp_p
     assert d.status == "UNRESOLVED" and d.entry_anchor is None, d.reason
 
 
-def test_action_block_accepts_a_clean_clause_with_its_own_stop(tmp_path):
+def test_action_block_accepts_a_clean_clause_and_its_own_stop_after_the_level(tmp_path):
+    clause = "We are now long $QETF."
+    d = decide(tmp_path, BLOCK, f"{clause}\n50.10 now.\nStop 48.90.", clause=clause)
+    assert d.status == "SUPPORTED", d.reason
+    # Owner's safeguard (12 Nov 2026): a level sentence right after the stop sentence holds.
     clause = "We are now long $QETF. Stop 48.90."
     d = decide(tmp_path, BLOCK, f"{clause}\n50.10 now.", clause=clause)
-    assert d.status == "SUPPORTED", d.reason
+    assert d.reason.split(",")[0] == "ENTRY_ANCHOR_LEVEL_NOT_MARKET_QUOTE", d.reason
