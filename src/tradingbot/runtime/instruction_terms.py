@@ -63,6 +63,9 @@ STRIKE_RIGHT_RE = re.compile(
     re.IGNORECASE,
 )
 RIGHT_RE = re.compile(r"\b(?P<right>call|put)s?\b", re.IGNORECASE)
+# A compact strike and right: 105C, 92.5P (review F7). It is option language on its own.
+COMPACT_STRIKE_RE = re.compile(r"(?<![\w.$-])\$?(?P<strike>\d+(?:\.\d+)?)(?P<right>[CP])\b",
+                               re.IGNORECASE)
 # Words naming a multi-leg option strategy (review F3). Any of them in an option instruction HOLDs.
 STRATEGY_RE = re.compile(
     r"\b(?P<word>spread|vertical|calendar|diagonal|straddle|strangle|condor|butterfl(?:y|ies)|"
@@ -149,7 +152,8 @@ def extract_terms(clause: str | None) -> InstructionTerms:
             (m.group(0), m.group("root"), _CODE_MONTH[m.group("code")], m.group("yy")))
     out.upper_words = UPPER_WORD_RE.findall(clause)
     out.option_language = (OPTION_LANGUAGE_RE.search(clause) is not None
-                           or OPTION_ONLY_STRATEGY_RE.search(clause) is not None)
+                           or OPTION_ONLY_STRATEGY_RE.search(clause) is not None
+                           or COMPACT_STRIKE_RE.search(clause) is not None)
     for m in ISO_DATE_RE.finditer(clause):
         try:
             d = date(int(m.group("y")), int(m.group("m")), int(m.group("d")))
@@ -166,6 +170,13 @@ def extract_terms(clause: str | None) -> InstructionTerms:
             out.strikes.append(strike)
     for m in RIGHT_RE.finditer(clause):
         right = m.group("right").upper()
+        if right not in out.rights:
+            out.rights.append(right)
+    for m in COMPACT_STRIKE_RE.finditer(clause):
+        strike = Decimal(m.group("strike"))
+        right = "CALL" if m.group("right").upper() == "C" else "PUT"
+        if strike > 0 and strike not in out.strikes:
+            out.strikes.append(strike)
         if right not in out.rights:
             out.rights.append(right)
     for m in STRATEGY_RE.finditer(clause):

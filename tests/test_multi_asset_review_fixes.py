@@ -537,3 +537,24 @@ def test_f6_an_option_idea_exit_binds_to_its_own_contract_without_option_words(t
                                             held=held)
     assert d.status == "SUPPORTED" and d.family == "QSTK.OPT"
     assert (inst.strike, inst.option_right, inst.expiry) == ("105", "CALL", "2026-09-18")
+
+
+# ================================================================== F7: compact strike-right
+
+@pytest.mark.parametrize("token,right", [("105C", "CALL"), ("105c", "CALL"), ("105P", "PUT")])
+def test_f7_a_compact_strike_and_right_is_option_language(tmp_path, token, right):
+    """Reviewer probe: "$QSTK 2026-09-18 105C" resolved to the stock family."""
+    d, inst = demo_policy(tmp_path).resolve(
+        opening("QSTK"), clause=f"We are now long $QSTK 2026-09-18 {token} at 4.22.", now=MAP_NOW)
+    assert d.family == "QSTK.OPT"
+    if right == "CALL":
+        assert d.status == "SUPPORTED" and (inst.strike, inst.option_right) == ("105", "CALL")
+    else:  # the shipped demo lists no put: the broker would not resolve it, but the terms do
+        assert d.status == "SUPPORTED" and inst.option_right == "PUT"
+
+
+def test_f7_compact_strikes_count_towards_the_single_leg_rule(tmp_path):
+    d, _ = demo_policy(tmp_path).resolve(
+        opening("QSTK"), clause="We are now long $QSTK 2026-09-18 105C 110C at 4.22.",
+        now=MAP_NOW)
+    assert d.status == "UNRESOLVED" and d.reason.startswith("OPTION_STRATEGY_NOT_SINGLE_LEG")
