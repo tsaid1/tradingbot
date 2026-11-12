@@ -427,15 +427,30 @@ class SimBroker:
 
     def expire_day_orders(self) -> int:
         """Test control: the session ends and every working DAY order expires (IBKR reports it
-        cancelled). Positions are unchanged. Returns the number expired."""
+        cancelled). Bracket children still waiting on an expired parent are cancelled with it, as
+        IBKR cancels attached orders with their parent. Positions are unchanged. Returns the
+        number of DAY orders expired."""
         placeholders = ",".join("?" * len(WORKING_STATUSES))
         with self._tx() as c:
             self._settle(c)
+            now = self._now().isoformat()
+            expired = [
+                r["order_ref"] for r in c.execute(
+                    f"SELECT order_ref FROM sim_orders WHERE tif='DAY' AND status IN ({placeholders})",
+                    [s.value for s in WORKING_STATUSES],
+                ).fetchall()
+            ]
             cur = c.execute(
                 f"UPDATE sim_orders SET status='Cancelled', reason='DAY_ORDER_EXPIRED', "
                 f"updated_at=? WHERE tif='DAY' AND status IN ({placeholders})",
-                [self._now().isoformat(), *[s.value for s in WORKING_STATUSES]],
+                [now, *[s.value for s in WORKING_STATUSES]],
             )
+            for ref in expired:
+                c.execute(
+                    """UPDATE sim_orders SET status='Cancelled', reason='PARENT_CANCELLED',
+                    updated_at=? WHERE parent_ref=? AND status='PreSubmitted' AND activated=0""",
+                    (now, ref),
+                )
             return cur.rowcount
 
     def orders_with_ref(self, order_ref: str) -> list[BrokerOrder]:
