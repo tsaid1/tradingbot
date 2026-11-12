@@ -1,5 +1,9 @@
 """Operator settlement: a human records what they established at the broker. Nothing here sends,
-amends or cancels an order; every function only reads the broker and writes the store.
+amends or cancels an order; every function only reads the broker and writes the store. A
+settlement reads with ``sync(record_only=True)`` and leaves protective upkeep (sizing or cancelling
+protective orders, cancels under the halt) to the next normal cycle. ``lift_verified_blocks`` and
+``clear_exception`` run inside the normal cycle and use its full sync, which may resize or cancel
+protective orders and cancel working entries under the halt (risk-reducing only).
 
 * ``settle_intent``: an intent of unknown outcome (RECORDED / UNRESOLVED; an entry or add is never
   resent, so past the lookup horizon only a human can end it) is settled as exactly one of
@@ -207,8 +211,9 @@ def settle_intent(
         return refuse(problems)
     before = _state(coord, order_ref, idea)
 
-    # Broker evidence first: everything visible is adopted by sync (fills of every known ref).
-    if not coord.sync():
+    # Broker evidence first: everything visible is recorded (fills of every known ref); nothing is
+    # sent, amended or cancelled by this call (review note a).
+    if not coord.sync(record_only=True):
         return refuse(["BROKER_UNREADABLE"], before)
     try:
         open_orders = coord.broker.open_orders()
@@ -262,15 +267,11 @@ def settle_intent(
 
     _apply_settlement(coord, intent, rows, outcome, declared - applied, price, request_id,
                       operator, note, before)
-    coord.sync()  # protection is sized and confirmed (or flagged) exactly as after a fill
+    # Read and record only: the next normal cycle sizes and confirms protection exactly as after
+    # a broker fill (a declared fill with no confirmed stop opens UNPROTECTED_POSITION then), and
+    # its verification pass is the earliest a block can lift (review F1, note a).
     after = _state(coord, order_ref, idea)
-    lifted: list[int] = []
-    if outcome == "FILLED":
-        # A NOT_AT_BROKER or CANCELLED block never lifts in the call that records it (review F1).
-        lifted = lift_verified_blocks(coord)
-        if lifted:
-            after = _state(coord, order_ref, idea)
-    return OperatorResult(status="APPLIED", before=before, after=after, lifted=lifted)
+    return OperatorResult(status="APPLIED", before=before, after=after, lifted=[])
 
 
 def _fill_problems(coord, intent: Intent, quantity: int, price: Decimal, applied: int) -> list[str]:

@@ -147,6 +147,8 @@ def test_filled_beyond_the_horizon_creates_the_position_as_a_broker_fill_would(h
     [fill] = h.coord.store.fills(ref)
     assert fill["exec_id"] == "OPERATOR:777" and fill["quantity"] == 4
     assert h.coord.intent(ref).state == IntentState.FILLED
+    assert open_kinds(h) == [C.OPERATOR_SETTLEMENT_UNVERIFIED]  # never lifted in the same call
+    assert S.lift_verified_blocks(h.coord)  # the next normal cycle: clean, so it lifts
     assert open_kinds(h) == [] and h.coord.reconcile().clean
     # The same request applied again changes nothing (crash between journal and result).
     again = settle(h, ref, "FILLED", quantity=4, avg_price="50.02", request_id=777)
@@ -169,6 +171,7 @@ def test_declared_fill_without_a_confirmed_stop_is_flagged_unprotected_and_stays
     result = settle(h, out.order_ref, "FILLED", quantity=4, avg_price="50.02")
 
     assert result.status == "APPLIED"
+    h.coord.sync()  # the next normal cycle sizes and confirms protection, as after a broker fill
     pos = h.coord.store.position("p1:open")
     assert pos.quantity == 4 and pos.protection == "UNPROTECTED"
     kinds = open_kinds(h)
@@ -571,3 +574,29 @@ def test_the_queue_wants_the_quantity_and_price_in_a_filled_confirmation(tmp_pat
     with pytest.raises(Q.OperatorInputError, match="type exactly"):
         queue.enqueue(**common, confirmation="SETTLE TB-x FILLED")
     assert queue.enqueue(**common, confirmation=want) == 1
+
+
+def test_a_settlement_only_reads_and_records_and_leaves_upkeep_to_the_normal_cycle(h):
+    """Review note (a): the settlement's own call sends, amends and cancels nothing, not even
+    the risk-reducing housekeeping a sync does (here: cancelling a working entry under the halt).
+    The next normal cycle does that."""
+    h.broker.set_quote("ZZR", "19.98", "20.02")
+    h.broker.script_next_submit("REST")
+    working = h.execute("p0", open_action(symbol="ZZR", entry="20", stop="19", target="22"))
+    assert working.state == IntentState.WORKING
+    ref = never_arrived(h, "p1")
+    h.halt()
+    calls = []
+    for name in ("submit", "modify", "cancel", "modify_condition"):
+        real = getattr(h.broker, name)
+
+        def counting(*a, _real=real, _name=name, **k):
+            calls.append(_name)
+            return _real(*a, **k)
+
+        setattr(h.broker, name, counting)
+    result = settle(h, ref, "NOT_AT_BROKER")
+    assert result.status == "APPLIED" and calls == []
+    assert "HALT_ENTRY_CANCELLED" not in h.events(working.order_ref)
+    h.coord.sync()  # the normal cycle
+    assert "cancel" in calls and "HALT_ENTRY_CANCELLED" in h.events(working.order_ref)

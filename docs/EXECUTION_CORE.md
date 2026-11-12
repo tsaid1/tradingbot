@@ -261,13 +261,19 @@ Duplicate delivery of a post revision is stopped twice:
 `execution/settlement.py` lets a human end what the coordinator never ends by itself (an entry or
 add of unknown outcome, above all one beyond the lookup horizon). `settle_intent` declares one
 intent `NOT_AT_BROKER`, `CANCELLED` or `FILLED` (quantity, average price) after the operator
-checked the broker. It sends nothing. It syncs first, then refuses a declaration the broker
+checked the broker. Its own call only reads and records: it sends, amends and cancels nothing,
+not even protective upkeep, which the next normal sync does. It reads first
+(`sync(record_only=True)`), then refuses a declaration the broker
 contradicts (the order or its fills visible, a fill outside the limit, off tick or increment, or a
 resulting follower position the broker's cannot equal, allowing only for other intents of unknown
 outcome in the contract). A declared fill goes through `apply_fill` (`exec_id = OPERATOR:<request>`)
 so protection must then be confirmed at the broker like any fill. The settlement opens
-`OPERATOR_SETTLEMENT_UNVERIFIED`, a blocking kind that only `lift_verified_blocks` resolves, after
-a full successful sync and a reconciliation with no blocking discrepancy in that contract.
+`OPERATOR_SETTLEMENT_UNVERIFIED`, a blocking kind that only `lift_verified_blocks` resolves, never
+in the call that records the settlement, after a full successful sync and a reconciliation with no
+blocking discrepancy in that contract. After `NOT_AT_BROKER` or `CANCELLED` it also needs the
+exit-resend evidence rule after the settlement (settle period, `exit_no_trace_lookups` no-trace
+lookups spread over it). Broker evidence for such an intent later opens
+`SETTLED_INTENT_CONTRADICTED` (blocking, a safety discrepancy in reconciliation, CLEAR-class).
 `clear_exception` (a `LEDGER_REVERSAL`, verified the same way) and `acknowledge_exception`
 (records that block nothing) complete the set; `operator_catalog.py` classes every exception kind.
 Every action, applied or refused, is journaled with its before and after state.

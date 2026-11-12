@@ -66,7 +66,10 @@ the execution journal records the result under that id with its target and outco
 is applied exactly once and never answered with another request's result.
 
 * `settle <ref> NOT_AT_BROKER | CANCELLED | FILLED --quantity N --price P`: declares the outcome
-  of an intent whose outcome is unknown, once you have checked the broker. The confirmation is
+  of an intent whose outcome is unknown, once you have checked the broker. Applying it reads the
+  broker and records the declaration; it sends, amends and cancels nothing. Protective upkeep
+  (sizing or cancelling the stop to the declared position, cancels under the halt) happens in the
+  service's next normal cycle, as after any broker fill. The confirmation is
   `SETTLE <ref> <outcome>`; for `FILLED` it also names what you declare,
   `SETTLE <ref> FILLED <N> @ <P>` (the price exactly as you typed it), so a mistyped size or price
   is not confirmed by habit. The ledger moves exactly

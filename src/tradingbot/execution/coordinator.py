@@ -515,9 +515,12 @@ class ExecutionCoordinator:
             raise BrokerUnreadable("broker state could not be read; recovery incomplete")
         return out
 
-    def sync(self, *, _rerun: bool = True) -> bool:
+    def sync(self, *, _rerun: bool = True, record_only: bool = False) -> bool:
         """Apply new broker fills to the ledger, refresh working orders, keep protection sized.
-        Returns False when the broker could not be read (nothing is changed then)."""
+        Returns False when the broker could not be read (nothing is changed then).
+        ``record_only``: read the broker and record what it shows (fills, order states,
+        contradictions) but send, amend and cancel nothing; protective upkeep and housekeeping
+        cancels are left to the next normal sync (an operator settlement uses this)."""
         now = self.clock()
         try:
             fills = self.broker.executions()
@@ -563,6 +566,8 @@ class ExecutionCoordinator:
                 )
         self._refresh_orders(open_orders, now, completed)
         touched |= self._settlement_contradictions(open_orders, fills, completed, now)
+        if record_only:
+            return True
         asked = self._cancel_stopped_out_entries(open_orders)
         if _rerun and self.halted() and self._cancel_entries_for_halt(open_orders):
             asked = True
