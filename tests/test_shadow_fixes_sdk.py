@@ -626,3 +626,23 @@ def test_a_refused_shadow_cancel_alert_is_swept_once_the_order_is_otherwise_term
     sh.step()
     assert _refused_alerts(sh) == []
     sh.close()
+
+
+def test_a_refused_shadow_cancel_alert_is_swept_when_a_later_read_qualifies_the_order(
+        shadow, tws, monkeypatch):
+    sh = shadow([post("1", 0, RESTING)])
+    fresh = _above_the_limit(sh)
+    run_until_processed(sh, 1, before=fresh)
+    intent, _ = _entry_life(sh)
+    sh.sim().script_next_cancel("REJECT")
+    _delayed(sh, 88.39, 88.43)  # the ask stays above the 88.40 limit: nothing can fill
+    sh.step()
+    [a] = _refused_alerts(sh)
+    assert "next read that does not qualify it" in a["detail"]
+    # The next reads qualify the order (the opening test passes), so no cancel is needed now.
+    monkeypatch.setattr(SB, "opening_problem", lambda *a, **k: None)
+    sh.step()
+    assert intent.order_ref in {o.order_ref for o in sh.sim().open_orders()}
+    assert len(sh.events("SHADOW_OPENING_CANCEL_REFUSED")) == 1
+    assert _refused_alerts(sh) == []
+    sh.close()

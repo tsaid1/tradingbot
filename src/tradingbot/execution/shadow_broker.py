@@ -521,7 +521,12 @@ class ShadowBroker:
                     and o.parent_ref is None
                     and (code := opening_problem(quote, at, self.opening_limit(o.order_ref)))]
 
-        for o, code in unqualified():
+        bad = unqualified()
+        refs = {o.order_ref for o, _ in bad}
+        for ref in [r for r, v in self.cancel_refusals.items()
+                    if v["contract_key"] == key and r not in refs]:
+            del self.cancel_refusals[ref]  # this read qualifies it: no cancel is needed now
+        for o, code in bad:
             if o.status.value == "PendingCancel":
                 continue
             try:
@@ -546,6 +551,8 @@ class ShadowBroker:
     def open_cancel_refusals(self) -> dict[str, dict]:
         """The refused shadow cancels whose order is still working in the simulator (one that
         has since ended, cancelled or otherwise, is dropped)."""
+        if not self.cancel_refusals:
+            return {}
         working = {o.order_ref for o in self._sim.open_orders()}
         for ref in [r for r in self.cancel_refusals if r not in working]:
             del self.cancel_refusals[ref]

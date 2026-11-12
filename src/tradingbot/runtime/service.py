@@ -1009,9 +1009,12 @@ class RuntimeService:
             keep.add(key)
             self.alerter.raise_(
                 key, N.SHADOW_OPENING_CANCEL_REFUSED, "Shadow opening cancel refused",
-                f"{ref} {r['contract_key']}: {r['code']}: the simulator refused the cancel of a "
-                f"resting opening order (since {r['since']}); the read was not published, so "
-                "nothing matched on it, and the cancel is retried at the next read", now)
+                f"{ref} {r['contract_key']}: {r['code']}: the simulator refused the shadow "
+                f"cancel of this resting opening order on a read that did not qualify it (since "
+                f"{r['since']}); that read was not published, so nothing matched on it. The "
+                "cancel is tried again at the next read that does not qualify it; the alert "
+                "closes once a read qualifies the order, the cancel succeeds or the order ends",
+                now)
         self.alerter.sweep("SHADOW:CANCEL_REFUSED:", keep, now)
 
     def _opening_limit(self, order_ref: str) -> float | None:
