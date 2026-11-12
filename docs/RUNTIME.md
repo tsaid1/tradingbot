@@ -302,8 +302,16 @@ the mention-with-context rule (`ENTRY_ANCHOR_POST_UNRESOLVED_MARKET`, `RULE:MENT
 was seen next to a price or a trading word, so it may be another market: whatever its kind, it is
 proposed as ambiguous (no list) and the page and the final table show, as plain text, "seen with a
 price or a trading word; may be another market". The warning comes from the review log's
-evidence, never from a proposals file: a file may suggest another group, the warning stays, and
-the final table repeats it beside the word when the owner accepts it into a list. One line:
+evidence, never from a proposals file: a file may suggest another group, but a warned word is
+always pre-selected as ambiguous, and the final table repeats the warning beside the word when the
+owner accepts it into a list. The warning belongs to the **word**, not to a (word, kind) pair: the
+plain batch shows ONE proposal per word with all its kinds, so a warned word is never also offered,
+unwarned, under another kind. "The same word" (`vocab_review.word_key`) is what the anchor rule
+and the mention detector compare: case-insensitive, edge punctuation and a leading `#`, `$` or `@`
+removed, a possessive `'s` removed. A phrase or compound one of whose parts (split on spaces, `/`,
+`.`, `-`) is a warned word is warned too. A plural is a different word: the detector does not fold
+it, so the plural in the lexicon does not remove the original's hold. The warning flag is part of
+the batch digest. One line:
 
 ```json
 {"schema": "tradingbot.vocab_proposal/1", "token": "zorbs", "group": "MARKET_NAME",
@@ -367,8 +375,16 @@ changes only through *Apply batch* (or the owner editing the file by hand).
 candidate) lies outside **this program's repository** (the checkout it runs from, its main
 checkout and every linked worktree of it, compared by their common git directory), outside any
 `.git` directory and outside any bare repository; the service refuses to start otherwise, and
-refuses a group- or world-readable review log. When this program's repository cannot be
-determined (an installed package, no git checkout), every git work tree is refused (fail closed).
+refuses a group- or world-readable review log. "Inside" is decided by **file identity** (device
+and inode of every existing enclosing directory, compared with this program's checkout, its main
+checkout, every linked worktree recorded in the common git directory and the git directory
+itself), never by comparing strings, so a case or Unicode-normalisation variant of a directory
+name or a symlinked parent cannot pass on a file system that folds them (macOS does); string checks
+remain as an extra refusal, and any error while checking refuses. A repository nested inside
+this program's main checkout is therefore refused too, also when the service runs from a linked
+worktree. When this program's repository cannot be determined (an installed package, no git
+checkout, a git directory that does not exist), every git work tree is refused (fail closed); so is
+another work tree whose own git directory cannot be found.
 A path inside **any other** git work tree is allowed (the Product Owner's decision: the owner's
 workspace is itself a private repository) and warned: a banner on the page saying the file could
 be committed to that repository by mistake and that the tool cannot prevent it, and, when the

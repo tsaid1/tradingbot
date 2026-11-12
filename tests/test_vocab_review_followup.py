@@ -120,7 +120,8 @@ def test_a_proposals_file_cannot_remove_the_warning(monkeypatch, local, tmp_path
             "families": ["TLT"], "reasons": ["ENTRY_ANCHOR_POST_UNRESOLVED_MARKET"]},
         "examples": [{"source_id": "1"}]}) + "\n")
     props, *_ = V.load_batch(log, lex, V.default_proposals_path(log))
-    assert props[0].group == V.NON_MARKET and props[0].market_warning
+    # The file's group is not pre-selected for a warned word (PR #71 review): ambiguous.
+    assert props[0].group == V.AMBIGUOUS and props[0].market_warning
     at = page_for(monkeypatch, tmp_path, log, lex)
     assert WARNING in plain(at)
 

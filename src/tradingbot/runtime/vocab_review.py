@@ -199,33 +199,84 @@ def common_git_dir(tree: Path) -> Path | None:
 
 def code_git_dir() -> Path | None:
     """The common git directory of the checkout this program runs from (main checkout or linked
-    worktree), or None when it cannot be determined (an installed package, no git)."""
-    return common_git_dir(REPO_ROOT)
+    worktree), or None when it cannot be determined (an installed package, no git, or a git
+    directory that does not exist): then every git work tree is refused."""
+    code = common_git_dir(REPO_ROOT)
+    return code if code is not None and code.is_dir() else None
+
+
+def _identity(path: Path) -> tuple[int, int] | None:
+    """(device, inode) of ``path``, None when it does not exist. Any other error propagates (the
+    caller refuses)."""
+    try:
+        st = os.stat(path)
+    except FileNotFoundError:
+        return None
+    return (st.st_dev, st.st_ino)
+
+
+def _code_identities(code: Path) -> set[tuple[int, int]]:
+    """File identities of this program's repository: the checkout it runs from, the common git
+    directory, the main checkout and every linked worktree recorded under ``worktrees/``."""
+    places = [Path(REPO_ROOT), code]
+    if code.name == ".git":
+        places.append(code.parent)  # the main checkout
+    worktrees = code / "worktrees"
+    if worktrees.is_dir():
+        for d in worktrees.iterdir():
+            places.append(d)
+            gitdir = d / "gitdir"
+            if gitdir.is_file():
+                places.append(Path(gitdir.read_text(encoding="utf-8").strip()).parent)
+    return {i for i in map(_identity, places) if i is not None}
 
 
 def check_private_path(path: str | Path, what: str) -> Path:
     """``path`` with its folders resolved (the last part is not followed). Refused inside this
-    program's repository (its main checkout and every linked worktree of it), inside a ``.git``
-    directory and inside a bare repository; when this program's repository cannot be determined,
-    inside any git work tree (fail closed). A path inside ANY OTHER git work tree is allowed (the
-    Product Owner's decision) and warned by ``git_tree_class``."""
+    program's repository (the checkout it runs from, its main checkout, every linked worktree of
+    it and its git directory), inside a ``.git`` directory and inside a bare repository; when this
+    program's repository cannot be determined, inside any git work tree (fail closed). A path
+    inside ANY OTHER git work tree is allowed (the Product Owner's decision) and warned by
+    ``git_tree_class``.
+
+    "Inside this program's repository" is decided by FILE IDENTITY (device and inode) of every
+    existing enclosing directory, never by comparing strings, so a case or Unicode-normalisation
+    variant or a symlinked parent cannot slip past on a file system that folds them. String
+    checks remain as an extra refusal. Any error while checking refuses."""
+    try:
+        return _check_private_path(path, what)
+    except PrivatePathError:
+        raise
+    except (OSError, ValueError) as exc:
+        raise PrivatePathError(f"the {what} could not be checked against this program's "
+                               f"repository ({type(exc).__name__}); refused") from None
+
+
+def _check_private_path(path: str | Path, what: str) -> Path:
     raw = Path(path).expanduser()
     target = Path(os.path.realpath(raw.parent)) / raw.name
     root = Path(os.path.realpath(REPO_ROOT))
     if target == root or root in target.parents:
         raise PrivatePathError(f"the {what} must lie outside this program's repository ({root}): "
                                "private text never enters the repository tree")
-    if ".git" in target.parent.parts:
+    if any(part.lower() == ".git" for part in target.parent.parts):
         raise PrivatePathError(f"the {what} may not lie inside a git directory")
+    code = code_git_dir()
+    if code is not None:
+        ours = _code_identities(code)
+        for folder in (target.parent, *target.parent.parents):
+            if _identity(folder) in ours:
+                raise PrivatePathError(
+                    f"the {what} must lie outside this program's repository: {folder} is (the "
+                    "same directory as) its checkout, a work tree of it or its git directory")
     tree = git_work_tree(target.parent)
     if tree is not None:
-        code = code_git_dir()
         if code is None:
             raise PrivatePathError(
                 f"the {what} lies in a git work tree ({tree}) and this program's repository "
                 "cannot be determined (no git checkout), so every git work tree is refused")
         theirs = common_git_dir(tree)
-        if theirs is None or theirs == code:
+        if theirs is None or _identity(theirs) is None or _identity(theirs) == _identity(code):
             raise PrivatePathError(
                 f"the {what} must lie outside this program's repository: {tree} is a work tree "
                 "of it (or its git directory cannot be read)")
@@ -358,6 +409,33 @@ def normalise(token: str) -> str:
     return " ".join(str(token).lower().split())
 
 
+_KEY_EDGE = "()[]{}.,;:!?\"'\u2018\u2019"
+
+
+def word_key(token: str) -> str:
+    """"The same word", as the anchor rule and the mention detector compare it: lower case, edge
+    punctuation and a leading ``#``, ``$`` or ``@`` removed, a possessive ``'s`` removed,
+    whitespace collapsed. A plural is a different word (the detector does not fold it)."""
+    out = []
+    for w in str(token).replace("\u2019", "'").split():
+        w = w.strip(_KEY_EDGE).lstrip("#$@").strip(_KEY_EDGE).lower()
+        w = w.removesuffix("'s")
+        if w:
+            out.append(w)
+    return " ".join(out)
+
+
+def word_parts(token: str) -> set[str]:
+    """The words of a token or phrase, also split on ``/``, ``.`` and ``-`` (the detector reads
+    "EUR/USD" part by part, and each word of a phrase becomes understood)."""
+    return {p for p in re.split(r"[\s/.\-]+", word_key(token)) if p}
+
+
+def is_warned(token: str, warned: set[str]) -> bool:
+    """Is any part of ``token`` a word the review log saw with a price or a trading word?"""
+    return bool(word_parts(token) & {p for w in warned for p in word_parts(w)})
+
+
 def known_words(lexicon_path: str | Path | None) -> set[str]:
     """Words already decided: every phrase of the lexicon's entry_anchor lists and every word
     recorded as a different market. Empty when there is no readable lexicon."""
@@ -385,7 +463,7 @@ def _mention_with_context(entry: dict) -> bool:
 
 def market_warning_words(entries: list[dict]) -> set[str]:
     """The words the review log saw in a mention-with-context hold."""
-    return {normalise(t["token"]) for e in entries if _mention_with_context(e)
+    return {word_key(t["token"]) for e in entries if _mention_with_context(e)
             for t in e.get("tokens") or () if isinstance(t, dict) and t.get("token")}
 
 
@@ -403,7 +481,7 @@ def candidates(entries: list[dict], *, lexicon_path: str | Path | None = None) -
         for t in e.get("tokens") or ():
             if not isinstance(t, dict) or not t.get("token"):
                 continue
-            key = (normalise(t["token"]), str(t.get("kind") or "UNKNOWN"))
+            key = (word_key(t["token"]), str(t.get("kind") or "UNKNOWN"))
             if key[0] in known or key in seen:
                 continue
             seen.add(key)
@@ -493,7 +571,7 @@ def _proposal(raw: dict) -> Proposal | None:
             if len(refs) < MAX_EXAMPLES:
                 refs.append(ref)
     return Proposal(
-        token=normalise(token), group=group, family=family,
+        token=word_key(token), group=group, family=family,
         meaning=raw.get("meaning") if isinstance(raw.get("meaning"), str) else "",
         kind=raw.get("kind") if isinstance(raw.get("kind"), str) else None,
         posts=_count(evidence.get("posts")), holds=_count(evidence.get("holds")),
@@ -567,29 +645,49 @@ _INSTRUCTION_ROLES = {"LEVEL", "INSTRUCTION"}
 
 def proposals_from_log(entries: list[dict], *, lexicon_path: str | Path | None = None
                        ) -> list[Proposal]:
-    """A plain batch from the review log by kind: a proper noun is a non-market word; a market
-    noun or instrument phrase seen in posts of one family is another name of that family; an
-    unknown word of an instruction sentence is an instruction phrase; anything else is
-    ambiguous. Meaning empty, measured change not measured."""
-    out = []
+    """A plain batch from the review log, ONE proposal per word (``word_key``) with all its kinds.
+    A word the log saw with a price or a trading word (a mention-with-context hold), in any form,
+    is ambiguous and warned whatever its kinds. Otherwise by kind: a proper noun is a non-market
+    word; a market noun or instrument phrase seen in posts of one family is another name of that
+    family; an unknown word of an instruction sentence is an instruction phrase; several kinds or
+    anything else is ambiguous. Meaning empty, measured change not measured."""
+    warned = market_warning_words(entries)
+    by_word: dict[str, list[Candidate]] = {}
     for c in candidates(entries, lexicon_path=lexicon_path):
+        by_word.setdefault(c.token, []).append(c)
+    posts: dict[str, set] = {}
+    for e in entries:
+        if vocabulary_hold(str(e.get("reason_code") or ""), e.get("reason_detail")):
+            for t in e.get("tokens") or ():
+                if isinstance(t, dict) and t.get("token"):
+                    posts.setdefault(word_key(t["token"]), set()).add(
+                        e.get("source_id") or e.get("post_id"))
+    out = []
+    for token, cs in by_word.items():
+        kinds = sorted({c.kind for c in cs})
+        families = sorted({f for c in cs for f in c.families})
+        roles = {r for c in cs for r, _ in c.sentences}
+        warn = is_warned(token, warned) or any(c.may_be_market for c in cs)
         family = None
-        roles = {r for r, _ in c.sentences}
-        if c.may_be_market:
-            group = AMBIGUOUS  # seen with a price or a trading word: the owner decides
-        elif c.kind == "PROPER_NOUN":
+        if warn or len(kinds) > 1:
+            group = AMBIGUOUS
+        elif kinds == ["PROPER_NOUN"]:
             group = NON_MARKET
-        elif c.kind in ("MARKET_NOUN", "INSTRUMENT_PHRASE") and len(c.families) == 1:
-            group, family = MARKET_NAME, c.families[0]
-        elif c.kind == "UNKNOWN_WORD" and roles and roles <= _INSTRUCTION_ROLES:
+        elif kinds[0] in ("MARKET_NOUN", "INSTRUMENT_PHRASE") and len(families) == 1:
+            group, family = MARKET_NAME, families[0]
+        elif kinds == ["UNKNOWN_WORD"] and roles and roles <= _INSTRUCTION_ROLES:
             group = INSTRUCTION_PHRASE
         else:
             group = AMBIGUOUS
-        out.append(Proposal(token=c.token, group=group, family=family, kind=c.kind,
-                            posts=c.posts, holds=c.holds, families=list(c.families),
-                            reasons=list(c.reasons), example_refs=list(c.refs),
-                            market_warning=c.may_be_market))
-    return out
+        refs = []
+        for c in cs:
+            refs += [r for r in c.refs if r not in refs]
+        out.append(Proposal(token=token, group=group, family=family, kind=", ".join(kinds),
+                            posts=len(posts.get(token, ())) or max(c.posts for c in cs),
+                            holds=sum(c.holds for c in cs), families=families,
+                            reasons=sorted({r for c in cs for r in c.reasons}),
+                            example_refs=refs[:MAX_EXAMPLES], market_warning=warn))
+    return sorted(out, key=lambda p: (-p.posts, -p.holds, p.token))
 
 
 # ------------------------------------------------------------------ the batch
@@ -646,7 +744,9 @@ def load_batch(review_log_path, lexicon_path, proposals_path) -> tuple[list[Prop
         props, bad_props = read_proposals(path, lexicon_path=lexicon_path)
         warned = market_warning_words(entries)  # the evidence decides, never the file
         for p in props:
-            p.market_warning = p.token in warned
+            p.market_warning = is_warned(p.token, warned)
+            if p.market_warning:  # the owner, never the file, moves it to a list
+                p.group, p.family = AMBIGUOUS, None
         return props, entries, "file", bad + bad_props
     return proposals_from_log(entries, lexicon_path=lexicon_path), entries, "log", bad
 
@@ -691,8 +791,8 @@ def batch_digest(items: list[BatchItem], lexicon_path: str | Path) -> str:
         lex = Path(lexicon_path).expanduser().read_bytes()
     except OSError:
         lex = b""
-    rows = [[normalise(i.token), i.verdict, i.group, i.family or "", i.meaning]
-            for i in items if i.verdict in (ACCEPT, KEEP_HOLDING)]
+    rows = [[normalise(i.token), i.verdict, i.group, i.family or "", i.meaning,
+             bool(i.may_be_market)] for i in items if i.verdict in (ACCEPT, KEEP_HOLDING)]
     blob = json.dumps([sorted(rows), hashlib.sha256(lex).hexdigest()], ensure_ascii=False)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 

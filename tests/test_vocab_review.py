@@ -365,15 +365,22 @@ def test_private_paths_inside_the_repository_are_refused_and_other_trees_warned(
     with pytest.raises(V.PrivatePathError, match="repository"):
         V.check_private_path(REPO / "state" / "review.jsonl", "review log")
     tree = tmp_path / "w"
-    tree.mkdir()
-    (tree / ".git").write_text("gitdir: /elsewhere\n")  # a linked worktree of ANOTHER repo
+    (tree / ".git").mkdir(parents=True)  # ANOTHER repository's work tree
     target = tree / "deep" / "review.jsonl"
     assert V.check_private_path(target, "review log") == target.resolve()  # allowed, warned
     assert V.git_tree_class(target) == "OTHER_GIT_WORK_TREE"
+    broken = tmp_path / "w3"
+    broken.mkdir()
+    (broken / ".git").write_text("gitdir: /elsewhere\n")  # its git directory cannot be found
+    with pytest.raises(V.PrivatePathError, match="cannot be read"):  # any doubt refuses
+        V.check_private_path(broken / "deep" / "review.jsonl", "review log")
+    monkeypatch.setattr(V, "REPO_ROOT", tree)  # the program runs from that same work tree
+    with pytest.raises(V.PrivatePathError, match="this program's repository"):
+        V.check_private_path(target, "review log")
     monkeypatch.setattr(V, "REPO_ROOT", tmp_path / "w2")
     (tmp_path / "w2").mkdir()
-    (tmp_path / "w2" / ".git").write_text("gitdir: /elsewhere\n")  # the same repository
-    with pytest.raises(V.PrivatePathError, match="this program's repository"):
+    (tmp_path / "w2" / ".git").write_text("gitdir: /elsewhere\n")  # its own git dir is missing
+    with pytest.raises(V.PrivatePathError, match="cannot be determined"):
         V.check_private_path(target, "review log")
     ok = V.check_private_path(tmp_path / "private" / "review.jsonl", "review log")
     assert ok == (tmp_path / "private" / "review.jsonl").resolve()
