@@ -60,6 +60,10 @@ STOP_RAISE = Decimal("0.10")  # stage 3: the one amendment
 FILL_TIMEOUT_SECONDS = 120.0  # stage 3: wait this long for the entry and for the close
 POLL_SECONDS = 1.0
 READ_BACK_WAIT_SECONDS = 2.0  # stage 2: let the views settle before reading back
+# Stage 1 takes up to this many bounded quote samples in a row and passes on the first one the
+# adapter labels LIVE or DELAYED with a bid and an ask (each sample is recorded).
+STAGE1_QUOTE_SAMPLES = 3
+USABLE_QUALITIES = (QuoteQuality.LIVE.value, QuoteQuality.DELAYED.value)
 # Stage 3: after the entry fill, the protection check is retried (reads only) this long, since
 # the position read can lag the execution.
 PROTECTION_SETTLE_SECONDS = 15.0
@@ -165,15 +169,23 @@ NO_SELL_ON_NUMBERS = "do not sell on this script's numbers"
 TWS_SELL = ("Look at the TLT position in the TWS window. Only if it shows 1: sell 1 there with a "
             "limit at the bid (lower it a tick at a time until it fills) and wait until it shows "
             "0. If it shows 0: do NOT sell.")
-TWS_PROCEDURE = ("In the TWS window: (1) cancel a resting TLT closing limit only if you can see it "
-                 "working there, never the stop; (2) " + TWS_SELL + " (3) Only once TWS shows 0, "
-                 "run abort to cancel what remains. Never run abort while TWS shows 1 and a "
-                 "working stop: abort cancels the stop.")
+TWS_PROCEDURE = ("In the TWS window: (1) open the Trades panel: if it already shows a TLT sale of "
+                 "this experiment today, skip step (3); (2) cancel a resting TLT closing limit "
+                 "only if you can see it working there, never the stop; (3) " + TWS_SELL + " (4) "
+                 "After a manual sale, run abort at once: the protective stop is still working "
+                 "until then and must not trigger on a share you no longer hold. Abort cancels "
+                 "the stop only when this script itself reads the account flat; if it reports the "
+                 "stop left working while TWS shows 0, cancel that TLT stop in the TWS window "
+                 "yourself at once. Never cancel the stop while TWS shows 1.")
+ABORT_STOP_NOTE = ("If the TWS window shows TLT 0 (for example after your manual sale), cancel that "
+                   "TLT stop there yourself at once: it is still working. If TWS shows 1, leave "
+                   "the stop working.")
 
 ABNORMAL_ENDINGS = frozenset({
     "STAGE2_UNEXPECTED_FILL", "STAGE2_PARENT_NOT_CONFIRMED_CANCELLED", "STAGE2_FAILED",
     "STAGE3_ENTRY_NOT_FILLED", "STAGE3_PROTECTION_UNCONFIRMED", "STAGE3_PROTECTION_LOST",
-    "STAGE3_CLOSE_REFUSED", "STAGE3_CLOSE_NOT_FILLED", "STAGE3_NOT_CLEAN"})
+    "STAGE3_CLOSE_REFUSED", "STAGE3_CLOSE_NOT_FILLED", "STAGE3_NOT_CLEAN",
+    "ABORT_STOP_LEFT_WORKING"})
 
 
 def _instruction(state: dict) -> str:
@@ -356,15 +368,40 @@ def _stage1(cfg: PaperOrderConfig, ev: dict) -> None:
         ev["read_only_settings"] = s.read_only_settings
         ev["lookups"] = _lookups(s)
         b = IbkrPaperBroker(s)
-        try:
-            q = b.quote(b.resolve(Instrument(asset_class=AssetClass.ETF, symbol=c.symbol)))
-            ev["quote"] = {"quality": q.quality.value, "bid": str(q.bid), "ask": str(q.ask)}
-        except Exception as exc:  # noqa: BLE001
-            ev["quote"] = {"quality": None, "error": redact_accounts(str(exc))}
+        contract = b.resolve(Instrument(asset_class=AssetClass.ETF, symbol=c.symbol))
+        samples = ev["quote_samples"] = []
+        usable = None
+        for _ in range(STAGE1_QUOTE_SAMPLES):  # bounded; passes on the first usable label
+            b.last_quote_report = None
+            try:
+                q = b.quote(contract)
+                rec = {"quality": q.quality.value, "bid": str(q.bid), "ask": str(q.ask),
+                       **(b.last_quote_report or {})}
+                rec.setdefault("reason", "")
+                ok = (q.quality.value in USABLE_QUALITIES and q.bid is not None and q.bid > 0
+                      and q.ask is not None and q.ask > 0)
+            except Exception as exc:  # noqa: BLE001 - evidence: the sample failed
+                rec = {"quality": None, "reason": redact_accounts(f"{type(exc).__name__}: "
+                                                                  f"{exc}")}
+                ok = False
+            samples.append(rec)
+            if ok:
+                usable = rec
+                break
+        ev["quote"] = usable or samples[-1]
         ev["account_rows_checked"] = not s.poisoned  # a row naming another account poisons
         ev["order_frames_sent"] = s.order_frames_sent
         ev["passed"] = (all(v["completed"] for v in ev["lookups"].values())
-                        and not s.poisoned and s.order_frames_sent == 0)
+                        and not s.poisoned and s.order_frames_sent == 0 and usable is not None)
+        if usable is None:
+            last = samples[-1]
+            ev["result"] = "STAGE1_QUOTE_NOT_USABLE"
+            ev["why_failed"] = (
+                f"STAGE1_QUOTE_NOT_USABLE: {len(samples)} bounded quote sample(s) labelled "
+                f"{[x['quality'] for x in samples]} by the adapter (last reason: "
+                f"{last.get('reason') or 'none given'}; flags {last.get('flags', [])}). Stage 3 "
+                "needs a LIVE or DELAYED quote with a bid and an ask. no order was sent; run "
+                "stage 1 again.")
     finally:
         s.disconnect()
 
@@ -526,7 +563,15 @@ def _stage3(cfg: PaperOrderConfig, ev: dict) -> None:
         c = s.contract
         tick = Decimal(str(c.min_tick))
         q = broker.quote(broker.resolve(Instrument(asset_class=AssetClass.ETF, symbol=c.symbol)))
-        entry = q.ask
+        if q.ask is None or q.ask <= 0:
+            ev.update(passed=False, why_failed="no ask to state the entry from; nothing was sent")
+            return
+        # The owner's choice (private config, 0 when absent, at most caps ceiling): the entry is
+        # STATED at the ask plus that many ticks; the core sends exactly the stated price.
+        ticks = cfg.stage3_entry_allowance_ticks
+        entry = q.ask + ticks * tick
+        ev["entry_price"] = {"ask": str(q.ask), "allowance_ticks": ticks, "tick": str(tick),
+                             "stated_entry": str(entry)}
         stop = _tick_floor(entry - STOP_DISTANCE, tick)
         now = datetime.now(UTC)
         src = ReplaySource(source_id=f"{cfg.experiment.name}-stage3", revision=1,
@@ -617,15 +662,31 @@ def _stage3(cfg: PaperOrderConfig, ev: dict) -> None:
 
 
 def _abort(cfg: PaperOrderConfig, ev: dict) -> None:
-    """Cancel every working order of THIS client by its own order id (children first), then
-    report what remains. Never a global cancel. Works even when the journal is unknown."""
+    """Re-read the position and the experiment's own fills FIRST. Only when they agree on flat
+    does abort cancel every working order of THIS client by its own order id (children first).
+    Otherwise (a share held, the read and the fills disagree, or a read fails) it never cancels a
+    protective SELL stop, nor the parent of one: it cancels only this client's other working
+    orders (an unfilled entry without a working stop, a resting closing limit) and prints the
+    TWS procedure. Never a global cancel. Works even when the journal is unknown."""
     s = _session(cfg)
     s.connect()
     try:
+        state = ev["state"] = _position_state(s)
+        flat = (state["agree"] and Decimal(state["held"]) == 0
+                and state["own_working"] is not None)
+        ev["flat"] = flat
         mine = [o for o in s.open_orders() if o.own]
         ev["found"] = [_row(o) for o in mine]
+
+        def protective(o) -> bool:
+            return o.action == "SELL" and o.order_type == "STP"
+
+        guarded = {o.parent_id for o in mine if protective(o) and o.parent_id}
+        targets = mine if flat else [o for o in mine if not protective(o)
+                                     and o.order_id not in guarded]
+        ev["left_working"] = [_row(o) for o in mine if o not in targets]
         ev["cancelled"], ev["cancel_errors"] = [], []
-        for o in sorted(mine, key=lambda o: (o.parent_id == 0, o.order_id)):
+        for o in sorted(targets, key=lambda o: (o.parent_id == 0, o.order_id)):
             t = s._tracks.get(o.order_id)
             if t is not None and t.status in FINAL_STATUSES:
                 continue  # cancelled with its parent
@@ -640,7 +701,16 @@ def _abort(cfg: PaperOrderConfig, ev: dict) -> None:
         remaining = [r for r in after["open_orders"].get("rows", []) if r["own"]]
         ev["remaining_own_working"] = remaining
         ev["position"] = after["positions"].get("rows")
-        ev["passed"] = after["open_orders"]["completed"] and not remaining
+        if flat:
+            ev["passed"] = after["open_orders"]["completed"] and not remaining
+            return
+        ev["passed"] = False
+        ev["result"] = "ABORT_STOP_LEFT_WORKING"
+        ev["why_failed"] = _ending_message(
+            "ABORT_STOP_LEFT_WORKING", f"this script does not read the account flat, so abort "
+            f"left this client's protective stop(s) {[r['order_id'] for r in ev['left_working']]} "
+            f"working and cancelled only {len(ev['cancelled'])} other order(s)",
+            state) + " " + ABORT_STOP_NOTE
     finally:
         s.disconnect()
 

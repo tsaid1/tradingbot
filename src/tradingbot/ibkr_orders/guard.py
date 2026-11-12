@@ -165,7 +165,13 @@ def parse_hours(text: str, time_zone_id: str) -> list[tuple[datetime, datetime]]
     """IBKR ``liquidHours``/``tradingHours``. Both formats are accepted:
     ``20261111:0930-20261111:1600;20261112:CLOSED`` (current) and
     ``20261111:0930-1600,1700-1800;20261112:CLOSED`` (older). Returns aware intervals, or None when
-    the text or the time zone cannot be understood (the guard then refuses)."""
+    the text or the time zone cannot be understood (the guard then refuses). Only a REGION zone
+    (``US/Eastern``, ``America/New_York``) is accepted: a fixed-offset or abbreviation zone
+    (``EST``, ``EST5EDT``, ``UTC``, ``Etc/GMT+5``) would misplace the hours across daylight
+    saving, so it is refused."""
+    if (not isinstance(time_zone_id, str) or "/" not in time_zone_id
+            or time_zone_id.split("/", 1)[0] in ("Etc", "SystemV")):
+        return None
     try:
         tz = ZoneInfo(time_zone_id)
     except (ZoneInfoNotFoundError, ValueError, TypeError):

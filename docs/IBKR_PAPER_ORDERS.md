@@ -27,13 +27,13 @@ below can send one**.
 
 | Way an order frame could reach the wire | Shipped default | What must ALL be true to send one | Tests that pin it |
 |---|---|---|---|
-| The runtime service (`scripts/run_service.py`, `tb_operator.py`, the watchdog, the dashboard) | No broker connection at all: `mode = "mock"` only, the SimBroker | Impossible: the runtime accepts only `"mock"`, has no key that selects a broker, imports neither `tradingbot.ibkr` nor `tradingbot.ibkr_orders`, and `build_service` builds only `SimBroker` | `test_the_runtime_accepts_only_its_simulated_mode`, `test_the_runtime_config_has_no_key_that_selects_another_broker`, `test_the_runtime_builds_the_simulated_broker_only`, `test_runtime_execution_core_and_read_only_adapter_do_not_load_the_order_package` |
+| The runtime service (`scripts/run_service.py`, `tb_operator.py`, the watchdog, the dashboard) | No order path at all: `mode = "mock"` or `"shadow"` only (shadow reads real quotes through the read-only adapter; orders and fills stay simulated), the SimBroker | Impossible: the runtime accepts only those two simulated modes, has no key that selects a broker, never imports `tradingbot.ibkr_orders`, and `build_service` builds only `SimBroker` | `test_the_runtime_accepts_only_its_simulated_modes`, `test_the_runtime_config_has_no_key_that_selects_another_broker`, `test_the_runtime_builds_the_simulated_broker_only`, `test_runtime_execution_core_and_read_only_adapter_do_not_load_the_order_package` |
 | The read-only adapter (`IbkrSession`, `ibkr_paper_check.py`, `ibkr_contract_discovery.py`, dashboard page 7) | Cannot: ids 3 and 4 are not in its deny-by-default allowlist, the order methods are denied | Impossible: the allowlist is exactly the 12 reviewed reads, unchanged by the merge | `test_read_only_allowlist_is_exactly_the_reviewed_read_set`, `test_read_only_allowlist_by_message_id_with_the_sdk`, `test_read_only_session_still_cannot_send_any_order_message` |
 | Any other module importing the order package | None does | Only `tradingbot.ibkr_orders` and the two `scripts/ibkr_paper_*` scripts import it; no shipped file names it otherwise | `test_only_the_order_package_and_its_two_scripts_import_it`, `test_no_shipped_non_test_file_names_the_order_package_dynamically` |
 | `scripts/ibkr_paper_init_journal.py` | Never sends | Offline: opens no socket | `test_init_script_is_offline_and_runs_once` |
 | `scripts/ibkr_paper_experiment.py` without a stage | Does nothing | One explicit stage argument; no flag skips or repeats a stage | `test_the_script_does_nothing_without_one_explicit_stage`, `test_the_script_has_no_flag_to_skip_or_repeat` |
-| `PaperOrderSession._send_place` (stage 2 bracket; stage 3 entry, stop, amendment, close) | Unreachable | 1. a private `~/.config/tradingbot/ibkr/paper_orders.toml` (mode 0600, owner-only) written by hand with `orders = "paper-test-1"` (the repo ships none and no template); 2. `state_dir` an existing private directory; 3. the journal created by hand with the init script; 4. paper port, loopback, a `D…` account, `tradingMode=p` and a listener owned by `tws_os_user`; 5. TWS's own `managedAccounts` exactly that account; 6. TWS reports Read-Only API **OFF**, localhost-only ON, the configured port; 7. the TLT contract pinned; 8. the stage's preconditions (the previous stage passed, this one never passed, the journal at the stage's starting count; stage 3 also a LIVE or DELAYED stage-1 quote); 9. `order_guard` ALLOW on every cap, the clock and the position cross-check; 10. the journal line fsync'd; 11. a one-shot permit for exactly those bytes, re-checked at the wire | `test_no_orders_entry_no_state_dir_or_no_journal_means_no_order_capability`, `test_the_repo_ships_no_order_config_and_no_template_that_works_as_is`, `test_the_default_order_config_path_is_private_and_absent_by_default`, `test_order_session_needs_a_loaded_order_config`, `test_deleting_the_journal_never_gives_a_fresh_budget`, `test_order_mode_refuses_unless_read_only_is_explicitly_off`, `test_every_stage_refuses_without_its_predecessor`, `test_a_failed_stage_that_submitted_cannot_run_again`, `test_stage3_refuses_without_a_live_or_delayed_quote_in_stage1`, `test_stage3_refuses_when_the_journal_is_not_at_two`, the guard and wire tests below |
-| `PaperOrderSession._send_cancel` (the core's cancels, stage 2, `abort`, a partial bracket's parent cancel) | Unreachable | Items 1, 2 and 4 to 7 above (a READY order session); an own, non-final order of this client; a one-shot permit. Never counted; works with the journal unknown (cancels only reduce risk) | `test_abort_cancels_only_this_clients_orders_by_id`, `test_what_counts_toward_the_six` |
+| `PaperOrderSession._send_place` (stage 2 bracket; stage 3 entry, stop, amendment, close) | Unreachable | 1. a private `~/.config/tradingbot/ibkr/paper_orders.toml` (mode 0600, owner-only) written by hand with `orders = "paper-test-1"` (the repo ships none and no template); 2. `state_dir` an existing private directory; 3. the journal created by hand with the init script; 4. paper port, loopback, a `D…` account, `tradingMode=p` and a listener owned by `tws_os_user`; 5. TWS's own `managedAccounts` exactly that account; 6. TWS reports Read-Only API **OFF**, localhost-only ON, the configured port; 7. the TLT contract pinned; 8. the stage's preconditions (the previous stage passed, this one never passed, the journal at the stage's starting count; stage 1 passed only on a LIVE or DELAYED quote with a bid and an ask; stages 2 and 3 not after 15:00 New York and only with 60 minutes of today's liquid hours left, in a region time zone); 9. `order_guard` ALLOW on every cap, the clock (liquid hours in a region time zone only; a fixed-offset zone such as `EST` is refused) and the position cross-check; for the stage-3 entry, the price checked is the stated entry, the ask plus the owner's `stage3_entry_allowance_ticks` (0 to 5, private config only); 10. the journal line fsync'd; 11. a one-shot permit for exactly those bytes, re-checked at the wire | `test_no_orders_entry_no_state_dir_or_no_journal_means_no_order_capability`, `test_the_repo_ships_no_order_config_and_no_template_that_works_as_is`, `test_the_default_order_config_path_is_private_and_absent_by_default`, `test_order_session_needs_a_loaded_order_config`, `test_deleting_the_journal_never_gives_a_fresh_budget`, `test_order_mode_refuses_unless_read_only_is_explicitly_off`, `test_every_stage_refuses_without_its_predecessor`, `test_a_failed_stage_that_submitted_cannot_run_again`, `test_stage3_refuses_without_a_live_or_delayed_quote_in_stage1`, `test_stage3_refuses_when_the_journal_is_not_at_two`, `test_stage1_fails_and_stays_repeatable_without_a_live_or_delayed_quote`, `test_a_fixed_offset_time_zone_is_refused`, `test_the_stage3_entry_allowance_is_a_strict_integer_under_the_ceiling`, `test_the_repo_ships_no_stage3_entry_allowance_value`, the guard and wire tests below |
+| `PaperOrderSession._send_cancel` (the core's cancels, stage 2, `abort`, a partial bracket's parent cancel) | Unreachable | Items 1, 2 and 4 to 7 above (a READY order session); an own, non-final order of this client; a one-shot permit. `abort` cancels a protective stop (or its parent) only when the position read and the experiment's own fills agree on flat. Never counted; works with the journal unknown | `test_abort_cancels_only_this_clients_orders_by_id`, `test_abort_never_cancels_the_stop_of_a_held_or_disputed_share`, `test_what_counts_toward_the_six` |
 | Direct SDK calls (`placeOrder`, `cancelOrder`, `placeOrderProtoBuf`, `sendMsg`, a replayed frame, global cancel) | Refused | Impossible without a permit; the text-framed and global paths are denied | `test_denied_methods_raise_and_send_nothing`, `test_direct_sends_without_a_guard_permit_never_reach_the_wire`, `test_object_graph_of_order_session_reaches_no_unguarded_order_send` |
 | The funded (live) account | Unreachable | Impossible: the config accepts only a `D…` paper id on a paper port, and TWS's own account list must be exactly that id (a live login reports `U…`) | `test_only_a_paper_account_id_can_be_configured`, `test_non_paper_accounts_refused_in_order_mode`, `test_live_ports_refused_in_order_mode`, `test_the_broker_account_list_must_be_exactly_the_paper_account` |
 | Another program on the Mac while Read-Only API is OFF | The owner's standing TWS setting is Read-Only API ON | Out of scope for this code: the owner turns Read-Only OFF only for stages 1 to 3 and back ON afterwards | runbook below |
@@ -288,7 +288,9 @@ entry 2, one stop amendment 1, closing limit 1): 2 + 4 = 6 = the cap (asserted i
 1. Close any live TWS. Start the paper TWS as `tws_os_user`, logged in to the paper account.
 2. `mkdir -m 700 <state_dir>` (outside Dropbox).
 3. Write `~/.config/tradingbot/ibkr/paper_orders.toml`, mode 0600: every key of `paper.toml` plus
-   `orders = "paper-test-1"` and `state_dir = "<state_dir>"`.
+   `orders = "paper-test-1"` and `state_dir = "<state_dir>"`. Optionally, the owner's stage-3
+   price choice `stage3_entry_allowance_ticks = N` (an integer 0 to 5; the ceiling is
+   `MAX_STAGE3_ENTRY_ALLOWANCE_TICKS` in `caps.py`; absent means 0). The repo ships no value.
 4. `python scripts/ibkr_paper_init_journal.py` (offline). It prints the journal path.
 5. Plan the day: start stage 3 no later than 14:30 ET; the experiment ends flat the same day.
    The script itself refuses to START stage 2 or stage 3 at or after 15:00 New York time
@@ -309,10 +311,10 @@ entry 2, one stop amendment 1, closing limit 1): 2 + 4 = 6 = the cap (asserted i
 | Stage | Owner does first | Command | Passes when | Count |
 |---|---|---|---|---|
 | 0 | TWS API settings: **Read-Only API ON**, localhost only ON, socket port = `port` | `python scripts/ibkr_paper_experiment.py stage0-refusal` | order mode refuses (`readOnlyApi=True`) and no order frame was sent | 0 |
-| 1 | Turn **Read-Only API OFF**. Nothing else. | `python scripts/ibkr_paper_experiment.py stage1-lookups` | open orders, executions, completed orders and positions all complete; no order frame; the evidence lists which fields the rows carry (order id, `orderRef`, perm id; the account is checked on every row) and the quote quality | 0 |
+| 1 | Turn **Read-Only API OFF**. Nothing else. | `python scripts/ibkr_paper_experiment.py stage1-lookups` | open orders, executions, completed orders and positions all complete; no order frame; the evidence lists which fields the rows carry (order id, `orderRef`, perm id; the account is checked on every row) and the quote labels. **Passes only when** the adapter labels a quote LIVE or DELAYED with a bid and an ask: up to `STAGE1_QUOTE_SAMPLES` (3) bounded samples in a row, each label and reason recorded, passing on the first usable one. Otherwise `STAGE1_QUOTE_NOT_USABLE` ("no order was sent; run stage 1 again"): stage 1 stays repeatable, stage 2 stays blocked | 0 |
 | 2 | Check stage 1 evidence. Watch TWS. | `python scripts/ibkr_paper_experiment.py stage2-unfillable-bracket` | one bracket, BUY LMT at 90% of the bid with its SELL STP 1.00 lower, never filled; the parent was not answered before the child was sent; both seen in the read-back; both cancelled, gone from open orders and in completed orders | 2 |
-| 3 | Check stage 2 evidence in full and **confirm in the TWS Audit Trail that the parent was held (not transmitted) until the child arrived**. The evidence field `parent_answered_before_child_sent` is one-sided: the child follows the parent by milliseconds, so False proves nothing. | `python scripts/ibkr_paper_experiment.py stage3-lifecycle` | bracket entry filled, a BUY LMT at the ask (the stated entry itself; the collar only rejects, it no longer lifts the limit 1 % above), stop confirmed working, one stop raise (+0.10), stop cancelled and confirmed, closing limit filled, reconciliation clean, 6 used | 4 |
-| any | — | `python scripts/ibkr_paper_experiment.py abort` | every working order of this client cancelled by its own order id; reports what remains and the position | 0 |
+| 3 | Check stage 2 evidence in full and **confirm in the TWS Audit Trail that the parent was held (not transmitted) until the child arrived**. The evidence field `parent_answered_before_child_sent` is one-sided: the child follows the parent by milliseconds, so False proves nothing. | `python scripts/ibkr_paper_experiment.py stage3-lifecycle` | bracket entry filled, a BUY LMT at the **stated entry = the ask + `stage3_entry_allowance_ticks` min ticks** (0 when absent: exactly the ask, e.g. 80.73 for an ask of 80.73; with 3: 80.76). The core sends the stated price itself (the collar only rejects; it adds nothing), every cap (150 USD notional included) applies to it, and the evidence records `entry_price` {ask, allowance_ticks, tick, stated_entry}. With 0, an ask that ticks up before the order is live may leave the entry unfilled (`STAGE3_ENTRY_NOT_FILLED`, 4 of 6 spent); stop confirmed working, one stop raise (+0.10), stop cancelled and confirmed, closing limit filled, reconciliation clean, 6 used | 4 |
+| any | — | `python scripts/ibkr_paper_experiment.py abort` | re-reads the position and the experiment's own fills first. Only when they agree on flat: every working order of this client cancelled by its own order id. Otherwise (held, disagreeing or unreadable): no protective stop and no parent of one is cancelled, only this client's other working orders; result `ABORT_STOP_LEFT_WORKING` with the TWS procedure | 0 |
 
 After stage 3 (or on any failure): turn Read-Only API back ON, remove the `orders` line, and keep
 the evidence directory and journal. If stage 2 reports a fill, follow its printed TWS procedure (below):
@@ -347,11 +349,20 @@ be read.
 
 The **procedure** is the same for every ending that is not a confirmed flat:
 
-> In the TWS window: (1) cancel a resting TLT closing limit only if you can see it working there,
-> never the stop; (2) Look at the TLT position in the TWS window. Only if it shows 1: sell 1 there
-> with a limit at the bid (lower it a tick at a time until it fills) and wait until it shows 0. If
-> it shows 0: do NOT sell. (3) Only once TWS shows 0, run abort to cancel what remains. Never run
-> abort while TWS shows 1 and a working stop: abort cancels the stop.
+> In the TWS window: (1) open the Trades panel: if it already shows a TLT sale of this experiment
+> today, skip step (3); (2) cancel a resting TLT closing limit only if you can see it working
+> there, never the stop; (3) Look at the TLT position in the TWS window. Only if it shows 1: sell
+> 1 there with a limit at the bid (lower it a tick at a time until it fills) and wait until it
+> shows 0. If it shows 0: do NOT sell. (4) After a manual sale, run abort at once: the protective
+> stop is still working until then and must not trigger on a share you no longer hold. Abort
+> cancels the stop only when this script itself reads the account flat; if it reports the stop
+> left working while TWS shows 0, cancel that TLT stop in the TWS window yourself at once. Never
+> cancel the stop while TWS shows 1.
+
+A manual sale is not an execution of the experiment, so after one the experiment's own fills
+still say 1 while the position read says 0: abort then reads a disagreement and leaves the stop
+working (`ABORT_STOP_LEFT_WORKING`), and the owner cancels that stop in TWS by hand, as step (4)
+says.
 
 When read and fills agree on 0, it instead says "run abort to cancel this client's N working
 order(s), then confirm in TWS that the TLT position is 0 and no TLT order is working", or, with
@@ -363,12 +374,14 @@ nothing working, "nothing to do; confirm in TWS ...". No message contains an unc
 | `STAGE2_UNEXPECTED_FILL` | the entry filled; its stop is working (status, in open orders) or NOT working (status, in or not in open orders); stage 3 blocked | the TWS procedure |
 | `STAGE2_PARENT_NOT_CONFIRMED_CANCELLED` | the parent was not confirmed cancelled; its child was left alone | the TWS procedure, or abort if the reads agree on flat |
 | `STAGE2_FAILED` | the read-back, cancels or completed orders did not show what stage 2 needs | abort if the reads agree on flat with orders working; otherwise the TWS procedure |
-| `STAGE3_ENTRY_NOT_FILLED` | the entry did not fill in time | normally flat with the bracket working: abort; otherwise the TWS procedure |
+| `STAGE3_ENTRY_NOT_FILLED` | the entry did not fill in time | normally flat with the bracket working: abort (it re-reads first: if the entry filled meanwhile, it leaves the stop working); otherwise the TWS procedure |
 | `STAGE3_PROTECTION_UNCONFIRMED` | the entry filled; the stop was not confirmed within 15 s | the TWS procedure |
 | `STAGE3_PROTECTION_LOST` | POSITION OPEN, PROTECTION ABSENT: the close was not sent after the stop was cancelled | the TWS procedure |
 | `STAGE3_CLOSE_REFUSED` | the close was REFUSED (or REJECTED / HALTED), with the core's reasons, e.g. `EXIT_WITHOUT_QUOTE` | the TWS procedure (the stop normally still works: sell only if TWS shows 1, abort after) |
 | `STAGE3_CLOSE_NOT_FILLED` | the closing limit was sent but did not fill in time | the TWS procedure (cancel the resting close in TWS first, then sell only if TWS shows 1) |
 | `STAGE3_NOT_CLEAN` | after the 15 s retry, reconciliation still not clean or not 6 used | the TWS procedure; with read and fills disagreeing, do not sell on the script's numbers; keep the evidence |
+| `ABORT_STOP_LEFT_WORKING` | abort does not read the account flat; it left the protective stop(s) working and cancelled only the other orders | the TWS procedure; if TWS shows TLT 0, cancel that stop in TWS yourself at once; if it shows 1, leave it |
+| `STAGE1_QUOTE_NOT_USABLE` | no sample labelled LIVE or DELAYED with a bid and an ask (labels and last reason) | nothing to do in TWS (no order was sent); run stage 1 again |
 
 ## Emergency stop
 
@@ -383,11 +396,13 @@ nothing working, "nothing to do; confirm in TWS ...". No message contains an unc
   the experiment that you can see working there (Orders / Activity panel, right-click, Cancel),
   then look at the TLT position in TWS: only if it shows 1, sell 1 with a limit at the bid; if it
   shows 0, do not sell. Confirm in the Portfolio that TLT is 0.
-- **The software path:** `python scripts/ibkr_paper_experiment.py abort` cancels every working
-  order of this client by its own order id (never a global cancel), including a protective stop,
-  and reports what remains. It works even when the journal is unknown. It does not close a
-  position: only if the TWS window shows 1 TLT, sell it there first (a limit at the bid), and run
-  `abort` once TWS shows 0.
+- **The software path:** `python scripts/ibkr_paper_experiment.py abort` re-reads the position
+  and the experiment's own fills first. When they agree on flat it cancels every working order of
+  this client by its own order id (never a global cancel). Otherwise it cancels no protective stop
+  (nor the parent of one), only the other orders, and reports `ABORT_STOP_LEFT_WORKING`. It works
+  even when the journal is unknown. It does not close a position: only if the TWS window shows 1
+  TLT, sell it there (a limit at the bid), then run `abort` at once; if it then reports the stop
+  left working while TWS shows 0, cancel that stop in TWS yourself.
 - **The close.** The protective stop is DAY: it expires at 16:00 ET and a share held overnight is
   unprotected; nothing can be placed after 16:00 ET. The experiment must end flat the same day.
   **If the closing limit has not filled by 15:30 ET** (the script normally reports
