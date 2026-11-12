@@ -33,15 +33,21 @@ def apply_pending(
     expected_account: str,
     clock: Callable[[], datetime],
     locked_out: bool = False,
+    require_full_reconnect: bool = True,
+    session_opened_at: datetime | None = None,
 ) -> list[dict]:
     """Apply every pending request in order. While the broker session is locked out (another
     account identity) only CLEAR_IDENTITY_LOCKOUT is applied; the rest wait. Returns one summary
-    per request applied or refused (identifiers and reason codes only)."""
+    per request applied or refused (identifiers and reason codes only).
+    ``require_full_reconnect`` (review N2): a lockout clears only through a full reconnect;
+    ``session_opened_at``: when this process opened its broker session (a session opened after
+    the lockout began is itself a full reconnect)."""
     out = []
     for req in queue.pending():
         if locked_out and req["action"] != Q.CLEAR_IDENTITY_LOCKOUT:
             continue
-        result = _apply_one(coordinator, runtime_store, req, expected_account, clock)
+        result = _apply_one(coordinator, runtime_store, req, expected_account, clock,
+                            require_full_reconnect, session_opened_at)
         queue.record_result(req["id"], clock(), status=result.status, reasons=result.reasons,
                             before=result.before, after=result.after)
         runtime_store.event(
@@ -57,7 +63,8 @@ def apply_pending(
     return out
 
 
-def _apply_one(coord, store: RuntimeStore, req: dict, expected_account: str, clock):
+def _apply_one(coord, store: RuntimeStore, req: dict, expected_account: str, clock,
+               require_full_reconnect: bool = True, session_opened_at: datetime | None = None):
     # The globally unique id: the journal matches results on it, its target and outcome (F3).
     common = {"request_id": req["uid"], "confirmation": req["confirmation"], "note": req["note"],
               "operator": req["operator"]}
@@ -78,7 +85,8 @@ def _apply_one(coord, store: RuntimeStore, req: dict, expected_account: str, clo
     if action == Q.ACKNOWLEDGE_SIGNAL:
         return _acknowledge_signal(store, req, clock)
     if action == Q.CLEAR_IDENTITY_LOCKOUT:
-        return _clear_lockout(coord, store, req, expected_account, clock)
+        return _clear_lockout(coord, store, req, expected_account, clock,
+                              require_full_reconnect, session_opened_at)
     return settlement.OperatorResult(status="REFUSED", reasons=["UNKNOWN_ACTION"])
 
 
@@ -109,11 +117,15 @@ def _acknowledge_signal(store: RuntimeStore, req: dict, clock) -> settlement.Ope
                                      after={"open": False, "kind": found["kind"]})
 
 
-def _clear_lockout(coord, store: RuntimeStore, req: dict, expected_account: str, clock):
-    """Review F2: clearing a lockout always forces a full reconnect through the adapter, so every
+def _clear_lockout(coord, store: RuntimeStore, req: dict, expected_account: str, clock,
+                   require_full_reconnect: bool = True,
+                   session_opened_at: datetime | None = None):
+    """Review F2: clearing a lockout forces a full reconnect through the adapter, so every
     identity check it has runs afresh, and succeeds only with the expected account AND the session
     identity this service last accepted. Otherwise the lockout stays and the reason is recorded.
-    It never clears the halt."""
+    It never clears the halt. Review N2: the journal states what was done, FULL_RECONNECT or
+    IDENTITY_REREAD_ONLY (an adapter without reconnect whose session predates the lockout); the
+    latter is refused (FULL_RECONNECT_UNAVAILABLE) unless ``require_full_reconnect`` is off."""
     session = session_state(store)
     before = {"session": session.get("state"), "reason": session.get("reason")}
     reasons = []
@@ -123,6 +135,9 @@ def _clear_lockout(coord, store: RuntimeStore, req: dict, expected_account: str,
         reasons.append("CONFIRMATION_MISMATCH")
     if session.get("state") != LOCKED_OUT:
         reasons.append("NOT_LOCKED_OUT")
+    mode, how = _reconnect_mode(coord.broker, session, session_opened_at)
+    if not reasons and mode == IDENTITY_REREAD_ONLY and require_full_reconnect:
+        reasons.append("FULL_RECONNECT_UNAVAILABLE")
     identity = None
     if not reasons:
         try:
@@ -152,9 +167,28 @@ def _clear_lockout(coord, store: RuntimeStore, req: dict, expected_account: str,
     store.put("broker_identity", identity, now)
     store.event(now, "IDENTITY_LOCKOUT_CLEARED", request_id=req["uid"], note=req["note"],
                 before=before,
-                identity=identity, rule="full reconnect, identity checks passed afresh")
+                identity=identity, mode=mode, how=how,
+                rule="full reconnect, identity checks passed afresh" if mode == FULL_RECONNECT
+                else "identity read only (the adapter cannot reconnect); its other checks did "
+                "not run again")
     return settlement.OperatorResult(status="APPLIED", before=before,
                                      after={"session": DISCONNECTED, "reason": "LOCKOUT_CLEARED"})
+
+
+FULL_RECONNECT = "FULL_RECONNECT"
+IDENTITY_REREAD_ONLY = "IDENTITY_REREAD_ONLY"
+
+
+def _reconnect_mode(broker, session: dict, session_opened_at: datetime | None):
+    """What clearing the lockout will actually do: (mode, how)."""
+    if callable(getattr(broker, "reconnect", None)):
+        return FULL_RECONNECT, "ADAPTER_RECONNECT"
+    since = session.get("since")
+    if session_opened_at is not None and since and session_opened_at > datetime.fromisoformat(
+        since
+    ):
+        return FULL_RECONNECT, "SESSION_OPENED_BY_THIS_PROCESS_AFTER_THE_LOCKOUT"
+    return IDENTITY_REREAD_ONLY, "IDENTITY_READ"
 
 
 def _force_reconnect(broker) -> None:

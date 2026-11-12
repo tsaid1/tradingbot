@@ -42,7 +42,7 @@ an alert.
 | Alert | Meaning | Action |
 |---|---|---|
 | `ENTRY_UNKNOWN_OUTCOME` | An entry or add was sent and its outcome is unknown. It is never resent, and its contract is blocked. | Look the order up at the broker. If it does not appear on its own, settle it (below). |
-| `UNPROTECTED_POSITION` | No working stop is confirmed for the position, or the check failed. | Check the stop at the broker. The alert clears only on evidence: a confirmed stop or a flat position. |
+| `UNPROTECTED_POSITION` | No working stop is confirmed for the position, or the check failed. With `BROKER_POSITION_DIFFERS` in the detail, the broker holds a different quantity than the ledger: the stop and target are never sized above what the broker holds, and are reduced below the ledger only on corroborated evidence (an exit fill visible in executions made after the idea's last fill or settlement and not used before, or the lower position read consistently over the settle period), never on one read; the contract is blocked. | Check the stop at the broker. If the broker holds less than a settlement declared, correct it with `settle <ref> FILLED` naming the true total; if it holds more, deal with the excess by hand. The alert clears only on evidence: a confirmed stop or a flat position. |
 | `BROKER_FAILURE` | The broker is unreadable, or its state is not yet verified. New exposure is blocked. | Check TWS or the gateway. The service retries on its own. |
 | `BROKER_RECONNECTED` | The session is back. The alert lists the fills and order ends adopted while it was down. | Read the list. If the resync waits on a discrepancy, resolve that first. |
 | `BROKER_IDENTITY_MISMATCH` | The session came back under another account, or its identity check failed. The service stops touching the broker and engages the halt. | Connect the expected account, clear the lockout, then clear the halt. |
@@ -50,12 +50,12 @@ an alert.
 | `LEDGER_REVERSAL` | An exit filled more than the position: the account went through flat. | Flatten the excess at the broker by hand, then CLEAR it. |
 | `EXIT_REFUSED`, `HALTED_ACTION_REFUSED` | A publisher exit or amendment was not executed. | Check the position and its stop. Exit by hand if needed, then acknowledge. |
 | `SETTLEMENT_UNVERIFIED` | A settlement was applied and its contract stays blocked until the evidence below has followed it. | None. It clears on its own once the evidence is in. |
-| `SETTLEMENT_CONTRADICTED` | The broker shows a fill, a working order or a completed order for an intent you settled as `NOT_AT_BROKER` or `CANCELLED`. The fill is in the ledger as it happened, the contract is blocked and reconciliation is not clean. | Check the account at the broker: it may hold more than intended. Decide what to do with the extra position, then CLEAR it once reconciliation is otherwise clean. |
+| `SETTLEMENT_CONTRADICTED` | The broker shows a fill, a working order or a completed order for an intent you settled as `NOT_AT_BROKER` or `CANCELLED`. The fill is in the ledger as it happened, the contract is blocked and reconciliation is not clean. | Check the account at the broker: it may hold more than intended. Decide what to do with the extra position and make sure the order has ended at the broker, then CLEAR it once reconciliation is otherwise clean. |
 | `MAPPING_REVOKED_OPEN_POSITION` | A position is open in a family that has lost approval. It can be exited, never added to. | Decide whether to keep or exit the position. |
 | `ROLL_DUE_FLATTEN_REQUIRED` | A futures position is inside its roll window. | Flatten or roll it by a new instruction. |
 | `SOURCE_FAILURE`, `PIPELINE_FAILURE` | The source or the processing of a post has failed repeatedly. The cursor does not move. | See Source outage below. |
 | `SOURCE_STALLED` | The cursor has not moved during the activity window. | Check the source account and token. |
-| `OPERATOR_QUEUE_UNAVAILABLE` | The operator queue is not initialised (`QUEUE_NOT_INITIALISED`), missing although the execution journal shows it was used (`QUEUE_LOST`), or unreadable or corrupt (`QUEUE_UNREADABLE`). No operator request is applied; trading, exits, protection upkeep and the heartbeat carry on. | Not initialised: run `tb_operator.py init`. Lost or corrupt: restore the file from where it went; if that is impossible, move the broken file aside and run `tb_operator.py init --replace-lost`. Request ids are globally unique, so a new queue's requests can never be matched to old results. |
+| `OPERATOR_QUEUE_UNAVAILABLE` | The operator queue is not initialised (`QUEUE_NOT_INITIALISED`), missing although the execution journal shows it was used, or present but lacking a request the execution journal records a result for, for example swapped for an empty valid file (`QUEUE_LOST`, checked at start-up and every cycle), or unreadable or corrupt (`QUEUE_UNREADABLE`). No operator request is applied; trading, exits, protection upkeep and the heartbeat carry on. | Not initialised: run `tb_operator.py init`. Lost, swapped or corrupt: restore the file from where it went; if that is impossible, move the file present aside and run `tb_operator.py init --replace-lost` (the new queue records the lost request ids it replaces, so it is accepted). Request ids are globally unique, so a new queue's requests can never be matched to old results. |
 | `HEARTBEAT_STALE` / `_RESTORED` | From the watchdog: the service has stopped, or is hung. | Check `launchctl list`, the service log and the lock holder. |
 | `HALT_ENGAGED` / `HALT_CLEARED` | The halt file appeared or went away. | Confirm that you meant it. |
 
@@ -102,7 +102,9 @@ of the queue; write what you checked, never a credential or a full account numbe
   reconciliation is clean.
 * `clear <id> LEDGER_REVERSAL | SETTLED_INTENT_CONTRADICTED | PARTIAL_GROUP`: applied only if a
   sync and reconciliation made at that moment show the contract clean (the record's own line
-  excepted). `PARTIAL_GROUP` is here, not under `ack`: while it is open reconciliation is not
+  excepted). A `SETTLED_INTENT_CONTRADICTED` also needs the contradicting order ended at the
+  broker: while it is working, or no terminal completed-orders row shows it, the clear is refused
+  with `CONTRADICTING_ORDER_NOT_TERMINAL:<ref>:<state>`; cancel it at the broker first. `PARTIAL_GROUP` is here, not under `ack`: while it is open reconciliation is not
   clean, so closing it can lift other blocks and needs the same evidence.
 * `ack <id> <kind>`: closes a record that blocks nothing (`EXIT_NOT_NETTED`, `EXIT_WITHOUT_QUOTE`,
   `STALE_AFTER_UNKNOWN_OUTCOME`, `MODIFY_NOT_CONFIRMED`, `PROTECTIVE_LEVEL_NOT_LOOSENED`).
@@ -112,8 +114,14 @@ of the queue; write what you checked, never a credential or a full account numbe
   that reconnect succeeds with the expected account and the same session identity the service
   last accepted (account and paper or live; a session that changed kind is never accepted by a
   typed word). Otherwise it is refused with the reason (`IDENTITY_CHECK_FAILED`,
-  `BROKER_STILL_SHOWS_ANOTHER_ACCOUNT`, `SESSION_IDENTITY_NOT_ACCEPTED`, `BROKER_UNREADABLE`) and
-  the lockout stays. Once applied, the next cycle runs the full resync. The halt stays engaged.
+  `BROKER_STILL_SHOWS_ANOTHER_ACCOUNT`, `SESSION_IDENTITY_NOT_ACCEPTED`, `BROKER_UNREADABLE`,
+  `FULL_RECONNECT_UNAVAILABLE`) and the lockout stays. Once applied, the next cycle runs the full
+  resync. The halt stays engaged. The journal (`IDENTITY_LOCKOUT_CLEARED`) states what was done:
+  `mode` `FULL_RECONNECT` (the adapter reconnected, or this process opened its session after the
+  lockout began) or `IDENTITY_REREAD_ONLY` (an adapter that cannot reconnect, cleared on an
+  identity read alone). With `[service] lockout_clear_requires_full_reconnect = true` (the
+  default) the latter is refused with `FULL_RECONNECT_UNAVAILABLE`: such an adapter stays locked
+  out until the service is restarted, after which the clear is accepted on the new session.
 * Never operator-clearable, because only evidence resolves them: `UNPROTECTED_POSITION`,
   `PROTECTION_UNVERIFIED`, `ENTRY_REMAINDER_NOT_CANCELLED`, `BROKER_STATE_UNKNOWN`,
   `BROKER_RECONNECT_PENDING`, `OPERATOR_SETTLEMENT_UNVERIFIED`.

@@ -77,6 +77,11 @@ class ServiceConfig(StrictModel):
     activity_window_utc: str | None = Field(default=None, pattern=r"^\d{2}:\d{2}-\d{2}:\d{2}$")
     # The watchdog reports the heartbeat stale after this long (unset: max(120, 10 x cadence)).
     heartbeat_stale_after_seconds: float | None = Field(default=None, gt=0)
+    # Review N2. True (strict): an identity lockout is cleared only through a full reconnect of
+    # the session (the adapter's reconnect, or a session this process opened after the lockout
+    # began); an adapter that cannot reconnect stays locked out until the service is restarted.
+    # False also accepts an identity read alone, journaled IDENTITY_REREAD_ONLY.
+    lockout_clear_requires_full_reconnect: bool = True
 
 
 class InterpreterConfig(StrictModel):

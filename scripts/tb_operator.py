@@ -36,12 +36,14 @@ from tradingbot.runtime.config import DEFAULT_CONFIG_PATH, ConfigError, load_con
 from tradingbot.runtime.register import load_register
 
 
-def _journal_references_requests(config) -> bool:
+def _journal_request_ids(config) -> set[str]:
+    """The ids of every operator request the execution journal records a result for."""
     from tradingbot.runtime.lifecycle import _ro, _rows
 
     with _ro(config.execution_db) as ex:
         rows = _rows(ex, "SELECT detail FROM exec_journal WHERE event LIKE 'OPERATOR_%'")
-    return any(json.loads(r["detail"]).get("request_id") for r in rows)
+    ids = (json.loads(r["detail"]).get("request_id") for r in rows)
+    return {str(i) for i in ids if i}
 
 
 def _init(config, replace_lost: bool) -> int:
@@ -55,13 +57,15 @@ def _init(config, replace_lost: bool) -> int:
             return 2
         print(f"operator queue already initialised: {path}")
         return 0
-    if _journal_references_requests(config) and not replace_lost:
+    lost = _journal_request_ids(config)
+    if lost and not replace_lost:
         print(f"refusing: {path} is missing but the execution journal references operator "
               "requests from it (the queue was lost). Restore it if you can; to start a new one "
               "anyway, run init --replace-lost (request ids are globally unique, so no old "
               "result can be confused with a new request)", file=sys.stderr)
         return 2
-    Q.OperatorQueue.initialise(path)
+    # Review N3: the new queue records the lost requests it replaces, so the service accepts it.
+    Q.OperatorQueue.initialise(path, replaces_lost=lost if replace_lost else ())
     print(f"operator queue initialised: {path}")
     return 0
 
@@ -76,6 +80,7 @@ def _apply_now(config) -> list[dict] | None:
 
     if config.mode != "mock":
         raise ConfigError("only mock mode may run")
+    opened_at = datetime.now(UTC)  # this process opens its own broker session (review N2)
     try:
         broker = SimBroker(config.broker_db, account=config.mock.account)
         coordinator = ExecutionCoordinator(
@@ -89,6 +94,8 @@ def _apply_now(config) -> list[dict] | None:
             coordinator=coordinator, runtime_store=store, queue=Q.OperatorQueue(config.operator_db),
             expected_account=config.execution.expected_account, clock=lambda: datetime.now(UTC),
             locked_out=session_state(store)["state"] == LOCKED_OUT,
+            require_full_reconnect=config.service.lockout_clear_requires_full_reconnect,
+            session_opened_at=opened_at,
         )
     finally:
         coordinator.close()

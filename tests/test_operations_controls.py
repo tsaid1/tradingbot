@@ -238,8 +238,9 @@ def test_request_ids_are_globally_unique_so_a_lost_queue_cannot_replay_an_old_re
     alert = [a for a in rt.store.alerts(open_only=True) if a["key"] == "OPERATOR:QUEUE"]
     assert alert and "QUEUE_LOST" in alert[0]["detail"]
     assert N.OPERATOR_QUEUE_UNAVAILABLE in kinds(rt)
-    # The explicit initialisation step: a fresh counter, fresh globally unique ids.
-    queue = Q.OperatorQueue.initialise(rt.config.operator_db)
+    # The explicit initialisation step (`init --replace-lost`, which records the lost requests
+    # it replaces, review N3): a fresh counter, fresh globally unique ids.
+    queue = Q.OperatorQueue.initialise(rt.config.operator_db, replaces_lost=[old["uid"]])
     rid = _settle_request(rt, queue, ref)
     assert rid == 1 and queue.requests()[0]["uid"] != old["uid"]
     rt.step()

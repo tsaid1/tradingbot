@@ -84,6 +84,25 @@ SourcePost -> PaperEventReplay.process  (gate_source, gate_action, atomic groups
   `UNPROTECTED_POSITION`. Either way the outcome is `EXCEPTION`, not `EXECUTED`, and new exposure
   in the instrument is blocked. `EXITING` means everything held is committed to working exits and
   no stop works beside them.
+* **Cover follows the broker's position, asymmetrically (review N1).** Upward, a protective
+  order is never placed or sized above what the broker shows held in the contract (each idea's
+  share of the broker's position on its side, less the working exits), so cover grows only once
+  the ledger and the broker both show it; when the positions cannot be read nothing is sized up.
+  Downward, cover is never reduced below the ledger, or cancelled, on a position read alone: only
+  as far as qualifying executions explain (review P1: exit side for the idea, in the contract,
+  not applied by the ledger, executed by the broker's own timestamp after the idea's last fill or
+  settlement, never attributed before, each attributed once to one idea and journaled
+  `EXECUTION_ATTRIBUTED`, and together capped at the ledger/broker gap), or to the lower position
+  once `exit_no_trace_lookups` consecutive successful reads spread over
+  `settle_seconds` all show it (a failed read restarts that run, and is never a quantity). Until
+  then the working order stays as it is. Whenever the broker's position differs from the ledger,
+  in either direction, `UNPROTECTED_POSITION` opens with `BROKER_POSITION_DIFFERS`, it is alerted,
+  and new exposure in the contract is blocked. A broker holding more than the ledger is covered
+  only for the ledger's quantity; the excess is reconciliation's unexplained `QUANTITY_MISMATCH` /
+  `UNEXPLAINED_BROKER_POSITION` (a stop the system invented for it would be an order no one
+  approved). The trade-off: an oversized stop risks a small reversal if it triggers before the
+  discrepancy is resolved; a missing stop risks an unbounded loss on what is really held; so cover
+  is reduced only on corroborated evidence, and an operator is alerted immediately in either case.
 * **Stop-outs (review F2).** Once a protective stop has filled for an idea, or the idea is closed,
   every working remainder of its entry and add orders is cancelled and the cancel confirmed
   (`ENTRY_REMAINDER_CANCELLED`). An unconfirmed cancel opens `ENTRY_REMAINDER_NOT_CANCELLED`, which
@@ -273,7 +292,9 @@ in the call that records the settlement, after a full successful sync and a reco
 blocking discrepancy in that contract. After `NOT_AT_BROKER` or `CANCELLED` it also needs the
 exit-resend evidence rule after the settlement (settle period, `exit_no_trace_lookups` no-trace
 lookups spread over it). Broker evidence for such an intent later opens
-`SETTLED_INTENT_CONTRADICTED` (blocking, a safety discrepancy in reconciliation, CLEAR-class).
+`SETTLED_INTENT_CONTRADICTED` (blocking, a safety discrepancy in reconciliation, CLEAR-class;
+cleared only once the contradicting order is terminal at the broker and the contract reconciles
+clean).
 `clear_exception` (a `LEDGER_REVERSAL`, verified the same way) and `acknowledge_exception`
 (records that block nothing) complete the set; `operator_catalog.py` classes every exception kind.
 Every action, applied or refused, is journaled with its before and after state.

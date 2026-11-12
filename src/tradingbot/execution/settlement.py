@@ -42,11 +42,12 @@ from decimal import Decimal, InvalidOperation
 from pydantic import Field
 
 from tradingbot.execution import operator_catalog as cat
-from tradingbot.execution.broker import BrokerError, OrderSide, OrderStatus
+from tradingbot.execution.broker import TERMINAL_STATUSES, BrokerError, OrderSide, OrderStatus
 from tradingbot.execution.coordinator import (
     COMPLETED_LOOKBACK,
     ENTRY_STATE_UNKNOWN,
     OPERATOR_SETTLEMENT_UNVERIFIED,
+    SETTLED_INTENT_CONTRADICTED,
     SETTLED_WITHOUT_FILL_REASONS,
     UNKNOWN_OUTCOME_BEYOND_LOOKUP_HORIZON,
     UNKNOWN_OUTCOME_ENTRY_NOT_RESENT,
@@ -633,8 +634,17 @@ def clear_exception(
         coord._key_of(pos.symbol, pos.asset_class, pos.contract_key) if pos else f"IDEA:{idea}"
     )
     blocking = _blocking_in(coord, report, key, exclude=e)
-    if blocking:
-        return refuse([f"CONTRACT_NOT_CLEAN:{','.join(blocking)}"])
+    reasons = [f"CONTRACT_NOT_CLEAN:{','.join(blocking)}"] if blocking else []
+    if e.kind == SETTLED_INTENT_CONTRADICTED and ref:
+        # Review N4: the order that contradicted the settlement must have ended at the broker.
+        try:
+            problem = _contradicting_order_problem(coord, ref)
+        except BrokerError:
+            return refuse(["BROKER_UNREADABLE"])
+        if problem:
+            reasons.insert(0, problem)
+    if reasons:
+        return refuse(reasons)
     now = coord.clock()
     with coord.store.tx() as c:
         coord.store.resolve_exception_id(exc_id, now, c)
@@ -647,6 +657,21 @@ def clear_exception(
             rule="cleared only after a full sync and reconciliation show the contract clean",
         )
     return OperatorResult(status="APPLIED", before=before, after=_state(coord, ref, idea))
+
+
+def _contradicting_order_problem(coord: ExecutionCoordinator, ref: str) -> str | None:
+    """Review N4: the reason the order that contradicted a settlement has not ended at the broker
+    (None when it has): still in the working orders, or no terminal completed-orders row for it.
+    Raises BrokerError when the broker cannot be read."""
+    working = next((o for o in coord.broker.open_orders() if o.order_ref == ref), None)
+    if working is not None:
+        return f"CONTRADICTING_ORDER_NOT_TERMINAL:{ref}:{working.status.value}"
+    intent = coord.store.intent(ref)
+    since = intent.created_at - COMPLETED_LOOKBACK if intent is not None else None
+    done = [o for o in coord.broker.completed_orders(since=since) if o.order_ref == ref]
+    if not any(o.status in TERMINAL_STATUSES for o in done):
+        return f"CONTRADICTING_ORDER_NOT_TERMINAL:{ref}:NO_TERMINAL_STATE_AT_BROKER"
+    return None
 
 
 def acknowledge_exception(

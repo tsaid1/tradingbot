@@ -48,8 +48,9 @@ resolve against the config file.
   `confirm_attempts`, `confirm_wait_seconds`.
 * Optional: `[interpreter] lexicon_path`, `[notify] channels, macos, realert_seconds,
   alerts_file`, `[service] source_stall_after_seconds, activity_window_utc,
-  heartbeat_stale_after_seconds` (alerting only), `[mock] account, quotes` (a static simulated
-  market).
+  heartbeat_stale_after_seconds` (alerting only), `[service]
+  lockout_clear_requires_full_reconnect` (default `true`, see `docs/OPERATIONS.md`), `[mock]
+  account, quotes` (a static simulated market).
 
 ## Sources and the cursor
 
