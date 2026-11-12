@@ -391,81 +391,120 @@ session.quote_streams()       # the open streams
   `stream.closed_reason` says why (`CLOSED`, `SESSION_DISCONNECTED`, `SESSION_POISONED`,
   `CONNECTION_LOST`, `OPEN_FAILED`).
 - A request error for the stream's reqId, a connectivity interruption (1100/2110) or an internal
-  callback error fails the stream: it stays registered until closed, and its label is
-  `UNAVAILABLE` / `STREAM_FAILED` from then on, even after a 1102 "restored" (reopen it).
+  callback error fails the stream: its label is `UNAVAILABLE` / `STREAM_FAILED` from then on, even
+  after a 1102 "data maintained"; it must be closed and reopened, and until it is closed it still
+  counts against `max_quote_streams`.
 - **The market-data type is session-wide.** The SDK's `reqMarketDataType` carries no reqId, so the
   latest call applies to the whole session. Rule: one requested type per session at a time. While
   any stream is open, opening a stream, a bounded sample or a snapshot with another type raises
-  `QuoteStreamConflict` before anything is sent. With no stream open, behaviour is as before.
+  `QuoteStreamConflict` before anything is sent, and nothing is cancelled either (nothing was
+  requested). With no stream open, behaviour is as before. On a session that can place orders
+  (`PaperOrderSession` subclasses `IbkrSession`), hold streams only with type 3, or not at all,
+  so its own quote requests never conflict.
+- Notices: an entitlement notice that TWS sends with reqId -1 (session-wide) is recorded in
+  `session.notices` only and is **not** attributed to any stream. Whether TWS sends 2186 / 10090 /
+  10167 with the request's reqId is for the stream check to confirm.
 
 ### Per-side evidence (additive `QuoteSnapshot` fields, safe defaults)
 
-`bid_at` / `ask_at` (UTC wall clock, ms) and `bid_at_monotonic` / `ask_at_monotonic` (this
-process's `time.monotonic()`): receipt time of the latest tick that confirmed that side, i.e. its
-price tick or its size tick carrying a set value. `bid_updates` / `ask_updates`: post-image
-updates. `bid_tick_class` / `ask_tick_class`: `LIVE`, `DELAYED` or `MIXED` tick ids on that side.
-`quality_reason`: the classification reason. `observed_at_monotonic`: when the snapshot was built.
+The counting lives in `models.SideEvidence` (pure, tested without the SDK):
+
+- A **valid** price is finite and > 0; a valid size is finite and >= 0. TWS's "no quote yet"
+  placeholders (price -1 or 0, a negative size), NaN and infinity are recorded as evidence (flags
+  `BID_PLACEHOLDER_TICK`, `BID_NON_FINITE_TICK`, and the `ASK_` pair) and never count as image or
+  change. An unset value (`UNSET_DOUBLE` / `UNSET_DECIMAL`) carries no information at all.
+- **Initial image** of a side: its first valid price. Its size part is the first valid size at or
+  after that price; a size alone never establishes the image, and sizes before it are ignored. The
+  delayed or live tick id of every tick of the side is recorded either way (`*_tick_class`).
+- **Change** (post-image update): a valid price or size of that side that differs from the
+  previous valid value of the same kind. An identical repeat is not a change, a size-only change
+  is. (The SDK turns each bid/ask price message into a price callback plus a size callback.)
+- **Freshness**: `bid_at` / `ask_at` (UTC, ms) and `bid_at_monotonic` / `ask_at_monotonic` move
+  **only** when the image is established or a value changes. An identical repeat never refreshes
+  them. `bid_last_tick_monotonic` / `ask_last_tick_monotonic` record the latest tick of any kind,
+  for diagnostics only, and are never used for freshness.
+- `bid_updates` / `ask_updates`: changes since the image. `quality_reason`: the reason code.
+  `observed_at_monotonic`: when the snapshot was built. `halted`: the latest HALTED tick (49)
+  value (0 = not halted).
+
 Reports written before these fields existed still load (defaults `None`, `0`, `""`) and can never
 pass the entry check. The monotonic stamps mean nothing in another process.
 
-**Initial image.** After subscribing, the first price tick and the first size tick of each side
-(bid, ask) with a set value, live or delayed id alike. A **post-image update** is any later tick of
-that side whose value differs from the previous value of the same kind. So a repeated image (a
-frozen feed re-sending the same bid) is not an update, a size-only change is, and an unset size is
-neither. (The SDK turns each bid/ask price message into a price callback plus a size callback; the
-size callback of an unchanged size does not count.)
-
 ### The classification (`models.classify_quote`, pure; first matching row wins)
+
+Evaluated on every `latest()`, at the end of a bounded sample and for a snapshot, with the
+requested type, the per-side change counts, each side's change age at that moment and every type
+delivered so far.
 
 | # | Observed facts | Quality | Reason |
 |---|---|---|---|
 | 1 | entitlement refusal for the request (354, 10089, 10168, 10186, 10197) | UNAVAILABLE | `NOT_ENTITLED` |
 | 2 | the held stream failed (request error, connectivity, internal error) | UNAVAILABLE | `STREAM_FAILED` |
-| 3 | no positive bid, ask or last | UNAVAILABLE | `NO_PRICE` |
-| 4 | reported type 3 | DELAYED | `REPORTED_DELAYED` |
-| 5 | reported type 4 | FROZEN (as today) | `REPORTED_DELAYED_FROZEN` |
-| 6 | reported type 2 | FROZEN | `REPORTED_FROZEN` |
-| 7 | any delayed tick id (66–76, 88, 90), type 1, unreported or unknown | DELAYED | `DELAYED_TICKS` |
-| 8 | reported type outside 1..4 | FROZEN | `UNKNOWN_MARKET_DATA_TYPE` |
-| 9 | reported type 1 but no live tick id | FROZEN | `REPORTED_LIVE_NO_LIVE_TICKS` |
-| 10 | reported type 1 with live tick ids (the initial image counts) | LIVE\* | `REPORTED_LIVE` |
-| 11 | type NOT reported, bid AND ask each ≥ 1 post-image update | LIVE\* | `TYPE_UNREPORTED_UPDATES_SEEN` |
-| 12 | type NOT reported, otherwise | FROZEN | `TYPE_UNREPORTED_NO_UPDATES_YET` |
+| 3 | no finite positive bid, ask or last | UNAVAILABLE | `NO_PRICE` |
+| 4 | latest reported type 3 | DELAYED | `REPORTED_DELAYED` |
+| 5 | latest reported type 4 | FROZEN (as before) | `REPORTED_DELAYED_FROZEN` |
+| 6 | latest reported type 2 | FROZEN | `REPORTED_FROZEN` |
+| 7 | any delayed tick id (66–76, 88, 90) on the subscription | DELAYED | `DELAYED_TICKS` |
+| 8 | an earlier reported type 2, 3 or 4 (sticky) | DELAYED (3/4 seen) or FROZEN | `REPORTED_TYPE_HISTORY_NOT_LIVE` |
+| 9 | latest reported type outside 1..4 | FROZEN | `UNKNOWN_MARKET_DATA_TYPE` |
+| 10 | reported type 1 but no live tick id | FROZEN | `REPORTED_LIVE_NO_LIVE_TICKS` |
+| 11 | reported type 1 with live tick ids (the initial image counts) | LIVE\* | `REPORTED_LIVE` |
+| 12 | type NOT reported, requested type not 1 or 3 | FROZEN | `TYPE_UNREPORTED_REQUESTED_NOT_ELIGIBLE` |
+| 13 | type NOT reported, fewer than `UNREPORTED_MIN_CHANGES` (2) changes on a side | FROZEN | `TYPE_UNREPORTED_NO_UPDATES_YET` |
+| 14 | type NOT reported, a side's latest change older than `UNREPORTED_LIVE_WINDOW_SECONDS` (5.0 s; or unknown or in the future) | FROZEN | `TYPE_UNREPORTED_UPDATES_TOO_OLD` |
+| 15 | type NOT reported, otherwise | LIVE\* | `TYPE_UNREPORTED_UPDATES_SEEN` |
 
 \* An entitlement notice for the request (`ENTITLEMENT_NOTICE_CODES`: 2186, 10090, 10167) turns a
-would-be LIVE into DELAYED / `ENTITLEMENT_NOTICE`. Notices are kept on the snapshot (`notices`) and
-can only make the label worse. Validity flags are separate from the label: `MISSING_BID/ASK`,
-`NON_POSITIVE_BID/ASK`, `CROSSED` (bid > ask) and `LOCKED` (bid = ask, new). `assess_quote` keeps
-its signature and is the same function with no update counts or notices, so for it an unreported
-type is never LIVE. The bounded sample (`quote_stream_sample`, and so `quote()` and the paper
-check) and the snapshot use `classify_quote` with their own per-side counts.
+would-be LIVE into DELAYED / `ENTITLEMENT_NOTICE`.
 
-**Why an unreported type needs post-image updates.** TWS does not always send `marketDataType` for
-real-time data: on 2026-11-12 a spot-gold stream delivered 31 bid and 35 ask updates in 12 s with
-plain tick ids and no type, and was labelled FROZEN, while an index CFD in the same run reported
-type 1. A frozen feed, however, also uses plain tick ids and delivers one fresh-looking image at
-subscription time, so "it arrived just now" is no evidence of a moving market. Requiring a
-changed value on each side after the image separates the two. US stocks on this account answer
-2186 with delayed ids (type 3) and futures answer 354 for a live request and 10167 with delayed
-data for a delayed request: rows 1, 4, 7 and the notice rule keep them DELAYED or UNAVAILABLE.
+- **Bad news is sticky per subscription.** Notices, delayed tick ids and every reported type
+  accumulate for the subscription. Once a delayed id, a reported 2/3/4 or an entitlement notice has
+  been seen, the subscription can never be LIVE again (reported 1 → 3 → 1 stays DELAYED). Close it
+  and open a new one.
+- **Validity flags** are separate from the label: `MISSING_BID/ASK`, `NON_POSITIVE_BID/ASK`,
+  `NON_FINITE_BID/ASK/LAST`, `CROSSED` (bid > ask) and `LOCKED` (bid = ask). A non-finite bid, ask
+  or last makes `two_sided_valid` false. `HALTED` is flagged and does not change the label.
+- `assess_quote` keeps its signature and is the same function with no update counts, notices or
+  requested type, so for it an unreported type is never LIVE.
 
-**Intended change in existing output.** A bounded sample with no reported type whose bid and ask
-both moved after the image is now `LIVE` (was `FROZEN`), and `assess_quote_attempts` then counts it
-as a LIVE two-sided quote (`PASS`). An unreported image-only quote is `FROZEN` as before, now with
-reason and flag `TYPE_UNREPORTED_NO_UPDATES_YET`. Flags gained `LOCKED` (bid = ask) and, only when
-it changes the label, `ENTITLEMENT_NOTICE`; no other flag changed.
+**Why an unreported type needs recent changes on both sides.** TWS does not always send
+`marketDataType` for real-time data: on 2026-11-12 a spot-gold stream delivered 31 bid and 35 ask
+updates in 12 s with plain tick ids and no type, and was labelled FROZEN, while an index CFD in
+the same run reported type 1. A frozen feed, however, also uses plain tick ids. It delivers one
+fresh-looking image at subscription time, sometimes after placeholders, and may re-send it. So
+"it arrived just now" proves nothing, and neither does one old change. Rows 12 to 15 require:
+- a request that could deliver live data (type 1 or 3);
+- at least two genuine value changes on each side since its first valid value;
+- the latest of those changes, on each side, within the last 5 seconds at the moment of the
+  snapshot.
+
+**Accepted consequence:** a thin or quiet market that is genuinely live but reports no type may
+never qualify, and an entry on it HOLDs. US stocks on this account answer 2186 with delayed ids
+(type 3), and futures answer 354 for a live request and 10167 with delayed data for a delayed
+request. Rows 1, 4, 7 and the notice rule keep them DELAYED or UNAVAILABLE.
+
+**Changes in existing output.** Compared with `main`:
+- A bounded sample or snapshot with no reported type, requested type 1 or 3, and two recent
+  changes on each side is now `LIVE` (it was `FROZEN`), and `assess_quote_attempts` counts it as
+  a LIVE two-sided quote (`PASS`).
+- Every other unreported quote stays `FROZEN`, now with one of three distinct reasons.
+- Flags gained `LOCKED`, `NON_FINITE_*`, the placeholder and non-finite tick flags, `HALTED`,
+  `EARLIER_TYPE_NOT_LIVE` and, only when it changes the label, `ENTITLEMENT_NOTICE`.
 
 ### Entry freshness (`models.entry_quote_check`, pure; not wired into execution)
 
 `entry_quote_check(snapshot, now_monotonic=..., max_age_seconds=3.0) -> EntryQuoteCheck(usable,
 reasons, bid_age_seconds, ask_age_seconds)`. Usable only if the label is `LIVE`; bid and ask are
-present and positive and bid < ask; each side's tick class is `LIVE`; and each side's last
-confirming tick is no older than the limit by the monotonic clock (an age equal to the limit
-passes) and not later than `now`. Every failing condition is listed, from the closed list
+present, finite and positive and bid < ask; no HALTED tick with a non-zero value; each side's
+tick class is `LIVE`; and each side's freshness time (its image or its latest change, never a mere
+repeat) is no older than the limit by the monotonic clock (an age equal to the limit passes) and
+not later than `now`. So even with reported type 1, a side that has not changed for longer than
+the limit is `*_STALE`. Every failing condition is listed, from the closed list
 `ENTRY_QUOTE_REASONS`: `INVALID_MAX_AGE`, `INVALID_NOW`, `NOT_LIVE`, `BID_MISSING`,
 `ASK_MISSING`, `BID_NON_POSITIVE`, `ASK_NON_POSITIVE`, `LOCKED`, `CROSSED`,
 `BID_TICKS_NOT_LIVE`, `ASK_TICKS_NOT_LIVE`, `BID_TIME_UNKNOWN`, `ASK_TIME_UNKNOWN`,
-`BID_FROM_FUTURE`, `ASK_FROM_FUTURE`, `BID_STALE`, `ASK_STALE`. Wall-clock times are never used
+`BID_FROM_FUTURE`, `ASK_FROM_FUTURE`, `BID_STALE`, `ASK_STALE`, `BID_NOT_FINITE`,
+`ASK_NOT_FINITE`, `HALTED`. Wall-clock times are never used
 for age. Wiring it into the entry rule belongs to the execution workstream.
 
 ### Run the stream check (only after the independent review, with the owner's approval and paper TWS running)
@@ -475,13 +514,13 @@ cd <worktree>
 PYTHONPATH="$PWD/src" ~/.venvs/tradingbot/bin/python scripts/ibkr_quote_stream_check.py \
     [--config ~/.config/tradingbot/ibkr/paper.toml] [--report-dir <workspace>/private/ibkr_reports] \
     [--contract symbol=TLT,sec_type=STK,exchange=SMART,currency=USD,primary_exchange=NASDAQ]... \
-    [--seconds 20] [--market-data-type 3] [--max-age 3]
+    [--seconds 20] [--market-data-type 1|3] [--max-age 3]
 ```
 
 - Arguments are validated before the private config is read or any socket opens (exit 2):
   `--contract` takes the `[[contract]]` fields of the discovery query file as `key=value` pairs
   (repeatable, at most 10; default TLT), `--seconds` 1..120 (default 20), `--market-data-type`
-  1..4 (default 3, one type for the whole run), `--max-age` (0, 60] (default 3).
+  1 or 3 only (default 3, one type for the whole run; 2 and 4 can never be LIVE), `--max-age` (0, 60] (default 3).
 - It loads the private config exactly as the paper check does; preflight, identity gate and
   read-only verification all apply. For each contract in turn it resolves the contract, opens one
   stream, polls `latest()` every 0.25 s for the hold, then closes it; then it disconnects.
@@ -497,11 +536,12 @@ PYTHONPATH="$PWD/src" ~/.venvs/tradingbot/bin/python scripts/ibkr_quote_stream_c
 
 - Whether a quiet but live market updates each side often enough for a 3-second limit (the
   "largest age while held" and "polls usable" columns), per instrument and time of day.
-- How long after subscribing the first post-image update arrives on each side (until then an
-  unreported-type stream is `TYPE_UNREPORTED_NO_UPDATES_YET`).
-- Whether TWS ever re-sends an unchanged bid/ask image on a frozen or closed market as a changed
-  value (that would be miscounted as an update), and whether `marketDataType` arrives late on a
-  stream (the label then moves from rule 11/12 to rule 10 or 6 at the next `latest()`).
+- How long after subscribing the second change arrives on each side (until then an
+  unreported-type stream is `TYPE_UNREPORTED_NO_UPDATES_YET`), and whether quiet unreported
+  markets keep changing within the 5-second window.
+- Which placeholders TWS really sends before the first quote (-1 / 0 are assumed), whether a
+  frozen or closed market ever sends a changed value, and whether `marketDataType` arrives late on
+  a stream (the label then moves to rule 11, or to rule 6/4 and stays not live).
 - What a second `reqMarketDataType` does to an already open subscription (the adapter avoids the
   question by refusing a conflicting type while streams are open).
 - How 2186 / 10090 / 10167 are attached to the request in practice (by reqId, or only as a
