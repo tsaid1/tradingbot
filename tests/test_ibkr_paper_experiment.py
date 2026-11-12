@@ -242,3 +242,55 @@ def test_a_stage2_fill_whose_stop_the_broker_cancelled_reports_it_unprotected(tw
     assert tws.count("CANCEL_ORDER") == 0  # the stage itself cancelled nothing
     with pytest.raises(X.StageRefused):
         X.run_stage("stage3-lifecycle", cfg_path)
+
+
+def test_stage3_refuses_without_a_live_or_delayed_quote_in_stage1(tws, cfg_path):
+    stage0(tws, cfg_path)
+    run("stage1-lookups", cfg_path)
+    assert run("stage2-unfillable-bracket", cfg_path)["passed"]
+    cfg = load_order_config(cfg_path)
+    p1 = X.evidence_path(cfg, "stage1-lookups")
+    data = json.loads(p1.read_text())
+    p1.write_text(json.dumps({**data, "quote": {"quality": "FROZEN"}}))
+    names = list(tws.names())
+    ev = run("stage3-lifecycle", cfg_path)
+    assert not ev["passed"] and "FROZEN" in ev["why_failed"]
+    assert tws.names() == names and placed(tws) == 2  # refused before connecting
+
+
+def test_stage3_refuses_when_the_journal_is_not_at_two(tws, cfg_path):
+    """Forged stage-2 evidence lets stage 3 start, but the durable count (0) is not the 2 it
+    starts from: it refuses before any order."""
+    stage0(tws, cfg_path)
+    run("stage1-lookups", cfg_path)
+    cfg = load_order_config(cfg_path)
+    X.evidence_path(cfg, "stage2-unfillable-bracket").write_text(json.dumps(
+        {"stage": "stage2-unfillable-bracket", "passed": True, "result": "STAGE2_PASSED"}))
+    ev = run("stage3-lifecycle", cfg_path)
+    assert not ev["passed"] and "starts from 2" in ev["why_failed"]
+    assert placed(tws) == 0 and ev["submissions_after"] == 0
+
+
+@pytest.mark.parametrize("argv", [[], ["--config", "x.toml"], ["--help"], ["stage4"],
+                                  ["all"], ["stage2-unfillable-bracket", "--count", "6"]])
+def test_the_script_does_nothing_without_one_explicit_stage(tws, monkeypatch, argv):
+    spec = importlib.util.spec_from_file_location("ibkr_paper_experiment",
+                                                  ROOT / "scripts" / "ibkr_paper_experiment.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    def never(*a, **k):
+        raise AssertionError("run_stage must not be reached")
+
+    monkeypatch.setattr(mod, "run_stage", never)
+    with pytest.raises(SystemExit):
+        mod.main(argv)
+    assert tws.names() == [] and tws.connections == []
+
+
+def test_stage_names_and_per_stage_budget_are_the_runbooks():
+    assert X.STAGES == ("stage0-refusal", "stage1-lookups", "stage2-unfillable-bracket",
+                        "stage3-lifecycle")
+    assert [X.SUBMISSIONS_OF[s] for s in X.STAGES] == [0, 0, 2, 4]
+    assert [X.SUBMISSIONS_BEFORE[s] for s in X.STAGES] == [0, 0, 0, 2]
+    assert X.SUBMISSIONS_OF.get(X.ABORT, 0) == 0

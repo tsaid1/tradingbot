@@ -1205,3 +1205,83 @@ def test_without_an_exit_collar_no_held_stop_can_be_cancelled(tws, tmp_path):
         assert tws.count("CANCEL_ORDER") == 0
     finally:
         s.disconnect()
+
+
+# --- disabled by default: the funded account; what counts toward the six -----------------------
+@pytest.mark.parametrize("accounts", ["U9990002", "DU9990002", f"{PAPER},U9990002",
+                                      [PAPER, "U9990002"], ""])
+def test_the_broker_account_list_must_be_exactly_the_paper_account(tws, tmp_path, accounts):
+    """Even with a valid paper config (a D... id), TWS's own managedAccounts must be exactly that
+    account; a live login reports a U... account. Nothing order-related is sent."""
+    tws.managed_accounts = accounts
+    s = make(tws, tmp_path, connect=False)
+    with pytest.raises(E.AccountIdentityError):
+        s.connect()
+    assert placed(tws) == 0 and tws.count("CANCEL_ORDER") == 0
+    assert "REQ_IDS" not in tws.names() and "REQ_CONFIG" not in tws.names()
+    assert s.order_mode_status != "VERIFIED"
+
+
+def test_what_counts_toward_the_six(tws, tmp_path):
+    """Every PLACE_ORDER frame counts (an entry, a bracket child, an amendment, a close, one the
+    broker rejects, one never acknowledged); a cancel and a guard refusal never count, and a
+    cancel stays possible after the cap."""
+    s = make(tws, tmp_path)
+    try:
+        parent, _child = s.place([buy("TB-1", "80.00"), stop("TB-1.STP", "79.00")])
+        assert s.submissions_used == 2  # parent 1 + child 1
+        s.modify(parent.order_id, limit_price=D("80.10"))
+        assert s.submissions_used == 3  # an amendment is a placeOrder
+        s.cancel(parent.order_id)  # the broker cancels the child with its parent
+        assert s.submissions_used == 3 and tws.count("CANCEL_ORDER") == 1
+        with pytest.raises(OrderRefused):
+            s.place([buy("TB-2", qty=2)])  # refused by the guard: nothing sent
+        assert s.submissions_used == 3
+        tws.reject_refs["TB-3"] = (201, "Order rejected - reason: invented")
+        assert s.place([buy("TB-3", "80.00")])[0].status == OrderStatus.REJECTED
+        assert s.submissions_used == 4  # sent, then rejected: it counts
+        tws.ack_lost = True
+        with pytest.raises(OrderOutcomeUnknown):
+            s.place([buy("TB-4", "80.00")])
+        assert s.submissions_used == 5  # sent, never acknowledged: it counts, never resent
+        tws.ack_lost = False
+        s.cancel(max(s.order_ids()))
+        assert s.submissions_used == 5
+        last = s.place([buy("TB-5", "80.00")])[0]
+        assert s.submissions_used == 6 == C.PAPER_TEST_1.max_submissions
+        assert s.cancel(last.order_id).status == OrderStatus.CANCELLED  # after the cap
+        with pytest.raises(OrderRefused) as info:
+            s.place([buy("TB-6", "80.00")])
+        assert info.value.refusal.reason in (RefusalReason.EXPERIMENT_FINISHED,
+                                             RefusalReason.SUBMISSION_CAP)
+        assert placed(tws) == 6 and s.submissions_used == 6
+        kinds = [e["kind"] for e in s._counter.entries]
+        assert kinds == ["PARENT", "CHILD", "MODIFY", "SINGLE", "SINGLE", "SINGLE"]
+    finally:
+        s.disconnect()
+
+
+def test_a_partial_bracket_counts_both_orders_and_its_parent_cancel_counts_nothing(tws, tmp_path):
+    s = make(tws, tmp_path)
+    try:
+        tws.reject_refs["TB-1.STP"] = (201, "Order rejected - reason: invented")
+        with pytest.raises(order_session_module.PartialBracket):
+            s.place([buy("TB-1", "80.00"), stop("TB-1.STP", "79.00")])
+        assert s.submissions_used == 2 and placed(tws) == 2
+        assert tws.count("CANCEL_ORDER") == 1  # the parent's cancel: not counted
+    finally:
+        s.disconnect()
+
+
+def test_a_bracket_that_does_not_fit_the_remaining_budget_sends_nothing(tws, tmp_path):
+    s = make(tws, tmp_path)
+    try:
+        for i in range(5):
+            s.cancel(s.place([buy(f"TB-{i}", "80.00")])[0].order_id)
+        assert s.submissions_used == 5
+        with pytest.raises(OrderRefused) as info:
+            s.place([buy("TB-B", "80.00"), stop("TB-B.STP", "79.00")])
+        assert info.value.refusal.reason == RefusalReason.SUBMISSION_CAP
+        assert s.submissions_used == 5 and placed(tws) == 5
+    finally:
+        s.disconnect()
