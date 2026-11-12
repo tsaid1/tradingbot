@@ -135,6 +135,19 @@ class SessionStateError(IbkrError):
     """Method called in the wrong lifecycle state (e.g. a request before the identity gate passed)."""
 
 
+class QuoteStreamLimit(SessionStateError):
+    """Opening another held quote stream would exceed the session's stream cap. Nothing was sent."""
+
+
+class QuoteStreamConflict(SessionStateError):
+    """A quote request asked for a market-data type other than the open streams' type
+    (``reqMarketDataType`` is session-wide). Nothing was sent."""
+
+
+class QuoteStreamClosed(SessionStateError):
+    """The held quote stream is closed (by close, disconnect, poison or connection loss)."""
+
+
 class CleanupError(IbkrError):
     """Cancel/disconnect did not complete cleanly. Never folded into success."""
 
