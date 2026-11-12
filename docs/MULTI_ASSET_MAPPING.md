@@ -290,28 +290,33 @@ number `AMBIGUOUS`). None of them is loosened. Two tightenings apply in **every*
   `≈`, `±`, `<`, `>`, `+`, `-`): they are not interpreted.
   "We are now long $X, 41.20 now.", "I am buying $X, currently 41.20.", "New position: long $X,
   trading at 41.20." and "We are now long $X." followed by "41.20 now." still anchor, subject to B.
-* **B. An elliptical level needs an understood neighbour** (review B1, 12 November 2026: an
-  allow-list, not a deny-list). When the number's own clause does not name this family (a name, an
-  alias, or a contract code of its own root), it takes its topic from its neighbour: the earlier
-  clauses of its sentence, or, when it opens its sentence, the sentence immediately before. That
-  neighbour must be (i) a sentence of this action's own clause as the interpreter delimited it, or
-  (ii) entirely on the whole-sentence allow-list that `SENTENCE_STRICT` applies to a preceding
-  sentence (the same function and word lists), or (iii) only when the owner sets
-  `level_after_own_protective_levels = true` (below), a sentence stating this action's own
-  protective levels. Anything else HOLDs: `AMBIGUOUS`, `NEIGHBOUR_NOT_UNDERSTOOD` ("Our purchase
-  price:", "Last Friday:", "Bid:", "The put:", "Qorvex is heavy.", "EUR/USD:", or a free-text
-  sentence between the instruction and the level). A second, independent check can only add a
-  hold: the neighbour and the earlier clauses hold no order, chart or cost-basis word (stop, target,
-  entry, exit, high, low, support, cost, basis, average, avg, breakeven, paid, filled, entered, ...;
-  `CONTEXT_WORD:<w>`). So "Stop is 40.10. 41.20 now." holds without the key: the interpreter's roles
-  cannot show that such a level is the market rather than the stop, because a `PriceMention` carries
-  a role and a value but no sentence. A level that names this family ("$X 41.20 now.") is an
-  explicit quotation whatever its neighbour says. A level sentence that cannot be located in the post
-  has no known context and holds (`CONTEXT_UNKNOWN`).
+* **B. Understood neighbours** (final review round, 12 November 2026: paths removed, not patterns
+  added). An *understood neighbour* of the level's sentence is one of: the boundary of the post;
+  one of this action's own instruction sentences (a sentence of the action's own clause that names
+  this family or carries the action's own side or add word); or a protective-levels sentence (one
+  stating only the action's own stop and target, defined below). Nothing else is understood.
+  - **R1, every anchored level, every scope, key on or off:** the sentence immediately AFTER the
+    level's sentence must be an understood neighbour (a protective-levels sentence counts here
+    whatever the key); otherwise HOLD (`AMBIGUOUS`, `FOLLOWING_NOT_UNDERSTOOD`). "... 41.20 now.
+    Stop 40.10." passes; "... 41.20 now. That is our average cost." and "... 41.20 now. The chart
+    looks constructive." hold.
+  - **R2, an elliptical level** (its clause does not name this family and its sentence is not the
+    action's own instruction sentence): the earlier clauses of its sentence, else the sentence
+    BEFORE it, must be the action's own instruction sentence or, only with
+    `level_after_own_protective_levels = true`, a protective-levels sentence; otherwise HOLD
+    (`AMBIGUOUS`, `NEIGHBOUR_NOT_UNDERSTOOD`), also when the level opens the post. A generic
+    allow-listed sentence ("Our position.", "This.", "We are long.") no longer attributes a level.
+  - The level- and cost-word deny-list (`CONTEXT_WORD:<w>`) stays as a second check that can only
+    add a hold: on the neighbour before an elliptical level and on the clauses before a level in
+    the instruction sentence ("We are now long $X, stop 40.10, 41.20 now." holds).
+  - Rule A and the whole-sentence checks of `SENTENCE_STRICT` and `ACTION_BLOCK` stay on top, so
+    no scope is looser than `SINGLE_MARKET_POST`. A level that names this family ("$X 41.20 now.")
+    needs no preceding neighbour, but R1 still applies. A level sentence that cannot be located in
+    the post holds (`CONTEXT_UNKNOWN`).
 
 * **Own protective levels** (`entry_anchor.level_after_own_protective_levels`, a strict boolean,
-  default false, shipped false for every family; an owner decision). When true, alternative (iii)
-  accepts a neighbour that satisfies all of: every alphabetic token is on a small closed public list
+  default false, shipped false for every family; an owner decision). When true, R2 also accepts as
+  the sentence before an elliptical level a protective-levels sentence, which satisfies all of: every alphabetic token is on a small closed public list
   (`instruction_terms.PROTECTIVE_WORDS`: stop, stops, stop-loss, stoploss, protective, target,
   targets, targeting, objective, with, a, an, the, and, at, is, are, our, my, set, of, price, level,
   loss) or the private `context_words`; it holds no time, condition or cost-basis word and no month;
@@ -404,8 +409,9 @@ Under `SINGLE_MARKET_POST` specifically, after the unresolved-reference check an
 allow-list (B): a market named only by a lower-case common word outside the public lists ("the
 widget fund"), or by an unknown word at the start of a sentence ("Zorbex is heavy."), in a sentence
 that is **not** the level's neighbour, in an otherwise understood post, is still invisible, so a
-marked level that really belongs to it could be attributed to the post's family. (Before an
-elliptical level such a sentence holds, because the neighbour is not understood.) This is not named-entity recognition and
+marked level that really belongs to it could be attributed to the post's family. (Directly before an
+elliptical level, or directly after any anchored level, such a sentence holds: it is not an
+understood neighbour.) This is not named-entity recognition and
 there is no dictionary. The protections that bound that case are the same: the collar against the
 live quote, the signal-age limit, the mandatory stop and the size caps; and the vocabulary can be
 extended privately (`entry_anchor.family_aliases`). The check also fails closed the other way: a
