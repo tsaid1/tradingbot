@@ -52,16 +52,20 @@ from tradingbot.models import (
     StrictModel,
 )
 from tradingbot.runtime.instruction_terms import (
+    ADD_WORDS,
     MONTH_WORD_RE,
     PRESENT_MARKERS,
+    SIDE_WORDS,
     InstructionTerms,
     anchor_not_current,
     check_phrase,
     clause_numbers,
     code_shaped,
+    context_unclear,
     extract_terms,
     foreign_words,
     leftover_tokens,
+    marked_numbers,
     post_multi_leg,
     relative_contract_words,
 )
@@ -96,6 +100,8 @@ ENTRY_ANCHOR_NOT_CURRENT = "ENTRY_ANCHOR_NOT_CURRENT"
 # A separate level line or attached quote has a word that is not this family's name, alias, a
 # present-market marker or a unit: whose level it is cannot be told.
 ENTRY_ANCHOR_INSTRUMENT_UNCLEAR = "ENTRY_ANCHOR_INSTRUMENT_UNCLEAR"
+# A word in the anchor's context window is not on the allow-list: what the number is cannot be told.
+ENTRY_ANCHOR_CONTEXT_UNCLEAR = "ENTRY_ANCHOR_CONTEXT_UNCLEAR"
 # level_contract_rule = FRONT_MONTH: why the front contract cannot be used for an unnamed month.
 FRONT_MONTH_IN_ROLL_WINDOW = "FRONT_MONTH_IN_ROLL_WINDOW"
 FRONT_MONTH_AMBIGUOUS = "FRONT_MONTH_AMBIGUOUS"
@@ -969,19 +975,54 @@ class FamilyMapping(StrictModel):
         lexicon = lexicon or AnchorLexicon()
         markers = (*PRESENT_MARKERS, *lexicon.present_markers)
         why = anchor_not_current(source, anchor, markers)
-        if why:
+        if "NO_PRESENT_MARKER" in why:  # no positive evidence at all
             return None, None, [ENTRY_ANCHOR_NOT_CURRENT, *why]
+        # The allow-list (confirmation review): every word around the number is understood. A
+        # reference-series anchor may be attributed only to the reference series (rule 3): the
+        # execution instrument's own symbol is not one of its names.
+        own = self.anchor_names(asset, lexicon)
+        instruction = list(SIDE_WORDS.get(getattr(action.position_side, "value", ""), ()))
+        if action.action == Action.ADD:
+            instruction += ADD_WORDS
+        skip = []
+        if self.execution.sec_type == "FUT":  # the contract check reads these instead
+            months = extract_terms(source)
+            skip = [*months.month_spans, *(m.span() for m in MONTH_WORD_RE.finditer(source))]
+        unclear = context_unclear(source, anchor, markers=markers, names=own,
+                                  instruction=instruction, skip_spans=skip)
+        if unclear:
+            return None, None, [ENTRY_ANCHOR_CONTEXT_UNCLEAR, f"WORDS:{unclear}"]
+        if why:  # the disqualifying words: a second, redundant check
+            return None, None, [ENTRY_ANCHOR_NOT_CURRENT, *why]
+        # Another marked level elsewhere in the post that is no other action's: which is meant?
+        consumed, _ = _consumed(action)
+        consumed |= {v for role, raw in levels or () if role in ("STOP", "TARGET")
+                     and (v := _level(raw)) is not None}
+        texts = [terms.clause, source, *(
+            line for line in _post_lines(post_text)
+            if not any(c and (c.strip() in line or line in c) for _, c, _ in others))]
+        marked = set().union(*(marked_numbers(x, markers) for x in texts)) - consumed - {anchor}
+        if marked:
+            return None, None, [ENTRY_ANCHOR_SEVERAL_LEVELS, "MARKED_ELSEWHERE"]
         if source != terms.clause:
-            allowed = {n.lower() for n in names} | set(self.aliases) | set(markers) | {"at"}
-            allowed |= set(lexicon.family_aliases.get(self.family, ()))
-            skip = []
-            if self.execution.sec_type == "FUT":  # the contract check reads these instead
-                line = extract_terms(source)
-                skip = [*line.month_spans, *(m.span() for m in MONTH_WORD_RE.finditer(source))]
+            allowed = set(own) | set(markers) | {"at"}
             foreign = foreign_words(source, anchor, allowed, skip)
             if foreign:
                 return None, None, [ENTRY_ANCHOR_INSTRUMENT_UNCLEAR, f"OTHER_WORDS:{len(foreign)}"]
         return anchor, source, []
+
+    def anchor_names(self, asset: str, lexicon: AnchorLexicon | None = None) -> list[str]:
+        """Lower-case names an anchor may be attributed to: the family, its reference series and
+        aliases, and for a family compared in its execution series (DIRECT) the execution
+        instrument's symbols too."""
+        names = {asset, self.family.removesuffix(".OPT")}
+        if self.reference is not None:
+            names.add(self.reference.symbol)
+        if self.basis not in ("BASIS_SHIFT", "REFERENCE_TRIGGER"):
+            names |= {self.execution.symbol, *self.equivalent_roots}
+        out = {n.lower() for n in names} | set(self.aliases)
+        out |= set((lexicon or AnchorLexicon()).family_aliases.get(self.family, ()))
+        return sorted(out)
 
     def unexplained_prices(self, action: TradeAction, terms: InstructionTerms, anchor: Decimal,
                            levels: list[tuple[str, str]] | None,

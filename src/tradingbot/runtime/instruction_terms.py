@@ -392,6 +392,88 @@ def anchor_not_current(text: str, value: Decimal, markers: tuple[str, ...]) -> l
     return out
 
 
+# The anchor's context window is an allow-list (confirmation review). Besides the markers, the
+# family's own names and the action's own instruction words, only these may stand there.
+CONNECTOR_WORDS = frozenset(("at", "is", "are", "around", "near", "here", "the", "a", "it", "@"))
+# The action's own instruction words, by side and kind: the words the interpreter reads as this
+# action's side and verb.
+SIDE_WORDS = {"LONG": ("long", "buy", "buying"),
+              "SHORT": ("short", "shorting", "sell", "selling")}
+ADD_WORDS = ("add", "adding")
+
+
+def _tokens(text: str):
+    """(start, end, token) of every token in every clause of ``text``, one list per clause."""
+    out, start = [], 0
+    for m in [*_SEGMENT_RE.finditer(text), None]:
+        end = m.start() if m else len(text)
+        seg = [(start + t.start(), start + t.end(), t.group(0))
+               for t in _TOKEN_RE.finditer(text[start:end])]
+        if seg:
+            out.append(seg)
+        start = m.end() if m else end
+    return out
+
+
+def _tag(words: list[str], phrases, tag: str, tags: list[str | None]) -> None:
+    for phrase in sorted({p for p in phrases if p}, key=lambda p: -len(p.split())):
+        pw = phrase.split()
+        n = len(pw)
+        for k in range(len(words) - n + 1):
+            if words[k:k + n] == pw and all(t is None for t in tags[k:k + n]):
+                tags[k:k + n] = [tag] * n
+
+
+def context_unclear(text: str, value: Decimal, *, markers, names, instruction,
+                    skip_spans: list[tuple[int, int]] = ()) -> int:
+    """How many words in the context window of ``value`` the bot does not understand (zero: the
+    window is entirely understood). The window runs from the start of the number's own clause, or
+    from the last of this action's instruction words or this family's names before the number if
+    there is one, to the number, and from the number to the end of its clause. Every alphabetic
+    token in it must be a present-market marker, a connector (``CONNECTOR_WORDS``), a currency or
+    unit, a name or alias of this family (``names``, lower case, without "$"), or one of the
+    action's own instruction words (``instruction``). ``skip_spans`` (a future's contract months)
+    are left to the contract check. Other numbers are left to the unexplained-price check."""
+    unknown = 0
+    for seg in _tokens(text or ""):
+        words = [_word(t).lstrip("~").lstrip("$") for _, _, t in seg]
+        hits = [i for i, (_, _, t) in enumerate(seg) if _value(t) == value]
+        if not hits:
+            continue
+        tags: list[str | None] = [None] * len(words)
+        _tag(words, markers, "marker", tags)
+        _tag(words, names, "name", tags)
+        _tag(words, instruction, "instruction", tags)
+        for i in hits:
+            starts = [j for j in range(i) if tags[j] in ("name", "instruction")]
+            first = starts[-1] + 1 if starts else 0
+            for k in (*range(first, i), *range(i + 1, len(seg))):
+                a, b, token = seg[k]
+                w = words[k]
+                if tags[k] is not None or any(x <= a and b <= y for x, y in skip_spans):
+                    continue
+                if not any(ch.isalpha() for ch in w) or w in CONNECTOR_WORDS or w in UNIT_WORDS:
+                    continue
+                if _value(token) is not None or any(ch.isdigit() for ch in w):
+                    continue
+                unknown += 1
+    return unknown
+
+
+def marked_numbers(text: str, markers) -> set[Decimal]:
+    """Every number in ``text`` with a present-market marker attached to it."""
+    phrases = [m.split() for m in markers]
+    out = set()
+    for seg in _SEGMENT_RE.split(text or ""):
+        tokens = seg.split()
+        words = [_word(t) for t in tokens]
+        for i, tok in enumerate(tokens):
+            v = _value(tok)
+            if v is not None and any(_attached(words, i, m) for m in phrases):
+                out.add(v)
+    return out
+
+
 def _attached(words: list[str], i: int, marker: list[str]) -> bool:
     n = len(marker)
     if words[i + 1:i + 1 + n] == marker:
