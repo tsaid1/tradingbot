@@ -20,6 +20,7 @@ docs/MAPPING_PROPOSAL.md.
 from __future__ import annotations
 
 import json
+import math
 import re
 import tomllib
 from dataclasses import dataclass, field
@@ -36,7 +37,9 @@ FND_FLAG = "first notice date not in report: owner/broker confirmation needed"
 TREATMENTS = ("DIRECT", "BASIS_SHIFT", "REFERENCE_TRIGGER")
 # Owner inputs the policy may already state; copied verbatim and checked by the real loader.
 OWNER_KEYS = {"sizing", "session", "roll", "contract_selection", "basis_shift",
-              "reference_trigger", "same_series_reason", "aliases"}
+              "reference_trigger", "same_series_reason", "aliases",
+              # the owner's whole-unit size increment where the broker allows fractions (shares)
+              "size_increment"}
 _FAMILY_KEYS = {"family", "treatment", "execution", "reference", "candidates", "level_meaning",
                 "illustrative_price", "owner"}
 _TOP_KEYS = {"schema", "roll_rule", "family"}
@@ -68,18 +71,28 @@ class ProposalUnsafe(RuntimeError):
 
 
 def _check_keys(v: Any, where: str) -> None:
+    """Bare keys at every level, and only value types the writer renders and the re-parse
+    reproduces exactly: strings, booleans, integers, finite floats, dates and date-times, and
+    lists and tables of them."""
     if isinstance(v, dict):
         for k, x in v.items():
-            if not isinstance(k, str) or not BARE_KEY.match(k):
+            if not isinstance(k, str) or not BARE_KEY.fullmatch(k):
                 raise ProposalInputInvalid(f"{where}: {k!r} is not a bare key ([A-Za-z0-9_-]+)")
             _check_keys(x, f"{where}.{k}")
     elif isinstance(v, list):
         for x in v:
             _check_keys(x, where)
+    elif isinstance(v, float):
+        if not math.isfinite(v):
+            raise ProposalInputInvalid(f"{where}: value {v!r} is not a finite number")
+    elif not isinstance(v, (str, bool, int, date)):
+        raise ProposalInputInvalid(f"{where}: value of type {type(v).__name__} is not supported "
+                                   "(strings, booleans, integers, finite numbers, dates, lists "
+                                   "and tables only)")
 
 
 def check_family_name(name: str, where: str = "family") -> str:
-    if not isinstance(name, str) or not FAMILY_NAME.match(name):
+    if not isinstance(name, str) or not FAMILY_NAME.fullmatch(name):
         raise ProposalInputInvalid(f"{where}: {name!r} is not a valid family name "
                                    "(A-Z, 0-9, up to 10 characters, optional .OPT)")
     return name
@@ -100,8 +113,17 @@ def absent(v: Any) -> bool:
     return v is None or v == "" or v == [] or v == {}
 
 
+_LINE_BREAKERS = re.compile(r"[\x00-\x1f\x7f\x85\u2028\u2029]+")
+
+
+def one_line(v: Any) -> str:
+    """Report- or policy-derived text for a comment, header or free text: one line, no control
+    characters (each run becomes a single space)."""
+    return _LINE_BREAKERS.sub(" ", str(v))
+
+
 def show(v: Any) -> str:
-    return "absent" if absent(v) else str(v)
+    return "absent" if absent(v) else one_line(v)
 
 
 # ============================================================================ inputs
@@ -162,6 +184,10 @@ def parse_family(f: dict, i: int | str = 0, source: str = "policy file") -> Fami
     if not isinstance(owner, dict) or set(owner) - OWNER_KEYS:
         raise ProposalInputInvalid(f"{where}: owner takes only {sorted(OWNER_KEYS)}")
     _check_keys(owner, f"{where}.owner")
+    inc = owner.get("size_increment")
+    if inc is not None and (isinstance(inc, bool) or not isinstance(inc, int) or inc < 1):
+        raise ProposalInputInvalid(f"{where}: owner size_increment is the whole-unit increment "
+                                   "the owner states (an int >= 1)")
     price = f.get("illustrative_price")
     if price is not None:
         try:
@@ -384,7 +410,7 @@ def _placeholder_table(keys: list[str], fixed: dict | None = None) -> dict:
 
 
 def _series(v: Vehicle, missing: list[str], where: str, *, execution: bool,
-            owner_in: list[str] | None = None) -> dict:
+            owner_in: list[str] | None = None, owner_increment: int | None = None) -> dict:
     s = v.spec
     out: dict[str, Any] = {}
     for k in ("sec_type", "symbol", "exchange", "currency"):
@@ -429,6 +455,8 @@ def _series(v: Vehicle, missing: list[str], where: str, *, execution: bool,
     inc = positive(s.get("size_increment"))
     if inc is not None and inc >= 1 and inc == inc.to_integral_value():
         out["size_increment"] = int(inc)
+    elif stock and inc is not None and inc < 1 and owner_increment is not None:
+        out["size_increment"] = owner_increment  # the owner stated whole units only
     elif stock and inc is not None and inc < 1 and owner_in is not None:
         out["size_increment"] = PLACEHOLDER
         owner_in.append(f"{where}.size_increment: the broker allows fractional shares (size "
@@ -438,19 +466,24 @@ def _series(v: Vehicle, missing: list[str], where: str, *, execution: bool,
         why = v.spec_problems.get("size_increment") or \
             f"report states {show(s.get('size_increment'))}"
         missing.append(f"{where}.size_increment: {why} (whole units only)")
+    if owner_increment is not None and out.get("size_increment") != owner_increment:
+        missing.append(f"{where}.size_increment: the owner's whole-unit increment applies only "
+                       "where the broker allows fractional shares")
     return out
 
 
 def report_warnings(cat: dict, x: Vehicle, ref: Vehicle) -> list[str]:
     out = []
     if cat.get("overall") != "COMPLETE":
-        out.append(f"the discovery report is {cat.get('overall')} ({show(cat.get('failure'))}): "
+        out.append(f"the discovery report is {_md(cat.get('overall'))} "
+                   f"({_md(cat.get('failure'))}): "
                    "re-run discovery before relying on it")
     if x.truncated:
-        out.append(f"execution row `{x.query}` is TRUNCATED: the month list may be incomplete "
+        out.append(f"execution row `{_md(x.query)}` is TRUNCATED: the month list may be incomplete "
                    f"(the report kept {len(x.contracts)} rows at limit {show(x.limit)})")
     if ref is not x and ref.truncated:
-        out.append(f"reference row `{ref.query}` is TRUNCATED: the broker returned more rows than "
+        out.append(f"reference row `{_md(ref.query)}` is TRUNCATED: the broker returned more "
+                   "rows than "
                    f"the report kept ({len(ref.contracts)} at limit {show(ref.limit)})")
     return out
 
@@ -540,7 +573,8 @@ def build_family(plan: FamilyPlan, cat: dict, policy: ProposalPolicy) -> FamilyP
                      f"execution {x.query!r}, reference {ref.query!r}, treatment from the "
                      f"{plan.source}.")
     reference = _series(ref, missing, "reference", execution=False)
-    execution = _series(x, missing, "execution", execution=True, owner_in=owner_in)
+    execution = _series(x, missing, "execution", execution=True, owner_in=owner_in,
+                        owner_increment=o.get("size_increment"))
     if opt:
         reference = {"sec_type": "OPT", "symbol": execution["symbol"],
                      "exchange": PLACEHOLDER, "currency": execution["currency"]}
@@ -683,13 +717,17 @@ def _toml(v: Any) -> str:
         return str(v)
     if isinstance(v, date):
         return v.isoformat()
-    if isinstance(v, (str, Decimal, float)):
+    if isinstance(v, float):
+        if not math.isfinite(v):
+            raise ProposalInputInvalid(f"value {v!r} is not a finite number: not written")
+        return repr(v)
+    if isinstance(v, (str, Decimal)):
         return _tstr(str(v))
     if isinstance(v, list):
         return "[" + ", ".join(_toml(x) for x in v) + "]"
     if isinstance(v, dict):
         for k in v:
-            if not isinstance(k, str) or not BARE_KEY.match(k):
+            if not isinstance(k, str) or not BARE_KEY.fullmatch(k):
                 raise ProposalInputInvalid(f"{k!r} is not a bare key: not written")
         return "{ " + ", ".join(f"{k} = {_toml(x)}" for k, x in v.items()) + " }"
     raise TypeError(f"cannot write {type(v).__name__} to TOML")
@@ -698,8 +736,8 @@ def _toml(v: Any) -> str:
 def render_toml(props: list[FamilyProposal], cat: dict) -> str:
     lines = [
         "# PROPOSED mapping entries (tradingbot.runtime.mapping_proposal). NOT APPROVED.",
-        (f"# Built from discovery report started_at={cat.get('started_at')} "
-        f"overall={cat.get('overall')}; every entry is approved = false."),
+        (f"# Built from discovery report started_at={one_line(cat.get('started_at'))} "
+        f"overall={one_line(cat.get('overall'))}; every entry is approved = false."),
         "# Entries carrying owner_input_required / broker_fact_missing do not load: replace each",
         f"# {PLACEHOLDER} with the owner's decision and {BROKER_FACT} with the broker's",
         "# fact (a new discovery query), delete those two keys, review with",
@@ -709,24 +747,45 @@ def render_toml(props: list[FamilyProposal], cat: dict) -> str:
     for p in props:
         lines.append("[[mapping]]")
         for k, v in p.entry.items():
-            if not BARE_KEY.match(k):
+            if not BARE_KEY.fullmatch(k):
                 raise ProposalInputInvalid(f"{k!r} is not a bare key: not written")
             lines.append(f"{k} = {_toml(v)}")
         lines.append("")
     return "\n".join(lines)
 
 
+def _plain(v: Any) -> Any:
+    """A proposed value as the TOML parser returns it (the writer renders a Decimal as a
+    string)."""
+    if isinstance(v, dict):
+        return {k: _plain(x) for k, x in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [_plain(x) for x in v]
+    if isinstance(v, Decimal):
+        return str(v)
+    return v
+
+
+def expected_document(props: list[FamilyProposal]) -> dict:
+    return {"version": 2, "mapping": [_plain(p.entry) for p in props]}
+
+
 def verify_rendered(text: str, props: list[FamilyProposal]) -> list[dict]:
-    """Re-parse the rendered proposal: exactly the proposed families, in order, each
-    ``approved = false`` with no approval or owner-rule key. Raises ``ProposalUnsafe``."""
+    """Re-parse the exact text to be written. It must EQUAL the proposal structurally (exactly
+    the proposed families, in order, each entry key for key and value for value, nothing else
+    anywhere), and, as a second, independent check, every entry must be ``approved = false``
+    with no approval or owner-rule key. Raises ``ProposalUnsafe``."""
     try:
         data = tomllib.loads(text)
     except tomllib.TOMLDecodeError as exc:
         raise ProposalUnsafe(f"rendered proposal does not parse: {exc}") from None
-    entries = data.get("mapping")
-    if set(data) != {"version", "mapping"} or data["version"] != 2 or not isinstance(entries,
-                                                                                      list):
-        raise ProposalUnsafe(f"rendered proposal has top-level keys {sorted(data)}")
+    expected = expected_document(props)
+    if data != expected:
+        got = [e.get("family") for e in data.get("mapping", [])] if isinstance(
+            data.get("mapping"), list) else None
+        raise ProposalUnsafe("rendered proposal differs from the proposal (top-level keys "
+                             f"{sorted(data)}, families {got})")
+    entries = data["mapping"]
     if [e.get("family") for e in entries] != [p.plan.family for p in props]:
         raise ProposalUnsafe("rendered proposal does not hold exactly the proposed families")
     for e in entries:
@@ -740,28 +799,31 @@ def verify_rendered(text: str, props: list[FamilyProposal]) -> list[dict]:
 
 
 def _md(v: Any) -> str:
-    return show(v).replace("|", "\\|").replace("\n", " ")
+    """Report- or policy-derived text inside Markdown: one line, pipes and backticks escaped, and
+    a leading # or > escaped, so it cannot forge a heading, a quote, a code span or a table row."""
+    text = show(v).replace("\\", "\\\\").replace("|", "\\|").replace("`", "'")
+    return "\\" + text if text[:1] in ("#", ">") else text
 
 
 def render_contract_table(props: list[FamilyProposal], cat: dict) -> str:
-    out = [(f"# Verified contract table (report {cat.get('started_at')}, "
-           f"overall {cat.get('overall')})"), "",
+    out = [(f"# Verified contract table (report {_md(cat.get('started_at'))}, "
+           f"overall {_md(cat.get('overall'))})"), "",
            ("Every value below is stated by the discovery report; `absent` means the report does "
            "not carry it. Nothing is inferred."), ""]
     if cat.get("overall") != "COMPLETE":
-        out += [(f"**WARNING: the report is {cat.get('overall')}** "
+        out += [(f"**WARNING: the report is {_md(cat.get('overall'))}** "
                 f"({_md(cat.get('failure'))}). Re-run discovery before relying on it."), ""]
     for p in props:
         out += [f"## {p.plan.family}", ""]
         for v in p.candidates:
             role = ("execution" if v.query == p.execution.query else
                     "reference" if v.query == p.reference.query else "candidate")
-            out.append(f"### {v.query} ({role})")
+            out.append(f"### {_md(v.query)} ({role})")
             out.append("")
             if not v.found:
                 code = "absent" if v.error_code is None else str(v.error_code)
                 label = "NOT_FOUND row" if v.status == "NOT_FOUND" else "unresolved row"
-                out += [(f"{label}: status `{v.status}`, broker code {code}, message "
+                out += [(f"{label}: status `{_md(v.status)}`, broker code {_md(code)}, message "
                         f"{_md(v.error_message)}."), ""]
                 continue
             if v.truncated:
@@ -797,15 +859,15 @@ def render_calendar(props: list[FamilyProposal], policy: ProposalPolicy, cat: di
                "; exchange holidays not applied: no holiday list given") + ")") \
         if policy.roll_days is not None else \
         "no rule parameter set: every roll_date is an owner input"
-    out = ["# Proposed roll calendar", "", f"Rule: {rule}. Report date: {report_date(cat)}.",
+    out = ["# Proposed roll calendar", "", f"Rule: {rule}. Report date: {_md(report_date(cat))}.",
            ("The report carries neither first-notice dates nor the broker's close-out dates, nor "
            "whether a contract settles physically or in cash: each is flagged for owner/broker "
            "confirmation, never guessed."), ""]
     for p in props:
         if not p.calendar:
             continue
-        out += [f"## {p.plan.family}: {p.execution.query}", ""]
-        out += [f"**WARNING:** {_md(w)}." for w in p.warnings]
+        out += [f"## {p.plan.family}: {_md(p.execution.query)}", ""]
+        out += [f"**WARNING:** {one_line(w)}." for w in p.warnings]
         if p.warnings:
             out.append("")
         if p.same_series_diffs:
@@ -845,28 +907,28 @@ def _num(d: Decimal) -> str:
 def render_sheet(p: FamilyProposal, cat: dict) -> str:
     fam, plan, x, r = p.plan.family, p.plan, p.execution, p.reference
     out = [f"# Approval sheet: {fam} (PROPOSAL, NOT APPROVED)", "",
-           (f"Discovery report {cat.get('started_at')} (overall {cat.get('overall')}). "
+           (f"Discovery report {_md(cat.get('started_at'))} (overall {_md(cat.get('overall'))}). "
            f"Treatment named by the {plan.source}: **{plan.treatment}**. "
            "Every entry this tool writes is `approved = false`."), ""]
     if p.warnings:
-        out += ["## Warnings", ""] + [f"* **WARNING:** {_md(w)}." for w in p.warnings] + [""]
+        out += ["## Warnings", ""] + [f"* **WARNING:** {one_line(w)}." for w in p.warnings] + [""]
     if p.unsupported_reason:
         out += [("**Not proposable from this report.** The proposed entry is `UNSUPPORTED` and "
-                f"HOLDs: {p.unsupported_reason}."), "",
+                f"HOLDs: {_md(p.unsupported_reason)}."), "",
                 ("Owner/broker: re-run discovery with a query the broker resolves, or choose "
                 "another vehicle explicitly. No substitute is chosen by this tool."), ""]
         return "\n".join(out)
     xs, rs = x.spec, r.spec
-    xname = f"{xs.get('symbol')} ({xs.get('sec_type')}, {show(xs.get('exchange'))})"
-    rname = f"{rs.get('symbol')} ({rs.get('sec_type')}, {show(rs.get('exchange'))})"
+    xname = f"{_md(xs.get('symbol'))} ({_md(xs.get('sec_type'))}, {_md(xs.get('exchange'))})"
+    rname = f"{_md(rs.get('symbol'))} ({_md(rs.get('sec_type'))}, {_md(rs.get('exchange'))})"
     key = "DIRECT_SAME" if p.entry.get("same_series") else plan.treatment
     out += ["## What the publisher's level means", "",
-            (plan.level_meaning + " ") if plan.level_meaning else "",
+            (_md(plan.level_meaning) + " ") if plan.level_meaning else "",
             "Under this treatment a level is " + _MEANING[key].format(x=xname, r=rname) + ".", ""]
     months = [c["month"] for c in p.entry.get("contracts", [])]
     out += ["## What the bot would trade", "",
-            f"{xname}, currency {show(xs.get('currency'))}"
-            + (f", months {', '.join(months)}" if months else "") + ".", ""]
+            f"{xname}, currency {_md(xs.get('currency'))}"
+            + (f", months {_md(', '.join(months))}" if months else "") + ".", ""]
     stock = xs.get("sec_type") == "STK"
     m, t = positive(xs.get("multiplier")), positive(xs.get("min_tick"))
     m_label = _num(m) if m is not None else show(xs.get("multiplier"))
@@ -876,13 +938,13 @@ def render_sheet(p: FamilyProposal, cat: dict) -> str:
     mag = xs.get("price_magnifier")
     why_not = []
     if m is None:
-        why_not.append(f"multiplier {show(xs.get('multiplier'))} is not a positive number "
+        why_not.append(f"multiplier {_md(xs.get('multiplier'))} is not a positive number "
                        "stated by the report")
     if t is None:
-        why_not.append(f"minimum tick {show(xs.get('min_tick'))} is not a positive number "
+        why_not.append(f"minimum tick {_md(xs.get('min_tick'))} is not a positive number "
                        "stated by the report")
     if x.kind != "option_chain" and positive(mag) != 1:
-        why_not.append(f"price_magnifier {show(mag)}: prices may not be in the contract's own "
+        why_not.append(f"price_magnifier {_md(mag)}: prices may not be in the contract's own "
                        "units")
     out += ["## Contract size and risk", ""]
     if why_not:
@@ -905,7 +967,7 @@ def render_sheet(p: FamilyProposal, cat: dict) -> str:
                        f"{fam}=P; no market price is assumed)")
     out.append("")
     if p.same_series_diffs:
-        xsym, rsym = xs.get("symbol"), rs.get("symbol")
+        xsym, rsym = _md(xs.get("symbol")), _md(rs.get("symbol"))
         out += ["## Same-series claim (an assertion the owner must make)", "",
                 (f"`same_series = true` asserts that {xsym} of a month is priced as the same "
                  f"series as {rsym} of that month. The report shows listing facts only (symbols, "
@@ -920,8 +982,8 @@ def render_sheet(p: FamilyProposal, cat: dict) -> str:
                 f"| month | {xsym} last trade | {rsym} last trade | difference |",
                 "|---|---|---|---|"]
         for d in p.same_series_diffs:
-            out.append(f"| {d['month']} | {show(d['execution_last_trade'])} | "
-                       f"{show(d['reference_last_trade'])} | {_md(d['text'])} |")
+            out.append(f"| {_md(d['month'])} | {_md(d['execution_last_trade'])} | "
+                       f"{_md(d['reference_last_trade'])} | {_md(d['text'])} |")
         out.append("")
     out += ["## Facts from the broker (this report)", ""]
     for role, v in (("execution", x), ("reference", r)) if r is not x else (("execution", x),):
@@ -929,15 +991,15 @@ def render_sheet(p: FamilyProposal, cat: dict) -> str:
         ids = ", ".join(all_ids[:12]) or "absent"
         if len(all_ids) > 12:
             ids = f"first 12 of {len(all_ids)}: {ids}"
-        facts = ", ".join(f"{k} {show(v.spec.get(k))}" for k in (
+        facts = ", ".join(f"{k} {_md(v.spec.get(k))}" for k in (
             "sec_type", "symbol", "exchange", "currency", "multiplier", "min_tick",
             "size_increment", "price_magnifier", "trading_class", "time_zone_id") if k in v.spec)
-        out.append(f"* {role} query `{v.query}`: {facts}; conIds {ids}")
+        out.append(f"* {role} query `{_md(v.query)}`: {facts}; conIds {_md(ids)}")
         for k, why in v.spec_problems.items():
             if k not in ("trading_hours", "liquid_hours"):
-                out.append(f"  * `{k}`: {why}")
+                out.append(f"  * `{k}`: {_md(why)}")
         for k in ("trading_hours", "liquid_hours"):
-            val = _md(v.spec[k]) if k in v.spec else v.spec_problems.get(k, "absent")
+            val = _md(v.spec[k] if k in v.spec else v.spec_problems.get(k, "absent"))
             out.append(f"  * `{k}`: {val}")
     if p.calendar:
         unusable = [r["contract_month"] for r in p.calendar if not r["usable"]]
@@ -945,7 +1007,8 @@ def render_sheet(p: FamilyProposal, cat: dict) -> str:
                    f"{FND_FLAG}."
                    + ("" if p.holidays_applied else
                       " exchange holidays not applied (no holiday list given).")
-                   + (f" UNUSABLE (roll date already reached): {', '.join(map(str, unusable))}."
+                   + (" UNUSABLE (roll date already reached): "
+                      f"{_md(', '.join(map(str, unusable)))}."
                       if unusable else ""))
     out.append("* Not in the report: settlement type, first-notice and close-out dates, "
                "margins, trading permissions, market-data entitlements.")
@@ -969,7 +1032,8 @@ def render_sheet(p: FamilyProposal, cat: dict) -> str:
             decisions.append("Level contract rule: whether a level without a month means the "
                              "front contract (`FRONT_MONTH`).")
     if p.entry.get("same_series"):
-        decisions.append(f"same_series: state why {rs.get('symbol')} and {xs.get('symbol')} "
+        decisions.append(f"same_series: state why {_md(rs.get('symbol'))} and "
+                         f"{_md(xs.get('symbol'))} "
                          "are one price series (`same_series_reason`).")
     if plan.treatment == "BASIS_SHIFT" or "basis_shift" in p.entry:
         decisions.append("Basis: `max_abs_basis`, `max_age_seconds`, `scale_ratio = 1`.")
@@ -980,7 +1044,7 @@ def render_sheet(p: FamilyProposal, cat: dict) -> str:
         "Session: `REGULAR_ONLY` or `EXTENDED`, timezone, days and windows (broker hours above).",
         f"Market data: real-time API data for {xname}"
         + (f" and for {rname}" if r is not x else "") + " (subscription names: not in the report).",
-        (f"Trading permission for {xs.get('sec_type')} on {show(xs.get('exchange'))}: a FOUND "
+        (f"Trading permission for {_md(xs.get('sec_type'))} on {_md(xs.get('exchange'))}: a FOUND "
         "contract does not prove the account may trade it."),
         "Then, and only then: `approved = true`, `approved_by`, `approved_at`.",
     ]
@@ -988,8 +1052,8 @@ def render_sheet(p: FamilyProposal, cat: dict) -> str:
     out.append("")
     if p.owner_inputs or p.broker_missing:
         out += ["## Still open in the proposed entry (it will not load until filled)", ""]
-        out += [f"* owner input: `{k}`" for k in p.owner_inputs]
-        out += [f"* broker fact missing: `{k}`" for k in p.broker_missing]
+        out += [f"* owner input: `{_md(k)}`" for k in p.owner_inputs]
+        out += [f"* broker fact missing: `{_md(k)}`" for k in p.broker_missing]
         out.append("")
     return "\n".join(out)
 
@@ -1003,8 +1067,9 @@ def write_outputs(props: list[FamilyProposal], cat: dict, policy: ProposalPolicy
         raise ProposalInputInvalid(f"output directory {d} is not empty: choose a new one")
     for p in props:
         check_family_name(p.plan.family)
-    toml_text = render_toml(props, cat)
-    verify_rendered(toml_text, props)
+    toml_bytes = render_toml(props, cat).encode("utf-8")
+    verify_rendered(toml_bytes.decode("utf-8"), props)  # the exact bytes written below
+    toml_text = toml_bytes.decode("utf-8")
     files = {"proposed_mapping.toml": toml_text,
              "contract_table.md": render_contract_table(props, cat),
              "roll_calendar.md": render_calendar(props, policy, cat)}
@@ -1014,6 +1079,6 @@ def write_outputs(props: list[FamilyProposal], cat: dict, policy: ProposalPolicy
     written = []
     for name, text in files.items():
         path = d / name
-        path.write_text(text, encoding="utf-8")
+        path.write_bytes(toml_bytes if name == "proposed_mapping.toml" else text.encode("utf-8"))
         written.append(path)
     return written

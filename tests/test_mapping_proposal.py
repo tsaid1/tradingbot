@@ -581,3 +581,159 @@ def test_r7_non_empty_output_directory_and_bad_family_names_are_refused(tmp_path
     out2 = tmp_path / "o2"
     assert _load().main([str(FIXTURE), "--out", str(out2), "--family", "../x:DIRECT:SPY"]) == 2
     assert not out2.exists()
+
+
+# ================================================================== confirmation review (PR #65)
+
+# The reviewer's shape: a report text that closes the header comment, opens a [[mapping]] block
+# with aliases nobody proposed, and an unterminated multi-line literal string that swallows the
+# real header and TLT block up to the ''' it finds inside the TLT note.
+EXPLOIT = ("2026-11-16T15:00:00+00:00\nversion = 2\n[[mapping]]\nfamily = \"TLT\"\n"
+           "basis = \"DIRECT\"\napproved = false\naliases = [\"injected\"]\nnote = '''#")
+
+
+def _write_cat(tmp_path, cat) -> Path:
+    p = tmp_path / "cat.json"
+    p.write_text(json.dumps(cat))
+    return p
+
+
+def _assert_written_equals_proposal(out: Path, cat: dict, pol) -> None:
+    text = (out / "proposed_mapping.toml").read_text()
+    data = tomllib.loads(text)
+    props = mp.build(cat, pol)
+    assert data == mp.expected_document(props)
+    assert all("aliases" not in e for e in data["mapping"])
+
+
+@pytest.mark.parametrize("field", ["started_at", "overall"])
+def test_f1_report_text_cannot_inject_through_the_header(tmp_path, field):
+    cat = catalog()
+    cat[field] = EXPLOIT if field == "started_at" else EXPLOIT.split("\n", 1)[1]
+    out = tmp_path / "o"
+    code = _load().main([str(_write_cat(tmp_path, cat)), "--out", str(out), "--roll-days", "5"])
+    assert code in (0, 3)
+    if code == 0:
+        _assert_written_equals_proposal(out, cat, shipped())
+        text = (out / "proposed_mapping.toml").read_text()
+        assert all(not line.startswith("[[") or line == "[[mapping]]"
+                   for line in text.splitlines())
+        assert text.count("\n[[mapping]]\n") == 5
+
+
+def test_f1_finished_at_schema_query_name_and_long_name_cannot_inject(tmp_path):
+    cat = catalog()
+    cat["finished_at"] = EXPLOIT
+    tlt = next(r for r in cat["results"] if r["name"] == "TLT")
+    tlt["contracts"][0]["long_name"] = EXPLOIT
+    mes = next(r for r in cat["results"] if r["name"] == "MES fut")
+    mes["name"] = "MES fut" + EXPLOIT[25:]
+    raw = tomllib.loads(POLICY.read_text())
+    spx = next(f for f in raw["family"] if f["family"] == "SPX")
+    spx["execution"] = mes["name"]
+    pol_path = tmp_path / "pol.toml"
+    pol_path.write_text(_policy_toml(raw))
+    out = tmp_path / "o"
+    assert _load().main([str(_write_cat(tmp_path, cat)), "--out", str(out), "--policy",
+                         str(pol_path), "--roll-days", "5"]) == 0
+    _assert_written_equals_proposal(out, cat, mp.merge_cli(mp.load_policy(pol_path), [], 5, {}))
+    bad = catalog()
+    bad["schema"] = mp.CATALOG_SCHEMA + EXPLOIT
+    assert _load().main([str(_write_cat(tmp_path, bad)), "--out", str(tmp_path / "o2")]) == 2
+
+
+def test_f1_verify_requires_structural_equality_with_the_proposal():
+    cat = catalog()
+    props = mp.build(cat, shipped())
+    text = mp.render_toml(props, cat)
+    mp.verify_rendered(text, props)
+    for change in ('aliases = ["x"]\n', 'sizing = { units_per_signal = 1 }\n',
+                   'note = "other"\n'):
+        tampered = text.replace('basis = "DIRECT"\n', 'basis = "DIRECT"\n' + change, 1)
+        with pytest.raises(mp.ProposalUnsafe):
+            mp.verify_rendered(tampered, props)
+    with pytest.raises(mp.ProposalUnsafe):
+        mp.verify_rendered(text + "\n[extra]\nx = 1\n", props)
+    with pytest.raises(mp.ProposalUnsafe):
+        mp.verify_rendered(text.replace('symbol = "MES"', 'symbol = "ES"', 1), props)
+
+
+def test_f1_markdown_cannot_forge_a_heading_or_a_table_row():
+    cat = catalog()
+    forged = "x\n# Approval sheet: SPX (APPROVED)\n| 202612 | forged | row |"
+    mes = next(r for r in cat["results"] if r["name"] == "MES fut")
+    for c in mes["contracts"]:
+        c["long_name"] = forged
+        c["trading_class"] = "#MES|x\n## forged"
+    mes["name"] = "MES fut" + forged
+    raw = tomllib.loads(POLICY.read_text())
+    spx = next(f for f in raw["family"] if f["family"] == "SPX")
+    spx["execution"] = mes["name"]
+    spx["candidates"] = [mes["name"]]
+    spx["level_meaning"] = forged
+    [p] = [p for p in mp.build(cat, mp.parse_policy(raw)) if p.plan.family == "SPX"]
+    for text in (mp.render_sheet(p, cat), mp.render_contract_table([p], cat),
+                 mp.render_calendar([p], mp.parse_policy(raw), cat)):
+        lines = text.splitlines()
+        assert not any(line.startswith("# Approval sheet: SPX (APPROVED)") for line in lines)
+        assert not any(line.startswith("## forged") for line in lines)
+        assert not any(line.startswith("| 202612 | forged") for line in lines)
+        assert sum(1 for line in lines if line.startswith("# ")) == 1
+
+
+def test_n1_name_patterns_use_fullmatch():
+    with pytest.raises(mp.ProposalInputInvalid):
+        mp.check_family_name("GLD\n")
+    with pytest.raises(mp.ProposalInputInvalid):
+        mp._toml({"key\n": 1})
+    with pytest.raises(mp.ProposalInputInvalid):
+        mp.parse_policy(_policy_with_owner({"sizing": {"max_units\n": 1}}))
+
+
+@pytest.mark.parametrize("value", [__import__("datetime").time(9, 30), float("nan"),
+                                   float("inf"), object()])
+def test_n2_unsupported_owner_value_types_are_refused(value, tmp_path):
+    with pytest.raises(mp.ProposalInputInvalid, match="value"):
+        mp.parse_policy(_policy_with_owner({"sizing": {"max_units": value}}))
+    pol = tmp_path / "p.toml"
+    pol.write_text('schema = "tradingbot.mapping_proposal_policy/1"\n[[family]]\n'
+                   'family = "TLT"\ntreatment = "DIRECT"\nexecution = "TLT"\n'
+                   '[family.owner.session]\nopen = 09:30:00\n')
+    assert _load().main([str(FIXTURE), "--out", str(tmp_path / "o"), "--policy", str(pol)]) == 2
+
+
+def _policy_toml(raw: dict) -> str:
+    lines = [f"schema = {mp._toml(raw['schema'])}"]
+    if "roll_rule" in raw:
+        lines.append(f"roll_rule = {mp._toml(raw['roll_rule'])}")
+    for f in raw["family"]:
+        lines.append("[[family]]")
+        lines += [f"{k} = {mp._toml(v)}" for k, v in f.items()]
+    return "\n".join(lines) + "\n"
+
+
+def test_n3_a_fully_filled_policy_loads_with_no_hand_edit_even_with_fractional_shares(tmp_path):
+    cat = catalog()
+    next(r for r in cat["results"] if r["name"] == "TLT")["contracts"][0][
+        "size_increment"] = "0.0001"
+    raw = tomllib.loads(POLICY.read_text())
+    raw["roll_rule"] = {"business_days_before_last_trade": 5}
+    filled = {f.family: f for f in filled_policy().families}
+    for f in raw["family"]:
+        src = filled[f["family"]]
+        f.update(execution=src.execution, treatment=src.treatment, owner=src.owner)
+        if src.reference:
+            f["reference"] = src.reference
+    tlt = next(f for f in raw["family"] if f["family"] == "TLT")
+    tlt["owner"] = {**tlt["owner"], "size_increment": 1}  # the owner states whole units only
+    pol = tmp_path / "pol.toml"
+    pol.write_text(_policy_toml(raw))
+    out = tmp_path / "o"
+    assert _load().main([str(_write_cat(tmp_path, cat)), "--out", str(out),
+                         "--policy", str(pol)]) == 0
+    loaded = MappingPolicy.from_toml(out / "proposed_mapping.toml")
+    assert {f: e.status_label for f, e in loaded.entries.items()} == {
+        f: "NOT APPROVED" for f in ("TLT", "SPX", "WTI", "NATGAS", "GOLD")}
+    assert loaded.entries["TLT"].execution.size_increment == 1
+    with pytest.raises(mp.ProposalInputInvalid):
+        mp.parse_policy(_policy_with_owner({"size_increment": 0}))

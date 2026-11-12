@@ -25,7 +25,8 @@ Try it on the invented fixture: `fixtures/contract_discovery_invented/contract_c
   (`DIRECT`, `BASIS_SHIFT` or `REFERENCE_TRIGGER`), an optional sentence on what the publisher's
   level is believed to mean, and an optional `[family.owner]` table holding owner inputs already
   decided (`sizing`, `session`, `roll`, `contract_selection`, `basis_shift`, `reference_trigger`,
-  `same_series_reason`, `aliases`). The shipped file holds the lead's first choices, all
+  `same_series_reason`, `aliases`, and `size_increment`: the whole-unit increment the owner states
+  where the broker allows fractional shares). The shipped file holds the lead's first choices, all
   unapproved. `--family` replaces a family's vehicle and treatment from the command line and drops
   owner inputs decided for a different vehicle or treatment.
 * **`--roll-days N`** (or `[roll_rule] business_days_before_last_trade`, with optional
@@ -81,10 +82,14 @@ is an owner decision (the loader needs whole units). Duplicate query names in a 
 duplicate months in a row are refused, never first-wins.
 
 **Output safety.** Policy keys must be bare TOML keys (`[A-Za-z0-9_-]+`) at every level and family
-names must match the loader's pattern; every string is escaped. After rendering, the tool re-parses
-`proposed_mapping.toml` and refuses (exit 3, nothing written) unless it holds exactly the proposed
-families, each `approved = false` with no `approved_by`, `approved_at`, `entry_rule`, `entry_anchor`
-or `level_contract_rule`. The output directory must be new or empty (exit 2 otherwise).
+names must match the loader's pattern (full match); owner values are strings, booleans, integers,
+finite numbers, dates, lists and tables only; every string is escaped. Report- or policy-derived
+text in a comment, header or Markdown is reduced to one line without control characters, with
+pipes, backticks and a leading `#` or `>` escaped. After rendering, the tool re-parses the exact
+bytes of `proposed_mapping.toml` and refuses (exit 3, nothing written) unless the parsed document
+equals the proposal key for key and value for value, with nothing else in it. As a second,
+independent check, each entry must be `approved = false` with no `approved_by`, `approved_at`,
+`entry_rule`, `entry_anchor` or `level_contract_rule`. The output directory must be new or empty (exit 2 otherwise).
 
 The proposal never writes `entry_rule`, `entry_anchor` or `level_contract_rule`. Those defaults
 (`EXPLICIT_ENTRY_ONLY`, `EXPLICIT_MONTH_ONLY`) stay until the owner decides otherwise.
