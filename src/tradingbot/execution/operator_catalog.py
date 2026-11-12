@@ -67,7 +67,14 @@ def action_for(kind: str) -> tuple[str, str]:
     return EXCEPTION_ACTIONS.get(kind, (EVIDENCE, "no operator action; investigate"))
 
 
-def settle_phrase(order_ref: str, outcome: str) -> str:
+def settle_phrase(order_ref: str, outcome: str, quantity: int | None = None,
+                  price: str | None = None) -> str:
+    """``SETTLE <ref> <outcome>``; for FILLED also what is declared: ``... FILLED <qty> @ <price>``
+    (review F5), with the price exactly as the operator enters it."""
+    if outcome == "FILLED":
+        qty = quantity if quantity is not None else "<quantity>"
+        px = str(price).strip() if price is not None else "<price>"
+        return f"SETTLE {order_ref} FILLED {qty} @ {px}"
     return f"SETTLE {order_ref} {outcome}"
 
 

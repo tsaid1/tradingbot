@@ -8,6 +8,7 @@ only after a full successful sync and reconciliation show the contract clean.
 from __future__ import annotations
 
 import pytest
+from execution_harness import START as START_AT
 from execution_harness import SYMBOL, Harness, open_action
 
 from tradingbot.execution import coordinator as C
@@ -33,7 +34,8 @@ _ids = iter(range(1, 10_000))
 def settle(h, ref, outcome, *, confirm=None, note=NOTE, request_id=None, **kw):
     return S.settle_intent(
         h.coord, request_id=request_id or next(_ids), order_ref=ref, outcome=outcome,
-        confirmation=confirm if confirm is not None else cat.settle_phrase(ref, outcome),
+        confirmation=confirm if confirm is not None else cat.settle_phrase(
+            ref, outcome, kw.get("quantity"), kw.get("avg_price")),
         note=note, operator="tester", **kw,
     )
 
@@ -541,3 +543,31 @@ def test_every_exception_kind_has_an_operator_class():
     for kind in (*C.INSTRUMENT_BLOCKING_KINDS, *C.ACCOUNT_BLOCKING_KINDS):
         assert cat.action_for(kind)[0] in (cat.EVIDENCE, cat.CLEAR, cat.SETTLE), kind
         assert cat.action_for(kind)[0] != cat.ACKNOWLEDGE
+
+
+def test_a_filled_confirmation_names_the_quantity_and_price_declared(h):
+    """Review F5: a mistyped size or price cannot be confirmed by habit."""
+    ref = filled_beyond_horizon(h, stop=None, target=None)
+    assert cat.settle_phrase(ref, "FILLED", 4, "50.02") == f"SETTLE {ref} FILLED 4 @ 50.02"
+    for phrase in (f"SETTLE {ref} FILLED", f"SETTLE {ref} FILLED 5 @ 50.02",
+                   f"SETTLE {ref} FILLED 4 @ 50.20"):
+        result = settle(h, ref, "FILLED", quantity=4, avg_price="50.02", confirm=phrase)
+        assert result.status == "REFUSED" and "CONFIRMATION_MISMATCH" in result.reasons
+    ok = settle(h, ref, "FILLED", quantity=4, avg_price="50.02",
+                confirm=f"SETTLE {ref} FILLED 4 @ 50.02")
+    assert ok.status == "APPLIED"
+
+
+def test_the_queue_wants_the_quantity_and_price_in_a_filled_confirmation(tmp_path):
+    from tradingbot.runtime import operator_actions as Q
+
+    queue = Q.OperatorQueue.initialise(tmp_path / "operator.sqlite3")
+    want = Q.expected_confirmation(Q.SETTLE, "TB-x", outcome="FILLED", quantity=2,
+                                   avg_price="88.42")
+    assert want == "SETTLE TB-x FILLED 2 @ 88.42"
+    common = {"at": START_AT, "operator": "tester", "origin": "test", "action": Q.SETTLE,
+              "target": "TB-x", "outcome": "FILLED", "quantity": 2, "avg_price": "88.42",
+              "note": NOTE}
+    with pytest.raises(Q.OperatorInputError, match="type exactly"):
+        queue.enqueue(**common, confirmation="SETTLE TB-x FILLED")
+    assert queue.enqueue(**common, confirmation=want) == 1

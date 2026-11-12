@@ -227,7 +227,7 @@ def test_request_ids_are_globally_unique_so_a_lost_queue_cannot_replay_an_old_re
     queue = Q.OperatorQueue(rt.config.operator_db)
     queue.enqueue(at=rt.clock.now(), operator="tester", origin="test", action=Q.SETTLE,
                   target=ref, outcome="FILLED", quantity=2, avg_price="88.42", note=NOTE,
-                  confirmation=cat.settle_phrase(ref, "FILLED"))
+                  confirmation=cat.settle_phrase(ref, "FILLED", 2, "88.42"))
     rt.step()
     [old] = queue.requests()
     assert old["id"] == 1 and old["status"] == "REFUSED"  # the broker holds nothing

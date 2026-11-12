@@ -64,7 +64,7 @@ def test_cli_reports_a_refused_settlement_with_exit_3(tmp_path):
     rt.service.close()
     out = run("scripts/operator.py", "--config", str(cfg), "settle", ref, "FILLED",
               "--quantity", "2", "--price", "88.42", "--note", NOTE,
-              "--confirm", cat.settle_phrase(ref, "FILLED"))
+              "--confirm", cat.settle_phrase(ref, "FILLED", 2, "88.42"))
     assert out.returncode == 3, out.stdout + out.stderr
     [result] = json.loads(out.stdout.split("\n", 1)[1])
     assert result["status"] == "REFUSED"

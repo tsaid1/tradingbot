@@ -66,7 +66,10 @@ the execution journal records the result under that id with its target and outco
 is applied exactly once and never answered with another request's result.
 
 * `settle <ref> NOT_AT_BROKER | CANCELLED | FILLED --quantity N --price P`: declares the outcome
-  of an intent whose outcome is unknown, once you have checked the broker. The ledger moves exactly
+  of an intent whose outcome is unknown, once you have checked the broker. The confirmation is
+  `SETTLE <ref> <outcome>`; for `FILLED` it also names what you declare,
+  `SETTLE <ref> FILLED <N> @ <P>` (the price exactly as you typed it), so a mistyped size or price
+  is not confirmed by habit. The ledger moves exactly
   as a broker fill would move it. A settlement is refused if the broker contradicts it: the order or
   its fills are visible, the price breaks the limit, the quantity is off, or the resulting position
   cannot match the broker's. A declared fill with no confirmed stop opens `UNPROTECTED_POSITION`.

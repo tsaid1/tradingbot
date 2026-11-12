@@ -178,7 +178,9 @@ def settle_intent(
         coord, request_id, cat.SETTLE, reasons, order_ref=order_ref, idea_id=idea,
         before=before, operator=operator, note=note, target=order_ref, outcome=outcome,
     )
-    problems = _basic_problems(confirmation, cat.settle_phrase(order_ref, outcome), note)
+    problems = _basic_problems(
+        confirmation, cat.settle_phrase(order_ref, outcome, quantity, avg_price), note
+    )
     if outcome not in cat.SETTLEMENT_OUTCOMES:
         problems.append("UNKNOWN_OUTCOME")
     if intent is None:

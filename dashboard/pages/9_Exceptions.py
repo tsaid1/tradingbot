@@ -164,7 +164,8 @@ if reg["unresolved_intents"]:
         qty = int(st.number_input("Filled quantity", min_value=0, step=1, key="settle_qty"))
         price = st.text_input("Average fill price", key="settle_price").strip() or None
     note = st.text_area("Note: what you checked at the broker", key="settle_note")
-    phrase = Q.expected_confirmation(Q.SETTLE, ref, outcome=outcome)
+    phrase = Q.expected_confirmation(Q.SETTLE, ref, outcome=outcome, quantity=qty,
+                                     avg_price=price)
     typed = st.text_input(f"Type exactly: {phrase}", key="settle_confirm")
     if st.button("Queue settlement", key="settle_submit"):
         queue_request(operator=op_name, action=Q.SETTLE, target=ref, outcome=outcome,

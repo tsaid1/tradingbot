@@ -91,10 +91,12 @@ class OperatorInputError(ValueError):
 
 
 def expected_confirmation(action: str, target: str, *, kind: str | None = None,
-                          outcome: str | None = None) -> str:
-    """The exact words the operator must type for this action (they name target and outcome)."""
+                          outcome: str | None = None, quantity: int | None = None,
+                          avg_price: str | None = None) -> str:
+    """The exact words the operator must type for this action: they name the target and the
+    outcome and, for FILLED, the quantity and price declared (review F5)."""
     if action == SETTLE:
-        return cat.settle_phrase(target, outcome or "?")
+        return cat.settle_phrase(target, outcome or "?", quantity, avg_price)
     if action == CLEAR:
         return cat.clear_phrase(int(target), kind or "?")
     if action == ACKNOWLEDGE:
@@ -197,7 +199,8 @@ class OperatorQueue:
             if outcome != "FILLED" and (quantity is not None or avg_price):
                 problems.append("quantity and price are given only with FILLED")
         if not problems:
-            want = expected_confirmation(action, str(target), kind=kind, outcome=outcome)
+            want = expected_confirmation(action, str(target), kind=kind, outcome=outcome,
+                                         quantity=quantity, avg_price=avg_price)
             if confirmation.strip() != want:
                 problems.append(f"type exactly: {want}")
         if problems:
