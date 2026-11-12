@@ -27,8 +27,12 @@
 #   entry_rule = "REFERENCE_AS_COLLAR"   a current open or add stating exactly one market level
 #                                        enters with a LIMIT at the live marketable price, the
 #                                        stated level an anchor bounded by [entry_anchor]
-#                                        max_adverse_move / max_favourable_move ("2.5" or "0.5%")
-#                                        and max_signal_age_seconds; all three required
+#                                        max_adverse_move / max_favourable_move ("2.5" or "0.5%"),
+#                                        max_signal_age_seconds, anchor_scope,
+#                                        max_quote_age_seconds (each side of the live streaming
+#                                        quote; ceiling 5 s) and environment = "PAPER" (its only
+#                                        value): all required, no defaults. Paper and simulation
+#                                        only; never a funded account; never a market order
 #   level_contract_rule = "EXPLICIT_MONTH_ONLY"  (default) a futures level needs a named month
 #   level_contract_rule = "FRONT_MONTH"  a DIRECT futures level with no month means the front
 #                                        contract of the entry's own list; HOLD in its roll window
@@ -40,12 +44,21 @@ family = "TLT"
 basis = "DIRECT"
 approved = true
 approved_by = "owner"
-approved_at = 2026-06-01T00:00:00Z
-note = "Publisher levels for TLT are quoted in the ETF's own share price. Version-1 behaviour."
-# entry_rule is not set: EXPLICIT_ENTRY_ONLY. A stated market level ("long here, TLT 88.40 now")
-# is a REFERENCE and the OPEN is held (OPEN_ENTRY_PRICE_MISSING) until the owner decides otherwise.
+approved_at = 2026-11-12T00:00:00Z
+note = "Publisher levels for TLT are quoted in the ETF's own share price. Current-market entry rule approved by the owner on 2026-11-12: paper and simulation only; does not authorize broker order submission."
 reference = { sec_type = "STK", asset_class = "ETF", symbol = "TLT", exchange = "SMART", currency = "USD" }
 execution = { sec_type = "STK", asset_class = "ETF", symbol = "TLT", exchange = "SMART", currency = "USD" }
+# The only exposure the owner has approved so far: 1 share, at most 150 USD notional, in the US
+# regular session. The entry rule is decided on the mapped path, which needs both.
+sizing = { units_per_signal = 1, max_units = 1, max_notional = "150" }
+session = { policy = "REGULAR_ONLY", timezone = "America/New_York", days = ["MON", "TUE", "WED", "THU", "FRI"], regular = ["09:30-16:00"] }
+# Owner's decision of 2026-11-12, TLT only: a current open stating exactly one market level, in a
+# post about this one market, enters with a LIMIT at the live ask (long) or bid (short), within
+# 0.3% adverse / 0.6% favourable of the stated level, at most 90 s after publication, on a live
+# streaming quote whose bid and ask are each at most 3 s old, always with a protective stop.
+# Paper and simulation only; does not authorize broker order submission.
+entry_rule = "REFERENCE_AS_COLLAR"
+entry_anchor = { max_adverse_move = "0.3%", max_favourable_move = "0.6%", max_signal_age_seconds = 90, anchor_scope = "SINGLE_MARKET_POST", max_quote_age_seconds = 3, environment = "PAPER" }
 
 # ------------------------------------------------------------------ templates (not active)
 # EXAMPLES ONLY. Every symbol, exchange, multiplier, tick, date, hour and cap below is a placeholder

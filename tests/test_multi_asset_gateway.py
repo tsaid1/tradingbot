@@ -53,18 +53,19 @@ def terms(basis="DIRECT", **kw) -> MarketTerms:
 
 
 def leg(bid="5009.5", ask="5010.5", last="5010", *, age=0.0, quality="LIVE", at=NOW):
-    # The series' own update time is the receipt time here (a live, moving series).
+    # The series' own update time, and each side's, is the receipt time here (a live, moving
+    # series).
+    seen = at - timedelta(seconds=age)
     return LegQuote(contract_key="IND:QREF:-:-:-:78", bid=Decimal(bid) if bid else None,
                     ask=Decimal(ask) if ask else None, last=Decimal(last) if last else None,
-                    observed_at=at - timedelta(seconds=age), quality=quality,
-                    updated_at=at - timedelta(seconds=age))
+                    observed_at=seen, quality=quality, updated_at=seen, bid_at=seen, ask_at=seen)
 
 
 def mq(t: MarketTerms, bid="5024.75", ask="5025.25", *, age=0.0, quality="LIVE",
        reference: LegQuote | None = None, at=NOW) -> MappedQuote:
-    return MappedQuote(symbol="QXF", bid=Decimal(bid), ask=Decimal(ask),
-                       observed_at=at - timedelta(seconds=age), quality=quality, terms=t,
-                       reference=reference)
+    seen = at - timedelta(seconds=age)
+    return MappedQuote(symbol="QXF", bid=Decimal(bid), ask=Decimal(ask), observed_at=seen,
+                       quality=quality, terms=t, reference=reference, bid_at=seen, ask_at=seen)
 
 
 def act(action=Action.OPEN, *, entry="5025", stop="4995", target="5085", side=PositionSide.LONG,

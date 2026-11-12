@@ -34,7 +34,8 @@ from tradingbot.validator import gate_action
 REPO = Path(__file__).resolve().parents[1]
 SHIPPED = REPO / "config" / "instrument_mapping.toml"
 RULE = {"entry_rule": "REFERENCE_AS_COLLAR", "anchor_max_adverse_move": "0.2%",
-        "anchor_max_favourable_move": "0.5%", "anchor_max_signal_age_seconds": 30}
+        "anchor_max_favourable_move": "0.5%", "anchor_max_signal_age_seconds": 30,
+        "anchor_max_quote_age_seconds": 3}
 
 
 def anchored(anchor="5025", **kw):
@@ -73,13 +74,14 @@ def test_a_short_enters_at_the_bid():
     assert g.plan.entry_limit == Decimal("5024.75") and g.plan.anchor_live == Decimal("5024.75")
 
 
-def test_an_off_tick_quote_is_snapped_never_past_the_touch():
+def test_an_off_tick_quote_never_carries_an_anchored_entry():
+    """Owner, 12 Nov 2026: bid and ask must be on tick (before, an off-tick touch was snapped)."""
     t = terms(**RULE)
     long = gate(act(entry=None), q_with(t, "5025", bid="5024.80", ask="5025.30"))
-    assert long.plan.entry_limit == Decimal("5025.25")  # a buy limit down, never above the ask
+    assert long.status == "HOLD" and long.reasons[0] == "ENTRY_ANCHOR_QUOTE_OFF_TICK"
     short = gate(act(entry=None, side=PositionSide.SHORT, stop="5055", target="4965"),
                  q_with(t, "5025", bid="5024.80", ask="5025.30"))
-    assert short.plan.entry_limit == Decimal("5025.00")  # a sell limit up, never below the bid
+    assert short.status == "HOLD" and short.reasons[0] == "ENTRY_ANCHOR_QUOTE_OFF_TICK"
 
 
 @pytest.mark.parametrize("side,anchor", [(PositionSide.LONG, "5010"),
@@ -608,29 +610,49 @@ def test_the_rule_and_its_limits_reach_the_gateway_terms(tmp_path):
 # ================================================================== the shipped configuration
 
 
-def test_the_shipped_configuration_keeps_both_rules_off():
+def test_the_shipped_configuration_turns_the_entry_rule_on_for_the_bond_etf_only():
+    """The owner's decision of 12 November 2026, exactly: TLT only, paper only."""
     p = MappingPolicy.from_toml(SHIPPED)
     assert p.entries, "the shipped file maps at least the bond ETF"
+    collar = {f for f, e in p.entries.items() if e.entry_rule == "REFERENCE_AS_COLLAR"}
+    assert collar == {"TLT"}
     for e in p.entries.values():
-        assert e.entry_rule == "EXPLICIT_ENTRY_ONLY" and e.entry_anchor is None
         assert e.level_contract_rule == "EXPLICIT_MONTH_ONLY"
     tlt = p.entries["TLT"]
-    assert tlt.legacy_equivalent and tlt.approved
+    assert tlt.approved and tlt.approved_by == "owner" and not tlt.legacy_equivalent
+    assert tlt.approved_at.date().isoformat() == "2026-11-12"
+    r = tlt.entry_anchor
+    assert (r.max_adverse_move, r.max_favourable_move, r.max_signal_age_seconds, r.anchor_scope,
+            r.max_quote_age_seconds, r.environment) == (
+        "0.3%", "0.6%", 90, "SINGLE_MARKET_POST", 3, "PAPER")
+    assert "paper and simulation only" in tlt.note
+    assert "does not authorize broker order submission" in tlt.note
 
 
-def test_the_shipped_bond_etf_still_holds_a_stated_market_level():
+def test_the_shipped_bond_etf_anchors_one_clear_market_quote_and_nothing_else():
     p = MappingPolicy.from_toml(SHIPPED)
     a = TradeAction(action_id="a1", action=Action.OPEN, timing=Timing.CURRENT,
                     instrument=Instrument(asset_class=AssetClass.ETF, symbol="TLT"),
                     position_side=PositionSide.LONG, price_basis=PriceBasis.TRADED_CONTRACT,
                     source_market_symbol="TLT", stop_price="87.20", explicit_instruction=True,
                     evidence=["invented"])
-    d, inst = p.resolve(a, clause="We are now long $TLT, 88.40 now.", now=MAP_NOW,
-                        levels=[("REFERENCE", "88.40"), ("STOP", "87.20")])
-    assert d.status == "SUPPORTED" and not d.mapped and d.entry_anchor is None
+    levels = [("REFERENCE", "88.40"), ("STOP", "87.20")]
+    clause = "We are now long $TLT, 88.40 now."
+    d, inst = p.resolve(a, clause=clause, now=MAP_NOW, levels=levels, post_text=clause,
+                        post_actions=[a])
+    assert d.status == "SUPPORTED" and d.mapped and d.entry_anchor == "88.40", d.reason
+    assert d.anchor_level_kind == "MARKET_QUOTE" and d.anchor_attribution == "OWN_SENTENCE"
+    # A possible cost basis, or a second market in the post, holds.
+    cost_basis = "We are now long $TLT.\nOur position is 88.40 now."
+    for own, post in (("We are now long $TLT.", cost_basis), (clause, f"{clause} Gold is firm.")):
+        d, inst = p.resolve(a, clause=own, now=MAP_NOW, levels=levels, post_text=post,
+                            post_actions=[a])
+        assert d.status == "UNRESOLVED" and inst is None, d.reason
+    # Without the post's actions the single-market scope cannot attribute it: HOLD.
+    d, _ = p.resolve(a, clause=clause, now=MAP_NOW, levels=levels)
+    assert d.status == "UNRESOLVED"
     q = Quote(symbol="TLT", bid=Decimal("88.39"), ask=Decimal("88.41"), observed_at=MAP_NOW)
-    g = gate_action(a.model_copy(update={"instrument": inst}), MAP_NOW - timedelta(seconds=2),
-                    q, MockPolicy(), None, now=MAP_NOW)
+    g = gate_action(a, MAP_NOW - timedelta(seconds=2), q, MockPolicy(), None, now=MAP_NOW)
     assert g.status == "HOLD" and g.reasons == ["OPEN_ENTRY_PRICE_MISSING"]
 
 

@@ -8,7 +8,7 @@ import json
 from datetime import timedelta
 
 import pytest
-from runtime_harness import CLOSE, COMMENTARY, ENTRY, MAPPING, Runtime, post
+from runtime_harness import CLOSE, COMMENTARY, ENTRY, SERVICE_MAPPING, Runtime, post
 from runtime_harness import START as START_AT
 
 from tradingbot.execution import operator_catalog as cat
@@ -106,7 +106,7 @@ def test_an_open_position_under_a_revoked_mapping_alerts(tmp_path):
     rt = Runtime(tmp_path, [post("1", 0, ENTRY)])
     rt.step()
     revoked = tmp_path / "revoked.toml"
-    text = MAPPING.read_text().replace("approved = true", "approved = false")
+    text = SERVICE_MAPPING.read_text().replace("approved = true", "approved = false")
     revoked.write_text("\n".join(
         line for line in text.splitlines() if not line.startswith(("approved_by", "approved_at"))
     ))

@@ -16,7 +16,10 @@ from tradingbot.runtime.store import RuntimeStore
 from tradingbot.source_events import Provenance, SourcePost
 
 REPO = Path(__file__).resolve().parents[1]
-MAPPING = REPO / "config" / "instrument_mapping.toml"
+MAPPING = REPO / "config" / "instrument_mapping.toml"  # the owner's (shipped) mapping
+# The service-mechanics tests run a whole lifecycle at 2 shares; the shipped TLT entry allows 1
+# share (owner, 12 Nov 2026), so they use the pre-decision version-1 copy (fixture header).
+SERVICE_MAPPING = REPO / "fixtures" / "runtime" / "mock_service_mapping.toml"
 DEMO_FIXTURE = REPO / "fixtures" / "runtime" / "mock_service_posts.jsonl"
 START = datetime(2026, 6, 1, 14, 0, tzinfo=UTC)
 RECORDED = datetime(2026, 3, 2, 15, 0, tzinfo=UTC)  # timestamps inside the fixture files
@@ -132,7 +135,7 @@ class Runtime:
         *,
         posts_file: Path | None = None,
         compression: float | None = 1.0,
-        mapping_file: Path = MAPPING,
+        mapping_file: Path = SERVICE_MAPPING,
         **overrides,
     ):
         self.folder = Path(folder)

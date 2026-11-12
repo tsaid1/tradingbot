@@ -158,6 +158,10 @@ class LegQuote(StrictModel):
     # When the series itself last updated: the broker's own stamp, or the receipt time at which
     # the runtime saw the value change. None when neither is known: a reference leg then HOLDs.
     updated_at: datetime | None = None
+    # Each side's own last-update time on a live streaming quote (additive). An anchored entry
+    # (entry_rule = REFERENCE_AS_COLLAR) needs both, each fresh; None: it HOLDs.
+    bid_at: datetime | None = None
+    ask_at: datetime | None = None
 
 
 class MarketTerms(StrictModel):
@@ -210,6 +214,8 @@ class MarketTerms(StrictModel):
     # (max_abs_basis above is then None): execution prices, and the quotes' oldest age and skew.
     anchor_max_abs_basis: Decimal | None = None
     anchor_max_basis_age_seconds: float | None = None
+    # The oldest each side (bid, ask) of the live streaming quote may be at an anchored decision.
+    anchor_max_quote_age_seconds: float | None = None
     # Problems found while building these terms (contract unresolved, specification differs).
     problems: list[str] = Field(default_factory=list)
 
@@ -224,6 +230,9 @@ class MappedQuote(Quote):
     # REFERENCE_AS_COLLAR only (additive): the stated market level the mapping policy accepted as
     # the entry anchor of each action of this post, by action id. Empty otherwise.
     entry_anchors: dict[str, Decimal] = Field(default_factory=dict)
+    # Each side's own last-update time on the execution quote (additive; see LegQuote).
+    bid_at: datetime | None = None
+    ask_at: datetime | None = None
 
 
 class ExecutionPlan(StrictModel):
@@ -264,6 +273,9 @@ class ExecutionPlan(StrictModel):
     anchor_series: Literal["EXECUTION", "REFERENCE"] | None = None
     anchor_live: Decimal | None = None
     entry_limit: Decimal | None = None
+    # The per-side quote freshness the gateway applied; the execution core applies it again to
+    # the quote it re-reads before sending the anchored limit (additive).
+    anchor_max_quote_age_seconds: float | None = None
 
 
 class GateDecision(StrictModel):

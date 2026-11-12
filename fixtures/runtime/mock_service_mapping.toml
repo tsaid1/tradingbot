@@ -1,0 +1,19 @@
+# Mapping for the mock service demo (scripts/run_mock_service_demo.py) and the service-mechanics
+# tests (tests/runtime_harness.py) ONLY. Not the owner's mapping: config/instrument_mapping.toml is.
+#
+# The demo and those tests exercise a whole idea lifecycle (an entry, an add, a stop amendment, a
+# partial reduction, a close) at the policy's demo sizing of 2 shares. The owner's mapping for TLT
+# (12 November 2026) allows 1 share and 150 USD only, which cannot add or halve a position, so the
+# mechanics run on this copy of the bond ETF entry as it stood before that decision: the version-1
+# behaviour, explicit entry prices only (EXPLICIT_ENTRY_ONLY), policy sizing, simulated broker.
+version = 2
+
+[[mapping]]
+family = "TLT"
+basis = "DIRECT"
+approved = true
+approved_by = "owner"
+approved_at = 2026-06-01T00:00:00Z
+note = "Mock demo and tests only: the ETF's own share price, version-1 behaviour."
+reference = { sec_type = "STK", asset_class = "ETF", symbol = "TLT", exchange = "SMART", currency = "USD" }
+execution = { sec_type = "STK", asset_class = "ETF", symbol = "TLT", exchange = "SMART", currency = "USD" }

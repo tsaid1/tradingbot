@@ -34,6 +34,7 @@ from pydantic import Field
 
 from tradingbot.event_models import ReplaySource, TradeAction
 from tradingbot.execution.broker import (
+    ANCHOR_ENVIRONMENTS,
     WORKING_STATUSES,
     AckLost,
     Broker,
@@ -50,6 +51,7 @@ from tradingbot.execution.broker import (
     PriceCondition,
     QuoteQuality,
     TimeInForce,
+    broker_environment,
     supports_price_conditions,
 )
 from tradingbot.execution.store import (
@@ -72,7 +74,13 @@ from tradingbot.models import (
     PositionSide,
     StrictModel,
 )
-from tradingbot.validator import fill_quantity, source_is_fresh
+from tradingbot.validator import (
+    ANCHOR_MAX_QUOTE_AGE_CEILING_SECONDS,
+    ANCHOR_RULE_INCOMPLETE,
+    anchor_quote_problem,
+    fill_quantity,
+    source_is_fresh,
+)
 
 UNPROTECTED_POSITION = "UNPROTECTED_POSITION"
 # The broker could not be read after a fill: protection is unknown, never assumed (review M1).
@@ -120,6 +128,10 @@ OPPOSITE_IDEA_IN_SAME_CONTRACT = "OPPOSITE_IDEA_IN_SAME_CONTRACT"
 CONDITIONS_UNSUPPORTED = "CONDITIONAL_ORDERS_UNSUPPORTED_BY_BROKER"
 # The contract the broker resolves now differs from the one the gateway decided on.
 CONTRACT_CHANGED = "CONTRACT_CHANGED_SINCE_DECISION"
+# An anchored entry (entry_rule = REFERENCE_AS_COLLAR) is sent only to a broker that positively
+# declares itself simulated or paper (owner, 12 November 2026: impossible against the funded
+# account). Checked before the intent is recorded and again at the last step before submission.
+ENTRY_ANCHOR_PAPER_ONLY = "ENTRY_ANCHOR_PAPER_ONLY"
 
 
 # An operator settled an intent of unknown outcome (execution.settlement): the instrument stays
@@ -253,6 +265,11 @@ def _anchored_limit(plan: ExecutionPlan | None) -> Decimal | None:
     if plan is not None and plan.entry_rule == "REFERENCE_AS_COLLAR":
         return plan.entry_limit
     return None
+
+
+def _anchor_quote_age(plan: ExecutionPlan | None) -> float | None:
+    """The per-side quote freshness of an anchored entry's plan (None otherwise)."""
+    return plan.anchor_max_quote_age_seconds if _anchored_limit(plan) is not None else None
 
 
 def _plan_of(raw: str | None) -> ExecutionPlan | None:
@@ -920,7 +937,8 @@ class ExecutionCoordinator:
         if rules:
             return self._refuse(source, action, gate, ref, account, rules, now)
         limit, reasons = self._entry_checks(contract, side, qty, entry_level, idea_id, now,
-                                            fixed_limit=_anchored_limit(plan))
+                                            fixed_limit=_anchored_limit(plan),
+                                            anchor_quote_age=_anchor_quote_age(plan))
         if reasons:
             return self._refuse(source, action, gate, ref, account, reasons, now, idea_id=idea_id)
         exit_side = OrderSide.SELL if long else OrderSide.BUY
@@ -1105,7 +1123,8 @@ class ExecutionCoordinator:
             return self._refuse(source, action, gate, ref, account, rules, now, idea_id=pos.idea_id)
         entry_level = str(plan.execution_reference) if plan else action.entry_reference
         limit, reasons = self._entry_checks(
-            contract, side, qty, entry_level, pos.idea_id, now, fixed_limit=_anchored_limit(plan)
+            contract, side, qty, entry_level, pos.idea_id, now, fixed_limit=_anchored_limit(plan),
+            anchor_quote_age=_anchor_quote_age(plan),
         )
         if reasons:
             return self._refuse(
@@ -1321,7 +1340,7 @@ class ExecutionCoordinator:
     # ================================================================== submission and recovery
 
     def _submit(self, intent: Intent, entry: OrderIntent, children: list[OrderIntent]) -> None:
-        if self._halt_blocks(intent):
+        if self._halt_blocks(intent) or self._paper_only_blocks(intent):
             return
         attempt = self.store.intent(intent.order_ref).attempts + 1
         self.store.mark_submitted(intent.order_ref, self.clock())
@@ -1979,6 +1998,39 @@ class ExecutionCoordinator:
             )
         return built[0], built[1:]
 
+    def _paper_only_problem(self, idea_id: str, order_ref: str | None = None) -> list[str]:
+        """An anchored entry may reach only a broker that declares SIM or PAPER; anything else
+        (LIVE, no declaration) refuses and opens an ENTRY_ANCHOR_PAPER_ONLY exception."""
+        env = broker_environment(self.broker)
+        if env in ANCHOR_ENVIRONMENTS:
+            return []
+        label = env.value if env is not None else "UNDECLARED"
+        now = self.clock()
+        if self.store.raise_exception(
+            now, ENTRY_ANCHOR_PAPER_ONLY,
+            f"anchored entry refused: broker environment {label}; the entry rule is paper and "
+            "simulation only", idea_id=idea_id, order_ref=order_ref,
+        ):
+            self.store.log(now, ENTRY_ANCHOR_PAPER_ONLY, idea_id=idea_id, order_ref=order_ref,
+                           environment=label)
+        return [ENTRY_ANCHOR_PAPER_ONLY, f"ENVIRONMENT:{label}"]
+
+    def _paper_only_blocks(self, intent: Intent) -> bool:
+        """The last step before submission: an anchored entry is never sent to a broker that does
+        not declare SIM or PAPER, whatever happened before (a resend, a changed adapter)."""
+        if _anchored_limit(_plan_of(intent.plan)) is None:
+            return False
+        reasons = self._paper_only_problem(intent.idea_id, intent.order_ref)
+        if not reasons:
+            return False
+        now = self.clock()
+        self.store.set_state(intent.order_ref, IntentState.REFUSED, now, reasons=reasons)
+        for row in self.store.orders(intent.order_ref):
+            self.store.update_order(row.order_ref, now, status="NotSubmitted")
+        if intent.action == Action.OPEN:
+            self.store.update_position(intent.idea_id, now, status="NOT_FILLED")
+        return True
+
     def _halt_blocks(self, intent: Intent) -> bool:
         if not self.halted():
             return False
@@ -2513,12 +2565,15 @@ class ExecutionCoordinator:
         now: datetime,
         exclude_ref: str | None = None,
         fixed_limit: Decimal | None = None,
+        anchor_quote_age: float | None = None,
     ) -> tuple[Decimal | None, list[str]]:
         """Broker-quote sanity, the price collar and exposure caps, before any entry or add.
         Returns the collar-bounded limit price, or the reasons to refuse. ``fixed_limit`` is the
         gateway's anchored entry limit (entry_rule REFERENCE_AS_COLLAR): the marketable side of
         the quote it decided on. It is sent as it is; the fresh quote must still lie inside the
-        policy collar around it, so a market that moved since the decision is refused."""
+        policy collar around it, so a market that moved since the decision is refused, and it must
+        pass the gateway's per-side rule again (``anchor_quote_problem``: LIVE, both sides on tick
+        and uncrossed, each side no older than ``anchor_quote_age``)."""
         key = contract.contract_key
         blocked = self._instrument_block(contract)
         if blocked:
@@ -2534,6 +2589,16 @@ class ExecutionCoordinator:
         q, problem = self._usable_quote(contract, now)
         if problem:
             return None, [problem]
+        if fixed_limit is not None:
+            refused = self._paper_only_problem(idea_id)
+            if refused:
+                return None, refused
+            if not anchor_quote_age or anchor_quote_age > ANCHOR_MAX_QUOTE_AGE_CEILING_SECONDS:
+                return None, [ANCHOR_RULE_INCOMPLETE]
+            stale = anchor_quote_problem(q.bid, q.ask, q.bid_at, q.ask_at, q.quality, now,
+                                         anchor_quote_age, contract.min_tick)
+            if stale:
+                return None, stale
         ref = _dec(reference)
         if ref is None:
             return None, ["ENTRY_REFERENCE_MISSING"]

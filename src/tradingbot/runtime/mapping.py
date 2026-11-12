@@ -820,6 +820,8 @@ class FamilyMapping(StrictModel):
             anchor_max_abs_basis=self.entry_anchor.max_abs_basis if self.entry_anchor else None,
             anchor_max_basis_age_seconds=self.entry_anchor.max_basis_age_seconds
             if self.entry_anchor else None,
+            anchor_max_quote_age_seconds=self.entry_anchor.max_quote_age_seconds
+            if self.entry_anchor else None,
             problems=out,
         )
 
@@ -1480,6 +1482,17 @@ class MappingPolicy:
             raise ValueError(f"entry_rule = REFERENCE_AS_COLLAR ({', '.join(collar)}) needs "
                              "policy.require_stop_on_open = true: an anchored entry always "
                              "carries a protective stop")
+
+    def check_mode(self, mode: str) -> None:
+        """Refuse a runtime mode in which the entry rule may not run (an allow-list,
+        ``ANCHOR_RULE_MODES``: only the simulated mode exists today, and a future mode never
+        inherits the rule silently)."""
+        collar = sorted(f for f, e in self.entries.items()
+                        if getattr(e, "entry_rule", None) == "REFERENCE_AS_COLLAR")
+        if collar and mode not in ANCHOR_RULE_MODES:
+            raise ValueError(f"entry_rule = REFERENCE_AS_COLLAR ({', '.join(collar)}) is paper "
+                             f"and simulation only: runtime mode {mode!r} is not in "
+                             f"{ANCHOR_RULE_MODES}")
 
     @classmethod
     def from_toml(cls, path: str | Path, *, allow_what_if: bool = False) -> MappingPolicy:

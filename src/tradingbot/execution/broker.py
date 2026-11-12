@@ -30,6 +30,19 @@ class QuoteQuality(str, Enum):
     UNAVAILABLE = "UNAVAILABLE"  # no subscription, no data, or the request failed
 
 
+class BrokerEnvironment(str, Enum):
+    """What account a broker session trades (additive declaration, ``environment()``)."""
+
+    SIM = "SIM"  # the simulated broker: no account exists
+    PAPER = "PAPER"  # a broker's paper-trading account
+    LIVE = "LIVE"  # a funded account
+
+
+# The only environments in which an anchored entry (entry_rule = REFERENCE_AS_COLLAR) may be sent:
+# the owner's rule is paper and simulation only, impossible against the funded account.
+ANCHOR_ENVIRONMENTS = frozenset({BrokerEnvironment.SIM, BrokerEnvironment.PAPER})
+
+
 class OrderSide(str, Enum):
     BUY = "BUY"
     SELL = "SELL"
@@ -135,6 +148,10 @@ class BrokerQuote(StrictModel):
     # The series' own last-update time when the broker supplies it (IBKR lastTimestamp); additive.
     # A reference series' freshness is judged by it, never by ``received_at`` alone.
     updated_at: datetime | None = None
+    # Each side's own last-update time on a live streaming quote (additive; IBKR reports a tick
+    # per side). None when the broker cannot tell: an anchored entry then never trades.
+    bid_at: datetime | None = None
+    ask_at: datetime | None = None
 
 
 class ConditionDirection(str, Enum):
@@ -322,6 +339,20 @@ class ConditionalOrders(Protocol):
     def reference_quote(self, contract: ContractRef) -> BrokerQuote: ...
 
     def modify_condition(self, order_ref: str, *, trigger_price: Decimal) -> BrokerOrder: ...
+
+
+def broker_environment(broker) -> BrokerEnvironment | None:
+    """The environment a broker positively declares through ``environment()``, or None when it
+    declares none, fails to say or says something else: such a broker is treated as possibly
+    funded. Kept out of ``Broker`` so an adapter without it still satisfies the protocol."""
+    get = getattr(broker, "environment", None)
+    if not callable(get):
+        return None
+    try:
+        value = get()
+        return BrokerEnvironment(getattr(value, "value", value))
+    except (BrokerError, ValueError, TypeError):
+        return None
 
 
 def supports_price_conditions(broker) -> bool:
