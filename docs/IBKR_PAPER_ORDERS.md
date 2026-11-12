@@ -72,13 +72,27 @@ refused, never rounded. A SELL is allowed only in two cases:
 - to reduce a long, and never for more than the position less other working sells (one-cancels-
   other siblings count once; a PendingCancel or Inactive order still counts).
 
-**Which position.** Two figures: (a) the broker's position read and (b) the position implied by
-this session's own fills (the connect-time baseline plus every later fill; for an order this
-session placed, the larger of its execution total and its `orderStatus` filled quantity, since
-either can arrive first). The guard uses the more cautious of the two (the larger for a BUY, the
+**Which position.** Two figures: (a) the broker's position read and (b) the experiment's own
+position, derived from the broker's executions that belong to the experiment (an `orderRef` with
+the experiment prefix, or this client's order ids in the journal or placed in this session):
+today's, read with `reqExecutions` at connect and again before the first submission of every
+session, plus every execution received live; for an order this session placed, the larger of its
+execution total and its `orderStatus` filled quantity, since either can arrive first. It never
+starts from the position read, so a read that lags across a restart is caught. It assumes the
+account holds no TLT outside the experiment (otherwise every order is refused). The guard uses the more cautious of the two (the larger for a BUY, the
 smaller for a SELL) and, when they differ, refuses everything with `POSITION_DISAGREEMENT` until
-they agree again. A failed read is `POSITION_UNKNOWN`. If the read lagged at the baseline itself,
-the disagreement persists for that session: restart it when flat and quiet.
+they agree again. A failed read is `POSITION_UNKNOWN`. The comparison made at connect is kept as
+`position_check`.
+
+**Exits never remove protection for a refused close.** Before the binding cancels or shrinks a
+protective SELL stop (the execution core does this before sending a close), it runs the guard on
+a closing SELL LMT for what is held, with the same inputs it will see at send time and the stop
+assumed gone (`dry_check_exit`). If that is refused, nothing is cancelled and the core sees a
+cancel failure (`EXIT_WOULD_BE_REFUSED`), so the exit is not netted and the stop stays. If the
+real close is nevertheless refused or fails (nothing sent) after the stop was cancelled, the
+binding raises `ProtectionLost` ("POSITION_OPEN_PROTECTION_ABSENT", a `BrokerError`). The core
+records it as a submit error with that text, and its next `sync` raises `UNPROTECTED_POSITION`;
+stage 3 calls `sync` at once and stops.
 
 **Which working orders.** Every row of the broker's open-orders answer whatever its status, plus
 every order this session sent that is not final and not rejected even if no view shows it yet
@@ -133,9 +147,10 @@ which is accepted). The used count is the number of submission lines.
   is a new session) it counts the distinct orders with that prefix in open orders (every client),
   executions and completed orders, and uses the larger of that count and the journal's; if the
   broker shows more, it refuses (`SUBMISSION_COUNT_MISMATCH`).
-- **What still cannot be prevented.** Someone who deletes the journal AND its head, initialises a
-  new one, and does so after the broker's own history of the experiment has rolled off (the
-  current day at IBKR) gets a fresh budget. Nothing in software can tell. The owner controls the
+- **What still cannot be prevented.** Replacing the journal and its head file together (or
+  deleting both and initialising again) resets the budget. The broker-side count catches that
+  only while the day's orders of the experiment are still visible in the broker's lookups (the
+  same day at IBKR); after that it is silent, and nothing in software can tell. The owner controls the
   state directory (`state_dir` in the private config); keep it outside Dropbox and do not delete
   it during the experiment.
 - A second process cannot open the journal (`flock`). New order ids always come from
@@ -213,12 +228,18 @@ entry 2, one stop amendment 1, closing limit 1): 2 + 4 = 6 = the cap (asserted i
 | 0 | TWS API settings: **Read-Only API ON**, localhost only ON, socket port = `port` | `python scripts/ibkr_paper_experiment.py stage0-refusal` | order mode refuses (`readOnlyApi=True`) and no order frame was sent | 0 |
 | 1 | Turn **Read-Only API OFF**. Nothing else. | `python scripts/ibkr_paper_experiment.py stage1-lookups` | open orders, executions, completed orders and positions all complete; no order frame; the evidence lists which fields the rows carry (order id, `orderRef`, perm id; the account is checked on every row) and the quote quality | 0 |
 | 2 | Check stage 1 evidence. Watch TWS. | `python scripts/ibkr_paper_experiment.py stage2-unfillable-bracket` | one bracket, BUY LMT at 90% of the bid with its SELL STP 1.00 lower, never filled; the parent was not answered before the child was sent; both seen in the read-back; both cancelled, gone from open orders and in completed orders | 2 |
-| 3 | Check stage 2 evidence in full (especially `parent_answered_before_child_sent` and the callback times) and the TWS Audit Trail. | `python scripts/ibkr_paper_experiment.py stage3-lifecycle` | bracket entry at the ask filled, stop confirmed working, one stop raise (+0.10), stop cancelled and confirmed, closing limit filled, reconciliation clean, 6 used | 4 |
+| 3 | Check stage 2 evidence in full and **confirm in the TWS Audit Trail that the parent was held (not transmitted) until the child arrived**. The evidence field `parent_answered_before_child_sent` is one-sided: the child follows the parent by milliseconds, so False proves nothing. | `python scripts/ibkr_paper_experiment.py stage3-lifecycle` | bracket entry at the ask filled, stop confirmed working, one stop raise (+0.10), stop cancelled and confirmed, closing limit filled, reconciliation clean, 6 used | 4 |
 | any | — | `python scripts/ibkr_paper_experiment.py abort` | every working order of this client cancelled by its own order id; reports what remains and the position | 0 |
 
 After stage 3 (or on any failure): turn Read-Only API back ON, remove the `orders` line, and keep
 the evidence directory and journal. If stage 2 reports a fill, run `abort` and close the share by
 hand (below); stage 3 then never runs.
+
+**If stage 2 fills** (result `STAGE2_UNEXPECTED_FILL`): stage 2 cancels the parent first and
+cancels the child only when the parent is confirmed cancelled with nothing filled. After any
+fill it leaves the protective SELL STP working, records what is held and blocks stage 3. Do NOT
+run `abort` first: it would cancel the stop. In TWS, sell the share by hand with a limit at the
+bid, confirm the TLT position is 0, then run `abort` to cancel the remaining stop.
 
 ## Emergency stop
 
@@ -230,8 +251,9 @@ hand (below); stage 3 then never runs.
   the experiment (Orders / Activity panel, right-click, Cancel), then close any TLT position by
   hand (SELL 1 TLT, a limit at the bid), and confirm in the Portfolio that TLT is 0.
 - **The software path:** `python scripts/ibkr_paper_experiment.py abort` cancels every working
-  order of this client by its own order id (never a global cancel) and reports what remains. It
-  works even when the journal is unknown. It does not close a position.
+  order of this client by its own order id (never a global cancel), including a protective stop,
+  and reports what remains. It works even when the journal is unknown. It does not close a
+  position: with a share held, sell it by hand first, then run `abort`.
 - **The close.** The protective stop is DAY: it expires at 16:00 ET and a share held overnight is
   unprotected; nothing can be placed after 16:00 ET. The experiment must end flat the same day.
   **If the closing limit has not filled by 15:30 ET** (30 minutes before the close): run `abort`,
