@@ -52,6 +52,8 @@ def _snap(clock: FakeClock, n: int) -> QuoteSnapshot:
         1, "TLT", 88.0, None, 88.02, None, None, None, None, "UNREPORTED", 3, "t", None,
         QuoteQuality.LIVE if n else QuoteQuality.FROZEN, (), bid_at_monotonic=clock.t - 0.5,
         ask_at_monotonic=clock.t - 4.0 if n == 2 else clock.t - 0.5, bid_updates=n,
+        bid_price_change_monotonic=clock.t - 0.5,
+        ask_price_change_monotonic=clock.t - 4.0 if n == 2 else clock.t - 0.5,
         ask_updates=n, bid_tick_class="LIVE", ask_tick_class="LIVE",
         quality_reason="TYPE_UNREPORTED_UPDATES_SEEN" if n else "TYPE_UNREPORTED_NO_UPDATES_YET",
         observed_at_monotonic=clock.t, route="held_stream")

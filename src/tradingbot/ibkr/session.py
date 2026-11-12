@@ -142,8 +142,8 @@ ALLOWED_OUT_MESSAGES = frozenset({
     OUT.CANCEL_MKT_DATA, OUT.REQ_MARKET_DATA_TYPE, OUT.REQ_CONFIG, OUT.REQ_SEC_DEF_OPT_PARAMS,
 })
 MAX_DISCOVERY_LIMIT = 1000  # upper bound on rows kept per discovery / option-chain request
-MAX_QUOTE_STREAMS = 10
-HALTED_TICK = 49  # TickTypeEnum.HALTED (tickGeneric): 0 not halted, 1 / 2 halted  # hard cap on simultaneously held-open quote streams per session
+MAX_QUOTE_STREAMS = 10  # hard cap on simultaneously held-open quote streams per session
+HALTED_TICK = 49  # TickTypeEnum.HALTED (tickGeneric): 0 not halted, 1 / 2 halted
 
 
 def _denied(name: str) -> Callable[..., None]:
@@ -297,6 +297,13 @@ def _mkt_contract(contract: ResolvedContract) -> Contract:
     c.currency, c.exchange = contract.currency, contract.exchange or "SMART"
     c.primaryExchange = contract.primary_exchange
     return c
+
+
+def _set_min_tick(p: _Pending, contract: ResolvedContract) -> None:
+    """Give both sides the contract's minimum tick (off-tick prices never count as changes)."""
+    tick = getattr(contract, "min_tick", None)
+    for side in p.sides.values():
+        side.min_tick = tick
 
 
 def _check_limit(limit: int) -> int:
@@ -959,6 +966,7 @@ class IbkrSession:
         c = _mkt_contract(contract)
 
         def send(rid: int) -> None:
+            _set_min_tick(self._pending[rid], contract)
             try:  # under the lock, before anything is sent
                 self._check_stream_type(market_data_type)
             except QuoteStreamConflict:
@@ -1000,6 +1008,9 @@ class IbkrSession:
                     return None
                 return mono - side.fresh_mono  # fresh_mono is the latest change once changed
 
+            def price_change_age(side: SideEvidence) -> float | None:
+                return None if side.price_change_mono is None else mono - side.price_change_mono
+
             verdict = classify_quote(
                 bid=bid, ask=ask, last=last, market_data_type=p.market_data_type,
                 delayed_ticks_seen=p.delayed_ticks, live_ticks_seen=p.live_ticks,
@@ -1007,13 +1018,18 @@ class IbkrSession:
                 unavailable_code=p.unavailable_code,
                 stream_failed=p.stream and p.error is not None,
                 requested_market_data_type=requested, bid_change_age_seconds=change_age(b),
-                ask_change_age_seconds=change_age(a), market_data_types_seen=tuple(p.mdt_values))
+                ask_change_age_seconds=change_age(a), market_data_types_seen=tuple(p.mdt_values),
+                bid_price_changes=b.price_changes, ask_price_changes=a.price_changes,
+                bid_price_change_age_seconds=price_change_age(b),
+                ask_price_change_age_seconds=price_change_age(a))
             flags = verdict.flags
             for name, sd in (("BID", b), ("ASK", a)):
                 if sd.placeholder_seen:
                     flags = (*flags, f"{name}_PLACEHOLDER_TICK")
                 if sd.non_finite_seen:
                     flags = (*flags, f"{name}_NON_FINITE_TICK")
+                if sd.off_tick_seen:
+                    flags = (*flags, f"{name}_OFF_TICK_TICK")
             if p.halted is not None and p.halted != 0:
                 flags = (*flags, "HALTED")
             end_missing = snapshot and not p.ended
@@ -1056,7 +1072,9 @@ class IbkrSession:
                 bid_tick_class=b.tick_class, ask_tick_class=a.tick_class,
                 quality_reason=verdict.reason, observed_at_monotonic=mono,
                 bid_last_tick_monotonic=b.last_tick_mono,
-                ask_last_tick_monotonic=a.last_tick_mono, halted=p.halted)
+                ask_last_tick_monotonic=a.last_tick_mono, halted=p.halted,
+                bid_price_change_monotonic=b.price_change_mono,
+                ask_price_change_monotonic=a.price_change_mono)
 
     # ------------------------------------------------------------------ held-open quote streams
     def open_quote_stream(self, contract: ResolvedContract, *,
@@ -1085,6 +1103,7 @@ class IbkrSession:
             self._check_stream_type(market_data_type)
             self._next_req_id += 1
             p = _Pending("quote", self._next_req_id, stream=True)
+            _set_min_tick(p, contract)
             p.t0 = time.monotonic()
             handle = QuoteStream(self, p.req_id, contract, market_data_type)
             self._pending[p.req_id] = p

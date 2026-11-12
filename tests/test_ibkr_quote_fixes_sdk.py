@@ -97,6 +97,8 @@ def test_P1_one_size_refresh_per_side_is_not_enough(tws, feed):  # noqa: F811
         q = st.latest()
         assert (q.bid_updates, q.ask_updates, q.quality) == (1, 1, F) and not usable(q)
         feed.push(s, 0, _size(rid, 0, "102"), _size(rid, 3, "98"))
+        assert st.latest().quality_reason == "TYPE_UNREPORTED_NO_PRICE_CHANGE_YET"
+        feed.push(s, 0, _price(rid, 1, 2000.01), _price(rid, 2, 2000.49))
         assert st.latest().quality is L
 
 

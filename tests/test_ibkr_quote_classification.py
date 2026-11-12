@@ -32,7 +32,8 @@ def cq(**kw):
             "delayed_ticks_seen": False, "live_ticks_seen": True, "bid_updates": 0,
             "ask_updates": 0, "notices": (), "unavailable_code": None, "stream_failed": False,
             "requested_market_data_type": 3, "bid_change_age_seconds": 0.5,
-            "ask_change_age_seconds": 0.5}
+            "ask_change_age_seconds": 0.5, "bid_price_changes": 5, "ask_price_changes": 5,
+            "bid_price_change_age_seconds": 0.5, "ask_price_change_age_seconds": 0.5}
     base.update(kw)
     return classify_quote(**base)
 
@@ -109,10 +110,12 @@ def test_reason_flags_are_explicit():
 
 # --- exhaustive invariants over the whole fact space ---------------------------------------------
 _PRICES = [(10.0, 10.02), (10.0, 10.0), (10.05, 10.0), (None, 10.02), (0.0, None), (None, None)]
-_SPACE = itertools.product(
+_SPACE = list(itertools.product(
     [None, 1, 2, 3, 4, 7], [False, True], [False, True], [0, 1, 3], [0, 1, 3],
     [(), (2104,), (10167,), (2186,), (10090,)], [None, 354], [False, True], _PRICES,
-    [None, 10.01])
+    [None, 10.01]))
+# requested type, price changes per side, change age (both kinds, both sides)
+_UNREPORTED = list(itertools.product([None, 1, 2, 3], [0, 1], [0, 1], [0.5, 6.0]))  # 32
 
 
 def _rank(q: QuoteQuality) -> int:  # higher is better
@@ -120,19 +123,28 @@ def _rank(q: QuoteQuality) -> int:  # higher is better
 
 
 def test_exhaustive_never_live_without_evidence_and_never_improved_by_bad_news():
-    n = 0
-    for mdt, delayed, live, bu, au, notices, unav, failed, (bid, ask), last in _SPACE:
+    n = unreported_live = 0
+    cases = ((facts, extra) for facts in _SPACE
+             for extra in (_UNREPORTED if facts[0] is None else [(3, 1, 1, 0.5)]))
+    for (mdt, delayed, live, bu, au, notices, unav, failed, (bid, ask), last), (
+            req, bp, ap, age) in cases:
         kw = {"bid": bid, "ask": ask, "last": last, "market_data_type": mdt,
               "delayed_ticks_seen": delayed, "live_ticks_seen": live, "bid_updates": bu,
               "ask_updates": au, "notices": notices, "unavailable_code": unav,
-              "stream_failed": failed}
+              "stream_failed": failed, "requested_market_data_type": req,
+              "bid_price_changes": bp, "ask_price_changes": ap,
+              "bid_change_age_seconds": age, "ask_change_age_seconds": age,
+              "bid_price_change_age_seconds": age, "ask_price_change_age_seconds": age}
         c = classify_quote(**kw)
         n += 1
         assert c.reason in QUOTE_REASONS
         if c.quality is L:
             assert not delayed and unav is None and not failed
             assert not ENTITLEMENT_NOTICE_CODES.intersection(notices)
-            assert (mdt == 1 and live) or (mdt is None and bu >= 1 and au >= 1)
+            assert (mdt == 1 and live) or (
+                mdt is None and req in (1, 3) and bu >= 2 and au >= 2 and bp >= 1 and ap >= 1
+                and age <= 5.0)  # N1: a recent price change on each side
+            unreported_live += mdt is None
         if mdt in (2, 3, 4) or delayed:
             assert c.quality is not L
         if mdt == 2 and unav is None and not failed and c.quality is not U:
@@ -147,7 +159,7 @@ def test_exhaustive_never_live_without_evidence_and_never_improved_by_bad_news()
                                  unavailable_code=unav)
         if not failed and not notices:
             assert _rank(legacy) <= _rank(c.quality)
-    assert n > 20000
+    assert n > 20000 and unreported_live > 0  # the unreported-LIVE branch is reached
 
 
 def test_reason_determines_quality():
@@ -157,7 +169,9 @@ def test_reason_determines_quality():
                 "TYPE_UNREPORTED_NO_UPDATES_YET": F, "ENTITLEMENT_NOTICE": D,
                 "REPORTED_LIVE": L, "TYPE_UNREPORTED_UPDATES_SEEN": L,
                 "TYPE_UNREPORTED_REQUESTED_NOT_ELIGIBLE": F,
-                "TYPE_UNREPORTED_UPDATES_TOO_OLD": F, "REPORTED_TYPE_HISTORY_NOT_LIVE": (D, F)}
+                "TYPE_UNREPORTED_UPDATES_TOO_OLD": F, "REPORTED_TYPE_HISTORY_NOT_LIVE": (D, F),
+                "TYPE_UNREPORTED_NO_PRICE_CHANGE_YET": F,
+                "TYPE_UNREPORTED_PRICE_CHANGE_TOO_OLD": F}
     assert set(expected) == set(QUOTE_REASONS)
     for mdt, delayed, live, bu, au, notices, unav, failed, (bid, ask), last in _SPACE:
         c = classify_quote(bid=bid, ask=ask, last=last, market_data_type=mdt,
@@ -184,6 +198,7 @@ def snap(**kw) -> QuoteSnapshot:
             "quality": L, "flags": ("MARKET_DATA_TYPE_NOT_REPORTED",), "route": "stream",
             "tick_counts": {"BID": 31, "ASK": 35}, "bid_at_monotonic": 100.0,
             "ask_at_monotonic": 100.0, "bid_updates": 31, "ask_updates": 35,
+            "bid_price_change_monotonic": 100.0, "ask_price_change_monotonic": 100.0,
             "bid_tick_class": "LIVE", "ask_tick_class": "LIVE",
             "quality_reason": "TYPE_UNREPORTED_UPDATES_SEEN", "observed_at_monotonic": 100.5}
     base.update(kw)
@@ -230,8 +245,8 @@ def test_entry_check_usable():
     ({"bid_tick_class": "DELAYED"}, 100.5, ["BID_TICKS_NOT_LIVE"]),
     ({"ask_tick_class": "MIXED"}, 100.5, ["ASK_TICKS_NOT_LIVE"]),
     ({"ask_tick_class": None}, 100.5, ["ASK_TICKS_NOT_LIVE"]),
-    ({"bid_at_monotonic": None}, 100.5, ["BID_TIME_UNKNOWN"]),
-    ({"ask_at_monotonic": float("nan")}, 100.5, ["ASK_TIME_UNKNOWN"]),
+    ({"bid_at_monotonic": None, "market_data_type": 1}, 100.5, ["BID_TIME_UNKNOWN"]),
+    ({"ask_at_monotonic": float("nan"), "market_data_type": 1}, 100.5, ["ASK_TIME_UNKNOWN"]),
     ({}, 103.001, ["BID_STALE", "ASK_STALE"]),
     ({"bid_at_monotonic": 102.0}, 103.5, ["ASK_STALE"]),  # one side stale, the other fresh
     ({"bid_at_monotonic": 101.0}, 100.5, ["BID_FROM_FUTURE"]),

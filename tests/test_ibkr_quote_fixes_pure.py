@@ -92,7 +92,8 @@ def cq(**kw):
     base = {"bid": 10.0, "ask": 10.02, "last": None, "market_data_type": None,
             "delayed_ticks_seen": False, "live_ticks_seen": True, "bid_updates": 2,
             "ask_updates": 2, "requested_market_data_type": 3, "bid_change_age_seconds": 0.5,
-            "ask_change_age_seconds": 0.5}
+            "ask_change_age_seconds": 0.5, "bid_price_changes": 1, "ask_price_changes": 1,
+            "bid_price_change_age_seconds": 0.5, "ask_price_change_age_seconds": 0.5}
     base.update(kw)
     return classify_quote(**base)
 

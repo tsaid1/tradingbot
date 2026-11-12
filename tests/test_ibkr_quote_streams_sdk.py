@@ -182,10 +182,12 @@ def test_size_only_updates_confirm_a_side(tws, feed):  # noqa: F811
         assert (q.bid_updates, q.ask_updates) == (1, 1) and q.quality is F  # one is not enough
         assert q.bid_at_monotonic >= before.bid_at_monotonic
         feed.push(s, 0, _size(rid, 0, "260"), _size(rid, 3, "180"))
+        assert st.latest().quality is F  # sizes only: no price change yet
+        feed.push(s, 0, _price(rid, 1, 2000.01), _price(rid, 2, 2000.49))
         assert st.latest().quality is L
         # an unset size is no confirmation
         feed.push(s, 0, frame(IN.TICK_SIZE, TickSize(reqId=rid, tickType=0)))
-        assert st.latest().bid_updates == 2
+        assert st.latest().bid_updates == 4  # the price tick also carried a new size
 
 
 def test_one_side_goes_stale_while_the_other_keeps_updating(tws, feed, monkeypatch):  # noqa: F811
