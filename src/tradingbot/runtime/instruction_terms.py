@@ -436,6 +436,10 @@ def sentences(text: str) -> list[tuple[str, bool]]:
 
 
 def unknown_words(sentence: str, allowed, skip_spans: list[tuple[int, int]] = ()) -> int:
+    return len(unknown_tokens(sentence, allowed, skip_spans))
+
+
+def unknown_tokens(sentence: str, allowed, skip_spans: list[tuple[int, int]] = ()) -> list[str]:
     """How many alphabetic tokens of ``sentence`` are not on the allow-list: ``allowed`` phrases
     (markers, the family's names, the action's own words, private additions; lower case), the
     connectors, the function words and the units. Tokens with a digit are left to the number
@@ -444,7 +448,7 @@ def unknown_words(sentence: str, allowed, skip_spans: list[tuple[int, int]] = ()
     words = [_word(tok).lstrip("~").lstrip("$") for _, _, tok in seg]
     tags: list[str | None] = [None] * len(words)
     _tag(words, allowed, "allowed", tags)
-    unknown = 0
+    unknown = []
     for (a, b, tok), w, tag in zip(seg, words, tags, strict=True):
         if tag is not None or any(x <= a and b <= y for x, y in skip_spans):
             continue
@@ -452,7 +456,7 @@ def unknown_words(sentence: str, allowed, skip_spans: list[tuple[int, int]] = ()
             continue
         if w in CONNECTOR_WORDS or w in FUNCTION_WORDS or w in UNIT_WORDS:
             continue
-        unknown += 1
+        unknown.append(w)
     return unknown
 
 

@@ -68,6 +68,7 @@ from tradingbot.runtime.instruction_terms import (
     post_multi_leg,
     relative_contract_words,
     sentences,
+    unknown_tokens,
     unknown_words,
 )
 from tradingbot.validator import (
@@ -1018,7 +1019,7 @@ class FamilyMapping(StrictModel):
                 *(m.span() for m in MONTH_WORD_RE.finditer(text))]
 
     def _sentence_problems(self, action, anchor, source, terms, levels, post_text, markers, own,
-                           lexicon) -> list[str]:
+                           lexicon, unknown_out: list[str] | None = None) -> list[str]:
         """The final rule (last review pass): the scope of the marked number is its whole
         sentence. Every alphabetic token in it must be on the allow-list (markers, connectors,
         function words, units, this family's names, the action's own side, verb and level words,
@@ -1048,9 +1049,11 @@ class FamilyMapping(StrictModel):
         for sentence, question in found:
             if question:
                 return [ENTRY_ANCHOR_CONTEXT_UNCLEAR, "QUESTION"]
-            unknown = unknown_words(sentence, allowed, self._month_spans(sentence))
+            unknown = unknown_tokens(sentence, allowed, self._month_spans(sentence))
             if unknown:
-                return [ENTRY_ANCHOR_CONTEXT_UNCLEAR, f"WORDS:{unknown}"]
+                if unknown_out is not None:  # a local analysis tool's hook; never logged
+                    unknown_out += unknown
+                return [ENTRY_ANCHOR_CONTEXT_UNCLEAR, f"WORDS:{len(unknown)}"]
             extra = [x for x in leftover_tokens(extract_terms(sentence), consumed, fractions,
                                                 self._roots())
                      if any(ch.isdigit() for ch in x)
@@ -1063,8 +1066,11 @@ class FamilyMapping(StrictModel):
                 texts = [s for s, _ in whole]
                 at = texts.index(sentence) if sentence in texts else -1
                 before = texts[at - 1] if at > 0 else None
-                if before is not None and unknown_words(before, allowed,
-                                                        self._month_spans(before)):
+                other = (unknown_tokens(before, allowed, self._month_spans(before))
+                         if before is not None else [])
+                if other:
+                    if unknown_out is not None:
+                        unknown_out += other
                     return [ENTRY_ANCHOR_INSTRUMENT_UNCLEAR, "PRECEDING_SENTENCE"]
         return []
 
