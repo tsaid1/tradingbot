@@ -286,7 +286,9 @@ in the call that records the settlement, after a full successful sync and a reco
 blocking discrepancy in that contract. After `NOT_AT_BROKER` or `CANCELLED` it also needs the
 exit-resend evidence rule after the settlement (settle period, `exit_no_trace_lookups` no-trace
 lookups spread over it). Broker evidence for such an intent later opens
-`SETTLED_INTENT_CONTRADICTED` (blocking, a safety discrepancy in reconciliation, CLEAR-class).
+`SETTLED_INTENT_CONTRADICTED` (blocking, a safety discrepancy in reconciliation, CLEAR-class;
+cleared only once the contradicting order is terminal at the broker and the contract reconciles
+clean).
 `clear_exception` (a `LEDGER_REVERSAL`, verified the same way) and `acknowledge_exception`
 (records that block nothing) complete the set; `operator_catalog.py` classes every exception kind.
 Every action, applied or refused, is journaled with its before and after state.

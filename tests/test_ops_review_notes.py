@@ -134,3 +134,47 @@ def test_n3_a_replacement_initialised_for_the_lost_requests_is_accepted(tmp_path
     rt.step()
     assert not queue_alert(rt)
     assert rt.heartbeat()["operator_queue"]["state"] != "UNAVAILABLE"
+
+
+# ------------------------------------------------------------------------------------------ N4
+
+
+def test_n4_a_contradiction_is_not_cleared_while_its_order_still_works(tmp_path):
+    from execution_harness import SYMBOL, Harness, open_action
+
+    from tradingbot.execution import coordinator as C
+    from tradingbot.execution import settlement as S
+    from tradingbot.execution.store import IntentState
+
+    h = Harness(tmp_path)
+    # Placed and resting, the ack lost, open orders lag: the operator declares NOT_AT_BROKER.
+    h.broker.open_orders_lag_seconds = 3600
+    h.broker.script_next_submit("LOST_ACK_PLACED_RESTING")
+    ref = h.execute("p1", open_action()).order_ref
+    h.clock.advance(h.config.settle_seconds + 1)
+    h.coord.recover()
+    assert h.coord.intent(ref).state == IntentState.UNRESOLVED
+    assert S.settle_intent(
+        h.coord, request_id="n4-settle", order_ref=ref, outcome="NOT_AT_BROKER",
+        confirmation=cat.settle_phrase(ref, "NOT_AT_BROKER"), note=NOTE, operator="tester",
+    ).status == "APPLIED"
+    h.broker.open_orders_lag_seconds = 0  # the order shows up, resting
+    h.coord.sync()
+    [e] = [x for x in h.coord.store.exceptions(open_only=True)
+           if x.kind == C.SETTLED_INTENT_CONTRADICTED]
+
+    def clear(rid):
+        return S.clear_exception(
+            h.coord, request_id=rid, exc_id=e.id, kind=e.kind,
+            confirmation=cat.clear_phrase(e.id, e.kind), note=NOTE, operator="tester",
+        )
+
+    early = clear("n4-clear-1")
+    assert early.status == "REFUSED"
+    assert any(r.startswith("CONTRADICTING_ORDER_NOT_TERMINAL:") for r in early.reasons)
+    assert h.coord.store.exception(e.id).resolved_at is None
+    h.broker.cancel(ref)  # the operator cancels it at the broker: now terminal (cancelled)
+    h.broker.set_quote(SYMBOL, "49.98", "50.02")
+    h.coord.recover()
+    late = clear("n4-clear-2")
+    assert late.status == "APPLIED", late.reasons

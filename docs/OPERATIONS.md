@@ -50,7 +50,7 @@ an alert.
 | `LEDGER_REVERSAL` | An exit filled more than the position: the account went through flat. | Flatten the excess at the broker by hand, then CLEAR it. |
 | `EXIT_REFUSED`, `HALTED_ACTION_REFUSED` | A publisher exit or amendment was not executed. | Check the position and its stop. Exit by hand if needed, then acknowledge. |
 | `SETTLEMENT_UNVERIFIED` | A settlement was applied and its contract stays blocked until the evidence below has followed it. | None. It clears on its own once the evidence is in. |
-| `SETTLEMENT_CONTRADICTED` | The broker shows a fill, a working order or a completed order for an intent you settled as `NOT_AT_BROKER` or `CANCELLED`. The fill is in the ledger as it happened, the contract is blocked and reconciliation is not clean. | Check the account at the broker: it may hold more than intended. Decide what to do with the extra position, then CLEAR it once reconciliation is otherwise clean. |
+| `SETTLEMENT_CONTRADICTED` | The broker shows a fill, a working order or a completed order for an intent you settled as `NOT_AT_BROKER` or `CANCELLED`. The fill is in the ledger as it happened, the contract is blocked and reconciliation is not clean. | Check the account at the broker: it may hold more than intended. Decide what to do with the extra position and make sure the order has ended at the broker, then CLEAR it once reconciliation is otherwise clean. |
 | `MAPPING_REVOKED_OPEN_POSITION` | A position is open in a family that has lost approval. It can be exited, never added to. | Decide whether to keep or exit the position. |
 | `ROLL_DUE_FLATTEN_REQUIRED` | A futures position is inside its roll window. | Flatten or roll it by a new instruction. |
 | `SOURCE_FAILURE`, `PIPELINE_FAILURE` | The source or the processing of a post has failed repeatedly. The cursor does not move. | See Source outage below. |
@@ -102,7 +102,9 @@ of the queue; write what you checked, never a credential or a full account numbe
   reconciliation is clean.
 * `clear <id> LEDGER_REVERSAL | SETTLED_INTENT_CONTRADICTED | PARTIAL_GROUP`: applied only if a
   sync and reconciliation made at that moment show the contract clean (the record's own line
-  excepted). `PARTIAL_GROUP` is here, not under `ack`: while it is open reconciliation is not
+  excepted). A `SETTLED_INTENT_CONTRADICTED` also needs the contradicting order ended at the
+  broker: while it is working, or no terminal completed-orders row shows it, the clear is refused
+  with `CONTRADICTING_ORDER_NOT_TERMINAL:<ref>:<state>`; cancel it at the broker first. `PARTIAL_GROUP` is here, not under `ack`: while it is open reconciliation is not
   clean, so closing it can lift other blocks and needs the same evidence.
 * `ack <id> <kind>`: closes a record that blocks nothing (`EXIT_NOT_NETTED`, `EXIT_WITHOUT_QUOTE`,
   `STALE_AFTER_UNKNOWN_OUTCOME`, `MODIFY_NOT_CONFIRMED`, `PROTECTIVE_LEVEL_NOT_LOOSENED`).
