@@ -685,3 +685,16 @@ def test_the_order_session_constructor_takes_only_the_config_and_timeouts():
     params = inspect.signature(PaperOrderSession.__init__).parameters
     assert list(params)[:2] == ["self", "config"]
     assert all(n.endswith(("_timeout", "_wait", "_seconds")) for n in list(params)[2:]), params
+
+
+# --- follow-up after PR #60: a fixed-offset time zone is refused -----------------------------------
+@pytest.mark.parametrize("zone", ["EST", "EST5EDT", "UTC", "GMT", "Etc/GMT+5", "Etc/UTC", "MST"])
+def test_a_fixed_offset_time_zone_is_refused(zone):
+    assert parse_hours("20261111:0930-20261111:1600", zone) is None
+    facts = replace(FACTS, time_zone_id=zone)
+    assert refused(order(), ctx(contract=facts)) == RefusalReason.LIQUID_HOURS_UNKNOWN
+
+
+@pytest.mark.parametrize("zone", ["US/Eastern", "America/New_York"])
+def test_a_region_time_zone_is_accepted(zone):
+    assert parse_hours("20261111:0930-20261111:1600", zone)

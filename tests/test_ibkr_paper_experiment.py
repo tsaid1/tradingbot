@@ -559,6 +559,8 @@ def test_a_normal_day_allows_a_start_at_1459():
 @pytest.mark.parametrize("hours,tz", [("", "US/Eastern"), ("garbage", "US/Eastern"),
                                       (None, "US/Eastern"), ("20261111:CLOSED", "US/Eastern"),
                                       ("20261111:0930-20261111:1600", "Nowhere/Invented"),
+                                      ("20261111:0930-20261111:1600", "EST"),
+                                      ("20261111:0930-20261111:1600", "Etc/GMT+5"),
                                       ("20261112:0930-20261112:1600", "US/Eastern")])
 def test_unknown_or_missing_liquid_hours_refuse(hours, tz):
     with pytest.raises(X.StageRefused):
