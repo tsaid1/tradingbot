@@ -63,6 +63,13 @@ from tradingbot.models import (
     PositionSide,
     StrictModel,
 )
+from tradingbot.runtime.entry_text import (
+    ascii_shadow,
+    entry_text_placeholder,
+    entry_text_problem,
+    has_non_ascii_word,
+    restore,
+)
 from tradingbot.runtime.instruction_terms import (
     ACTION_SEMANTIC_WORDS,
     ADD_WORDS,
@@ -1922,7 +1929,66 @@ class MappingPolicy:
     def decide(self, action: TradeAction, **kwargs) -> MappingDecision:
         return self.resolve(action, **kwargs)[0]
 
-    def resolve(
+    def resolve(self, action: TradeAction, **kw) -> tuple[MappingDecision, Instrument | None]:
+        """``_resolve``, then the entry rule's check of text that is not plain ASCII
+        (``tradingbot.runtime.entry_text``), for an OPEN or ADD in a family with an entry rule
+        (entry_rule = REFERENCE_AS_COLLAR or a family stop distance). It only ever turns a
+        SUPPORTED decision into a hold: an invisible character or a number outside ASCII holds; a
+        word holding a non-ASCII letter is decided once more as an unknown ASCII word (the shadow
+        text) and the stricter decision wins. Pure ASCII text is decided exactly as before."""
+        d, instrument = self._resolve(action, **kw)
+        if d.status != "SUPPORTED" or action.action not in (Action.OPEN, Action.ADD):
+            return d, instrument
+        entry = self.entries.get(d.family) if d.family else None
+        if not isinstance(entry, FamilyMapping) or not (
+            entry.entry_rule == "REFERENCE_AS_COLLAR" or getattr(entry, "max_stop_distance", None)
+        ):
+            return d, instrument
+        post_text, clause = kw.get("post_text"), kw.get("clause")
+        others = list(kw.get("others") or ())
+        texts = [post_text, clause, *(c for _, c, _ in others)]
+        problem = entry_text_problem(*texts)
+        out = d.model_dump(include={"action_id", "source_asset", "family", "broker_symbol",
+                                    "basis", "anchor_level_kind"})
+        if problem:
+            return MappingDecision(status="UNRESOLVED", reason=problem, **out), None
+        if not has_non_ascii_word(*texts):
+            return d, instrument
+        originals: dict[str, str] = {}
+
+        def shadow_all(t):
+            if not t:
+                return t
+            sh, orig = ascii_shadow(t)
+            if not orig:
+                return t
+            mapping = {}
+            for ph, word in orig.items():
+                key = next((k for k, w in originals.items() if w == word), None)
+                if key is None:
+                    key = entry_text_placeholder(len(originals), ph[0].isupper())
+                    originals[key] = word
+                mapping[ph] = key
+            return re.sub(r"[Qq]zu[a-z]{3}x", lambda m: mapping.get(m.group(0), m.group(0)), sh)
+
+        kw2 = dict(kw)
+        kw2["post_text"], kw2["clause"] = shadow_all(post_text), shadow_all(clause)
+        kw2["others"] = [(a, shadow_all(c), v) for a, c, v in others]
+        d2, _ = self._resolve(action, **kw2)
+        if d2.status == "SUPPORTED":
+            return d, instrument
+        held = MappingDecision(status=d2.status, reason=restore(d2.reason, originals),
+                               **d2.model_dump(include={"action_id", "source_asset", "family",
+                                                        "broker_symbol", "basis",
+                                                        "anchor_level_kind"}))
+        ev = d2.vocab_evidence
+        if ev is not None:
+            held._vocab_evidence = VocabEvidence(
+                [(restore(w, originals), k) for w, k in ev.tokens],
+                [(r, restore(t, originals)) for r, t in ev.sentences])
+        return held, None
+
+    def _resolve(
         self,
         action: TradeAction,
         *,

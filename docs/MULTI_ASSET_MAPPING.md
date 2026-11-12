@@ -613,6 +613,35 @@ the publisher's level bounded by the two limits; that a misread level would be u
 listed, but not a single level the interpreter misread that also carries a marker); and that the limits are in the anchor's series, so for a basis-shifted family the
 execution price can differ from the anchor by the basis.
 
+### Text that is not plain ASCII
+
+The entry rule's lists and tokenisers were written for ASCII text, so a word holding an accented
+or non-Latin letter could split into fragments or vanish ("an unknown word holds" did not apply to
+it; an independent review found a second market named that way invisible). For an OPEN or ADD in
+a family with an entry rule (`REFERENCE_AS_COLLAR` or a family stop distance), a SUPPORTED decision
+is checked once more (`tradingbot.runtime.entry_text`); the check can only turn it into a hold:
+
+* *A word* is a maximal run of letters of any script (`str.isalpha()`) with any combining marks
+  attached. A word holding any non-ASCII character is never equal to an allow-listed, family,
+  alias, marker or instruction word, look-alikes included (Greek capital taus, full-width letters,
+  a combining mark): the text is normalised (NFC) and every such word is replaced by a distinct
+  ASCII placeholder that no list holds, keeping its leading capital, and the decision is taken
+  again on that shadow text. The stricter decision wins; the owner's review log receives the word
+  as written. So "Zörbleflux sits near 12.40." is a capitalised unknown word with a trading context:
+  `ENTRY_ANCHOR_POST_UNRESOLVED_MARKET`. Accented commentary with no trading context holds no
+  more than its ASCII spelling would.
+* *Invisible and odd characters*, fail closed: any format character (zero-width space, joiner,
+  non-joiner, word joiner, soft hyphen, byte-order mark, bidirectional controls), any control
+  character but tab and newline, any space but U+0020 (no-break and other exotic spaces), line and
+  paragraph separators, private-use or unassigned code points anywhere in the post:
+  `ENTRY_TEXT_INVISIBLE_CHARACTER`. Nothing is normalised away, so nothing can be joined into a
+  word that was not there. (A post with an emoji built with a joiner holds too.)
+* *Numbers*, fail closed: any digit or numeral outside ASCII 0-9 (full-width, Arabic-Indic,
+  superscripts, fractions), or the Unicode minus or a non-ASCII dash next to a digit:
+  `ENTRY_TEXT_NUMBER_UNREADABLE`. Such a number is never an anchor or a stop.
+
+Pure ASCII text is decided exactly as before.
+
 ## Level contract rule
 
 A DIRECT future whose levels are a futures series (its own, or `same_series`) is selected
