@@ -445,14 +445,16 @@ delivered so far.
 | 5 | latest reported type 4 | FROZEN (as before) | `REPORTED_DELAYED_FROZEN` |
 | 6 | latest reported type 2 | FROZEN | `REPORTED_FROZEN` |
 | 7 | any delayed tick id (66–76, 88, 90) on the subscription | DELAYED | `DELAYED_TICKS` |
-| 8 | an earlier reported type 2, 3 or 4 (sticky) | DELAYED (3/4 seen) or FROZEN | `REPORTED_TYPE_HISTORY_NOT_LIVE` |
+| 8 | any reported type other than 1 in the history (2, 3, 4 or unknown, e.g. 7; sticky) | DELAYED (3/4 seen) or FROZEN | `REPORTED_TYPE_HISTORY_NOT_LIVE` |
 | 9 | latest reported type outside 1..4 | FROZEN | `UNKNOWN_MARKET_DATA_TYPE` |
 | 10 | reported type 1 but no live tick id | FROZEN | `REPORTED_LIVE_NO_LIVE_TICKS` |
 | 11 | reported type 1 with live tick ids (the initial image counts) | LIVE\* | `REPORTED_LIVE` |
 | 12 | type NOT reported, requested type not 1 or 3 | FROZEN | `TYPE_UNREPORTED_REQUESTED_NOT_ELIGIBLE` |
 | 13 | type NOT reported, fewer than `UNREPORTED_MIN_CHANGES` (2) changes on a side | FROZEN | `TYPE_UNREPORTED_NO_UPDATES_YET` |
-| 14 | type NOT reported, a side's latest change older than `UNREPORTED_LIVE_WINDOW_SECONDS` (5.0 s; or unknown or in the future) | FROZEN | `TYPE_UNREPORTED_UPDATES_TOO_OLD` |
-| 15 | type NOT reported, otherwise | LIVE\* | `TYPE_UNREPORTED_UPDATES_SEEN` |
+| 14 | type NOT reported, no PRICE change on a side since its image | FROZEN | `TYPE_UNREPORTED_NO_PRICE_CHANGE_YET` |
+| 15 | type NOT reported, a side's latest change older than `UNREPORTED_LIVE_WINDOW_SECONDS` (5.0 s; or unknown or in the future) | FROZEN | `TYPE_UNREPORTED_UPDATES_TOO_OLD` |
+| 16 | type NOT reported, a side's latest PRICE change older than the window (or unknown or in the future) | FROZEN | `TYPE_UNREPORTED_PRICE_CHANGE_TOO_OLD` |
+| 17 | type NOT reported, otherwise | LIVE\* | `TYPE_UNREPORTED_UPDATES_SEEN` |
 
 \* An entitlement notice for the request (`ENTITLEMENT_NOTICE_CODES`: 2186, 10090, 10167) turns a
 would-be LIVE into DELAYED / `ENTITLEMENT_NOTICE`.
@@ -460,10 +462,15 @@ would-be LIVE into DELAYED / `ENTITLEMENT_NOTICE`.
 - **Bad news is sticky per subscription.** Notices, delayed tick ids and every reported type
   accumulate for the subscription. Once a delayed id, a reported 2/3/4 or an entitlement notice has
   been seen, the subscription can never be LIVE again (reported 1 → 3 → 1 stays DELAYED). Close it
-  and open a new one.
+  and open a new one. The same holds for any reported value other than 1, including an unknown
+  one: 1 → 7 → 1 stays FROZEN.
+- **A 10090 notice fails the stream.** 10090 ("part of requested market data is not subscribed")
+  is an error for the request in `classify_error`, not a farm notice, so the stream becomes
+  `UNAVAILABLE` / `STREAM_FAILED`, which is stricter than the DELAYED the notice rule would give.
 - **Validity flags** are separate from the label: `MISSING_BID/ASK`, `NON_POSITIVE_BID/ASK`,
   `NON_FINITE_BID/ASK/LAST`, `CROSSED` (bid > ask) and `LOCKED` (bid = ask). A non-finite bid, ask
-  or last makes `two_sided_valid` false. `HALTED` is flagged and does not change the label.
+  or last makes `two_sided_valid` false. `HALTED` is flagged and does not change the label; any
+  non-zero HALTED value counts as halted, including -1 ("status not available").
 - `assess_quote` keeps its signature and is the same function with no update counts, notices or
   requested type, so for it an unreported type is never LIVE.
 
@@ -474,9 +481,17 @@ the same run reported type 1. A frozen feed, however, also uses plain tick ids. 
 fresh-looking image at subscription time, sometimes after placeholders, and may re-send it. So
 "it arrived just now" proves nothing, and neither does one old change. Rows 12 to 15 require:
 - a request that could deliver live data (type 1 or 3);
-- at least two genuine value changes on each side since its first valid value;
-- the latest of those changes, on each side, within the last 5 seconds at the moment of the
-  snapshot.
+- at least two genuine value changes on each side since its first valid value, at least one of
+  them a PRICE change (a size flicker 100 → 200 → 100 under unchanged prices is not enough);
+- each side's latest change AND its latest price change within the last 5 seconds at the moment
+  of the snapshot.
+
+A size change still moves a side's freshness time on every path. A price that is not a multiple
+of the contract's minimum tick (`ResolvedContract.min_tick`, which every stream and sample
+carries) is flagged `BID_OFF_TICK_TICK` / `ASK_OFF_TICK_TICK` and is neither image nor change.
+Prices on a coarser increment are multiples of the minimum tick, so they still count. When the
+minimum tick is unknown (missing, zero or not finite), the stream does no tick check, and the
+gateway's own off-tick refusal applies.
 
 **Accepted consequence:** a thin or quiet market that is genuinely live but reports no type may
 never qualify, and an entry on it HOLDs. US stocks on this account answer 2186 with delayed ids
@@ -485,10 +500,11 @@ request. Rows 1, 4, 7 and the notice rule keep them DELAYED or UNAVAILABLE.
 
 **Changes in existing output.** Compared with `main`:
 - A bounded sample or snapshot with no reported type, requested type 1 or 3, and two recent
-  changes on each side is now `LIVE` (it was `FROZEN`), and `assess_quote_attempts` counts it as
+  changes on each side (one of them a recent price change) is now `LIVE` (it was `FROZEN`), and `assess_quote_attempts` counts it as
   a LIVE two-sided quote (`PASS`).
-- Every other unreported quote stays `FROZEN`, now with one of three distinct reasons.
-- Flags gained `LOCKED`, `NON_FINITE_*`, the placeholder and non-finite tick flags, `HALTED`,
+- Every other unreported quote stays `FROZEN`, now with one of five distinct reasons.
+- Flags gained `LOCKED`, `NON_FINITE_*`, the placeholder, non-finite and off-tick tick flags,
+  `HALTED`,
   `EARLIER_TYPE_NOT_LIVE` and, only when it changes the label, `ENTITLEMENT_NOTICE`.
 
 ### Entry freshness (`models.entry_quote_check`, pure; not wired into execution)
@@ -499,12 +515,15 @@ present, finite and positive and bid < ask; no HALTED tick with a non-zero value
 tick class is `LIVE`; and each side's freshness time (its image or its latest change, never a mere
 repeat) is no older than the limit by the monotonic clock (an age equal to the limit passes) and
 not later than `now`. So even with reported type 1, a side that has not changed for longer than
-the limit is `*_STALE`. Every failing condition is listed, from the closed list
+the limit is `*_STALE`. A quote that is LIVE with no reported type is re-checked at the check's
+own `now`: if either side's latest change or latest price change is then older than
+`UNREPORTED_LIVE_WINDOW_SECONDS`, the reason is `UNREPORTED_EVIDENCE_EXPIRED`, whatever
+`max_age_seconds` the caller passed. Every failing condition is listed, from the closed list
 `ENTRY_QUOTE_REASONS`: `INVALID_MAX_AGE`, `INVALID_NOW`, `NOT_LIVE`, `BID_MISSING`,
 `ASK_MISSING`, `BID_NON_POSITIVE`, `ASK_NON_POSITIVE`, `LOCKED`, `CROSSED`,
 `BID_TICKS_NOT_LIVE`, `ASK_TICKS_NOT_LIVE`, `BID_TIME_UNKNOWN`, `ASK_TIME_UNKNOWN`,
 `BID_FROM_FUTURE`, `ASK_FROM_FUTURE`, `BID_STALE`, `ASK_STALE`, `BID_NOT_FINITE`,
-`ASK_NOT_FINITE`, `HALTED`. Wall-clock times are never used
+`ASK_NOT_FINITE`, `HALTED`, `UNREPORTED_EVIDENCE_EXPIRED`. Wall-clock times are never used
 for age. Wiring it into the entry rule belongs to the execution workstream.
 
 ### Run the stream check (only after the independent review, with the owner's approval and paper TWS running)
@@ -536,9 +555,10 @@ PYTHONPATH="$PWD/src" ~/.venvs/tradingbot/bin/python scripts/ibkr_quote_stream_c
 
 - Whether a quiet but live market updates each side often enough for a 3-second limit (the
   "largest age while held" and "polls usable" columns), per instrument and time of day.
-- How long after subscribing the second change arrives on each side (until then an
-  unreported-type stream is `TYPE_UNREPORTED_NO_UPDATES_YET`), and whether quiet unreported
-  markets keep changing within the 5-second window.
+- How long after subscribing the second change and the first price change arrive on each side
+  (until then an unreported-type stream is `TYPE_UNREPORTED_NO_UPDATES_YET` or
+  `TYPE_UNREPORTED_NO_PRICE_CHANGE_YET`), and whether quiet unreported markets keep changing
+  prices within the 5-second window.
 - Which placeholders TWS really sends before the first quote (-1 / 0 are assumed), whether a
   frozen or closed market ever sends a changed value, and whether `marketDataType` arrives late on
   a stream (the label then moves to rule 11, or to rule 6/4 and stays not live).
