@@ -350,3 +350,18 @@ def test_only_a_paper_account_id_can_be_configured(tmp_path, account):
     with pytest.raises(IbkrConfigError):
         load_order_config(write_cfg(tmp_path, account=account))
     assert PAPER.startswith("D")
+
+
+def test_the_repo_ships_no_stage3_entry_allowance_value():
+    """Only the owner's own private file can set the stage-3 allowance."""
+    hits = []
+    for p in _tracked():
+        rel = _rel(p)
+        if rel.startswith(("tests/", "docs/", "src/tradingbot/ibkr_orders/")) or p.suffix == ".md":
+            continue
+        try:
+            if "stage3_entry_allowance_ticks" in p.read_text():
+                hits.append(rel)
+        except (UnicodeDecodeError, OSError):
+            continue
+    assert hits == []

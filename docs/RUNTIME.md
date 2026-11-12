@@ -297,7 +297,21 @@ byte is as before.
 `TRADINGBOT_VOCAB_PROPOSALS`, else `<review log>.proposals.jsonl` beside the log; without one it
 builds a plain batch from the log by kind (proper noun: non-market word; market noun or instrument
 phrase seen in posts of one family: a name of that family; unknown word of an instruction sentence:
-instruction phrase; anything else: ambiguous). One line:
+instruction phrase; anything else: ambiguous). **Safer default:** a word that held a post through
+the mention-with-context rule (`ENTRY_ANCHOR_POST_UNRESOLVED_MARKET`, `RULE:MENTION_WITH_CONTEXT`)
+was seen next to a price or a trading word, so it may be another market: whatever its kind, it is
+proposed as ambiguous (no list) and the page and the final table show, as plain text, "seen with a
+price or a trading word; may be another market". The warning comes from the review log's
+evidence, never from a proposals file: a file may suggest another group, but a warned word is
+always pre-selected as ambiguous, and the final table repeats the warning beside the word when the
+owner accepts it into a list. The warning belongs to the **word**, not to a (word, kind) pair: the
+plain batch shows ONE proposal per word with all its kinds, so a warned word is never also offered,
+unwarned, under another kind. "The same word" (`vocab_review.word_key`) is what the anchor rule
+and the mention detector compare: case-insensitive, edge punctuation and a leading `#`, `$` or `@`
+removed, a possessive `'s` removed. A phrase or compound one of whose parts (split on spaces, `/`,
+`.`, `-`) is a warned word is warned too. A plural is a different word: the detector does not fold
+it, so the plural in the lexicon does not remove the original's hold. The warning flag is part of
+the batch digest. One line:
 
 ```json
 {"schema": "tradingbot.vocab_proposal/1", "token": "zorbs", "group": "MARKET_NAME",
@@ -358,15 +372,51 @@ experimental holds and trades never enter production's journal. Production eligi
 changes only through *Apply batch* (or the owner editing the file by hand).
 
 **Privacy rules.** Every private file (review log, proposals, lexicon, backups, decisions,
-candidate) lies outside the repository, every git work tree it can detect (a `.git` entry in an
-ancestor) and every bare repository; the service refuses to start otherwise, and refuses a group-
-or world-readable review log. A work tree whose git directory lives elsewhere without a `.git`
-entry (`core.worktree`) cannot be detected. A cloud-synced folder (`~/Library/CloudStorage`,
+candidate) lies outside **this program's repository** (the checkout it runs from, its main
+checkout and every linked worktree of it, compared by their common git directory), outside any
+`.git` directory and outside any bare repository; the service refuses to start otherwise, and
+refuses a group- or world-readable review log. "Inside" is decided by **file identity** (device
+and inode of every existing enclosing directory, compared with this program's checkout, its main
+checkout, every linked worktree recorded in the common git directory and the git directory
+itself), never by comparing strings, so a case or Unicode-normalisation variant of a directory
+name or a symlinked parent cannot pass on a file system that folds them (macOS does); string checks
+remain as an extra refusal, and any error while checking refuses. A repository nested inside
+this program's main checkout is therefore refused too, also when the service runs from a linked
+worktree. When this program's repository cannot be determined (an installed package, no git
+checkout, a git directory that does not exist), every git work tree is refused (fail closed); so is
+another work tree whose own git directory cannot be found. After start nothing is trusted either:
+every private write (review log appends, lexicon, backups, decisions, candidate) opens its file
+relative to a held descriptor of its checked folder, never through a link (`O_NOFOLLOW`), re-runs
+the path check and requires the folder to be the same directory (device and inode) before and
+after opening, and refuses a file whose link count is above 1 (a hard link elsewhere, checked with
+`fstat` on the open file). A refused review-log append raises `REVIEW_LOG_WRITE_FAILED` by code
+only; the service and the hold are unaffected.
+A path inside **any other** git work tree is allowed (the Product Owner's decision: the owner's
+workspace is itself a private repository) and warned: a banner on the page saying the file could
+be committed to that repository by mistake and that the tool cannot prevent it, and, when the
+review log is on, a start-up alert `PRIVATE_PATH_IN_OTHER_GIT_TREE <file> OTHER_GIT_WORK_TREE`
+(no path). A work tree whose git directory lives elsewhere without a `.git` entry
+(`core.worktree`) cannot be detected. A cloud-synced folder (`~/Library/CloudStorage`,
 iCloud Drive, `~/Dropbox`, OneDrive, Google Drive, possibly iCloud Desktop and Documents) is
 allowed by the owner's policy but warned: a banner on the page and, when the review log is on, a
 start-up alert `PRIVATE_PATH_IN_SYNCED_FOLDER` naming the file kind and path class only. A
 non-synced private directory is recommended for the review log, proposals, candidates and
-backups; credentials never belong in a synced folder. A lexicon the loader refuses stops the
+backups; credentials never belong in a synced folder. A path can carry both warnings.
+
+Recommended layout: one private folder, mode 0700, outside this program's repository, ideally not
+synced and not in any git work tree, holding all of the owner's review files:
+
+```
+~/tradingbot-private/            (chmod 700)
+  lexicon.json                   [interpreter] lexicon_path (chmod 600)
+  lexicon.json.bak-<UTC time>    backups, one per applied batch
+  lexicon.review-decisions.json  keep-holding words, applied words, meanings, write hashes
+  lexicon.candidate.json         a candidate for an offline replay only
+  review.jsonl                   [interpreter] review_log_path (the only file with sentences)
+  review.proposals.jsonl         proposals (optional)
+```
+
+A lexicon the loader refuses stops the
 service with a `ConfigError` naming the error type, field paths and count only, never a value. Files are created with mode 0600. The
 private words ride on the mapping decision as a pydantic private attribute that no serialisation
 reads, so they never reach the journal, logs, alerts, the heartbeat, the exception register or

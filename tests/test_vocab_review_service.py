@@ -221,10 +221,11 @@ def test_a_review_log_inside_the_repository_is_refused(tmp_path):
     assert not (REPO / "state" / "review.jsonl").exists()
 
 
-def test_a_review_log_inside_any_git_work_tree_is_refused(tmp_path):
+def test_a_review_log_inside_this_programs_work_tree_is_refused(tmp_path, monkeypatch):
     tree = tmp_path / "some-checkout"
     (tree / ".git").mkdir(parents=True)
-    with pytest.raises(ConfigError, match="git work tree"):
+    monkeypatch.setattr(V, "REPO_ROOT", tree)  # an invented checkout of this program
+    with pytest.raises(ConfigError, match="this program's repository"):
         run(tmp_path / "a", [], review_log=tree / "logs" / "review.jsonl", cycles=0)
 
 
@@ -262,8 +263,10 @@ def owner_lexicon(tmp_path: Path) -> Path:
     return lex
 
 
-def review_then_rerun(tmp_path: Path, text: str, verdict: str, group: str):
-    """Hold, review the plain batch built from the log, apply the owner's verdict, re-run."""
+def review_then_rerun(tmp_path: Path, text: str, verdict: str, group: str,
+                      owner_group: str | None = None, owner_family: str | None = None):
+    """Hold, review the plain batch built from the log, apply the owner's verdict (moving the
+    word to ``owner_group`` when given), re-run."""
     log = private_dir(tmp_path) / "review.jsonl"
     lex = owner_lexicon(tmp_path)
     first = run(tmp_path / "first", [text], review_log=log, lexicon=lex)
@@ -272,7 +275,8 @@ def review_then_rerun(tmp_path: Path, text: str, verdict: str, group: str):
     entries, _ = V.read_review_log(log)
     [prop] = V.proposals_from_log(entries, lexicon_path=lex)
     assert prop.group == group  # the plain batch's proposed group
-    r = V.apply_batch(lex, [V.BatchItem(prop.token, verdict, prop.group, prop.family)])
+    r = V.apply_batch(lex, [V.BatchItem(prop.token, verdict, owner_group or prop.group,
+                                        owner_family or prop.family)])
     assert r.status in ("WRITTEN", "RECORDED"), r.message
     cand = prop
     load_lexicons(lex)  # the real loader accepts the result
@@ -288,18 +292,20 @@ def test_plain_instruction_wording_lets_the_held_post_trade(tmp_path):
 
 
 def test_not_a_market_lets_the_held_post_trade(tmp_path):
-    statuses, *_ = review_then_rerun(tmp_path, PERSON, V.ACCEPT, V.NON_MARKET)
+    # Seen with a trading word: proposed as ambiguous; the owner moves it to "not a market".
+    statuses, *_ = review_then_rerun(tmp_path, PERSON, V.ACCEPT, V.AMBIGUOUS, V.NON_MARKET)
     assert [s for s, _ in statuses] == ["EXECUTED"], statuses
 
 
 def test_another_name_of_the_family_lets_the_held_post_trade(tmp_path):
-    statuses, *_ = review_then_rerun(tmp_path, FAMILY_WORD, V.ACCEPT, V.MARKET_NAME)
+    statuses, *_ = review_then_rerun(tmp_path, FAMILY_WORD, V.ACCEPT, V.AMBIGUOUS,
+                                     V.MARKET_NAME, "TLT")
     assert [s for s, _ in statuses] == ["EXECUTED"], statuses
 
 
 def test_a_different_market_keeps_holding_and_is_not_offered_again(tmp_path):
     statuses, lex, log, _cand = review_then_rerun(tmp_path, OTHER_MARKET, V.KEEP_HOLDING,
-                                                 V.NON_MARKET)
+                                                  V.AMBIGUOUS)
     assert [s for s, _ in statuses] == ["HOLD"]
     assert statuses[0][1] == ("ENTRY_ANCHOR_POST_UNRESOLVED_MARKET,RULE:MENTION_WITH_CONTEXT,"
                               "MENTION:PROPER_NOUN")

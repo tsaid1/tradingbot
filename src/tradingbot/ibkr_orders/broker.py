@@ -83,6 +83,7 @@ class IbkrPaperBroker:
     def __init__(self, session: Any, *, exit_collar_pct: Decimal | None = None) -> None:
         self._s = session
         self._exit_collar_pct = exit_collar_pct
+        self.last_quote_report: dict | None = None  # evidence: the adapter's label and reason
         self._asset_class: dict[int, AssetClass] = {}
         self._stops_cancelled: set[str] = set()  # protective stops this binding cancelled
         self.protection_lost = ""  # set when an exit failed after its stop was cancelled
@@ -242,6 +243,11 @@ class IbkrPaperBroker:
         try:  # a malformed report (e.g. no attempt at all) is a failed read, never an escape
             attempts = list(report.attempts)
             best = next((a for a in reversed(attempts) if a.two_sided_valid), attempts[-1])
+            self.last_quote_report = {
+                "status": str(getattr(report, "status", "")),
+                "reason": str(getattr(report, "reason", "")),
+                "flags": [str(f) for f in getattr(best, "flags", ())],
+                "market_data_type": getattr(best, "market_data_type", None)}
             return BrokerQuote(contract=contract, bid=dec(best.bid), ask=dec(best.ask),
                                last=dec(best.last), received_at=datetime.fromisoformat(
                                    best.received_at), quality=QuoteQuality(best.quality.value))

@@ -138,6 +138,11 @@ def main() -> None:
     candidate_path = V.default_candidate_path(lexicon)
     for label, path in (("private lexicon", lexicon), ("review log", log),
                         ("proposals file", prop_path), ("candidate lexicon", candidate_path)):
+        if V.git_tree_class(path) is not None:
+            st.error(f"PRIVATE_PATH_IN_OTHER_GIT_TREE: the {label} is inside another git work "
+                     "tree (not this program's repository). It could be committed to that "
+                     "repository by mistake, and this tool cannot prevent it: keep it out of that "
+                     "repository's commits (for example with an ignore rule).")
         cls = V.synced_folder_class(path)
         if cls is not None:
             st.error(f"PRIVATE_PATH_IN_SYNCED_FOLDER: the {label} is in a cloud-synced folder "
@@ -171,6 +176,8 @@ def main() -> None:
             pid = V.proposal_id(p)
             with st.expander(f"Proposal {n}: {p.posts} held post(s), {p.holds} hold(s)"):
                 st.code(_details(p), language=None)
+                if p.market_warning:
+                    st.text(f"Warning: {V.MAY_BE_MARKET}.")
                 if p.measured:
                     st.caption("Measured change (claimed by the proposals file; not verified by "
                                "this page):")
