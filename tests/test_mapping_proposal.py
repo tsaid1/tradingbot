@@ -354,3 +354,230 @@ def test_cli_replacing_a_vehicle_drops_owner_inputs_decided_for_another():
 def test_written_toml_round_trips():
     base = copy.deepcopy(mp.build(catalog(), shipped())[1].entry)
     assert tomllib.loads("x = " + mp._toml(base["contracts"]))["x"][0]["month"] == "202612"
+
+
+# ================================================================== review fixes (PR #65)
+
+INJECT = 'x = 1 }\n[[mapping]]\nfamily = "TLT"\nbasis = "DIRECT"\napproved = true\nq = { y'
+
+
+def _policy_with_owner(owner: dict) -> dict:
+    return {"schema": mp.POLICY_SCHEMA, "family": [
+        {"family": "TLT", "treatment": "DIRECT", "execution": "TLT", "owner": owner}]}
+
+
+@pytest.mark.parametrize("owner", [
+    {"sizing": {INJECT: 1}},
+    {"session": {"policy": "REGULAR_ONLY", "nested": {INJECT: 1}}},
+    {"sizing": {"entry rule": 1}},
+    {"roll": {"a.b": 1}},
+])
+def test_r1_policy_keys_must_be_bare_at_every_level(owner, tmp_path, capsys):
+    with pytest.raises(mp.ProposalInputInvalid, match="bare key"):
+        mp.parse_policy(_policy_with_owner(owner))
+    pol = tmp_path / "p.toml"
+    import tomllib as _t  # noqa: F401
+    pol.write_text('schema = "tradingbot.mapping_proposal_policy/1"\n[[family]]\n'
+                   'family = "TLT"\ntreatment = "DIRECT"\nexecution = "TLT"\n'
+                   '[family.owner.sizing]\n"x\\n[[mapping]]\\napproved = true" = 1\n')
+    out = tmp_path / "o"
+    assert _load().main([str(FIXTURE), "--out", str(out), "--policy", str(pol)]) == 2
+    assert not out.exists()
+
+
+def test_r1_toml_writer_refuses_a_non_bare_key_and_escapes_every_string():
+    with pytest.raises(mp.ProposalInputInvalid):
+        mp._toml({INJECT: 1})
+    nasty = 'a"b\\c\n[[mapping]]\napproved = true\t\x7f\x00 ]}  '
+    assert tomllib.loads("v = " + mp._toml(nasty))["v"] == nasty
+    assert tomllib.loads("v = " + mp._toml({"k": [nasty]}))["v"]["k"] == [nasty]
+
+
+def test_r1_values_names_and_notes_cannot_inject_entries(tmp_path):
+    cat = catalog()
+    for r in cat["results"]:
+        if r["name"] == "MES fut":
+            r["name"] = 'MES fut"\n[[mapping]]\nfamily = "SPX"\napproved = true\n#'
+    raw = tomllib.loads(POLICY.read_text())
+    spx = next(f for f in raw["family"] if f["family"] == "SPX")
+    spx["execution"] = 'MES fut"\n[[mapping]]\nfamily = "SPX"\napproved = true\n#'
+    spx["candidates"] = [spx["execution"]]
+    spx["level_meaning"] = '"\n[[mapping]]\napproved = true'
+    spx["owner"] = {"sizing": {"units_per_signal": '1"\napproved = true\n"'}}
+    props = mp.build(cat, mp.parse_policy(raw))
+    text = mp.render_toml(props, cat)
+    es = mp.verify_rendered(text, props)
+    assert len(es) == 5 and all(e["approved"] is False for e in es)
+
+
+def test_r1_a_rendered_approval_writes_nothing_and_exits_non_zero(tmp_path, monkeypatch):
+    real = mp.render_toml
+    monkeypatch.setattr(mp, "render_toml", lambda props, cat: real(props, cat).replace(
+        "\napproved = false", "\napproved = true", 1))
+    out = tmp_path / "o"
+    assert _load().main([str(FIXTURE), "--out", str(out), "--roll-days", "5"]) == 3
+    assert not out.exists() or not any(out.iterdir())
+    for bad in ("entry_rule", "level_contract_rule", "approved_by", "entry_anchor"):
+        monkeypatch.setattr(mp, "render_toml", lambda props, cat, b=bad: real(props, cat).replace(
+            'basis = "DIRECT"', f'basis = "DIRECT"\n{b} = "X"', 1))
+        with pytest.raises(mp.ProposalUnsafe):
+            mp.write_outputs(mp.build(catalog(), shipped()), catalog(), shipped(), out)
+        assert not out.exists() or not any(out.iterdir())
+
+
+def test_r2_same_series_lists_every_last_trade_difference_as_the_owners_assertion():
+    cat = catalog()
+    by = {p.plan.family: p for p in mp.build(cat, shipped())}
+    for fam in ("WTI", "NATGAS"):
+        p = by[fam]
+        diffs = p.same_series_diffs
+        assert [d["month"] for d in diffs] == [c["contract_month"] for c in p.calendar]
+        assert all(d["business_days"] == 1 for d in diffs), diffs
+        sheet = mp.render_sheet(p, cat)
+        assert "trades that same month at the same price" not in sheet
+        assert "assertion the owner must make" in sheet
+        assert "never shows price equality" in sheet
+        assert "1 business day before" in sheet
+        sym = p.execution.spec["symbol"]
+        assert f"roll dates are proposed from the execution vehicle's ({sym})" in sheet
+        cal = mp.render_calendar([p], shipped(), cat)
+        assert cal.count("1 business day before the reference") == len(p.calendar)
+
+
+def test_r2_a_month_missing_from_the_reference_is_listed():
+    cat = catalog()
+    cl = next(r for r in cat["results"] if r["name"] == "CL fut")
+    cl["contracts"] = cl["contracts"][:1]
+    [p] = [p for p in mp.build(cat, shipped()) if p.plan.family == "WTI"]
+    assert p.same_series_diffs[1]["business_days"] is None
+    assert "not in the reference row (row truncated)" in mp.render_sheet(p, cat)
+
+
+def test_r3_truncation_and_a_failed_report_warn_everywhere():
+    cat = catalog()
+    cat.update(overall="FAILED", failure="connect: INVENTED")
+    mcl = next(r for r in cat["results"] if r["name"] == "MCL fut")
+    mcl["truncated"] = True
+    by = {p.plan.family: p for p in mp.build(cat, shipped())}
+    wti = by["WTI"]
+    sheet, cal = mp.render_sheet(wti, cat), mp.render_calendar([wti], shipped(), cat)
+    for text in (sheet, cal, wti.entry["note"]):
+        assert "report is FAILED" in text
+        assert "reference row `CL fut` is TRUNCATED" in text
+        assert "execution row `MCL fut` is TRUNCATED: the month list may be incomplete" in text
+    assert "report is FAILED" in mp.render_sheet(by["TLT"], cat)
+
+
+def test_r4_a_roll_date_already_reached_is_unusable_and_lead_time_is_flagged():
+    cat = catalog()
+    cat["started_at"] = "2026-12-09T07:00:00+00:00"  # MCL Jan roll date is 2026-12-09
+    raw = tomllib.loads(POLICY.read_text())
+    wti = next(f for f in raw["family"] if f["family"] == "WTI")
+    wti["owner"] = {"contract_selection": {"rule": "EXPLICIT_ONLY",
+                                           "min_business_days_to_roll": 30}}
+    pol = mp.merge_cli(mp.parse_policy(raw), [], 5, {})
+    [p] = [p for p in mp.build(cat, pol) if p.plan.family == "WTI"]
+    first, second = p.calendar
+    assert not first["usable"] and any("UNUSABLE" in f for f in first["flags"])
+    assert second["usable"] and any("minimum lead time" in f for f in second["flags"])
+    assert [c["month"] for c in p.entry["contracts"]] == ["202702"]
+    assert "202701" in p.entry["note"]
+    assert "UNUSABLE" in mp.render_calendar([p], pol, cat)
+
+
+@pytest.mark.parametrize("mult", ["0", "-5", "abc", "nan", "inf"])
+def test_r5_multiplier_must_be_positive_and_finite(mult):
+    cat = catalog()
+    mes = next(r for r in cat["results"] if r["name"] == "MES fut")
+    for c in mes["contracts"]:
+        c["multiplier"] = mult
+    [p] = [p for p in mp.build(cat, shipped()) if p.plan.family == "SPX"]
+    assert p.entry["execution"]["multiplier"] == mp.BROKER_FACT
+    assert any("not a positive number" in m for m in p.broker_missing)
+    assert "no dollar values" in mp.render_sheet(p, cat)
+
+
+def test_r5_a_tick_of_zero_is_a_missing_fact():
+    cat = catalog()
+    mes = next(r for r in cat["results"] if r["name"] == "MES fut")
+    for c in mes["contracts"]:
+        c["min_tick"] = 0
+    [p] = [p for p in mp.build(cat, shipped()) if p.plan.family == "SPX"]
+    assert p.entry["execution"]["min_tick"] == mp.BROKER_FACT
+
+
+@pytest.mark.parametrize("magnifier", [100, None])
+def test_r5_price_magnifier_other_than_one_means_no_dollar_values(magnifier):
+    cat = catalog()
+    mes = next(r for r in cat["results"] if r["name"] == "MES fut")
+    for c in mes["contracts"]:
+        c["price_magnifier"] = magnifier
+    pol = mp.merge_cli(shipped(), [], 5, {"SPX": Decimal(5000)})
+    [p] = [p for p in mp.build(cat, pol) if p.plan.family == "SPX"]
+    sheet = mp.render_sheet(p, cat)
+    assert "USD 5 per 1.00" not in sheet and "price_magnifier" in sheet
+    assert any("price_magnifier" in m for m in p.broker_missing)
+
+
+def test_r6_share_multiplier_is_the_loader_default_and_fractional_shares_are_an_owner_decision():
+    cat = catalog()
+    tlt = next(r for r in cat["results"] if r["name"] == "TLT")
+    tlt["contracts"][0]["size_increment"] = "0.0001"
+    [p] = [p for p in mp.build(cat, shipped()) if p.plan.family == "TLT"]
+    sheet = mp.render_sheet(p, cat)
+    assert "multiplier 1 (the loader's default for shares; the report states none)" in sheet
+    assert not any("size_increment" in m for m in p.broker_missing)
+    assert any("broker allows fractional shares" in o and "owner decision" in o
+               for o in p.owner_inputs)
+
+
+def test_r7_roll_function_guards_and_holidays_notice():
+    with pytest.raises(ValueError):
+        mp.business_days_before(date(2026, 12, 18), -1, [])
+    assert mp.business_days_before(date(2026, 12, 19), 0, []) == date(2026, 12, 18)  # Sat
+    cal = mp.render_calendar(mp.build(catalog(), shipped()), shipped(), catalog())
+    assert "exchange holidays not applied" in cal
+    [p] = [p for p in mp.build(catalog(), shipped()) if p.plan.family == "SPX"]
+    assert "exchange holidays not applied" in mp.render_sheet(p, catalog())
+
+
+def test_r7_duplicate_report_names_and_months_are_refused(tmp_path):
+    cat = catalog()
+    cat["results"].append(copy.deepcopy(cat["results"][0]))
+    bad = tmp_path / "r.json"
+    bad.write_text(json.dumps(cat))
+    with pytest.raises(mp.ProposalInputInvalid, match="twice"):
+        mp.load_report(bad)
+    cat = catalog()
+    mcl = next(r for r in cat["results"] if r["name"] == "MCL fut")
+    mcl["contracts"].append(copy.deepcopy(mcl["contracts"][0]))
+    [p] = [p for p in mp.build(cat, shipped()) if p.plan.family == "WTI"]
+    assert p.entry["basis"] == "UNSUPPORTED" and "listed twice" in p.unsupported_reason
+
+
+def test_r7_error_rows_are_unresolved_not_not_found_and_conids_say_first_12_of_n():
+    cat = catalog()
+    pol = shipped(specs=["SPX:REFERENCE_TRIGGER:IBUS500 CFD:SPX index"])
+    [p] = [p for p in mp.build(cat, pol) if p.plan.family == "SPX"]
+    table = mp.render_contract_table([p], cat)
+    assert "unresolved row: status `ERROR`" in table
+    assert "NOT_FOUND row: status `ERROR`" not in table
+    mes = next(r for r in cat["results"] if r["name"] == "MES fut")
+    base = mes["contracts"][0]
+    mes["contracts"] = [dict(base, con_id=1000 + i, contract_month=f"2027{i:02d}",
+                             last_trade_date=f"2027{i:02d}15") for i in range(1, 13)] + [
+        dict(base, con_id=2000, contract_month="202801", last_trade_date="20280115")]
+    [p] = [p for p in mp.build(cat, shipped()) if p.plan.family == "SPX"]
+    assert "first 12 of 13" in mp.render_sheet(p, cat)
+
+
+def test_r7_non_empty_output_directory_and_bad_family_names_are_refused(tmp_path):
+    out = tmp_path / "o"
+    out.mkdir()
+    (out / "approval_OLD.md").write_text("stale")
+    assert _load().main([str(FIXTURE), "--out", str(out)]) == 2
+    with pytest.raises(mp.ProposalInputInvalid, match="family name"):
+        mp.parse_family_spec("SP/X:DIRECT:SPY")
+    out2 = tmp_path / "o2"
+    assert _load().main([str(FIXTURE), "--out", str(out2), "--family", "../x:DIRECT:SPY"]) == 2
+    assert not out2.exists()

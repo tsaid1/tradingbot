@@ -20,6 +20,7 @@ docs/MAPPING_PROPOSAL.md.
 from __future__ import annotations
 
 import json
+import re
 import tomllib
 from dataclasses import dataclass, field
 from datetime import date, timedelta
@@ -48,11 +49,51 @@ TABLE_FIELDS = ("con_id", "symbol", "local_symbol", "sec_type", "exchange", "pri
                 "query_match")
 SPEC_FIELDS = ("sec_type", "symbol", "exchange", "currency", "multiplier", "min_tick",
                "size_increment", "trading_class", "time_zone_id", "trading_hours",
-               "liquid_hours")
+               "liquid_hours", "price_magnifier")
+# A TOML bare key: the only key form the writer emits, at every nesting level, so no key can
+# close a table or open a new [[mapping]] block.
+BARE_KEY = re.compile(r"^[A-Za-z0-9_-]+$")
+FAMILY_NAME = re.compile(r"^[A-Z][A-Z0-9]{0,9}(\.OPT)?$")  # as the mapping loader requires
+# Keys a proposal never carries; the rendered file is re-parsed and refused if one appears.
+NEVER_RENDERED = ("approved_by", "approved_at", "entry_rule", "entry_anchor",
+                  "level_contract_rule")
 
 
 class ProposalInputInvalid(ValueError):
     """The report or the proposal policy is malformed, or tries to approve something."""
+
+
+class ProposalUnsafe(RuntimeError):
+    """The rendered proposal failed its own re-parse check: nothing is written."""
+
+
+def _check_keys(v: Any, where: str) -> None:
+    if isinstance(v, dict):
+        for k, x in v.items():
+            if not isinstance(k, str) or not BARE_KEY.match(k):
+                raise ProposalInputInvalid(f"{where}: {k!r} is not a bare key ([A-Za-z0-9_-]+)")
+            _check_keys(x, f"{where}.{k}")
+    elif isinstance(v, list):
+        for x in v:
+            _check_keys(x, where)
+
+
+def check_family_name(name: str, where: str = "family") -> str:
+    if not isinstance(name, str) or not FAMILY_NAME.match(name):
+        raise ProposalInputInvalid(f"{where}: {name!r} is not a valid family name "
+                                   "(A-Z, 0-9, up to 10 characters, optional .OPT)")
+    return name
+
+
+def positive(v: Any) -> Decimal | None:
+    """A positive, finite number, or None."""
+    if isinstance(v, bool) or absent(v):
+        return None
+    try:
+        d = Decimal(str(v))
+    except (InvalidOperation, ValueError):
+        return None
+    return d if d.is_finite() and d > 0 else None
 
 
 def absent(v: Any) -> bool:
@@ -114,11 +155,13 @@ def parse_family(f: dict, i: int | str = 0, source: str = "policy file") -> Fami
     for k in ("family", "treatment", "execution"):
         if not isinstance(f.get(k), str) or not f[k].strip():
             raise ProposalInputInvalid(f"{where}: {k} is required")
+    check_family_name(f["family"], where)
     if f["treatment"] not in TREATMENTS:
         raise ProposalInputInvalid(f"{where}: treatment must be one of {TREATMENTS}")
     owner = f.get("owner", {})
     if not isinstance(owner, dict) or set(owner) - OWNER_KEYS:
         raise ProposalInputInvalid(f"{where}: owner takes only {sorted(OWNER_KEYS)}")
+    _check_keys(owner, f"{where}.owner")
     price = f.get("illustrative_price")
     if price is not None:
         try:
@@ -160,6 +203,11 @@ def load_report(path: str | Path) -> dict:
         raise ProposalInputInvalid(f"not a discovery report (schema must be {CATALOG_SCHEMA!r})")
     if not isinstance(cat.get("results"), list):
         raise ProposalInputInvalid("discovery report has no results list")
+    names = [r.get("name") for r in cat["results"] if isinstance(r, dict)]
+    twice = sorted({n for n in names if names.count(n) > 1}, key=str)
+    if twice or len(names) != len(cat["results"]):
+        raise ProposalInputInvalid(f"discovery report lists query name(s) {twice} twice "
+                                   "(or a result that is not an object): refused, not first-wins")
     return cat
 
 
@@ -184,6 +232,7 @@ class Vehicle:
     error_code: Any = None
     error_message: str | None = None
     truncated: bool = False
+    limit: Any = None
     spec: dict = field(default_factory=dict)  # field -> single value stated by every contract
     spec_problems: dict = field(default_factory=dict)  # field -> why there is no single value
 
@@ -202,7 +251,8 @@ def vehicle(cat: dict, name: str) -> Vehicle:
         return Vehicle(name, "NOT_IN_REPORT", error_message="no such query in the report")
     v = Vehicle(name, str(row.get("status")), row.get("kind", "contracts"),
                 list(row.get("contracts") or []), list(row.get("params") or []),
-                row.get("error_code"), row.get("error_message"), bool(row.get("truncated")))
+                row.get("error_code"), row.get("error_message"), bool(row.get("truncated")),
+                row.get("limit"))
     if v.kind == "option_chain":
         und = (row.get("underlying") or {}).get("contracts") or []
         mults = {p.get("multiplier") for p in v.params}
@@ -240,17 +290,37 @@ def last_trade(c: dict) -> tuple[date | None, str]:
     return None, ""
 
 
+def is_business_day(d: date, holidays: list[date]) -> bool:
+    return d.weekday() < 5 and d not in holidays
+
+
 def business_days_before(d: date, n: int, holidays: list[date]) -> date:
+    """``n`` business days before ``d``. With ``n = 0`` a last-trade date on a weekend or listed
+    holiday moves back to the business day before it."""
+    if isinstance(n, bool) or not isinstance(n, int) or n < 0:
+        raise ValueError("the number of business days must be an int >= 0")
     out, left = d, n
+    if left == 0:
+        while not is_business_day(out, holidays):
+            out -= timedelta(days=1)
+        return out
     while left:
         out -= timedelta(days=1)
-        if out.weekday() < 5 and out not in holidays:
+        if is_business_day(out, holidays):
             left -= 1
     return out
 
 
+def business_days_between(a: date, b: date, holidays: list[date]) -> int:
+    """Business days d with a < d <= b (negative when b is before a)."""
+    if b < a:
+        return -business_days_between(b, a, holidays)
+    return sum(1 for i in range(1, (b - a).days + 1)
+               if is_business_day(a + timedelta(days=i), holidays))
+
+
 def roll_calendar(v: Vehicle, roll_days: int | None, holidays: list[date],
-                  as_of: date | None) -> list[dict]:
+                  as_of: date | None, min_lead: int | None = None) -> list[dict]:
     rows = []
     for c in sorted(v.contracts, key=lambda c: (str(c.get("contract_month") or ""),
                                                  str(c.get("last_trade_date") or ""))):
@@ -260,18 +330,31 @@ def roll_calendar(v: Vehicle, roll_days: int | None, holidays: list[date],
         if not (len(month) == 6 and month.isdigit()):
             flags.append("contract month not in report: month omitted from the proposal")
             month = ""
-        roll = None
+        roll, usable = None, True
         if ltd is None:
             flags.append("last-trade date not in report: no roll date proposed")
         elif roll_days is None:
             flags.append("no roll rule parameter set: roll date is an owner input")
         else:
             roll = business_days_before(ltd, roll_days, holidays)
-            if as_of is not None and roll < as_of:
-                flags.append("proposed roll date is before the report date")
+            if roll_days == 0 and roll != ltd:
+                flags.append("last-trade date is not a business day: moved back to the one before")
+            if as_of is None:
+                flags.append("report date unknown: roll date not checked against it")
+            elif roll <= as_of:
+                usable = False
+                flags.append("UNUSABLE: proposed roll date already reached on the report date "
+                             "(roll_date <= report date); month left out of the proposal")
+            elif min_lead is not None:
+                lead = business_days_between(as_of, roll, holidays)
+                if lead < min_lead:
+                    flags.append(f"inside the minimum lead time: {lead} business days from the "
+                                 f"report date to the roll date, fewer than "
+                                 f"min_business_days_to_roll {min_lead}")
         rows.append({"con_id": c.get("con_id"), "local_symbol": c.get("local_symbol"),
                      "contract_month": month or None, "last_trade_date": ltd,
-                     "last_trade_source": src or None, "roll_date": roll, "flags": flags})
+                     "last_trade_source": src or None, "roll_date": roll, "usable": usable,
+                     "flags": flags})
     return rows
 
 
@@ -289,6 +372,9 @@ class FamilyProposal:
     owner_inputs: list[str]
     broker_missing: list[str]
     unsupported_reason: str | None = None
+    warnings: list[str] = field(default_factory=list)
+    same_series_diffs: list[dict] = field(default_factory=list)
+    holidays_applied: bool = False
 
 
 def _placeholder_table(keys: list[str], fixed: dict | None = None) -> dict:
@@ -297,7 +383,8 @@ def _placeholder_table(keys: list[str], fixed: dict | None = None) -> dict:
     return out
 
 
-def _series(v: Vehicle, missing: list[str], where: str, *, execution: bool) -> dict:
+def _series(v: Vehicle, missing: list[str], where: str, *, execution: bool,
+            owner_in: list[str] | None = None) -> dict:
     s = v.spec
     out: dict[str, Any] = {}
     for k in ("sec_type", "symbol", "exchange", "currency"):
@@ -318,25 +405,88 @@ def _series(v: Vehicle, missing: list[str], where: str, *, execution: bool) -> d
     if not execution:
         return out
     # A share left without a multiplier keeps the loader's stock default (1 share); every other
-    # rule the report does not state is a missing broker fact.
+    # rule the report does not state, or states as zero, negative or non-numeric, is a missing
+    # broker fact.
     stock = s.get("sec_type") == "STK"
     for k in ("multiplier", "min_tick"):
-        if k in s:
-            out[k] = format(Decimal(str(s[k])).normalize(), "f")
+        value = positive(s.get(k))
+        if value is not None:
+            out[k] = format(value.normalize(), "f")
+        elif k in s:
+            out[k] = BROKER_FACT
+            missing.append(f"{where}.{k}: report states {s[k]!r}: not a positive number")
         elif not (stock and k == "multiplier"):
             out[k] = BROKER_FACT
             missing.append(f"{where}.{k}: {v.spec_problems.get(k, 'absent')}")
     if v.kind == "option_chain":
         return out
-    inc = s.get("size_increment")
-    whole = inc is not None and Decimal(str(inc)) >= 1 and \
-        Decimal(str(inc)) == Decimal(str(inc)).to_integral_value()
-    if whole:
-        out["size_increment"] = int(Decimal(str(inc)))
+    mag = s.get("price_magnifier")
+    if mag is None or positive(mag) != 1:
+        why = (v.spec_problems.get("price_magnifier", "absent") if mag is None
+               else f"report states {mag}")
+        missing.append(f"{where}.price_magnifier: {why}: prices may not be in the contract's own "
+                       "units, so no dollar values are computed (owner/broker confirmation)")
+    inc = positive(s.get("size_increment"))
+    if inc is not None and inc >= 1 and inc == inc.to_integral_value():
+        out["size_increment"] = int(inc)
+    elif stock and inc is not None and inc < 1 and owner_in is not None:
+        out["size_increment"] = PLACEHOLDER
+        owner_in.append(f"{where}.size_increment: the broker allows fractional shares (size "
+                        f"increment {_num(inc)}); the loader needs whole units: owner decision")
     else:
         out["size_increment"] = BROKER_FACT
-        why = v.spec_problems.get("size_increment") or f"report states {show(inc)}"
+        why = v.spec_problems.get("size_increment") or \
+            f"report states {show(s.get('size_increment'))}"
         missing.append(f"{where}.size_increment: {why} (whole units only)")
+    return out
+
+
+def report_warnings(cat: dict, x: Vehicle, ref: Vehicle) -> list[str]:
+    out = []
+    if cat.get("overall") != "COMPLETE":
+        out.append(f"the discovery report is {cat.get('overall')} ({show(cat.get('failure'))}): "
+                   "re-run discovery before relying on it")
+    if x.truncated:
+        out.append(f"execution row `{x.query}` is TRUNCATED: the month list may be incomplete "
+                   f"(the report kept {len(x.contracts)} rows at limit {show(x.limit)})")
+    if ref is not x and ref.truncated:
+        out.append(f"reference row `{ref.query}` is TRUNCATED: the broker returned more rows than "
+                   f"the report kept ({len(ref.contracts)} at limit {show(ref.limit)})")
+    return out
+
+
+def same_series_diffs(x: Vehicle, ref: Vehicle, calendar: list[dict],
+                      holidays: list[date]) -> list[dict]:
+    """Month by month: the execution vehicle's last-trade date against the reference's. The report
+    shows listing facts only; it never shows that the two trade at the same price."""
+    by_month: dict[str, list[date | None]] = {}
+    for c in ref.contracts:
+        by_month.setdefault(str(c.get("contract_month") or ""), []).append(last_trade(c)[0])
+    out = []
+    for row in calendar:
+        m = row["contract_month"]
+        if m is None:
+            continue
+        refs = by_month.get(m, [])
+        ref_ltd = refs[0] if len(refs) == 1 else None
+        xl = row["last_trade_date"]
+        n = business_days_between(xl, ref_ltd, holidays) if xl and ref_ltd else None
+        if not refs:
+            why = "not in the reference row" + (" (row truncated)" if ref.truncated else "")
+        elif ref_ltd is None:
+            why = "reference last-trade date not in report"
+        elif xl is None:
+            why = "execution last-trade date not in report"
+        elif n == 0:
+            why = "same last-trade date as the reference"
+        else:
+            unit = "business day" if abs(n) == 1 else "business days"
+            why = (f"execution last trade {abs(n)} {unit} "
+                   f"{'before' if n > 0 else 'after'} the reference's ({ref_ltd})")
+        out.append({"month": m, "execution_last_trade": xl, "reference_last_trade": ref_ltd,
+                    "business_days": n, "text": why})
+        if why != "same last-trade date as the reference":
+            row["flags"].append(why)
     return out
 
 
@@ -347,14 +497,22 @@ def build_family(plan: FamilyPlan, cat: dict, policy: ProposalPolicy) -> FamilyP
         [plan.reference] if plan.reference else [])]))
     cands = [vehicle(cat, n) for n in names]
     as_of = report_date(cat)
-    calendar = roll_calendar(x, policy.roll_days, policy.holidays, as_of) if x.is_future else []
+    sel = plan.owner.get("contract_selection")
+    lead = sel.get("min_business_days_to_roll") if isinstance(sel, dict) else None
+    lead = lead if isinstance(lead, int) and not isinstance(lead, bool) else None
+    calendar = roll_calendar(x, policy.roll_days, policy.holidays, as_of, lead) \
+        if x.is_future else []
     owner_in: list[str] = []
     missing: list[str] = []
+    warnings = report_warnings(cat, x, ref)
+    warn_note = (" WARNINGS: " + "; ".join(warnings) + ".") if warnings else ""
+    extra = {"warnings": warnings, "holidays_applied": bool(policy.holidays)}
 
     def unsupported(reason: str) -> FamilyProposal:
         entry = {"family": plan.family, "basis": "UNSUPPORTED", "approved": False,
-                 "note": f"PROPOSAL (not approved): {reason}. Unresolved mappings HOLD."}
-        return FamilyProposal(plan, x, ref, cands, entry, calendar, [], [], reason)
+                 "note": f"PROPOSAL (not approved): {reason}. Unresolved mappings HOLD."
+                         + warn_note}
+        return FamilyProposal(plan, x, ref, cands, entry, calendar, [], [], reason, **extra)
 
     for role, v in (("execution", x), ("reference", ref)):
         if not v.found:
@@ -363,6 +521,11 @@ def build_family(plan: FamilyPlan, cat: dict, policy: ProposalPolicy) -> FamilyP
         if v.kind == "contracts" and v.spec.get("sec_type") != "FUT" and len(v.contracts) != 1:
             return unsupported(f"{role} query {v.query!r} returned {len(v.contracts)} contracts, "
                                "not exactly one")
+        months = [str(c.get("contract_month")) for c in v.contracts if c.get("contract_month")]
+        twice = sorted({m for m in months if months.count(m) > 1})
+        if twice:
+            return unsupported(f"{role} query {v.query!r} has month(s) {', '.join(twice)} "
+                               "listed twice: refused, not first-wins")
     if ref is not x and ref.kind == "option_chain":
         return unsupported("an option chain cannot be a reference series")
     opt = x.kind == "option_chain"
@@ -377,7 +540,7 @@ def build_family(plan: FamilyPlan, cat: dict, policy: ProposalPolicy) -> FamilyP
                      f"execution {x.query!r}, reference {ref.query!r}, treatment from the "
                      f"{plan.source}.")
     reference = _series(ref, missing, "reference", execution=False)
-    execution = _series(x, missing, "execution", execution=True)
+    execution = _series(x, missing, "execution", execution=True, owner_in=owner_in)
     if opt:
         reference = {"sec_type": "OPT", "symbol": execution["symbol"],
                      "exchange": PLACEHOLDER, "currency": execution["currency"]}
@@ -406,9 +569,12 @@ def build_family(plan: FamilyPlan, cat: dict, policy: ProposalPolicy) -> FamilyP
     if x.is_future:
         owner_table("contract_selection", ["rule", "min_business_days_to_roll"],
                     {"rule": "EXPLICIT_ONLY"} if same_series_needed else None)
-        contracts = []
+        contracts, past = [], []
         for row in calendar:
             if row["contract_month"] is None:
+                continue
+            if not row["usable"]:
+                past.append(row["contract_month"])
                 continue
             rd = row["roll_date"]
             contracts.append({"month": row["contract_month"],
@@ -416,7 +582,10 @@ def build_family(plan: FamilyPlan, cat: dict, policy: ProposalPolicy) -> FamilyP
             if rd is None and "contracts.roll_date" not in owner_in:
                 owner_in.append("contracts.roll_date")
         if not contracts:
-            missing.append("contracts: no listed month states its contract month")
+            missing.append("contracts: no usable listed month (contract month or roll date)")
+        if past:
+            entry["note"] += (" Months left out, roll date already reached on the report date: "
+                              f"{', '.join(past)}.")
         entry["contracts"] = contracts
     legacy = (plan.treatment == "DIRECT" and execution.get("sec_type") == "STK"
               and plan.family == execution.get("symbol") and "sizing" not in o
@@ -452,7 +621,10 @@ def build_family(plan: FamilyPlan, cat: dict, policy: ProposalPolicy) -> FamilyP
         entry["owner_input_required"] = list(owner_in)
     if missing:
         entry["broker_fact_missing"] = list(missing)
-    return FamilyProposal(plan, x, ref, cands, entry, calendar, owner_in, missing)
+    diffs = same_series_diffs(x, ref, calendar, policy.holidays) if same_series_needed else []
+    entry["note"] += warn_note
+    return FamilyProposal(plan, x, ref, cands, entry, calendar, owner_in, missing,
+                          same_series_diffs=diffs, **extra)
 
 
 def build(cat: dict, policy: ProposalPolicy) -> list[FamilyProposal]:
@@ -491,6 +663,19 @@ def merge_cli(policy: ProposalPolicy, specs: list[str], roll_days: int | None,
 # ============================================================================ rendering
 
 
+def _tstr(text: str) -> str:
+    """A TOML basic string: quote, backslash and every control character (and DEL) escaped."""
+    out = []
+    for ch in text:
+        if ch in '"\\':
+            out.append("\\" + ch)
+        elif ord(ch) < 0x20 or ord(ch) == 0x7F:
+            out.append(f"\\u{ord(ch):04X}")
+        else:
+            out.append(ch)
+    return '"' + "".join(out) + '"'
+
+
 def _toml(v: Any) -> str:
     if isinstance(v, bool):
         return "true" if v else "false"
@@ -499,10 +684,13 @@ def _toml(v: Any) -> str:
     if isinstance(v, date):
         return v.isoformat()
     if isinstance(v, (str, Decimal, float)):
-        return json.dumps(str(v), ensure_ascii=False)
+        return _tstr(str(v))
     if isinstance(v, list):
         return "[" + ", ".join(_toml(x) for x in v) + "]"
     if isinstance(v, dict):
+        for k in v:
+            if not isinstance(k, str) or not BARE_KEY.match(k):
+                raise ProposalInputInvalid(f"{k!r} is not a bare key: not written")
         return "{ " + ", ".join(f"{k} = {_toml(x)}" for k, x in v.items()) + " }"
     raise TypeError(f"cannot write {type(v).__name__} to TOML")
 
@@ -521,9 +709,34 @@ def render_toml(props: list[FamilyProposal], cat: dict) -> str:
     for p in props:
         lines.append("[[mapping]]")
         for k, v in p.entry.items():
+            if not BARE_KEY.match(k):
+                raise ProposalInputInvalid(f"{k!r} is not a bare key: not written")
             lines.append(f"{k} = {_toml(v)}")
         lines.append("")
     return "\n".join(lines)
+
+
+def verify_rendered(text: str, props: list[FamilyProposal]) -> list[dict]:
+    """Re-parse the rendered proposal: exactly the proposed families, in order, each
+    ``approved = false`` with no approval or owner-rule key. Raises ``ProposalUnsafe``."""
+    try:
+        data = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as exc:
+        raise ProposalUnsafe(f"rendered proposal does not parse: {exc}") from None
+    entries = data.get("mapping")
+    if set(data) != {"version", "mapping"} or data["version"] != 2 or not isinstance(entries,
+                                                                                      list):
+        raise ProposalUnsafe(f"rendered proposal has top-level keys {sorted(data)}")
+    if [e.get("family") for e in entries] != [p.plan.family for p in props]:
+        raise ProposalUnsafe("rendered proposal does not hold exactly the proposed families")
+    for e in entries:
+        if e.get("approved") is not False:
+            raise ProposalUnsafe(f"family {e.get('family')}: rendered entry is not "
+                                 "approved = false")
+        bad = [k for k in NEVER_RENDERED if k in e]
+        if bad:
+            raise ProposalUnsafe(f"family {e.get('family')}: rendered entry carries {bad}")
+    return entries
 
 
 def _md(v: Any) -> str:
@@ -547,7 +760,8 @@ def render_contract_table(props: list[FamilyProposal], cat: dict) -> str:
             out.append("")
             if not v.found:
                 code = "absent" if v.error_code is None else str(v.error_code)
-                out += [(f"NOT_FOUND row: status `{v.status}`, broker code {code}, message "
+                label = "NOT_FOUND row" if v.status == "NOT_FOUND" else "unresolved row"
+                out += [(f"{label}: status `{v.status}`, broker code {code}, message "
                         f"{_md(v.error_message)}."), ""]
                 continue
             if v.truncated:
@@ -577,10 +791,11 @@ def render_contract_table(props: list[FamilyProposal], cat: dict) -> str:
 
 
 def render_calendar(props: list[FamilyProposal], policy: ProposalPolicy, cat: dict) -> str:
-    rule = ("roll_date = last-trade date minus "
+    rule = ("roll_date = the execution vehicle's last-trade date minus "
             f"{policy.roll_days} business days (Mon-Fri"
             + (f", less {len(policy.holidays)} listed holidays" if policy.holidays else
-               "; no holidays listed") + ")") if policy.roll_days is not None else \
+               "; exchange holidays not applied: no holiday list given") + ")") \
+        if policy.roll_days is not None else \
         "no rule parameter set: every roll_date is an owner input"
     out = ["# Proposed roll calendar", "", f"Rule: {rule}. Report date: {report_date(cat)}.",
            ("The report carries neither first-notice dates nor the broker's close-out dates, nor "
@@ -589,13 +804,21 @@ def render_calendar(props: list[FamilyProposal], policy: ProposalPolicy, cat: di
     for p in props:
         if not p.calendar:
             continue
-        out += [f"## {p.plan.family}: {p.execution.query}", "",
-                "| month | local symbol | last trade | from field | proposed roll_date | flags |",
+        out += [f"## {p.plan.family}: {p.execution.query}", ""]
+        out += [f"**WARNING:** {_md(w)}." for w in p.warnings]
+        if p.warnings:
+            out.append("")
+        if p.same_series_diffs:
+            out += [(f"Same-series proposal: reference `{_md(p.reference.query)}`. Roll dates "
+                    "follow the execution vehicle's own last-trade dates; each month's difference "
+                    "from the reference is listed in the flags."), ""]
+        out += ["| month | local symbol | last trade | from field | proposed roll_date | flags |",
                 "|---|---|---|---|---|---|"]
         for r in p.calendar:
+            roll = _md(r["roll_date"]) if r["usable"] else f"UNUSABLE ({_md(r['roll_date'])})"
             out.append(f"| {_md(r['contract_month'])} | {_md(r['local_symbol'])} | "
                        f"{_md(r['last_trade_date'])} | {_md(r['last_trade_source'])} | "
-                       f"{_md(r['roll_date'])} | {'; '.join(r['flags'])} |")
+                       f"{roll} | {_md('; '.join(r['flags']))} |")
         out.append("")
     return "\n".join(out)
 
@@ -603,8 +826,10 @@ def render_calendar(props: list[FamilyProposal], policy: ProposalPolicy, cat: di
 _MEANING = {
     "DIRECT": "the price of {x} itself: entry, stop and target are checked against {x}'s own "
               "quote and must lie on its tick",
-    "DIRECT_SAME": "the price of the {r} futures month the instruction names; {x} is asserted "
-                   "(same_series, owner's reason) to trade that same month at the same price",
+    "DIRECT_SAME": "the price of the {r} futures month the instruction names. Executing it in {x} "
+                   "rests on an assertion the owner must make (same_series, with its reason): "
+                   "that {x} of that month is priced as the same series. The report does not "
+                   "show this",
     "BASIS_SHIFT": "a price of {r}; at each decision it is converted into {x} by adding the live "
                    "basis ({x} mid minus {r} mid, both fresh), held if the basis exceeds the cap",
     "REFERENCE_TRIGGER": "a level of {r}; the entry is a limit priced from {x}'s own quote, and "
@@ -623,6 +848,8 @@ def render_sheet(p: FamilyProposal, cat: dict) -> str:
            (f"Discovery report {cat.get('started_at')} (overall {cat.get('overall')}). "
            f"Treatment named by the {plan.source}: **{plan.treatment}**. "
            "Every entry this tool writes is `approved = false`."), ""]
+    if p.warnings:
+        out += ["## Warnings", ""] + [f"* **WARNING:** {_md(w)}." for w in p.warnings] + [""]
     if p.unsupported_reason:
         out += [("**Not proposable from this report.** The proposed entry is `UNSUPPORTED` and "
                 f"HOLDs: {p.unsupported_reason}."), "",
@@ -640,16 +867,29 @@ def render_sheet(p: FamilyProposal, cat: dict) -> str:
     out += ["## What the bot would trade", "",
             f"{xname}, currency {show(xs.get('currency'))}"
             + (f", months {', '.join(months)}" if months else "") + ".", ""]
-    mult = xs.get("multiplier") if xs.get("sec_type") != "STK" else (xs.get("multiplier") or "1")
-    tick = xs.get("min_tick")
+    stock = xs.get("sec_type") == "STK"
+    m, t = positive(xs.get("multiplier")), positive(xs.get("min_tick"))
+    m_label = _num(m) if m is not None else show(xs.get("multiplier"))
+    if m is None and stock and absent(xs.get("multiplier")):
+        m = Decimal(1)
+        m_label = "1 (the loader's default for shares; the report states none)"
+    mag = xs.get("price_magnifier")
+    why_not = []
+    if m is None:
+        why_not.append(f"multiplier {show(xs.get('multiplier'))} is not a positive number "
+                       "stated by the report")
+    if t is None:
+        why_not.append(f"minimum tick {show(xs.get('min_tick'))} is not a positive number "
+                       "stated by the report")
+    if x.kind != "option_chain" and positive(mag) != 1:
+        why_not.append(f"price_magnifier {show(mag)}: prices may not be in the contract's own "
+                       "units")
     out += ["## Contract size and risk", ""]
-    if absent(mult) or absent(tick):
-        out.append(f"* multiplier {show(mult)}, minimum tick {show(tick)}: not both stated by "
-                   "the report, so no dollar values are computed.")
+    if why_not:
+        out.append("* no dollar values are computed: " + "; ".join(why_not) + ".")
     else:
-        m, t = Decimal(str(mult)), Decimal(str(tick))
-        unit = "share" if xs.get("sec_type") == "STK" else "contract"
-        out += [(f"* multiplier {_num(m)} -> **USD {_num(m)} per 1.00 price point** "
+        unit = "share" if stock else "contract"
+        out += [(f"* multiplier {m_label} -> **USD {_num(m)} per 1.00 price point** "
                 f"per {unit}"),
                 (f"* minimum tick {_num(t)} -> **USD {_num(m * t)} per tick** "
                 f"per {unit}")]
@@ -664,13 +904,35 @@ def render_sheet(p: FamilyProposal, cat: dict) -> str:
                        f"{_num(m / 100)} x P per {unit} (supply P with --price "
                        f"{fam}=P; no market price is assumed)")
     out.append("")
+    if p.same_series_diffs:
+        xsym, rsym = xs.get("symbol"), rs.get("symbol")
+        out += ["## Same-series claim (an assertion the owner must make)", "",
+                (f"`same_series = true` asserts that {xsym} of a month is priced as the same "
+                 f"series as {rsym} of that month. The report shows listing facts only (symbols, "
+                 "months, last-trade dates, multipliers, ticks); it never shows price equality. "
+                 "The owner must make and justify the assertion (`same_series_reason`)."), "",
+                (f"Listing differences, month by month; roll dates are proposed from the "
+                 f"execution vehicle's ({xsym}) last-trade dates, not the reference's"
+                 + ("." if p.holidays_applied else
+                    ". Business days are counted Monday to Friday: exchange holidays not "
+                    "applied (no holiday list given), so a month spanning a holiday shows one "
+                    "day more than the exchange calendar would.")), "",
+                f"| month | {xsym} last trade | {rsym} last trade | difference |",
+                "|---|---|---|---|"]
+        for d in p.same_series_diffs:
+            out.append(f"| {d['month']} | {show(d['execution_last_trade'])} | "
+                       f"{show(d['reference_last_trade'])} | {_md(d['text'])} |")
+        out.append("")
     out += ["## Facts from the broker (this report)", ""]
     for role, v in (("execution", x), ("reference", r)) if r is not x else (("execution", x),):
-        ids = [str(c.get("con_id")) for c in v.contracts][:12]
+        all_ids = [str(c.get("con_id")) for c in v.contracts]
+        ids = ", ".join(all_ids[:12]) or "absent"
+        if len(all_ids) > 12:
+            ids = f"first 12 of {len(all_ids)}: {ids}"
         facts = ", ".join(f"{k} {show(v.spec.get(k))}" for k in (
             "sec_type", "symbol", "exchange", "currency", "multiplier", "min_tick",
-            "size_increment", "trading_class", "time_zone_id") if k in v.spec)
-        out.append(f"* {role} query `{v.query}`: {facts}; conIds {', '.join(ids) or 'absent'}")
+            "size_increment", "price_magnifier", "trading_class", "time_zone_id") if k in v.spec)
+        out.append(f"* {role} query `{v.query}`: {facts}; conIds {ids}")
         for k, why in v.spec_problems.items():
             if k not in ("trading_hours", "liquid_hours"):
                 out.append(f"  * `{k}`: {why}")
@@ -678,8 +940,13 @@ def render_sheet(p: FamilyProposal, cat: dict) -> str:
             val = _md(v.spec[k]) if k in v.spec else v.spec_problems.get(k, "absent")
             out.append(f"  * `{k}`: {val}")
     if p.calendar:
+        unusable = [r["contract_month"] for r in p.calendar if not r["usable"]]
         out.append(f"* roll calendar: {len(p.calendar)} listed months; see roll_calendar.md. "
-                   f"{FND_FLAG}.")
+                   f"{FND_FLAG}."
+                   + ("" if p.holidays_applied else
+                      " exchange holidays not applied (no holiday list given).")
+                   + (f" UNUSABLE (roll date already reached): {', '.join(map(str, unusable))}."
+                      if unusable else ""))
     out.append("* Not in the report: settlement type, first-notice and close-out dates, "
                "margins, trading permissions, market-data entitlements.")
     out.append("")
@@ -729,13 +996,21 @@ def render_sheet(p: FamilyProposal, cat: dict) -> str:
 
 def write_outputs(props: list[FamilyProposal], cat: dict, policy: ProposalPolicy,
                   out_dir: str | Path) -> list[Path]:
+    """Render everything, re-check the proposal, then write into a new or empty directory.
+    Nothing is written when any check fails."""
     d = Path(out_dir)
-    d.mkdir(parents=True, exist_ok=True)
-    files = {"proposed_mapping.toml": render_toml(props, cat),
+    if d.exists() and (not d.is_dir() or any(d.iterdir())):
+        raise ProposalInputInvalid(f"output directory {d} is not empty: choose a new one")
+    for p in props:
+        check_family_name(p.plan.family)
+    toml_text = render_toml(props, cat)
+    verify_rendered(toml_text, props)
+    files = {"proposed_mapping.toml": toml_text,
              "contract_table.md": render_contract_table(props, cat),
              "roll_calendar.md": render_calendar(props, policy, cat)}
     for p in props:
         files[f"approval_{p.plan.family.replace('.', '_')}.md"] = render_sheet(p, cat)
+    d.mkdir(parents=True, exist_ok=True)
     written = []
     for name, text in files.items():
         path = d / name

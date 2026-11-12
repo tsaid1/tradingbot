@@ -10,7 +10,8 @@ writes. Writes to DIR: ``contract_table.md``, ``roll_calendar.md``, ``proposed_m
 load) and one ``approval_<FAMILY>.md`` per family. Reads only the two input files: no network, no
 ``ibapi``. ``--roll-days`` is the owner's roll-rule parameter (business days before the report's
 last-trade date); ``--price`` an owner-supplied illustrative price for the 1% risk line (never a
-market price). Exit 0 on success, 2 on a bad input. See docs/MAPPING_PROPOSAL.md.
+market price). Exit 0 on success, 2 on a bad input or a non-empty DIR, 3 when the
+rendered proposal fails its own re-parse check (nothing is written). See docs/MAPPING_PROPOSAL.md.
 """
 from __future__ import annotations
 
@@ -21,6 +22,7 @@ from pathlib import Path
 
 from tradingbot.runtime.mapping_proposal import (
     ProposalInputInvalid,
+    ProposalUnsafe,
     build,
     load_policy,
     load_report,
@@ -68,10 +70,13 @@ def main(argv: list[str] | None = None) -> int:
         policy = merge_cli(load_policy(args.policy), args.family, args.roll_days,
                            _prices(args.price))
         props = build(cat, policy)
+        paths = write_outputs(props, cat, policy, args.out)
     except ProposalInputInvalid as exc:
         print(f"refused: {exc}", file=sys.stderr)
         return 2
-    paths = write_outputs(props, cat, policy, args.out)
+    except ProposalUnsafe as exc:
+        print(f"UNSAFE, nothing written: {exc}", file=sys.stderr)
+        return 3
     for p in props:
         state = ("UNSUPPORTED: " + p.unsupported_reason if p.unsupported_reason else
                  f"{p.plan.treatment}, {len(p.owner_inputs)} owner inputs, "

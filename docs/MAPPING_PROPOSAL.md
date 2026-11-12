@@ -61,5 +61,30 @@ that an OPEN on each family HOLDs with `MAPPING_NOT_APPROVED`, both at the mappi
 the gateway (`tests/test_mapping_proposal.py`). A stock quoted in its own price with no sizing
 (TLT) needs no owner input and keeps the version-1 behaviour.
 
+**Same-series proposals.** For a DIRECT `same_series` proposal (a micro future executing the
+standard contract's levels) the sheet compares the two vehicles' last-trade dates month by month
+and lists every difference (in the real catalog every micro oil and micro gas month stops trading
+one business day before the full-size contract). The report shows listing facts only, never that
+the two are priced as one series: that is an assertion the owner must make (`same_series_reason`).
+Roll dates are always proposed from the execution vehicle's own last-trade dates.
+
+**Warnings and refusals.** A report that is not `COMPLETE`, and a truncated execution or reference
+row (the query's `limit` was reached; for the execution row the month list may be incomplete), are
+warned on the sheet, in the roll calendar and in the entry's note. A proposed roll date on or before
+the report date is UNUSABLE: the month is left out of `contracts` and named in the note. A roll
+date closer to the report date than the owner's `min_business_days_to_roll` (when stated) is
+flagged. Without a holiday list the business-day counts are Monday to Friday and every output says
+"exchange holidays not applied". Dollar values need a positive, finite multiplier and tick and a
+`price_magnifier` of 1; otherwise none are computed and the entry records a missing broker fact.
+A share's multiplier of 1 is the loader's default, not a report fact; a fractional size increment
+is an owner decision (the loader needs whole units). Duplicate query names in a report and
+duplicate months in a row are refused, never first-wins.
+
+**Output safety.** Policy keys must be bare TOML keys (`[A-Za-z0-9_-]+`) at every level and family
+names must match the loader's pattern; every string is escaped. After rendering, the tool re-parses
+`proposed_mapping.toml` and refuses (exit 3, nothing written) unless it holds exactly the proposed
+families, each `approved = false` with no `approved_by`, `approved_at`, `entry_rule`, `entry_anchor`
+or `level_contract_rule`. The output directory must be new or empty (exit 2 otherwise).
+
 The proposal never writes `entry_rule`, `entry_anchor` or `level_contract_rule`. Those defaults
 (`EXPLICIT_ENTRY_ONLY`, `EXPLICIT_MONTH_ONLY`) stay until the owner decides otherwise.
