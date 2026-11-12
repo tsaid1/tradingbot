@@ -20,7 +20,7 @@ from tradingbot.runtime.config import ConfigError, parse_config
 from tradingbot.runtime.service import RuntimeService
 
 ROOT = Path(__file__).resolve().parents[1]
-ENTRY = "We are now long $TLT at 88.40. Stop 87.20."
+ENTRY = "We are now long $TLT at 88.42. Stop 87.20."  # at the ask: the limit is the stated price (PR #70)
 
 
 def _paper_file(folder: Path) -> Path:

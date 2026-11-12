@@ -86,7 +86,7 @@ DRIVER = textwrap.dedent(r'''
     base = datetime(2026, 3, 2, 15, 0, tzinfo=UTC)
     posts = os.path.join(folder, "posts.jsonl")
     with open(posts, "w") as f:
-        for sid, off, text in (("1", 0, "We are now long $TLT at 88.40. Stop 87.20."),
+        for sid, off, text in (("1", 0, "We are now long $TLT at 88.42. Stop 87.20."),  # at the ask
                                ("2", 120, "Raising our $TLT stop to 87.90."),
                                ("3", 240, "Closing the rest of our $TLT long at 88.40.")):
             at = base + timedelta(seconds=off)
@@ -127,7 +127,7 @@ DRIVER = textwrap.dedent(r'''
         """A real change on both sides of the newest stream, then wait until it is seen."""
         n[0] += 1
         conn, rid = subs[-1]
-        bid, ask = 88.40 - (n[0] % 2) / 100, 88.42 + (n[0] % 2) / 100
+        bid, ask = 88.40 - (n[0] % 2) / 100, 88.42 - (n[0] % 2) / 100  # ask never above 88.42
         conn.push(F.frame(IN.MARKET_DATA_TYPE, MarketDataType(reqId=rid, marketDataType=1)))
         for t, v in ((1, bid), (2, ask)):
             conn.push(F.frame(IN.TICK_PRICE, TickPrice(reqId=rid, tickType=t, price=v,

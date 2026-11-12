@@ -335,3 +335,94 @@ def test_n1_a_failed_bad_opening_leaves_nothing_for_a_stop_amendment(shadow):
     [o] = b.submit(exit_)
     assert o.status.value == "Filled"
     sh.close()
+
+
+# ------------------------------------------------------------------ the life of an entry (PR #70)
+RESTING = "We are now long $TLT at 88.40. Stop 87.20."  # below the ask: the entry rests
+
+
+def _above_the_limit(sh):
+    """Live and fresh, both sides changing, the ask never down to the 88.40 limit."""
+    moves = iter(range(100000))
+
+    def fresh():
+        i = next(moves) % 2
+        sh.live(88.39 + i / 100, 88.42 + i / 100)
+        sh.live(88.40 - i / 100, 88.43 - i / 100)
+
+    return fresh
+
+
+def _entry_life(sh):
+    [intent] = [i for i in sh.service.coordinator.store.intents() if i.action.value == "OPEN"]
+    journal = [e.event for e in sh.service.coordinator.store.journal()
+               if e.order_ref == intent.order_ref]
+    return intent, journal
+
+
+def _assert_clean_end(sh, intent):
+    assert sh.sim().open_orders() == [] and sh.sim().positions() == []
+    orders = {o.order_ref: o for o in sh.sim().all_orders()}
+    child = [o for o in orders.values() if o.parent_ref == intent.order_ref]
+    assert child and all(o.status.value == "Cancelled" for o in child)  # the stop went with it
+    assert orders[intent.order_ref].status.value == "Cancelled"
+    assert list(sh.sim()._submit_script) == [] and sh.events("SHADOW_STALE_SCRIPT_DRAINED") == []
+    kinds = {e.kind for e in sh.service.coordinator.store.exceptions(open_only=True)}
+    assert "ENTRY_REMAINDER_NOT_CANCELLED" not in kinds, kinds
+    assert sh.events("SHADOW_SIMULATED_FILL") == []
+
+
+def test_entry_life_the_shadow_cancel_first_then_the_core_expiry_finds_nothing(shadow, tws):
+    sh = shadow([post("1", 0, RESTING)])
+    fresh = _above_the_limit(sh)
+    run_until_processed(sh, 1, before=fresh)
+    intent, _ = _entry_life(sh)
+    assert intent.state.value == "WORKING"
+    _delayed(sh, 88.38, 88.40)  # the stream turns delayed: the simulation cannot keep the order
+    sh.step()
+    [c] = sh.events("SHADOW_OPENING_ORDER_CANCELLED")
+    assert c["order_ref"] == intent.order_ref and c["code"] == "SHADOW_OPENING_QUOTE_NOT_LIVE"
+    for _ in range(30):  # well past max_intent_age_seconds: the core has nothing left to expire
+        fresh()
+        sh.step(5.0)
+    intent, journal = _entry_life(sh)
+    assert intent.state.value == "CANCELLED", intent.state
+    assert "ENTRY_EXPIRED_UNFILLED" not in journal, journal  # one reason: the shadow cancel
+    assert len(sh.events("SHADOW_OPENING_ORDER_CANCELLED")) == 1
+    _assert_clean_end(sh, intent)
+    sh.close()
+    assert_only_read_only_messages(tws)
+
+
+@pytest.mark.parametrize("market_at_expiry", ["live", "delayed"])
+def test_entry_life_the_core_expiry_first_and_the_shadow_never_cancels_twice(
+        shadow, tws, market_at_expiry):
+    """The core expires the entry first. "delayed": the stream turns delayed exactly at the read
+    the core's own cancel makes, so both mechanisms see the same order at once."""
+    sh = shadow([post("1", 0, RESTING)])
+    fresh = _above_the_limit(sh)
+    run_until_processed(sh, 1, before=fresh)
+    intent, _ = _entry_life(sh)
+    if market_at_expiry == "delayed":
+        orig = sh.broker.cancel
+
+        def cancel(order_ref):
+            _delayed(sh, 88.38, 88.41)
+            return orig(order_ref)
+
+        sh.broker.cancel = cancel
+    for _ in range(40):
+        fresh()
+        sh.step(5.0)
+        if _entry_life(sh)[0].state.value != "WORKING":
+            break
+    intent, journal = _entry_life(sh)
+    assert intent.state.value == "CANCELLED" and "ENTRY_EXPIRED_UNFILLED" in journal, journal
+    assert sh.events("SHADOW_OPENING_ORDER_CANCELLED") == []  # one reason: the core's expiry
+    for _ in range(3):  # later reads, live or not, find nothing to cancel again
+        _delayed(sh)
+        sh.step()
+    assert sh.events("SHADOW_OPENING_ORDER_CANCELLED") == []
+    _assert_clean_end(sh, intent)
+    sh.close()
+    assert_only_read_only_messages(tws)

@@ -174,7 +174,11 @@ fails, the simulated broker rejects the whole bracket with a public code
 journaled `SHADOW_OPENING_ORDER_REJECTED`): nothing rests. A resting opening order is cancelled
 (`SHADOW_OPENING_ORDER_CANCELLED`, with the code and the quote) as soon as a read of its contract
 fails that test: the simulation cannot know what a real resting order would have done on data it
-does not have. Reduce-only orders (stops, closes, take-profits) keep the simulator's rules on any
+does not have. This sits beside the execution core's own rules for a resting entry (it expires
+once its post is older than its validity, and a publisher CLOSE or REDUCE cancels it,
+docs/EXECUTION_CORE.md): whichever acts first cancels the order, the other finds nothing working,
+and the order the core is cancelling in a call is never also cancelled by the shadow broker in
+that same call, so the journal shows one reason; the stop child is cancelled with its parent. Reduce-only orders (stops, closes, take-profits) keep the simulator's rules on any
 real quote, and every simulated fill's label says what it was computed from:
 `SIMULATED_AT_LIVE_QUOTE`, `SIMULATED_AT_DELAYED_QUOTE` or `SIMULATED_AT_FROZEN_QUOTE`.
 

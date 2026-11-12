@@ -464,13 +464,14 @@ class ShadowBroker:
         return self.quote(contract)
 
     def _with_quote(self, quote: BrokerQuote, simulated: BrokerQuote, evidence: QuoteEvidence,
-                    at: datetime, action: Callable[[], Any] | None = None) -> Any:
+                    at: datetime, action: Callable[[], Any] | None = None,
+                    spare: str | None = None) -> Any:
         """The ONLY moment a real quote is in the simulator's store: resting opening orders
         that this read does not qualify are cancelled first (review B1); the quote's evidence is
         written ahead (review S3); the quote is published (the simulator matches); ``action``
         runs on it; every new fill is journaled with its label; the store is set back to
         UNAVAILABLE, so no later match can use this quote."""
-        self._cancel_unqualified_openings(quote, evidence, at)
+        self._cancel_unqualified_openings(quote, evidence, at, spare)
         usable = (simulated.bid is not None and simulated.ask is not None
                   and simulated.quality is not QuoteQuality.UNAVAILABLE)
         label = simulated.quality.value if usable else None
@@ -496,11 +497,13 @@ class ShadowBroker:
                             received_at=self.clock(), contract=contract)
 
     def _cancel_unqualified_openings(self, quote: BrokerQuote, evidence: QuoteEvidence,
-                                     at: datetime) -> None:
+                                     at: datetime, spare: str | None = None) -> None:
+        """``spare``: the order the execution core is cancelling in this very call (its expiry or
+        a publisher exit): it is cancelled once, for the core's reason, not twice."""
         key = quote.contract.contract_key
         for o in self._sim.open_orders():
             if o.contract.contract_key != key or o.reduce_only or o.parent_ref is not None \
-                    or o.status.value == "PendingCancel":
+                    or o.status.value == "PendingCancel" or o.order_ref == spare:
                 continue
             code = opening_problem(quote, at, self.opening_limit(o.order_ref))
             if code is None:
@@ -538,12 +541,13 @@ class ShadowBroker:
                     self._ensure_stream(contract.contract_key)
         return len(contracts)
 
-    def _on_contract_of(self, order_ref: str, action: Callable[[], Any]) -> Any:
+    def _on_contract_of(self, order_ref: str, action: Callable[[], Any],
+                        spare: str | None = None) -> Any:
         """Run ``action`` on a fresh read of the order's contract (and only on it)."""
         orders = self._sim.orders_with_ref(order_ref)
         if not orders:
             return action()
-        return self._with_quote(*self._take(orders[-1].contract), action=action)
+        return self._with_quote(*self._take(orders[-1].contract), action=action, spare=spare)
 
     # ------------------------------------------------------------------ simulated (SimBroker)
     def account_id(self) -> str:
@@ -591,7 +595,8 @@ class ShadowBroker:
 
     def cancel(self, order_ref: str) -> BrokerOrder:
         self._drain_stale_scripts("cancel")
-        return self._on_contract_of(order_ref, lambda: self._sim.cancel(order_ref))
+        return self._on_contract_of(order_ref, lambda: self._sim.cancel(order_ref),
+                                    spare=order_ref)
 
     def supports_price_conditions(self) -> bool:
         return self._sim.supports_price_conditions()

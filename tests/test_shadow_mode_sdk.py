@@ -55,7 +55,9 @@ from tradingbot.runtime.operator_actions import OperatorQueue
 from tradingbot.runtime.service import BROKER_RECONNECT_PENDING
 
 SHADOW_ACCOUNT = "SIM-SHADOW-0001"
-EXPLICIT = "We are now long $TLT at 88.40. Stop 87.20."
+# At the ask: since PR #70 an explicit entry is sent at the stated price, so a stated entry below
+# the ask would rest. These tests are about the shadow lifecycle, not about resting entries.
+EXPLICIT = "We are now long $TLT at 88.42. Stop 87.20."
 ANCHORED = "We are now long $TLT, 88.42 now. Stop 87.20."
 RAISE_STOP = "Raising our $TLT stop to 87.90."
 CLOSE = "Closing the rest of our $TLT long at 88.40."
