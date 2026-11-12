@@ -34,7 +34,7 @@ def run(text, collar="0.1"):
 
 
 @pytest.mark.parametrize("stop,ok,reason", [
-    ("84.09", True, None),  # 4.9 % below the 88.42 entry, 4.98 % below the 88.50 limit
+    ("84.09", True, None),  # 4.9 % below the 88.42 entry (and the 88.42 limit)
     ("83.91", False, "PROTECTIVE_STOP_TOO_FAR_FROM_ENTRY"),  # 5.1 %
     ("1.20", False, "PROTECTIVE_STOP_TOO_FAR_FROM_ENTRY"),  # a distance written as a stop
     ("89.00", False, "STOP_DIRECTION_CONTRADICTION"),  # above a long's entry
@@ -52,11 +52,11 @@ def test_two_different_stops_hold_an_explicit_entry():
     assert sent == 0 and "PROTECTIVE_STOP_NOT_UNIQUE" in out[0][2], out
 
 
-def test_the_limit_is_checked_as_well_as_the_entry():
-    """With a 1 % collar the explicit limit is 89.30: a stop 4.5 % below the 88.42 entry is
-    5.4 % below the limit actually sent, and the execution core refuses it."""
-    sent, out = run("We are now long $TLT at 88.42. Stop 84.44.", collar="1.0")
-    assert sent == 0 and "PROTECTIVE_STOP_TOO_FAR_FROM_LIMIT" in out[0][2], out
+def test_a_stop_just_inside_the_limit_trades_under_the_default_collar():
+    """The explicit limit is the stated entry (the 1 % collar only rejects), so the entry and
+    limit checks coincide up to the tick: 4.9 % below trades with the default collar."""
+    sent, out = run("We are now long $TLT at 88.42. Stop 84.09.", collar="1.0")
+    assert sent == 1 and out[0][1] == "EXECUTED", out
 
 
 def test_exactly_at_the_limit_is_accepted():

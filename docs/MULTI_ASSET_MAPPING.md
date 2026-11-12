@@ -201,9 +201,9 @@ only (they do not authorize order submission):**
   - farther than the limit from the limit-entry price actually to be sent
     (`PROTECTIVE_STOP_TOO_FAR_FROM_LIMIT`, in the series the stop is held in): at the gateway for
     an anchored entry, and at the execution core before every submission, explicit and anchored,
-    OPEN and ADD, recovery included (for an explicit entry the limit is the collar limit the core
-    computes, so with a 1 % collar a stop 4.5 % below the entry is 5.4 % below the limit and is
-    refused).
+    OPEN and ADD, recovery included. For an explicit entry the limit sent is the stated entry
+    price itself (the collar only rejects), so the two checks coincide up to tick snapping: a stop
+    4.9 % below an explicit entry trades under the default 1 % collar.
   Exactly at the limit is accepted (inclusive); farther is refused. A distance written as a stop
   ("Stop 1.20." on an 88 share price) is refused as too far.
 * `long_only = true` (a family switch, default false): an OPEN or ADD on the short side HOLDs at

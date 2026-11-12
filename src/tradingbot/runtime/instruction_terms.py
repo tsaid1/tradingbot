@@ -936,9 +936,9 @@ def price_like_level(sentence: str, markers) -> bool:
 
 # Review of PR #70 (510350e). Stop words for the text-level uniqueness check of an anchored entry's
 # stop: "stop" in any hyphenated or qualified form ("stop-loss", "hard stop", "mental stop",
-# "trailing stop", "stop at"), "stoploss", "stops" and "sl". "stopped" reports a past exit and is
-# not a stop price.
-STOP_PRICE_WORDS = frozenset(("stop", "stops", "stoploss", "sl"))
+# "trailing stop", "stop at"), "stoploss", "stops", "sl" and "protective" ("protective level N").
+# "stopped" reports a past exit and is not a stop price.
+STOP_PRICE_WORDS = frozenset(("stop", "stops", "stoploss", "sl", "protective"))
 # With an unresolved mention in the same sentence only (rule b of the fix round): past forms of the
 # instruction words, close / closing / closed, and a small set of acquisition verbs.
 MENTION_ACTION_WORDS = frozenset((

@@ -187,7 +187,7 @@ def test_declared_fill_without_a_confirmed_stop_is_flagged_unprotected_and_stays
     ("quantity", "price", "reason"),
     [
         (5, "50.02", "FILL_EXCEEDS_ORDER:5>4"),
-        (4, "60", "FILL_PRICE_VIOLATES_LIMIT:60:50.50"),
+        (4, "60", "FILL_PRICE_VIOLATES_LIMIT:60:50.02"),
         (4, "50.015", "FILL_PRICE_OFF_TICK"),
         (2, "50.02", "BROKER_POSITION_CONTRADICTS_FILLED:follower_after=2,broker=4"),
     ],

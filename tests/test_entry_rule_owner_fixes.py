@@ -149,7 +149,7 @@ def test_e_a_commentary_action_repeating_the_stop_does_not_share_it(tmp_path):
 
 
 def test_f_a_held_long_is_closed_with_a_sell_under_long_only():
-    out, orders, flat = run(["We are now long $TLT at 88.40. Stop 87.20.",
+    out, orders, flat = run(["We are now long $TLT at 88.42. Stop 87.20.",
                              "Closing the rest of our $TLT long at 88.40."])
     assert [(o[0], o[1]) for o in out] == [("OPEN", "EXECUTED"), ("CLOSE", "EXECUTED")], out
     assert any(o.side.value == "SELL" and o.parent_ref is None and not o.order_ref.endswith(
@@ -158,7 +158,7 @@ def test_f_a_held_long_is_closed_with_a_sell_under_long_only():
 
 
 def test_f_a_reduction_of_one_share_holds_for_the_size_not_for_long_only():
-    out, _, _ = run(["We are now long $TLT at 88.40. Stop 87.20.",
+    out, _, _ = run(["We are now long $TLT at 88.42. Stop 87.20.",
                      "Selling half of our $TLT long at 88.40."])
     reduce = [o for o in out if o[0] == "REDUCE"]
     assert reduce and reduce[0][1] == "HOLD" and "NON_INTEGER_REDUCTION" in reduce[0][2], out

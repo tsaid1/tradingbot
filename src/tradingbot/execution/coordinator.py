@@ -2654,12 +2654,17 @@ class ExecutionCoordinator:
         band = self.policy.max_price_deviation_pct / Decimal(100)
         if abs(price - ref) / ref > band:
             return None, ["BROKER_QUOTE_OUTSIDE_COLLAR"]
-        # Snapped to the contract's tick inside the collar: a buy limit down, a sell limit up.
+        # The owner's clarification (12 November 2026): the collar above is a REJECTION boundary
+        # between the fresh executable quote and the stated entry, never the price sent. An
+        # explicit entry's limit is the publisher's stated entry price itself, snapped to the
+        # tick never past it (a buy limit down, a sell limit up): a buy whose ask is above the
+        # stated price rests at it. An anchored entry sends the gateway's limit (the fresh
+        # executable quote side inside the owner's anchor limits).
         limit = (
             fixed_limit if fixed_limit is not None
-            else snap_to_tick(ref * (1 + band), contract.min_tick, ROUND_FLOOR)
+            else snap_to_tick(ref, contract.min_tick, ROUND_FLOOR)
             if buy
-            else snap_to_tick(ref * (1 - band), contract.min_tick, ROUND_CEILING)
+            else snap_to_tick(ref, contract.min_tick, ROUND_CEILING)
         )
         if anchor_stop_distance:
             # The family stop rule at the last check, explicit and anchored alike: the held stop

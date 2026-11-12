@@ -254,7 +254,7 @@ def test_f3_reviewer_probe_spread_never_reaches_the_broker(tmp_path):
 
 # ================================================================== F4: approval governs new exposure
 
-OIL_OPEN = "We are now long $QOIL Jul 2026 at 71.50. Stop 69.80. Target 75.00."
+OIL_OPEN = "We are now long $QOIL Jul 2026 at 71.52. Stop 69.80. Target 75.00."  # at the ask
 
 
 def revoke_at(seconds, text_of=lambda: mapping_toml(approved=False)):

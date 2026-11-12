@@ -27,7 +27,13 @@ SourcePost -> PaperEventReplay.process  (gate_source, gate_action, atomic groups
   one:
   * the broker's own quote: quality `LIVE` (configurable), not stale, not crossed, positive, and
     inside the policy collar `max_price_deviation_pct` around the action's entry reference. The
-    entry is a limit order at the collar bound.
+    collar is a rejection boundary only (owner, 12 November 2026): an explicit entry or add is a
+    limit at the publisher's stated entry price itself, snapped to the tick never past it (a buy
+    limit down, a sell limit up), so a buy whose ask is above the stated price rests at it; it is
+    never lifted to the collar. An entry stated as a range reaches the action as its first entry
+    value (the lower bound of "88.38-88.42"), so the buy limit is never above the stated maximum.
+    An anchored entry sends the gateway's limit, the fresh executable quote side inside the
+    owner's anchor limits.
   * exposure caps: `MockPolicy.max_instrument_exposure_usd`, which defaults to `max_notional_usd`,
     and `max_aggregate_exposure_usd`. Per contract the larger of the ledger's and the broker's
     position counts (a broker-only position counts too), valued at quantity x the usable quote's
@@ -120,7 +126,8 @@ SourcePost -> PaperEventReplay.process  (gate_source, gate_action, atomic groups
 * **Follow-ups.**
   * ADD is a plain limit entry. Its fill is covered by resizing the existing children.
   * REDUCE and CLOSE are marketable limits: the bid (sell) or ask (buy) of a usable broker quote,
-    moved by `max_price_deviation_pct` and snapped to the contract tick inside the collar. With no usable quote nothing is
+    moved by `max_price_deviation_pct` and snapped to the contract tick inside the collar (exits
+    are unchanged by the entry-side correction of 12 November 2026). With no usable quote nothing is
     sent and `EXIT_WITHOUT_QUOTE` opens; the broker-side stop stays the protection. They are
     refused if they exceed the ledger or the broker position. Before one is sent, it is netted
     (next section).
@@ -141,8 +148,9 @@ as before: `multiplier` 1, `min_tick` 0.01, `size_increment` 1, `expiry` / `stri
 `local_symbol` None. Notional and exposure are quantity x price x multiplier. Before an order is
 built, stop and target prices must be multiples of `min_tick` (`STOP_PRICE_OFF_TICK`,
 `TARGET_PRICE_OFF_TICK`) and quantities multiples of `size_increment` (`QUANTITY_OFF_INCREMENT`).
-Those are refused, never rounded, so a protective stop is never loosened. Only collar-bounded
-limits are snapped, always inside the collar: a buy limit down, a sell limit up. Sessions, rollover,
+Those are refused, never rounded, so a protective stop is never loosened. Entry and exit limits
+are snapped, a buy limit down and a sell limit up (an entry never past its stated price, an exit
+always inside the collar). Sessions, rollover,
 margin and option chains are not implemented beyond what the multi-asset mapping states.
 `BrokerPosition.avg_cost` is per unit, before the multiplier. A future, option, CFD or spot
 commodity reaches the coordinator only through an approved version-2 mapping entry. The gateway
