@@ -54,6 +54,9 @@ from tradingbot.ibkr.errors import (
     IbkrError,
     IbkrRequestError,
     IbkrTimeout,
+    QuoteStreamClosed,
+    QuoteStreamConflict,
+    QuoteStreamLimit,
     ReadOnlyNotVerified,
     ReadOnlySettingRefused,
     ReadOnlyViolation,
@@ -73,6 +76,9 @@ from tradingbot.ibkr.models import (
     NO_SECURITY_DEFINITION,
     PRICE_TICKS,
     SIZE_TICKS,
+    TICK_CLASS_DELAYED,
+    TICK_CLASS_LIVE,
+    TICK_CLASS_MIXED,
     AccountSummary,
     AccountValue,
     ContractQuery,
@@ -84,8 +90,8 @@ from tradingbot.ibkr.models import (
     QuoteReport,
     QuoteSnapshot,
     ResolvedContract,
-    assess_quote,
     assess_quote_attempts,
+    classify_quote,
     quote_age_seconds,
 )
 from tradingbot.ibkr.redact import mask_account, redact_accounts
@@ -138,6 +144,7 @@ ALLOWED_OUT_MESSAGES = frozenset({
     OUT.CANCEL_MKT_DATA, OUT.REQ_MARKET_DATA_TYPE, OUT.REQ_CONFIG, OUT.REQ_SEC_DEF_OPT_PARAMS,
 })
 MAX_DISCOVERY_LIMIT = 1000  # upper bound on rows kept per discovery / option-chain request
+MAX_QUOTE_STREAMS = 10  # hard cap on simultaneously held-open quote streams per session
 
 
 def _denied(name: str) -> Callable[..., None]:
@@ -284,6 +291,15 @@ def _query_contract(query: ContractQuery) -> Contract:
     return c
 
 
+def _mkt_contract(contract: ResolvedContract) -> Contract:
+    """SDK ``Contract`` for a market-data request on a resolved contract."""
+    c = Contract()
+    c.conId, c.symbol, c.secType = contract.con_id, contract.symbol, contract.sec_type
+    c.currency, c.exchange = contract.currency, contract.exchange or "SMART"
+    c.primaryExchange = contract.primary_exchange
+    return c
+
+
 def _check_limit(limit: int) -> int:
     if (isinstance(limit, bool) or not isinstance(limit, int)
             or not 1 <= limit <= MAX_DISCOVERY_LIMIT):
@@ -324,6 +340,54 @@ class SessionState(str, Enum):
     CLOSING = "CLOSING"
 
 
+# Monotonic clock for the per-side stamps and ``observed_at_monotonic`` (a seam for tests only).
+_side_clock = time.monotonic
+
+
+@dataclass
+class _Side:
+    """Per-side (bid or ask) evidence of one quote request. Updated under the session lock.
+
+    Initial image: the first price tick and the first size tick of this side that carry a set
+    value. A post-image update is a later tick of the same kind whose value differs from the
+    previous one (a repeated image is not an update). Every set-value tick confirms the side
+    and moves its receipt times."""
+
+    price: float | None = None
+    size: Decimal | None = None
+    price_seen: bool = False
+    size_seen: bool = False
+    at_wall: datetime | None = None
+    at_mono: float | None = None
+    updates: int = 0
+    live: bool = False
+    delayed: bool = False
+
+    def observe(self, kind: str, value: Any, delayed: bool) -> None:
+        if value is None:  # an unset price or size says nothing about the side
+            return
+        seen = f"{kind}_seen"
+        if getattr(self, seen):
+            if value != getattr(self, kind):
+                self.updates += 1
+        else:
+            setattr(self, seen, True)
+        setattr(self, kind, value)
+        self.at_wall, self.at_mono = datetime.now(UTC), _side_clock()
+        if delayed:
+            self.delayed = True
+        else:
+            self.live = True
+
+    @property
+    def tick_class(self) -> str | None:
+        if self.live and self.delayed:
+            return TICK_CLASS_MIXED
+        if self.delayed:
+            return TICK_CLASS_DELAYED
+        return TICK_CLASS_LIVE if self.live else None
+
+
 @dataclass
 class _Pending:
     kind: str
@@ -356,6 +420,8 @@ class _Pending:
     ended_early: bool = False
     timed_out: bool = False
     request_error: str | None = None
+    sides: dict[str, _Side] = field(default_factory=lambda: {"bid": _Side(), "ask": _Side()})
+    stream: bool = False  # a held-open stream (open_quote_stream), not a bounded request
 
     def fail(self, exc: BaseException) -> None:
         if self.error is None:
@@ -451,6 +517,39 @@ class _Wrapper(EWrapper):
         self._call(self._s._on_config_response, configResponseProto)
 
 
+class QuoteStream:
+    """Handle for one held-open streaming ``reqMktData`` (see ``IbkrSession.open_quote_stream``).
+
+    ``latest()`` returns a consistent snapshot of everything received so far (built under the
+    session lock, so no tick callback interleaves). ``close()`` cancels the subscription and
+    returns the final snapshot. Once closed (by ``close``, ``disconnect``, poison or a lost
+    connection) ``latest()`` raises ``QuoteStreamClosed``; ``final`` keeps the last snapshot."""
+
+    def __init__(self, session: IbkrSession, stream_id: int, contract: ResolvedContract,
+                 requested_market_data_type: int) -> None:
+        self._session = session
+        self.stream_id = stream_id
+        self.contract = contract
+        self.requested_market_data_type = requested_market_data_type
+        self.opened_at = _now_iso()
+        self.closed_reason: str | None = None
+        self.final: QuoteSnapshot | None = None
+
+    @property
+    def closed(self) -> bool:
+        return self.closed_reason is not None
+
+    def latest(self) -> QuoteSnapshot:
+        return self._session._stream_latest(self)
+
+    def close(self) -> QuoteSnapshot:
+        return self._session.close_quote_stream(self)
+
+    def __repr__(self) -> str:
+        state = self.closed_reason or "OPEN"
+        return f"QuoteStream(id={self.stream_id}, {self.contract.symbol}, {state})"
+
+
 class IbkrSession:
     """Read-only paper session. Use as a context manager::
 
@@ -459,6 +558,7 @@ class IbkrSession:
     """
 
     sdk_version = SDK_VERSION
+    max_quote_streams = 4  # simultaneous held streams; at most MAX_QUOTE_STREAMS
 
     def __init__(self, config: PaperConnectionConfig, *, connect_timeout: float = 15.0,
                  request_timeout: float = 10.0, quote_timeout: float = 20.0,
@@ -499,6 +599,8 @@ class IbkrSession:
         self._pending: dict[int, _Pending] = {}
         self._positions: _Pending | None = None
         self._next_req_id = 9000
+        self._streams: dict[int, QuoteStream] = {}  # open held streams by reqId
+        self._stream_mdt: int | None = None  # the one market-data type the open streams use
 
         self.notices: list[tuple[int, int, str]] = []
         self.connection_events: list[tuple[int, int, str]] = []
@@ -693,7 +795,7 @@ class IbkrSession:
             if self._state is SessionState.DISCONNECTED and not self.threads_alive():
                 return
             self._state = SessionState.CLOSING
-        failures: list[str] = []
+        failures: list[str] = self._close_all_streams("SESSION_DISCONNECTED")
         reader = self._reader or self._client.reader
         try:
             if self._handshake_thread is not None and self._handshake_thread.is_alive():
@@ -896,53 +998,200 @@ class IbkrSession:
                        early: Callable[[_Pending], bool] | None = None) -> QuoteSnapshot:
         if market_data_type not in MARKET_DATA_TYPE_NAMES:
             raise ValueError("market_data_type must be 1, 2, 3 or 4")
-        c = Contract()
-        c.conId, c.symbol, c.secType = contract.con_id, contract.symbol, contract.sec_type
-        c.currency, c.exchange = contract.currency, contract.exchange or "SMART"
-        c.primaryExchange = contract.primary_exchange
+        c = _mkt_contract(contract)
 
         def send(rid: int) -> None:
+            self._check_stream_type(market_data_type)  # under the lock, before anything is sent
             self._client.reqMarketDataType(market_data_type)
             self._client.reqMktData(rid, c, "", snapshot, False, [])
 
-        def ms(t: float | None, p: _Pending) -> int | None:
-            return None if t is None else int((t - p.t0) * 1000)
-
         def build(p: _Pending) -> QuoteSnapshot:
+            return self._build_quote(p, contract, market_data_type,
+                                     route="snapshot" if snapshot else "stream",
+                                     snapshot=snapshot, window=wait)
+
+        with self._cond:  # refuse before registering anything (the type is session-wide)
+            self._check_stream_type(market_data_type)
+        return self._request(
+            "quote", send, lambda rid: self._client.cancelMktData(rid), wait,
+            cancel_always=not snapshot, build=build, soft=True, early=early)
+
+    def _check_stream_type(self, market_data_type: int) -> None:
+        """Caller holds the lock. ``reqMarketDataType`` has no reqId: it is session-wide in the
+        SDK. While held streams are open, every quote request must ask for their type."""
+        if self._streams and self._stream_mdt != market_data_type:
+            raise QuoteStreamConflict(
+                f"market data type {market_data_type} conflicts with the open quote streams' "
+                f"type {self._stream_mdt} (reqMarketDataType is session-wide)")
+
+    def _build_quote(self, p: _Pending, contract: ResolvedContract, requested: int, *,
+                     route: str, snapshot: bool, window: float) -> QuoteSnapshot:
+        """One consistent ``QuoteSnapshot`` of ``p``, built under the session lock."""
+        with self._cond:
             bid, ask, last = p.prices.get("bid"), p.prices.get("ask"), p.prices.get("last")
-            quality, flags = assess_quote(
+            b, a = p.sides["bid"], p.sides["ask"]
+            verdict = classify_quote(
                 bid=bid, ask=ask, last=last, market_data_type=p.market_data_type,
                 delayed_ticks_seen=p.delayed_ticks, live_ticks_seen=p.live_ticks,
-                unavailable_code=p.unavailable_code)
+                bid_updates=b.updates, ask_updates=a.updates, notices=tuple(p.notices),
+                unavailable_code=p.unavailable_code,
+                stream_failed=p.stream and p.error is not None)
+            flags = verdict.flags
             end_missing = snapshot and not p.ended
             received = datetime.now(UTC)
+            mono = _side_clock()
             age = quote_age_seconds(received, p.last_trade_epoch)
             if age is None:
                 flags = (*flags, "QUOTE_AGE_UNKNOWN")
             if end_missing:
                 flags = (*flags, "SNAPSHOT_END_MISSING")
-            if p.request_error:
+            request_error = p.request_error
+            if p.stream and p.error is not None:
+                request_error = redact_accounts(str(p.error))
+            if request_error:
                 flags = (*flags, "REQUEST_ERROR")
+
+            def ms(t: float | None) -> int | None:
+                return None if t is None else int((t - p.t0) * 1000)
+
+            def iso(t: datetime | None) -> str | None:
+                return None if t is None else t.isoformat(timespec="milliseconds")
+
             return QuoteSnapshot(
                 con_id=contract.con_id, symbol=contract.symbol, bid=bid,
                 bid_size=p.sizes.get("bid"), ask=ask, ask_size=p.sizes.get("ask"), last=last,
                 last_size=p.sizes.get("last"), market_data_type=p.market_data_type,
                 market_data_type_name=MARKET_DATA_TYPE_NAMES.get(p.market_data_type, "UNREPORTED"),
-                requested_market_data_type=market_data_type,
+                requested_market_data_type=requested,
                 received_at=received.isoformat(timespec="milliseconds"),
-                last_trade_time=p.last_trade_time, quality=quality, flags=flags,
+                last_trade_time=p.last_trade_time, quality=verdict.quality, flags=flags,
                 notices=tuple(p.notices), unavailable_code=p.unavailable_code,
-                route="snapshot" if snapshot else "stream", close=p.close,
-                snapshot_end_missing=end_missing, waited_ms=int((time.monotonic() - p.t0) * 1000),
-                tick_counts=dict(p.tick_counts), market_data_types_delivered=tuple(p.mdt_values),
-                tick_req_params=p.tick_req_params, request_events=tuple(p.events),
-                request_error=p.request_error, first_tick_ms=ms(p.first_tick, p),
-                last_tick_ms=ms(p.last_tick, p), quote_age_seconds=age,
-                ended_early=p.ended_early, window_ms=int(wait * 1000))
+                route=route, close=p.close, snapshot_end_missing=end_missing,
+                waited_ms=int((time.monotonic() - p.t0) * 1000), tick_counts=dict(p.tick_counts),
+                market_data_types_delivered=tuple(p.mdt_values),
+                tick_req_params=dict(p.tick_req_params) if p.tick_req_params else None,
+                request_events=tuple(p.events), request_error=request_error,
+                first_tick_ms=ms(p.first_tick), last_tick_ms=ms(p.last_tick),
+                quote_age_seconds=age, ended_early=p.ended_early, window_ms=int(window * 1000),
+                bid_at=iso(b.at_wall), ask_at=iso(a.at_wall), bid_at_monotonic=b.at_mono,
+                ask_at_monotonic=a.at_mono, bid_updates=b.updates, ask_updates=a.updates,
+                bid_tick_class=b.tick_class, ask_tick_class=a.tick_class,
+                quality_reason=verdict.reason, observed_at_monotonic=mono)
 
-        return self._request(
-            "quote", send, lambda rid: self._client.cancelMktData(rid), wait,
-            cancel_always=not snapshot, build=build, soft=True, early=early)
+    # ------------------------------------------------------------------ held-open quote streams
+    def open_quote_stream(self, contract: ResolvedContract, *,
+                          market_data_type: int = 3) -> QuoteStream:
+        """Open a streaming ``reqMktData`` (``snapshot=False``) for one resolved contract and keep
+        it open until ``close_quote_stream`` / ``QuoteStream.close``, ``disconnect``, poison or
+        connection loss (each of which cancels it). Sends exactly what a bounded sample sends:
+        ``reqMarketDataType(market_data_type)`` then ``reqMktData``.
+
+        Refused (nothing sent) when the session is not READY, when ``max_quote_streams`` streams
+        are open (``QuoteStreamLimit``), or when open streams use another market-data type
+        (``QuoteStreamConflict``: the SDK's ``reqMarketDataType`` is session-wide, so one type
+        per session at a time)."""
+        if market_data_type not in MARKET_DATA_TYPE_NAMES:
+            raise ValueError("market_data_type must be 1, 2, 3 or 4")
+        cap = self.max_quote_streams
+        if isinstance(cap, bool) or not isinstance(cap, int) or not 1 <= cap <= MAX_QUOTE_STREAMS:
+            raise ValueError(f"max_quote_streams must be an int in 1..{MAX_QUOTE_STREAMS}")
+        c = _mkt_contract(contract)
+        primary: BaseException | None = None
+        with self._cond:
+            self._require_ready()
+            if len(self._streams) >= cap:
+                raise QuoteStreamLimit(f"{len(self._streams)} quote streams already open "
+                                       f"(limit {cap})")
+            self._check_stream_type(market_data_type)
+            self._next_req_id += 1
+            p = _Pending("quote", self._next_req_id, stream=True)
+            p.t0 = time.monotonic()
+            handle = QuoteStream(self, p.req_id, contract, market_data_type)
+            self._pending[p.req_id] = p
+            self._streams[p.req_id] = handle
+            self._stream_mdt = market_data_type
+            try:  # sent under the lock: no poison/loss callback can interleave
+                self._client.reqMarketDataType(market_data_type)
+                self._client.reqMktData(p.req_id, c, "", False, False, [])
+            except BaseException as exc:  # noqa: BLE001 - cancel below, then re-raise
+                primary = exc
+            if primary is None and p.error is not None:
+                primary = p.error  # reported synchronously by the SDK during the send
+        if primary is None:
+            return handle
+        failures: list[str] = []
+        try:
+            self._detach_stream(handle, "OPEN_FAILED")
+            failures = self._cancel("quote_stream", p.req_id,
+                                    lambda rid: self._client.cancelMktData(rid))
+        finally:
+            if failures:
+                self.cleanup_failures.extend(failures)
+                primary.add_note("cleanup also failed: " + "; ".join(failures))
+        raise primary
+
+    def quote_streams(self) -> tuple[QuoteStream, ...]:
+        """The currently open held streams."""
+        with self._cond:
+            return tuple(self._streams.values())
+
+    def _stream_latest(self, handle: QuoteStream) -> QuoteSnapshot:
+        with self._cond:
+            if handle.closed:
+                raise QuoteStreamClosed(f"quote stream {handle.stream_id} is closed "
+                                        f"({handle.closed_reason})")
+            p = self._pending.get(handle.stream_id)
+            if p is None or self._streams.get(handle.stream_id) is not handle:
+                raise QuoteStreamClosed(f"quote stream {handle.stream_id} is not open")
+            return self._build_quote(p, handle.contract, handle.requested_market_data_type,
+                                     route="held_stream", snapshot=False, window=0.0)
+
+    def _detach_stream(self, handle: QuoteStream, reason: str) -> bool:
+        """Mark closed, keep the final snapshot, unregister. False if it was already closed."""
+        with self._cond:
+            if handle.closed:
+                return False
+            p = self._pending.get(handle.stream_id)
+            if p is not None:
+                handle.final = self._build_quote(
+                    p, handle.contract, handle.requested_market_data_type, route="held_stream",
+                    snapshot=False, window=0.0)
+            handle.closed_reason = reason
+            self._pending.pop(handle.stream_id, None)
+            self._streams.pop(handle.stream_id, None)
+            if not self._streams:
+                self._stream_mdt = None
+            return True
+
+    def close_quote_stream(self, handle: QuoteStream) -> QuoteSnapshot:
+        """Cancel one held stream (``cancelMktData``) and return its final snapshot. Idempotent:
+        closing a closed stream returns its final snapshot and sends nothing. A failed cancel is
+        recorded in ``cleanup_failures`` and raises ``CleanupError`` (``result`` = the final
+        snapshot), never reported as success."""
+        if handle._session is not self:
+            raise SessionStateError("quote stream belongs to another session")
+        if not self._detach_stream(handle, "CLOSED"):
+            if handle.final is None:
+                raise QuoteStreamClosed(f"quote stream {handle.stream_id} was never opened")
+            return handle.final
+        failures = self._cancel("quote_stream", handle.stream_id,
+                                lambda rid: self._client.cancelMktData(rid))
+        if failures:
+            self.cleanup_failures.extend(failures)
+            raise CleanupError("quote stream cleanup failed", failures=failures,
+                               result=handle.final)
+        return handle.final
+
+    def _close_all_streams(self, reason: str) -> list[str]:
+        """Detach and cancel every open stream; returns the cancel failures (not recorded)."""
+        with self._cond:
+            handles = list(self._streams.values())
+        failures: list[str] = []
+        for h in handles:
+            if self._detach_stream(h, reason):
+                failures += self._cancel("quote_stream", h.stream_id,
+                                         lambda rid: self._client.cancelMktData(rid))
+        return failures
 
     # ------------------------------------------------------------------ request machinery
     def _require_ready(self, gate: bool = False) -> None:
@@ -1098,6 +1347,11 @@ class IbkrSession:
                 self._poisoned = exc
             self._fail_all(exc)
             self._cond.notify_all()
+        # The poison is set, so nothing new can be sent; cancel the held streams while the
+        # transport is still open, then close it.
+        failures = self._close_all_streams("SESSION_POISONED")
+        if failures:
+            self.cleanup_failures.extend(failures)
         self._close_transport()
 
     def _lost(self, reason: str) -> None:
@@ -1110,6 +1364,10 @@ class IbkrSession:
             if self._state is SessionState.CONNECTING and self._connect_failure is None:
                 self._connect_failure = exc
             self._fail_all(exc)
+            for h in list(self._streams.values()):  # TWS drops them; a cancel cannot be sent
+                if self._detach_stream(h, "CONNECTION_LOST"):
+                    self.cleanup_failures.append(
+                        f"quote_stream (reqId {h.stream_id}): cancel not sent, connection is down")
             self._cond.notify_all()
 
     # ------------------------------------------------------------------ callbacks (SDK threads)
@@ -1327,6 +1585,8 @@ class IbkrSession:
             name, delayed = mapped
             p.prices[name] = value
             p.live_ticks |= not delayed
+            if name in p.sides:
+                p.sides[name].observe("price", value, delayed)
 
     def _on_tick_size(self, req_id: int, tick_type: int, size) -> None:
         with self._cond:
@@ -1336,7 +1596,10 @@ class IbkrSession:
             self._count_tick(p, tick_type)
             mapped = SIZE_TICKS.get(int(tick_type))
             if mapped is not None:
-                p.sizes[mapped[0]] = None if size == UNSET_DECIMAL else Decimal(size)
+                value = None if size == UNSET_DECIMAL else Decimal(size)
+                p.sizes[mapped[0]] = value
+                if mapped[0] in p.sides:
+                    p.sides[mapped[0]].observe("size", value, mapped[1])
 
     def _on_tick_string(self, req_id: int, tick_type: int, value: str) -> None:
         with self._cond:
