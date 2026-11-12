@@ -62,6 +62,9 @@ FUTURES_CODE_RE = re.compile(r"^([A-Z]{1,4})([FGHJKMNQUVXZ])(\d{1,2})$")
 MONTH_LETTERS = "FGHJKMNQUVXZ"  # January..December
 DERIVATIVES = frozenset({AssetClass.OPTION, AssetClass.FUTURE})
 CASH_INSTRUMENTS = frozenset({AssetClass.EQUITY, AssetClass.ETF})
+# Undated instruments (multi-asset mapping): spot commodities, CFDs and reference indexes carry no
+# expiry, strike or underlying; an index is a reference series only and is never orderable.
+UNDATED_INSTRUMENTS = frozenset({AssetClass.COMMODITY, AssetClass.CFD, AssetClass.INDEX})
 
 
 # ----------------------------------------------------------------------------- input records
@@ -484,6 +487,17 @@ def _contract_rules(r: MappingRecord, c: _Collector) -> None:
                   "asset class.", "instrument")
         return
 
+    if cls in UNDATED_INSTRUMENTS:
+        if inst.exchange is None:
+            c.add("LISTING_VENUE_UNSPECIFIED", FindingKind.AMBIGUOUS,
+                  "The venue is part of the instrument's identity and is not stated.",
+                  "instrument.exchange")
+        if cls == AssetClass.INDEX:
+            c.add("INDEX_NOT_ORDERABLE", FindingKind.UNSUPPORTED,
+                  "An index is a reference series: it can be quoted and used in a broker-side "
+                  "condition, never ordered.", "instrument.asset_class")
+        return
+
     if inst.underlying is None:
         c.add("UNDERLYING_MISSING", FindingKind.MISSING, f"{cls.value} states no underlying.",
               "instrument.underlying")
@@ -585,7 +599,7 @@ def _runtime_rules(r: MappingRecord, c: _Collector) -> RuntimeScope:
     inst = r.instrument
     if inst is None:
         return RuntimeScope.UNDETERMINED
-    if inst.asset_class in DERIVATIVES:
+    if inst.asset_class in DERIVATIVES | UNDATED_INSTRUMENTS:
         c.add("RUNTIME_ASSET_CLASS_UNSUPPORTED", FindingKind.UNSUPPORTED,
               f"{inst.asset_class.value} cannot be acted on by the current paper adapter: the gateway holds it as "
               "ASSET_CLASS_PAPER_ADAPTER_UNSUPPORTED however complete the contract metadata is.",
@@ -645,7 +659,7 @@ def load_records(path: Path) -> list[MappingRecord]:
     if isinstance(payload, dict):
         payload = payload.get("records")
     if not isinstance(payload, list):
-        raise ValueError(f"{path}: expected a JSON list of records or an object with a 'records' list")
+        raise ValueError(f"{path}: expected a JSON list of records or an object with a 'records' list")  # noqa: TRY004
     try:
         return [MappingRecord.model_validate(item) for item in payload]
     except Exception as exc:  # pydantic.ValidationError, kept generic so the CLI can report it

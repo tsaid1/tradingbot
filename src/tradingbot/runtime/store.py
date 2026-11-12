@@ -221,6 +221,9 @@ class RuntimeStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.tx() as c:
             c.executescript(SCHEMA)
+            cols = {r["name"] for r in c.execute("PRAGMA table_info(signal_actions)")}
+            if "mapping_family" not in cols:  # multi-asset mapping: the family the action fell in
+                c.execute("ALTER TABLE signal_actions ADD COLUMN mapping_family TEXT")
 
     @contextmanager
     def tx(self) -> Iterator[sqlite3.Connection]:

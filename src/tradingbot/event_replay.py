@@ -276,7 +276,7 @@ class PaperEventReplay:
         """Ask the gateway; on APPROVE apply a fictional fill to the staged ledger."""
         idea = ideas.get(a.idea_reference) if a.idea_reference else None
         position = idea.as_position() if idea is not None else None
-        quote = quotes.get(a.instrument.symbol) if a.instrument is not None else None
+        quote = quotes.get(a.instrument.quote_key) if a.instrument is not None else None
         gate = gate_action(a, source.published_at, quote, self.policy, position, now=now,
                            supported_actions=ALL_ACTIONS)
         if gate.status != "APPROVE":

@@ -21,12 +21,19 @@ from pydantic import Field
 from tradingbot.execution.broker import (
     Broker,
     BrokerError,
+    ConditionDirection,
     OrderSide,
     OrderStatus,
     OrderType,
     QuoteQuality,
+    reference_quote,
 )
-from tradingbot.execution.store import UNRESOLVED_STATES, ExecutionStore, Role
+from tradingbot.execution.store import (
+    PROTECTIVE_ROLES,
+    UNRESOLVED_STATES,
+    ExecutionStore,
+    Role,
+)
 from tradingbot.models import Instrument, PositionSide, StrictModel
 
 
@@ -96,6 +103,42 @@ class ReconciliationReport(StrictModel):
     @property
     def clean(self) -> bool:
         return not self.blocking
+
+
+def _reference_stop_problem(stop, p, quote) -> tuple[DiscrepancyKind | None, str]:
+    """A REFERENCE_TRIGGER stop: a conditional exit in the idea's contract, held on the ledger's
+    reference series, in the protective direction, at the ledger's level (multi-asset mapping)."""
+    long = p.position_side == PositionSide.LONG
+    c = stop.condition
+    if c is None:
+        return DiscrepancyKind.PROTECTIVE_STOP_INVALID, "reference stop carries no price condition"
+    if stop.side != (OrderSide.SELL if long else OrderSide.BUY):
+        return DiscrepancyKind.PROTECTIVE_STOP_INVALID, (
+            f"stop side {stop.side.value} would add to a {p.position_side.value} position"
+        )
+    if p.contract_key and stop.contract.contract_key != p.contract_key:
+        return DiscrepancyKind.PROTECTIVE_STOP_INVALID, "conditional exit is in another contract"
+    if c.contract.contract_key != p.reference_key:
+        return DiscrepancyKind.PROTECTIVE_STOP_INVALID, (
+            f"condition is on {c.contract.contract_key}, not the reference {p.reference_key}"
+        )
+    want = ConditionDirection.BELOW if long else ConditionDirection.ABOVE
+    if c.direction != want:
+        return DiscrepancyKind.PROTECTIVE_STOP_INVALID, f"condition direction {c.direction.value}"
+    ledger = Decimal(p.stop_price) if p.stop_price else None
+    if ledger is None or c.trigger_price != ledger:
+        return DiscrepancyKind.STOP_PRICE_MISMATCH, (
+            f"condition trigger {c.trigger_price} differs from the ledger's stop {ledger}"
+        )
+    if quote is not None and quote.quality != QuoteQuality.UNAVAILABLE:
+        last = quote.last
+        if last is None and quote.bid is not None and quote.ask is not None:
+            last = (quote.bid + quote.ask) / 2
+        if last is not None and not (last > ledger if long else last < ledger):
+            return DiscrepancyKind.PROTECTIVE_STOP_INVALID, (
+                f"reference {last} is already through the stop condition {ledger}"
+            )
+    return None, ""
 
 
 def _stop_problem(stop, p, quote) -> tuple[DiscrepancyKind | None, str]:
@@ -221,17 +264,46 @@ def reconcile(
             )
             continue
         stop = open_by_ref.get(p.stop_ref) if p.stop_ref else None
-        if stop is not None and stop.working:
+        if stop is not None and stop.working and p.protection_series == "REFERENCE":
+            ref_quote = (
+                reference_quote(broker, stop.condition.contract, now) if stop.condition else None
+            )
+            kind, problem = _reference_stop_problem(stop, p, ref_quote)
+        elif stop is not None and stop.working:
             kind, problem = _stop_problem(stop, p, _quote(broker, stop.contract))
-            if kind is not None:
+        else:
+            kind = None
+        if kind is not None:
+            out.append(
+                Discrepancy(
+                    kind=kind,
+                    symbol=p.symbol,
+                    contract_key=p.contract_key,
+                    idea_id=p.idea_id,
+                    order_ref=p.stop_ref,
+                    detail=problem,
+                )
+            )
+        if p.backstop_ref:
+            b = open_by_ref.get(p.backstop_ref)
+            ok = (
+                b is not None and b.working and b.status != OrderStatus.PENDING_CANCEL
+                and b.order_type == OrderType.STP and b.remaining == cover[p.idea_id]
+                and b.stop_price == Decimal(p.backstop_price or "0")
+            )
+            if not ok:
                 out.append(
                     Discrepancy(
-                        kind=kind,
+                        kind=DiscrepancyKind.POSITION_WITHOUT_PROTECTIVE_STOP,
                         symbol=p.symbol,
                         contract_key=p.contract_key,
                         idea_id=p.idea_id,
-                        order_ref=p.stop_ref,
-                        detail=problem,
+                        order_ref=p.backstop_ref,
+                        detail=(
+                            f"required backstop STP {p.backstop_price} x{cover[p.idea_id]} not "
+                            f"working ({b.status.value if b else 'absent'})"
+                        ),
+                        explained_by=covering("UNPROTECTED_POSITION", p.idea_id),
                     )
                 )
         # A PreSubmitted stop counts only once its parent's own fills are applied (never inferred).
@@ -276,7 +348,7 @@ def reconcile(
             )
             continue
         pos = positions.get(row.idea_id)
-        if row.role in (Role.STOP, Role.TARGET):
+        if row.role in PROTECTIVE_ROLES:
             flat = pos is None or (pos.quantity == 0 and pos.status != "PENDING")
             if flat:
                 out.append(
