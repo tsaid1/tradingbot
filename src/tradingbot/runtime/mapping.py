@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import Field, ValidationError, field_validator, model_validator
+from pydantic import Field, StrictBool, ValidationError, field_validator, model_validator
 
 from tradingbot.event_models import ParsedPost, TradeAction
 from tradingbot.execution.broker import ContractRef
@@ -287,13 +287,15 @@ class FamilyMapping(StrictModel):
     """One source asset family (version 2). See docs/MULTI_ASSET_MAPPING.md."""
     family: str = Field(pattern=r"^[A-Z][A-Z0-9]{0,9}(\.OPT)?$")
     basis: BasisTreatment
-    approved: bool = False
+    # The TOML boolean true only: "yes", 1 or "true" refuse to load (review F11). An approval also
+    # names its approver and a timezone-aware time that is not in the future.
+    approved: StrictBool = False
     approved_by: str | None = None
-    approved_at: datetime | None = None
+    approved_at: datetime | None = Field(default=None, strict=True)
     note: str = ""
     # DIRECT only: the reference and execution identities differ but are one price series (for
     # example one ETF listed on two venues). Needs a stated reason.
-    same_series: bool = False
+    same_series: StrictBool = False
     same_series_reason: str = ""
     reference: SeriesSpec | None = None
     execution: ExecutionSpec | None = None
@@ -310,8 +312,12 @@ class FamilyMapping(StrictModel):
         def bad(msg: str):
             raise ValueError(f"family {self.family}: {msg}")
 
-        if self.approved and (not self.approved_by or self.approved_at is None):
+        if self.approved and (not (self.approved_by or "").strip() or self.approved_at is None):
             bad("an approved entry states approved_by and approved_at")
+        if self.approved_at is not None and (
+            self.approved_at.tzinfo is None or self.approved_at > datetime.now(UTC)
+        ):
+            bad("approved_at must be a past date-time with its UTC offset")
         if not self.approved and (self.approved_by or self.approved_at):
             bad("approved_by / approved_at are set but approved = false")
         if self.basis == "UNSUPPORTED":

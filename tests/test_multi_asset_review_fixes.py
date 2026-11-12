@@ -655,3 +655,36 @@ def test_f10_legal_pairs_still_load(tmp_path):
         'sec_type = "CFD", symbol = "QMC", exchange = "X", currency = "USD"',
         'basis_shift = { max_abs_basis = "20", max_age_seconds = 5, scale_ratio = "1" }\n'))
     assert ok.entries["QMTL"].basis_shift.scale_ratio == 1
+
+
+TLT_REF = 'sec_type = "STK", asset_class = "ETF", symbol = "TLT", exchange = "SMART", currency = "USD"'
+
+
+def tlt_entry(approval):
+    return (f'version = 2\n[[mapping]]\nfamily = "TLT"\nbasis = "DIRECT"\n{approval}\n'
+            f"reference = {{ {TLT_REF} }}\nexecution = {{ {TLT_REF} }}\n")
+
+
+@pytest.mark.parametrize("approval", [
+    # Reviewer probes: a string and an integer loaded as approved.
+    'approved = "yes"\napproved_by = "o"\napproved_at = 2026-01-01T00:00:00Z',
+    'approved = 1\napproved_by = "o"\napproved_at = 2026-01-01T00:00:00Z',
+    'approved = "true"\napproved_by = "o"\napproved_at = 2026-01-01T00:00:00Z',
+    'approved = true\napproved_by = ""\napproved_at = 2026-01-01T00:00:00Z',
+    'approved = true\napproved_by = "   "\napproved_at = 2026-01-01T00:00:00Z',
+    'approved = true\napproved_by = "o"\napproved_at = "2026-01-01T00:00:00Z"',
+    'approved = true\napproved_by = "o"\napproved_at = 2026-01-01',
+    'approved = true\napproved_by = "o"\napproved_at = 2026-01-01T00:00:00',  # no offset
+    'approved = true\napproved_by = "o"\napproved_at = 2999-01-01T00:00:00Z',  # in the future
+    'approved = true\napproved_by = "o"',
+])
+def test_f11_an_approval_must_be_a_toml_boolean_with_an_approver_and_a_time(tmp_path, approval):
+    with pytest.raises(ValueError):
+        load(tmp_path, tlt_entry(approval))
+
+
+def test_f11_a_proper_approval_loads(tmp_path):
+    p = load(tmp_path, tlt_entry('approved = true\napproved_by = "o"\n'
+                                 'approved_at = 2026-01-01T00:00:00Z'))
+    assert p.executable_assets == ["TLT"]
+    assert load(tmp_path, tlt_entry("approved = false")).executable_assets == []
