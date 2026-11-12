@@ -102,7 +102,8 @@ def fast_session(cfg, cls=IbkrSession, preflight=stub_preflight, cap=None):
 
 class Shadow:
     def __init__(self, folder: Path, server: FakeTws, mono: Mono, posts=(), *, factory=None,
-                 restart: bool = False, clock: SimClock | None = None):
+                 restart: bool = False, clock: SimClock | None = None,
+                 interpreter: dict | None = None, allow_candidate_lexicon: bool = False):
         """``restart``: a new process on the same files (posts, state, private config)."""
         self.folder, self.tws, self.mono = folder, server, mono
         self.clock = clock or SimClock(START)
@@ -120,13 +121,16 @@ class Shadow:
             "shadow": {"paper_config": str(folder / "private" / "paper.toml") if restart
                        else str(paper_config_file(folder))},
         }
+        if interpreter:
+            raw["interpreter"] = dict(interpreter)
         self.raw = raw
         self.config = parse_config(raw, base=folder)
         if not restart:
             OperatorQueue.initialise(self.config.operator_db)
         self.notifier = RecordingNotifier()
         self.service = build_service(self.config, clock=self.clock.now, notifier=self.notifier,
-                                     session_factory=factory or fast_session)
+                                     session_factory=factory or fast_session,
+                                     allow_candidate_lexicon=allow_candidate_lexicon)
         self.broker: ShadowBroker = self.service.broker
 
     @property

@@ -161,3 +161,14 @@ def test_with_the_sdk_blocked_shadow_mode_refuses_to_start_cleanly(tmp_path):
             print("refused")
     """, tmp_path)
     assert r.returncode == 0 and r.stdout.strip() == "refused", r.stderr
+
+
+def test_the_candidate_lexicon_opt_in_is_refused_in_shadow_mode_before_anything_starts(tmp_path):
+    """PR #68: an experimental vocabulary runs only in an offline replay on a throwaway state
+    directory. A shadow run reads a real broker session: refused, also with a replay source."""
+    from tradingbot.runtime.app import build_service
+    cfg = parse_config(_runtime_raw(tmp_path, "shadow"), base=tmp_path)
+    assert cfg.source.kind == "replay"
+    with pytest.raises(ConfigError, match="candidate lexicon may not run in shadow mode"):
+        build_service(cfg, allow_candidate_lexicon=True)
+    assert not cfg.paths.state_dir.exists()  # refused before the state directory was touched

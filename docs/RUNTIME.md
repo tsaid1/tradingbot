@@ -351,7 +351,7 @@ proposals, validated by the same loader, to a separate file (`<lexicon>.candidat
 the decisions file or the review log. The service refuses to start with a
 candidate as its `lexicon_path`; only an offline replay may load one, explicitly:
 `scripts/run_service.py --config <replay.toml> --source replay:<posts.jsonl>
---allow-candidate-lexicon` (refused with any live source). The candidate replay needs a **new
+--allow-candidate-lexicon` (refused with any live source, and in shadow mode whatever the source). The candidate replay needs a **new
 state directory** (no heartbeat, no journaled event or signal) or one an earlier candidate run
 marked (`CANDIDATE_RUN`); it marks it, and a production run on a marked directory is refused, so
 experimental holds and trades never enter production's journal. Production eligibility therefore

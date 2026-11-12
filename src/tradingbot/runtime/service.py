@@ -152,6 +152,9 @@ ADOPTED_EVENTS = frozenset(
      "ENTRY_STATE_UNKNOWN", "ENTRY_REMAINDER_CANCELLED", "PROTECTIVE_CANCELLED", LEDGER_REVERSAL,
      "UNPROTECTED_POSITION"}
 )
+SHADOW_CANDIDATE_REFUSED = ("a candidate lexicon may not run in shadow mode: an experimental "
+                            "vocabulary runs only in an offline mock replay on a throwaway state "
+                            "directory, and a shadow run reads a real broker session")
 # Bounds the arithmetic only; max_backoff_seconds still bounds the wait itself.
 MAX_BACKOFF_EXPONENT = 32
 FAILURE_KIND = {
@@ -325,6 +328,10 @@ class RuntimeService:
         if allow_what_if_mapping and not isinstance(source, ReplayFileSource):
             # A what-if mapping is an offline analysis aid: never with a live source.
             raise ValueError("a what-if mapping may only be used with a replay-file source")
+        if allow_candidate_lexicon and config.mode == "shadow":
+            # An experimental vocabulary runs only in an offline replay on a throwaway state
+            # directory; a shadow run reads a real (read-only) broker session.
+            raise ConfigError(SHADOW_CANDIDATE_REFUSED)
         if allow_candidate_lexicon and not isinstance(source, ReplayFileSource):
             # A candidate lexicon is an experiment: never with a live source.
             raise ConfigError("a candidate lexicon may only be used with a replay-file source")

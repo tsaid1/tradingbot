@@ -16,7 +16,7 @@ from tradingbot.models import AssetClass, Instrument
 from tradingbot.runtime.config import ConfigError, ReplaySourceConfig, RuntimeConfig
 from tradingbot.runtime.mapping import FamilyMapping, MappingPolicy
 from tradingbot.runtime.notify import ChannelContext, Notifier, build_channels
-from tradingbot.runtime.service import RuntimeService
+from tradingbot.runtime.service import SHADOW_CANDIDATE_REFUSED, RuntimeService
 from tradingbot.runtime.sources import (
     FileTokenStore,
     HttpTransport,
@@ -131,6 +131,8 @@ def build_service(
     paper config; whatever it returns must be exactly an ``IbkrSession`` or the start is refused."""
     if config.mode not in ("mock", "shadow"):
         raise ConfigError("only mock mode or shadow mode may run")
+    if allow_candidate_lexicon and config.mode == "shadow":  # refused before any session opens
+        raise ConfigError(SHADOW_CANDIDATE_REFUSED)
     config.paths.state_dir.mkdir(parents=True, exist_ok=True)
     if config.interpreter.lexicon_path is not None and not config.interpreter.lexicon_path.exists():
         raise ConfigError("interpreter.lexicon_path is set but the file does not exist")
