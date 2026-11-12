@@ -154,6 +154,7 @@ def test_the_final_table_names_each_list_family_and_effect(monkeypatch, local, h
     pid = ids(log, lex)
     at = page(monkeypatch, cfg)
     at.radio(key=f"vr_verdict_{pid['zorbly']}").set_value(V.ACCEPT).run()
+    at.selectbox(key=f"vr_group_{pid['bonds']}").set_value(V.MARKET_NAME).run()  # was ambiguous
     at.radio(key=f"vr_verdict_{pid['bonds']}").set_value(V.ACCEPT).run()
     at.radio(key=f"vr_verdict_{pid['quentin']}").set_value(V.KEEP_HOLDING).run()
     [table] = at.dataframe
@@ -173,6 +174,7 @@ def test_the_batch_is_applied_in_one_action_and_undone(monkeypatch, local, held)
     at = page(monkeypatch, cfg)
     at.radio(key=f"vr_verdict_{pid['zorbly']}").set_value(V.ACCEPT).run()
     at.text_input(key=f"vr_meaning_{pid['zorbly']}").input("invented filler word").run()
+    at.selectbox(key=f"vr_group_{pid['quentin']}").set_value(V.NON_MARKET).run()  # was ambiguous
     at.radio(key=f"vr_verdict_{pid['quentin']}").set_value(V.ACCEPT).run()
     at.radio(key=f"vr_verdict_{pid['bonds']}").set_value(V.KEEP_HOLDING).run()
     at.button(key="vr_apply").click().run()
