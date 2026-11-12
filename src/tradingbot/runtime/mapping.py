@@ -51,6 +51,7 @@ from tradingbot.models import (
 )
 from tradingbot.runtime.instruction_terms import (
     InstructionTerms,
+    code_shaped,
     extract_terms,
     leftover_tokens,
     post_multi_leg,
@@ -586,7 +587,7 @@ class FamilyMapping(StrictModel):
             named.add(f"{year}{month:02d}")
         codes = {t for t, _, _, _ in terms.month_codes}
         unread += [w for w in terms.upper_words
-                   if w.startswith(x.symbol) and w != x.symbol and w not in codes]
+                   if code_shaped(w, x.symbol) and w not in codes]
         if unread:
             return None, [CONTRACT_MONTH_UNRECOGNISED, *(f"MONTH_TOKEN:{t}" for t in unread)]
         for n in terms.bare_months:

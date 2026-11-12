@@ -56,7 +56,10 @@ after removing the recognised month forms and the numbers the interpreter alread
 action (its entry, stop and target, and a reduction percentage), any token still left that carries
 a digit (a percentage, a date, a time, a count, a second price, `09/26`, `U 26`), any month name, or
 any token shaped like a contract code for the family's roots in any case (`qifu6`, `QIFU`) HOLDs
-with `CONTRACT_MONTH_UNRECOGNISED`. `EXPLICIT_OR_NEAREST` uses the nearest month only for a clause
+with `CONTRACT_MONTH_UNRECOGNISED`. Shaped like a code means the root followed by a month code, a
+month name or a digit; an ordinary word that merely starts with the root's letters ("stop" for a
+root `STO`) is not one. The number in an index's own name ("S&P 500", "Nasdaq 100", "Russell 2000")
+is part of the market's name and is skipped, like a recognised month. `EXPLICIT_OR_NEAREST` uses the nearest month only for a clause
 with no such leftover token at all. A follow-up on an open idea uses the idea's own contract. "May" and "march" count as months only in one of the forms
 above. A month name with a two-digit number is read as a year: "Dec 18" is December 2018.
 

@@ -57,6 +57,28 @@ CONTRACT_CODE_RE = re.compile(
 # the policy could not read.
 UPPER_WORD_RE = re.compile(r"(?<![\w$])[A-Z][A-Z0-9]{1,7}(?!\w)")
 MONTH_CONTRACT_RE = re.compile(rf"\b{_MON}\s+(?:futures?\s+)?contract\b", re.IGNORECASE)
+# An equity index whose own name carries a number ("S&P 500", "Nasdaq 100", "Russell 2000"): the
+# number is part of the market's name, never a contract term, a level or a count.
+INDEX_NAME_RE = re.compile(
+    r"(?<![\w$])(?:s&p|nasdaq|russell|dow(?:\s+jones)?|ftse|nikkei|dax|(?:euro\s+)?stoxx|cac|asx)"
+    r"\s?-?\s?(?:500|400|600|100|1000|2000|30|225|40|50|200)(?![\d.,]\d|\d)",
+    re.IGNORECASE,
+)
+# What may follow a root in a contract code: a month code with an optional year (QIFU, QIFU6), a
+# month name (QIFDEC), or anything that carries a digit (QIFX7Z).
+_CODE_TAIL_RE = re.compile(
+    r"[FGHJKMNQUVXZ]\d{0,2}|\w*\d\w*|(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\w*"
+)
+
+
+def code_shaped(word: str, root: str) -> bool:
+    """Is the upper-case ``word`` a contract code of ``root`` that the policy could not read? Only a
+    root followed by a month code, a month name or a digit is: an ordinary word that merely starts
+    with the root's letters ("CLOSE" for a root CL, "STOP" for STO) is not."""
+    return (
+        bool(root) and word.startswith(root) and word != root
+        and _CODE_TAIL_RE.fullmatch(word[len(root):]) is not None
+    )
 ISO_DATE_RE = re.compile(r"(?<![\d-])(?P<y>20\d{2})-(?P<m>\d{2})-(?P<d>\d{2})(?![\d-])")
 STRIKE_RIGHT_RE = re.compile(
     r"(?<![\w.$-])\$?(?P<strike>\d+(?:\.\d+)?)\s*(?:strike\s+)?(?P<right>call|put)s?\b",
@@ -122,6 +144,8 @@ class InstructionTerms:
     # month code, "the Sep contract", an ISO date): the leftover-token rule skips those.
     clause: str = ""
     month_spans: list[tuple[int, int]] = field(default_factory=list)
+    # Spans naming an index whose name carries a number ("S&P 500"): skipped by that rule too.
+    name_spans: list[tuple[int, int]] = field(default_factory=list)
 
     @property
     def names_a_month(self) -> bool:
@@ -169,6 +193,7 @@ def extract_terms(clause: str | None) -> InstructionTerms:
         out.month_spans.append(m.span())
         out.month_codes.append(
             (m.group(0), m.group("root"), _CODE_MONTH[m.group("code")], m.group("yy")))
+    out.name_spans = [m.span() for m in INDEX_NAME_RE.finditer(clause)]
     out.upper_words = UPPER_WORD_RE.findall(clause)
     words = IDIOM_RE.sub(" ", clause)  # call and put as nouns only
     out.option_language = (OPTION_LANGUAGE_RE.search(words) is not None
@@ -224,9 +249,10 @@ def leftover_tokens(terms: InstructionTerms, consumed: set[Decimal],
     """What the clause still names after its contract months and the action's own levels
     (review F2, confirmation): any token with a digit that is not a consumed level (``consumed``)
     or a consumed reduction percentage (``fractions`` x 100), any month name, and any token shaped
-    like a contract code for ``roots`` (case-insensitive). A futures selection may fall back to its
-    nearest-contract rule only when this is empty; otherwise the clause names something the bot
-    has not understood."""
+    like a contract code for ``roots`` (case-insensitive; ``code_shaped``). The digits of an index's
+    own name ("S&P 500") are part of the market's name and are skipped. A futures selection may fall
+    back to its nearest-contract rule only when this is empty; otherwise the clause names something
+    the bot has not understood."""
     out = []
     upper_roots = {r.upper() for r in roots if r}
     for m in _TOKEN_RE.finditer(terms.clause):
@@ -236,7 +262,7 @@ def leftover_tokens(terms: InstructionTerms, consumed: set[Decimal],
         if not token:
             continue
         end = start + len(token)
-        if any(a <= start and end <= b for a, b in terms.month_spans):
+        if any(a <= start and end <= b for a, b in (*terms.month_spans, *terms.name_spans)):
             continue
         word = token.upper().lstrip("$")
         if any(ch.isdigit() for ch in token):
@@ -249,7 +275,7 @@ def leftover_tokens(terms: InstructionTerms, consumed: set[Decimal],
             out.append(token)
         else:
             month = MONTH_WORD_RE.fullmatch(token) and token.lower().rstrip(".") not in ENGLISH_WORDS
-            code = any(word.startswith(r) and word != r for r in upper_roots)
+            code = any(code_shaped(word, r) for r in upper_roots)
             if month or code:
                 out.append(token)
     return out
