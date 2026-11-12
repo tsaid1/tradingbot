@@ -118,9 +118,9 @@ def test_a_protective_level_is_a_second_stop(text):
 
 
 def test_a_protective_stop_that_is_the_actions_own_still_anchors(tmp_path):
-    """At the mapping stage, with the stop tagged as the action's own. (Through the whole service
-    the held interpreter reads "Protective stop N." as commentary and attaches no stop, so the
-    post holds: the safe direction.)"""
+    """The guard lives at the mapping stage, with the stop tagged as the action's own. Through the
+    whole service "Protective stop N." alone is read by the interpreter as commentary and attaches
+    no stop, so such a post HOLDS for a missing stop (safe); it does not trade."""
     from test_entry_anchor_policy import ANCHOR_RULE, MAP_NOW, etf_entry, policy
     from test_entry_anchor_policy import action as etf_action
     from test_entry_anchor_single_market import note
@@ -147,4 +147,13 @@ def test_a_stated_range_never_buys_above_its_upper_bound(text):
     rt = service(text)
     [entry] = entries(rt)
     assert entry.limit_price == Decimal("88.38") and entry.limit_price <= Decimal("88.42")
+    rt.service.close()
+
+
+def test_a_protective_stop_alone_holds_through_the_service_for_a_missing_stop():
+    """The honest statement of the docstring above, pinned: the interpreter attaches no stop."""
+    rt = service("We are now long $TLT at 88.42. Protective stop 87.20.")
+    assert entries(rt) == []
+    assert rt.actions()[0]["status"] == "HOLD"
+    assert "PROTECTIVE_STOP_MISSING" in rt.actions()[0]["reasons"]
     rt.service.close()

@@ -34,6 +34,28 @@ SourcePost -> PaperEventReplay.process  (gate_source, gate_action, atomic groups
     value (the lower bound of "88.38-88.42"), so the buy limit is never above the stated maximum.
     An anchored entry sends the gateway's limit, the fresh executable quote side inside the
     owner's anchor limits.
+  * **The life of an entry order** (lead's decision, 12 November 2026): an unfilled entry never
+    outlives the validity of its signal, and never outlives the publisher's own exit. An entry or
+    add is sent at the stated price or the anchored quote and may rest. Every normal `sync()`
+    (each service cycle, and the first after a restart) cancels, and confirms through the same
+    cancel-and-confirm path as the halt and the pre-exit netting, any OPEN or ADD still working
+    once its source post is older than `max_intent_age_seconds` (for an anchored entry the
+    smaller of that and the anchor's `max_signal_age_seconds`), measured from the post's
+    publication with the service clock; at exactly the limit it is still valid. It ends
+    `CANCELLED` with `ENTRY_EXPIRED_UNFILLED`, journaled. A partial fill keeps its position and
+    its protection sized to what filled; only the remainder is cancelled. It is never resent or
+    re-priced. An unconfirmed cancel opens `ENTRY_REMAINDER_NOT_CANCELLED` (the instrument is
+    blocked, the alert fires) and is retried at the next sync. A follow-up on an idea whose entry
+    is still working and wholly unfilled (the ledger holds nothing yet, so the gateway alone would
+    hold it with `REFERENCED_ACTIVE_IDEA_NOT_FOUND`) is seen by the broker-backed replay before the
+    gateway: the entry is cancelled and confirmed first; a CLOSE or REDUCE is then recorded
+    `CANCELLED` with `ENTRY_CANCELLED_BEFORE_FILL` (nothing else is sent); any other follow-up (a
+    stop or target change, an add) is held (`ENTRY_CANCELLED_BEFORE_FILL`,
+    `FOLLOW_UP_ON_UNFILLED_ENTRY`); a resting bracket is never amended. If the entry filled before
+    its cancel took effect, the follow-up is gated on what is held, as before; after a partial fill
+    a CLOSE cancels the remainder and closes what is held (pre-exit netting). Real-broker binding:
+    before any resting entry is possible at a real broker, the expiry must also be enforced
+    broker-side (the order module today sends day orders); that is outside this change.
   * exposure caps: `MockPolicy.max_instrument_exposure_usd`, which defaults to `max_notional_usd`,
     and `max_aggregate_exposure_usd`. Per contract the larger of the ledger's and the broker's
     position counts (a broker-only position counts too), valued at quantity x the usable quote's

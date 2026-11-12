@@ -192,10 +192,13 @@ only (they do not authorize order submission):**
     `STOP_DIFFERS_FROM_ACTION`; the value stated by another trading action of the post,
     commentary aside, `STOP_SHARED_WITH_ANOTHER_ACTION`; and on the text, every number in a
     clause with a stop word anywhere in the post ("stop" in any hyphenated or qualified form,
-    "stoploss", "stops", "sl"; not "stopped", which reports an exit; in a clause that also names
-    a target, only the numbers between the stop word and the target word): more than one distinct
-    value `SEVERAL_STOP_VALUES`, one value other than the action's stop `STOP_TEXT_DIFFERS`; a
-    repeated identical value is not a second stop);
+    "stoploss", "stops", "sl", "protective"; not "stopped", which reports an exit; in a clause
+    that also names a target, only the numbers between the stop word and the target word): more
+    than one distinct value `SEVERAL_STOP_VALUES`, one value other than the action's stop
+    `STOP_TEXT_DIFFERS`; a repeated identical value is not a second stop. So "Stop 87.20.
+    Protective level 87.10." holds. "Protective stop 87.20." alone is read by the interpreter as
+    commentary and attaches no stop, so such a post holds for a missing stop (the safe direction);
+    the guard that the action's own protective stop still anchors lives at the mapping stage);
   - farther than the limit from the entry (`PROTECTIVE_STOP_TOO_FAR_FROM_ENTRY`: the explicit
     entry price, or an anchored entry's stated reference, in the publisher's series);
   - farther than the limit from the limit-entry price actually to be sent
