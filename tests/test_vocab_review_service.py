@@ -36,10 +36,11 @@ NOW = datetime(2026, 6, 1, 14, 0, tzinfo=UTC)
 # Invented posts for the shipped TLT entry rule (SINGLE_MARKET_POST).
 CLEAN = "We are now long $TLT, 88.42 now. Stop 87.20."
 UNKNOWN_WORD = "We are now long $TLT zorbly, 88.42 now. Stop 87.20."  # lower-case, instruction
-PERSON = "We are now long $TLT, 88.42 now. Stop 87.20. Thanks to Quentin."  # capitalised word
-OTHER_MARKET = "We are now long $TLT, 88.42 now. Stop 87.20. Watching Zorbex too."
-FAMILY_WORD = "We are now long $TLT, 88.42 now. Stop 87.20. We like bonds here."  # a market noun
-PRIVATE = ("zorbly", "Quentin", "Zorbex", "Thanks to Quentin", "We are now long $TLT zorbly")
+# Since PR #70 a mention holds only with a trading context in its own sentence ("bought").
+PERSON = "We are now long $TLT, 88.42 now. Stop 87.20. Quentin bought earlier."  # capitalised
+OTHER_MARKET = "We are now long $TLT, 88.42 now. Stop 87.20. Zorbex bought earlier."
+FAMILY_WORD = "We are now long $TLT, 88.42 now. Stop 87.20. The bonds look bought here."  # noun
+PRIVATE = ("zorbly", "Quentin", "Zorbex", "Quentin bought earlier", "We are now long $TLT zorbly")
 
 
 def private_dir(tmp_path: Path) -> Path:
@@ -179,7 +180,8 @@ def test_a_journaled_held_decision_leaves_the_words_only_in_the_private_log(tmp_
     # The journal still records the public reason code and kinds as before.
     reasons = {a["mapping_reason"] for a in opens(rt)}
     assert "ENTRY_ANCHOR_CONTEXT_UNCLEAR,WORDS:1" in reasons
-    assert "ENTRY_ANCHOR_POST_UNRESOLVED_MARKET,MENTION:PROPER_NOUN" in reasons
+    assert "ENTRY_ANCHOR_POST_UNRESOLVED_MARKET,RULE:MENTION_WITH_CONTEXT,MENTION:PROPER_NOUN" \
+        in reasons
     rt.service.close()
 
 
@@ -299,7 +301,8 @@ def test_a_different_market_keeps_holding_and_is_not_offered_again(tmp_path):
     statuses, lex, log, _cand = review_then_rerun(tmp_path, OTHER_MARKET, V.KEEP_HOLDING,
                                                  V.NON_MARKET)
     assert [s for s, _ in statuses] == ["HOLD"]
-    assert statuses[0][1] == "ENTRY_ANCHOR_POST_UNRESOLVED_MARKET,MENTION:PROPER_NOUN"
+    assert statuses[0][1] == ("ENTRY_ANCHOR_POST_UNRESOLVED_MARKET,RULE:MENTION_WITH_CONTEXT,"
+                              "MENTION:PROPER_NOUN")
     assert json.loads(lex.read_text()) == {"open_present": [], "entry_anchor": {}}
     entries, _ = V.read_review_log(log)
     assert len(entries) == 1  # held twice, logged once (one record per hold)

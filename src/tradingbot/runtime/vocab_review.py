@@ -56,6 +56,12 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from tradingbot.runtime.config import ConfigError
+from tradingbot.runtime.mapping import _VOCABULARY_DETAILS, vocabulary_hold
+
+# The public reason codes of holds a lexicon word can resolve (``mapping.vocabulary_hold`` decides
+# with the detail). Anything else (an unattributed action sentence, an additive ellipsis, a stop
+# refusal, long-only) is never offered for review.
+VOCABULARY_REASON_CODES = frozenset(_VOCABULARY_DETAILS)
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
@@ -317,6 +323,8 @@ def candidates(entries: list[dict], *, lexicon_path: str | Path | None = None) -
     found: dict[tuple[str, str], Candidate] = {}
     posts: dict[tuple[str, str], set] = {}
     for e in entries:
+        if not vocabulary_hold(str(e.get("reason_code") or ""), e.get("reason_detail")):
+            continue  # no lexicon word may remove this hold: never proposed
         seen = set()
         for t in e.get("tokens") or ():
             if not isinstance(t, dict) or not t.get("token"):
@@ -383,6 +391,10 @@ def _proposal(raw: dict) -> Proposal | None:
     family = raw.get("family")
     if family is not None and not (isinstance(family, str) and _FAMILY_RE.match(family)):
         return None
+    cited = (raw.get("categories") or {}).get("reasons") if isinstance(
+        raw.get("categories"), dict) else None
+    if cited and not any(str(r) in VOCABULARY_REASON_CODES for r in cited):
+        return None  # cites only holds no lexicon word may remove
     evidence = raw.get("evidence") if isinstance(raw.get("evidence"), dict) else {}
     cats = raw.get("categories") if isinstance(raw.get("categories"), dict) else {}
     measured = raw.get("measured")

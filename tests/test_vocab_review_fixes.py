@@ -437,3 +437,55 @@ def test_an_unknown_or_private_key_never_appears_in_a_lexicon_error(tmp_path, co
     for f in (tmp_path / "b").rglob("*"):  # logs, the alert file, the journal
         if f.is_file():
             assert not contains(f.read_bytes(), "zorbleflux"), f.name
+
+
+# ------------------------------------------------------------------ after PR #70: vocabulary holds only
+
+# Holds no lexicon word may remove (PR #70): never logged, never proposed.
+NOT_VOCABULARY = [
+    "We are now long $TLT, 88.42 now. Likewise Zorbex. Stop 87.20.",  # additive ellipsis
+    "We are now long $TLT, 88.42 now. Stop 87.20. We stay long-only here as well.",  # unattrib.
+]
+
+
+@pytest.mark.parametrize("text", NOT_VOCABULARY, ids=["additive", "unattributed"])
+def test_holds_no_word_can_remove_are_never_logged(tmp_path, text):
+    from test_vocab_review_service import run
+
+    log = private_dir(tmp_path) / "review.jsonl"
+    rt = run(tmp_path / "a", [text], review_log=log)
+    [a] = opens(rt)
+    rt.service.close()
+    assert a["status"] == "HOLD" and ("RULE:ADDITIVE_ELLIPSIS" in a["mapping_reason"]
+                                      or "UNATTRIBUTED_ACTION" in a["mapping_reason"]), a
+    assert log.read_text() == ""
+
+
+@pytest.mark.parametrize(("code", "detail", "vocab"), [
+    ("ENTRY_ANCHOR_POST_UNRESOLVED_MARKET", ["RULE:MENTION_WITH_CONTEXT", "MENTION:PROPER_NOUN"],
+     True),
+    ("ENTRY_ANCHOR_POST_UNRESOLVED_MARKET", ["RULE:ADDITIVE_ELLIPSIS"], False),
+    ("ENTRY_ANCHOR_POST_UNATTRIBUTED_ACTION", ["RULE:UNATTRIBUTED_ACTION_SENTENCE"], False),
+    ("ENTRY_ANCHOR_CONTEXT_UNCLEAR", ["WORDS:1"], True),
+    ("ENTRY_ANCHOR_INSTRUMENT_UNCLEAR", ["PRECEDING_SENTENCE"], True),
+    ("ENTRY_ANCHOR_INSTRUMENT_UNCLEAR", ["OTHER_WORDS:2"], True),
+    ("ENTRY_ANCHOR_LEVEL_NOT_MARKET_QUOTE", ["LEVEL_KIND:AMBIGUOUS", "FOLLOWING_NOT_UNDERSTOOD"],
+     True),
+    ("ENTRY_ANCHOR_LEVEL_NOT_MARKET_QUOTE", ["LEVEL_KIND:ENTRY_OR_COST_BASIS", "OWN_CLAUSE"],
+     False),
+    ("PROTECTIVE_STOP_NOT_UNIQUE", [], False),
+    ("PROTECTIVE_STOP_TOO_FAR_FROM_ENTRY", [], False),
+    ("MAPPING_LONG_ONLY", [], False),
+])
+def test_only_vocabulary_holds_are_offered_for_review(tmp_path, code, detail, vocab):
+    entry_ = {"source_id": "1", "post_id": "1", "revision": 1, "action_id": "a1",
+              "family": "TLT", "reason_code": code, "reason_detail": detail,
+              "tokens": [{"token": "zorbex", "kind": "PROPER_NOUN"}],
+              "sentences": [{"role": "MENTION", "text": "Zorbex sentence"}]}
+    assert bool(V.candidates([entry_])) is vocab
+    assert bool(V.proposals_from_log([entry_])) is vocab
+    path = tmp_path / "p.jsonl"
+    path.write_text(json.dumps({"schema": V.PROPOSAL_SCHEMA, "token": "zorbex",
+                                "group": V.NON_MARKET,
+                                "categories": {"families": ["TLT"], "reasons": [code]}}) + "\n")
+    assert bool(V.read_proposals(path)[0]) is (vocab or code in V.VOCABULARY_REASON_CODES)

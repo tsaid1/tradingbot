@@ -27,8 +27,8 @@ REPO = Path(__file__).resolve().parents[1]
 PAGE = REPO / "dashboard" / "pages" / "10_Vocabulary_Review.py"
 TEXTS = [
     "We are now long $TLT zorbly, 88.42 now. Stop 87.20.",
-    "We are now long $TLT, 88.42 now. Stop 87.20. Thanks to Quentin.",
-    "We are now long $TLT, 88.42 now. Stop 87.20. We like bonds here.",
+    "We are now long $TLT, 88.42 now. Stop 87.20. Quentin bought earlier.",
+    "We are now long $TLT, 88.42 now. Stop 87.20. The bonds look bought here.",
 ]
 
 
@@ -142,7 +142,7 @@ def test_the_page_shows_the_batch_in_four_groups_with_its_evidence(monkeypatch, 
     text = shown(at)
     for needle in ("Vocabulary review (OWNER ONLY)", "privately, here on your machine only",
                    "restarted", *V.GROUPS.values(), "plain batch built from the review log",
-                   "not measured", "zorbly", "quentin", "Thanks to Quentin",
+                   "not measured", "zorbly", "quentin", "Quentin bought earlier",
                    "Vocabulary holds logged 3", "Pending proposals 3"):
         assert needle in text, needle
     # Private words are never in a Markdown-rendered label.
@@ -311,7 +311,8 @@ def test_file_supplied_text_is_never_rendered_as_markdown_or_html(monkeypatch, l
     for n, payload in enumerate(PAYLOADS):
         rows.append({"token": f"tok{n} {payload}", "group": V.NON_MARKET, "meaning": payload,
                      "kind": payload,
-                     "categories": {"families": [payload], "reasons": [payload]},
+                     "categories": {"families": [payload],
+                                    "reasons": ["ENTRY_ANCHOR_CONTEXT_UNCLEAR", payload]},
                      "measured": {payload: 1},
                      "examples": [{"role": payload, "text": f"sentence {payload}"}]})
     proposals(log, rows)
