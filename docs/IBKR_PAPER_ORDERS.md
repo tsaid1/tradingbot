@@ -128,7 +128,7 @@ stage 3 calls `sync` at once and stops.
 **Residual.** The dry check cannot see the future. If the market falls sharply between the core
 pricing the exit and the send, the stop is already cancelled and the closing limit (priced off
 the earlier bid) may rest unfilled: one share is then held with no stop, and the owner closes it
-by hand (stage 3 reports `STAGE3_CLOSE_NOT_FILLED` with that instruction).
+by hand (stage 3 reports `STAGE3_CLOSE_NOT_FILLED`; the owner sells only if the TWS window shows 1).
 
 **Which working orders.** Every row of the broker's open-orders answer whatever its status, plus
 every order this session sent that is not final and not rejected even if no view shows it yet
@@ -293,7 +293,12 @@ entry 2, one stop amendment 1, closing limit 1): 2 + 4 = 6 = the cap (asserted i
 5. Plan the day: start stage 3 no later than 14:30 ET; the experiment ends flat the same day.
    The script itself refuses to START stage 2 or stage 3 at or after 15:00 New York time
    (`LATEST_START_NEW_YORK`, `experiment.py`): stage 3 holds a share, and stage 2 can leave one
-   (an unexpected fill) that must be closed by hand before 16:00.
+   (an unexpected fill) that must be closed by hand before 16:00. After connecting and before
+   any order, stages 2 and 3 also refuse unless TODAY's broker-reported liquid hours (the
+   contract's `liquidHours`, the data the guard uses) last at least 60 more minutes
+   (`MIN_MINUTES_TO_CLOSE`): an early-close day such as a 13:00 close is caught. If today's end
+   cannot be determined (missing or unparseable hours, an unknown time zone, now outside them),
+   the stage refuses. The stricter of the two rules applies.
 6. **Required before stage 2 and again before stage 3:** run the full test suite locally WITH the
    SDK (`ibapi` installed, `TRADINGBOT_BLOCK_IBAPI` unset) at the exact commit you will run:
    `PYTHONPATH="$PWD/src" python -m pytest tests docs/research/g0_x_probe`. CI has no `ibapi`, so
@@ -310,8 +315,9 @@ entry 2, one stop amendment 1, closing limit 1): 2 + 4 = 6 = the cap (asserted i
 | any | — | `python scripts/ibkr_paper_experiment.py abort` | every working order of this client cancelled by its own order id; reports what remains and the position | 0 |
 
 After stage 3 (or on any failure): turn Read-Only API back ON, remove the `orders` line, and keep
-the evidence directory and journal. If stage 2 reports a fill, follow its message (below): with a
-working stop, close the share by hand first and only then run `abort`; stage 3 then never runs.
+the evidence directory and journal. If stage 2 reports a fill, follow its printed TWS procedure (below):
+sell only if the TWS window shows 1, and run `abort` only once TWS shows 0; stage 3 then never
+runs.
 
 **If stage 2 fills** (result `STAGE2_UNEXPECTED_FILL`): stage 2 cancels the parent first and
 cancels the child only when the parent is confirmed cancelled with nothing filled. After any
@@ -319,48 +325,77 @@ fill it sends no cancel for the protective SELL STP, records what is held and bl
 evidence (`held.stop_status`, `held.stop_working`) and the message report the child's actual
 state: the broker may have cancelled it with its parent. The stop counts as working ONLY when its
 status is Submitted or PreSubmitted AND it is visible in a completed open-orders read; Inactive,
-PendingCancel, an unknown status or a failed read are "NOT working". If the stop is working, do
-NOT run `abort` first: it would cancel the stop. If it is not working, the share is unprotected:
-close it by hand at once. In TWS, sell the share by hand with a limit at the bid, confirm the TLT
-position is 0, then run `abort` to cancel what remains.
+PendingCancel, an unknown status or a failed read are "NOT working". Then follow the printed
+TWS procedure (below): never `abort` while TWS shows 1 and a working stop.
 
-**What the script prints on an abnormal ending, and what the owner does.** Every message ends with
-"Now:" and an instruction built from a fresh read of the position (the more cautious of the read
-and the experiment's own fills) and this client's working orders (evidence field `state`):
+**What the script prints on an abnormal ending, and what the owner does.** Every message is
+`<RESULT>: <cause>. Now: <state>. <procedure>`, built from reads only. Before printing, the reads
+are retried for up to 15 s (`POSITION_SETTLE_SECONDS`) until the broker's position read agrees
+with the experiment's own fills; stage 3 likewise retries a reconciliation that is not clean for
+up to 15 s (`RECONCILE_SETTLE_SECONDS`) before failing, so a read that merely lags the closing
+fill ends as a PASS. No retry sends an order frame or uses budget.
 
-| Result | Printed as the cause | The owner does (from the printed state) |
+The **state** line is one of:
+- read and fills agree: "this script reads a TLT position of N (the broker's read and the
+  experiment's own fills agree)";
+- they disagree: "the broker's position read R and the experiment's own fills F disagree: do not
+  sell on this script's numbers" (no position is stated as held);
+- unreadable: "the broker's position could not be read: do not sell on this script's numbers".
+It then says whether a protective stop of this client is working (status) or not ("if TWS shows
+1, the share is UNPROTECTED"), whether a closing limit is resting, or that the orders could not
+be read.
+
+The **procedure** is the same for every ending that is not a confirmed flat:
+
+> In the TWS window: (1) cancel a resting TLT closing limit only if you can see it working there,
+> never the stop; (2) Look at the TLT position in the TWS window. Only if it shows 1: sell 1 there
+> with a limit at the bid (lower it a tick at a time until it fills) and wait until it shows 0. If
+> it shows 0: do NOT sell. (3) Only once TWS shows 0, run abort to cancel what remains. Never run
+> abort while TWS shows 1 and a working stop: abort cancels the stop.
+
+When read and fills agree on 0, it instead says "run abort to cancel this client's N working
+order(s), then confirm in TWS that the TLT position is 0 and no TLT order is working", or, with
+nothing working, "nothing to do; confirm in TWS ...". No message contains an unconditional sell
+(test: every ending x every state).
+
+| Result | Cause printed | The owner does |
 |---|---|---|
-| `STAGE2_UNEXPECTED_FILL`, stop working | the stop is working (status) | close by hand first, then `abort`; never `abort` first |
-| `STAGE2_UNEXPECTED_FILL`, stop not working | the stop is NOT working (status, open orders), UNPROTECTED | close by hand NOW, then `abort` |
-| `STAGE2_PARENT_NOT_CONFIRMED_CANCELLED` | the parent's cancel was not confirmed | check TWS: held with a working stop: by hand first, then `abort`; held without one: by hand NOW, then `abort`; flat: `abort` |
-| `STAGE3_ENTRY_NOT_FILLED` | the entry did not fill in time | as the state says (normally flat with the bracket working: `abort`) |
-| `STAGE3_PROTECTION_UNCONFIRMED` | the stop was not confirmed within 15 s of the fill (`PROTECTION_SETTLE_SECONDS`, reads only) | held with a working stop: by hand first, then `abort`; without: by hand NOW, then `abort` |
-| `STAGE3_PROTECTION_LOST` | POSITION OPEN, PROTECTION ABSENT: the close was not sent after the stop was cancelled | by hand NOW, then `abort` |
-| `STAGE3_CLOSE_REFUSED` | the close was REFUSED (or REJECTED / HALTED) with the core's reasons, e.g. `EXIT_WITHOUT_QUOTE` | the stop still works: by hand first, then `abort` |
-| `STAGE3_CLOSE_NOT_FILLED` | the closing limit was sent but did not fill in time | no stop, a resting close: `abort` (it cancels that limit; there is no stop to lose), then by hand at once |
-| `STAGE3_NOT_CLEAN` | reconciliation not clean, or not 6 used | as the state says; keep the evidence for review |
-
-With the position or the orders unreadable, the message says so and gives all three cases.
+| `STAGE2_UNEXPECTED_FILL` | the entry filled; its stop is working (status, in open orders) or NOT working (status, in or not in open orders); stage 3 blocked | the TWS procedure |
+| `STAGE2_PARENT_NOT_CONFIRMED_CANCELLED` | the parent was not confirmed cancelled; its child was left alone | the TWS procedure, or abort if the reads agree on flat |
+| `STAGE2_FAILED` | the read-back, cancels or completed orders did not show what stage 2 needs | abort if the reads agree on flat with orders working; otherwise the TWS procedure |
+| `STAGE3_ENTRY_NOT_FILLED` | the entry did not fill in time | normally flat with the bracket working: abort; otherwise the TWS procedure |
+| `STAGE3_PROTECTION_UNCONFIRMED` | the entry filled; the stop was not confirmed within 15 s | the TWS procedure |
+| `STAGE3_PROTECTION_LOST` | POSITION OPEN, PROTECTION ABSENT: the close was not sent after the stop was cancelled | the TWS procedure |
+| `STAGE3_CLOSE_REFUSED` | the close was REFUSED (or REJECTED / HALTED), with the core's reasons, e.g. `EXIT_WITHOUT_QUOTE` | the TWS procedure (the stop normally still works: sell only if TWS shows 1, abort after) |
+| `STAGE3_CLOSE_NOT_FILLED` | the closing limit was sent but did not fill in time | the TWS procedure (cancel the resting close in TWS first, then sell only if TWS shows 1) |
+| `STAGE3_NOT_CLEAN` | after the 15 s retry, reconciliation still not clean or not 6 used | the TWS procedure; with read and fills disagreeing, do not sell on the script's numbers; keep the evidence |
 
 ## Emergency stop
 
+- **The TWS window is the source of truth.** Check the TLT position and the working TLT orders
+  there before any manual order or cancel. Sell only if TWS shows 1; cancel only orders you can
+  see working in TWS. Never act on this script's numbers when they disagree with TWS.
 - **Not known to cancel anything (unverified):** disconnecting the client, killing the script, or
   turning Read-Only API back ON. Working orders may stay live in TWS after any of these. The
   halt file only affects a coordinator that is still running (stage 3): it stops new entries and
   amendments and cancels working entries, not the stop or a placed close.
 - **The certain stop:** in the paper Trader Workstation window, cancel every working TLT order of
-  the experiment (Orders / Activity panel, right-click, Cancel), then close any TLT position by
-  hand (SELL 1 TLT, a limit at the bid), and confirm in the Portfolio that TLT is 0.
+  the experiment that you can see working there (Orders / Activity panel, right-click, Cancel),
+  then look at the TLT position in TWS: only if it shows 1, sell 1 with a limit at the bid; if it
+  shows 0, do not sell. Confirm in the Portfolio that TLT is 0.
 - **The software path:** `python scripts/ibkr_paper_experiment.py abort` cancels every working
   order of this client by its own order id (never a global cancel), including a protective stop,
   and reports what remains. It works even when the journal is unknown. It does not close a
-  position: with a share held, sell it by hand first, then run `abort`.
+  position: only if the TWS window shows 1 TLT, sell it there first (a limit at the bid), and run
+  `abort` once TWS shows 0.
 - **The close.** The protective stop is DAY: it expires at 16:00 ET and a share held overnight is
   unprotected; nothing can be placed after 16:00 ET. The experiment must end flat the same day.
   **If the closing limit has not filled by 15:30 ET** (the script normally reports
-  `STAGE3_CLOSE_NOT_FILLED` well before) (30 minutes before the close): run `abort`,
-  then in TWS sell the share by hand with a limit at the bid (lower it a tick at a time until it
-  fills), confirm the position is 0 before 16:00 ET, and record what you did beside the evidence.
+  `STAGE3_CLOSE_NOT_FILLED` well before) (30 minutes before the close): in TWS cancel the
+  resting closing limit you can see working, then look at the TLT position there: only if it
+  shows 1, sell 1 with a limit at the bid (lower it a tick at a time until it fills); if it shows
+  0, do not sell. Confirm 0 before 16:00 ET, run `abort`, and record what you did beside the
+  evidence.
 
 ## Execution-core change it needs
 
