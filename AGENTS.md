@@ -1,35 +1,37 @@
 # Agent development rules
 
-Canonical repository: https://github.com/tsaid1/tradingbot
+Canonical repository: https://github.com/tsaid1/tradingbot (**public**).
 
-1. No agent may add live broker order submission without a new, explicit safety review.
-2. Never commit user-subscription content or API credentials to this **public** repo.
-3. Work on separate branches and PRs. Avoid unrelated formatting/refactors.
-4. Treat schemas in `src/tradingbot/models.py` as versioned contracts.
-5. No LLM-created field directly bypasses deterministic `validator.py`.
-6. Add regression tests for every new parsing rule and execution lifecycle feature.
-7. Record external API feasibility findings, exact documentation URLs and limitations.
-8. Do not use unauthorized scraping to read protected X content.
+## Safety rules (never relaxed by any task)
 
-## Suggested parallel assignments
+1. **One gateway.** Every order comes from an action that the deterministic gateway
+   (`validator.py`) approved, through `ExecutionCoordinator`. No other path may create or increase
+   exposure. Operator tools only record what a human established at the broker, or lift a block.
+   LLM or interpreter output never bypasses the gateway.
+2. **No paid source content and no credentials in this repo.** Do not commit post text,
+   screenshots, subscriber material, tokens, account numbers or broker licences. Tests and
+   fixtures use invented data only. Logs, journals and notifications carry identifiers and reason
+   codes, never post text.
+3. **No order submission without the owner's explicit authorization of a specific experiment.**
+   `main` runs the simulated broker only (`mode = "mock"`). The IBKR code on `main` is read-only.
+4. **Independent review before any change to an order path.** That covers the coordinator, the
+   broker protocol and adapters, reconciliation, settlement and the runtime service's broker
+   handling. Protocol changes are additive.
+5. **The funded account is out of scope.** Paper only, and only after rule 3.
+6. Treat `models.py` and `event_models.py` as versioned contracts. Add a regression test for
+   every parsing rule and every execution lifecycle change.
+7. Read the publisher only through authorized access. No scraping of protected content.
 
-**Agent A (core, this starter)**: contracts, demo parser, optional vision extraction,
-validation, mock journal, tests, local UI. Ownership: `src/tradingbot/`,
-`dashboard/`, `tests/`.
+## How work is organised
 
-**Agent B (research and isolated implementation)**: official X protected-post
-availability proof, commercial/publisher terms diligence; compare IBKR vs tastytrade
-(or a suitable alternative), including native presets for API orders and support for
-ETF/stock, options and futures. Ownership: `docs/research/` ONLY until a review.
+* Each task runs on its own branch and worktree, and lands as its own PR. Avoid unrelated
+  refactors and reformatting.
+* The core engineering agent owns `src/`, `dashboard/`, `tests/`, `scripts/`, `ops/` and `docs/`.
+* The research agent owns `docs/research/` until a review accepts its work.
+* Reviewers are independent of the author and record their findings under `orchestration/reviews/`
+  (outside the repo).
+* The product owner merges PRs, approves mappings and experiments, and owns every broker-side
+  change.
 
-**Product owner:** selects broker, approves ingestion terms, merges PRs, authorizes
-real-money permission changes only after paper-trading gate.
-
-## Secondary agent prompt
-
-"Research official authorized read access for the protected X account
-@TKLSubscribers without attempting to bypass access, and independently score
-IBKR/tastytrade API order types, native broker preset support, paper accounts,
-options/futures availability and authentication. Produce concise, source-linked
-findings in docs/research/ as a PR. Do not touch the core parser, risk gateway,
-GUI or any live execution route. Do not use or publish paid source content."
+Architecture: `README.md`, `docs/RUNTIME.md`, `docs/EXECUTION_CORE.md`. Operations:
+`docs/OPERATIONS.md`.
