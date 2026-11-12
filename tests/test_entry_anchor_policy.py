@@ -35,7 +35,7 @@ REPO = Path(__file__).resolve().parents[1]
 SHIPPED = REPO / "config" / "instrument_mapping.toml"
 RULE = {"entry_rule": "REFERENCE_AS_COLLAR", "anchor_max_adverse_move": "0.2%",
         "anchor_max_favourable_move": "0.5%", "anchor_max_signal_age_seconds": 30,
-        "anchor_max_quote_age_seconds": 3}
+        "anchor_max_quote_age_seconds": 3, "anchor_max_stop_distance": "5%"}
 
 
 def anchored(anchor="5025", **kw):
@@ -253,7 +253,7 @@ SESSION = ('session = { policy = "REGULAR_ONLY", timezone = "UTC", '
 # (standalone_level_sentence = true); the shipped default (off) in test_entry_rule_standalone.
 ANCHOR_RULE = ('entry_rule = "REFERENCE_AS_COLLAR"\n'
                'entry_anchor = { max_adverse_move = "0.5%", max_favourable_move = "1%", '
-               'max_signal_age_seconds = 60, anchor_scope = "SENTENCE_STRICT", max_quote_age_seconds = 3, environment = "PAPER", standalone_level_sentence = true }')
+               'max_signal_age_seconds = 60, anchor_scope = "SENTENCE_STRICT", max_quote_age_seconds = 3, environment = "PAPER", max_stop_distance = "5%", standalone_level_sentence = true }')
 OIL_CONTRACTS = ('contracts = [ { month = "202607", roll_date = 2026-07-06 }, '
                  '{ month = "202608", roll_date = 2026-08-05 } ]')
 
@@ -555,7 +555,7 @@ def load(text):
 @pytest.mark.parametrize("text,message", [
     (etf_entry(rule='entry_rule = "REFERENCE_AS_COLLAR"'), "needs its [entry_anchor] limits"),
     (etf_entry(rule='entry_anchor = { max_adverse_move = "1%", max_favourable_move = "1%", '
-                    'max_signal_age_seconds = 60, anchor_scope = "SENTENCE_STRICT", max_quote_age_seconds = 3, environment = "PAPER" }'),
+                    'max_signal_age_seconds = 60, anchor_scope = "SENTENCE_STRICT", max_quote_age_seconds = 3, environment = "PAPER", max_stop_distance = "5%" }'),
      "needs its [entry_anchor] limits"),
     (etf_entry(rule=ANCHOR_RULE.replace(', max_signal_age_seconds = 60', '')), "Field required"),
     (etf_entry(rule=ANCHOR_RULE.replace('"0.5%"', '"abc"')), "String should match"),
@@ -692,7 +692,7 @@ def _write(body: str) -> Path:
 
 RULE_TOML = ('entry_rule = "REFERENCE_AS_COLLAR"\n'
              'entry_anchor = {{ max_adverse_move = "{adverse}", max_favourable_move = "1%", '
-             'max_signal_age_seconds = 60, anchor_scope = "{scope}", max_quote_age_seconds = 3, environment = "PAPER", standalone_level_sentence = true }}')
+             'max_signal_age_seconds = 60, anchor_scope = "{scope}", max_quote_age_seconds = 3, environment = "PAPER", max_stop_distance = "5%", standalone_level_sentence = true }}')
 
 
 def service_mapping(*, rule=True, adverse="0.2%", front=True, oil_contracts=None,

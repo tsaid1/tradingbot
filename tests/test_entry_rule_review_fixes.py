@@ -199,16 +199,17 @@ def test_b1b_the_key_is_a_strict_boolean(tmp_path, value, ok):
 def test_b1b_the_key_needs_the_rule(tmp_path):
     rule = ('entry_anchor = { max_adverse_move = "0.5%", max_favourable_move = "1%", '
             'max_signal_age_seconds = 60, anchor_scope = "SINGLE_MARKET_POST", '
-            'max_quote_age_seconds = 3, environment = "PAPER", '
+            'max_quote_age_seconds = 3, environment = "PAPER", max_stop_distance = "5%", '
             'standalone_level_sentence = true }')
     with pytest.raises(ValueError, match="REFERENCE_AS_COLLAR"):
         policy(tmp_path, etf_entry(rule=rule))
 
 
-def test_b1b_the_key_is_off_for_every_shipped_family():
-    for e in MappingPolicy.from_toml(MAPPING).entries.values():
+def test_b1b_the_key_is_on_for_tlt_only():
+    """Owner, 12 November 2026 (DECIDED 7)."""
+    for f, e in MappingPolicy.from_toml(MAPPING).entries.items():
         if getattr(e, "entry_anchor", None) is not None:
-            assert e.entry_anchor.standalone_level_sentence is False
+            assert e.entry_anchor.standalone_level_sentence is (f == "TLT")
 
 
 # ================================================================== B2: unknown markets

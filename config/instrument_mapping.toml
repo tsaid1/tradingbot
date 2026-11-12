@@ -36,7 +36,10 @@
 #                                        A level written on its own ("41.20 now.") never
 #                                        anchors unless the optional standalone_level_sentence
 #                                        (strict boolean, default false; an owner decision) is
-#                                        true
+#                                        true. max_stop_distance ("5%"; required, ceiling 10%):
+#                                        the farthest the publisher's stop may be from the stated
+#                                        level and from the limit; never a stop the bot sets
+#   long_only = true                     an OPEN or ADD on the short side HOLDs (MAPPING_LONG_ONLY)
 #   level_contract_rule = "EXPLICIT_MONTH_ONLY"  (default) a futures level needs a named month
 #   level_contract_rule = "FRONT_MONTH"  a DIRECT futures level with no month means the front
 #                                        contract of the entry's own list; HOLD in its roll window
@@ -49,7 +52,7 @@ basis = "DIRECT"
 approved = true
 approved_by = "owner"
 approved_at = 2026-11-12T00:00:00Z
-note = "Publisher levels for TLT are quoted in the ETF's own share price. Current-market entry rule approved by the owner on 2026-11-12: paper and simulation only; does not authorize broker order submission."
+note = "Publisher levels for TLT are quoted in the ETF's own share price. Current-market entry rule approved by the owner on 2026-11-12: paper and simulation only; does not authorize broker order submission. standalone_level_sentence, a 5% maximum stop distance and long-only approved by the owner on 2026-11-12 (DECIDED 7): paper and simulation only; does not authorize order submission."
 reference = { sec_type = "STK", asset_class = "ETF", symbol = "TLT", exchange = "SMART", currency = "USD" }
 execution = { sec_type = "STK", asset_class = "ETF", symbol = "TLT", exchange = "SMART", currency = "USD" }
 # The only exposure the owner has approved so far: 1 share, at most 150 USD notional, in the US
@@ -61,8 +64,13 @@ session = { policy = "REGULAR_ONLY", timezone = "America/New_York", days = ["MON
 # 0.3% adverse / 0.6% favourable of the stated level, at most 90 s after publication, on a live
 # streaming quote whose bid and ask are each at most 3 s old, always with a protective stop.
 # Paper and simulation only; does not authorize broker order submission.
+# Owner's decisions of 2026-11-12 (DECIDED 7), TLT only: a level may also stand in its own
+# sentence directly after the instruction or after the instruction's own stop and target
+# (standalone_level_sentence); the stop may be at most 5% from the stated level and from the limit
+# (max_stop_distance); no short entries (long_only). Paper and simulation only.
+long_only = true
 entry_rule = "REFERENCE_AS_COLLAR"
-entry_anchor = { max_adverse_move = "0.3%", max_favourable_move = "0.6%", max_signal_age_seconds = 90, anchor_scope = "SINGLE_MARKET_POST", max_quote_age_seconds = 3, environment = "PAPER" }
+entry_anchor = { max_adverse_move = "0.3%", max_favourable_move = "0.6%", max_signal_age_seconds = 90, anchor_scope = "SINGLE_MARKET_POST", max_quote_age_seconds = 3, environment = "PAPER", max_stop_distance = "5%", standalone_level_sentence = true }
 
 # ------------------------------------------------------------------ templates (not active)
 # EXAMPLES ONLY. Every symbol, exchange, multiplier, tick, date, hour and cap below is a placeholder
@@ -86,7 +94,7 @@ entry_anchor = { max_adverse_move = "0.3%", max_favourable_move = "0.6%", max_si
 # reference_trigger = { released_order_type = "MKT", reference_hours = ["09:30-16:00"], require_backstop = true }
 # basis_shift = { max_abs_basis = "40", max_age_seconds = 5, scale_ratio = "1" }   # prices the backstop stop
 # entry_rule = "REFERENCE_AS_COLLAR"               # owner decision: a stated index level anchors the entry
-# entry_anchor = { max_adverse_move = "10", max_favourable_move = "25", max_signal_age_seconds = 60, anchor_scope = "SENTENCE_STRICT", max_quote_age_seconds = 3, environment = "PAPER" }   # index points
+# entry_anchor = { max_adverse_move = "10", max_favourable_move = "25", max_signal_age_seconds = 60, anchor_scope = "SENTENCE_STRICT", max_quote_age_seconds = 3, environment = "PAPER", max_stop_distance = "5%" }   # index points
 #
 # --- an energy future quoted in its own contract month's price, executed in a micro contract
 # --- on the same underlying that trades at that same price (same_series asserts this)
@@ -107,7 +115,7 @@ entry_anchor = { max_adverse_move = "0.3%", max_favourable_move = "0.6%", max_si
 # roll = { business_days_before = 3, action = "FLATTEN", holidays = [2026-11-26] }
 # level_contract_rule = "FRONT_MONTH"              # owner decision: a level with no month is the front contract's
 # entry_rule = "REFERENCE_AS_COLLAR"               # owner decision: a stated level anchors the entry
-# entry_anchor = { max_adverse_move = "0.5%", max_favourable_move = "1.5%", max_signal_age_seconds = 60, anchor_scope = "SENTENCE_STRICT", max_quote_age_seconds = 3, environment = "PAPER" }
+# entry_anchor = { max_adverse_move = "0.5%", max_favourable_move = "1.5%", max_signal_age_seconds = 60, anchor_scope = "SENTENCE_STRICT", max_quote_age_seconds = 3, environment = "PAPER", max_stop_distance = "5%" }
 #
 # --- a metal quoted as spot and executed in a future
 # [[mapping]]

@@ -541,6 +541,33 @@ ANCHOR_MAX_QUOTE_AGE_CEILING_SECONDS = 5
 # How far in the future a side's own update time may be (clock skew) before it HOLDs (review S1):
 # a separate, small bound, so a stale side can never look fresh by a stamp ahead of the clock.
 ANCHOR_QUOTE_FUTURE_TOLERANCE_SECONDS = 0.5
+# The highest maximum protective-stop distance a family may set (owner, 12 November 2026, D3: TLT
+# uses 5%). An outer rejection threshold; the bot never sets or moves a stop.
+ANCHOR_MAX_STOP_DISTANCE_PCT_CEILING = Decimal(10)
+ANCHOR_STOP_TOO_FAR_FROM_REFERENCE = "ENTRY_ANCHOR_STOP_TOO_FAR_FROM_REFERENCE"
+ANCHOR_STOP_TOO_FAR_FROM_LIMIT = "ENTRY_ANCHOR_STOP_TOO_FAR_FROM_LIMIT"
+
+
+def stop_distance_limit(spec: str | None) -> Decimal | None:
+    """The stop-distance limit as a percentage, or None when it is missing or not a finite
+    positive percentage within the ceiling (an anchored entry then HOLDs)."""
+    if not spec or not isinstance(spec, str) or not spec.endswith("%"):
+        return None
+    try:
+        v = Decimal(spec[:-1])
+    except (InvalidOperation, ValueError):
+        return None
+    return v if v.is_finite() and 0 < v <= ANCHOR_MAX_STOP_DISTANCE_PCT_CEILING else None
+
+
+def stop_distance_problem(stop: Decimal | None, point: Decimal | None, limit_pct: Decimal,
+                          code: str) -> list[str]:
+    """[code, detail] when ``stop`` is farther than ``limit_pct`` percent from ``point``."""
+    if stop is None or point is None or point <= 0:
+        return []
+    if abs(point - stop) / point * 100 > limit_pct:
+        return [code, f"MAX:{limit_pct.normalize():f}%"]
+    return []
 
 
 def finite_positive(value) -> bool:
@@ -621,7 +648,8 @@ def _entry_anchor(a: TradeAction, q: MappedQuote, policy: MockPolicy, now: datet
     favourable = move_limit(t.anchor_max_favourable_move, anchor)
     if adverse is None or favourable is None or not adverse.is_finite() \
             or not favourable.is_finite() or not finite_positive(t.anchor_max_signal_age_seconds) \
-            or not finite_positive(t.anchor_max_quote_age_seconds):
+            or not finite_positive(t.anchor_max_quote_age_seconds) \
+            or stop_distance_limit(t.anchor_max_stop_distance) is None:
         return None, _gate("HOLD", ANCHOR_RULE_INCOMPLETE)
     collar = policy.max_price_deviation_pct
     for name, limit, ceiling in (("ADVERSE", adverse, ANCHOR_MAX_ADVERSE_PCT_CEILING),
@@ -680,11 +708,13 @@ def _entry_anchor(a: TradeAction, q: MappedQuote, policy: MockPolicy, now: datet
                          entry_rule=REFERENCE_AS_COLLAR, entry_anchor=anchor,
                          anchor_series=series, anchor_live=live, entry_limit=limit,
                          anchor_max_quote_age_seconds=t.anchor_max_quote_age_seconds,
-                         anchor_max_signal_age_seconds=t.anchor_max_signal_age_seconds), None
+                         anchor_max_signal_age_seconds=t.anchor_max_signal_age_seconds,
+                         anchor_max_stop_distance=t.anchor_max_stop_distance), None
 
 
 _ANCHOR_FIELDS = {"entry_rule", "entry_anchor", "anchor_series", "anchor_live", "entry_limit",
-                  "anchor_max_quote_age_seconds", "anchor_max_signal_age_seconds"}
+                  "anchor_max_quote_age_seconds", "anchor_max_signal_age_seconds",
+                  "anchor_max_stop_distance"}
 
 
 def _mapped_open(a: TradeAction, q: MappedQuote, policy: MockPolicy, now: datetime,
@@ -781,6 +811,16 @@ def _mapped_open(a: TradeAction, q: MappedQuote, policy: MockPolicy, now: dateti
                                               "basis_reference_mid", "basis_observed_at"}),
                 "backstop_stop": backstop})
     if anchored:
+        # D3: the stop is within the limit of the stated reference (the anchor, in the publisher's
+        # series) and of the proposed limit (in the series the stop is held in).
+        pct = stop_distance_limit(anchored.anchor_max_stop_distance)
+        point = (anchored.entry_limit if plan.protection_series == "EXECUTION"
+                 else anchored.anchor_live)
+        far = (stop_distance_problem(stop, anchored.entry_anchor, pct,
+                                     ANCHOR_STOP_TOO_FAR_FROM_REFERENCE)
+               or stop_distance_problem(plan.stop, point, pct, ANCHOR_STOP_TOO_FAR_FROM_LIMIT))
+        if far:
+            return _gate("HOLD", *far)
         # The entry is the live marketable limit; the publisher's level is recorded as the anchor.
         plan = plan.model_copy(update={
             **anchored.model_dump(include=_ANCHOR_FIELDS), "entry_reference": None,
@@ -858,6 +898,16 @@ def _mapped_follow_up(a: TradeAction, q: MappedQuote, policy: MockPolicy,
             if prior_stop is None:  # an anchored add never adds to an unprotected idea
                 return _gate("HOLD", "PROTECTIVE_STOP_MISSING")
             entry = anchored.entry_limit
+            # D3 for an add: the idea's stop against the anchor (DIRECT: one series) and the limit
+            # (held in the execution series unless it is a reference trigger).
+            pct = stop_distance_limit(anchored.anchor_max_stop_distance)
+            far = ((stop_distance_problem(prior_stop, anchored.entry_anchor, pct,
+                                          ANCHOR_STOP_TOO_FAR_FROM_REFERENCE)
+                    if t.basis == "DIRECT" else [])
+                   or stop_distance_problem(prior_stop, anchored.anchor_live if reference_series
+                                            else entry, pct, ANCHOR_STOP_TOO_FAR_FROM_LIMIT))
+            if far:
+                return _gate("HOLD", *far)
             if t.basis == "BASIS_SHIFT":  # both legs live and near-simultaneous, recorded
                 shifted, reasons = _basis(q, now)
                 if shifted is None:

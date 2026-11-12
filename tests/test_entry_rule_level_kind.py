@@ -194,14 +194,21 @@ def test_without_a_stated_level_nothing_is_classified(tmp_path):
     ("The bond ETF is heavy.", "MARKET_NOUN"),
     ("Stocks are heavy.", "INSTRUMENT_PHRASE"),
 ])
-def test_an_unresolved_market_mention_holds_the_single_market_post(tmp_path, extra, kind):
-    d = decide(two_families(tmp_path), post=POST.replace(NOTE, f"{NOTE} {extra}"))
+def test_an_unresolved_market_mention_holds_only_with_a_trading_context(tmp_path, extra, kind):
+    """Owner, 12 November 2026 (DECIDED 7): a mention alone no longer holds; with a price-like
+    level in its own sentence it does (RULE:MENTION_WITH_CONTEXT)."""
+    plain = decide(two_families(tmp_path), post=POST.replace(NOTE, f"{NOTE} {extra}"))
+    assert plain.status == "SUPPORTED", plain.reason
+    quoted = extra.replace(".", " at 12.50.", 1) if not extra.endswith("here.") else \
+        extra.replace("here.", "at 12.50.")
+    d = decide(two_families(tmp_path), post=POST.replace(NOTE, f"{NOTE} {quoted}"))
     assert d.status == "UNRESOLVED" and d.entry_anchor is None, d.reason
-    assert d.reason.split(",")[0] == UNRESOLVED and f"MENTION:{kind}" in d.reason, d.reason
+    assert d.reason.split(",")[:2] == [UNRESOLVED, "RULE:MENTION_WITH_CONTEXT"], d.reason
+    assert f"MENTION:{kind}" in d.reason, d.reason
 
 
 @pytest.mark.parametrize("extra", [
-    "We are NOW long, STOP below the lows.",  # emphasised words the anchor rule understands
+    "The STOP is set, NOW.",  # emphasised words the anchor rule understands
     "The Fed meets in December.",  # a non-market proper noun
     "See you on Monday, I'm out.",
     "$QETF shares look cheap.",  # an instrument noun headed by this family
@@ -222,9 +229,9 @@ def test_an_emphasised_understood_word_in_the_instruction_still_anchors(tmp_path
 
 def test_a_private_alias_or_non_market_word_resolves_a_mention(tmp_path):
     p = two_families(tmp_path)
-    bonds = POST.replace(NOTE, f"{NOTE} Treasuries are firm.")
+    bonds = POST.replace(NOTE, f"{NOTE} Treasuries are firm at 98.10.")  # with a level
     assert decide(p, post=bonds).reason.split(",")[0] == UNRESOLVED
-    person = POST.replace(NOTE, f"{NOTE} We spoke with Qorvaline.")
+    person = POST.replace(NOTE, f"{NOTE} We spoke with Qorvaline at 12.50.")
     assert decide(p, post=person).reason.split(",")[0] == UNRESOLVED
     p.anchor_lexicon = AnchorLexicon(family_aliases={"QETF": ["treasuries"]},
                                      non_market_words=["qorvaline"])

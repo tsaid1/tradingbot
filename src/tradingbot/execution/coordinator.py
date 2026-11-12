@@ -78,10 +78,13 @@ from tradingbot.validator import (
     ANCHOR_MAX_QUOTE_AGE_CEILING_SECONDS,
     ANCHOR_RULE_INCOMPLETE,
     ANCHOR_SIGNAL_TOO_OLD,
+    ANCHOR_STOP_TOO_FAR_FROM_LIMIT,
     anchor_quote_problem,
     fill_quantity,
     finite_positive,
     source_is_fresh,
+    stop_distance_limit,
+    stop_distance_problem,
 )
 
 UNPROTECTED_POSITION = "UNPROTECTED_POSITION"
@@ -272,6 +275,18 @@ def _anchored_limit(plan: ExecutionPlan | None) -> Decimal | None:
 def _anchor_quote_age(plan: ExecutionPlan | None) -> float | None:
     """The per-side quote freshness of an anchored entry's plan (None otherwise)."""
     return plan.anchor_max_quote_age_seconds if _anchored_limit(plan) is not None else None
+
+
+def _held_stop(plan: ExecutionPlan | None, stop: Decimal | None) -> Decimal | None:
+    """The stop an anchored entry's limit is checked against at the execution core (D3): held in
+    the execution series; a reference-series stop is the gateway's to check."""
+    if _anchored_limit(plan) is None or plan.protection_series != "EXECUTION":
+        return None
+    return stop
+
+
+def _stop_spec(plan: ExecutionPlan | None) -> str | None:
+    return plan.anchor_max_stop_distance if plan is not None else None
 
 
 def _plan_of(raw: str | None) -> ExecutionPlan | None:
@@ -940,7 +955,10 @@ class ExecutionCoordinator:
             return self._refuse(source, action, gate, ref, account, rules, now)
         limit, reasons = self._entry_checks(contract, side, qty, entry_level, idea_id, now,
                                             fixed_limit=_anchored_limit(plan),
-                                            anchor_quote_age=_anchor_quote_age(plan))
+                                            anchor_quote_age=_anchor_quote_age(plan),
+                                            anchor_stop=_held_stop(plan, plan.stop if plan
+                                                                   else None),
+                                            anchor_stop_distance=_stop_spec(plan))
         if reasons:
             return self._refuse(source, action, gate, ref, account, reasons, now, idea_id=idea_id)
         exit_side = OrderSide.SELL if long else OrderSide.BUY
@@ -1127,6 +1145,8 @@ class ExecutionCoordinator:
         limit, reasons = self._entry_checks(
             contract, side, qty, entry_level, pos.idea_id, now, fixed_limit=_anchored_limit(plan),
             anchor_quote_age=_anchor_quote_age(plan),
+            anchor_stop=_held_stop(plan, _dec(pos.stop_price)),
+            anchor_stop_distance=_stop_spec(plan),
         )
         if reasons:
             return self._refuse(
@@ -1772,6 +1792,9 @@ class ExecutionCoordinator:
             contract, OrderSide(intent.side), intent.quantity, reference,
             intent.idea_id, now, exclude_ref=intent.order_ref, fixed_limit=fixed,
             anchor_quote_age=_anchor_quote_age(plan),
+            anchor_stop=_held_stop(plan, (plan.stop if plan is not None else None)
+                                   if intent.action == Action.OPEN else _dec(pos.stop_price)),
+            anchor_stop_distance=_stop_spec(plan),
         )
         if reasons:
             return reasons
@@ -2583,6 +2606,8 @@ class ExecutionCoordinator:
         exclude_ref: str | None = None,
         fixed_limit: Decimal | None = None,
         anchor_quote_age: float | None = None,
+        anchor_stop: Decimal | None = None,
+        anchor_stop_distance: str | None = None,
     ) -> tuple[Decimal | None, list[str]]:
         """Broker-quote sanity, the price collar and exposure caps, before any entry or add.
         Returns the collar-bounded limit price, or the reasons to refuse. ``fixed_limit`` is the
@@ -2632,6 +2657,14 @@ class ExecutionCoordinator:
             if buy
             else snap_to_tick(ref * (1 - band), contract.min_tick, ROUND_CEILING)
         )
+        if fixed_limit is not None and anchor_stop is not None:
+            # D3 again at the last check: the held stop within the limit of the limit sent.
+            pct = stop_distance_limit(anchor_stop_distance)
+            if pct is None:
+                return None, [ANCHOR_RULE_INCOMPLETE]
+            far = stop_distance_problem(anchor_stop, limit, pct, ANCHOR_STOP_TOO_FAR_FROM_LIMIT)
+            if far:
+                return None, far
         mult = contract.multiplier
         pos = self.store.position(idea_id)
         idea_notional = price * ((pos.quantity if pos else 0) + qty) * mult

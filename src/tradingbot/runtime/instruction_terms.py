@@ -883,3 +883,50 @@ def protective_sentence_problem(sentence: str, own_values: set[Decimal], extra=(
         if tag is None and w not in PROTECTIVE_WORDS:
             return "WORD"
     return None if numbers else "NO_LEVEL"
+
+
+# ------------------------------------------------------------------ competing actionable markets
+#
+# The owner's decision of 12 November 2026 (DECIDED 7): a mention the bot cannot tie to this family
+# holds a SINGLE_MARKET_POST post only when the post "may contain multiple actionable instruments".
+# Two closed tests, from the generic lists the anchor rule already uses; no scoring.
+#
+# Instruction words: a side, add, reduce or exit word in its present or imperative form. A past
+# form ("bought", "sold") reports, it does not instruct; "close" is a chart level for the anchor rule
+# (NOT_CURRENT_WORDS) and is not counted; a hyphenated token ("long-term", "short-dated") is one
+# word and is not counted.
+INSTRUCTION_WORDS = frozenset((
+    *(w for ws in SIDE_WORDS.values() for w in ws), *ADD_WORDS,
+    "reduce", "reducing", "trim", "trimming", "exit", "exiting", "cover", "covering",
+))
+# Action semantics around a mention: an instruction word, or a stop or target word.
+ACTION_SEMANTIC_WORDS = INSTRUCTION_WORDS | STOP_TARGET_WORDS
+_YEAR_RE = re.compile(r"^(?:19|20)\d{2}$")
+
+
+def instruction_word_in(sentence: str, words=INSTRUCTION_WORDS) -> bool:
+    """Whether ``sentence`` holds one of ``words`` as a whole token (case-insensitive)."""
+    return any(_word(t).lstrip("#") in words for t in _TOKEN_RE.findall(sentence or ""))
+
+
+def price_like_level(sentence: str, markers) -> bool:
+    """Whether ``sentence`` pairs something with a price-like level: a number written as a price
+    (a decimal, a thousands separator or a currency sign), a number with a present-market marker
+    attached, or a number after "at" / "@". A percentage, a year, a date (a contract month) or a
+    plain count is not a price-like level."""
+    if marked_numbers(sentence, markers):
+        return True
+    spans = extract_terms(sentence).month_spans
+    tokens = [(m.start(), m.group(0)) for m in _TOKEN_RE.finditer(sentence or "")]
+    for k, (start, tok) in enumerate(tokens):
+        if any(a <= start < b for a, b in spans):
+            continue
+        t = tok.strip(_EDGE)
+        n = _NUMBER_RE.match(t.lstrip("~"))
+        if not n or n.group(3) or _YEAR_RE.match(t):
+            continue
+        written_as_price = t.startswith("$") or n.group(2) or "," in n.group(1)
+        after_at = k > 0 and _word(tokens[k - 1][1]) in ("at", "@")
+        if written_as_price or after_at:
+            return True
+    return False
