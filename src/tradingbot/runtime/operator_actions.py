@@ -105,7 +105,7 @@ class OperatorQueue:
         finally:
             conn.close()
 
-    def submit(
+    def enqueue(
         self,
         *,
         at: datetime,
