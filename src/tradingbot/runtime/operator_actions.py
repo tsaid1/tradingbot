@@ -4,14 +4,14 @@
 and DELETE): ``operator_requests`` (who, when, which action on which target, the declared outcome,
 the note and the typed confirmation) and ``operator_results`` (applied or refused, the reasons and
 the state before and after). A request is checked here for form and confirmation and applied later
-by the process that holds the execution store (the running service, or ``scripts/operator.py
+by the process that holds the execution store (the running service, or ``scripts/tb_operator.py
 apply`` while the service is stopped), which checks it again against the broker.
 
 No action in this queue sends, amends or cancels an order. Each one only records what a human has
 established at the broker, or closes a record that blocks nothing, or lifts a lockout.
 
 Review F3: the queue is created only by an explicit initialisation step
-(``OperatorQueue.initialise``, ``scripts/operator.py init``); opening a missing, unreadable or
+(``OperatorQueue.initialise``, ``scripts/tb_operator.py init``); opening a missing, unreadable or
 corrupt queue raises ``OperatorQueueUnavailable`` and never recreates it. Every request carries a
 globally unique ``uid`` (the integer ``id`` is only a display counter and restarts with a new
 queue); the execution journal records results under the ``uid``.

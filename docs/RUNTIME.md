@@ -107,7 +107,7 @@ cleared, a revoked mapping with an open position, a roll due, repeated source or
 a stalled cursor, a broker identity lockout. One alert per key; notified when it opens, again every
 `realert_seconds` while open, resolved when its cause is gone. Channels are registered by name
 (`log`, `alerts_file`, `macos`); a new one is a module in `tradingbot/runtime/channels/` and a
-config entry. `scripts/watchdog.py` alerts on a stale heartbeat.
+config entry. `scripts/tb_watchdog.py` alerts on a stale heartbeat.
 
 **Broker session:** a failed probe marks the session lost (`BROKER_RECONNECT_PENDING` refuses
 every OPEN and ADD, protection becomes UNKNOWN). Reconnection is retried on the broker backoff and
@@ -116,7 +116,7 @@ the broker and engages the halt. The block lifts only after a full sync and a re
 nothing unexplained; what changed meanwhile is adopted from broker evidence and reported
 (`BROKER_RECONNECTED`).
 
-**Operator actions** (`scripts/operator.py`, dashboard page *Exceptions*) are queued and applied
+**Operator actions** (`scripts/tb_operator.py`, dashboard page *Exceptions*) are queued and applied
 at the start of the next cycle; see `docs/OPERATIONS.md`. Every publisher-driven REDUCE, CLOSE or MODIFY refused because the halt is engaged sends
 `HALTED_ACTION_REFUSED` naming the idea, action and order ref (identifiers and reason codes only). Post text is never stored; the journal keeps hashes, identities, reason codes and
 timestamps for every stage (published, received, interpreted, gate decided, submitted,

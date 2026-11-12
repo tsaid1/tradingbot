@@ -1,7 +1,7 @@
 """The exception register: every open item that needs a human, the action that resolves it, and
 the resolved history. Read-only: every database is opened ``mode=ro`` (a missing file reads as
 empty); nothing here writes, decides or calls a broker. Used by the dashboard's Exceptions page and
-``scripts/operator.py list``.
+``scripts/tb_operator.py list``.
 """
 
 from __future__ import annotations

@@ -27,7 +27,7 @@ case "${1:-}" in
     wait "$PIPE_PID"
     ;;
   watchdog)
-    "$TRADINGBOT_PYTHON" scripts/watchdog.py --config "$TRADINGBOT_RUNTIME_CONFIG" 2>&1 \
+    "$TRADINGBOT_PYTHON" scripts/tb_watchdog.py --config "$TRADINGBOT_RUNTIME_CONFIG" 2>&1 \
       | "$TRADINGBOT_PYTHON" scripts/rotating_log.py "$LOG_DIR/watchdog.log" --max-bytes 1000000
     ;;
   *)

@@ -564,8 +564,8 @@ class RuntimeService:
             f"{problem}: the operator queue {self.config.operator_db} is unusable, so no operator "
             "request is applied; the trading loop, exits, protection upkeep and the heartbeat "
             "keep running. " + (
-                "Run `scripts/operator.py init` once." if problem == "QUEUE_NOT_INITIALISED"
-                else "Restore the queue file, or initialise a new one with `scripts/operator.py "
+                "Run `scripts/tb_operator.py init` once." if problem == "QUEUE_NOT_INITIALISED"
+                else "Restore the queue file, or initialise a new one with `scripts/tb_operator.py "
                 "init --replace-lost` after checking the request history."
             ), now,
         )

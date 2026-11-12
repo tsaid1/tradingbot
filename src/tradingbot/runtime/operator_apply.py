@@ -1,5 +1,5 @@
 """Apply queued operator requests (``runtime.operator_actions``) in the process that holds the
-execution store: the running service each cycle, or ``scripts/operator.py apply`` while it is
+execution store: the running service each cycle, or ``scripts/tb_operator.py apply`` while it is
 stopped. Every request ends with exactly one appended result; nothing here sends an order.
 """
 

@@ -70,7 +70,7 @@ try:
 except Q.OperatorQueueUnavailable as exc:  # never created or repaired from here (review F3)
     queue = None
     st.error(f"Operator actions disabled: the operator queue is unavailable ({exc}). Run "
-             "`scripts/operator.py init` once, or restore the queue; see docs/OPERATIONS.md.")
+             "`scripts/tb_operator.py init` once, or restore the queue; see docs/OPERATIONS.md.")
 
 
 def queue_request(**fields) -> None:

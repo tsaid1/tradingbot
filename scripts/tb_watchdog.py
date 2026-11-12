@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Heartbeat watchdog: alert when the runtime service stops writing its heartbeat.
 
-    PYTHONPATH=src python scripts/watchdog.py --config runtime.toml [--max-age 300]
+    PYTHONPATH=src python scripts/tb_watchdog.py --config runtime.toml [--max-age 300]
 
 Run it on a schedule (the launchd template runs it every 60 s). It reads
 ``<state_dir>/heartbeat.json`` and nothing else of the service's state; it never touches a broker.

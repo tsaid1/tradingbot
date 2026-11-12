@@ -1,14 +1,14 @@
 # Operations runbook (mock mode)
 
 Three processes: the **service** (`scripts/run_service.py`), the **watchdog**
-(`scripts/watchdog.py`, every 60 s) and the **dashboard** (`streamlit run dashboard/app.py`, pages
+(`scripts/tb_watchdog.py`, every 60 s) and the **dashboard** (`streamlit run dashboard/app.py`, pages
 *Execution* and *Exceptions*). All read one runtime TOML (`TRADINGBOT_RUNTIME_CONFIG`, default
 `~/.config/tradingbot/runtime.toml`). Only the simulated broker exists; no operator action below
 sends an order.
 
 ## Start and stop
 
-* Once, before the first start: `PYTHONPATH=src python scripts/operator.py --config <toml> init`
+* Once, before the first start: `PYTHONPATH=src python scripts/tb_operator.py --config <toml> init`
   creates the operator queue (`<state_dir>/operator.sqlite3`). Nothing else creates it: the
   service, the CLI and the dashboard only open an existing queue. Without it the service runs, but
   operator actions are disabled and `OPERATOR_QUEUE_UNAVAILABLE` stays open.
@@ -55,16 +55,16 @@ an alert.
 | `ROLL_DUE_FLATTEN_REQUIRED` | A futures position is inside its roll window. | Flatten or roll it by a new instruction. |
 | `SOURCE_FAILURE`, `PIPELINE_FAILURE` | The source or the processing of a post has failed repeatedly. The cursor does not move. | See Source outage below. |
 | `SOURCE_STALLED` | The cursor has not moved during the activity window. | Check the source account and token. |
-| `OPERATOR_QUEUE_UNAVAILABLE` | The operator queue is not initialised (`QUEUE_NOT_INITIALISED`), missing although the execution journal shows it was used (`QUEUE_LOST`), or unreadable or corrupt (`QUEUE_UNREADABLE`). No operator request is applied; trading, exits, protection upkeep and the heartbeat carry on. | Not initialised: run `operator.py init`. Lost or corrupt: restore the file from where it went; if that is impossible, move the broken file aside and run `operator.py init --replace-lost`. Request ids are globally unique, so a new queue's requests can never be matched to old results. |
+| `OPERATOR_QUEUE_UNAVAILABLE` | The operator queue is not initialised (`QUEUE_NOT_INITIALISED`), missing although the execution journal shows it was used (`QUEUE_LOST`), or unreadable or corrupt (`QUEUE_UNREADABLE`). No operator request is applied; trading, exits, protection upkeep and the heartbeat carry on. | Not initialised: run `tb_operator.py init`. Lost or corrupt: restore the file from where it went; if that is impossible, move the broken file aside and run `tb_operator.py init --replace-lost`. Request ids are globally unique, so a new queue's requests can never be matched to old results. |
 | `HEARTBEAT_STALE` / `_RESTORED` | From the watchdog: the service has stopped, or is hung. | Check `launchctl list`, the service log and the lock holder. |
 | `HALT_ENGAGED` / `HALT_CLEARED` | The halt file appeared or went away. | Confirm that you meant it. |
 
-## Operator actions (CLI `scripts/operator.py`, or the *Exceptions* page)
+## Operator actions (CLI `scripts/tb_operator.py`, or the *Exceptions* page)
 
 Every action needs a note and the exact confirmation words. It is queued append-only in
 `<state_dir>/operator.sqlite3` and applied by the process that holds the execution store: the
-running service on its next cycle, or `operator.py apply` while the service is stopped. Results
-show under `operator.py history` and on the page. Each request has a globally unique id (`uid`);
+running service on its next cycle, or `tb_operator.py apply` while the service is stopped. Results
+show under `tb_operator.py history` and on the page. Each request has a globally unique id (`uid`);
 the execution journal records the result under that id with its target and outcome, so a request
 is applied exactly once and never answered with another request's result. Your note is kept in
 the queue and, with its hash, in the local execution journal, so your reasoning survives the loss

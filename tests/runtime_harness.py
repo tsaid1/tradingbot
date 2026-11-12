@@ -159,7 +159,7 @@ class Runtime:
             else:
                 raw[key] = value
         self.config: RuntimeConfig = parse_config(raw, base=self.folder)
-        # The explicit initialisation step a deployment runs once (scripts/operator.py init).
+        # The explicit initialisation step a deployment runs once (scripts/tb_operator.py init).
         OperatorQueue.initialise(self.config.operator_db)
         self.notifier = RecordingNotifier()
         self.restart()

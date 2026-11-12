@@ -1,4 +1,4 @@
-"""Heartbeat watchdog (``scripts/watchdog.py``): alert when the service stops writing its heartbeat.
+"""Heartbeat watchdog (``scripts/tb_watchdog.py``): alert when the service stops writing its heartbeat.
 
 It reads ``<state_dir>/heartbeat.json`` and nothing else of the service's state, and never touches a
 broker. De-duplication: one HEARTBEAT_STALE when the heartbeat goes missing or stale, again every

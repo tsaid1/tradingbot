@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """Operator actions on the runtime service's state (mock mode). None of them sends an order.
 
-    PYTHONPATH=src python scripts/operator.py --config runtime.toml init
-    PYTHONPATH=src python scripts/operator.py --config runtime.toml list
-    PYTHONPATH=src python scripts/operator.py --config runtime.toml settle TB-... NOT_AT_BROKER \\
+    PYTHONPATH=src python scripts/tb_operator.py --config runtime.toml init
+    PYTHONPATH=src python scripts/tb_operator.py --config runtime.toml list
+    PYTHONPATH=src python scripts/tb_operator.py --config runtime.toml settle TB-... NOT_AT_BROKER \\
         --note "checked TWS: no such order" --confirm "SETTLE TB-... NOT_AT_BROKER"
-    PYTHONPATH=src python scripts/operator.py --config runtime.toml settle TB-... FILLED \\
+    PYTHONPATH=src python scripts/tb_operator.py --config runtime.toml settle TB-... FILLED \\
         --quantity 2 --price 88.42 --note "..." --confirm "SETTLE TB-... FILLED 2 @ 88.42"
-    PYTHONPATH=src python scripts/operator.py --config runtime.toml clear 7 LEDGER_REVERSAL ...
-    PYTHONPATH=src python scripts/operator.py --config runtime.toml ack 9 EXIT_WITHOUT_QUOTE ...
-    PYTHONPATH=src python scripts/operator.py --config runtime.toml ack-signal 3 SIGNAL_HOLD ...
-    PYTHONPATH=src python scripts/operator.py --config runtime.toml clear-lockout SIM-PAPER-0001 ...
-    PYTHONPATH=src python scripts/operator.py --config runtime.toml apply
-    PYTHONPATH=src python scripts/operator.py --config runtime.toml history
+    PYTHONPATH=src python scripts/tb_operator.py --config runtime.toml clear 7 LEDGER_REVERSAL ...
+    PYTHONPATH=src python scripts/tb_operator.py --config runtime.toml ack 9 EXIT_WITHOUT_QUOTE ...
+    PYTHONPATH=src python scripts/tb_operator.py --config runtime.toml ack-signal 3 SIGNAL_HOLD ...
+    PYTHONPATH=src python scripts/tb_operator.py --config runtime.toml clear-lockout SIM-PAPER-0001 ...
+    PYTHONPATH=src python scripts/tb_operator.py --config runtime.toml apply
+    PYTHONPATH=src python scripts/tb_operator.py --config runtime.toml history
 
 Every action is queued (append-only) with its note and typed confirmation, then applied by the
 process that holds the execution store: the running service on its next cycle, or this command at
@@ -145,7 +145,7 @@ def main(argv: list[str] | None = None) -> int:
         queue = Q.OperatorQueue(config.operator_db)
     except Q.OperatorQueueUnavailable as exc:
         print(f"operator queue unavailable ({exc}): operator actions are disabled; run "
-              "`operator.py init` (see docs/OPERATIONS.md)", file=sys.stderr)
+              "`tb_operator.py init` (see docs/OPERATIONS.md)", file=sys.stderr)
         return 2
     if args.cmd == "history":
         print(json.dumps(queue.requests(), indent=2, default=str))
