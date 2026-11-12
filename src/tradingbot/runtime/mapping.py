@@ -297,6 +297,8 @@ class FamilyMapping(StrictModel):
     # example one ETF listed on two venues). Needs a stated reason.
     same_series: StrictBool = False
     same_series_reason: str = ""
+    # same_series only: a micro and its standard contract, the two roots (review N1).
+    equivalent_roots: list[str] = Field(default_factory=list)
     reference: SeriesSpec | None = None
     execution: ExecutionSpec | None = None
     contract_selection: ContractSelection | None = None
@@ -333,6 +335,8 @@ class FamilyMapping(StrictModel):
                 "neither, keeps the version-1 behaviour)")
         if legacy and (self.session or self.roll or self.contracts):
             bad("a stock entry without sizing takes no session, roll or contracts")
+        if self.same_series or self.equivalent_roots:
+            self._check_same_series(bad)
         if self.approved and x.currency != "USD":
             bad("caps are in USD and no FX conversion exists: only USD execution may be approved")
         if self.same_series and self.basis != "DIRECT":
@@ -390,6 +394,28 @@ class FamilyMapping(StrictModel):
         elif self.family.endswith(".OPT"):
             bad("a .OPT family executes an option (sec_type OPT)")
         return self
+
+    def _check_same_series(self, bad) -> None:
+        """same_series joins two futures only (review N1): both FUT, one currency, one root or
+        the two roots of an ``equivalent_roots`` pair (a micro and its standard contract), and a
+        selection that uses the month the instruction names, so a level quoted for one month is
+        never applied to another. An index, a spot commodity, a CFD, a stock or an ETF on either
+        side refuses: a stock or ETF quoted in its own price needs no flag."""
+        x, ref = self.execution, self.reference
+        rule = "same_series joins two futures of one underlying only"
+        if not self.same_series:
+            bad(f"{rule}: equivalent_roots is used only with same_series = true")
+        if ref.sec_type != "FUT" or x.sec_type != "FUT":
+            bad(f"{rule}, not {ref.sec_type} to {x.sec_type}")
+        if ref.currency != x.currency:
+            bad(f"{rule}, in one currency ({ref.currency} != {x.currency})")
+        if ref.symbol != x.symbol and sorted(self.equivalent_roots) != sorted(
+                {ref.symbol, x.symbol}):
+            bad(f"{rule}: roots {ref.symbol} and {x.symbol} differ and are not listed together "
+                "in equivalent_roots")
+        if self.contract_selection is None or self.contract_selection.rule != "EXPLICIT_ONLY":
+            bad(f"{rule}, with contract_selection EXPLICIT_ONLY (the level's month is the "
+                "execution contract's month)")
 
     # ---------------------------------------------------------------- views
 

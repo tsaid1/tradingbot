@@ -23,7 +23,7 @@ ETF. An entry states:
 |---|---|
 | `basis` | exactly one of `DIRECT`, `BASIS_SHIFT`, `REFERENCE_TRIGGER`, `UNSUPPORTED` |
 | `approved`, `approved_by`, `approved_at` | `false` by default. An approval is the TOML boolean `true` (not `"yes"`, `1` or `"true"`) with a non-blank `approved_by` and an `approved_at` date-time with its UTC offset, not in the future |
-| `same_series`, `same_series_reason` | DIRECT only: the reference and execution identities differ but are one price series (one ETF on two venues). Needs the reason |
+| `same_series`, `same_series_reason`, `equivalent_roots` | DIRECT only: the reference and the execution future are one price series. Legal only between two futures in one currency, with one root or the two roots listed in `equivalent_roots` (a micro and its standard contract), and `contract_selection = EXPLICIT_ONLY`. Needs the reason |
 | `reference` | the series the levels are quoted in: `sec_type` (`STK`, `FUT`, `OPT`, `CMDTY`, `CFD`, `IND`), `symbol`, `exchange`, `currency` |
 | `execution` | the instrument traded: the same fields plus the expected `multiplier`, `min_tick` and `size_increment`. The broker's resolved contract must agree, or the action is held (`CONTRACT_SPEC_MISMATCH`) |
 | `contract_selection`, `contracts` | futures only. `EXPLICIT_ONLY` (the instruction names the month) or `EXPLICIT_OR_NEAREST` (a named month, otherwise the nearest listed month with at least `min_business_days_to_roll` business days before its configured `roll_date`) |
@@ -86,10 +86,12 @@ quote. Version-1 files still load.
 ETF, the option premium. The gateway checks entry, stop and target against the execution quote,
 and requires them on its tick. Levels the interpreter marked as belonging to another series
 (`SOURCE_SERIES`) are refused, as on the stock path (`SOURCE_TO_BROKER_PRICE_BASIS_UNRESOLVED`),
-unless the entry declares `same_series = true`. That declaration asserts that the reference series
-the publisher quotes (for example a futures contract month) and the execution instrument's price
-are one and the same series (for example a micro contract on that underlying), so its levels are
-execution prices and get every check above in that one series. It is part of what the owner
+unless the entry declares `same_series = true`. That declaration asserts that the futures contract
+month the publisher quotes and the execution future's price are one and the same series (a micro
+and its standard contract, same month), so its levels are execution prices and get every check
+above in that one series. It may join only two futures in one currency with one root or an
+`equivalent_roots` pair, selected `EXPLICIT_ONLY`; anything involving an index, a spot commodity,
+a CFD, a stock or an ETF refuses to load (a stock or ETF quoted in its own price needs no flag). It is part of what the owner
 approves, together with its stated reason, and the contract-month rules then apply in full: a level
 is used only in the month the instruction names or the selection rule picks.
 *Risk:* the publisher's "front month" may not be the month the

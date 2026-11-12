@@ -628,14 +628,14 @@ def entry(family, basis, reference, execution, extra="", approval=APP):
            'sec_type = "CFD", symbol = "QMC", exchange = "X", currency = "USD"',
            'basis_shift = { max_abs_basis = "20", max_age_seconds = 5 }\n'), "scale_ratio"),
     # A declared same series needs its reason.
-    (entry("SPX", "DIRECT", SPY, SPY, 'same_series = true\n'), "same_series_reason"),
+    (entry("SPX", "DIRECT", SPY, SPY, 'same_series = true\n'), "same_series joins"),
     (entry("SPX", "DIRECT", IDX, SPY, 'same_series = true\nsame_series_reason = "x"\n'),
-     "price scale"),
+     "same_series joins"),
     (entry("QMTL", "BASIS_SHIFT",
            'sec_type = "CMDTY", symbol = "QMS", exchange = "X", currency = "USD"',
            'sec_type = "CFD", symbol = "QMC", exchange = "X", currency = "USD"',
            'basis_shift = { max_abs_basis = "20", max_age_seconds = 5, scale_ratio = "1" }\n'
-           'same_series = true\nsame_series_reason = "x"\n'), "only for DIRECT"),
+           'same_series = true\nsame_series_reason = "x"\n'), "same_series joins"),
 ])
 def test_f10_the_loader_refuses_pairs_that_are_not_the_same_series_or_scale(tmp_path, text,
                                                                           match):
@@ -646,10 +646,6 @@ def test_f10_the_loader_refuses_pairs_that_are_not_the_same_series_or_scale(tmp_
 def test_f10_legal_pairs_still_load(tmp_path):
     ok = load(tmp_path, entry("SPY", "DIRECT", SPY, SPY))
     assert ok.entries["SPY"].approved
-    spy_arca = SPY.replace('"SMART"', '"ARCA"')
-    ok = load(tmp_path, entry("SPY", "DIRECT", spy_arca, SPY,
-                              'same_series = true\nsame_series_reason = "one ETF, two venues"\n'))
-    assert ok.entries["SPY"].same_series
     ok = load(tmp_path, entry(
         "QMTL", "BASIS_SHIFT", 'sec_type = "CMDTY", symbol = "QMS", exchange = "X", currency = "USD"',
         'sec_type = "CFD", symbol = "QMC", exchange = "X", currency = "USD"',
@@ -701,6 +697,7 @@ approved_by = "o"
 approved_at = 2026-05-29T12:00:00Z
 same_series = true
 same_series_reason = "the micro QMOF trades at the standard QOF contract month's own price"
+equivalent_roots = ["QOF", "QMOF"]
 reference = { sec_type = "FUT", symbol = "QOF", exchange = "SIMNRG", currency = "USD" }
 execution = { sec_type = "FUT", symbol = "QMOF", exchange = "SIMNRG", currency = "USD", multiplier = "10", min_tick = "0.01" }
 contract_selection = { rule = "EXPLICIT_ONLY", min_business_days_to_roll = 6 }
@@ -768,3 +765,52 @@ def test_same_series_reaches_the_gateway_terms(tmp_path):
     assert e.terms(inst, None, None).same_series is True
     tlt_e = MappingPolicy.from_toml(SHIPPED).entries["TLT"]
     assert tlt_e.same_series is False
+
+
+# ================================================================== N1: what same_series may join
+
+FUT_X = 'sec_type = "FUT", symbol = "QMOF", exchange = "SIMNRG", currency = "USD", multiplier = "10", min_tick = "0.01"'
+
+
+def energy_with(reference, execution=FUT_X, extra=""):
+    text = ENERGY.replace(
+        'reference = { sec_type = "FUT", symbol = "QOF", exchange = "SIMNRG", currency = "USD" }',
+        f"reference = {{ {reference} }}")
+    text = text.replace(
+        'execution = { sec_type = "FUT", symbol = "QMOF", exchange = "SIMNRG", currency = "USD", '
+        'multiplier = "10", min_tick = "0.01" }', f"execution = {{ {execution} }}")
+    return text.replace('equivalent_roots = ["QOF", "QMOF"]\n', extra)
+
+
+@pytest.mark.parametrize("text", [
+    # The reviewer's probes: an index, a spot commodity and a CFD declared the same series as a
+    # future, and one ETF declared the same series as another.
+    energy_with('sec_type = "IND", symbol = "QIDX", exchange = "SIMIDX", currency = "USD"'),
+    energy_with('sec_type = "CMDTY", symbol = "QMS", exchange = "SIMSPOT", currency = "USD"'),
+    energy_with('sec_type = "CFD", symbol = "QOC", exchange = "SIMCFD", currency = "USD"'),
+    entry("SPX", "DIRECT", SPY, SPY.replace('"SPY"', '"IVV"'),
+          'same_series = true\nsame_series_reason = "they track the same index"\n'),
+    entry("SPY", "DIRECT", SPY.replace('"SMART"', '"ARCA"'), SPY,
+          'same_series = true\nsame_series_reason = "one ETF, two venues"\n'),
+    # Two futures with different roots and no equivalent_roots pair; another currency; a pair
+    # that does not name both roots; a selection rule that could put the level in another month.
+    energy_with('sec_type = "FUT", symbol = "QOF", exchange = "SIMNRG", currency = "USD"'),
+    energy_with('sec_type = "FUT", symbol = "QOF", exchange = "SIMNRG", currency = "EUR"',
+                extra='equivalent_roots = ["QOF", "QMOF"]\n'),
+    energy_with('sec_type = "FUT", symbol = "QOF", exchange = "SIMNRG", currency = "USD"',
+                extra='equivalent_roots = ["QOF", "QXX"]\n'),
+    ENERGY.replace('rule = "EXPLICIT_ONLY"', 'rule = "EXPLICIT_OR_NEAREST"'),
+])
+def test_n1_same_series_refuses_anything_but_two_equivalent_futures(tmp_path, text):
+    with pytest.raises(ValueError, match="same_series joins"):
+        load(tmp_path, text)
+
+
+def test_n1_a_micro_and_its_standard_future_may_be_declared_one_series(tmp_path):
+    e = load(tmp_path, ENERGY).entries["QNRG"]
+    assert e.same_series and e.equivalent_roots == ["QOF", "QMOF"]
+    same_root = energy_with('sec_type = "FUT", symbol = "QMOF", exchange = "SIMNRG", '
+                            'currency = "USD"')
+    assert load(tmp_path, same_root).entries["QNRG"].same_series
+    # A stock quoted in its own price needs no flag.
+    assert not load(tmp_path, entry("SPY", "DIRECT", SPY, SPY)).entries["SPY"].same_series

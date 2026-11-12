@@ -63,6 +63,7 @@ execution = { sec_type = "STK", asset_class = "ETF", symbol = "TLT", exchange = 
 # note = "EXAMPLE: the publisher quotes the named contract month itself."
 # same_series = true
 # same_series_reason = "EXAMPLE: the micro trades at the standard contract month's own price"
+# equivalent_roots = ["EXOIL", "EXMOIL"]   # same_series joins two futures of one underlying only
 # reference = { sec_type = "FUT", symbol = "EXOIL", exchange = "EXAMPLE", currency = "USD" }
 # execution = { sec_type = "FUT", symbol = "EXMOIL", exchange = "EXAMPLE", currency = "USD", multiplier = "100", min_tick = "0.01" }
 # contract_selection = { rule = "EXPLICIT_ONLY", min_business_days_to_roll = 6 }
