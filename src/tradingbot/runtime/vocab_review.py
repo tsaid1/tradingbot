@@ -93,6 +93,10 @@ CANDIDATE_RUN_MARKER = "CANDIDATE_RUN"
 _FAMILY_RE = re.compile(r"^[A-Z][A-Z0-9]{0,9}(\.OPT)?$")
 # At most this many example sentences per proposal are loaded for display.
 MAX_EXAMPLES = 5
+# A word that held a post through the mention-with-context rule was seen next to a price or a
+# trading word: it may BE another market. Proposed as ambiguous; this warning comes from the
+# review log's evidence, never from a proposals file.
+MAY_BE_MARKET = "seen with a price or a trading word; may be another market"
 
 
 class PrivatePathError(ValueError):
@@ -139,6 +143,15 @@ _SYNCED = (
 )
 
 
+def git_tree_class(path: str | Path) -> str | None:
+    """``OTHER_GIT_WORK_TREE`` when ``path`` lies in a git work tree (one ``check_private_path``
+    allowed: not this program's): the file could be committed there by mistake. A constant,
+    never the path."""
+    p = Path(path).expanduser()
+    return "OTHER_GIT_WORK_TREE" if git_work_tree(
+        Path(os.path.realpath(p.parent))) is not None else None
+
+
 def synced_folder_class(path: str | Path) -> str | None:
     """The class of cloud-synced folder holding ``path`` (a constant, never the path), or None."""
     p = Path(path).expanduser()
@@ -159,18 +172,63 @@ def synced_folder_class(path: str | Path) -> str | None:
     return None
 
 
+def common_git_dir(tree: Path) -> Path | None:
+    """The common git directory of the work tree ``tree`` (its ``.git`` directory, or for a linked
+    worktree the main repository's, through ``.git`` -> ``gitdir`` -> ``commondir``), read from
+    the files only. None when it cannot be read."""
+    dot = tree / ".git"
+    try:
+        if dot.is_dir():
+            git_dir = dot
+        elif dot.is_file():
+            text = dot.read_text(encoding="utf-8").strip()
+            if not text.startswith("gitdir:"):
+                return None
+            git_dir = Path(text.removeprefix("gitdir:").strip())
+            git_dir = git_dir if git_dir.is_absolute() else tree / git_dir
+        else:
+            return None
+        common = git_dir / "commondir"
+        if common.is_file():
+            c = Path(common.read_text(encoding="utf-8").strip())
+            git_dir = c if c.is_absolute() else git_dir / c
+    except OSError:
+        return None
+    return Path(os.path.realpath(git_dir))
+
+
+def code_git_dir() -> Path | None:
+    """The common git directory of the checkout this program runs from (main checkout or linked
+    worktree), or None when it cannot be determined (an installed package, no git)."""
+    return common_git_dir(REPO_ROOT)
+
+
 def check_private_path(path: str | Path, what: str) -> Path:
-    """``path`` with its folders resolved (the last part is not followed), refused when it lies in
-    this repository or any git work tree."""
+    """``path`` with its folders resolved (the last part is not followed). Refused inside this
+    program's repository (its main checkout and every linked worktree of it), inside a ``.git``
+    directory and inside a bare repository; when this program's repository cannot be determined,
+    inside any git work tree (fail closed). A path inside ANY OTHER git work tree is allowed (the
+    Product Owner's decision) and warned by ``git_tree_class``."""
     raw = Path(path).expanduser()
     target = Path(os.path.realpath(raw.parent)) / raw.name
-    if target == REPO_ROOT or REPO_ROOT in target.parents:
-        raise PrivatePathError(f"the {what} must lie outside the repository ({REPO_ROOT}): "
+    root = Path(os.path.realpath(REPO_ROOT))
+    if target == root or root in target.parents:
+        raise PrivatePathError(f"the {what} must lie outside this program's repository ({root}): "
                                "private text never enters the repository tree")
+    if ".git" in target.parent.parts:
+        raise PrivatePathError(f"the {what} may not lie inside a git directory")
     tree = git_work_tree(target.parent)
     if tree is not None:
-        raise PrivatePathError(f"the {what} must lie outside any git work tree (found one at "
-                               f"{tree}): private text must never be committable")
+        code = code_git_dir()
+        if code is None:
+            raise PrivatePathError(
+                f"the {what} lies in a git work tree ({tree}) and this program's repository "
+                "cannot be determined (no git checkout), so every git work tree is refused")
+        theirs = common_git_dir(tree)
+        if theirs is None or theirs == code:
+            raise PrivatePathError(
+                f"the {what} must lie outside this program's repository: {tree} is a work tree "
+                "of it (or its git directory cannot be read)")
     bare = bare_repository(target.parent)
     if bare is not None:
         raise PrivatePathError(f"the {what} must lie outside any bare git repository (found one "
@@ -293,6 +351,7 @@ class Candidate:
     reasons: list[str] = field(default_factory=list)
     sentences: list[tuple[str, str]] = field(default_factory=list)  # at most MAX_EXAMPLES
     refs: list[dict] = field(default_factory=list)  # {source_id, action_id}, at most MAX_EXAMPLES
+    may_be_market: bool = False  # held a post through the mention-with-context rule
 
 
 def normalise(token: str) -> str:
@@ -315,6 +374,21 @@ def known_words(lexicon_path: str | Path | None) -> set[str]:
     return out
 
 
+def _mention_with_context(entry: dict) -> bool:
+    """A review-log line of a mention hold that needed a trading context (or one logged before
+    the rule detail existed): the word was seen with a price or a trading word."""
+    if entry.get("reason_code") != "ENTRY_ANCHOR_POST_UNRESOLVED_MARKET":
+        return False
+    detail = [str(d) for d in entry.get("reason_detail") or ()]
+    return "RULE:MENTION_WITH_CONTEXT" in detail or not any(d.startswith("RULE:") for d in detail)
+
+
+def market_warning_words(entries: list[dict]) -> set[str]:
+    """The words the review log saw in a mention-with-context hold."""
+    return {normalise(t["token"]) for e in entries if _mention_with_context(e)
+            for t in e.get("tokens") or () if isinstance(t, dict) and t.get("token")}
+
+
 def candidates(entries: list[dict], *, lexicon_path: str | Path | None = None) -> list[Candidate]:
     """The words to review, by (word, kind): held posts, holds, families, reason codes and the
     sentences that hold the word. A word already in the lexicon or marked a different market is
@@ -334,6 +408,7 @@ def candidates(entries: list[dict], *, lexicon_path: str | Path | None = None) -
                 continue
             seen.add(key)
             c = found.setdefault(key, Candidate(*key))
+            c.may_be_market = c.may_be_market or _mention_with_context(e)
             c.holds += 1
             posts.setdefault(key, set()).add(e.get("source_id") or e.get("post_id"))
             if e.get("family") and e["family"] not in c.families:
@@ -380,6 +455,8 @@ class Proposal:
     examples: list[tuple[str, str]] = field(default_factory=list)
     # References into the review log ({source_id[, action_id]}), resolved at display time.
     example_refs: list[dict] = field(default_factory=list)
+    # From the review log's evidence only (``market_warning_words``), never from the file.
+    market_warning: bool = False
 
 
 def _proposal(raw: dict) -> Proposal | None:
@@ -498,7 +575,9 @@ def proposals_from_log(entries: list[dict], *, lexicon_path: str | Path | None =
     for c in candidates(entries, lexicon_path=lexicon_path):
         family = None
         roles = {r for r, _ in c.sentences}
-        if c.kind == "PROPER_NOUN":
+        if c.may_be_market:
+            group = AMBIGUOUS  # seen with a price or a trading word: the owner decides
+        elif c.kind == "PROPER_NOUN":
             group = NON_MARKET
         elif c.kind in ("MARKET_NOUN", "INSTRUMENT_PHRASE") and len(c.families) == 1:
             group, family = MARKET_NAME, c.families[0]
@@ -508,7 +587,8 @@ def proposals_from_log(entries: list[dict], *, lexicon_path: str | Path | None =
             group = AMBIGUOUS
         out.append(Proposal(token=c.token, group=group, family=family, kind=c.kind,
                             posts=c.posts, holds=c.holds, families=list(c.families),
-                            reasons=list(c.reasons), example_refs=list(c.refs)))
+                            reasons=list(c.reasons), example_refs=list(c.refs),
+                            market_warning=c.may_be_market))
     return out
 
 
@@ -523,6 +603,7 @@ class BatchItem:
     group: str
     family: str | None = None
     meaning: str = ""
+    may_be_market: bool = False  # the review log saw it with a price or a trading word
 
 
 @dataclass
@@ -563,6 +644,9 @@ def load_batch(review_log_path, lexicon_path, proposals_path) -> tuple[list[Prop
     path = Path(proposals_path).expanduser()
     if path.exists():
         props, bad_props = read_proposals(path, lexicon_path=lexicon_path)
+        warned = market_warning_words(entries)  # the evidence decides, never the file
+        for p in props:
+            p.market_warning = p.token in warned
         return props, entries, "file", bad + bad_props
     return proposals_from_log(entries, lexicon_path=lexicon_path), entries, "log", bad
 
@@ -574,7 +658,8 @@ def batch_items(proposals: list[Proposal], verdicts: dict[str, Verdict]) -> list
         v = verdicts.get(proposal_id(p)) or Verdict()
         group = v.group if v.group in GROUPS else p.group
         family = (v.family or p.family) if group == MARKET_NAME else None
-        out.append(BatchItem(p.token, v.verdict, group, family, v.meaning))
+        out.append(BatchItem(p.token, v.verdict, group, family, v.meaning,
+                             p.market_warning))
     return out
 
 
@@ -594,7 +679,9 @@ def final_table(items: list[BatchItem]) -> list[dict[str, str]]:
             continue
         rows.append({"word": normalise(i.token), "list": f"entry_anchor.{where}"
                      if i.verdict == ACCEPT and i.group in GROUP_LIST else where,
-                     "family": i.family or "", "effect": effect, "meaning": i.meaning})
+                     "family": i.family or "", "effect": effect, "meaning": i.meaning,
+                     "warning": MAY_BE_MARKET if i.may_be_market and i.verdict == ACCEPT
+                     else ""})
     return sorted(rows, key=lambda r: (r["list"], r["word"]))
 
 

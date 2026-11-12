@@ -175,8 +175,11 @@ def test_a_plain_batch_is_built_from_the_review_log_by_kind():
               [("NEIGHBOUR", "Stop zap 87.2"), ("LEVEL", "Long $TLT, 88.4 now")]),
     ]
     by = {p.token: p for p in V.proposals_from_log(log_entries)}
-    assert by["quentin"].group == V.NON_MARKET
-    assert (by["bonds"].group, by["bonds"].family) == (V.MARKET_NAME, "TLT")
+    # A word that held a post as a market mention may be another market: always ambiguous,
+    # with the warning (follow-up of PR #68; these lines predate the rule detail).
+    assert by["quentin"].group == V.AMBIGUOUS and by["quentin"].market_warning
+    assert (by["bonds"].group, by["bonds"].family) == (V.AMBIGUOUS, None)
+    assert by["bonds"].market_warning and not by["zorbly"].market_warning
     assert by["zorbly"].group == V.INSTRUCTION_PHRASE  # unknown word of the instruction sentence
     assert by["blorp"].group == V.AMBIGUOUS and by["zap"].group == V.AMBIGUOUS
     assert all(p.meaning == "" and p.measured is None for p in by.values())
@@ -340,15 +343,16 @@ def test_a_candidate_is_a_separate_marked_file_and_production_is_untouched(tmp_p
 # ------------------------------------------------------------------ never inside a work tree
 
 
-def test_a_lexicon_inside_a_git_work_tree_is_never_written(tmp_path):
+def test_a_lexicon_inside_this_programs_repository_is_never_written(tmp_path, monkeypatch):
     tree = tmp_path / "tree"
     (tree / ".git").mkdir(parents=True)
     (tree / "sub").mkdir()
+    monkeypatch.setattr(V, "REPO_ROOT", tree)  # an invented checkout of this program
     lex = tree / "sub" / "lexicon.json"
     lex.write_text(json.dumps(LEXICON))
     before = lex.read_bytes()
     r = V.apply_batch(lex, [item("zorbly")], now=NOW)
-    assert r.status == "REFUSED" and "git work tree" in r.message
+    assert r.status == "REFUSED" and "this program's repository" in r.message
     assert V.write_candidate(lex, [item("zorbly")], tmp_path / "c.json", now=NOW).status \
         == "REFUSED"
     assert V.write_candidate(lexicon(tmp_path), [item("zorbly")], tree / "c.json",
@@ -356,14 +360,21 @@ def test_a_lexicon_inside_a_git_work_tree_is_never_written(tmp_path):
     assert lex.read_bytes() == before and V.backups(lex) == []
 
 
-def test_private_paths_inside_the_repository_or_a_work_tree_are_refused(tmp_path):
+def test_private_paths_inside_the_repository_are_refused_and_other_trees_warned(tmp_path,
+                                                                                 monkeypatch):
     with pytest.raises(V.PrivatePathError, match="repository"):
         V.check_private_path(REPO / "state" / "review.jsonl", "review log")
     tree = tmp_path / "w"
     tree.mkdir()
-    (tree / ".git").write_text("gitdir: /elsewhere\n")  # a linked worktree's .git file
-    with pytest.raises(V.PrivatePathError, match="git work tree"):
-        V.check_private_path(tree / "deep" / "review.jsonl", "review log")
+    (tree / ".git").write_text("gitdir: /elsewhere\n")  # a linked worktree of ANOTHER repo
+    target = tree / "deep" / "review.jsonl"
+    assert V.check_private_path(target, "review log") == target.resolve()  # allowed, warned
+    assert V.git_tree_class(target) == "OTHER_GIT_WORK_TREE"
+    monkeypatch.setattr(V, "REPO_ROOT", tmp_path / "w2")
+    (tmp_path / "w2").mkdir()
+    (tmp_path / "w2" / ".git").write_text("gitdir: /elsewhere\n")  # the same repository
+    with pytest.raises(V.PrivatePathError, match="this program's repository"):
+        V.check_private_path(target, "review log")
     ok = V.check_private_path(tmp_path / "private" / "review.jsonl", "review log")
     assert ok == (tmp_path / "private" / "review.jsonl").resolve()
 

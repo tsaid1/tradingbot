@@ -906,17 +906,22 @@ class RuntimeService:
         return len(exceptions), result.duplicate
 
     def _warn_synced_private_paths(self) -> None:
-        """Review S5: a private file in a cloud-synced folder is allowed (the owner's choice) but
-        alerted once at start, by path class only."""
+        """Review S5 and the Product Owner's path policy: a private file in a cloud-synced folder
+        or in a git work tree other than this program's is allowed but alerted once at start, by
+        path class only."""
         now = self.clock()
         for label, path in (("review_log", self.config.interpreter.review_log_path),
                             ("lexicon", self.config.interpreter.lexicon_path)):
-            cls = vocab_review.synced_folder_class(path) if path is not None else None
-            if cls is not None:
-                self.alerter.event(
-                    f"EVENT:{N.PRIVATE_PATH_IN_SYNCED_FOLDER}:{label}:{now.isoformat()}",
-                    N.PRIVATE_PATH_IN_SYNCED_FOLDER, "Private file in a cloud-synced folder",
-                    f"{N.PRIVATE_PATH_IN_SYNCED_FOLDER} {label} {cls}", now)
+            if path is None:
+                continue
+            for kind, title, cls in (
+                    (N.PRIVATE_PATH_IN_SYNCED_FOLDER, "Private file in a cloud-synced folder",
+                     vocab_review.synced_folder_class(path)),
+                    (N.PRIVATE_PATH_IN_OTHER_GIT_TREE, "Private file in another git work tree",
+                     vocab_review.git_tree_class(path))):
+                if cls is not None:
+                    self.alerter.event(f"EVENT:{kind}:{label}:{now.isoformat()}", kind, title,
+                                       f"{kind} {label} {cls}", now)
 
     def _write_review_log(self, post: SourcePost, outcomes, decisions, at: datetime) -> None:
         """The owner's PRIVATE review log: one line per held action whose mapping decision carries
