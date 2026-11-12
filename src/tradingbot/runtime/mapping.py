@@ -52,14 +52,25 @@ from tradingbot.models import (
     StrictModel,
 )
 from tradingbot.runtime.instruction_terms import (
+    MONTH_WORD_RE,
+    PRESENT_MARKERS,
     InstructionTerms,
+    anchor_not_current,
+    check_phrase,
     clause_numbers,
     code_shaped,
     extract_terms,
+    foreign_words,
     leftover_tokens,
     post_multi_leg,
+    relative_contract_words,
 )
-from tradingbot.validator import business_days_until
+from tradingbot.validator import (
+    ANCHOR_MAX_ADVERSE_PCT_CEILING,
+    ANCHOR_MAX_FAVOURABLE_PCT_CEILING,
+    ANCHOR_MAX_SIGNAL_AGE_CEILING_SECONDS,
+    business_days_until,
+)
 
 UNSUPPORTED_INSTRUMENT_MAPPING = "UNSUPPORTED_INSTRUMENT_MAPPING"
 MAPPING_NOT_APPROVED = "MAPPING_NOT_APPROVED"
@@ -79,6 +90,12 @@ ENTRY_ANCHOR_NOT_IN_POST = "ENTRY_ANCHOR_NOT_IN_POST"
 ENTRY_ANCHOR_SOURCE_AMBIGUOUS = "ENTRY_ANCHOR_SOURCE_AMBIGUOUS"
 ENTRY_ANCHOR_INSTRUMENT_AMBIGUOUS = "ENTRY_ANCHOR_INSTRUMENT_AMBIGUOUS"
 ENTRY_ANCHOR_UNEXPLAINED_PRICE = "ENTRY_ANCHOR_UNEXPLAINED_PRICE"
+# The level carries no present-market marker, or its own clause says it is something else (a past
+# or future level, a chart or order level, a condition, a range, a comparison): not an anchor.
+ENTRY_ANCHOR_NOT_CURRENT = "ENTRY_ANCHOR_NOT_CURRENT"
+# A separate level line or attached quote has a word that is not this family's name, alias, a
+# present-market marker or a unit: whose level it is cannot be told.
+ENTRY_ANCHOR_INSTRUMENT_UNCLEAR = "ENTRY_ANCHOR_INSTRUMENT_UNCLEAR"
 # level_contract_rule = FRONT_MONTH: why the front contract cannot be used for an unnamed month.
 FRONT_MONTH_IN_ROLL_WINDOW = "FRONT_MONTH_IN_ROLL_WINDOW"
 FRONT_MONTH_AMBIGUOUS = "FRONT_MONTH_AMBIGUOUS"
@@ -316,14 +333,21 @@ _MOVE = r"^(?:\d+(?:\.\d+)?)%?$"
 class EntryAnchorRules(StrictModel):
     """The limits of entry_rule = REFERENCE_AS_COLLAR. All three are required: there are no
     defaults. A move is a decimal in the anchor's own price units ("2.5") or a percentage of the
-    anchor ("0.5%")."""
+    anchor ("0.5%"). Each has a hard ceiling in code (validator.ANCHOR_MAX_*_CEILING*), which only
+    a code change and its review can raise."""
     # How far the live price may have moved from the anchor in the direction that makes the entry
     # worse (up for a long, down for a short): beyond it the bot would be chasing.
     max_adverse_move: str = Field(pattern=_MOVE)
     # How far it may have moved the other way: beyond it the signal may be stale or misread.
     max_favourable_move: str = Field(pattern=_MOVE)
     # The oldest source post the rule may act on, at the decision.
-    max_signal_age_seconds: int = Field(gt=0, le=3600)
+    max_signal_age_seconds: int = Field(gt=0)
+    # A family whose anchor is compared in a reference series and that has no [basis_shift] (a
+    # REFERENCE_TRIGGER without a backstop): the largest absolute difference allowed between the
+    # live execution and reference quotes at the decision, in execution prices, and the oldest
+    # each quote (and their skew) may be. Otherwise [basis_shift]'s cap is the one used.
+    max_abs_basis: Decimal | None = Field(default=None, gt=0)
+    max_basis_age_seconds: float | None = Field(default=None, gt=0, le=60)
 
     @field_validator("max_adverse_move", "max_favourable_move")
     @classmethod
@@ -331,6 +355,64 @@ class EntryAnchorRules(StrictModel):
         if Decimal(v.rstrip("%")) <= 0:
             raise ValueError(f"move limit {v!r} must be positive")
         return v
+
+    @model_validator(mode="after")
+    def _ceilings(self):
+        for name, v, ceiling in (
+            ("max_adverse_move", self.max_adverse_move, ANCHOR_MAX_ADVERSE_PCT_CEILING),
+            ("max_favourable_move", self.max_favourable_move, ANCHOR_MAX_FAVOURABLE_PCT_CEILING),
+        ):
+            if v.endswith("%") and Decimal(v[:-1]) > ceiling:
+                raise ValueError(f"{name} {v!r} is above its ceiling of {ceiling}% (a code "
+                                 "constant)")
+        if self.max_signal_age_seconds > ANCHOR_MAX_SIGNAL_AGE_CEILING_SECONDS:
+            raise ValueError(f"max_signal_age_seconds {self.max_signal_age_seconds} is above its "
+                             f"ceiling of {ANCHOR_MAX_SIGNAL_AGE_CEILING_SECONDS} s (a code "
+                             "constant)")
+        if (self.max_abs_basis is None) != (self.max_basis_age_seconds is None):
+            raise ValueError("the anchor's basis cap states max_abs_basis and "
+                             "max_basis_age_seconds together")
+        return self
+
+    def absolute_ceiling_problem(self, max_price: Decimal) -> str | None:
+        """An absolute move above its ceiling percentage of the highest entry price this family's
+        sizing can ever approve (max_notional / (units_per_signal x multiplier))."""
+        for name, v, ceiling in (
+            ("max_adverse_move", self.max_adverse_move, ANCHOR_MAX_ADVERSE_PCT_CEILING),
+            ("max_favourable_move", self.max_favourable_move, ANCHOR_MAX_FAVOURABLE_PCT_CEILING),
+        ):
+            if not v.endswith("%") and Decimal(v) > max_price * ceiling / 100:
+                return (f"{name} {v!r} is above its ceiling of {ceiling}% of the highest price "
+                        f"the sizing can buy ({max_price.normalize():f})")
+        return None
+
+
+class AnchorLexicon(StrictModel):
+    """The entry-anchor part of the private lexicon extension (its ``entry_anchor`` section):
+    present-market markers beyond the public list, and names of a family beyond its mapping
+    entry's ``aliases``. Publisher-specific phrasing lives only there. A marker or alias may never
+    contain a disqualifying word, so neither can turn a past, chart or conditional level into an
+    anchor."""
+    present_markers: list[str] = Field(default_factory=list)
+    family_aliases: dict[str, list[str]] = Field(default_factory=dict)
+
+    @field_validator("present_markers")
+    @classmethod
+    def _markers(cls, v):
+        return [check_phrase(m, "present-market marker", 4) for m in v]
+
+    @field_validator("family_aliases")
+    @classmethod
+    def _aliases(cls, v):
+        return {f: [_alias(a) for a in names] for f, names in v.items()}
+
+
+def _alias(a: str) -> str:
+    p = check_phrase(a, "alias", 3)
+    marker_words = {w for m in PRESENT_MARKERS for w in m.split()}
+    if set(p.split()) & marker_words:
+        raise ValueError(f"alias {a!r} contains a present-market marker word")
+    return p
 
 
 class FamilyMapping(StrictModel):
@@ -370,6 +452,15 @@ class FamilyMapping(StrictModel):
     # of this entry's own list (the first listed contract still at least
     # min_business_days_to_roll business days before its roll date), executed in that month.
     level_contract_rule: Literal["EXPLICIT_MONTH_ONLY", "FRONT_MONTH"] = "EXPLICIT_MONTH_ONLY"
+    # Plain-word names of this family (one to three words, for example "crude oil"). With the
+    # entry rule on, a separate level line may name only this family: its code, its series
+    # symbols, these aliases (and the private lexicon's).
+    aliases: list[str] = Field(default_factory=list)
+
+    @field_validator("aliases")
+    @classmethod
+    def _aliases(cls, v):
+        return [_alias(a) for a in v]
 
     @model_validator(mode="after")
     def _consistent(self):
@@ -408,6 +499,8 @@ class FamilyMapping(StrictModel):
         if legacy and collar:
             bad("entry_rule = REFERENCE_AS_COLLAR is decided on the mapped path: state sizing "
                 "and session for this entry")
+        if collar:
+            self._check_anchor_rule(bad)
         if self.same_series or self.equivalent_roots:
             self._check_same_series(bad)
         if self.approved and x.currency != "USD":
@@ -472,6 +565,26 @@ class FamilyMapping(StrictModel):
         elif self.family.endswith(".OPT"):
             bad("a .OPT family executes an option (sec_type OPT)")
         return self
+
+    def _check_anchor_rule(self, bad) -> None:
+        """The anchor's absolute limits within their ceilings, and the basis cap (review F4): an
+        anchor compared in a reference series bounds the execution price only through the live
+        basis, so the entry must state its cap ([basis_shift]'s, or the anchor's own when there is
+        no [basis_shift])."""
+        rules, x, s = self.entry_anchor, self.execution, self.sizing
+        problem = rules.absolute_ceiling_problem(
+            s.max_notional / (s.units_per_signal * x.multiplier))
+        if problem:
+            bad(problem)
+        if self.basis in ("BASIS_SHIFT", "REFERENCE_TRIGGER"):
+            if self.basis_shift is None and rules.max_abs_basis is None:
+                bad("entry_rule = REFERENCE_AS_COLLAR on a reference-series family needs a basis "
+                    "cap: [basis_shift], or entry_anchor max_abs_basis and max_basis_age_seconds")
+            if self.basis_shift is not None and rules.max_abs_basis is not None:
+                bad("the basis cap of this family is [basis_shift]'s: entry_anchor states no "
+                    "second one")
+        elif rules.max_abs_basis is not None:
+            bad("an entry_anchor basis cap is only for a reference-series family")
 
     def _check_same_series(self, bad) -> None:
         """same_series joins two futures only (review N1): both FUT, one currency, one root or
@@ -616,6 +729,9 @@ class FamilyMapping(StrictModel):
             else None,
             anchor_max_signal_age_seconds=self.entry_anchor.max_signal_age_seconds
             if self.entry_anchor else None,
+            anchor_max_abs_basis=self.entry_anchor.max_abs_basis if self.entry_anchor else None,
+            anchor_max_basis_age_seconds=self.entry_anchor.max_basis_age_seconds
+            if self.entry_anchor else None,
             problems=out,
         )
 
@@ -630,10 +746,12 @@ class FamilyMapping(StrictModel):
         held: ContractRef | None,
         post_text: str | None = None,
         anchor: Decimal | None = None,
+        source: str | None = None,
     ) -> tuple[Instrument | None, list[str]]:
         """The execution instrument for this action, or the reasons it cannot be selected.
         ``anchor`` is the stated level accepted as the entry anchor (REFERENCE_AS_COLLAR): the
-        leftover-token rule counts it as read, and nothing else."""
+        leftover-token rule counts it as read, and nothing else. ``source`` is the line or quote
+        it was taken from when that is not the clause: it passes the same contract checks."""
         x = self.execution
         if x.sec_type == "STK":
             exchange = None if x.exchange == "SMART" else x.exchange  # v1: SMART is the default
@@ -641,7 +759,7 @@ class FamilyMapping(StrictModel):
         if x.sec_type in ("CMDTY", "CFD"):
             return Instrument(asset_class=x.asset, symbol=x.symbol, exchange=x.exchange), []
         if x.sec_type == "FUT":
-            return self._select_future(terms, today, held, action, anchor)
+            return self._select_future(terms, today, held, action, anchor, source)
         return self._select_option(asset, terms, held, action, post_text)
 
     def _roots(self) -> set[str]:
@@ -684,11 +802,27 @@ class FamilyMapping(StrictModel):
             return None, [CONTRACT_MONTH_UNRECOGNISED, f"MONTH_NOT_LISTED:{min(named)}"]
         return named, []
 
-    def _select_future(self, terms, today, held, action=None, anchor=None):
+    def _select_future(self, terms, today, held, action=None, anchor=None, source=None):
         x = self.execution
+        new_exposure = action is None or action.action in (Action.OPEN, Action.ADD)
+        # Review F2 (entry anchor): a contract described rather than named ("back month", "next
+        # contract", "roll") is the publisher's choice, not the bot's: HOLD, never the front.
+        line = extract_terms(source) if source and source != terms.clause else None
+        for t in (terms, line) if new_exposure else ():
+            relative = relative_contract_words(t) if t is not None else []
+            if relative:
+                return None, [CONTRACT_MONTH_UNRECOGNISED,
+                              *(f"RELATIVE_CONTRACT:{w}" for w in relative)]
         named, problems = self._named_months(terms, today)
         if problems:
             return None, problems
+        line_named = None
+        if line is not None:
+            # Review F3: the line the anchor is taken from passes the clause's own checks, and a
+            # month it names must be the order's month (checked below).
+            line_named, problems = self._named_months(line, today)
+            if problems:
+                return None, [*problems, "IN_LEVEL_LINE"]
         if held is None and action is not None:
             # Default HOLD (review F2, confirmation): a clause that still names anything after its
             # recognised months and the action's own levels has named something not understood.
@@ -697,6 +831,9 @@ class FamilyMapping(StrictModel):
             if anchor is not None:
                 levels = levels | {anchor}
             leftover = leftover_tokens(terms, levels, fractions, self._roots())
+            if line is not None:  # its numbers are checked by unexplained_prices
+                leftover += [t for t in leftover_tokens(line, levels, fractions, self._roots())
+                             if not any(ch.isdigit() for ch in t)]
             if leftover:
                 return None, [CONTRACT_MONTH_UNRECOGNISED,
                               *(f"UNREAD_TOKEN:{t}" for t in leftover)]
@@ -722,6 +859,9 @@ class FamilyMapping(StrictModel):
             if not eligible:
                 return None, [CONTRACT_SELECTION_AMBIGUOUS, "NO_LISTED_MONTH_OUTSIDE_ROLL_WINDOW"]
             month = eligible[0]
+        if line_named and line_named != {month}:
+            return None, [CONTRACT_MONTH_UNRECOGNISED, f"LEVEL_LINE_MONTH:{min(line_named)}",
+                          f"ORDER_MONTH:{month}"]
         return Instrument(
             asset_class=AssetClass.FUTURE, symbol=x.symbol, exchange=x.exchange,
             futures_contract=month,
@@ -757,6 +897,7 @@ class FamilyMapping(StrictModel):
         levels: list[tuple[str, str]] | None,
         others: list[tuple[str | None, str | None, set[Decimal]]] = (),
         post_text: str | None = None,
+        lexicon: AnchorLexicon | None = None,
     ) -> tuple[Decimal | None, str | None, list[str]]:
         """entry_rule = REFERENCE_AS_COLLAR: the stated market level that may anchor this action's
         entry, the text it is written in, or why none may. ``levels`` are the interpreter's price
@@ -773,7 +914,12 @@ class FamilyMapping(StrictModel):
         to the instruction they follow. No action of the post for another instrument may share the
         action's clause or state the same value, and neither the clause nor the source line may name
         another cashtag. The last check, that no other number is left in either, runs after the
-        contract is selected (``unexplained_prices``)."""
+        contract is selected (``unexplained_prices``).
+
+        Default HOLD (review F1, F7): the value is an anchor only with positive evidence that it is
+        the market now, a present-market marker attached to it, and nothing in its own clause
+        making it something else (``anchor_not_current``: ENTRY_ANCHOR_NOT_CURRENT). A separate
+        line or quote may name only this family (ENTRY_ANCHOR_INSTRUMENT_UNCLEAR)."""
         if not (self.entry_rule == "REFERENCE_AS_COLLAR"
                 and action.action in (Action.OPEN, Action.ADD)
                 and action.timing == Timing.CURRENT and action.entry_reference is None):
@@ -820,6 +966,21 @@ class FamilyMapping(StrictModel):
         for text in {terms.clause, source}:
             if {t.upper().rstrip(".") for t in _CASHTAG_RE.findall(text)} - names:
                 return None, None, [ENTRY_ANCHOR_INSTRUMENT_AMBIGUOUS, "OTHER_CASHTAG"]
+        lexicon = lexicon or AnchorLexicon()
+        markers = (*PRESENT_MARKERS, *lexicon.present_markers)
+        why = anchor_not_current(source, anchor, markers)
+        if why:
+            return None, None, [ENTRY_ANCHOR_NOT_CURRENT, *why]
+        if source != terms.clause:
+            allowed = {n.lower() for n in names} | set(self.aliases) | set(markers) | {"at"}
+            allowed |= set(lexicon.family_aliases.get(self.family, ()))
+            skip = []
+            if self.execution.sec_type == "FUT":  # the contract check reads these instead
+                line = extract_terms(source)
+                skip = [*line.month_spans, *(m.span() for m in MONTH_WORD_RE.finditer(source))]
+            foreign = foreign_words(source, anchor, allowed, skip)
+            if foreign:
+                return None, None, [ENTRY_ANCHOR_INSTRUMENT_UNCLEAR, f"OTHER_WORDS:{len(foreign)}"]
         return anchor, source, []
 
     def unexplained_prices(self, action: TradeAction, terms: InstructionTerms, anchor: Decimal,
@@ -943,6 +1104,18 @@ class MappingPolicy:
         self.entries = seen
         # Set only for a what-if analysis file loaded with allow_what_if=True.
         self.what_if = what_if
+        # The private lexicon extension's entry-anchor section (markers, aliases); empty unless
+        # the runtime loads one.
+        self.anchor_lexicon = AnchorLexicon()
+
+    def check_policy(self, policy) -> None:
+        """Refuse a gateway policy under which an entry rule here could open without a stop."""
+        collar = sorted(f for f, e in self.entries.items()
+                        if getattr(e, "entry_rule", None) == "REFERENCE_AS_COLLAR")
+        if collar and not policy.require_stop_on_open:
+            raise ValueError(f"entry_rule = REFERENCE_AS_COLLAR ({', '.join(collar)}) needs "
+                             "policy.require_stop_on_open = true: an anchored entry always "
+                             "carries a protective stop")
 
     @classmethod
     def from_toml(cls, path: str | Path, *, allow_what_if: bool = False) -> MappingPolicy:
@@ -1064,11 +1237,11 @@ class MappingPolicy:
             ZoneInfo(entry.session.timezone if entry.session else "UTC")
         ).date()
         anchor, source, problems = (None, None, []) if revoked else entry.entry_anchor_for(
-            action, asset, terms, levels, others, post_text)
+            action, asset, terms, levels, others, post_text, self.anchor_lexicon)
         if problems:
             return MappingDecision(status="UNRESOLVED", reason=",".join(problems), **out), None
         instrument, problems = entry.select(action, asset, terms, today, held_contract, post_text,
-                                            anchor)
+                                            anchor, source)
         if instrument is None:
             return MappingDecision(
                 status="UNRESOLVED", reason=",".join(problems), **out

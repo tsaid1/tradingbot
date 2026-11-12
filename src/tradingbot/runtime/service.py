@@ -53,7 +53,12 @@ from tradingbot.execution.store import UNRESOLVED_STATES
 from tradingbot.models import Action, Instrument, LegQuote, MappedQuote, Quote
 from tradingbot.runtime import notify as N
 from tradingbot.runtime.config import RuntimeConfig
-from tradingbot.runtime.mapping import FamilyMapping, MappingDecision, MappingPolicy
+from tradingbot.runtime.mapping import (
+    AnchorLexicon,
+    FamilyMapping,
+    MappingDecision,
+    MappingPolicy,
+)
 from tradingbot.runtime.notify import Notifier
 from tradingbot.runtime.sources import ReplayFileSource, SourceAdapter, SourceError
 from tradingbot.runtime.store import RuntimeStore, write_json_atomic
@@ -125,6 +130,16 @@ def _safe_error(exc: BaseException) -> str:
     return type(exc).__name__
 
 
+
+def load_lexicons(path) -> tuple[LexiconExtension, AnchorLexicon]:
+    """The private lexicon extension: the interpreter's patterns, and its optional
+    ``entry_anchor`` section (present-market markers and family aliases), which only the mapping
+    policy reads. The interpreter never sees that section."""
+    with open(path, encoding="utf-8") as f:
+        raw = json.load(f)
+    section = raw.pop("entry_anchor", None) or {}
+    return LexiconExtension.model_validate(raw), AnchorLexicon.model_validate(section)
+
 class RuntimeService:
     def __init__(
         self,
@@ -152,6 +167,7 @@ class RuntimeService:
         self.mapping = MappingPolicy.from_toml(
             config.paths.mapping_file, allow_what_if=allow_what_if_mapping
         )
+        self.mapping.check_policy(config.policy)  # an anchored entry always has a stop
         self.coordinator = ExecutionCoordinator(
             broker,
             config.execution_db,
@@ -175,7 +191,8 @@ class RuntimeService:
             self.replay = _StampingReplay(config.replay_db, self.coordinator, self.clock)
             lexicon = None
             if config.interpreter.lexicon_path is not None:
-                lexicon = LexiconExtension.from_json(config.interpreter.lexicon_path)
+                lexicon, self.mapping.anchor_lexicon = load_lexicons(
+                    config.interpreter.lexicon_path)
             self.interpreter = TklInterpreter(context=self.store.load_context(), lexicon=lexicon)
         except BaseException:
             self.coordinator.close()

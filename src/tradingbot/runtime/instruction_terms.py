@@ -298,6 +298,159 @@ def clause_numbers(clause: str) -> set[Decimal]:
     return out
 
 
+# ------------------------------------------------------------------ entry anchor evidence
+#
+# entry_rule = REFERENCE_AS_COLLAR (docs/MULTI_ASSET_MAPPING.md, "What makes a level an anchor").
+# A stated number is the market's level at the time of the post only with POSITIVE evidence next
+# to it: one of these present-market markers, written directly before it ("now 41.20", "trading at
+# 41.20"; "now at 41.20" too) or directly after it ("41.20 now"). The list is closed and generic on
+# purpose; a publisher's own phrasing is added only through the private lexicon extension, never
+# here. Anything else is not an anchor (default HOLD).
+PRESENT_MARKERS: tuple[str, ...] = (
+    "now", "right now", "currently", "here at", "trading at", "at the market",
+)
+# Any of these words in the number's own clause makes the number something other than the market
+# now: a time other than now, a chart or order level, a condition, a range or a comparison. A
+# marker never overrides them, and no marker or alias may contain one.
+NOT_CURRENT_WORDS = frozenset((
+    # a time other than now
+    "yesterday", "today", "tonight", "tomorrow", "earlier", "later", "ago", "before", "after",
+    "previously", "previous", "prior", "last", "next", "was", "were", "been", "had", "will",
+    "would", "could", "should", "might", "shall", "going", "gonna", "morning", "afternoon",
+    "evening", "overnight", "weekend", "week", "weeks", "monday", "tuesday", "wednesday",
+    "thursday", "friday", "saturday", "sunday", "premarket", "pre", "postmarket", "hours",
+    "session", "yesterdays",
+    # a chart, session or order level
+    "high", "highs", "low", "lows", "open", "opening", "opened", "close", "closing", "closed",
+    "settle", "settled", "settlement", "resistance", "support", "target", "targets",
+    "objective", "objectives", "tp", "stop", "stops", "sl", "level", "levels", "pivot", "zone",
+    "area", "entry", "exit",
+    # a condition or a level to cross
+    "from", "to", "above", "below", "over", "under", "through", "break", "breaks", "broke",
+    "breakout", "breakdown", "if", "when", "once", "until", "unless", "whenever",
+    # a range or a comparison
+    "between", "range", "vs", "versus", "than", "higher", "lower", "up", "down", "more",
+    "less", "or",
+    "<", ">", "<=", ">=", "\u2264", "\u2265",
+))
+# A currency or unit may stand on a level line beside the number.
+UNIT_WORDS = frozenset(("usd", "us$", "$", "dollar", "dollars", "pt", "pts", "point", "points",
+                        "tick", "ticks", "bbl", "oz", "mmbtu", "cents"))
+_SEGMENT_RE = re.compile(r"[;!?\n]|[.,:](?!\d)|\s[-–—]\s")
+_PHRASE_RE = re.compile(r"^[a-z][a-z&']*(?: [a-z][a-z&']*)*$")
+
+
+def _word(token: str) -> str:
+    w = token.strip(_EDGE).lower()
+    return w.removesuffix("'s")
+
+
+def _value(token: str) -> Decimal | None:
+    t = token.strip(_EDGE).lstrip("~")
+    n = _NUMBER_RE.match(t)
+    if not n or n.group(3):
+        return None
+    return Decimal((n.group(1) + (n.group(2) or "")).replace(",", ""))
+
+
+def check_phrase(phrase: str, what: str, max_words: int) -> str:
+    """A marker or alias: one to ``max_words`` words of letters, none a disqualifying word."""
+    p = " ".join(phrase.lower().split())
+    if not _PHRASE_RE.match(p) or len(p) > 40 or len(p.split()) > max_words:
+        raise ValueError(f"{what} {phrase!r} must be one to {max_words} words of letters")
+    bad = set(p.split()) & NOT_CURRENT_WORDS
+    if bad:
+        raise ValueError(f"{what} {phrase!r} contains {min(bad)!r}, which disqualifies a level")
+    return p
+
+
+def anchor_not_current(text: str, value: Decimal, markers: tuple[str, ...]) -> list[str]:
+    """Why ``value``, as written in ``text`` (the clause or line it is taken from), is not the
+    market's level at the time of the post. Every place it is written is checked: its own clause
+    (the part of ``text`` between punctuation) must carry no disqualifying word
+    (``NOT_CURRENT_WORDS``) and must attach a present-market marker to it. Empty when it may be
+    an anchor."""
+    out: list[str] = []
+    places = 0
+    phrases = [m.split() for m in markers]
+    for seg in _SEGMENT_RE.split(text or ""):
+        tokens = seg.split()
+        hits = [i for i, t in enumerate(tokens) if _value(t) == value]
+        if not hits:
+            continue
+        places += 1
+        words = [_word(t) for t in tokens]
+        parts = {p for w in words for p in (w, *w.split("-"), *w.split("/")) if p}
+        bad = sorted(parts & NOT_CURRENT_WORDS)
+        out += [f"NOT_CURRENT_WORD:{w}" for w in bad if f"NOT_CURRENT_WORD:{w}" not in out]
+        for i in hits:
+            if not any(_attached(words, i, m) for m in phrases):
+                out.append("NO_PRESENT_MARKER")
+                break
+    if not places:
+        out.append("NO_PRESENT_MARKER")
+    return out
+
+
+def _attached(words: list[str], i: int, marker: list[str]) -> bool:
+    n = len(marker)
+    if words[i + 1:i + 1 + n] == marker:
+        return True
+    if i >= n and words[i - n:i] == marker:
+        return True
+    return marker[-1] != "at" and i >= n + 1 and words[i - 1] == "at" \
+        and words[i - 1 - n:i - 1] == marker
+
+
+def foreign_words(text: str, value: Decimal, allowed: set[str],
+                  skip_spans: list[tuple[int, int]] = ()) -> list[str]:
+    """The words of a separate level line (or attached quote) that are not this family's: every
+    alphabetic token must be part of a present-market marker, a currency or unit, or a name or
+    alias of this family (``allowed``: lower-case phrases, markers included). ``skip_spans`` are
+    contract-month spans the contract check reads instead."""
+    low = (text or "").lower()
+    keep = [True] * len(low)
+    for a, b in skip_spans:
+        for k in range(a, min(b, len(low))):
+            keep[k] = False
+    masked = "".join(ch if k else " " for ch, k in zip(low, keep, strict=True))
+    for phrase in sorted(allowed, key=len, reverse=True):
+        masked = re.sub(rf"(?<![\w$]){re.escape(phrase)}(?![\w])", " ", masked)
+        masked = re.sub(rf"\${re.escape(phrase)}(?![\w])", " ", masked)
+    out = []
+    for token in masked.split():
+        if _value(token) is not None:
+            continue
+        w = _word(token).lstrip("~")
+        if not w or w in UNIT_WORDS or not any(ch.isalpha() for ch in w):
+            continue
+        if w.startswith("$") and w[1:] in UNIT_WORDS:
+            continue
+        out.append(w)
+    return out
+
+
+# A contract described rather than named: which one is meant is the publisher's, not the bot's.
+RELATIVE_CONTRACT_RE = re.compile(
+    r"(?<![\w$])(?P<word>back|next|following|second|2nd|deferred|far|nearby|front|spot\s+month|"
+    r"calendar|spreads?|roll|rolls|rolled|rolling|rollover)(?!\w)",
+    re.IGNORECASE,
+)
+
+
+def relative_contract_words(terms: InstructionTerms) -> list[str]:
+    """Relative or descriptive contract words in the clause, outside a recognised contract month
+    ("the Aug contract", "Dec 2026"). Any one HOLDs a futures selection."""
+    out = []
+    for m in RELATIVE_CONTRACT_RE.finditer(terms.clause):
+        if any(a <= m.start() < b for a, b in terms.month_spans):
+            continue
+        w = " ".join(m.group("word").lower().split()).replace(" ", "_")
+        if w not in out:
+            out.append(w)
+    return out
+
+
 # Language that adds a leg: selling, shorting or writing an option, or one put on "against" another.
 SECOND_LEG_RE = re.compile(
     r"\b(?P<word>sell|sells|selling|sold|short|shorts|shorting|shorted|write|writes|writing|"
