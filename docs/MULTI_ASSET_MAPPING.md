@@ -35,6 +35,8 @@ ETF. An entry states:
 | `roll` | `business_days_before` the roll date, and `action = "FLATTEN"` |
 | `basis_shift` | `max_abs_basis`, `max_age_seconds` and `scale_ratio` (for BASIS_SHIFT, or for a backstop). `scale_ratio` must be declared and must be exactly `1`: any other ratio is UNSUPPORTED |
 | `reference_trigger` | `released_order_type = "MKT"`, the `reference_hours` when the reference updates, and `require_backstop` |
+| `entry_rule`, `entry_anchor` | `EXPLICIT_ENTRY_ONLY` (default) or `REFERENCE_AS_COLLAR` with its required limits `max_adverse_move`, `max_favourable_move` (`"2.5"` in the anchor's own price units, or `"0.5%"` of it) and `max_signal_age_seconds`. See "Entry rule" below |
+| `level_contract_rule` | `EXPLICIT_MONTH_ONLY` (default) or `FRONT_MONTH`, for a DIRECT future whose levels are a futures series. See "Level contract rule" below |
 
 A family with no entry is marked `UNSUPPORTED_INSTRUMENT_MAPPING`. An entry that is not approved is
 marked `MAPPING_NOT_APPROVED`. An approved entry that cannot select exactly one contract gets
@@ -151,6 +153,91 @@ trigger day must trigger again on a later day.
 
 **UNSUPPORTED** always HOLDs. It documents why a family is not traded.
 
+## Entry rule
+
+By default (`entry_rule = "EXPLICIT_ENTRY_ONLY"`, the product decision of 5 November 2026) only
+explicit execution language sets an entry price. A market level the publisher states when opening
+("long here, the index 5,010 now") is a REFERENCE, so such an OPEN or ADD HOLDs
+(`OPEN_ENTRY_PRICE_MISSING`, `ADD_ENTRY_REFERENCE_MISSING`). The shipped file keeps this for every
+entry.
+
+`entry_rule = "REFERENCE_AS_COLLAR"`, approved per family with its three limits (no defaults),
+changes one thing. A **current** OPEN or ADD (timing CURRENT: never a retrospective report, a
+conditional, commentary or an uncertain one) that states **exactly one** market level for its
+instrument and **no** explicit entry price enters with a **limit order at the marketable side of the
+live execution quote** (the ask for a long, the bid for a short, snapped to the tick never past it),
+never a market order. The stated level is the **anchor**. An explicit entry price or range is
+decided exactly as before; the rule never touches it.
+
+*How the stated level travels.* The interpreter classifies each price in a clause with a role
+(`PriceMention`: ENTRY, STOP, TARGET, EXIT, TRIGGER, REFERENCE). The typed action carries only
+ENTRY (`entry_reference`), STOP and TARGET; a REFERENCE level is not on it. The service passes each
+action's classified mentions, as (role, value) pairs, to `MappingPolicy.apply(levels=...)`, beside
+the clause text it already passes for contract months. Only an entry with the rule on reads them
+(`FamilyMapping.entry_anchor_for`). The level becomes the anchor only if all of these hold, and
+otherwise the action HOLDs at the mapping stage with the reason shown:
+
+| Condition | Otherwise |
+|---|---|
+| exactly one distinct REFERENCE value for the action | `ENTRY_ANCHOR_SEVERAL_LEVELS` |
+| no other classified price (trigger, exit) beside the stop and target | `ENTRY_ANCHOR_SECOND_PRICE` |
+| the value is a number | `ENTRY_ANCHOR_UNREADABLE` |
+| the value is written in the action's own clause | `ENTRY_ANCHOR_NOT_IN_CLAUSE` |
+| no other action of the post for another instrument shares the clause or states the same value, and the clause names no other cashtag | `ENTRY_ANCHOR_INSTRUMENT_AMBIGUOUS` |
+| after the contract is selected, the clause holds no other number once its months, an index's own name, the anchor, the stop, the target and a reduction percentage are read | `ENTRY_ANCHOR_UNEXPLAINED_PRICE` |
+
+No stated level at all leaves the action as today (`OPEN_ENTRY_PRICE_MISSING`, with
+`ENTRY_ANCHOR_NOT_STATED`). For a futures family the accepted anchor is the one extra level the
+contract-month leftover rule counts as read; without the rule, or for any other number, that rule is
+unchanged. The accepted anchor is recorded on the mapping decision (`entry_anchor`), handed to the
+gateway on the `MappedQuote` (`entry_anchors`, by action id), and the gateway decides:
+
+* the source post is no older than `max_signal_age_seconds` (`ENTRY_ANCHOR_SIGNAL_TOO_OLD`), on top
+  of the policy's own signal age;
+* the anchor is compared **in its own series**: with the live reference quote for BASIS_SHIFT and
+  REFERENCE_TRIGGER (which must be LIVE and fresh by the reference-freshness rules; it HOLDs
+  otherwise), with the execution quote for DIRECT and a same-series future (whose quote checks
+  already refuse a delayed, frozen, stale or absent quote);
+* the live side the entry trades against may be worse than the anchor (above it for a long) by at
+  most `max_adverse_move` (`ENTRY_ANCHOR_ADVERSE_MOVE`: do not chase) and better by at most
+  `max_favourable_move` (`ENTRY_ANCHOR_FAVOURABLE_MOVE`: the market moved so far the signal may be
+  stale or misread);
+* a protective stop is still required, its side is checked against the anchor in the publisher's
+  series, and it must not already be crossed by the live market in the series it will be held in
+  (converted by the basis for BASIS_SHIFT, in reference levels for REFERENCE_TRIGGER, with the
+  backstop as before);
+* the policy's percentage collar between the entry level and the quote is replaced by the two
+  limits above; sizing, caps, session and roll window are unchanged.
+
+The approved plan records `entry_rule`, `entry_anchor`, `anchor_series`, `anchor_live` and
+`entry_limit`; the execution core sends exactly that limit, after re-checking that a fresh quote
+still lies inside the policy collar around it. An anchored entry whose first submission has an
+unknown outcome is never re-sent (as for every entry).
+
+*What the owner accepts.* Buying at the market some seconds after the post, with the slippage from
+the publisher's level bounded by the two limits; that a misread level would be used as an anchor
+(the checks above refuse every ambiguity they can see, but not a single level the interpreter
+misread); and that the limits are in the anchor's series, so for a basis-shifted family the
+execution price can differ from the anchor by the basis.
+
+## Level contract rule
+
+A DIRECT future whose levels are a futures series (its own, or `same_series`) is selected
+`EXPLICIT_ONLY`: a level is used only in the month the instruction names. The publisher often
+quotes an energy level without a month, so such an instruction HOLDs
+(`CONTRACT_SELECTION_AMBIGUOUS`). `level_contract_rule = "FRONT_MONTH"` declares that a level
+stated without a month refers to the **front contract** of the entry's own list: the first listed
+contract whose roll date has not been reached. Execution is in that same month (or its
+`equivalent_roots` micro). A month the instruction names always wins; a follow-up keeps its idea's
+contract; the other same-series constraints stay. It HOLDs when the front is fewer than
+`min_business_days_to_roll` business days from its roll date (`FRONT_MONTH_IN_ROLL_WINDOW`: the
+publisher may be quoting either month, and the next one is never assumed), and when the front
+cannot be determined uniquely (`FRONT_MONTH_AMBIGUOUS`: months not listed in order, roll dates not
+strictly increasing, or no listed contract before its roll date). *Risk:* near a roll the
+publisher's "oil" may already be the next month while the list's front is still the old one; the
+roll margin is the only protection, so set it no shorter than the period in which the market's own
+front-month convention changes.
+
 ## Protective levels are never loosened
 
 An amendment in which the publisher's own stop loosens follows the gateway's rule for widened stops,
@@ -195,6 +282,9 @@ Approve the following for each family:
 * The contract months and their roll dates, with the business-day margin.
 * The units per signal and the caps.
 * The trading session.
+* The entry rule. `REFERENCE_AS_COLLAR` only with its adverse and favourable move limits and its
+  signal age, chosen for the family.
+* For a DIRECT future, whether a level without a month means the front contract (`FRONT_MONTH`).
 
 Then set `approved = true` (the TOML boolean) with `approved_by` and `approved_at`. The shipped file approves only the
 bond ETF. Its other entries are commented templates with placeholder values.
