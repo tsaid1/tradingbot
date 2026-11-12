@@ -78,10 +78,13 @@ from tradingbot.validator import (
     ANCHOR_MAX_QUOTE_AGE_CEILING_SECONDS,
     ANCHOR_RULE_INCOMPLETE,
     ANCHOR_SIGNAL_TOO_OLD,
+    STOP_TOO_FAR_FROM_LIMIT,
     anchor_quote_problem,
     fill_quantity,
     finite_positive,
     source_is_fresh,
+    stop_distance_limit,
+    stop_distance_problem,
 )
 
 UNPROTECTED_POSITION = "UNPROTECTED_POSITION"
@@ -122,6 +125,12 @@ BROKER_UNREADABLE = "BROKER_UNREADABLE"
 # An idea was stopped out (or closed) while part of its entry or add was still working, and the
 # cancel of that remainder could not be confirmed at the broker (review F2).
 ENTRY_REMAINDER_NOT_CANCELLED = "ENTRY_REMAINDER_NOT_CANCELLED"
+# The life of an entry order (lead's decision, 12 Nov 2026): an OPEN or ADD still working when its
+# source post is older than the limit that allowed it to be sent is cancelled (confirmed); and a
+# follow-up on an idea whose entry is still working and unfilled cancels that entry first.
+ENTRY_EXPIRED_UNFILLED = "ENTRY_EXPIRED_UNFILLED"
+ENTRY_CANCELLED_BEFORE_FILL = "ENTRY_CANCELLED_BEFORE_FILL"
+ENTRY_CANCEL_UNCONFIRMED = "ENTRY_CANCEL_UNCONFIRMED"
 # The broker nets one position per contract: an idea on the opposite side of an open idea in the
 # same contract is never opened beside it. A publisher reversal is a close followed by an open.
 OPPOSITE_IDEA_IN_SAME_CONTRACT = "OPPOSITE_IDEA_IN_SAME_CONTRACT"
@@ -272,6 +281,22 @@ def _anchored_limit(plan: ExecutionPlan | None) -> Decimal | None:
 def _anchor_quote_age(plan: ExecutionPlan | None) -> float | None:
     """The per-side quote freshness of an anchored entry's plan (None otherwise)."""
     return plan.anchor_max_quote_age_seconds if _anchored_limit(plan) is not None else None
+
+
+def _held_stop(plan: ExecutionPlan | None, stop: Decimal | None) -> Decimal | None:
+    """The stop an entry's limit is checked against at the execution core under the family stop
+    rule (any entry whose plan carries ``max_stop_distance``): held in the execution series; a
+    reference-series stop is the gateway's to check."""
+    if plan is None or not plan.max_stop_distance or plan.protection_series != "EXECUTION":
+        return None
+    return stop
+
+
+def _stop_spec(plan: ExecutionPlan | None) -> str | None:
+    # A reference-series stop (REFERENCE_TRIGGER) is checked by the gateway only.
+    if plan is None or plan.protection_series != "EXECUTION":
+        return None
+    return plan.max_stop_distance
 
 
 def _plan_of(raw: str | None) -> ExecutionPlan | None:
@@ -605,11 +630,15 @@ class ExecutionCoordinator:
         if record_only:
             return True
         asked = self._cancel_stopped_out_entries(open_orders)
+        expired = self._cancel_expired_entries(open_orders, now) if _rerun else []
+        asked |= bool(expired)
         if _rerun and self.halted() and self._cancel_entries_for_halt(open_orders):
             asked = True
         if asked and _rerun:
             # Risk-reducing: re-read once so a fill that beat the cancel is applied and covered.
-            return self.sync(_rerun=False)
+            synced = self.sync(_rerun=False)
+            self._stamp_cancelled(expired, ENTRY_EXPIRED_UNFILLED)
+            return synced
         positions = {p.idea_id: p for p in self.store.positions()}
         for idea_id in sorted(
             touched | {i for i, p in positions.items() if p.status in ("OPEN", "PENDING")}
@@ -643,24 +672,122 @@ class ExecutionCoordinator:
             self.store.resolve_exceptions(now, ENTRY_REMAINDER_NOT_CANCELLED, idea_id=idea)
         for idea, refs in sorted(remainder.items()):
             for ref in refs:
-                if self._cancel_confirmed(ref, idea, "idea stopped out: entry remainder"):
-                    self.store.log(
-                        self.clock(), "ENTRY_REMAINDER_CANCELLED", order_ref=ref, idea_id=idea,
-                        rule="a stopped-out or closed idea keeps no working entry or add",
-                    )
-                    continue
-                detail = (
+                self._cancel_entry_or_block(
+                    ref, idea, "idea stopped out: entry remainder", "ENTRY_REMAINDER_CANCELLED",
+                    "a stopped-out or closed idea keeps no working entry or add",
                     f"{ref} is still working after {idea} was stopped out or closed and its "
-                    "cancel was not confirmed; new exposure in this instrument is blocked"
+                    "cancel was not confirmed; new exposure in this instrument is blocked",
                 )
-                if self.store.raise_exception(
-                    self.clock(), ENTRY_REMAINDER_NOT_CANCELLED, detail, idea_id=idea,
-                    order_ref=ref,
-                ):
-                    self.store.log(
-                        self.clock(), ENTRY_REMAINDER_NOT_CANCELLED, order_ref=ref, idea_id=idea
-                    )
         return bool(remainder)
+
+    def _cancel_entry_or_block(
+        self, ref: str, idea: str, reason: str, event: str, rule: str, detail: str
+    ) -> bool:
+        """Cancel one working entry or add and confirm it at the broker (``_cancel_confirmed``).
+        Confirmed: journaled as ``event``. Not confirmed: ENTRY_REMAINDER_NOT_CANCELLED is opened,
+        which blocks new exposure in the instrument until a later sync confirms the cancel."""
+        if self._cancel_confirmed(ref, idea, reason):
+            self.store.log(self.clock(), event, order_ref=ref, idea_id=idea, rule=rule)
+            return True
+        if self.store.raise_exception(
+            self.clock(), ENTRY_REMAINDER_NOT_CANCELLED, detail, idea_id=idea, order_ref=ref
+        ):
+            self.store.log(self.clock(), ENTRY_REMAINDER_NOT_CANCELLED, order_ref=ref, idea_id=idea)
+        return False
+
+    def _entry_validity_seconds(self, intent: Intent) -> float:
+        """How long after its source post an entry or add may keep working: the execution
+        ``max_intent_age_seconds``; for an anchored entry the smaller of that and the anchor's
+        signal-age limit (the limits that allowed it to be sent)."""
+        limit = float(self.config.max_intent_age_seconds)
+        plan = _plan_of(intent.plan)
+        if _anchored_limit(plan) is not None and finite_positive(
+            plan.anchor_max_signal_age_seconds
+        ):
+            limit = min(limit, float(plan.anchor_max_signal_age_seconds))
+        return limit
+
+    def _cancel_expired_entries(self, open_orders: list[BrokerOrder], now: datetime) -> list[str]:
+        """The life of an entry order (lead's decision, 12 Nov 2026): an OPEN or ADD that is still
+        working (wholly or partly unfilled) once its source post is older than
+        ``_entry_validity_seconds`` (measured from the post's publication, service clock; the limit
+        itself is still valid) is cancelled and confirmed. Only the remainder goes: a partial fill
+        keeps its position and its protection, sized by ``_maintain_protection``. Never resent,
+        never re-priced. An unconfirmed cancel opens ENTRY_REMAINDER_NOT_CANCELLED (the instrument
+        is blocked) and is retried at the next sync. Returns the refs whose cancel was confirmed."""
+        working = {o.order_ref for o in open_orders}
+        done = []
+        for intent in self.store.intents(frozenset({IntentState.WORKING})):
+            if intent.action not in (Action.OPEN, Action.ADD) or intent.order_ref not in working:
+                continue
+            published = intent.source_published_at or intent.created_at
+            age = (now - published).total_seconds()
+            limit = self._entry_validity_seconds(intent)
+            if age <= limit:
+                continue
+            if self._cancel_entry_or_block(
+                intent.order_ref, intent.idea_id, "entry expired unfilled", ENTRY_EXPIRED_UNFILLED,
+                f"an entry never outlives its signal: {age:.0f} s > {limit:g} s",
+                f"{intent.order_ref} is still working {age:.0f} s after its post (limit "
+                f"{limit:g} s) and its cancel was not confirmed; new exposure in this instrument "
+                "is blocked",
+            ):
+                done.append(intent.order_ref)
+        self._lift_entry_blocks(working - set(done))
+        return done
+
+    def _lift_entry_blocks(self, working: set[str]) -> None:
+        """An ENTRY_REMAINDER_NOT_CANCELLED record whose order is no longer working is resolved."""
+        now = self.clock()
+        for e in self.store.exceptions(open_only=True):
+            if e.kind == ENTRY_REMAINDER_NOT_CANCELLED and e.order_ref \
+                    and e.order_ref not in working:
+                self.store.resolve_exceptions(
+                    now, ENTRY_REMAINDER_NOT_CANCELLED, idea_id=e.idea_id, order_ref=e.order_ref
+                )
+
+    def _stamp_cancelled(self, refs: list[str], reason: str) -> None:
+        """Record the public reason on each entry intent the broker now shows cancelled (one that
+        lost the race to a fill keeps its own state and reasons)."""
+        for ref in refs:
+            intent = self.store.intent(ref)
+            if intent is not None and intent.state == IntentState.CANCELLED \
+                    and reason not in intent.reasons:
+                self.store.set_state(ref, intent.state, self.clock(),
+                                     reasons=[*intent.reasons, reason])
+
+    def unfilled_entry_refs(self, idea_id: str) -> list[str]:
+        """The working entry orders of an idea that holds nothing yet (an OPEN resting unfilled)."""
+        pos = self.store.position(idea_id)
+        if pos is None or pos.quantity != 0 or pos.status != "PENDING":
+            return []
+        return [
+            i.order_ref for i in self.store.intents(frozenset({IntentState.WORKING}))
+            if i.idea_id == idea_id and i.action in (Action.OPEN, Action.ADD)
+        ]
+
+    def cancel_unfilled_entry(self, idea_id: str) -> str | None:
+        """A publisher follow-up on an idea whose entry is still working and unfilled: cancel that
+        entry (confirmed, as above) before anything else. Returns ENTRY_CANCELLED_BEFORE_FILL,
+        ENTRY_CANCEL_UNCONFIRMED (the instrument is blocked), or None when there was none. The
+        ledger is synced afterwards, so an entry that filled before its cancel shows its fill."""
+        refs = self.unfilled_entry_refs(idea_id)
+        if not refs:
+            return None
+        confirmed = [
+            ref for ref in refs
+            if self._cancel_entry_or_block(
+                ref, idea_id, "publisher follow-up before the entry filled",
+                ENTRY_CANCELLED_BEFORE_FILL,
+                "an unfilled entry never outlives the publisher's own exit",
+                f"{ref} is still working after a publisher follow-up on {idea_id} and its cancel "
+                "was not confirmed; new exposure in this instrument is blocked",
+            )
+        ]
+        self.sync()
+        self._stamp_cancelled(confirmed, ENTRY_CANCELLED_BEFORE_FILL)
+        return ENTRY_CANCELLED_BEFORE_FILL if len(confirmed) == len(refs) \
+            else ENTRY_CANCEL_UNCONFIRMED
 
     def _cancel_entries_for_halt(self, open_orders: list[BrokerOrder]) -> bool:
         """Under the halt no entry or add may keep working (it could fill while nothing else may
@@ -940,7 +1067,10 @@ class ExecutionCoordinator:
             return self._refuse(source, action, gate, ref, account, rules, now)
         limit, reasons = self._entry_checks(contract, side, qty, entry_level, idea_id, now,
                                             fixed_limit=_anchored_limit(plan),
-                                            anchor_quote_age=_anchor_quote_age(plan))
+                                            anchor_quote_age=_anchor_quote_age(plan),
+                                            anchor_stop=_held_stop(plan, plan.stop if plan
+                                                                   else None),
+                                            anchor_stop_distance=_stop_spec(plan))
         if reasons:
             return self._refuse(source, action, gate, ref, account, reasons, now, idea_id=idea_id)
         exit_side = OrderSide.SELL if long else OrderSide.BUY
@@ -1127,6 +1257,8 @@ class ExecutionCoordinator:
         limit, reasons = self._entry_checks(
             contract, side, qty, entry_level, pos.idea_id, now, fixed_limit=_anchored_limit(plan),
             anchor_quote_age=_anchor_quote_age(plan),
+            anchor_stop=_held_stop(plan, _dec(pos.stop_price)),
+            anchor_stop_distance=_stop_spec(plan),
         )
         if reasons:
             return self._refuse(
@@ -1772,6 +1904,9 @@ class ExecutionCoordinator:
             contract, OrderSide(intent.side), intent.quantity, reference,
             intent.idea_id, now, exclude_ref=intent.order_ref, fixed_limit=fixed,
             anchor_quote_age=_anchor_quote_age(plan),
+            anchor_stop=_held_stop(plan, (plan.stop if plan is not None else None)
+                                   if intent.action == Action.OPEN else _dec(pos.stop_price)),
+            anchor_stop_distance=_stop_spec(plan),
         )
         if reasons:
             return reasons
@@ -2583,6 +2718,8 @@ class ExecutionCoordinator:
         exclude_ref: str | None = None,
         fixed_limit: Decimal | None = None,
         anchor_quote_age: float | None = None,
+        anchor_stop: Decimal | None = None,
+        anchor_stop_distance: str | None = None,
     ) -> tuple[Decimal | None, list[str]]:
         """Broker-quote sanity, the price collar and exposure caps, before any entry or add.
         Returns the collar-bounded limit price, or the reasons to refuse. ``fixed_limit`` is the
@@ -2625,13 +2762,29 @@ class ExecutionCoordinator:
         band = self.policy.max_price_deviation_pct / Decimal(100)
         if abs(price - ref) / ref > band:
             return None, ["BROKER_QUOTE_OUTSIDE_COLLAR"]
-        # Snapped to the contract's tick inside the collar: a buy limit down, a sell limit up.
+        # The owner's clarification (12 November 2026): the collar above is a REJECTION boundary
+        # between the fresh executable quote and the stated entry, never the price sent. An
+        # explicit entry's limit is the publisher's stated entry price itself, snapped to the
+        # tick never past it (a buy limit down, a sell limit up): a buy whose ask is above the
+        # stated price rests at it. An anchored entry sends the gateway's limit (the fresh
+        # executable quote side inside the owner's anchor limits).
         limit = (
             fixed_limit if fixed_limit is not None
-            else snap_to_tick(ref * (1 + band), contract.min_tick, ROUND_FLOOR)
+            else snap_to_tick(ref, contract.min_tick, ROUND_FLOOR)
             if buy
-            else snap_to_tick(ref * (1 - band), contract.min_tick, ROUND_CEILING)
+            else snap_to_tick(ref, contract.min_tick, ROUND_CEILING)
         )
+        if anchor_stop_distance:
+            # The family stop rule at the last check, explicit and anchored alike: the held stop
+            # within the limit of the limit actually sent (recomputed here for an explicit entry).
+            pct = stop_distance_limit(anchor_stop_distance)
+            if pct is None:
+                return None, [ANCHOR_RULE_INCOMPLETE]
+            if anchor_stop is None:
+                return None, ["PROTECTIVE_STOP_MISSING"]
+            far = stop_distance_problem(anchor_stop, limit, pct, STOP_TOO_FAR_FROM_LIMIT)
+            if far:
+                return None, far
         mult = contract.multiplier
         pos = self.store.position(idea_id)
         idea_notional = price * ((pos.quantity if pos else 0) + qty) * mult

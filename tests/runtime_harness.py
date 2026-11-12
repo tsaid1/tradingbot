@@ -25,7 +25,7 @@ START = datetime(2026, 6, 1, 14, 0, tzinfo=UTC)
 RECORDED = datetime(2026, 3, 2, 15, 0, tzinfo=UTC)  # timestamps inside the fixture files
 AUTHOR = "4242"  # invented author id
 
-ENTRY = "We are now long $TLT at 88.40. Stop 87.20."
+ENTRY = "We are now long $TLT at 88.42. Stop 87.20."  # at the mock ask: fills at once
 ADD = "Adding to our $TLT long here at 88.45."
 RAISE_STOP = "Raising our $TLT stop to 87.90."
 REDUCE_HALF = "Selling half of our $TLT long at 88.40."

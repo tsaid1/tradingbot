@@ -299,6 +299,7 @@ sizing = {{ units_per_signal = 2, max_units = 4, max_notional = "60000" }}
 {session}
 roll = {{ business_days_before = 3, action = "FLATTEN" }}
 reference_trigger = {{ released_order_type = "MKT", reference_hours = ["13:30-20:00"], require_backstop = false }}
+max_stop_distance = "5%"
 entry_rule = "REFERENCE_AS_COLLAR"
 entry_anchor = {{ max_adverse_move = "0.5%", max_favourable_move = "1%", max_signal_age_seconds = 60, anchor_scope = "SENTENCE_STRICT"{cap}, max_quote_age_seconds = 3, environment = "PAPER", standalone_level_sentence = true }}
 """
@@ -374,7 +375,7 @@ def test_the_loader_refuses_limits_above_the_ceilings(change, message):
 
 
 def test_limits_at_the_ceilings_load():
-    rule = ('entry_rule = "REFERENCE_AS_COLLAR"\nentry_anchor = { max_adverse_move = "1%", '
+    rule = ('max_stop_distance = "5%"\nentry_rule = "REFERENCE_AS_COLLAR"\nentry_anchor = { max_adverse_move = "1%", '
             'max_favourable_move = "2%", max_signal_age_seconds = 120, '
             'anchor_scope = "SENTENCE_STRICT", max_quote_age_seconds = 3, environment = "PAPER" }')
     assert load(etf_entry(rule=rule)).entry_anchor.max_signal_age_seconds == 120

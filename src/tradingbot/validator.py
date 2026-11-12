@@ -541,6 +541,35 @@ ANCHOR_MAX_QUOTE_AGE_CEILING_SECONDS = 5
 # How far in the future a side's own update time may be (clock skew) before it HOLDs (review S1):
 # a separate, small bound, so a stale side can never look fresh by a stamp ahead of the clock.
 ANCHOR_QUOTE_FUTURE_TOLERANCE_SECONDS = 0.5
+# The highest maximum protective-stop distance a family may set (owner, 12 November 2026, D3: TLT
+# uses 5%). An outer rejection threshold; the bot never sets or moves a stop.
+ANCHOR_MAX_STOP_DISTANCE_PCT_CEILING = Decimal(10)
+# The family stop rule (owner, 12 November 2026): one set of codes for explicit and anchored
+# entries. "Entry" is the explicit entry price, or the stated reference of an anchored entry.
+STOP_TOO_FAR_FROM_ENTRY = "PROTECTIVE_STOP_TOO_FAR_FROM_ENTRY"
+STOP_TOO_FAR_FROM_LIMIT = "PROTECTIVE_STOP_TOO_FAR_FROM_LIMIT"
+
+
+def stop_distance_limit(spec: str | None) -> Decimal | None:
+    """The stop-distance limit as a percentage, or None when it is missing or not a finite
+    positive percentage within the ceiling (an anchored entry then HOLDs)."""
+    if not spec or not isinstance(spec, str) or not spec.endswith("%"):
+        return None
+    try:
+        v = Decimal(spec[:-1])
+    except (InvalidOperation, ValueError):
+        return None
+    return v if v.is_finite() and 0 < v <= ANCHOR_MAX_STOP_DISTANCE_PCT_CEILING else None
+
+
+def stop_distance_problem(stop: Decimal | None, point: Decimal | None, limit_pct: Decimal,
+                          code: str) -> list[str]:
+    """[code, detail] when ``stop`` is farther than ``limit_pct`` percent from ``point``."""
+    if stop is None or point is None or point <= 0:
+        return []
+    if abs(point - stop) / point * 100 > limit_pct:
+        return [code, f"MAX:{limit_pct.normalize():f}%"]
+    return []
 
 
 def finite_positive(value) -> bool:
@@ -621,7 +650,8 @@ def _entry_anchor(a: TradeAction, q: MappedQuote, policy: MockPolicy, now: datet
     favourable = move_limit(t.anchor_max_favourable_move, anchor)
     if adverse is None or favourable is None or not adverse.is_finite() \
             or not favourable.is_finite() or not finite_positive(t.anchor_max_signal_age_seconds) \
-            or not finite_positive(t.anchor_max_quote_age_seconds):
+            or not finite_positive(t.anchor_max_quote_age_seconds) \
+            or stop_distance_limit(t.max_stop_distance) is None:
         return None, _gate("HOLD", ANCHOR_RULE_INCOMPLETE)
     collar = policy.max_price_deviation_pct
     for name, limit, ceiling in (("ADVERSE", adverse, ANCHOR_MAX_ADVERSE_PCT_CEILING),
@@ -712,8 +742,8 @@ def _mapped_open(a: TradeAction, q: MappedQuote, policy: MockPolicy, now: dateti
     stop, target, bad = _mapped_levels(a)
     if bad:
         return bad
-    if (policy.require_stop_on_open or anchored) and stop is None:
-        # An anchored entry always carries a protective stop, whatever the policy says.
+    if (policy.require_stop_on_open or anchored or t.max_stop_distance) and stop is None:
+        # An anchored entry, and any entry of a family with the stop rule, carries a stop.
         return _gate("HOLD", "PROTECTIVE_STOP_MISSING")
     # Direction checks in the publisher's own series (both sides of each comparison are there).
     if stop is not None and (stop >= ref if long else stop <= ref):
@@ -724,6 +754,7 @@ def _mapped_open(a: TradeAction, q: MappedQuote, policy: MockPolicy, now: dateti
     exec_touch = q.ask if long else q.bid
     plan = ExecutionPlan(family=t.family, basis=t.basis, execution_key=t.execution_key,
                          quantity=t.units_per_signal, entry_reference=ref,
+                         max_stop_distance=t.max_stop_distance,
                          publisher_stop=stop, publisher_target=target)
     if t.basis == "DIRECT":
         bad = _off_tick(t, stop=stop, target=target)
@@ -780,6 +811,21 @@ def _mapped_open(a: TradeAction, q: MappedQuote, policy: MockPolicy, now: dateti
                 **shifted.model_dump(include={"basis_value", "basis_execution_mid",
                                               "basis_reference_mid", "basis_observed_at"}),
                 "backstop_stop": backstop})
+    pct = stop_distance_limit(t.max_stop_distance)
+    if t.max_stop_distance and pct is None:
+        return _gate("HOLD", ANCHOR_RULE_INCOMPLETE, "MAX_STOP_DISTANCE")
+    if pct is not None:
+        # The family stop rule: the stop within the limit of the entry, in the publisher's series
+        # (the explicit price, or an anchored entry's stated reference), and of the limit: here
+        # for an anchored entry (its limit is known); for an explicit entry the execution core
+        # checks the limit it computes and sends.
+        far = stop_distance_problem(stop, ref, pct, STOP_TOO_FAR_FROM_ENTRY)
+        if not far and anchored:
+            point = (anchored.entry_limit if plan.protection_series == "EXECUTION"
+                     else anchored.anchor_live)
+            far = stop_distance_problem(plan.stop, point, pct, STOP_TOO_FAR_FROM_LIMIT)
+        if far:
+            return _gate("HOLD", *far)
     if anchored:
         # The entry is the live marketable limit; the publisher's level is recorded as the anchor.
         plan = plan.model_copy(update={
@@ -817,7 +863,8 @@ def _mapped_follow_up(a: TradeAction, q: MappedQuote, policy: MockPolicy,
     base = ExecutionPlan(family=t.family, basis=t.basis, execution_key=t.execution_key,
                          protection_series="REFERENCE" if reference_series else "EXECUTION",
                          reference_contract_key=t.reference_contract_key,
-                         reference_contract=t.reference_contract)
+                         reference_contract=t.reference_contract,
+                         max_stop_distance=t.max_stop_distance)
     if a.action in (Action.CLOSE, Action.REDUCE):
         if a.action == Action.REDUCE:
             fraction = _num(a.close_fraction)
@@ -858,6 +905,17 @@ def _mapped_follow_up(a: TradeAction, q: MappedQuote, policy: MockPolicy,
             if prior_stop is None:  # an anchored add never adds to an unprotected idea
                 return _gate("HOLD", "PROTECTIVE_STOP_MISSING")
             entry = anchored.entry_limit
+            # The family stop rule for an add: the idea's stop as it stands, against the anchor
+            # (DIRECT: one series) and the limit (held in the execution series unless it is a
+            # reference trigger).
+            pct = stop_distance_limit(t.max_stop_distance)
+            far = ((stop_distance_problem(prior_stop, anchored.entry_anchor, pct,
+                                          STOP_TOO_FAR_FROM_ENTRY)
+                    if t.basis == "DIRECT" else [])
+                   or stop_distance_problem(prior_stop, anchored.anchor_live if reference_series
+                                            else entry, pct, STOP_TOO_FAR_FROM_LIMIT))
+            if far:
+                return _gate("HOLD", *far)
             if t.basis == "BASIS_SHIFT":  # both legs live and near-simultaneous, recorded
                 shifted, reasons = _basis(q, now)
                 if shifted is None:
@@ -890,6 +948,18 @@ def _mapped_follow_up(a: TradeAction, q: MappedQuote, policy: MockPolicy,
                 return _gate("BLOCK", "ENTRY_PRICE_COLLAR")
         if abs(exec_touch - entry) / entry * 100 > policy.max_price_deviation_pct:
             return _gate("BLOCK", "ENTRY_PRICE_COLLAR")
+        if t.max_stop_distance:
+            # The family stop rule for an explicit add: the idea's stop as it stands, against the
+            # entry in the series it is held in; never a stop the bot chooses.
+            pct = stop_distance_limit(t.max_stop_distance)
+            if pct is None:
+                return _gate("HOLD", ANCHOR_RULE_INCOMPLETE, "MAX_STOP_DISTANCE")
+            if prior_stop is None:
+                return _gate("HOLD", "PROTECTIVE_STOP_MISSING")
+            far = stop_distance_problem(prior_stop, ref if reference_series else entry, pct,
+                                        STOP_TOO_FAR_FROM_ENTRY)
+            if far:
+                return _gate("HOLD", *far)
         qty = t.units_per_signal
         if position.quantity + qty > t.max_units:
             return _gate("BLOCK", "UNIT_CAP")

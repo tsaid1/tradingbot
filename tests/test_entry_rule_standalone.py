@@ -19,11 +19,12 @@ from tradingbot.runtime.mapping import MappingPolicy
 CUT = "# ------------------------------------------------------------------ templates"
 
 
-def switched(folder: Path) -> Path:
+def switched(folder: Path, on: bool = True) -> Path:
+    """The shipped file with the TLT switch as given (shipped on since DECIDED 7)."""
     head, tail = MAPPING.read_text().split(CUT, 1)
-    assert head.count('environment = "PAPER" }') == 1
-    head = head.replace('environment = "PAPER" }',
-                        'environment = "PAPER", standalone_level_sentence = true }')
+    assert head.count("standalone_level_sentence = true") == 1
+    head = head.replace("standalone_level_sentence = true",
+                        f"standalone_level_sentence = {'true' if on else 'false'}")
     f = folder / "switched.toml"
     f.write_text(head + CUT + tail)
     return f
@@ -31,7 +32,7 @@ def switched(folder: Path) -> Path:
 
 def run(text: str, key: bool):
     with tempfile.TemporaryDirectory() as d:
-        mapping = switched(Path(d)) if key else MAPPING
+        mapping = switched(Path(d), key)
         (Path(d) / "rt").mkdir()
         rt = Runtime(Path(d) / "rt", [post("1", 0, text)], mapping_file=mapping)
         rt.run(3)
@@ -121,10 +122,11 @@ def test_with_the_switch_every_earlier_hold_still_holds(text):
     assert sent == 0 and out[0][0] != "EXECUTED", out
 
 
-def test_the_switch_is_off_in_the_shipped_file_and_strict():
-    for e in MappingPolicy.from_toml(MAPPING).entries.values():
+def test_the_switch_is_on_for_tlt_only_in_the_shipped_file():
+    """Owner, 12 November 2026 (DECIDED 7): on for TLT, paper and simulation only."""
+    for f, e in MappingPolicy.from_toml(MAPPING).entries.items():
         if getattr(e, "entry_anchor", None) is not None:
-            assert e.entry_anchor.standalone_level_sentence is False
+            assert e.entry_anchor.standalone_level_sentence is (f == "TLT")
 
 
 def test_the_old_key_name_is_refused_with_a_clear_message(tmp_path):

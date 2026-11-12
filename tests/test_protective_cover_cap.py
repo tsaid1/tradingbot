@@ -294,7 +294,7 @@ def test_p1_a_sale_on_the_wrong_side_explains_nothing(h):
 
 
 def test_n1_short_mirror(h):
-    h.execute("p1", open_action(side=PositionSide.SHORT, stop="52", target="45"))
+    h.execute("p1", open_action(side=PositionSide.SHORT, entry="49.98", stop="52", target="45"))
     assert h.broker.positions()[0].quantity == -4
     real = h.broker.positions
     broker_shows(h, -2)  # read alone: the stop stays
@@ -314,7 +314,7 @@ def test_p1_short_mirror(h):
     foreign(h, OrderSide.BUY, 1, "OLD-BUY")  # an old buy, then a short idea opens
     h.clock.advance(60)
     h.broker.set_quote(SYMBOL, "49.98", "50.02")
-    h.execute("p1", open_action(side=PositionSide.SHORT, stop="52", target="45"))
+    h.execute("p1", open_action(side=PositionSide.SHORT, entry="49.98", stop="52", target="45"))
     real = h.broker.positions
     broker_shows(h, 0)
     h.coord.sync()

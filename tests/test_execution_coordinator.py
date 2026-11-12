@@ -93,7 +93,7 @@ def test_open_with_stop_fills_and_confirms_protection(h):
     assert working[pos.target_ref].limit_price == Decimal(55)
     entry = h.broker.orders_with_ref(out.order_ref)[0]
     assert entry.order_type == OrderType.LMT and entry.limit_price == Decimal(
-        "50.50"
+        "50.02"
     )  # collar bound
     assert h.events(out.order_ref)[:3] == ["INTENT_RECORDED", "SUBMIT", "ACK"]
     assert "FILL" in h.events(out.order_ref)
@@ -298,7 +298,7 @@ def test_default_halt_file_location(monkeypatch):
 
 def test_add_resizes_protective_orders(h):
     _, pos = opened(h)
-    out = h.execute("p2", action("add", Action.ADD, idea=pos.idea_id, entry="50"))
+    out = h.execute("p2", action("add", Action.ADD, idea=pos.idea_id, entry="50.02"))
     assert (
         out.state == IntentState.FILLED
         and out.filled_quantity == 2
@@ -498,10 +498,11 @@ def test_refused_intent_is_not_retried_on_redelivery(h):
 
 
 def test_short_entry_collar_and_protection(h):
-    out = h.execute("s1", open_action(side=PositionSide.SHORT, stop="52", target="45"))
+    out = h.execute("s1", open_action(side=PositionSide.SHORT, entry="49.98", stop="52",
+                                      target="45"))
     assert out.state == IntentState.FILLED and out.protection == "CONFIRMED"
     entry = h.broker.orders_with_ref(out.order_ref)[0]
-    assert entry.side == OrderSide.SELL and entry.limit_price == Decimal("49.50")
+    assert entry.side == OrderSide.SELL and entry.limit_price == Decimal("49.98")
     assert [p.quantity for p in h.broker.positions()] == [-4]
     stop = h.working()[f"{out.order_ref}.STP"]
     assert stop.side == OrderSide.BUY and stop.status == OrderStatus.SUBMITTED
