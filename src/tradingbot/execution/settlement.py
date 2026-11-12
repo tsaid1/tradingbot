@@ -113,23 +113,33 @@ def _state(coord: ExecutionCoordinator, intent_ref: str | None, idea_id: str | N
     return out
 
 
-def _already_done(coord: ExecutionCoordinator, request_id: int) -> OperatorResult | None:
+def _already_done(coord: ExecutionCoordinator, request_id, action: str, target: str,
+                  outcome: str) -> OperatorResult | None:
+    """The recorded result of this request (a crash between the journal and the queue result).
+    Matched on the request's globally unique id AND its action, target and outcome (review F3):
+    the same id with anything else is refused, never answered with another request's result."""
     for e in coord.store.journal():
-        if e.event.startswith("OPERATOR_") and e.detail.get("request_id") == request_id:
-            return OperatorResult(
-                status=e.detail.get("status", "APPLIED"), reasons=e.detail.get("reasons", []),
-                before=e.detail.get("before", {}), after=e.detail.get("after", {}),
-            )
+        if not e.event.startswith("OPERATOR_") or e.detail.get("request_id") != request_id:
+            continue
+        same = (e.detail.get("action"), e.detail.get("target"), e.detail.get("outcome")) == (
+            action, str(target), outcome)
+        if not same:
+            return OperatorResult(status="REFUSED", reasons=["REQUEST_ID_CONFLICT"])
+        return OperatorResult(
+            status=e.detail.get("status", "APPLIED"), reasons=e.detail.get("reasons", []),
+            before=e.detail.get("before", {}), after=e.detail.get("after", {}),
+        )
     return None
 
 
 def _refuse(coord, request_id, action, reasons, *, order_ref=None, idea_id=None, before=None,
-            operator="", note="") -> OperatorResult:
+            operator="", note="", target="", outcome="") -> OperatorResult:
     before = before if before is not None else _state(coord, order_ref, idea_id)
     coord.store.log(
         coord.clock(), "OPERATOR_ACTION_REFUSED", order_ref=order_ref, idea_id=idea_id,
-        request_id=request_id, action=action, status="REFUSED", reasons=reasons, before=before,
-        after=before, operator=operator, note_sha256=note_digest(note),
+        request_id=request_id, action=action, target=str(target), outcome=outcome,
+        status="REFUSED", reasons=reasons, before=before, after=before, operator=operator,
+        note_sha256=note_digest(note),
     )
     return OperatorResult(status="REFUSED", reasons=reasons, before=before, after=before)
 
@@ -149,7 +159,7 @@ def _basic_problems(confirmation: str, expected: str, note: str) -> list[str]:
 def settle_intent(
     coord: ExecutionCoordinator,
     *,
-    request_id: int,
+    request_id: str,
     order_ref: str,
     outcome: str,
     confirmation: str,
@@ -159,14 +169,14 @@ def settle_intent(
     avg_price: str | None = None,
 ) -> OperatorResult:
     """Settle one intent of unknown outcome from what the operator established at the broker."""
-    done = _already_done(coord, request_id)
+    done = _already_done(coord, request_id, cat.SETTLE, order_ref, outcome)
     if done is not None:
         return done
     intent = coord.store.intent(order_ref)
     idea = intent.idea_id if intent else None
     refuse = lambda reasons, before=None: _refuse(
         coord, request_id, cat.SETTLE, reasons, order_ref=order_ref, idea_id=idea,
-        before=before, operator=operator, note=note,
+        before=before, operator=operator, note=note, target=order_ref, outcome=outcome,
     )
     problems = _basic_problems(confirmation, cat.settle_phrase(order_ref, outcome), note)
     if outcome not in cat.SETTLEMENT_OUTCOMES:
@@ -374,7 +384,8 @@ def _apply_settlement(coord, intent, rows, outcome, fill_qty, price, request_id,
         )
         store.log(
             now, "OPERATOR_SETTLEMENT", order_ref=intent.order_ref, idea_id=intent.idea_id, c=c,
-            request_id=request_id, action=cat.SETTLE, status="APPLIED", outcome=outcome,
+            request_id=request_id, action=cat.SETTLE, target=intent.order_ref,
+            status="APPLIED", outcome=outcome,
             declared_quantity=total if outcome == "FILLED" else 0, declared_filled=total,
             declared_price=str(price) if price is not None else None,
             fill_applied=fill_qty, intent_state=state.value, exceptions_ended=ended,
@@ -507,12 +518,12 @@ def lift_verified_blocks(coord: ExecutionCoordinator) -> list[int]:
 
 
 def clear_exception(
-    coord: ExecutionCoordinator, *, request_id: int, exc_id: int, kind: str, confirmation: str,
+    coord: ExecutionCoordinator, *, request_id: str, exc_id: int, kind: str, confirmation: str,
     note: str, operator: str,
 ) -> OperatorResult:
     """Close a CLEAR-class exception (LEDGER_REVERSAL) only when a full sync and reconciliation
     made now show its contract without blocking discrepancy."""
-    done = _already_done(coord, request_id)
+    done = _already_done(coord, request_id, cat.CLEAR, str(exc_id), kind)
     if done is not None:
         return done
     e = coord.store.exception(exc_id)
@@ -520,7 +531,7 @@ def clear_exception(
     ref = e.order_ref if e else None
     refuse = lambda reasons: _refuse(
         coord, request_id, cat.CLEAR, reasons, order_ref=ref, idea_id=idea, operator=operator,
-        note=note,
+        note=note, target=str(exc_id), outcome=kind,
     )
     problems = _basic_problems(confirmation, cat.clear_phrase(exc_id, kind), note)
     if e is None:
@@ -551,7 +562,8 @@ def clear_exception(
         coord.store.resolve_exception_id(exc_id, now, c)
         coord.store.log(
             now, "OPERATOR_CLEARED", order_ref=ref, idea_id=idea, c=c, request_id=request_id,
-            action=cat.CLEAR, status="APPLIED", exception_id=exc_id, kind=e.kind, before=before,
+            action=cat.CLEAR, target=str(exc_id), outcome=kind, status="APPLIED",
+            exception_id=exc_id, kind=e.kind, before=before,
             after=_state_after_resolve(before, e.kind), contract=key, operator=operator,
             note_sha256=note_digest(note),
             rule="cleared only after a full sync and reconciliation show the contract clean",
@@ -560,11 +572,11 @@ def clear_exception(
 
 
 def acknowledge_exception(
-    coord: ExecutionCoordinator, *, request_id: int, exc_id: int, kind: str, confirmation: str,
+    coord: ExecutionCoordinator, *, request_id: str, exc_id: int, kind: str, confirmation: str,
     note: str, operator: str,
 ) -> OperatorResult:
     """Close an ACKNOWLEDGE-class record (it blocks no exposure); no broker read is needed."""
-    done = _already_done(coord, request_id)
+    done = _already_done(coord, request_id, cat.ACKNOWLEDGE, str(exc_id), kind)
     if done is not None:
         return done
     e = coord.store.exception(exc_id)
@@ -582,14 +594,15 @@ def acknowledge_exception(
             problems.append(f"NOT_ACKNOWLEDGEABLE:{cat.action_for(e.kind)[0]}")
     if problems:
         return _refuse(coord, request_id, cat.ACKNOWLEDGE, problems, order_ref=ref, idea_id=idea,
-                       operator=operator, note=note)
+                       operator=operator, note=note, target=str(exc_id), outcome=kind)
     before = _state(coord, ref, idea)
     now = coord.clock()
     with coord.store.tx() as c:
         coord.store.resolve_exception_id(exc_id, now, c)
         coord.store.log(
             now, "OPERATOR_ACKNOWLEDGED", order_ref=ref, idea_id=idea, c=c,
-            request_id=request_id, action=cat.ACKNOWLEDGE, status="APPLIED", exception_id=exc_id,
+            request_id=request_id, action=cat.ACKNOWLEDGE, target=str(exc_id), outcome=kind,
+            status="APPLIED", exception_id=exc_id,
             kind=e.kind, before=before, after=_state_after_resolve(before, e.kind),
             operator=operator, note_sha256=note_digest(note),
         )

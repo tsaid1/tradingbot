@@ -45,18 +45,21 @@ def apply_pending(
         queue.record_result(req["id"], clock(), status=result.status, reasons=result.reasons,
                             before=result.before, after=result.after)
         runtime_store.event(
-            clock(), "OPERATOR_ACTION", request_id=req["id"], action=req["action"],
+            clock(), "OPERATOR_ACTION", request_id=req["uid"], request=req["id"],
+            action=req["action"],
             target=req["target"], outcome=req["outcome"], status=result.status,
             reasons=result.reasons, operator=req["operator"], origin=req["origin"],
         )
-        out.append({"request_id": req["id"], "action": req["action"], "target": req["target"],
+        out.append({"request_id": req["id"], "uid": req["uid"], "action": req["action"],
+                    "target": req["target"],
                     "outcome": req["outcome"], "status": result.status, "reasons": result.reasons,
                     "lifted": result.lifted})
     return out
 
 
 def _apply_one(coord, store: RuntimeStore, req: dict, expected_account: str, clock):
-    common = {"request_id": req["id"], "confirmation": req["confirmation"], "note": req["note"],
+    # The globally unique id: the journal matches results on it, its target and outcome (F3).
+    common = {"request_id": req["uid"], "confirmation": req["confirmation"], "note": req["note"],
               "operator": req["operator"]}
     action = req["action"]
     if action == Q.SETTLE:
@@ -99,7 +102,7 @@ def _acknowledge_signal(store: RuntimeStore, req: dict, clock) -> settlement.Ope
         return settlement.OperatorResult(status="REFUSED", reasons=reasons, before=before,
                                          after=before)
     store.resolve_exception(exc_id, clock(), f"acknowledged by operator request {req['id']}")
-    store.event(clock(), "OPERATOR_ACKNOWLEDGED_SIGNAL", request_id=req["id"],
+    store.event(clock(), "OPERATOR_ACKNOWLEDGED_SIGNAL", request_id=req["uid"],
                 exception_id=exc_id, kind=found["kind"], before=before,
                 after={"open": False, "kind": found["kind"]})
     return settlement.OperatorResult(status="APPLIED", before=before,
@@ -137,7 +140,7 @@ def _clear_lockout(coord, store: RuntimeStore, req: dict, expected_account: str,
             reasons.append("SESSION_IDENTITY_NOT_ACCEPTED")
     if reasons:
         if session.get("state") == LOCKED_OUT:
-            store.event(clock(), "IDENTITY_LOCKOUT_CLEAR_REFUSED", request_id=req["id"],
+            store.event(clock(), "IDENTITY_LOCKOUT_CLEAR_REFUSED", request_id=req["uid"],
                         reasons=reasons, lockout_reason=session.get("reason"))
         return settlement.OperatorResult(status="REFUSED", reasons=reasons, before=before,
                                          after=before)
@@ -147,7 +150,7 @@ def _clear_lockout(coord, store: RuntimeStore, req: dict, expected_account: str,
                             "journal_mark": session.get("journal_mark", 0),
                             "reason": "LOCKOUT_CLEARED"}, now)
     store.put("broker_identity", identity, now)
-    store.event(now, "IDENTITY_LOCKOUT_CLEARED", request_id=req["id"], before=before,
+    store.event(now, "IDENTITY_LOCKOUT_CLEARED", request_id=req["uid"], before=before,
                 identity=identity, rule="full reconnect, identity checks passed afresh")
     return settlement.OperatorResult(status="APPLIED", before=before,
                                      after={"session": DISCONNECTED, "reason": "LOCKOUT_CLEARED"})

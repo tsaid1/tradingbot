@@ -9,12 +9,19 @@ apply`` while the service is stopped), which checks it again against the broker.
 
 No action in this queue sends, amends or cancels an order. Each one only records what a human has
 established at the broker, or closes a record that blocks nothing, or lifts a lockout.
+
+Review F3: the queue is created only by an explicit initialisation step
+(``OperatorQueue.initialise``, ``scripts/operator.py init``); opening a missing, unreadable or
+corrupt queue raises ``OperatorQueueUnavailable`` and never recreates it. Every request carries a
+globally unique ``uid`` (the integer ``id`` is only a display counter and restarts with a new
+queue); the execution journal records results under the ``uid``.
 """
 
 from __future__ import annotations
 
 import json
 import sqlite3
+import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime
@@ -33,6 +40,7 @@ MIN_NOTE_CHARS = 8
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS operator_requests (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    uid TEXT NOT NULL UNIQUE,
     at TEXT NOT NULL,
     operator TEXT NOT NULL,
     origin TEXT NOT NULL,
@@ -64,6 +72,20 @@ BEGIN SELECT RAISE(ABORT, 'operator_results is append-only'); END;
 """
 
 
+TABLES = ("operator_requests", "operator_results")
+NOT_INITIALISED = "NOT_INITIALISED"
+UNREADABLE = "UNREADABLE"
+
+
+class OperatorQueueUnavailable(RuntimeError):
+    """The queue is missing (never initialised, or lost), unreadable or corrupt. Operator actions
+    are disabled; nothing is recreated implicitly. ``reason``: NOT_INITIALISED or UNREADABLE."""
+
+    def __init__(self, reason: str, detail: str = ""):
+        super().__init__(f"{reason}: {detail}" if detail else reason)
+        self.reason = reason
+
+
 class OperatorInputError(ValueError):
     """The request is malformed or its typed confirmation does not match; nothing was queued."""
 
@@ -86,13 +108,50 @@ def expected_confirmation(action: str, target: str, *, kind: str | None = None,
 
 class OperatorQueue:
     def __init__(self, path: str | Path):
+        """Open an existing, initialised queue. Raises OperatorQueueUnavailable otherwise."""
         self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self._tx() as c:
-            c.executescript(SCHEMA)
+        if not self.path.exists():
+            raise OperatorQueueUnavailable(NOT_INITIALISED, str(self.path))
+        self.check()
+
+    @classmethod
+    def initialise(cls, path: str | Path) -> OperatorQueue:
+        """The explicit initialisation step: create the queue if it does not exist (an existing
+        one is opened and checked, never replaced)."""
+        path = Path(path)
+        if not path.exists():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            conn = sqlite3.connect(str(path), timeout=10.0)
+            try:
+                conn.executescript(SCHEMA)
+                conn.commit()
+            finally:
+                conn.close()
+        return cls(path)
+
+    def check(self) -> None:
+        """Raise OperatorQueueUnavailable(UNREADABLE) unless the file is a readable queue
+        (NOT_INITIALISED when it is gone)."""
+        if not self.path.exists():
+            raise OperatorQueueUnavailable(NOT_INITIALISED, str(self.path))
+        try:
+            conn = sqlite3.connect(f"{self.path.resolve().as_uri()}?mode=ro", uri=True,
+                                   timeout=10.0)
+            try:
+                names = {r[0] for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'")}
+                cols = {r[1] for r in conn.execute("PRAGMA table_info(operator_requests)")}
+            finally:
+                conn.close()
+        except (sqlite3.Error, OSError) as exc:
+            raise OperatorQueueUnavailable(UNREADABLE, type(exc).__name__) from None
+        if not set(TABLES) <= names or "uid" not in cols:
+            raise OperatorQueueUnavailable(UNREADABLE, "not an operator queue")
 
     @contextmanager
     def _tx(self) -> Iterator[sqlite3.Connection]:
+        if not self.path.exists():  # deleted while open: never recreated by a connect
+            raise OperatorQueueUnavailable(NOT_INITIALISED, str(self.path))
         conn = sqlite3.connect(str(self.path), timeout=10.0)
         conn.row_factory = sqlite3.Row
         try:
@@ -145,10 +204,10 @@ class OperatorQueue:
             raise OperatorInputError("; ".join(problems))
         with self._tx() as c:
             cur = c.execute(
-                """INSERT INTO operator_requests (at,operator,origin,action,target,kind,outcome,
-                quantity,avg_price,note,confirmation) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-                (at.isoformat(), operator.strip(), origin, action, str(target), kind, outcome,
-                 quantity, avg_price, note.strip(), confirmation.strip()),
+                """INSERT INTO operator_requests (uid,at,operator,origin,action,target,kind,
+                outcome,quantity,avg_price,note,confirmation) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (uuid.uuid4().hex, at.isoformat(), operator.strip(), origin, action, str(target),
+                 kind, outcome, quantity, avg_price, note.strip(), confirmation.strip()),
             )
             return int(cur.lastrowid)
 

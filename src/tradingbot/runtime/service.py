@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -78,7 +79,7 @@ from tradingbot.runtime.alerts import Alerter
 from tradingbot.runtime.config import RuntimeConfig
 from tradingbot.runtime.mapping import FamilyMapping, MappingDecision, MappingPolicy
 from tradingbot.runtime.notify import Notifier
-from tradingbot.runtime.operator_actions import OperatorQueue
+from tradingbot.runtime.operator_actions import OperatorQueue, OperatorQueueUnavailable
 from tradingbot.runtime.operator_apply import (
     CONNECTED,
     DISCONNECTED,
@@ -237,8 +238,10 @@ class RuntimeService:
         self.coordinator = ExecutionCoordinator(
             broker, config.execution_db, config.policy, execution_config(config), clock=self.clock
         )
+        # Review F3: never created here; a missing or broken queue disables operator actions only.
+        self.queue: OperatorQueue | None = None
+        self.queue_problem: str | None = None
         try:
-            self.queue = OperatorQueue(config.operator_db)
             self.replay = _StampingReplay(config.replay_db, self.coordinator, self.clock)
             lexicon = None
             if config.interpreter.lexicon_path is not None:
@@ -512,15 +515,70 @@ class RuntimeService:
         self.store.event(now, "BROKER_IDENTITY_LOCKOUT", reason=reason, detail=detail)
         self._check_halt(now)
 
-    def _apply_operator_requests(self, *, locked_out: bool = False) -> None:
-        results = apply_pending(
-            coordinator=self.coordinator, runtime_store=self.store, queue=self.queue,
-            expected_account=self.config.execution.expected_account, clock=self.clock,
-            locked_out=locked_out,
+    def _open_queue(self) -> OperatorQueue | None:
+        """The operator queue, or None with ``queue_problem`` set: QUEUE_NOT_INITIALISED (never
+        created), QUEUE_LOST (missing although the execution journal references requests from it)
+        or QUEUE_UNREADABLE (unreadable or corrupt). Never recreated here (review F3)."""
+        if self.queue is not None:
+            try:
+                self.queue.check()
+                return self.queue
+            except OperatorQueueUnavailable as exc:
+                self.queue = None
+                problem = exc.reason
+        else:
+            try:
+                self.queue = OperatorQueue(self.config.operator_db)
+                return self.queue
+            except OperatorQueueUnavailable as exc:
+                problem = exc.reason
+        if problem == "NOT_INITIALISED":
+            used = any(e.event.startswith("OPERATOR_") and e.detail.get("request_id")
+                       for e in self.coordinator.store.journal())
+            problem = "QUEUE_LOST" if used else "QUEUE_NOT_INITIALISED"
+        else:
+            problem = "QUEUE_UNREADABLE"
+        self._queue_unavailable(problem)
+        return None
+
+    def _queue_unavailable(self, problem: str) -> None:
+        now = self.clock()
+        if problem != self.queue_problem:
+            self.store.event(now, "OPERATOR_QUEUE_UNAVAILABLE", problem=problem,
+                             path=str(self.config.operator_db))
+        self.queue_problem = problem
+        self.queue = None
+        self.alerter.raise_(
+            "OPERATOR:QUEUE", N.OPERATOR_QUEUE_UNAVAILABLE, "Operator actions disabled",
+            f"{problem}: the operator queue {self.config.operator_db} is unusable, so no operator "
+            "request is applied; the trading loop, exits, protection upkeep and the heartbeat "
+            "keep running. " + (
+                "Run `scripts/operator.py init` once." if problem == "QUEUE_NOT_INITIALISED"
+                else "Restore the queue file, or initialise a new one with `scripts/operator.py "
+                "init --replace-lost` after checking the request history."
+            ), now,
         )
+
+    def _apply_operator_requests(self, *, locked_out: bool = False) -> None:
+        queue = self._open_queue()
+        if queue is None:
+            return
+        try:
+            results = apply_pending(
+                coordinator=self.coordinator, runtime_store=self.store, queue=queue,
+                expected_account=self.config.execution.expected_account, clock=self.clock,
+                locked_out=locked_out,
+            )
+        except (OperatorQueueUnavailable, sqlite3.DatabaseError, OSError):
+            self._queue_unavailable("QUEUE_UNREADABLE")
+            return
+        if self.queue_problem is not None:
+            self.store.event(self.clock(), "OPERATOR_QUEUE_RESTORED", was=self.queue_problem)
+            self.queue_problem = None
+        self.alerter.sweep("OPERATOR:QUEUE", set(), self.clock())
         for r in results:
             self.alerter.event(
-                f"EVENT:OPERATOR:{r['request_id']}",
+                f"EVENT:OPERATOR:{r['uid']}",
                 N.OPERATOR_ACTION,
                 f"Operator {r['action']} {r['status']}",
                 f"request {r['request_id']} {r['action']} {r['target']} {r['outcome'] or ''}: "
@@ -1052,6 +1110,8 @@ class RuntimeService:
             "broker_session": {"state": session["state"], "since": session.get("since"),
                                "reason": session.get("reason")},
             "halt_file": str(self.config.paths.halt_file),
+            "operator_queue": {"state": "UNAVAILABLE" if self.queue_problem else "AVAILABLE",
+                               "problem": self.queue_problem},
             "last_cycle": {
                 "started_at": report.started_at.isoformat(),
                 "skipped": report.skipped,

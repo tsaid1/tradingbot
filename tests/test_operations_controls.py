@@ -204,6 +204,97 @@ def test_a_contradicted_settlement_alerts_at_once_and_keeps_reconciliation_uncle
     assert rt.service.last_reconciliation.clean
 
 
+def _settle_request(rt, queue, ref):
+    return queue.enqueue(at=rt.clock.now(), operator="tester", origin="test", action=Q.SETTLE,
+                         target=ref, outcome="NOT_AT_BROKER", note=NOTE,
+                         confirmation=cat.settle_phrase(ref, "NOT_AT_BROKER"))
+
+
+def test_a_missing_queue_is_never_created_implicitly(tmp_path):
+    path = tmp_path / "state" / "operator.sqlite3"
+    with pytest.raises(Q.OperatorQueueUnavailable, match="NOT_INITIALISED"):
+        Q.OperatorQueue(path)
+    assert not path.exists()
+    queue = Q.OperatorQueue.initialise(path)
+    assert path.exists() and queue.requests() == []
+
+
+def test_request_ids_are_globally_unique_so_a_lost_queue_cannot_replay_an_old_result(tmp_path):
+    """Review F3: the queue is lost and re-initialised; its counter restarts at 1. A new genuine
+    settlement must be applied on its own merits, never answered with the old journal result."""
+    rt, ref = unknown_entry(tmp_path)
+    rt.run(3, 5)
+    queue = Q.OperatorQueue(rt.config.operator_db)
+    queue.enqueue(at=rt.clock.now(), operator="tester", origin="test", action=Q.SETTLE,
+                  target=ref, outcome="FILLED", quantity=2, avg_price="88.42", note=NOTE,
+                  confirmation=cat.settle_phrase(ref, "FILLED"))
+    rt.step()
+    [old] = queue.requests()
+    assert old["id"] == 1 and old["status"] == "REFUSED"  # the broker holds nothing
+    rt.config.operator_db.unlink()  # the queue is lost
+    rt.step()
+    assert not rt.config.operator_db.exists()  # never silently recreated
+    alert = [a for a in rt.store.alerts(open_only=True) if a["key"] == "OPERATOR:QUEUE"]
+    assert alert and "QUEUE_LOST" in alert[0]["detail"]
+    assert N.OPERATOR_QUEUE_UNAVAILABLE in kinds(rt)
+    # The explicit initialisation step: a fresh counter, fresh globally unique ids.
+    queue = Q.OperatorQueue.initialise(rt.config.operator_db)
+    rid = _settle_request(rt, queue, ref)
+    assert rid == 1 and queue.requests()[0]["uid"] != old["uid"]
+    rt.step()
+    assert queue.requests()[0]["status"] == "APPLIED"
+    assert rt.service.coordinator.intent(ref).state == IntentState.CANCELLED
+    assert not any(a["key"] == "OPERATOR:QUEUE" for a in rt.store.alerts(open_only=True))
+
+
+def test_a_corrupt_queue_disables_operator_actions_but_the_trading_loop_keeps_running(tmp_path):
+    rt = Runtime(tmp_path, [post("1", 0, ENTRY), post("2", 30, CLOSE)])
+    rt.step(5)
+    assert rt.service.coordinator.store.position("1:a1").quantity == 2
+    rt.config.operator_db.write_bytes(b"not a database at all" * 100)
+    for _ in range(8):
+        report = rt.step(5)  # never raises
+    assert rt.service.coordinator.store.position("1:a1").status == "CLOSED"  # the exit ran
+    assert rt.heartbeat()["cycle"] == rt.service.cycles
+    assert rt.heartbeat()["operator_queue"]["state"] == "UNAVAILABLE"
+    assert report.skipped is None
+    [alert] = [a for a in rt.store.alerts(open_only=True) if a["key"] == "OPERATOR:QUEUE"]
+    assert "QUEUE_UNREADABLE" in alert["detail"]
+    assert kinds(rt).count(N.OPERATOR_QUEUE_UNAVAILABLE) == 1
+
+
+def test_a_service_started_without_a_queue_runs_and_says_so(tmp_path):
+    rt = Runtime(tmp_path, [post("1", 0, ENTRY)])
+    rt.service.close()
+    rt.config.operator_db.unlink()
+    rt.restart()
+    rt.run(3)
+    assert not rt.config.operator_db.exists()
+    assert rt.service.coordinator.store.position("1:a1").quantity == 2
+    [alert] = [a for a in rt.store.alerts(open_only=True) if a["key"] == "OPERATOR:QUEUE"]
+    assert "QUEUE_NOT_INITIALISED" in alert["detail"]
+
+
+def test_a_journal_result_matches_only_the_same_id_target_and_outcome(tmp_path):
+    from tradingbot.execution import settlement as S
+
+    rt, ref = unknown_entry(tmp_path)
+    rt.run(3, 5)
+    coord = rt.service.coordinator
+    first = S.settle_intent(coord, request_id="uid-1", order_ref=ref, outcome="NOT_AT_BROKER",
+                            confirmation=cat.settle_phrase(ref, "NOT_AT_BROKER"), note=NOTE,
+                            operator="tester")
+    assert first.status == "APPLIED"
+    again = S.settle_intent(coord, request_id="uid-1", order_ref=ref, outcome="NOT_AT_BROKER",
+                            confirmation=cat.settle_phrase(ref, "NOT_AT_BROKER"), note=NOTE,
+                            operator="tester")
+    assert again.status == "APPLIED"  # the same request after a crash: the recorded result
+    other = S.settle_intent(coord, request_id="uid-1", order_ref=ref, outcome="CANCELLED",
+                            confirmation=cat.settle_phrase(ref, "CANCELLED"), note=NOTE,
+                            operator="tester")
+    assert other.status == "REFUSED" and other.reasons == ["REQUEST_ID_CONFLICT"]
+
+
 # ------------------------------------------------------------------------------ reconnect
 
 

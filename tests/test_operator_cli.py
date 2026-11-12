@@ -80,3 +80,37 @@ def test_watchdog_exits_1_and_alerts_when_the_heartbeat_is_missing(tmp_path):
     out = run("scripts/watchdog.py", "--config", str(cfg))
     assert out.returncode == 1 and json.loads(out.stdout)["notified"] == "HEARTBEAT_STALE"
     assert "HEARTBEAT_STALE" in rt.config.alerts_file.read_text()
+
+
+def test_cli_init_is_the_only_way_to_create_the_queue_and_refuses_to_hide_a_lost_one(tmp_path):
+    rt, cfg, ref = unresolved(tmp_path)
+    rt.service.close()
+    rt.config.operator_db.unlink()
+    out = run("scripts/operator.py", "--config", str(cfg), "settle", ref, "NOT_AT_BROKER",
+              "--note", NOTE, "--confirm", cat.settle_phrase(ref, "NOT_AT_BROKER"))
+    assert out.returncode == 2 and "operator queue unavailable" in out.stderr
+    assert not rt.config.operator_db.exists()
+    out = run("scripts/operator.py", "--config", str(cfg), "init")
+    assert out.returncode == 0, out.stderr
+    assert rt.config.operator_db.exists()
+    assert run("scripts/operator.py", "--config", str(cfg), "init").returncode == 0  # idempotent
+    # Once the execution journal references requests, a lost queue is not silently replaced.
+    out = run("scripts/operator.py", "--config", str(cfg), "--operator", "tester", "settle", ref,
+              "NOT_AT_BROKER", "--note", NOTE, "--confirm", cat.settle_phrase(ref, "NOT_AT_BROKER"))
+    assert out.returncode == 0, out.stderr
+    rt.config.operator_db.unlink()
+    out = run("scripts/operator.py", "--config", str(cfg), "init")
+    assert out.returncode == 2 and "--replace-lost" in out.stderr
+    assert not rt.config.operator_db.exists()
+    out = run("scripts/operator.py", "--config", str(cfg), "init", "--replace-lost")
+    assert out.returncode == 0 and rt.config.operator_db.exists()
+
+
+def test_cli_reports_a_corrupt_queue_instead_of_crashing(tmp_path):
+    rt, cfg, _ = unresolved(tmp_path)
+    rt.service.close()
+    rt.config.operator_db.write_bytes(b"garbage" * 200)
+    out = run("scripts/operator.py", "--config", str(cfg), "history")
+    assert out.returncode == 2 and "UNREADABLE" in out.stderr
+    out = run("scripts/operator.py", "--config", str(cfg), "list")
+    assert out.returncode == 0, out.stderr

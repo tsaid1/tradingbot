@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Operator actions on the runtime service's state (mock mode). None of them sends an order.
 
+    PYTHONPATH=src python scripts/operator.py --config runtime.toml init
     PYTHONPATH=src python scripts/operator.py --config runtime.toml list
     PYTHONPATH=src python scripts/operator.py --config runtime.toml settle TB-... NOT_AT_BROKER \\
         --note "checked TWS: no such order" --confirm "SETTLE TB-... NOT_AT_BROKER"
@@ -15,7 +16,9 @@
 
 Every action is queued (append-only) with its note and typed confirmation, then applied by the
 process that holds the execution store: the running service on its next cycle, or this command at
-once when the service is stopped. ``apply`` applies whatever is pending. See docs/OPERATIONS.md.
+once when the service is stopped. ``apply`` applies whatever is pending. ``init`` creates the
+queue once (nothing else ever creates it); it refuses to replace a queue the execution journal
+shows was in use unless ``--replace-lost`` is given. See docs/OPERATIONS.md.
 
 Exit codes: 0 queued or applied, 3 refused, 2 bad input or config.
 """
@@ -31,6 +34,36 @@ from datetime import UTC, datetime
 from tradingbot.runtime import operator_actions as Q
 from tradingbot.runtime.config import DEFAULT_CONFIG_PATH, ConfigError, load_config
 from tradingbot.runtime.register import load_register
+
+
+def _journal_references_requests(config) -> bool:
+    from tradingbot.runtime.lifecycle import _ro, _rows
+
+    with _ro(config.execution_db) as ex:
+        rows = _rows(ex, "SELECT detail FROM exec_journal WHERE event LIKE 'OPERATOR_%'")
+    return any(json.loads(r["detail"]).get("request_id") for r in rows)
+
+
+def _init(config, replace_lost: bool) -> int:
+    path = config.operator_db
+    if path.exists():
+        try:
+            Q.OperatorQueue(path)
+        except Q.OperatorQueueUnavailable as exc:
+            print(f"refusing: {path} exists but is not a usable queue ({exc}); move it aside "
+                  "after keeping a copy, then run init again", file=sys.stderr)
+            return 2
+        print(f"operator queue already initialised: {path}")
+        return 0
+    if _journal_references_requests(config) and not replace_lost:
+        print(f"refusing: {path} is missing but the execution journal references operator "
+              "requests from it (the queue was lost). Restore it if you can; to start a new one "
+              "anyway, run init --replace-lost (request ids are globally unique, so no old "
+              "result can be confused with a new request)", file=sys.stderr)
+        return 2
+    Q.OperatorQueue.initialise(path)
+    print(f"operator queue initialised: {path}")
+    return 0
 
 
 def _apply_now(config) -> list[dict] | None:
@@ -78,6 +111,9 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("list", help="open exceptions, unresolved intents, open alerts (read-only)")
     sub.add_parser("history", help="every operator request and its result")
     sub.add_parser("apply", help="apply pending requests now (service stopped)")
+    init = sub.add_parser("init", help="create the operator queue (once)")
+    init.add_argument("--replace-lost", action="store_true",
+                      help="start a new queue although the journal shows one was in use")
 
     def action(name, help_, *positional):
         p = sub.add_parser(name, help=help_)
@@ -103,7 +139,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "list":
         _print_list(config)
         return 0
-    queue = Q.OperatorQueue(config.operator_db)
+    if args.cmd == "init":
+        return _init(config, args.replace_lost)
+    try:
+        queue = Q.OperatorQueue(config.operator_db)
+    except Q.OperatorQueueUnavailable as exc:
+        print(f"operator queue unavailable ({exc}): operator actions are disabled; run "
+              "`operator.py init` (see docs/OPERATIONS.md)", file=sys.stderr)
+        return 2
     if args.cmd == "history":
         print(json.dumps(queue.requests(), indent=2, default=str))
         return 0
@@ -128,6 +171,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"queued as request {request_id}")
     try:
         results = _apply_now(config)
+    except Q.OperatorQueueUnavailable as exc:
+        print(f"operator queue unavailable ({exc})", file=sys.stderr)
+        return 2
     except ConfigError as exc:
         print(f"refusing: {exc}", file=sys.stderr)
         return 2

@@ -9,6 +9,7 @@ from pathlib import Path
 
 from tradingbot.execution.sim_broker import SimBroker, SimClock
 from tradingbot.runtime.config import RuntimeConfig, parse_config
+from tradingbot.runtime.operator_actions import OperatorQueue
 from tradingbot.runtime.service import RuntimeService
 from tradingbot.runtime.sources import ReplayFileSource
 from tradingbot.runtime.store import RuntimeStore
@@ -158,6 +159,8 @@ class Runtime:
             else:
                 raw[key] = value
         self.config: RuntimeConfig = parse_config(raw, base=self.folder)
+        # The explicit initialisation step a deployment runs once (scripts/operator.py init).
+        OperatorQueue.initialise(self.config.operator_db)
         self.notifier = RecordingNotifier()
         self.restart()
 

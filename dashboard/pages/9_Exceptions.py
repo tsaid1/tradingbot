@@ -65,10 +65,18 @@ except ConfigError as exc:
 
 reg = load_register(config)
 halt_file = config.paths.halt_file
-queue = Q.OperatorQueue(config.operator_db)
+try:
+    queue = Q.OperatorQueue(config.operator_db)
+except Q.OperatorQueueUnavailable as exc:  # never created or repaired from here (review F3)
+    queue = None
+    st.error(f"Operator actions disabled: the operator queue is unavailable ({exc}). Run "
+             "`scripts/operator.py init` once, or restore the queue; see docs/OPERATIONS.md.")
 
 
 def queue_request(**fields) -> None:
+    if queue is None:
+        st.error("Not queued: the operator queue is unavailable.")
+        return
     try:
         rid = queue.enqueue(at=datetime.now(UTC), origin="dashboard", **fields)
     except Q.OperatorInputError as exc:

@@ -7,6 +7,7 @@ empty); nothing here writes, decides or calls a broker. Used by the dashboard's 
 from __future__ import annotations
 
 import json
+import sqlite3
 from datetime import UTC, datetime
 
 from tradingbot.execution import operator_catalog as cat
@@ -51,13 +52,17 @@ def load_register(config: RuntimeConfig, now: datetime | None = None) -> dict:
         alerts = _rows(rt, "SELECT * FROM alerts ORDER BY opened_at, key")
         session = _kv(rt, "broker_session") or {"state": "CONNECTED"}
         heartbeat = _kv(rt, "heartbeat")
-        requests = _rows(
-            op,
-            """SELECT q.id, q.at, q.operator, q.origin, q.action, q.target, q.kind, q.outcome,
-            q.quantity, q.avg_price, r.at AS result_at, r.status, r.reasons
-            FROM operator_requests q LEFT JOIN operator_results r ON r.request_id = q.id
-            ORDER BY q.id""",
-        )
+        queue_problem = None if op is not None else "NOT_INITIALISED"
+        try:
+            requests = _rows(
+                op,
+                """SELECT q.id, q.at, q.operator, q.origin, q.action, q.target, q.kind,
+                q.outcome, q.quantity, q.avg_price, r.at AS result_at, r.status, r.reasons
+                FROM operator_requests q LEFT JOIN operator_results r ON r.request_id = q.id
+                ORDER BY q.id""",
+            )
+        except sqlite3.DatabaseError:  # corrupt: shown, never repaired here (review F3)
+            requests, queue_problem = [], "UNREADABLE"
     by_ref = {i["order_ref"]: i for i in intents}
 
     def contract_of(idea_id: str | None, order_ref: str | None) -> str:
@@ -145,6 +150,7 @@ def load_register(config: RuntimeConfig, now: datetime | None = None) -> dict:
         "alerts_resolved": [a for a in alerts if a["resolved_at"] is not None][-50:],
         "alerts_feed": read_alerts_file(config.alerts_file, 100),
         "requests": requests,
+        "operator_queue_problem": queue_problem,
         "expected_account": config.execution.expected_account,
         "lockout_confirmation": cat.lockout_phrase(config.execution.expected_account),
     }
