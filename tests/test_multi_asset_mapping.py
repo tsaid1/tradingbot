@@ -255,7 +255,6 @@ def test_a_fully_specified_option_selects_its_contract(tmp_path):
         ("Buying $QSTK 2026-09-18 call at 4.22", ["STRIKE"]),
         ("Buying $QSTK 2026-09-18 105 strike option at 4.22", ["STRIKE", "RIGHT"]),
         ("Buying $QSTK Sep 2026 105 call at 4.22", ["EXPIRY"]),  # a month is not an expiry
-        ("Buying $QSTK 2026-09-18 105 call and 110 put at 4.22", ["STRIKE", "RIGHT"]),
     ],
 )
 def test_an_option_with_any_identifying_field_missing_holds(tmp_path, clause, missing):
@@ -264,6 +263,14 @@ def test_an_option_with_any_identifying_field_missing_holds(tmp_path, clause, mi
     assert d.status == "UNRESOLVED"
     assert parsed.actions[0].ambiguities == ["OPTION_TERMS_INCOMPLETE",
                                              *(f"OPTION_{m}_NOT_EXPLICIT" for m in missing)]
+
+
+def test_two_strikes_and_two_rights_are_not_a_single_leg(tmp_path):
+    # Formerly OPTION_TERMS_INCOMPLETE; now named for what it is (review F3).
+    clause = "Buying $QSTK 2026-09-18 105 call and 110 put at 4.22"
+    d, _ = resolve(demo(tmp_path), act("QSTK"), clause)
+    assert d.status == "UNRESOLVED"
+    assert d.reason.split(",")[0] == "OPTION_STRATEGY_NOT_SINGLE_LEG"
 
 
 def test_an_option_whose_underlying_is_not_the_family_holds(tmp_path):

@@ -63,6 +63,25 @@ STRIKE_RIGHT_RE = re.compile(
     re.IGNORECASE,
 )
 RIGHT_RE = re.compile(r"\b(?P<right>call|put)s?\b", re.IGNORECASE)
+# Words naming a multi-leg option strategy (review F3). Any of them in an option instruction HOLDs.
+STRATEGY_RE = re.compile(
+    r"\b(?P<word>spread|vertical|calendar|diagonal|straddle|strangle|condor|butterfl(?:y|ies)|"
+    r"collar|ratio|covered|combo)s?\b",
+    re.IGNORECASE,
+)
+# The ones that only ever name options: they route an instruction to its option family even
+# without the words call, put or option.
+OPTION_ONLY_STRATEGY_RE = re.compile(
+    r"\b(?:straddles?|strangles?|condors?|butterfl(?:y|ies)|"
+    r"(?:vertical|calendar|diagonal|ratio|credit|debit)\s+spreads?)\b",
+    re.IGNORECASE,
+)
+# Two strikes written together before a right or a strategy word: 100/105, 100-105, 105 and 110.
+STRIKE_PAIR_RE = re.compile(
+    r"(?<![\w.$/-])\$?\d+(?:\.\d+)?\s*(?:/|-|,|&|and|to)\s*\$?\d+(?:\.\d+)?\s*"
+    r"(?:strikes?\s+)?(?:calls?|puts?|spreads?|straddles?|strangles?|strikes?)\b",
+    re.IGNORECASE,
+)
 OPTION_LANGUAGE_RE = re.compile(r"\b(?:calls?|puts?|options?|strike)\b", re.IGNORECASE)
 
 
@@ -83,6 +102,9 @@ class InstructionTerms:
     # Tokens that look like a contract month or code but do not parse ("Sep", "2026-13").
     unrecognised_months: list[str] = field(default_factory=list)
     upper_words: list[str] = field(default_factory=list)
+    # Why the instruction is not a single-leg option (several strikes, expiries or rights, a
+    # strategy word). Empty for a single leg.
+    multi_leg: list[str] = field(default_factory=list)
 
     @property
     def names_a_month(self) -> bool:
@@ -126,7 +148,8 @@ def extract_terms(clause: str | None) -> InstructionTerms:
         out.month_codes.append(
             (m.group(0), m.group("root"), _CODE_MONTH[m.group("code")], m.group("yy")))
     out.upper_words = UPPER_WORD_RE.findall(clause)
-    out.option_language = OPTION_LANGUAGE_RE.search(clause) is not None
+    out.option_language = (OPTION_LANGUAGE_RE.search(clause) is not None
+                           or OPTION_ONLY_STRATEGY_RE.search(clause) is not None)
     for m in ISO_DATE_RE.finditer(clause):
         try:
             d = date(int(m.group("y")), int(m.group("m")), int(m.group("d")))
@@ -145,4 +168,15 @@ def extract_terms(clause: str | None) -> InstructionTerms:
         right = m.group("right").upper()
         if right not in out.rights:
             out.rights.append(right)
+    for m in STRATEGY_RE.finditer(clause):
+        word = m.group("word").lower()
+        word = "butterfly" if word.startswith("butterfl") else word
+        if f"STRATEGY_WORD:{word}" not in out.multi_leg:
+            out.multi_leg.append(f"STRATEGY_WORD:{word}")
+    if len(out.strikes) > 1 or STRIKE_PAIR_RE.search(clause):
+        out.multi_leg.append("SEVERAL_STRIKES")
+    if len(out.expiries) > 1:
+        out.multi_leg.append("SEVERAL_EXPIRIES")
+    if len(out.rights) > 1:
+        out.multi_leg.append("SEVERAL_RIGHTS")
     return out

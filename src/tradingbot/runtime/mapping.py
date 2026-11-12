@@ -60,6 +60,8 @@ IDEA_CONTRACT_MISMATCH = "IDEA_CONTRACT_MISMATCH"
 # The clause has a month-like or contract-code token that does not resolve to exactly one listed
 # contract of the entry (review F2): never replaced by the nearest month.
 CONTRACT_MONTH_UNRECOGNISED = "CONTRACT_MONTH_UNRECOGNISED"
+# An option instruction with more than one strike, expiry or right, or a strategy word (review F3).
+OPTION_STRATEGY_NOT_SINGLE_LEG = "OPTION_STRATEGY_NOT_SINGLE_LEG"
 
 
 class BasisRelation(str, Enum):
@@ -546,6 +548,8 @@ class FamilyMapping(StrictModel):
 
     def _select_option(self, asset, terms, held):
         x = self.execution
+        if terms.multi_leg:  # only one underlying, expiry, strike and right is a single leg
+            return None, [OPTION_STRATEGY_NOT_SINGLE_LEG, *terms.multi_leg]
         if held is not None:
             right = {"C": "CALL", "P": "PUT"}.get(held.right or "")
             expiry = f"{held.expiry[:4]}-{held.expiry[4:6]}-{held.expiry[6:8]}" if held.expiry \

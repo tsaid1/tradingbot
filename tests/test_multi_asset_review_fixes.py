@@ -194,3 +194,56 @@ def test_f2_reviewer_probes_through_the_service(tmp_path):
     assert a["status"] == "HOLD" and "CONTRACT_MONTH_UNRECOGNISED" in a["reasons"]
     assert run.broker.submit_calls == 0
     run.close()
+
+
+# ================================================================== F3: single-leg options only
+
+SINGLE = "Buying $QSTK 2026-09-18 105 call at 4.22. Stop 3.40."
+
+
+@pytest.mark.parametrize(
+    "clause,detail",
+    [
+        ("Buying the $QSTK 2026-09-18 100/105 call spread at 4.22. Stop 3.40.", None),
+        ("We are now long $QSTK 2026-09-18 105 calls at 4.22, short the 110 calls.",
+         "SEVERAL_STRIKES"),
+        ("Buying $QSTK 2026-09-18 100-105 calls at 4.22.", "SEVERAL_STRIKES"),
+        ("Buying $QSTK 2026-09-18 105 and 110 calls at 4.22.", "SEVERAL_STRIKES"),
+        ("Buying $QSTK 2026-09-18 105 call and 110 put at 4.22.", None),
+        ("Buying $QSTK 2026-09-18 105 call and 105 put at 4.22.", "SEVERAL_RIGHTS"),
+        ("Buying $QSTK 2026-09-18 and 2026-12-18 105 calls at 4.22.", "SEVERAL_EXPIRIES"),
+        ("Buying the $QSTK 2026-09-18 105 straddle at 8.10.", "STRATEGY_WORD:straddle"),
+        ("Buying the $QSTK 2026-09-18 100 105 strangle at 3.10.", "STRATEGY_WORD:strangle"),
+        ("Buying the $QSTK 2026-09-18 105 call vertical at 2.10.", "STRATEGY_WORD:vertical"),
+        ("Buying the $QSTK 2026-09-18 105 call calendar at 1.10.", "STRATEGY_WORD:calendar"),
+        ("Buying the $QSTK 2026-09-18 105 call diagonal at 1.10.", "STRATEGY_WORD:diagonal"),
+        ("Buying the $QSTK 2026-09-18 105 iron condor at 1.10.", "STRATEGY_WORD:condor"),
+        ("Buying the $QSTK 2026-09-18 105 call butterfly at 1.10.", "STRATEGY_WORD:butterfly"),
+        ("Buying the $QSTK 2026-09-18 105 put collar at 1.10.", "STRATEGY_WORD:collar"),
+        ("Buying the $QSTK 2026-09-18 105 call ratio at 1.10.", "STRATEGY_WORD:ratio"),
+        ("Buying the $QSTK 2026-09-18 105 covered call at 1.10.", "STRATEGY_WORD:covered"),
+        ("Buying the $QSTK 2026-09-18 105 call combo at 1.10.", "STRATEGY_WORD:combo"),
+        ("Buying the $QSTK 2026-09-18 105 call spread at 1.10.", "STRATEGY_WORD:spread"),
+    ],
+)
+def test_f3_a_multi_leg_option_instruction_holds(tmp_path, clause, detail):
+    d, inst = demo_policy(tmp_path).resolve(opening("QSTK"), clause=clause, now=MAP_NOW)
+    assert d.status == "UNRESOLVED" and inst is None and d.family == "QSTK.OPT"
+    reasons = d.reason.split(",")
+    assert reasons[0] == "OPTION_STRATEGY_NOT_SINGLE_LEG", reasons
+    if detail:
+        assert detail in reasons
+
+
+def test_f3_exactly_one_underlying_expiry_strike_and_right_is_a_single_leg(tmp_path):
+    d, inst = demo_policy(tmp_path).resolve(opening("QSTK"), clause=SINGLE, now=MAP_NOW)
+    assert d.status == "SUPPORTED" and (inst.strike, inst.option_right) == ("105", "CALL")
+
+
+def test_f3_reviewer_probe_spread_never_reaches_the_broker(tmp_path):
+    run = run_steps(tmp_path, [Step(0, "We are now long the $QSTK 2026-09-18 100/105 call spread at "
+                                       "4.22. Stop 3.40.", "HOLD")], family="QSTK.OPT")
+    [a] = traded(run)
+    assert a["status"] == "HOLD" and "OPTION_STRATEGY_NOT_SINGLE_LEG" in a["reasons"]
+    assert run.broker.submit_calls == 0
+    run.close()
