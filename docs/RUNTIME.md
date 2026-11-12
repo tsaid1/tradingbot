@@ -225,6 +225,12 @@ streamable. Exit code 2, nothing left connected (the simulator is opened before 
 PYTHONPATH=src python scripts/run_service.py --config <private>/runtime.shadow.toml
 ```
 
+**Start before the first post.** A post that arrives before the watched family's quote stream has
+delivered its first price is blocked with `QUOTE_UNAVAILABLE`. The stream is opened at start and
+needs a moment to deliver, so start the service before the session's first expected post, and
+check the heartbeat's `shadow` block (each open stream with its label and reason) shows a usable
+quote before relying on it.
+
 **What the owner sees.** The heartbeat carries `mode = "shadow"` and a `shadow` block (quote
 session state, masked paper account, requested market-data type, open streams with their label and
 reason, reconnects, `fills = SIMULATED_AT_REAL_QUOTE`). The journal's `SERVICE_START` carries the
