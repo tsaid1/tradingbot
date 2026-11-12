@@ -236,3 +236,52 @@ def test_the_flag_raises_an_alert_through_the_service(tmp_path):
     assert any(a["key"] == f"EXC:{e.id}" and a["kind"] == N.EXIT_WHILE_ENTRY_UNKNOWN
                for a in rt.store.alerts(open_only=True))
     rt.service.close()
+
+
+# ---------------------------------------------------------------- review fixes (PR #74)
+
+
+def _add_unknown_then_close(tmp_path, monkeypatch, *, fault: bool):
+    """An OPEN of 2 that fills, an ADD whose acknowledgement is lost, then the publisher's CLOSE.
+    With ``fault`` only the flag's exception write fails."""
+    from runtime_harness import ADD, ENTRY, SERVICE_MAPPING
+
+    from tradingbot.execution import store as xs
+
+    if fault:
+        orig = xs.ExecutionStore.raise_exception
+
+        def boom(self, at, kind, *a, **k):
+            if kind == EXIT_WHILE_ENTRY_UNKNOWN:
+                raise RuntimeError("invented: flag write failed")
+            return orig(self, at, kind, *a, **k)
+
+        monkeypatch.setattr(xs.ExecutionStore, "raise_exception", boom)
+    tmp_path.mkdir(parents=True)
+    rt = Runtime(tmp_path, [post("1", 0, ENTRY), post("2", 10, ADD), post("3", 13, CLOSE)],
+                 mapping_file=SERVICE_MAPPING)
+    rt.run(2)
+    rt.broker.script_next_submit("LOST_ACK_NOT_PLACED")
+    rt.run(8)
+    broker = (
+        [(o.order_ref, o.side.value, o.quantity, o.order_type.value, str(o.limit_price),
+          str(o.stop_price), o.status.value, o.filled_quantity) for o in rt.broker.all_orders()],
+        [(p.contract.contract_key, p.quantity) for p in rt.broker.positions()],
+        rt.broker.submit_calls,
+    )
+    rows = [(a["action"], a["status"]) for a in rt.actions()]
+    journal = [e.event for e in coord(rt).store.journal()]
+    events = [e["event"] for e in rt.store.events()]
+    rt.service.close()
+    return broker, rows, journal, events
+
+
+def test_a_failure_in_the_flag_path_never_alters_the_exit(tmp_path, monkeypatch):
+    clean = _add_unknown_then_close(tmp_path / "a", monkeypatch, fault=False)
+    faulty = _add_unknown_then_close(tmp_path / "b", monkeypatch, fault=True)
+    assert EXIT_WHILE_ENTRY_UNKNOWN in clean[2]
+    assert faulty[0] == clean[0]  # every broker-facing order, fill and position is identical
+    assert faulty[1] == clean[1]
+    assert ("CLOSE", "EXECUTED") in faulty[1]
+    assert "EXIT_FLAG_FAILED" in faulty[2] and "EXIT_FLAG_FAILED" not in clean[2]
+    assert "POST_PROCESSING_FAILED" not in faulty[3]
