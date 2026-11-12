@@ -204,14 +204,31 @@ is written in between punctuation (`,` `;` `.` `:` `!` `?`, a line break, a spac
    `at the market`. Attached means written directly after the number ("41.20 now") or directly
    before it ("now 41.20", "trading at 41.20", also with "at" between: "currently at 41.20").
    "We are now long $X, 41.20" has a "now", but not attached to the number: not an anchor.
-2. **Nothing in its own clause makes it something else** (`NOT_CURRENT_WORDS`): a time other than
+2. **Its context window is entirely understood** (an allow-list, `ENTRY_ANCHOR_CONTEXT_UNCLEAR`).
+   The window runs from the start of the number's own clause, or from the last of this action's
+   instruction words or this family's names before the number, up to the number, and from the
+   number to the end of its clause. Every word in it must be a present-market marker (public or
+   private), a connector (`CONNECTOR_WORDS`: at, is, are, around, near, here, the, a, it, @), a
+   currency or unit, a name or alias of this family, or one of the action's own instruction
+   words (long, buy, buying for a long; short, shorting, sell, selling for a short; add, adding for
+   an ADD). Anything else holds: "71.60 now is the goal", "avg 71.60 now", "sold some at 71.50
+   now", "Dubai 71.45 now". For a family whose anchor is compared in a reference series
+   (BASIS_SHIFT, REFERENCE_TRIGGER) the names are the reference series' only: a number labelled
+   with the execution instrument's symbol ("QIF 5,025 now" for an index family) is never compared
+   with the reference. A future's contract months in the window are left to the contract check,
+   and other numbers to `ENTRY_ANCHOR_UNEXPLAINED_PRICE`. A second marked number elsewhere in the
+   post that belongs to no other action holds (`ENTRY_ANCHOR_SEVERAL_LEVELS`). Phrasings that pass
+   include "long $X, 41.20 now", "long $X here at 41.20", "buying $X, currently 41.20", "$X is at
+   41.20 now, we are long", "short $X, 41.20 right now", "long $X ~41.20 now", "adding $X here at
+   41.20", and an alias: "long the bond fund, currently 41.20 USD".
+3. **Nothing in its own clause makes it something else** (a second, redundant check) (`NOT_CURRENT_WORDS`): a time other than
    now (yesterday, earlier, last, next, was, will, a weekday, overnight, ...), a chart, session or
    order level (high, low, open, close, settlement, resistance, support, target, objective, stop,
    level, entry, exit, ...), a condition or a level to cross (from, to, above, below, over, under,
    through, break, if, when, once, until, unless), a range or a comparison (between, range, vs,
    than, higher, lower, up, down, or, `<`, `>`). A marker never overrides them. Every place the
    number is written must pass.
-3. **A separate level line or attached quote** (not the action's own clause) may hold only: the
+4. **A separate level line or attached quote** (not the action's own clause) may hold only: the
    number and other numbers (which `ENTRY_ANCHOR_UNEXPLAINED_PRICE` then checks), the markers, the
    connector "at", a currency or unit (`UNIT_WORDS`: usd, $, points, ticks, bbl, oz, ...), and a
    name of **this** family: its code, its reference and execution symbols (with or without `$`),
@@ -227,11 +244,10 @@ lexicon file (`[interpreter] lexicon_path`, git-ignored):
 interpreter never sees that section. A marker (one to four words) or an alias (one to three) is
 letters only and may not contain any disqualifying word; an alias may not contain a marker word.
 Loading refuses anything else. The extension can only turn a held level into an anchor where the
-publisher's wording is positive evidence; it cannot override rule 2.
+publisher's wording is positive evidence; it cannot override rules 2 and 3.
 
-*Residual.* In the action's own clause another market named in plain words (not a cashtag) next to
-the number is not detected; a separate line is held for it. The interpreter must still tag the
-right number REFERENCE.
+*Residual.* The interpreter must still tag the right number REFERENCE; a word outside the
+number's own clause is not read by the window.
 
 No stated level at all leaves the action as today (`OPEN_ENTRY_PRICE_MISSING`, with
 `ENTRY_ANCHOR_NOT_STATED`). For a futures family the accepted anchor is the one extra level the
