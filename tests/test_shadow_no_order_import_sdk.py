@@ -173,7 +173,8 @@ DRIVER = textwrap.dedent(r'''
 ''')
 READ_ONLY = {"START_API", "REQ_CONTRACT_DATA", "CANCEL_CONTRACT_DATA", "REQ_ACCOUNT_SUMMARY",
              "CANCEL_ACCOUNT_SUMMARY", "REQ_POSITIONS", "CANCEL_POSITIONS", "REQ_MKT_DATA",
-             "CANCEL_MKT_DATA", "REQ_MARKET_DATA_TYPE", "REQ_CONFIG", "REQ_SEC_DEF_OPT_PARAMS"}
+             "CANCEL_MKT_DATA", "REQ_MARKET_DATA_TYPE", "REQ_CONFIG", "REQ_SEC_DEF_OPT_PARAMS",
+             "REQ_HISTORICAL_DATA", "CANCEL_HISTORICAL_DATA"}
 
 
 def _run(tmp_path: Path, inject: bool = False) -> subprocess.CompletedProcess:

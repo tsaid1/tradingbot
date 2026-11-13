@@ -22,6 +22,7 @@ from ibapi.protobuf.ApiConfig_pb2 import ApiConfig
 from ibapi.protobuf.ApiSettingsConfig_pb2 import ApiSettingsConfig
 from ibapi.protobuf.CancelAccountSummary_pb2 import CancelAccountSummary
 from ibapi.protobuf.CancelContractData_pb2 import CancelContractData
+from ibapi.protobuf.CancelHistoricalData_pb2 import CancelHistoricalData
 from ibapi.protobuf.CancelMarketData_pb2 import CancelMarketData
 from ibapi.protobuf.CancelPositions_pb2 import CancelPositions
 from ibapi.protobuf.ConfigRequest_pb2 import ConfigRequest
@@ -32,6 +33,10 @@ from ibapi.protobuf.ContractDataEnd_pb2 import ContractDataEnd
 from ibapi.protobuf.ContractDataRequest_pb2 import ContractDataRequest
 from ibapi.protobuf.ContractDetails_pb2 import ContractDetails as ContractDetailsProto
 from ibapi.protobuf.ErrorMessage_pb2 import ErrorMessage
+from ibapi.protobuf.HistoricalData_pb2 import HistoricalData
+from ibapi.protobuf.HistoricalDataBar_pb2 import HistoricalDataBar
+from ibapi.protobuf.HistoricalDataEnd_pb2 import HistoricalDataEnd
+from ibapi.protobuf.HistoricalDataRequest_pb2 import HistoricalDataRequest
 from ibapi.protobuf.ManagedAccounts_pb2 import ManagedAccounts
 from ibapi.protobuf.MarketDataRequest_pb2 import MarketDataRequest
 from ibapi.protobuf.MarketDataType_pb2 import MarketDataType
@@ -65,6 +70,8 @@ _REQUESTS = {
     OUT.REQ_MARKET_DATA_TYPE: ("REQ_MARKET_DATA_TYPE", MarketDataTypeRequest),
     OUT.REQ_CONFIG: ("REQ_CONFIG", ConfigRequest),
     OUT.REQ_SEC_DEF_OPT_PARAMS: ("REQ_SEC_DEF_OPT_PARAMS", SecDefOptParamsRequest),
+    OUT.REQ_HISTORICAL_DATA: ("REQ_HISTORICAL_DATA", HistoricalDataRequest),
+    OUT.CANCEL_HISTORICAL_DATA: ("CANCEL_HISTORICAL_DATA", CancelHistoricalData),
 }
 
 
@@ -154,6 +161,32 @@ def delayed_quote_frames(req_id: int) -> list[bytes]:
         frame(IN.TICK_STRING, TickString(reqId=req_id, tickType=88, value="1794412800")),
         frame(IN.TICK_SNAPSHOT_END, TickSnapshotEnd(reqId=req_id)),
     ]
+
+
+def hist_bar(date: str, o: float, h: float, lo: float, c: float, volume: str | None = "10",
+             wap: str | None = None, bar_count: int | None = None) -> HistoricalDataBar:
+    """One protobuf bar (``None`` leaves an optional field absent)."""
+    b = HistoricalDataBar(date=date, open=o, high=h, low=lo, close=c)
+    if volume is not None:
+        b.volume = volume
+    if wap is not None:
+        b.WAP = wap
+    if bar_count is not None:
+        b.barCount = bar_count
+    return b
+
+
+def hist_data_frame(req_id: int | None, bars: list[HistoricalDataBar]) -> bytes:
+    msg = HistoricalData(historicalDataBars=bars)
+    if req_id is not None:
+        msg.reqId = req_id
+    return frame(IN.HISTORICAL_DATA, msg)
+
+
+def hist_end_frame(req_id: int, start: str = "20260309 14:00:00",
+                   end: str = "20260309 15:00:00") -> bytes:
+    return frame(IN.HISTORICAL_DATA_END, HistoricalDataEnd(reqId=req_id, startDateStr=start,
+                                                           endDateStr=end))
 
 
 class FakeConnection:

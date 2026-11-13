@@ -66,7 +66,6 @@ from tradingbot.ibkr.models import ContractQuery, ResolvedContract
 from tradingbot.ibkr.redact import redact_accounts
 from tradingbot.ibkr.session import (
     ALLOWED_CLIENT_METHODS,
-    ALLOWED_OUT_MESSAGES,
     MIN_SERVER_VER_CONFIG,
     IbkrSession,
     SessionState,
@@ -112,7 +111,15 @@ from tradingbot.ibkr_orders.timefmt import parse_broker_time
 ORDER_MESSAGES = frozenset({OUT.PLACE_ORDER, OUT.CANCEL_ORDER})  # need a one-shot permit each
 ORDER_READ_MESSAGES = frozenset({OUT.REQ_ALL_OPEN_ORDERS, OUT.REQ_EXECUTIONS,
                                  OUT.REQ_COMPLETED_ORDERS, OUT.REQ_IDS})
-ORDER_MODE_OUT_MESSAGES = ALLOWED_OUT_MESSAGES | ORDER_MESSAGES | ORDER_READ_MESSAGES
+# The read ids order mode allows: an EXPLICIT set, exactly the read-only allowlist as of 5835566.
+# It does not follow later additions to ``ALLOWED_OUT_MESSAGES`` (e.g. historical bars, 20 / 25):
+# each one needs its own decision and review for order mode.
+ORDER_MODE_READ_MESSAGES = frozenset({
+    OUT.START_API, OUT.REQ_CONTRACT_DATA, OUT.CANCEL_CONTRACT_DATA, OUT.REQ_ACCOUNT_SUMMARY,
+    OUT.CANCEL_ACCOUNT_SUMMARY, OUT.REQ_POSITIONS, OUT.CANCEL_POSITIONS, OUT.REQ_MKT_DATA,
+    OUT.CANCEL_MKT_DATA, OUT.REQ_MARKET_DATA_TYPE, OUT.REQ_CONFIG, OUT.REQ_SEC_DEF_OPT_PARAMS,
+})
+ORDER_MODE_OUT_MESSAGES = ORDER_MODE_READ_MESSAGES | ORDER_MESSAGES | ORDER_READ_MESSAGES
 ORDER_MODE_CLIENT_METHODS = ALLOWED_CLIENT_METHODS | frozenset({
     # placing goes through our own protobuf (explicit transmit/outsideRth presence), never the
     # text-or-proto ``placeOrder`` / ``cancelOrder`` wrappers, which stay denied

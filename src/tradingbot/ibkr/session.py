@@ -33,6 +33,8 @@ from ibapi.const import UNSET_DECIMAL, UNSET_DOUBLE
 from ibapi.contract import Contract
 from ibapi.message import OUT
 from ibapi.protobuf.ConfigRequest_pb2 import ConfigRequest
+from ibapi.protobuf.HistoricalDataRequest_pb2 import HistoricalDataRequest
+from ibapi.server_versions import MIN_SERVER_VER_PROTOBUF_HISTORICAL_DATA
 from ibapi.ticktype import TickTypeEnum
 from ibapi.wrapper import EWrapper
 
@@ -50,6 +52,7 @@ from tradingbot.ibkr.errors import (
     ConfigResponseChanged,
     ContractNotFound,
     ErrorClass,
+    HistoricalDataMalformed,
     IbkrConnectionError,
     IbkrError,
     IbkrRequestError,
@@ -63,6 +66,28 @@ from tradingbot.ibkr.errors import (
     SessionStateError,
     UnsupportedServerVersion,
     classify_error,
+)
+from tradingbot.ibkr.historical import (
+    COMPLETE,
+    DEFAULT_HISTORICAL_PACER,
+    DEFAULT_HISTORICAL_TIMEOUT,
+    FORMAT_DATE_EPOCH,
+    MAX_HISTORICAL_BARS,
+    MAX_HISTORICAL_TIMEOUT,
+    R_MALFORMED,
+    R_NO_BARS,
+    R_OK,
+    R_PACING_VIOLATION,
+    R_TIMEOUT,
+    BarMalformed,
+    HistoricalBarsRequest,
+    HistoricalBarsResult,
+    HistoricalContract,
+    HistoricalPacer,
+    HistoricalRequestInvalid,
+    build_bar,
+    classify_broker_error,
+    failed,
 )
 from tradingbot.ibkr.identity import check_managed_accounts, check_row_account
 from tradingbot.ibkr.models import (
@@ -135,11 +160,15 @@ ALLOWED_CLIENT_METHODS = frozenset({
     "reqConfigProtoBuf",
     # option-chain parameters (expirations, strikes, exchanges, trading classes, multiplier)
     "reqSecDefOptParams", "reqSecDefOptParamsProtoBuf",
+    # historical bars: one bounded request and its cancel (keepUpToDate refused at the wire)
+    "reqHistoricalData", "reqHistoricalDataProtoBuf", "cancelHistoricalData",
+    "cancelHistoricalDataProtoBuf",
 })
 ALLOWED_OUT_MESSAGES = frozenset({
     OUT.START_API, OUT.REQ_CONTRACT_DATA, OUT.CANCEL_CONTRACT_DATA, OUT.REQ_ACCOUNT_SUMMARY,
     OUT.CANCEL_ACCOUNT_SUMMARY, OUT.REQ_POSITIONS, OUT.CANCEL_POSITIONS, OUT.REQ_MKT_DATA,
     OUT.CANCEL_MKT_DATA, OUT.REQ_MARKET_DATA_TYPE, OUT.REQ_CONFIG, OUT.REQ_SEC_DEF_OPT_PARAMS,
+    OUT.REQ_HISTORICAL_DATA, OUT.CANCEL_HISTORICAL_DATA,
 })
 MAX_DISCOVERY_LIMIT = 1000  # upper bound on rows kept per discovery / option-chain request
 MAX_QUOTE_STREAMS = 10  # hard cap on simultaneously held-open quote streams per session
@@ -166,6 +195,21 @@ def _outgoing_msg_id(frame: bytes, server_version: int | None) -> int | None:
         return int(body.split(b"\0", 1)[0])
     except ValueError:
         return None
+
+
+def _check_historical_frame(frame: bytes, server_version: int | None) -> None:
+    """A REQ_HISTORICAL_DATA frame passes only as protobuf with ``keepUpToDate`` unset or false
+    (no streaming subscription through this adapter, whichever send path built the frame)."""
+    body = frame[4:]
+    if (server_version is None or server_version < MIN_SERVER_VER_PROTOBUF_HISTORICAL_DATA
+            or int.from_bytes(body[:4], "big") <= PROTOBUF_MSG_ID):
+        raise ReadOnlyViolation("a text-framed historical-data request is refused")
+    try:
+        req = HistoricalDataRequest.FromString(body[4:])
+    except Exception:  # noqa: BLE001 - unparseable: refuse
+        raise ReadOnlyViolation("unparseable historical-data request refused") from None
+    if req.keepUpToDate:
+        raise ReadOnlyViolation("historical-data request with keepUpToDate refused")
 
 
 # The SDK ``Connection`` (and through it the socket) behind each ``_GuardedConnection``, keyed by an
@@ -228,6 +272,8 @@ class _GuardedConnection:
         mid = _outgoing_msg_id(msg, self._client.serverVersion())
         if mid not in ALLOWED_OUT_MESSAGES:
             raise ReadOnlyViolation(f"outgoing message id {mid} refused at the connection")
+        if mid == OUT.REQ_HISTORICAL_DATA:
+            _check_historical_frame(msg, self._client.serverVersion())
         return _raw_call(self, "sendMsg", msg)
 
     def connect(self):
@@ -299,6 +345,17 @@ def _mkt_contract(contract: ResolvedContract) -> Contract:
     return c
 
 
+def _hist_contract(k: HistoricalContract) -> Contract:
+    """SDK ``Contract`` for a historical request: exactly the caller's fully specified fields."""
+    c = Contract()
+    c.conId, c.symbol, c.secType, c.exchange = k.con_id, k.symbol, k.sec_type, k.exchange
+    c.currency, c.primaryExchange = k.currency, k.primary_exchange
+    c.lastTradeDateOrContractMonth = k.last_trade_date_or_contract_month
+    c.multiplier, c.tradingClass, c.localSymbol = k.multiplier, k.trading_class, k.local_symbol
+    c.includeExpired = bool(k.include_expired)
+    return c
+
+
 def _set_min_tick(p: _Pending, contract: ResolvedContract) -> None:
     """Give both sides the contract's minimum tick (off-tick prices never count as changes)."""
     tick = getattr(contract, "min_tick", None)
@@ -351,6 +408,14 @@ _side_clock = time.monotonic
 
 
 @dataclass
+class _HistState:
+    request: HistoricalBarsRequest
+    received: int = 0  # bars delivered for this request (kept or not)
+    end_start: str | None = None
+    end_end: str | None = None
+
+
+@dataclass
 class _Pending:
     kind: str
     req_id: int
@@ -387,6 +452,7 @@ class _Pending:
     stream: bool = False  # a held-open stream (open_quote_stream), not a bounded request
     halted: float | None = None  # latest HALTED tick (49) value
     refused: bool = False  # refused before anything was sent: no cancel
+    hist: _HistState | None = None  # historical bars only
 
     def fail(self, exc: BaseException) -> None:
         if self.error is None:
@@ -481,6 +547,15 @@ class _Wrapper(EWrapper):
     def configResponseProtoBuf(self, configResponseProto):
         self._call(self._s._on_config_response, configResponseProto)
 
+    def historicalDataProtoBuf(self, historicalDataProto):
+        self._call(self._s._on_hist_proto, historicalDataProto)
+
+    def historicalData(self, reqId, bar):
+        self._call(self._s._on_hist_bar, reqId, bar)
+
+    def historicalDataEnd(self, reqId, start, end):
+        self._call(self._s._on_hist_end, reqId, start, end)
+
 
 class QuoteStream:
     """Handle for one held-open streaming ``reqMktData`` (see ``IbkrSession.open_quote_stream``).
@@ -529,7 +604,8 @@ class IbkrSession:
                  request_timeout: float = 10.0, quote_timeout: float = 20.0,
                  stream_seconds: float = 8.0, stream_settle_seconds: float = 1.0,
                  shutdown_timeout: float = 5.0,
-                 preflight: Callable[[PaperConnectionConfig], dict] = run_preflight) -> None:
+                 preflight: Callable[[PaperConnectionConfig], dict] = run_preflight,
+                 historical_pacer: HistoricalPacer | None = None) -> None:
         if not isinstance(config, PaperConnectionConfig) or config.mode != "paper":
             raise SessionStateError("IbkrSession requires a validated PaperConnectionConfig")
         _silence_sdk_logging()  # again, in case something reconfigured logging since import
@@ -566,6 +642,10 @@ class IbkrSession:
         self._next_req_id = 9000
         self._streams: dict[int, QuoteStream] = {}  # open held streams by reqId
         self._stream_mdt: int | None = None  # the one market-data type the open streams use
+        self._hist_pacer = historical_pacer or DEFAULT_HISTORICAL_PACER
+        self._hist_busy = False
+        self.historical_unrouted_bars = 0  # bars for a request id that is not open: ignored
+        self.historical_unrouted_ends = 0
 
         self.notices: list[tuple[int, int, str]] = []
         self.connection_events: list[tuple[int, int, str]] = []
@@ -1076,6 +1156,104 @@ class IbkrSession:
                 bid_price_change_monotonic=b.price_change_mono,
                 ask_price_change_monotonic=a.price_change_mono)
 
+    # ------------------------------------------------------------------ historical bars
+    def historical_bars(self, request: HistoricalBarsRequest, *,
+                        timeout: float | None = None) -> HistoricalBarsResult:
+        """One bounded ``reqHistoricalData`` for a fully specified contract, explicit UTC end,
+        duration and bar size from the closed sets, ``formatDate`` 2 (epoch seconds) and
+        ``keepUpToDate`` always False (there is no parameter for it; the connection guard refuses
+        a frame that sets it). One request at a time per session.
+
+        Local pacing (``HistoricalPacer``) runs first and may wait up to the minimum spacing, or
+        refuse (``LOCAL_*`` reasons, nothing sent). Then the request goes through ``_request``
+        like every other read: READY, identity and poison are re-checked under the lock before
+        the send. Outcomes, all returned as a ``HistoricalBarsResult``:
+
+        - end marker received: ``OK`` (bars) or ``NO_BARS`` (complete, empty);
+        - a request-scoped broker error: its reason (``NO_DATA``, ``NO_PERMISSION``,
+          ``PACING_VIOLATION`` (which also latches the pacer), ...), code and redacted message;
+        - no end marker within ``timeout``: ``TIMEOUT``, and the request is cancelled;
+        - a bar or answer that fails validation: ``MALFORMED``, and the request is cancelled.
+
+        A failed read carries no bars. Connection, identity, poison and read-only failures raise,
+        as for every other read; a failed cancel raises ``CleanupError`` with the result."""
+        if not isinstance(request, HistoricalBarsRequest):
+            raise HistoricalRequestInvalid("request must be a HistoricalBarsRequest")
+        wait = DEFAULT_HISTORICAL_TIMEOUT if timeout is None else timeout
+        if (isinstance(wait, bool) or not isinstance(wait, (int, float))
+                or not 0 < wait <= MAX_HISTORICAL_TIMEOUT):
+            raise HistoricalRequestInvalid(f"timeout must be in (0, {MAX_HISTORICAL_TIMEOUT}]")
+        contract = _hist_contract(request.contract)
+        with self._cond:
+            self._require_ready()
+            if self._hist_busy:
+                raise SessionStateError("a historical-bars request is already outstanding")
+            self._hist_busy = True
+        try:
+            return self._historical(request, contract, float(wait))
+        finally:
+            with self._cond:
+                self._hist_busy = False
+
+    def _historical(self, request: HistoricalBarsRequest, contract: Contract,
+                    wait: float) -> HistoricalBarsResult:
+        refusal = self._hist_pacer.admit(request.pacing_key())
+        if refusal is not None:
+            return failed(request, refusal, detail="refused locally; nothing was sent")
+        state = _HistState(request)
+        sent: list[int] = []
+        cancelled: list[int] = []
+        t0 = time.monotonic()
+
+        def send(rid: int) -> None:
+            self._pending[rid].hist = state
+            sent.append(rid)
+            self._client.reqHistoricalData(
+                rid, contract, request.end_date_time, request.duration, request.bar_size,
+                request.what_to_show, 1 if request.regular_hours_only else 0, FORMAT_DATE_EPOCH,
+                False, [])
+
+        def cancel(rid: int) -> None:
+            cancelled.append(rid)
+            self._client.cancelHistoricalData(rid)
+
+        def common(p: _Pending | None = None) -> dict:
+            return {"req_id": sent[0] if sent else None, "sent": bool(sent),
+                    "cancel_sent": bool(cancelled),
+                    "notices": tuple(p.notices) if p is not None else (),
+                    "waited_ms": int((time.monotonic() - t0) * 1000)}
+
+        def build(p: _Pending) -> HistoricalBarsResult:
+            with self._cond:
+                bars = tuple(p.rows)
+                return HistoricalBarsResult(
+                    request=request, status=COMPLETE, reason=R_OK if bars else R_NO_BARS,
+                    complete=True, bars=bars, count=len(bars), end_marker_start=state.end_start,
+                    end_marker_end=state.end_end, **common(p))
+
+        before = len(self.cleanup_failures)
+        try:
+            return self._request("historical", send, cancel, wait, cancel_always=False,
+                                 build=build)
+        except IbkrTimeout:
+            result = failed(request, R_TIMEOUT, detail=f"no end marker within {wait:.1f}s",
+                            bars_discarded=state.received, **common())
+        except IbkrRequestError as exc:
+            reason = classify_broker_error(exc.code, exc.broker_message)
+            if reason == R_PACING_VIOLATION:
+                self._hist_pacer.latch(f"broker pacing violation {exc.code}")
+            result = failed(request, reason, error_code=exc.code,
+                            error_message=exc.broker_message, bars_discarded=state.received,
+                            **common())
+        except HistoricalDataMalformed as exc:
+            result = failed(request, R_MALFORMED, detail=str(exc),
+                            bars_discarded=state.received, **common())
+        new = self.cleanup_failures[before:]
+        if new:
+            raise CleanupError("historical bars cleanup failed", failures=list(new),
+                               result=result)
+        return result
+
     # ------------------------------------------------------------------ held-open quote streams
     def open_quote_stream(self, contract: ResolvedContract, *,
                           market_data_type: int = 3) -> QuoteStream:
@@ -1528,6 +1706,64 @@ class IbkrSession:
             if self._positions is not None:
                 self._positions.ended = self._positions.done = True
                 self._cond.notify_all()
+
+    def _hist_pending(self, req_id: int | None) -> _Pending | None:
+        p = self._pending.get(req_id) if req_id is not None else None
+        return p if p is not None and p.kind == "historical" and p.hist is not None else None
+
+    def _fail_hist(self, p: _Pending, why: str) -> None:
+        p.fail(HistoricalDataMalformed(why))
+        self._cond.notify_all()
+
+    def _on_hist_proto(self, proto) -> None:
+        """Presence check on the raw protobuf (the SDK fills an absent field with 0.0 / "", which
+        would be indistinguishable from a real value); the per-bar callbacks follow it."""
+        rid = proto.reqId if proto.HasField("reqId") else None
+        with self._cond:
+            p = self._hist_pending(rid)
+            if p is None or p.done:
+                return
+            for i, bar in enumerate(proto.historicalDataBars):
+                missing = [f for f in ("date", "open", "high", "low", "close")
+                           if not bar.HasField(f)]
+                if missing:
+                    self._fail_hist(p, f"bar {i} has no {', '.join(missing)}")
+                    return
+
+    def _on_hist_bar(self, req_id: int, bar) -> None:
+        with self._cond:
+            p = self._hist_pending(req_id)
+            if p is None:  # not open (never, or no longer): ignored and counted
+                self.historical_unrouted_bars += 1
+                return
+            p.hist.received += 1
+            if p.done:
+                return
+            if len(p.rows) >= MAX_HISTORICAL_BARS:
+                self._fail_hist(p, f"more than {MAX_HISTORICAL_BARS} bars")
+                return
+            try:
+                row = build_bar(
+                    bar.date, bar.open, bar.high, bar.low, bar.close,
+                    volume=None if bar.volume == UNSET_DECIMAL else bar.volume,
+                    wap=None if bar.wap == UNSET_DECIMAL else bar.wap, bar_count=bar.barCount,
+                    request=p.hist.request, previous=p.rows[-1] if p.rows else None)
+            except BarMalformed as exc:
+                self._fail_hist(p, f"bar {len(p.rows)}: {exc}")
+                return
+            p.rows.append(row)
+
+    def _on_hist_end(self, req_id: int, start: str, end: str) -> None:
+        with self._cond:
+            p = self._hist_pending(req_id)
+            if p is None:
+                self.historical_unrouted_ends += 1
+                return
+            if p.done:
+                return
+            p.hist.end_start, p.hist.end_end = str(start), str(end)
+            p.ended = p.done = True
+            self._cond.notify_all()
 
     def _quote_pending(self, req_id: int) -> _Pending | None:
         p = self._pending.get(req_id)

@@ -89,7 +89,8 @@ def test_allowlist_adds_only_the_option_parameters_read():
                 OUT.REQ_ACCOUNT_SUMMARY, OUT.CANCEL_ACCOUNT_SUMMARY, OUT.REQ_POSITIONS,
                 OUT.CANCEL_POSITIONS, OUT.REQ_MKT_DATA, OUT.CANCEL_MKT_DATA,
                 OUT.REQ_MARKET_DATA_TYPE, OUT.REQ_CONFIG}
-    assert ALLOWED_OUT_MESSAGES == baseline | {OUT.REQ_SEC_DEF_OPT_PARAMS}
+    assert ALLOWED_OUT_MESSAGES == baseline | {OUT.REQ_SEC_DEF_OPT_PARAMS, OUT.REQ_HISTORICAL_DATA,
+                                               OUT.CANCEL_HISTORICAL_DATA}  # + historical bars
     assert OUT.REQ_SEC_DEF_OPT_PARAMS == 78
     assert {"reqSecDefOptParams", "reqSecDefOptParamsProtoBuf"} <= ALLOWED_CLIENT_METHODS
     # the SDK defines no cancel for this request

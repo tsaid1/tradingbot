@@ -17,6 +17,8 @@ positions, and samples a quote.
 | `report_view.py` | no | load, validate and redact the latest report for the dashboard page |
 | `discovery.py` | no (lazy) | query file, batch runner, catalog and table for contract discovery |
 | `stream_check.py` | no (lazy) | held-quote-stream check behind `scripts/ibkr_quote_stream_check.py` |
+| `historical.py` | no | historical-bars request model, closed sets, pacing, bar parsing |
+| `historical_batch.py` | no (lazy) | request file, batch runner and private report behind `scripts/ibkr_historical_bars.py` |
 | `session.py` | **yes** | `IbkrSession` over a deny-by-default `_ReadOnlyClient(EClient)` |
 
 ## 1. Install the SDK (not on PyPI, never committed)
@@ -572,3 +574,103 @@ PYTHONPATH="$PWD/src" ~/.venvs/tradingbot/bin/python scripts/ibkr_quote_stream_c
 - How 2186 / 10090 / 10167 are attached to the request in practice (by reqId, or only as a
   session-wide notice with reqId -1, which the adapter records in `session.notices` but cannot
   attach to a stream).
+
+## 9. Historical bars (read-only, bounded, one request at a time)
+
+`IbkrSession.historical_bars(request, *, timeout=60)` sends one `reqHistoricalData` and returns an
+immutable `HistoricalBarsResult`. It exists to compare a publisher's past levels with one-minute
+history of candidate reference contracts (front month, second month, continuous), including futures
+that have since expired. It is a market-data **read**: no order, account or setting is touched, no
+subscription is opened or bought, and an entitlement refusal is reported, never worked around.
+
+**Request** (`tradingbot.ibkr.historical.HistoricalBarsRequest`, validated before any socket use):
+
+- `contract`: a `HistoricalContract`, fully specified: `con_id` plus `exchange`, or every
+  identifying field contract discovery returns (`symbol`, `sec_type`, `exchange`, `currency`; STK
+  also `primary_exchange`; FUT also `last_trade_date_or_contract_month`, `multiplier`,
+  `trading_class`). `include_expired = true` is required for an expired future (FUT only).
+  `HistoricalContract.from_discovered(row, include_expired=...)` builds one from a catalog row.
+  `sec_type` is one of STK, IND, FUT, CONTFUT, CMDTY, CASH.
+- `end`: a timezone-aware `datetime`, whole seconds. Naive datetimes are refused. A wall-clock time
+  that is repeated or skipped by a DST change in its zone (e.g. 01:30 New York on the fall-back
+  night) is refused: give it in UTC or with a fixed offset. It is sent as UTC,
+  `yyyymmdd-hh:mm:ss`.
+- `bar_size` and `duration`, closed sets: `1 min` with `1800 S`, `3600 S`, `7200 S`, `14400 S`,
+  `28800 S`, `1 D`; `1 day` with `1 W`, `1 M`, `3 M`, `6 M`, `1 Y`.
+- `what_to_show`: `TRADES`, `MIDPOINT`, `BID` or `ASK`. An index has no bid / ask history; the
+  caller may ask and gets the broker's refusal.
+- `regular_hours_only` (`useRTH`).
+- There is **no** keep-up-to-date input. The session always sends `keepUpToDate=False` and
+  `formatDate=2`; `_GuardedConnection` additionally refuses any REQ_HISTORICAL_DATA frame that is
+  text-framed, unparseable or has `keepUpToDate` set, whatever send path built it.
+
+**Allowlists.** Outgoing: `REQ_HISTORICAL_DATA` (20) and `CANCEL_HISTORICAL_DATA` (25) only;
+client methods `reqHistoricalData`, `reqHistoricalDataProtoBuf`, `cancelHistoricalData`,
+`cancelHistoricalDataProtoBuf`. Incoming (the `_Wrapper` callbacks): `historicalDataProtoBuf`
+(a presence check on each bar's date / open / high / low / close: the SDK would otherwise fill an
+absent field with 0.0), `historicalData` and `historicalDataEnd`; errors arrive on the existing
+`error` callback. `historicalDataUpdate` (keepUpToDate updates), real-time bars, historical ticks
+and head timestamps are not allowed. The order-frame proofs (every other id, unbound base sends,
+object graph) run over the larger allowlist.
+
+**Gates and bounds.** Same `_request` path as every read: READY (after the identity gate and the
+config-read verification), identity and poison re-checked under the lock before the send. One
+historical request per session at a time. No end marker within `timeout` (at most 300 s):
+`TIMEOUT` and `cancelHistoricalData` is sent. Bars arriving for a request that is not open are
+ignored and counted (`historical_unrouted_bars`, `historical_unrouted_ends`).
+
+**Result.** The request echoed; `bars` (`start_utc` aware UTC for intraday bars, from epoch
+seconds; `session_date` `YYYY-MM-DD` for day bars, which IBKR gives only as `yyyyMMdd`; open,
+high, low, close; volume, WAP and trade count where given, `None` for unset or -1); `count`;
+`complete` (end marker received); `reason`; on failure the broker's code and redacted message.
+A failed read never carries bars. Reasons: `OK`, `NO_BARS` (complete, empty), `NO_DATA`,
+`NO_PERMISSION`, `PACING_VIOLATION`, `EXPIRED_CONTRACT_UNAVAILABLE`, `CONTRACT_NOT_FOUND`,
+`REQUEST_INVALID`, `HMDS_QUERY_MESSAGE`, `HMDS_ERROR`, `BROKER_ERROR`, `TIMEOUT`, `MALFORMED`
+(unparseable time, a formatted local time, missing or non-finite price, high / low not bounding
+open / close, times not strictly increasing, a bar at or after the end, more than 2000 bars),
+`LOCAL_PACING_CAP`, `LOCAL_IDENTICAL_REQUEST`, `LOCAL_PACING_LATCHED`. Connection, identity,
+poison and read-only failures raise as for every read; a failed cancel raises `CleanupError`.
+
+**Pacing** (`HistoricalPacer`, shared by every session in the process). IBKR documents, for bars of
+30 s or less: no identical request within 15 s, fewer than six requests for one contract within
+2 s, at most 60 requests in any 10 minutes. Applied conservatively to every bar size:
+`HIST_MIN_SPACING_SECONDS = 3` (the adapter waits), `HIST_MAX_PER_WINDOW = 50` per
+`HIST_WINDOW_SECONDS = 600` and `HIST_IDENTICAL_INTERVAL_SECONDS = 60` (refused locally, nothing
+sent). A broker-reported pacing violation (error 162 whose text says so) is `PACING_VIOLATION`
+and latches the pacer: every later historical request in the process is `LOCAL_PACING_LATCHED`.
+
+### Run it (only by the owner or the lead, in a bounded session, paper TWS running)
+
+```sh
+cd <worktree>
+PYTHONPATH="$PWD/src" ~/.venvs/tradingbot/bin/python scripts/ibkr_historical_bars.py \
+    --requests <private>/requests.toml --out <private>/historical_bars_<UTC>.json \
+    [--config ~/.config/tradingbot/ibkr/paper.toml]
+```
+
+- The request file (schema `tradingbot.ibkr.historical_bars_requests/1`; invented example in
+  `config/historical_bars.example.toml`, at most 50 requests) and the output path are validated
+  before the private config is read or any socket opens (exit 2). `end` is a TOML date-time with an
+  offset, or a local date-time plus `time_zone` (IANA).
+- The output path must be a new file (never overwritten, not a symlink) in an existing directory
+  owned by the caller, and not inside the repository (after resolving symlinks). It is written
+  once, mode 0600, with the masked account only (and scrubbed again before writing).
+- The batch stops on a pacing violation or local pacing refusal, and on a connection, identity,
+  poison, read-only or cleanup failure (remaining rows `SKIPPED`, report `FAILED`, exit 1).
+  `NO_DATA`, `NO_PERMISSION`, `TIMEOUT` and `MALFORMED` rows do not stop it.
+- The console shows only counts and reason codes (no names, prices or broker text).
+
+### What only a real TWS can confirm (checks for the first bounded session)
+
+- Whether one-minute history is still served for a future that expired months ago with
+  `includeExpired`, and how far back (IBKR documents two years after expiry; bars of 30 s or less
+  are documented as unavailable after six months).
+- Whether TWS honours `formatDate=2` for one-minute bars on the protobuf path (epoch seconds) and
+  sends `yyyyMMdd` for day bars; any other format fails the read as `MALFORMED`.
+- Whether the UTC `yyyymmdd-hh:mm:ss` end form is accepted on the paper TWS version in use.
+- The real error codes and texts for no data, no permission (including an index asked for BID /
+  ASK) and pacing (the classification of 162 relies on its text), and whether a request answered
+  with an error also needs a cancel (the adapter sends one whenever no end marker arrived; a
+  resulting 366 is recorded as an unrouted error).
+- Whether `CONTFUT` accepts an explicit end time, and what `volume` / `barCount` look like for
+  MIDPOINT, BID and ASK bars.
