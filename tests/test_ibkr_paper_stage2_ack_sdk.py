@@ -557,3 +557,34 @@ def test_an_unparseable_protobuf_frame_is_reported_on_id_minus_one_and_reading_c
         assert sum(1 for rid, _c, _m in s.unrouted_errors if rid == -1) >= 2
     finally:
         s.disconnect()
+
+
+# --- the broker-added stop limit and one-cancels-all group in a LATER stage ----------------------
+def test_broker_added_stop_limit_and_oca_group_do_not_hide_the_protective_stop(rtws, tmp_path):
+    """The real TWS echoed the stop child with a lmtPrice it added and ocaGroup = the parent's
+    permId (ocaType 3). The session keeps only the stop price for an STP (no limit), so the stop
+    is still a SELL STP with one price: recognised as protective, counted as a working sell. A
+    LATER session that adopts the stop from the broker (no own proposal) and amends it sends the
+    broker's ocaGroup with ocaType 1 (``_proto``), not the broker's 3: what TWS does with that is
+    unknown without a live read. Characterised here, not changed."""
+    rtws.real_fields, rtws.sequence = True, bracket_sequence
+    s = make(rtws, tmp_path)
+    try:
+        parent, child = place_bracket(s)
+    finally:
+        s.disconnect()
+    rtws.fill(parent.order_id, 1, 88.12)
+    rtws.set_status(child.order_id, "Submitted")
+    s2 = make(rtws, tmp_path, init=False)
+    try:
+        mine = [o for o in s2.open_orders() if o.own]
+        stp = next(o for o in mine if o.order_id == child.order_id)
+        assert (stp.action, stp.order_type, stp.limit_price) == ("SELL", "STP", None)
+        assert stp.stop_price == Decimal(87)
+        assert s2._tracks[child.order_id].proposed is None  # adopted from the broker
+        s2.modify(child.order_id, stop_price=Decimal("87.10"))
+        sent = rtws.placed()[-1].order
+        assert sent.orderType == "STP" and not sent.HasField("lmtPrice")  # the added limit: not sent
+        assert (sent.ocaGroup, sent.ocaType) == (str(rtws.orders[parent.order_id].perm_id), 1)
+    finally:
+        s2.disconnect()
