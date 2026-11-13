@@ -156,8 +156,10 @@ SourcePost -> PaperEventReplay.process  (gate_source, gate_action, atomic groups
     (docs/IBKR_PAPER_ORDERS.md, "Stage 3: the close"): `exit_price_policy="TOUCH"` prices the
     exit at the touch itself (a sell at the bid snapped up, a buy at the ask snapped down), and
     `exit_validity_seconds` bounds its life: `sync` cancels an exit still working after that long,
-    confirms the cancel, ends it `EXIT_UNFILLED_CANCELLED` and places the stop the netting cancelled
-    again (once, a new order `<entry>.STP<n>`); an unconfirmed cancel opens
+    confirms the cancel and ends it `EXIT_UNFILLED_CANCELLED`; any exit that ends without
+    flattening the idea after its stop was cancelled for it gets that stop placed again (once, a
+    new order `<entry>.STP<n>`), and in touch mode the limit is priced again after the netting
+    (no usable quote: not sent, `EXIT_WITHOUT_QUOTE` / `AFTER_NETTING`); an unconfirmed cancel opens
     `EXIT_CANCEL_UNCONFIRMED` and places nothing, and an exit of unknown outcome is never resent
     (`EXIT_OUTCOME_UNKNOWN`).
   * MODIFY amends the working stop or target to an absolute price, then confirms the new price at

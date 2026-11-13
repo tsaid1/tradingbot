@@ -396,7 +396,7 @@ def test_a_session_resolving_another_contract_refuses_order_mode(tws, tmp_path, 
     assert original is FakeOrderTws.contract_handler
 
 
-def test_seventh_submission_refused_including_after_a_restart(tws, tmp_path):
+def test_a_submission_past_the_cap_is_refused_including_after_a_restart(tws, tmp_path):
     s = make(tws, tmp_path)
     try:
         snaps = s.place([buy(), stop()])  # 1, 2
@@ -479,7 +479,7 @@ def fake_id(tws, ref):
     return max(o.order_id for o in tws.orders.values() if core_ref(o.order.orderRef) == ref)
 
 
-def test_full_lifecycle_within_the_six_submission_cap(tws, tmp_path):
+def test_full_lifecycle_within_the_submission_cap(tws, tmp_path):
     s, _broker, coord = coordinator(tws, tmp_path)
     try:
         out = run(coord, "p1", tlt_open())
@@ -1210,7 +1210,7 @@ def test_without_an_exit_collar_no_held_stop_can_be_cancelled(tws, tmp_path):
         s.disconnect()
 
 
-# --- disabled by default: the funded account; what counts toward the six -----------------------
+# --- disabled by default: the funded account; what counts toward the cap -----------------------
 @pytest.mark.parametrize("accounts", ["U9990002", "DU9990002", f"{PAPER},U9990002",
                                       [PAPER, "U9990002"], ""])
 def test_the_broker_account_list_must_be_exactly_the_paper_account(tws, tmp_path, accounts):
@@ -1225,7 +1225,7 @@ def test_the_broker_account_list_must_be_exactly_the_paper_account(tws, tmp_path
     assert s.order_mode_status != "VERIFIED"
 
 
-def test_what_counts_toward_the_six(tws, tmp_path):
+def test_what_counts_toward_the_cap(tws, tmp_path):
     """Every PLACE_ORDER frame counts (an entry, a bracket child, an amendment, a close, one the
     broker rejects, one never acknowledged); a cancel and a guard refusal never count, and a
     cancel stays possible after the cap."""

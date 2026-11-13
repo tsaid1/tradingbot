@@ -101,6 +101,21 @@ def test_submission_arithmetic_is_exactly_the_cap():
     assert sum(X.SUBMISSIONS_OF.values()) == C.PAPER_TEST_1.max_submissions == 9
     # a clean pass: the first close fills (no stop placed again) or the second does
     assert [X._passing_count(k) for k in (1, 2)] == [6, 8]
+    # Every way one close attempt can end, and what it places (closing limit, stop placed again).
+    # Only "cancelled unfilled" leads to another attempt; every other ending stops stage 3.
+    per_attempt = {
+        "fills": (1, 0),  # done
+        "cancelled unfilled, stop placed again": (1, 1),  # -> the next attempt (or the end)
+        "rejected by the broker, stop placed again": (1, 1),  # ends
+        "no usable quote after the netting, stop placed again": (0, 1),  # ends
+        "refused by the guard after the stop cancel (ProtectionLost), stop placed again": (0, 1),
+        "refused before the netting (the stop never touched)": (0, 0),  # ends
+        "acknowledgement lost / cancel unconfirmed: nothing placed again": (1, 0),  # ends
+    }
+    worst_attempt = max(sum(v) for v in per_attempt.values())
+    assert worst_attempt == 2
+    before_close = X.SUBMISSIONS_BEFORE["stage3-lifecycle"] + 3  # entry, stop, amendment
+    assert before_close + worst_attempt * X.STAGE3_CLOSE_ATTEMPTS == 9
     for stage, before in X.SUBMISSIONS_BEFORE.items():
         i = X.STAGES.index(stage)
         assert before == sum(X.SUBMISSIONS_OF[s] for s in X.STAGES[:i])
@@ -911,3 +926,103 @@ def test_every_wall_clock_the_stage_reads_is_the_tests(tws):
         assert abs((mod.datetime.now(UTC) - MIDDAY).total_seconds()) < 60, mod.__name__
     assert X._wall_clock() == MIDDAY
     assert MIDDAY.strftime("%Y%m%d") in tws.liquid_hours
+
+
+# --- review round: priced after the netting; the stop back after any unflat exit ----------------
+def _after_the_stop_cancel(tws, then):
+    """``then(s)`` runs once the stop has been cancelled for the close (invented market move)."""
+    cancel = tws.on["CANCEL_ORDER"]
+
+    def hook(s, conn, req):
+        fo = s.orders.get(req.orderId)
+        cancel(s, conn, req)
+        if fo is not None and fo.order.orderType == "STP" and fo.status == "Cancelled":
+            then(s)
+
+    tws.on["CANCEL_ORDER"] = hook
+
+
+def test_the_close_is_priced_from_the_bid_read_after_the_stop_cancel(tws, cfg_path):
+    _to_stage3(tws, cfg_path)
+    _after_the_stop_cancel(tws, lambda s: setattr(s, "bid", 88.05))
+    ev = run("stage3-lifecycle", cfg_path)
+    assert ev["passed"], ev
+    assert tws.placed()[-1].order.lmtPrice == pytest.approx(88.05)  # not the earlier 88.10
+    [a] = ev["close_attempts"]
+    assert a["limit"] == "88.05" and a["priced_after_netting"]["sent"] == "88.05"
+    assert a["priced_after_netting"]["before_netting"] == "88.1"
+
+
+def test_no_usable_quote_after_the_netting_sends_no_close_and_the_stop_is_back(tws, cfg_path,
+                                                                             monkeypatch):
+    import tradingbot.execution.coordinator as core
+    monkeypatch.setattr(core, "EXIT_REQUOTE_SECONDS", 0.3)
+    _to_stage3(tws, cfg_path)
+    _after_the_stop_cancel(tws, lambda s: setattr(s, "market_data_type", 3))  # delayed only
+    ev = run("stage3-lifecycle", cfg_path)
+    assert not ev["passed"] and ev["result"] == "STAGE3_CLOSE_REFUSED", ev
+    assert placed(tws) == 6  # 5, then the stop placed again; no closing limit
+    assert _sent(tws)[-1] == ("SELL", "STP", False)
+    text = ev["why_failed"]
+    assert "EXIT_WITHOUT_QUOTE" in text and "AFTER_NETTING" in text
+    assert "protective stop is working (Submitted) as read" in text
+    assert ev["state"]["stop_working"] is True and ev["state"]["held"] == "1"
+    _assert_no_unconditional_sell(text)
+
+
+def test_a_close_the_broker_rejects_ends_with_the_stop_back(tws, cfg_path):
+    _to_stage3(tws, cfg_path)
+    place = tws.on["PLACE_ORDER"]
+
+    def reject_close(s, conn, req):
+        o = req.order
+        if req.orderId not in s.orders and o.action == "SELL" and o.orderType == "LMT":
+            s.reject_refs[core_ref(o.orderRef)] = (201, "Order rejected - reason: invented")
+        place(s, conn, req)
+
+    tws.on["PLACE_ORDER"] = reject_close
+    ev = run("stage3-lifecycle", cfg_path)
+    assert not ev["passed"] and ev["result"] == "STAGE3_CLOSE_REFUSED", ev
+    assert placed(tws) == 7  # the rejected close counts, then the stop placed again
+    assert "protective stop is working (Submitted) as read" in ev["why_failed"]
+    assert ev["state"]["stop_working"] is True
+
+
+def test_a_close_refused_after_the_stop_cancel_reports_the_stop_back_as_read(tws, cfg_path,
+                                                                            monkeypatch):
+    from tradingbot.ibkr_orders.guard import Refusal, RefusalReason
+    from tradingbot.ibkr_orders.records import OrderRefused
+
+    class RefusingSession(OfflineTestSession):
+        def place(self, specs):
+            if specs[0].action == "SELL" and specs[0].order_type == "LMT":
+                raise OrderRefused(Refusal(RefusalReason.OUTSIDE_LIQUID_HOURS, "invented"))
+            return super().place(specs)
+
+    _to_stage3(tws, cfg_path)
+    monkeypatch.setattr(X, "PaperOrderSession", RefusingSession)
+    ev = run("stage3-lifecycle", cfg_path)
+    assert not ev["passed"] and ev["result"] == "STAGE3_PROTECTION_LOST", ev
+    assert "POSITION_OPEN_PROTECTION_ABSENT" in ev["protection_lost"]
+    assert placed(tws) == 6  # no closing limit reached the wire; the stop placed again
+    text = ev["why_failed"]
+    assert "the core placed the protective stop again" in text
+    assert "protective stop is working (Submitted) as read" in text
+    _assert_no_unconditional_sell(text)
+
+
+def test_abort_with_no_stop_says_so(tws, cfg_path):
+    from tradingbot.ibkr_orders.records import OrderSpec
+    stage0(tws, cfg_path)
+    run("stage1-lookups", cfg_path)
+    s = OfflineTestSession(load_order_config(cfg_path))
+    s.connect()
+    try:
+        [snap] = s.place([OrderSpec("TB-A", "BUY", 1, "LMT", limit_price=Decimal("80.00"))])
+        tws.fill(snap.order_id, 1, 80.00)  # held, and no stop at all (invented)
+    finally:
+        s.disconnect()
+    ev = run("abort", cfg_path)
+    assert ev["result"] == "ABORT_STOP_LEFT_WORKING" and ev["left_working"] == []
+    assert "no protective stop of this client is working" in ev["why_failed"]
+    assert "stop(s) []" not in ev["why_failed"] and X.ABORT_STOP_NOTE not in ev["why_failed"]

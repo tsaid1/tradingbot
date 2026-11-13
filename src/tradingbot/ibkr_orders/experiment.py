@@ -600,10 +600,11 @@ def _stage3_quote(broker: IbkrPaperBroker, contract) -> tuple[object | None, lis
                    "error": redact_accounts(f"{type(exc).__name__}: {exc}")}
         rec["read_at"] = t.isoformat()
         reads.append(rec)
-        if ok:
-            return q, reads
-        if time.monotonic() >= deadline:
-            return None, reads
+        if ok or time.monotonic() >= deadline:
+            # later reads (the core's exit reads) anchor at their own read time; the core then
+            # measures their age after the read (touch mode)
+            broker.set_reference_time(None)
+            return (q if ok else None), reads
         time.sleep(POLL_SECONDS)
 
 
@@ -687,6 +688,7 @@ def _stage3(cfg: PaperOrderConfig, ev: dict) -> None:
         opened = step("open", coord.execute(src, act("open", Action.OPEN,
                                                      entry_reference=str(entry),
                                                      stop_price=str(stop)), gate))
+        broker.set_reference_time(None)
         if opened.state in (IntentState.REFUSED, IntentState.REJECTED, IntentState.HALTED):
             fail("STAGE3_ENTRY_REFUSED", f"the entry was {opened.state.value} "
                  f"({', '.join(opened.reasons) or 'no reason given'})")
@@ -726,27 +728,54 @@ def _stage3(cfg: PaperOrderConfig, ev: dict) -> None:
                 return
             rec["quote"] = reads[-1]
             first_read = len(broker.quote_reports)
-            broker.set_reference_time(datetime.now(UTC))  # no later than the core's own now
+            # no reference time here: in touch mode the core measures each exit read's age
+            # after the read itself (before the netting, and again after it, for the price sent)
             closed = step(f"close-{k}", coord.execute(src, act(f"close-{k}", Action.CLOSE,
                                                                idea_reference=idea), gate))
-            # the first read is the one the core priced the limit on; a later one is the stop
-            # cancel's dry-check estimate
+            # in order: the core's read before the netting (no stop is cancelled without it),
+            # the stop cancel's dry-check estimate, then the read(s) after the netting that
+            # priced the limit actually sent
             rec["core_quote_reads"] = broker.quote_reports[first_read:]
             ref = closed.order_ref
             sent = coord.intent(ref)
+            journal = coord.store.journal(ref)
+            priced = next((e.detail for e in journal if e.event == "EXIT_PRICED_AFTER_NETTING"),
+                          None)
             rec.update(order_ref=ref, limit=sent.limit_price if sent else None,
-                       state_after_send=closed.state.value, wait_seconds=CLOSE_WAIT_SECONDS)
+                       priced_after_netting=priced, state_after_send=closed.state.value,
+                       wait_seconds=CLOSE_WAIT_SECONDS)
+
+            def stop_as_read(ref=ref, rec=rec) -> str:
+                """Reads only: the stop placed again (if the core placed one) confirmed, then
+                what the open-orders read shows; never assumed."""
+                _wait(lambda: coord.sync() and coord.ledger()[0].protection == "CONFIRMED"
+                      and _read_state(s)["stop_working"], PROTECTION_SETTLE_SECONDS)
+                read = _read_state(s)
+                again = any(e.event == "PROTECTIVE_STOP_REPLACE_SUBMIT"
+                            for e in coord.store.journal(ref))
+                rec.update(stop_placed_again=again,
+                           protection_after=coord.ledger()[0].protection,
+                           stop_ref_after=coord.ledger()[0].stop_ref,
+                           stop_status_after=read["stop_status"],
+                           stop_working_after=read["stop_working"],
+                           submissions_after=s.submissions_used)
+                head = "the core placed the protective stop again; " if again else ""
+                if read["stop_working"]:
+                    return head + f"a protective stop is working ({read['stop_status']}) as read"
+                return head + ("NO protective stop of this client is working as read: a share "
+                               "still held is UNPROTECTED")
+
             if broker.protection_lost:  # the close was refused after its stop was cancelled
-                coord.sync()  # the core raises UNPROTECTED_POSITION now, not at a later read
                 ev["protection_lost"] = broker.protection_lost
                 rec["outcome"] = "NOT_SENT_PROTECTION_LOST"
-                fail("STAGE3_PROTECTION_LOST", "POSITION OPEN, PROTECTION ABSENT: the close was "
-                     "not sent after the stop was cancelled")
+                fail("STAGE3_PROTECTION_LOST", "POSITION_OPEN_PROTECTION_ABSENT when the close "
+                     "was refused after the stop was cancelled (nothing sent); "
+                     + stop_as_read())
                 return
             if closed.state in (IntentState.REFUSED, IntentState.REJECTED, IntentState.HALTED):
                 rec["outcome"] = closed.state.value
                 fail("STAGE3_CLOSE_REFUSED", f"the close was {closed.state.value} and not working "
-                     f"({', '.join(closed.reasons) or 'no reason given'})")
+                     f"({', '.join(closed.reasons) or 'no reason given'}); " + stop_as_read())
                 return
             t0 = time.monotonic()
             if closed.state not in UNRESOLVED_STATES:
@@ -867,11 +896,14 @@ def _abort(cfg: PaperOrderConfig, ev: dict) -> None:
             return
         ev["passed"] = False
         ev["result"] = "ABORT_STOP_LEFT_WORKING"
-        ev["why_failed"] = _ending_message(
-            "ABORT_STOP_LEFT_WORKING", f"this script does not read the account flat, so abort "
-            f"left this client's protective stop(s) {[r['order_id'] for r in ev['left_working']]} "
-            f"working and cancelled only {len(ev['cancelled'])} other order(s)",
-            state) + " " + ABORT_STOP_NOTE
+        kept = [r["order_id"] for r in ev["left_working"]]
+        what = (f"this script does not read the account flat, so abort left this client's "
+                f"protective stop(s) {kept} working and cancelled only {len(ev['cancelled'])} "
+                "other order(s)" if kept else
+                "this script does not read the account flat; no protective stop of this client "
+                f"is working, and abort cancelled {len(ev['cancelled'])} other order(s)")
+        ev["why_failed"] = _ending_message("ABORT_STOP_LEFT_WORKING", what, state) + (
+            " " + ABORT_STOP_NOTE if kept else "")
     finally:
         s.disconnect()
 

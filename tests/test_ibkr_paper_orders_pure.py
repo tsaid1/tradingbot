@@ -249,7 +249,7 @@ def test_151_usd_notional_refused_150_allowed():
     assert refused(stop, ctx(position=Decimal(1))) == RefusalReason.NOTIONAL_CAP
 
 
-def test_seventh_submission_refused():
+def test_a_submission_past_the_cap_is_refused():
     cap = C.PAPER_TEST_1.max_submissions  # 9 since the owner's exit decision (13 Nov 2026)
     assert refused(order(), ctx(submissions_used=cap)) == RefusalReason.EXPERIMENT_FINISHED
     assert order_guard(order(), ctx(submissions_used=cap - 1)) is ALLOW

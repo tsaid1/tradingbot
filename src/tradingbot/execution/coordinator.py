@@ -159,6 +159,12 @@ ENTRY_ANCHOR_PAPER_ONLY = "ENTRY_ANCHOR_PAPER_ONLY"
 EXIT_UNFILLED_CANCELLED = "EXIT_UNFILLED_CANCELLED"
 EXIT_CANCEL_UNCONFIRMED = "EXIT_CANCEL_UNCONFIRMED"
 EXIT_OUTCOME_UNKNOWN = "EXIT_OUTCOME_UNKNOWN"
+# Touch mode: once the netting has cleared the way (the stop's cancel confirmed, the position
+# unchanged), the exit is priced again from fresh reads for at most this long, one every
+# EXIT_REQUOTE_INTERVAL_SECONDS (at least one read); none usable: nothing is sent (EXIT_WITHOUT_QUOTE,
+# AFTER_NETTING).
+EXIT_REQUOTE_SECONDS = 3.0
+EXIT_REQUOTE_INTERVAL_SECONDS = 0.25
 
 
 # An operator settled an intent of unknown outcome (execution.settlement): the instrument stays
@@ -676,7 +682,7 @@ class ExecutionCoordinator:
         if self.config.exit_validity_seconds is not None:
             # After the fills and order states above: an exit that ended on its expiry cancel is
             # stamped and its idea's stop placed again, before protection is checked below.
-            self._settle_expired_exits()
+            self._settle_ended_exits()
         positions = {p.idea_id: p for p in self.store.positions()}
         for idea_id in sorted(
             touched | {i for i, p in positions.items() if p.status in ("OPEN", "PENDING")}
@@ -815,38 +821,58 @@ class ExecutionCoordinator:
                 self.store.log(self.clock(), EXIT_CANCEL_UNCONFIRMED, order_ref=ref, idea_id=idea)
         return asked
 
-    def _settle_expired_exits(self) -> None:
-        """Every exit whose expiry cancel was asked and that is terminal now by broker evidence:
-        EXIT_CANCEL_UNCONFIRMED is closed; a CANCELLED one (nothing or part filled) takes the public
-        reason EXIT_UNFILLED_CANCELLED and its idea's protective stop is placed again for what is
-        still held (``_restore_stop``, once per exit). A FILLED one (the fill won the race) leaves
-        the idea flat: nothing is placed. UNRESOLVED or still working: nothing changes."""
-        terminal = frozenset({IntentState.CANCELLED, IntentState.FILLED, IntentState.REJECTED})
+    def _settle_ended_exits(self) -> None:
+        """Bounded exit mode, every sync, after the fills and order states are applied.
+
+        1. Every exit whose expiry cancel was asked and that is terminal now by broker evidence:
+           EXIT_CANCEL_UNCONFIRMED is closed; a CANCELLED one (nothing or part filled) takes the
+           public reason EXIT_UNFILLED_CANCELLED.
+        2. Every exit that ENDED (cancelled, filled, rejected, refused or halted) after its netting
+           cancelled the idea's stop (journal EXIT_STOP_CANCELLED) gives the idea its stop back:
+           ``_restore_stop`` places it again, once per exit, when the idea still holds a position.
+           Nothing is placed while any exit of the idea is working, recorded, unresolved or of
+           unknown outcome (``_restore_stop`` and the open-exception check here)."""
+        terminal = frozenset({IntentState.CANCELLED, IntentState.FILLED, IntentState.REJECTED,
+                              IntentState.REFUSED, IntentState.HALTED})
         now = self.clock()
+        unknown = {e.idea_id for e in self.store.exceptions(open_only=True)
+                   if e.kind in (EXIT_CANCEL_UNCONFIRMED, EXIT_OUTCOME_UNKNOWN)}
         for intent in self.store.intents(terminal):
             if intent.action not in (Action.REDUCE, Action.CLOSE):
                 continue
             events = {e.event for e in self.store.journal(intent.order_ref)}
-            if "EXIT_EXPIRY_CANCEL_REQUESTED" not in events:
-                continue
-            if self.store.resolve_exceptions(now, EXIT_CANCEL_UNCONFIRMED,
-                                             idea_id=intent.idea_id, order_ref=intent.order_ref):
-                self.store.log(now, "EXIT_CANCEL_SETTLED", order_ref=intent.order_ref,
-                               idea_id=intent.idea_id, state=intent.state.value)
-            if intent.state != IntentState.CANCELLED:
-                continue
-            if EXIT_UNFILLED_CANCELLED not in intent.reasons:
-                self.store.set_state(intent.order_ref, intent.state, now,
-                                     reasons=[*intent.reasons, EXIT_UNFILLED_CANCELLED])
-                self.store.log(now, EXIT_UNFILLED_CANCELLED, order_ref=intent.order_ref,
-                               idea_id=intent.idea_id,
-                               filled=self.store.filled_quantity(intent.order_ref))
-            if "PROTECTIVE_STOP_REPLACE_SUBMIT" not in events:
+            if "EXIT_EXPIRY_CANCEL_REQUESTED" in events:
+                if self.store.resolve_exceptions(now, EXIT_CANCEL_UNCONFIRMED,
+                                                 idea_id=intent.idea_id,
+                                                 order_ref=intent.order_ref):
+                    self.store.log(now, "EXIT_CANCEL_SETTLED", order_ref=intent.order_ref,
+                                   idea_id=intent.idea_id, state=intent.state.value)
+                    unknown = {e.idea_id for e in self.store.exceptions(open_only=True)
+                               if e.kind in (EXIT_CANCEL_UNCONFIRMED, EXIT_OUTCOME_UNKNOWN)}
+                if intent.state == IntentState.CANCELLED \
+                        and EXIT_UNFILLED_CANCELLED not in intent.reasons:
+                    self.store.set_state(intent.order_ref, intent.state, now,
+                                         reasons=[*intent.reasons, EXIT_UNFILLED_CANCELLED])
+                    self.store.log(now, EXIT_UNFILLED_CANCELLED, order_ref=intent.order_ref,
+                                   idea_id=intent.idea_id,
+                                   filled=self.store.filled_quantity(intent.order_ref))
+            if "EXIT_STOP_CANCELLED" in events and "PROTECTIVE_STOP_REPLACE_SUBMIT" not in events \
+                    and intent.idea_id not in unknown:
                 self._restore_stop(intent)
+
+    def _mark_stop_cancelled_for_exits(self, idea_id: str, stop: str) -> None:
+        """Bounded exit mode: the idea's stop was cancelled to make room for its live exit(s);
+        each of them owes the idea its stop back if it ends without flattening it."""
+        live = UNRESOLVED_STATES | {IntentState.WORKING}
+        for i in self.store.intents(frozenset(live)):
+            if i.idea_id == idea_id and i.action in (Action.REDUCE, Action.CLOSE):
+                self.store.log(self.clock(), "EXIT_STOP_CANCELLED", order_ref=i.order_ref,
+                               idea_id=idea_id, stop_ref=stop)
 
     def _restore_stop(self, exit_intent: Intent) -> None:
         """The exit netting cancelled the idea's protective stop to make room for an exit that has
-        now ended unfilled (or part filled) on a confirmed cancel. Place a stop again, once, for
+        now ended without flattening the idea (cancelled unfilled or part filled, rejected, or
+        refused / failed with nothing sent). Place a stop again, once, for
         what the idea still holds, at the ledger's confirmed stop price, under a new ref
         (``<entry>.STP<n>``) that becomes the idea's stop. Only when every condition holds, from
         broker reads made now: the idea holds a plain execution-series stop and nothing else (no
@@ -1762,7 +1788,51 @@ class ExecutionCoordinator:
         if problems:
             self._exit_not_netted(intent, problems)
             return
+        if self.config.exit_price_policy == "TOUCH":
+            order = self._price_after_netting(intent, order)
+            if order is None:
+                return
         self._submit(intent, order, [])
+
+    def _price_after_netting(self, intent: Intent, order: OrderIntent) -> OrderIntent | None:
+        """Touch mode (owner: "use the fresh executable bid as the initial price"): the stop is out
+        of the way now, so the limit is priced again, immediately before the submission, from a
+        usable quote read now (the same rule: accepted quality, both sides, no older than
+        ``max_quote_age_seconds``), for at most ``EXIT_REQUOTE_SECONDS``. The intent's limit becomes
+        the price actually sent. None usable: nothing is sent, the intent ends REFUSED with
+        EXIT_WITHOUT_QUOTE / AFTER_NETTING, and the sync after it places the stop again."""
+        deadline = time.monotonic() + EXIT_REQUOTE_SECONDS
+        reads = 0
+        while True:
+            reads += 1
+            limit, problem = self._exit_limit(order.contract, order.side, self.clock())
+            if problem is None or time.monotonic() >= deadline:
+                break
+            time.sleep(EXIT_REQUOTE_INTERVAL_SECONDS)
+        now = self.clock()
+        if problem is not None:
+            self.store.set_state(intent.order_ref, IntentState.REFUSED, now,
+                                 reasons=[EXIT_WITHOUT_QUOTE, "AFTER_NETTING", problem])
+            for row in self.store.orders(intent.order_ref):
+                self.store.update_order(row.order_ref, now, status="NotSubmitted")
+            detail = (f"{intent.action.value} {intent.quantity} of {intent.idea_id} not sent: no "
+                      f"usable quote in {reads} read(s) after the netting ({problem}); the stop "
+                      "cancelled for it is placed again")
+            self.store.raise_exception(now, EXIT_WITHOUT_QUOTE, detail, idea_id=intent.idea_id,
+                                       order_ref=intent.order_ref)
+            self.store.log(now, EXIT_WITHOUT_QUOTE, order_ref=intent.order_ref,
+                           idea_id=intent.idea_id, problem=problem, reads=reads,
+                           rule="touch exit: priced after the netting; no usable quote, not sent")
+            self.sync()  # terminal now: the stop is placed again (bounded exit mode)
+            return None
+        before = intent.limit_price
+        self.store.set_intent_limit(intent.order_ref, str(limit), now)
+        row = self.store.order(intent.order_ref)
+        self.store.update_order(intent.order_ref, now, status=row.status, limit_price=str(limit))
+        self.store.log(now, "EXIT_PRICED_AFTER_NETTING", order_ref=intent.order_ref,
+                       idea_id=intent.idea_id, before_netting=before, sent=str(limit), reads=reads,
+                       rule="touch exit: the limit sent is the bid read after the stop was cancelled")
+        return order.model_copy(update={"limit_price": limit})
 
     def _net_exit(self, intent: Intent) -> list[str]:
         idea = intent.idea_id
@@ -1812,6 +1882,8 @@ class ExecutionCoordinator:
             if left == 0:
                 if not self._cancel_confirmed(ref, idea, "position fully committed to exits"):
                     return [f"PROTECTIVE_CANCEL_UNCONFIRMED:{ref}"]
+                if self.config.exit_validity_seconds is not None:
+                    self._mark_stop_cancelled_for_exits(idea, ref)
             elif o.remaining > left and not self._resize_confirmed(o, left, idea):
                 return [f"PROTECTIVE_RESIZE_UNCONFIRMED:{ref}"]
         # A cancel or resize can lose the race with a fill: only an unchanged position may exit.
@@ -2245,6 +2317,9 @@ class ExecutionCoordinator:
             error=error,
             rule="definite submit error: outcome known, recorded, never resent",
         )
+        if intent.action in (Action.REDUCE, Action.CLOSE) \
+                and self.config.exit_validity_seconds is not None:
+            self.sync()  # terminal now: the stop cancelled for it is placed again
 
     def _beyond_horizon(self, intent: Intent, checked: list[str], since: float) -> None:
         """Older than the broker's lookup history: absence cannot be proven. Never resent; it stays
@@ -2535,6 +2610,8 @@ class ExecutionCoordinator:
                     reason="position fully committed to working exits" if cover == 0
                     else "the broker holds nothing this order may cover",
                 )
+                if done and cover == 0 and self.config.exit_validity_seconds is not None:
+                    self._mark_stop_cancelled_for_exits(idea_id, ref)
                 changed |= done
                 reduced |= done and cover > 0
                 continue
@@ -3087,13 +3164,17 @@ class ExecutionCoordinator:
         return (q.bid + q.ask) / 2
 
     def _usable_quote(
-        self, contract: ContractRef, now: datetime
+        self, contract: ContractRef, now: datetime | None
     ) -> tuple[BrokerQuote | None, str | None]:
-        """The broker's own quote, if it is fresh, of an accepted quality, positive and uncrossed."""
+        """The broker's own quote, if it is fresh, of an accepted quality, positive and uncrossed.
+        ``now`` None: the age is measured at the service clock read AFTER the quote returned (an
+        exit at the touch), so it is never smaller than the age at the read itself."""
         try:
             q: BrokerQuote = self.broker.quote(contract)
         except BrokerError:
             return None, "BROKER_QUOTE_UNAVAILABLE"
+        if now is None:
+            now = self.clock()
         if q.quality == QuoteQuality.UNAVAILABLE:
             return None, "BROKER_QUOTE_UNAVAILABLE"
         if q.quality not in self.config.accepted_quote_qualities:
@@ -3113,12 +3194,13 @@ class ExecutionCoordinator:
         """A marketable limit for an exit: the touch it trades against (bid for a sell, ask for a
         buy) moved by the policy collar, so it fills now but never far from a fresh reference.
         Under ``exit_price_policy="TOUCH"`` the touch itself, snapped so that it is never through
-        the observed touch (a sell up, a buy down)."""
-        q, problem = self._usable_quote(contract, now)
+        the observed touch (a sell up, a buy down), its age measured after the read."""
+        touch = self.config.exit_price_policy == "TOUCH"
+        q, problem = self._usable_quote(contract, None if touch else now)
         if problem:
             return None, problem
         tick = contract.min_tick
-        if self.config.exit_price_policy == "TOUCH":
+        if touch:
             if side == OrderSide.SELL:
                 return snap_to_tick(q.bid, tick, ROUND_CEILING), None
             return snap_to_tick(q.ask, tick, ROUND_FLOOR), None

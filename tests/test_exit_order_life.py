@@ -19,6 +19,7 @@ SimBroker (strict), invented data only.
 
 from __future__ import annotations
 
+from datetime import timedelta
 from decimal import Decimal
 
 import pytest
@@ -333,4 +334,141 @@ def test_by_default_an_exit_of_unknown_outcome_is_still_resent_after_no_trace(tm
     assert h.broker.submit_calls == 3  # the existing no-trace resend, unchanged
     assert h.coord.intent(first.order_ref).state == IntentState.FILLED
     assert OrderStatus.FILLED in {o.status for o in h.broker.orders_with_ref(first.order_ref)}
+    h.coord.close()
+
+
+# ---------------------------------------------------------------- 4. priced after the netting
+
+
+def _move_quote_after_stop_cancel(h: Harness, bid: str, ask: str, **quote):
+    """Once the exit netting has cancelled the stop, the market moves (invented)."""
+    real = h.broker.cancel
+
+    def cancel(ref):
+        out = real(ref)
+        if ref.endswith(".STP") or ".STP" in ref:
+            h.broker.set_quote(SYMBOL, bid, ask, **quote)
+        return out
+
+    h.broker.cancel = cancel
+
+
+def test_a_touch_close_is_priced_from_a_read_made_after_the_stop_is_out_of_the_way(tmp_path):
+    h = one_share(tmp_path, **BOUNDED)
+    opened(h)
+    _move_quote_after_stop_cancel(h, "49.90", "49.92")
+    out = close(h, rest=False)
+    assert out.state == IntentState.FILLED, out
+    assert h.coord.intent(out.order_ref).limit_price == "49.90"  # the price actually sent
+    assert h.broker.orders_with_ref(out.order_ref)[0].limit_price == Decimal("49.90")
+    [e] = [e for e in h.coord.store.journal(out.order_ref) if e.event == "EXIT_PRICED_AFTER_NETTING"]
+    assert e.detail["before_netting"] == "49.98" and e.detail["sent"] == "49.90"
+    h.coord.close()
+
+
+def test_the_collar_close_is_still_priced_before_the_netting(tmp_path):
+    h = one_share(tmp_path, exit_validity_seconds=10.0)  # collar (default price policy)
+    opened(h)
+    _move_quote_after_stop_cancel(h, "49.90", "49.92")
+    out = close(h, rest=False)
+    assert h.coord.intent(out.order_ref).limit_price == "49.49"  # 49.98 less 1 %, as before
+    assert "EXIT_PRICED_AFTER_NETTING" not in h.events(out.order_ref)
+    h.coord.close()
+
+
+def test_no_usable_quote_after_the_netting_sends_nothing_and_places_the_stop_again(tmp_path,
+                                                                                  monkeypatch):
+    import tradingbot.execution.coordinator as core
+    monkeypatch.setattr(core, "EXIT_REQUOTE_SECONDS", 0.0)
+    h = one_share(tmp_path, **BOUNDED)
+    pos = opened(h)
+    _move_quote_after_stop_cancel(h, "49.90", "49.92",
+                                  received_at=h.clock.now() - timedelta(seconds=60))
+    out = close(h, rest=False)
+    assert out.state == IntentState.REFUSED, out
+    assert out.reasons[:2] == ["EXIT_WITHOUT_QUOTE", "AFTER_NETTING"], out.reasons
+    assert h.broker.orders_with_ref(out.order_ref) == []  # nothing sent
+    [new] = h.coord.ledger()
+    assert new.stop_ref == f"{pos.stop_ref}2" and len(stops(h)) == 1
+    assert h.coord._protection(new.idea_id) == "CONFIRMED"
+    assert h.broker.submit_calls == 2  # the bracket and the stop placed again
+    assert "PROTECTIVE_STOP_REPLACE_SUBMIT" in h.events(out.order_ref)
+    h.coord.close()
+
+
+# ---------------------------------------------------------------- 5. stop restored after any exit
+
+
+def test_a_close_that_fails_after_the_netting_gets_its_stop_back(tmp_path):
+    from tradingbot.execution.broker import BrokerError
+    h = one_share(tmp_path, **BOUNDED)
+    opened(h)
+    real = h.broker.submit
+
+    def submit(order, children=()):
+        if order.order_type == OrderType.LMT and order.side == OrderSide.SELL:
+            raise BrokerError("invented: refused before anything was sent")
+        return real(order, children)
+
+    h.broker.submit = submit
+    out = close(h, rest=False)
+    assert out.state == IntentState.REJECTED and "SUBMIT_ERROR" in out.reasons
+    [stop] = stops(h)
+    assert stop.order_ref.endswith(".STP2")
+    assert h.coord._protection(h.coord.ledger()[0].idea_id) == "CONFIRMED"
+    assert UNPROTECTED_POSITION not in open_kinds(h)
+    h.coord.close()
+
+
+def test_a_close_the_broker_rejects_gets_its_stop_back(tmp_path):
+    h = one_share(tmp_path, **BOUNDED)
+    opened(h)
+    h.broker.script_next_submit("REJECT")
+    out = close(h, rest=False)
+    assert out.state == IntentState.REJECTED, out
+    assert len(stops(h)) == 1 and stops(h)[0].order_ref.endswith(".STP2")
+    assert h.broker.submit_calls == 3  # bracket, the rejected close, the stop placed again
+    h.coord.close()
+
+
+def test_a_close_refused_before_the_netting_places_nothing(tmp_path):
+    h = one_share(tmp_path, **BOUNDED)
+    pos = opened(h)
+    h.clock.advance(31)  # stale: refused before the stop is touched
+    out = close(h, rest=False)
+    assert out.state == IntentState.REFUSED and "BROKER_QUOTE_STALE" in out.reasons
+    [stop] = stops(h)
+    assert stop.order_ref == pos.stop_ref and h.broker.submit_calls == 1
+    h.coord.close()
+
+
+def test_nothing_is_placed_again_while_an_exits_outcome_is_unknown(tmp_path):
+    h = one_share(tmp_path, **BOUNDED)
+    opened(h)
+    h.broker.script_next_submit("LOST_ACK_NOT_PLACED")
+    out = close(h, rest=False)
+    assert out.state == IntentState.UNRESOLVED
+    for _ in range(4):
+        h.clock.advance(30)
+        h.coord.sync()
+    assert not stops(h) and h.broker.submit_calls == 2
+    assert not any(e.event == "PROTECTIVE_STOP_REPLACE_SUBMIT" for e in h.coord.store.journal())
+    h.coord.close()
+
+
+def test_by_default_a_failed_close_still_leaves_the_share_unprotected(tmp_path):
+    from tradingbot.execution.broker import BrokerError
+    h = one_share(tmp_path, exit_price_policy="TOUCH")
+    opened(h)
+    real = h.broker.submit
+
+    def submit(order, children=()):
+        if order.order_type == OrderType.LMT and order.side == OrderSide.SELL:
+            raise BrokerError("invented")
+        return real(order, children)
+
+    h.broker.submit = submit
+    close(h, rest=False)
+    h.coord.sync()
+    assert not stops(h) and UNPROTECTED_POSITION in open_kinds(h)  # unchanged without the mode
     h.coord.close()
