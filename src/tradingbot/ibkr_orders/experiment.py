@@ -103,6 +103,8 @@ class ExperimentPlan:
     ack_timeout: str
     callback_ack_required: bool = False  # bracket: both orders' openOrder+orderStatus by callback
     stop_proof_after_fill: bool = False  # lifecycle: the protective stop after the entry fills
+    # endings and abort judge "stop working" only from the broker's open-orders answer
+    strict_stop_read: bool = False
     codes: dict = field(default_factory=dict)  # kind -> (code prefix written, prefix reported)
 
     def stage(self, kind: str) -> str:
@@ -136,7 +138,7 @@ PAPER_TEST_2_PLAN = ExperimentPlan(
     experiment="paper-test-2", stages=PAPER_TEST_2_STAGES,
     kinds=(REFUSAL, LOOKUPS, SINGLE, BRACKET, LIFECYCLE), submissions=(0, 0, 1, 2, 7),
     ack_timeout=ACK_HALT,  # the owner's rule; ACK_CANCEL_IF_WORKING is the one-line alternative
-    callback_ack_required=True, stop_proof_after_fill=True,
+    callback_ack_required=True, stop_proof_after_fill=True, strict_stop_read=True,
     codes={BRACKET: ("STAGE2_", "STAGE3_"), LIFECYCLE: ("STAGE3_", "STAGE4_")})
 PLANS = {p.experiment: p for p in (PAPER_TEST_1_PLAN, PAPER_TEST_2_PLAN)}
 
@@ -245,6 +247,9 @@ def _check_time_to_close(contract, stage: str, now: datetime, extra_seconds: flo
                            "close counts)")
 
 
+LOCAL_ONLY = "LOCAL_STATE_NOT_IN_SNAPSHOT"  # session.py: a row added from the session's own state
+
+
 def _read_state(s: PaperOrderSession) -> dict:
     state: dict = {"position_read": None, "own_fills": None, "agree": False, "held": None,
                    "stop_working": False, "stop_status": None, "close_working": False,
@@ -265,6 +270,13 @@ def _read_state(s: PaperOrderSession) -> dict:
         state["read_errors"].append(redact_accounts(f"open orders: {exc}"))
         return state
     stops = [o for o in own if o.action == "SELL" and o.order_type == "STP"]
+    if getattr(s, "stop_read_strict", False):
+        # paper-test-2: a stop counts (and is named) only when the BROKER's open-orders answer
+        # shows it, never from a row the session adds from its own state
+        local = [o for o in stops if o.reason == LOCAL_ONLY]
+        stops = [o for o in stops if o.reason != LOCAL_ONLY]
+        state["stop_read"] = "broker answer only"
+        state["stops_not_in_broker_answer"] = [o.order_id for o in local]
     state["own_working"] = len(own)
     state["stop_status"] = ",".join(o.status.value for o in stops) or None
     state["stop_working"] = any(o.status in STOP_WORKING_STATUSES for o in stops)
@@ -313,6 +325,7 @@ ABNORMAL_ENDINGS = frozenset({
     "STAGE2_PARENT_NOT_CONFIRMED_CANCELLED", "STAGE2_CHILD_NOT_CONFIRMED_CANCELLED",
     "STAGE2_CANCEL_NOT_CONFIRMED_BY_READ", "STAGE2_FAILED", "STAGE2_ACK_UNKNOWN_HALTED",
     "STAGE2_ACK_NOT_BY_CALLBACK", "STAGE2_REJECTED",
+    "STAGE2_PARTIAL_BRACKET_PARENT_CANCEL_REQUESTED",
     "STAGE3_ENTRY_NOT_FILLED", "STAGE3_PROTECTION_UNCONFIRMED", "STAGE3_PROTECTION_LOST",
     "STAGE3_CLOSE_REFUSED", "STAGE3_CLOSE_NOT_FILLED", "STAGE3_NOT_CLEAN",
     "STAGE3_NO_USABLE_QUOTE", "STAGE3_ENTRY_REFUSED", "STAGE3_CLOSE_NO_QUOTE",
@@ -327,10 +340,8 @@ SINGLE_ENDINGS = frozenset({
     "STAGE2_FAILED"})
 
 
-def _instruction(state: dict) -> str:
-    """What the owner does now. No manual sell is ever unconditional (it depends on what the TWS
-    window shows), a disputed position is never stated as fact, and abort never comes first
-    while TWS may show a working stop."""
+def _state_text(state: dict) -> tuple[str, str, Decimal | None]:
+    """(the position sentence, the orders sentence, the position held when read and fills agree)."""
     read, fills = state.get("position_read"), state.get("own_fills")
     if state.get("agree"):
         held = Decimal(state["held"])
@@ -351,6 +362,17 @@ def _instruction(state: dict) -> str:
                        "is UNPROTECTED. ")
         if state["close_working"]:
             orders += "A closing limit of this client is resting. "
+        if state.get("stops_not_in_broker_answer"):
+            orders += (f"Stop order(s) {state['stops_not_in_broker_answer']} of this client are "
+                       "not in the broker's open-orders answer: check them in TWS. ")
+    return head, orders, held
+
+
+def _instruction(state: dict) -> str:
+    """What the owner does now. No manual sell is ever unconditional (it depends on what the TWS
+    window shows), a disputed position is never stated as fact, and abort never comes first
+    while TWS may show a working stop."""
+    head, orders, held = _state_text(state)
     if held is not None and held <= 0 and state.get("own_working") is not None:
         if state["own_working"]:
             return (head + orders + f"Run abort to cancel this client's {state['own_working']} "
@@ -363,6 +385,20 @@ def _instruction(state: dict) -> str:
 
 def _ending_message(result: str, what: str, state: dict) -> str:
     return f"{result}: {what}. Now: {_instruction(state)}"
+
+
+HALT_RECONCILE = ("Reconcile by hand in TWS: look at the TLT position and every TLT order of this "
+                  "experiment in the TWS window and settle them there yourself; this script "
+                  "cancels nothing more. Afterwards, only if you choose to, abort can cancel this "
+                  "client's orders that are still working (it re-reads first and never cancels a "
+                  "protective stop while a share is held).")
+
+
+def _halt_message(result: str, what: str, state: dict) -> str:
+    """After a HALT (the owner's DECIDED 15 rule): the reads as facts, then reconcile by hand in
+    TWS; abort only as a later step the owner may choose, never the next action."""
+    head, orders, _ = _state_text(state)
+    return f"{result}: {what}. Now: {head}{orders}{HALT_RECONCILE}"
 
 
 class StageRefused(RuntimeError):
@@ -432,7 +468,9 @@ def _write(cfg: PaperOrderConfig, stage: str, evidence: dict) -> Path:
 
 
 def _session(cfg: PaperOrderConfig) -> PaperOrderSession:
-    return PaperOrderSession(cfg)
+    s = PaperOrderSession(cfg)
+    s.stop_read_strict = _plan(cfg).strict_stop_read  # read by _read_state only
+    return s
 
 
 def _tick_floor(price: Decimal, tick: Decimal) -> Decimal:
@@ -663,10 +701,38 @@ def _halt_unknown(s: PaperOrderSession, ev: dict, what: str) -> None:
     ev["ack_timeout_policy"] = ACK_HALT
     ev["result"] = "STAGE2_ACK_UNKNOWN_HALTED"
     ev["state"] = state = _position_state(s)
-    ev["why_failed"] = _ending_message(
+    ev["why_failed"] = _halt_message(
         "STAGE2_ACK_UNKNOWN_HALTED", f"no acknowledgement of {what} within the wait; the read-only "
         f"reconciliation shows {ev.get('reconciliation') or 'nothing'}; nothing was cancelled or "
         "re-sent: the outcome is treated as unknown and reconciled by hand in TWS", state)
+
+
+def _partial_bracket_ending(s: PaperOrderSession, ev: dict, exc: PartialBracket) -> None:
+    """ACK_HALT's ONE exception: a bracket accepted in part (e.g. its stop rejected) has already
+    had its parent's cancel requested by the session (risk-reducing: an entry without its stop
+    must not stay working). Name the ending and state each order AS READ (reads only); the caller
+    re-raises. Nothing else is cancelled or sent."""
+    ids = tuple(o.order_id for o in exc.orders) or tuple(sorted(s.order_ids()))
+    ev["ack_timeout_policy"] = ACK_HALT
+    ev["partial_bracket"] = redact_accounts(str(exc))
+    as_read: dict[int, dict] = {}
+    after: dict = {}
+    for _ in range(STAGE2_CONFIRM_READS):  # reads only
+        time.sleep(READ_BACK_WAIT_SECONDS)
+        after = _lookups(s)
+        as_read = _orders_as_read(after, ids)
+        if all(r["in_open_orders"] is False for r in as_read.values()):
+            break
+    ev["after_cancel"] = after
+    ev["orders_as_read"] = {str(k): v for k, v in as_read.items()}
+    read_text = "; ".join(_as_read_text(k, as_read[k]) for k in ids) if as_read else \
+        "the read failed"
+    ev["result"] = "STAGE2_PARTIAL_BRACKET_PARENT_CANCEL_REQUESTED"
+    ev["state"] = state = _position_state(s)
+    ev["why_failed"] = _halt_message(
+        "STAGE2_PARTIAL_BRACKET_PARENT_CANCEL_REQUESTED", "the bracket was accepted only in part "
+        f"({ev['partial_bracket']}); the session requested the parent's cancel (the one exception "
+        f"to the halt rule); the read shows {read_text}; nothing was re-sent", state)
 
 
 def _stage_single(cfg: PaperOrderConfig, ev: dict) -> None:
@@ -809,7 +875,9 @@ def _stage2(cfg: PaperOrderConfig, ev: dict) -> None:
         try:
             snaps = s.place([OrderSpec(ref, "BUY", 1, "LMT", limit_price=limit),
                              OrderSpec(f"{ref}.STP", "SELL", 1, "STP", stop_price=stop)])
-        except PartialBracket:
+        except PartialBracket as exc:
+            if plan.ack_timeout == ACK_HALT:
+                _partial_bracket_ending(s, ev, exc)
             raise
         except OrderOutcomeUnknown as exc:
             rec = exc.reconciliation or {}
@@ -1075,8 +1143,8 @@ def _stop_proof_after_fill(s: PaperOrderSession, coord, entry_ref: str, seen_fil
                 "remaining": str(row.remaining), "parent_id": row.parent_id},
             "open_orders_error": read_error,
             # from the broker's answer itself: never a row the session adds from its own state
-            "row_from_broker": row is not None and row.reason != "LOCAL_STATE_NOT_IN_SNAPSHOT",
-            "row_working": (row is not None and row.reason != "LOCAL_STATE_NOT_IN_SNAPSHOT"
+            "row_from_broker": row is not None and row.reason != LOCAL_ONLY,
+            "row_working": (row is not None and row.reason != LOCAL_ONLY
                             and row.status in STOP_WORKING_STATUSES
                             and row.stop_price == want_stop and row.total_quantity == 1
                             and row.parent_id == entry_id),
@@ -1479,8 +1547,18 @@ def _abort(cfg: PaperOrderConfig, ev: dict) -> None:
             cancels += "; NOT confirmed: " + ", ".join(
                 f"order {r['order_id']} ({r['status_now']})" for r in ev["cancels_unconfirmed"])
             cancels += " - treat it as still working"
+        if kept and getattr(s, "stop_read_strict", False):
+            # paper-test-2: say "working" only for what the BROKER's answer shows (reporting
+            # only: what abort cancels is decided above, unchanged)
+            shown = [k for k in kept if any(r["order_id"] == k and r.get("reason") != LOCAL_ONLY
+                                            for r in remaining)]
+            ev["left_working_shown_by_broker"] = shown
+            kept_text = (f"protective stop(s) {kept} uncancelled; the broker's open-orders "
+                         f"answer shows {shown or 'none of them'} working")
+        else:
+            kept_text = f"protective stop(s) {kept} working"
         what = (f"this script does not read the account flat, so abort left this client's "
-                f"protective stop(s) {kept} working; it {cancels}" if kept else
+                f"{kept_text}; it {cancels}" if kept else
                 "this script does not read the account flat; no protective stop of this client "
                 f"is working; abort {cancels}")
         # the instruction follows what is read now, after the cancel requests

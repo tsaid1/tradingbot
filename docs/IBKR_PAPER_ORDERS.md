@@ -540,8 +540,12 @@ of the other experiment is refused before connecting.
 **After an acknowledgement timeout** (`ExperimentPlan.ack_timeout` in `experiment.py`): the session
 always makes its bounded read-only reconciliation. For `paper-test-2` the value is `ACK_HALT` (the
 owner's DECIDED 15 rule) in every stage: the reconciliation is written into the evidence, the stage
-ends `STAGEn_ACK_UNKNOWN_HALTED` and raises; nothing is cancelled or re-sent; the owner reconciles
-by hand in TWS. The alternative, `ACK_CANCEL_IF_WORKING` (one line of the definition; tested in
+ends `STAGEn_ACK_UNKNOWN_HALTED` and raises; nothing is cancelled or re-sent; the printed
+instruction is to reconcile by hand in TWS (`abort` only as a later step the owner may choose).
+**The ONE exception to HALT:** a bracket accepted only in part in stage 3 (for example its stop
+rejected at placement) keeps the session's parent cancel, because an entry without its stop must
+not stay working; the stage ends `STAGE3_PARTIAL_BRACKET_PARENT_CANCEL_REQUESTED`, states each
+order as read afterwards (reads only) and raises; nothing else is cancelled or sent. The alternative, `ACK_CANCEL_IF_WORKING` (one line of the definition; tested in
 both settings), applies only to the unfillable stages 2 and 3: when the read shows every order
 WORKING, the stage's confirmed cancels run and the stage ends `STAGEn_ACK_BY_RECONCILIATION`,
 never a pass and never a resend. An acknowledgement found only by the reconciliation is never a
@@ -563,6 +567,16 @@ perm id presence, status, whyHeld, the order's prices, OCA group, transmit).
 | 4 | `python scripts/ibkr_paper_experiment.py stage4-lifecycle` | `paper-test-1`'s stage 3 (entry, stop 1.00 below, one raise of 0.10, the close in two attempts, reconciliation clean, exactly 7 or 9 used in total), plus, after the entry fills and before the raise (below) | at most 7 |
 | any | `python scripts/ibkr_paper_experiment.py abort` | as `paper-test-1` | 0 |
 
+**Residual risk of stage 2:** its single order has NO protective stop. It is priced at 90% of the
+bid and should not fill; if it ever did, the result would be one unprotected TLT share
+(`STAGE2_UNEXPECTED_FILL`), to be closed by hand in TWS following the printed procedure; stage 3
+is then blocked.
+
+**"Stop working" in paper-test-2's messages and `abort`'s report** is judged only from the
+broker's own open-orders answer: a stop the session still tracks but the broker's answer does not
+show is reported as not working ("check it in TWS"), never as working. This changes reporting and
+the stage-4 restore wait only: what `abort` cancels is decided exactly as for `paper-test-1`.
+
 **Stage 4, the protective stop after the entry fills** (the owner's requirement, DECIDED 16). Reads
 only; nothing is sent. Within `PROTECTION_SETTLE_SECONDS` (15 s) of the entry's fill (its
 `execDetails`, else its Filled status): (1) an `orderStatus` for the stop carrying this client's id,
@@ -581,7 +595,7 @@ also needs 61 minutes of liquid hours left (60 plus the 30 s hold, rounded up).
 | Stage | Endings (`result`) |
 |---|---|
 | 2 | `STAGE2_PASSED`; `STAGE2_ACK_UNKNOWN_HALTED`; `STAGE2_ACK_BY_RECONCILIATION` (alternative policy only); `STAGE2_ACK_NOT_BY_CALLBACK`; `STAGE2_REJECTED`; `STAGE2_UNEXPECTED_FILL` (a share without a stop: the TWS procedure); `STAGE2_CANCEL_NOT_CONFIRMED_BY_READ`; `STAGE2_FAILED` |
-| 3 | `STAGE3_PASSED`; `STAGE3_ACK_UNKNOWN_HALTED`; `STAGE3_ACK_BY_RECONCILIATION` (alternative only); `STAGE3_ACK_NOT_BY_CALLBACK`; `STAGE3_UNEXPECTED_FILL`; `STAGE3_PARENT_NOT_CONFIRMED_CANCELLED`; `STAGE3_CHILD_NOT_CONFIRMED_CANCELLED`; `STAGE3_CANCEL_NOT_CONFIRMED_BY_READ`; `STAGE3_FAILED`; a `PartialBracket` error (the parent cancel requested) |
+| 3 | `STAGE3_PASSED`; `STAGE3_ACK_UNKNOWN_HALTED`; `STAGE3_PARTIAL_BRACKET_PARENT_CANCEL_REQUESTED` (the one exception to HALT; under the alternative policy: a `PartialBracket` error as for `paper-test-1`); `STAGE3_ACK_BY_RECONCILIATION` (alternative only); `STAGE3_ACK_NOT_BY_CALLBACK`; `STAGE3_UNEXPECTED_FILL`; `STAGE3_PARENT_NOT_CONFIRMED_CANCELLED`; `STAGE3_CHILD_NOT_CONFIRMED_CANCELLED`; `STAGE3_CANCEL_NOT_CONFIRMED_BY_READ`; `STAGE3_FAILED` |
 | 4 | `STAGE4_PASSED`; `STAGE4_NO_USABLE_QUOTE`; `STAGE4_ENTRY_REFUSED`; `STAGE4_ENTRY_NOT_FILLED`; `STAGE4_PROTECTION_UNCONFIRMED`; `STAGE4_PROTECTION_LOST`; `STAGE4_CLOSE_NO_QUOTE`; `STAGE4_CLOSE_REFUSED`; `STAGE4_CLOSE_OUTCOME_UNKNOWN`; `STAGE4_PROTECTION_NOT_RESTORED`; `STAGE4_CLOSE_NOT_FILLED`; `STAGE4_NOT_CLEAN` |
 
 Before stage 2 and again before stages 3 and 4: the full suite with the SDK at the exact commit, as

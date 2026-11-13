@@ -389,3 +389,75 @@ def test_abort_works_for_paper_test_2(tws, p2):  # noqa: F811
     assert ev["passed"], ev
     assert all(o.status in TERMINAL for o in tws.orders.values())
     assert tws.count("PLACE_ORDER") == 1
+
+
+# --- PR #79 review fixes ------------------------------------------------------------------------
+def test_stage3_partial_bracket_under_halt_is_the_named_exception(tws, p2):  # noqa: F811
+    """The stop rejected at placement: the session's parent cancel is kept (risk-reducing), the
+    ending is named, each order is stated as read, nothing else is sent."""
+    through(tws, p2, S3)
+    cancels = tws.count("CANCEL_ORDER")
+    tws.reject_refs["TB-paper-test-2-stage3.STP"] = (201, "Order rejected - reason: invented")
+    ev = run(S3, p2)
+    assert ev["result"] == "STAGE3_PARTIAL_BRACKET_PARENT_CANCEL_REQUESTED" and not ev["passed"]
+    assert "PartialBracket" in ev["error"]
+    assert tws.count("CANCEL_ORDER") == cancels + 1 and tws.count("PLACE_ORDER") == 3
+    parent, child = sorted(tws.orders)[-2:]
+    assert set(ev["orders_as_read"]) == {str(parent), str(child)}
+    assert ev["orders_as_read"][str(parent)]["in_open_orders"] is False
+    assert f"order {parent}: not in open orders" in ev["why_failed"]
+    assert "the one exception to the halt rule" in ev["why_failed"]
+    assert "Reconcile by hand in TWS" in ev["why_failed"]
+    with pytest.raises(X.StageRefused):
+        X.run_stage(S4, p2)
+
+
+def test_partial_bracket_with_the_alternative_policy_is_as_before(tws, p2, monkeypatch):  # noqa: F811
+    through(tws, p2, S3)
+    policy(monkeypatch, X.ACK_CANCEL_IF_WORKING)
+    tws.reject_refs["TB-paper-test-2-stage3.STP"] = (201, "Order rejected - reason: invented")
+    ev = run(S3, p2)
+    assert "PartialBracket" in ev["error"] and ev.get("result") is None
+
+
+def test_the_halt_instruction_is_reconcile_by_hand_with_abort_only_afterwards(tws, p2):  # noqa: F811
+    import re
+
+    through(tws, p2, S2)
+    tws.ack_lost = True  # the order works at the broker: the old instruction said "Run abort"
+    ev = run(S2, p2)
+    text = ev["why_failed"]
+    now = text.split("Now: ", 1)[1]
+    assert "Run abort" not in text
+    assert now.index("Reconcile by hand in TWS") < now.index("abort")
+    assert "only if you choose to, abort" in now
+    assert not re.search(r"\bsell", text, re.IGNORECASE)  # no sale of any kind is instructed
+
+
+def test_paper_test_2_reports_a_stop_working_only_from_the_brokers_answer(tws, p2, monkeypatch):  # noqa: F811
+    """The stop vanished at the broker during the hold; the session still tracks it Submitted.
+    The ending must not tell the owner a protective stop is working."""
+    through(tws, p2, S4)
+    fill_later(tws)
+    real_sleep = time.sleep
+
+    def sleep(seconds):
+        if seconds == X.STOP_HOLD_SECONDS:
+            stop = tws.orders[max(i for i, o in tws.orders.items() if o.order.parentId)]
+            tws._set(stop, "Cancelled")  # gone at the broker, silently (invented)
+        real_sleep(seconds)
+
+    monkeypatch.setattr(X, "time", SimpleNamespace(monotonic=time.monotonic, sleep=sleep))
+    ev = run(S4, p2)
+    assert ev["result"] == "STAGE4_PROTECTION_LOST"
+    assert ev["state"]["stop_working"] is False and ev["state"]["stop_read"] == \
+        "broker answer only"
+    assert ev["state"]["stops_not_in_broker_answer"]
+    assert "Protective stop working" not in ev["why_failed"]
+    assert "No protective stop of this client is working" in ev["why_failed"]
+    assert "not in the broker's open-orders answer: check them in TWS" in ev["why_failed"]
+
+
+def test_the_strict_read_is_paper_test_2_only(tws, p2, cfg_path):  # noqa: F811
+    s1, s2 = X._session(load_order_config(cfg_path)), X._session(load_order_config(p2))
+    assert s1.stop_read_strict is False and s2.stop_read_strict is True
