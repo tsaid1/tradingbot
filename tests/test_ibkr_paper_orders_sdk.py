@@ -396,26 +396,28 @@ def test_a_session_resolving_another_contract_refuses_order_mode(tws, tmp_path, 
     assert original is FakeOrderTws.contract_handler
 
 
-def test_seventh_submission_refused_including_after_a_restart(tws, tmp_path):
+def test_a_submission_past_the_cap_is_refused_including_after_a_restart(tws, tmp_path):
     s = make(tws, tmp_path)
     try:
         snaps = s.place([buy(), stop()])  # 1, 2
-        for i, price in enumerate(("87.10", "87.20", "87.30", "87.40"), start=3):
+        prices = ("87.10", "87.20", "87.30", "87.40", "87.50", "87.60", "87.70")
+        for i, price in enumerate(prices, start=3):
             assert s.modify(snaps[1].order_id, stop_price=D(price)).stop_price == D(price)
             assert s.submissions_used == i
-        with pytest.raises(OrderRefused) as info:  # the seventh: an amendment
-            s.modify(snaps[1].order_id, stop_price=D("87.50"))
+        assert s.submissions_used == C.PAPER_TEST_1.max_submissions == 9
+        with pytest.raises(OrderRefused) as info:  # the tenth: an amendment
+            s.modify(snaps[1].order_id, stop_price=D("87.80"))
         assert info.value.refusal.reason == RefusalReason.EXPERIMENT_FINISHED
-        assert placed(tws) == 6
+        assert placed(tws) == 9
     finally:
         s.disconnect()
     again = make(tws, tmp_path)  # a new process on the same state directory
     try:
-        assert again.submissions_used == 6 and again.submissions_remaining == 0
+        assert again.submissions_used == 9 and again.submissions_remaining == 0
         with pytest.raises(OrderRefused) as info:
             again.place([buy("TB-0009")])
         assert info.value.refusal.reason == RefusalReason.EXPERIMENT_FINISHED
-        assert placed(tws) == 6
+        assert placed(tws) == 9
         child = max(again.order_ids())  # cancels stay possible: they only reduce risk
         assert again.cancel(child).status == OrderStatus.CANCELLED
     finally:
@@ -426,14 +428,14 @@ def test_bracket_that_would_cross_the_cap_sends_nothing(tws, tmp_path):
     s = make(tws, tmp_path)
     try:
         snaps = s.place([buy(), stop()])
-        for price in ("87.10", "87.20", "87.30"):
+        for price in ("87.10", "87.20", "87.30", "87.40", "87.50", "87.60"):
             s.modify(snaps[1].order_id, stop_price=D(price))
         s.cancel(snaps[0].order_id)
-        assert s.submissions_used == 5
+        assert s.submissions_used == C.PAPER_TEST_1.max_submissions - 1 == 8
         with pytest.raises(OrderRefused) as info:
             s.place([buy("TB-0002"), stop("TB-0002.STP")])
         assert info.value.refusal.reason == RefusalReason.SUBMISSION_CAP
-        assert placed(tws) == 5
+        assert placed(tws) == 8
     finally:
         s.disconnect()
 
@@ -477,7 +479,7 @@ def fake_id(tws, ref):
     return max(o.order_id for o in tws.orders.values() if core_ref(o.order.orderRef) == ref)
 
 
-def test_full_lifecycle_within_the_six_submission_cap(tws, tmp_path):
+def test_full_lifecycle_within_the_submission_cap(tws, tmp_path):
     s, _broker, coord = coordinator(tws, tmp_path)
     try:
         out = run(coord, "p1", tlt_open())
@@ -502,7 +504,7 @@ def test_full_lifecycle_within_the_six_submission_cap(tws, tmp_path):
         assert settle(lambda: coord.sync() and coord.ledger()[0].quantity == 0)
         report = coord.reconcile()
         assert report.clean, report
-        assert placed(tws) == 4 and s.submissions_remaining == 2
+        assert placed(tws) == 4 and s.submissions_remaining == C.PAPER_TEST_1.max_submissions - 4
         assert s.submissions_used <= C.PAPER_TEST_1.max_submissions
     finally:
         coord.close()
@@ -1067,15 +1069,16 @@ def test_a_close_the_guard_would_refuse_cancels_nothing(tws, tmp_path):
     s, _broker, coord, out = _held_with_stop(tws, tmp_path)
     try:
         idea = coord.ledger()[0].idea_id
-        for i, price in enumerate(("87.10", "87.20", "87.30", "87.40")):
+        prices = ("87.10", "87.20", "87.30", "87.40", "87.50", "87.60", "87.70")
+        for i, price in enumerate(prices):
             assert run(coord, f"m{i}", action(f"raise{i}", Action.MODIFY, idea=idea, stop=price,
                                               symbol="TLT")).state == IntentState.APPLIED
-        assert s.submissions_used == 6  # the close would be EXPERIMENT_FINISHED
+        assert s.submissions_used == 9  # the close would be EXPERIMENT_FINISHED
         close = run(coord, "c1", action("close", Action.CLOSE, idea=idea, symbol="TLT"))
         assert close.state != IntentState.WORKING
         stop_id = fake_id(tws, f"{out.order_ref}.STP")
         assert tws.orders[stop_id].status == "Submitted"  # the stop still protects the share
-        assert tws.count("CANCEL_ORDER") == 0 and placed(tws) == 6
+        assert tws.count("CANCEL_ORDER") == 0 and placed(tws) == 9
     finally:
         coord.close()
         s.disconnect()
@@ -1207,7 +1210,7 @@ def test_without_an_exit_collar_no_held_stop_can_be_cancelled(tws, tmp_path):
         s.disconnect()
 
 
-# --- disabled by default: the funded account; what counts toward the six -----------------------
+# --- disabled by default: the funded account; what counts toward the cap -----------------------
 @pytest.mark.parametrize("accounts", ["U9990002", "DU9990002", f"{PAPER},U9990002",
                                       [PAPER, "U9990002"], ""])
 def test_the_broker_account_list_must_be_exactly_the_paper_account(tws, tmp_path, accounts):
@@ -1222,7 +1225,7 @@ def test_the_broker_account_list_must_be_exactly_the_paper_account(tws, tmp_path
     assert s.order_mode_status != "VERIFIED"
 
 
-def test_what_counts_toward_the_six(tws, tmp_path):
+def test_what_counts_toward_the_cap(tws, tmp_path):
     """Every PLACE_ORDER frame counts (an entry, a bracket child, an amendment, a close, one the
     broker rejects, one never acknowledged); a cancel and a guard refusal never count, and a
     cancel stays possible after the cap."""
@@ -1247,16 +1250,19 @@ def test_what_counts_toward_the_six(tws, tmp_path):
         tws.ack_lost = False
         s.cancel(max(s.order_ids()))
         assert s.submissions_used == 5
+        for i in (6, 7, 8):  # up to the cap of 9 (owner's exit decision, 13 Nov 2026)
+            s.cancel(s.place([buy(f"TB-5{i}", "80.00")])[0].order_id)
+        assert s.submissions_used == 8
         last = s.place([buy("TB-5", "80.00")])[0]
-        assert s.submissions_used == 6 == C.PAPER_TEST_1.max_submissions
+        assert s.submissions_used == 9 == C.PAPER_TEST_1.max_submissions
         assert s.cancel(last.order_id).status == OrderStatus.CANCELLED  # after the cap
         with pytest.raises(OrderRefused) as info:
             s.place([buy("TB-6", "80.00")])
         assert info.value.refusal.reason in (RefusalReason.EXPERIMENT_FINISHED,
                                              RefusalReason.SUBMISSION_CAP)
-        assert placed(tws) == 6 and s.submissions_used == 6
+        assert placed(tws) == 9 and s.submissions_used == 9
         kinds = [e["kind"] for e in s._counter.entries]
-        assert kinds == ["PARENT", "CHILD", "MODIFY", "SINGLE", "SINGLE", "SINGLE"]
+        assert kinds == ["PARENT", "CHILD", "MODIFY"] + ["SINGLE"] * 6
     finally:
         s.disconnect()
 
@@ -1276,13 +1282,13 @@ def test_a_partial_bracket_counts_both_orders_and_its_parent_cancel_counts_nothi
 def test_a_bracket_that_does_not_fit_the_remaining_budget_sends_nothing(tws, tmp_path):
     s = make(tws, tmp_path)
     try:
-        for i in range(5):
+        for i in range(8):
             s.cancel(s.place([buy(f"TB-{i}", "80.00")])[0].order_id)
-        assert s.submissions_used == 5
+        assert s.submissions_used == 8 == C.PAPER_TEST_1.max_submissions - 1
         with pytest.raises(OrderRefused) as info:
             s.place([buy("TB-B", "80.00"), stop("TB-B.STP", "79.00")])
         assert info.value.refusal.reason == RefusalReason.SUBMISSION_CAP
-        assert s.submissions_used == 5 and placed(tws) == 5
+        assert s.submissions_used == 8 and placed(tws) == 8
     finally:
         s.disconnect()
 

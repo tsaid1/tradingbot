@@ -653,6 +653,15 @@ class ExecutionStore:
                 [*fields.values(), at.isoformat(), idea_id],
             )
 
+    def set_stop_ref(self, c: sqlite3.Connection, idea_id: str, stop_ref: str, at: datetime) -> None:
+        """The idea's protective stop is now the order ``stop_ref`` (a stop placed again after the
+        one cancelled for an exit; coordinator ``_restore_stop``). Inside the caller's transaction,
+        with that order's write-ahead row."""
+        c.execute(
+            "UPDATE exec_positions SET stop_ref=?, updated_at=? WHERE idea_id=?",
+            (stop_ref, at.isoformat(), idea_id),
+        )
+
     # ------------------------------------------------------------------ journal and exceptions
 
     def log(
