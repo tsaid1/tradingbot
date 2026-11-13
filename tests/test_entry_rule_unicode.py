@@ -74,7 +74,7 @@ def test_a_word_with_a_non_ascii_letter_is_an_unknown_word(text):
 @pytest.mark.parametrize("text", [
     f"{ANCHORED} Zörbleflux looks heavy.",  # a mention with no trading context in its sentence
     "Zörbleflux. We are now long $TLT, 88.42 now. Stop 87.20.",
-    f"{EXPLICIT} Zörbleflux sits near 12.40.",  # explicit entries have no competing-market check
+    f"{EXPLICIT} Zörbleflux sits near 12.40.",  # explicit TLT entries get the checks too (13 Nov 2026)
 ])
 def test_otherwise_a_non_ascii_word_is_held_no_less_than_its_ascii_twin(text):
     """Same policy as any unknown word: never laxer than the same post spelled in ASCII."""

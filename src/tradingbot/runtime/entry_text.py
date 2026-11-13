@@ -128,6 +128,80 @@ def read_price_problem(prices, *texts: str | None) -> str | None:
     return None
 
 
+# A sentence end for the cost-basis rule: ". ! ?" or a line break (not ";"), a full stop not
+# before a digit and not ending the abbreviations "avg." and "av.".
+_COST_SENTENCE_END_RE = re.compile(r"[!?\n]|(?<![Aa][Vv][Gg])(?<![Aa][Vv])\.(?!\d)")
+_WORD_RE = re.compile(r"[^\W\d_]+")
+_GLUED_AVG_RE = re.compile(r"\b(avg|av)\.(?=\d)", re.IGNORECASE)
+_POSITION_FROM_RE = re.compile(r"\b(?:from|since)\s+\$?$", re.IGNORECASE)
+
+
+def _cost_sentences(text: str) -> list[tuple[int, int]]:
+    spans, start = [], 0
+    for m in [*_COST_SENTENCE_END_RE.finditer(text), None]:
+        end = m.start() if m else len(text)
+        spans.append((start, end))
+        start = m.end() if m else end
+    return spans
+
+
+def _numbers(text: str) -> list[tuple[int, int, Decimal]]:
+    return [(m.start(), m.end(), Decimal(m.group(1).replace(",", "") + (m.group(2) or "")))
+            for m in _READ_NUMBER_RE.finditer(text)]
+
+
+def entry_is_cost_basis(entry, words, phrases, own_levels, *texts: str | None) -> bool:
+    """The owner's rule of 13 November 2026 (and the PR #75 review): is the action's stated entry
+    price, as written in the post (every place the value is written), possibly an average or cost
+    basis rather than a fresh entry? A sentence ends at ". ! ?" or a line break, never at ";".
+    (i) a cost-basis word or phrase anywhere in the entry's sentence, before or after the number;
+    (ii) one in the directly following sentence when that sentence carries no number of its own
+    ("That is our average."); (iii) the post holds a cost-basis expression anywhere and the
+    entry's sentence holds another price that is not one of the action's own stop or target
+    levels (``own_levels``): which of several fills is the fresh entry cannot be told; (iv)
+    "from" or "since" directly before the price ("long from 88.42"); (v) a word holding a
+    non-ASCII letter in the entry's sentence or the following one: unreadable for this purpose
+    (a look-alike "avg" never passes)."""
+    try:
+        value = Decimal(str(entry).replace(",", "").lstrip("$"))
+    except (InvalidOperation, TypeError, ValueError):
+        return False
+    own = set()
+    for p in own_levels:
+        with contextlib.suppress(InvalidOperation, TypeError, ValueError):
+            if p is not None and str(p).strip():
+                own.add(Decimal(str(p).replace(",", "").lstrip("$")))
+
+    def cost(t: str) -> bool:
+        return bool({w.lower() for w in _WORD_RE.findall(t)} & words or phrases.search(t))
+
+    def non_ascii_word(t: str) -> bool:
+        return any(not w.isascii() for w in _WORD_RE.findall(t))
+
+    for raw in texts:
+        if not raw:
+            continue
+        text = _GLUED_AVG_RE.sub(r"\1. ", raw)
+        spans = _cost_sentences(text)
+        anywhere = cost(text)
+        for start, end, v in _numbers(text):
+            if v != value:
+                continue
+            k = next(i for i, (a, b) in enumerate(spans) if a <= start <= b)
+            sentence = text[spans[k][0]:spans[k][1]]
+            following = text[spans[k + 1][0]:spans[k + 1][1]] if k + 1 < len(spans) else ""
+            if cost(sentence) or non_ascii_word(sentence) or non_ascii_word(following):
+                return True
+            if following.strip() and cost(following) and not _numbers(following):
+                return True
+            if _POSITION_FROM_RE.search(text[spans[k][0]:start]):
+                return True
+            if anywhere and any(x not in own and x != value
+                                for _, _, x in _numbers(sentence)):
+                return True
+    return False
+
+
 def _letter_or_mark(ch: str) -> bool:
     return ch.isalpha() or unicodedata.category(ch).startswith("M")
 
@@ -165,7 +239,9 @@ def ascii_shadow(text: str | None) -> tuple[str | None, dict[str, str]]:
             out.append(word)
         else:
             first = next(ch for ch in word if ch.isalpha())
-            ph = entry_text_placeholder(len(originals), first.isupper())
+            # A letter of a script without case (Japanese, Arabic, Hebrew, Thai, Chinese) may
+            # begin a name: its placeholder is capitalised, so it is read as a possible name.
+            ph = entry_text_placeholder(len(originals), first.isupper() or not first.islower())
             originals[ph] = word
             out.append(ph)
         i = j
