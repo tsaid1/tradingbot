@@ -491,7 +491,8 @@ STATES = {
 
 def _assert_no_unconditional_sell(text: str) -> None:
     assert "Only if it shows 1" in X.TWS_SELL and "If it shows 0: do NOT sell" in X.TWS_SELL
-    rest = text.replace(X.TWS_SELL, "").replace(X.NO_SELL_ON_NUMBERS, "")
+    rest = text.replace(X.TWS_SELL, "").replace(X.NO_SELL_ON_NUMBERS, "").replace(
+        X.WAIT_FOR_CANCELLED, "")  # a prohibition ("do not sell until ..."), not an instruction
     assert not re.search(r"\bsell", rest, re.IGNORECASE), rest
     assert "by hand" not in rest.lower(), rest
 
@@ -1023,6 +1024,61 @@ def test_abort_with_no_stop_says_so(tws, cfg_path):
     finally:
         s.disconnect()
     ev = run("abort", cfg_path)
-    assert ev["result"] == "ABORT_STOP_LEFT_WORKING" and ev["left_working"] == []
+    assert ev["result"] == "ABORT_NOT_FLAT_NO_STOP" and ev["left_working"] == []
     assert "no protective stop of this client is working" in ev["why_failed"]
     assert "stop(s) []" not in ev["why_failed"] and X.ABORT_STOP_NOTE not in ev["why_failed"]
+
+
+# --- review round 2: no manual sale beside a closing limit still pending its cancel -------------
+def test_the_procedure_waits_for_the_closing_limit_to_show_cancelled():
+    assert X.WAIT_FOR_CANCELLED in X.TWS_PROCEDURE
+    assert "do not sell by hand until the TWS window shows that closing limit as Cancelled" in \
+        X.WAIT_FOR_CANCELLED
+    assert "PendingCancel" in X.WAIT_FOR_CANCELLED
+    # step (2) comes before the sale in step (3)
+    assert X.TWS_PROCEDURE.index(X.WAIT_FOR_CANCELLED) < X.TWS_PROCEDURE.index(X.TWS_SELL)
+    assert "ABORT_NOT_FLAT_NO_STOP" in X.ABNORMAL_ENDINGS
+
+
+def test_abort_reports_cancels_requested_apart_from_cancels_confirmed(tws, cfg_path):
+    """B2: TWS never answers the closing limit's cancel; stage 3 ends OUTCOME_UNKNOWN, then abort
+    asks again. It must not say "cancelled" for a request a later read does not confirm."""
+    _to_stage3(tws, cfg_path)
+    _close_fills_on(tws, None)
+    cancel = tws.on["CANCEL_ORDER"]
+
+    def ignore_close_cancels(s, conn, req):
+        fo = s.orders.get(req.orderId)
+        if fo is not None and fo.order.action == "SELL" and fo.order.orderType == "LMT":
+            return
+        cancel(s, conn, req)
+
+    tws.on["CANCEL_ORDER"] = ignore_close_cancels
+    ev3 = run("stage3-lifecycle", cfg_path)
+    assert ev3["result"] == "STAGE3_CLOSE_OUTCOME_UNKNOWN"
+    assert X.WAIT_FOR_CANCELLED in ev3["why_failed"]
+    ev = run("abort", cfg_path)
+    assert ev["result"] == "ABORT_NOT_FLAT_NO_STOP", ev
+    assert len(ev["cancels_requested"]) == 1 and ev["cancels_confirmed"] == []
+    assert len(ev["cancels_unconfirmed"]) == 1
+    text = ev["why_failed"]
+    assert "asked TWS to cancel 1 other order(s); 0 confirmed cancelled by a later read" in text
+    assert "NOT confirmed" in text and "cancelled 1 other" not in text
+    assert "A closing limit of this client is resting" in text  # the state read AFTER the cancel
+    assert X.WAIT_FOR_CANCELLED in text
+    _assert_no_unconditional_sell(text)
+
+
+def test_abort_says_cancelled_only_for_a_cancel_a_later_read_confirms(tws, cfg_path):
+    _to_stage3(tws, cfg_path)
+    _close_fills_on(tws, None)
+    from tradingbot.ibkr_orders.records import OrderSpec
+    s = OfflineTestSession(load_order_config(cfg_path))
+    s.connect()
+    try:
+        s.place([OrderSpec("TB-A", "BUY", 1, "LMT", limit_price=Decimal("80.00"))])
+    finally:
+        s.disconnect()
+    ev = run("abort", cfg_path)
+    assert ev["passed"], ev  # flat: every working order cancelled, confirmed by the read after
+    assert len(ev["cancels_requested"]) == len(ev["cancels_confirmed"]) == 1

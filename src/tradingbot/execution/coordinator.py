@@ -31,7 +31,7 @@ from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, InvalidOperation
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from tradingbot.event_models import ReplaySource, TradeAction
 from tradingbot.execution.broker import (
@@ -159,6 +159,10 @@ ENTRY_ANCHOR_PAPER_ONLY = "ENTRY_ANCHOR_PAPER_ONLY"
 EXIT_UNFILLED_CANCELLED = "EXIT_UNFILLED_CANCELLED"
 EXIT_CANCEL_UNCONFIRMED = "EXIT_CANCEL_UNCONFIRMED"
 EXIT_OUTCOME_UNKNOWN = "EXIT_OUTCOME_UNKNOWN"
+# An exception: the broker reports an exit of the idea filled beyond the fills the ledger has
+# applied for it (its executions have not caught up). No stop is placed again meanwhile; it
+# resolves once the ledger has applied them (or the idea is flat).
+EXIT_FILLS_NOT_APPLIED = "EXIT_FILLS_NOT_APPLIED"
 # Touch mode: once the netting has cleared the way (the stop's cancel confirmed, the position
 # unchanged), the exit is priced again from fresh reads for at most this long, one every
 # EXIT_REQUOTE_INTERVAL_SECONDS (at least one read); none usable: nothing is sent (EXIT_WITHOUT_QUOTE,
@@ -258,6 +262,14 @@ class ExecutionConfig(StrictModel):
     # sync and nothing is placed for the idea. In this mode an exit of unknown outcome is never
     # resent either (EXIT_OUTCOME_UNKNOWN): it resolves on broker evidence only.
     exit_validity_seconds: float | None = Field(default=None, gt=0)
+
+    @model_validator(mode="after")
+    def _touch_needs_a_bounded_life(self):
+        # The never-resend rule for exits and the stop placed again belong to the bounded mode: a
+        # touch exit without it (no bounded life, resent after no-trace lookups) is refused.
+        if self.exit_price_policy == "TOUCH" and self.exit_validity_seconds is None:
+            raise ValueError('exit_price_policy="TOUCH" requires exit_validity_seconds')
+        return self
 
 
 class ExecutionOutcome(StrictModel):
@@ -856,6 +868,8 @@ class ExecutionCoordinator:
                     self.store.log(now, EXIT_UNFILLED_CANCELLED, order_ref=intent.order_ref,
                                    idea_id=intent.idea_id,
                                    filled=self.store.filled_quantity(intent.order_ref))
+            if intent.state == IntentState.FILLED:
+                continue  # review B1 (a): never a stop again after an exit reported FILLED
             if "EXIT_STOP_CANCELLED" in events and "PROTECTIVE_STOP_REPLACE_SUBMIT" not in events \
                     and intent.idea_id not in unknown:
                 self._restore_stop(intent)
@@ -891,6 +905,8 @@ class ExecutionCoordinator:
                 self.store.log(now, "PROTECTIVE_STOP_NOT_REPLACED", order_ref=ref, idea_id=idea,
                                reason=why)
 
+        if pos is not None and pos.quantity <= 0:
+            self.store.resolve_exceptions(now, EXIT_FILLS_NOT_APPLIED, idea_id=idea)
         if pos is None or pos.quantity <= 0 or pos.stop_price is None or not pos.stop_ref:
             return  # flat, or no stop to restore: nothing to protect
         if pos.protection_series == "REFERENCE" or pos.target_ref or pos.backstop_ref:
@@ -917,6 +933,33 @@ class ExecutionCoordinator:
             return  # unreadable: tried again at the next sync
         if any(o.order_ref == pos.stop_ref for o in open_orders):
             return  # the stop still works: _maintain_protection sizes it
+        # Review B1 (b): the ledger moves only on executions, an order's status can run ahead of
+        # them. While the broker reports any exit of the idea filled beyond what the ledger has
+        # applied for it, nothing is placed: the ledger (and the position read) may describe a
+        # share that is already gone.
+        rows = [*open_orders, *completed]
+
+        def reported(order_ref: str) -> int:
+            return max((o.filled_quantity for o in rows if o.order_ref == order_ref), default=0)
+
+        lagging = [
+            f"{i.order_ref}: broker {reported(i.order_ref)} > ledger "
+            f"{self.store.filled_quantity(i.order_ref)}"
+            for i in self.store.intents()
+            if i.idea_id == idea and i.action in (Action.REDUCE, Action.CLOSE)
+            and reported(i.order_ref) > self.store.filled_quantity(i.order_ref)
+        ]
+        if lagging:
+            if self.store.raise_exception(
+                now, EXIT_FILLS_NOT_APPLIED,
+                f"the broker reports exit fills the ledger has not applied ({'; '.join(lagging)}); "
+                "no protective stop is placed again until the executions catch up",
+                idea_id=idea, order_ref=ref,
+            ):
+                self.store.log(now, EXIT_FILLS_NOT_APPLIED, order_ref=ref, idea_id=idea,
+                               lagging=lagging)
+            return
+        self.store.resolve_exceptions(now, EXIT_FILLS_NOT_APPLIED, idea_id=idea)
         old = [o for o in completed if o.order_ref == pos.stop_ref]
         if not old or any(
             o.status not in (OrderStatus.CANCELLED, OrderStatus.API_CANCELLED) for o in old
@@ -928,10 +971,14 @@ class ExecutionCoordinator:
                 g = o.parent_ref or o.order_ref
                 groups[g] = max(groups.get(g, 0), o.remaining)
         room = (held if long else -held) - sum(groups.values())
-        cover = pos.quantity
-        if room < cover:
-            return skip(f"the broker position less working exit-side orders ({room}) does not "
-                        f"cover {cover}")
+        # Review B1 (c), (d): the smallest of the ledger after every known fill, the broker
+        # position less working exit-side orders, and what the idea held before this exit less
+        # what the exit's own status reports filled; nothing when that is zero or less.
+        before = pos.quantity + self.store.filled_quantity(ref)
+        cover = min(pos.quantity, room, before - reported(ref))
+        if cover <= 0:
+            return skip(f"nothing to cover: ledger {pos.quantity}, broker room {room}, held "
+                        f"before the exit {before} less its reported fill {reported(ref)}")
         n = sum(1 for r in self.store.orders() if r.idea_id == idea and r.role == Role.STOP) + 1
         new_ref = f"{old_row.intent_ref}.STP{n}"
         stop_price = Decimal(pos.stop_price)

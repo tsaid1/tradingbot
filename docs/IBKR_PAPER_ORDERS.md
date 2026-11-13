@@ -369,7 +369,9 @@ At most `STAGE3_CLOSE_ATTEMPTS` (2) attempts. Each attempt, in order:
    or failed with nothing sent after the stop's cancel (the binding's `ProtectionLost`), or
    rejected by the broker, also gets its stop back (step 4); stage 3 then ends
    `STAGE3_PROTECTION_LOST` or `STAGE3_CLOSE_REFUSED`, stating the stop as read. A send whose
-   acknowledgement is lost ends at once `STAGE3_CLOSE_OUTCOME_UNKNOWN`, with nothing placed again.
+   acknowledgement is lost is looked up by its ref at once: if the broker shows the order it is
+   adopted and the attempt goes on normally (steps 3 to 5); only if it cannot be found does the
+   stage end at once `STAGE3_CLOSE_OUTCOME_UNKNOWN`, with nothing placed again.
 3. **Wait, reads only.** `sync` every second. Filled: reconcile and finish. Once the limit has
    worked `CLOSE_WAIT_SECONDS` (10 s) since it was sent, the core's `sync` cancels it and confirms
    the cancel (`EXIT_EXPIRY_CANCEL_REQUESTED`, `EXIT_EXPIRED_CANCEL_CONFIRMED`; up to 10 reads 1 s
@@ -382,8 +384,16 @@ At most `STAGE3_CLOSE_ATTEMPTS` (2) attempts. Each attempt, in order:
    becomes the idea's stop (one submission, once per exit, never resent). It is placed only when
    reads made then show the old stop cancelled, no other exit of the idea working, recorded or
    unresolved, no open `EXIT_CANCEL_UNCONFIRMED` or `EXIT_OUTCOME_UNKNOWN` on the idea, and the
-   broker position less every working sell covers it. `_maintain_protection` then confirms it like any
-   stop. The script waits (reads only, up to `PROTECTION_SETTLE_SECONDS`, 15 s) until the core
+   broker position less every working sell covers it. Never after an exit whose final state is
+   FILLED, and never while the broker reports any exit of the idea filled beyond the fills the
+   ledger has applied for it (its executions have not caught up: `EXIT_FILLS_NOT_APPLIED` stays
+   open, nothing is placed, and it resolves only when the executions are applied or the idea is
+   flat). Its size is the smallest of the ledger quantity, the broker position less working sells,
+   and what the idea held before the exit less what the exit's own status reports filled; none is
+   placed when that is zero or less. It uses the ledger's stop price at that moment: a stop raise
+   that arrives while the closing limit works is rejected (`MODIFY_NOT_CONFIRMED`, there is no
+   stop to amend), so the stop placed again carries the price before that raise.
+   `_maintain_protection` then confirms it like any stop. The script waits (reads only, up to `PROTECTION_SETTLE_SECONDS`, 15 s) until the core
    reports it CONFIRMED **and** the open-orders read shows it working. Only then may the next
    attempt start. Not confirmed: `STAGE3_PROTECTION_NOT_RESTORED` (the share may be unprotected).
 5. **Cancel not confirmed or outcome unknown** (the limit still working after
@@ -419,7 +429,14 @@ netting, `ProtectionLost`) or the broker rejects it, the window ends at the stop
 without the 10 s wait. Twice at most. It is **unbounded** (a human acts) only on an abnormal
 ending: `STAGE3_CLOSE_OUTCOME_UNKNOWN` (a limit of unknown outcome: no stop beside it, by design),
 `STAGE3_PROTECTION_NOT_RESTORED`, an ending whose message says "NO protective stop ... working as
-read", or a process or TWS failure inside the window.
+read", or a process or TWS failure inside the window. Three short cases inside the window, each
+reported: (a) a close whose acknowledgement is lost and that cannot be found is UNRESOLVED, with the
+stop already cancelled, for `settle_seconds` (10 s) before `EXIT_OUTCOME_UNKNOWN` opens; stage 3
+reports `STAGE3_CLOSE_OUTCOME_UNKNOWN` at once; (b) a halt file that appears between the netting and
+the send leaves the close HALTED with the stop cancelled until the next `sync`, which places the
+stop again; (c) a process death between the restored stop's write-ahead row and its request leaves
+that row Recorded and never sent: it is never resent, and the next `sync` raises
+`UNPROTECTED_POSITION` (a human acts).
 
 After stage 3 (or on any failure): turn Read-Only API back ON, remove the `orders` line, and keep
 the evidence directory and journal. If stage 2 reports a fill, follow its printed TWS procedure (below):
@@ -456,7 +473,9 @@ The **procedure** is the same for every ending that is not a confirmed flat:
 
 > In the TWS window: (1) open the Trades panel: if it already shows a TLT sale of this experiment
 > today, skip step (3); (2) cancel a resting TLT closing limit only if you can see it working
-> there, never the stop; (3) Look at the TLT position in the TWS window. Only if it shows 1: sell
+> there, never the stop. If you cancelled one, do not sell by hand until the TWS window shows that
+> closing limit as Cancelled; while it shows PendingCancel or working, do not sell and do nothing
+> more. (3) Look at the TLT position in the TWS window. Only if it shows 1: sell
 > 1 there with a limit at the bid (lower it a tick at a time until it fills) and wait until it
 > shows 0. If it shows 0: do NOT sell. (4) After a manual sale, run abort at once: the protective
 > stop is still working until then and must not trigger on a share you no longer hold. Abort
@@ -467,7 +486,11 @@ The **procedure** is the same for every ending that is not a confirmed flat:
 A manual sale is not an execution of the experiment, so after one the experiment's own fills
 still say 1 while the position read says 0: abort then reads a disagreement and leaves the stop
 working (`ABORT_STOP_LEFT_WORKING`), and the owner cancels that stop in TWS by hand, as step (4)
-says.
+says. With no protective stop of this client working at all, the result is
+`ABORT_NOT_FLAT_NO_STOP`. Abort reports the cancels it asked for apart from those a later read
+confirms (gone from open orders and Cancelled in the completed orders): "asked TWS to cancel N
+other order(s); M confirmed cancelled by a later read; NOT confirmed: order X (PendingCancel) -
+treat it as still working". Its instruction is built from a read made after those requests.
 
 When read and fills agree on 0, it instead says "run abort to cancel this client's N working
 order(s), then confirm in TWS that the TLT position is 0 and no TLT order is working", or, with
@@ -490,7 +513,8 @@ nothing working, "nothing to do; confirm in TWS ...". No message contains an unc
 | `STAGE3_NO_USABLE_QUOTE` | before the entry no such quote; nothing was sent | nothing in TWS; stage 3 may run again (the count is still 2) |
 | `STAGE3_ENTRY_REFUSED` | the core refused the entry (its reasons, e.g. `BROKER_QUOTE_STALE`); nothing was sent | nothing in TWS; stage 3 may run again |
 | `STAGE3_NOT_CLEAN` | after the 15 s retry, reconciliation still not clean, or the count is not exactly 6 (first close filled) or 8 (second close filled) | the TWS procedure; with read and fills disagreeing, do not sell on the script's numbers; keep the evidence |
-| `ABORT_STOP_LEFT_WORKING` | abort does not read the account flat; it left the protective stop(s) working and cancelled only the other orders, or, with no stop at all, "no protective stop of this client is working" | the TWS procedure; if TWS shows TLT 0, cancel that stop in TWS yourself at once; if it shows 1, leave it |
+| `ABORT_NOT_FLAT_NO_STOP` | abort does not read the account flat and no protective stop of this client is working; it asked TWS to cancel the other orders and says how many a later read confirmed | the TWS procedure (step 2: no sale while a closing limit shows PendingCancel or working) |
+| `ABORT_STOP_LEFT_WORKING` | abort does not read the account flat; it left the protective stop(s) working and asked TWS to cancel the other orders (requested and confirmed counts apart) | the TWS procedure; if TWS shows TLT 0, cancel that stop in TWS yourself at once; if it shows 1, leave it |
 | `STAGE1_QUOTE_NOT_USABLE` | no sample labelled LIVE or DELAYED with a bid and an ask (labels and last reason) | nothing to do in TWS (no order was sent); run stage 1 again |
 
 ## Emergency stop
@@ -504,12 +528,15 @@ nothing working, "nothing to do; confirm in TWS ...". No message contains an unc
   amendments and cancels working entries, not the stop or a placed close.
 - **The certain stop:** in the paper Trader Workstation window, cancel every working TLT order of
   the experiment that you can see working there (Orders / Activity panel, right-click, Cancel),
-  then look at the TLT position in TWS: only if it shows 1, sell 1 with a limit at the bid; if it
+  wait until TWS shows every one of them Cancelled (while one shows PendingCancel or working, do
+  not sell), then look at the TLT position in TWS: only if it shows 1, sell 1 with a limit at the bid; if it
   shows 0, do not sell. Confirm in the Portfolio that TLT is 0.
 - **The software path:** `python scripts/ibkr_paper_experiment.py abort` re-reads the position
   and the experiment's own fills first. When they agree on flat it cancels every working order of
   this client by its own order id (never a global cancel). Otherwise it cancels no protective stop
-  (nor the parent of one), only the other orders, and reports `ABORT_STOP_LEFT_WORKING`. It works
+  (nor the parent of one), only the other orders, and reports `ABORT_STOP_LEFT_WORKING` (or
+  `ABORT_NOT_FLAT_NO_STOP` when no stop is working), counting the cancels it asked for apart from
+  those a later read confirmed. It works
   even when the journal is unknown. It does not close a position: only if the TWS window shows 1
   TLT, sell it there (a limit at the bid), then run `abort` at once; if it then reports the stop
   left working while TWS shows 0, cancel that stop in TWS yourself.
@@ -517,7 +544,9 @@ nothing working, "nothing to do; confirm in TWS ...". No message contains an unc
   unprotected; nothing can be placed after 16:00 ET. The experiment must end flat the same day.
   **If the share is not closed by 15:30 ET** (the script reports the close within about two
   minutes, normally `STAGE3_CLOSE_NOT_FILLED` with the stop working): in TWS cancel any resting
-  closing limit you can see working, then look at the TLT position there: only if it shows 1,
+  closing limit you can see working, and do not sell by hand until the TWS window shows that
+  closing limit as Cancelled (while it shows PendingCancel or working, do not sell and do nothing
+  more); then look at the TLT position there: only if it shows 1,
   sell 1 with a limit at the bid (lower it a tick at a time until it fills); if it shows 0, do
   not sell. Confirm 0 before 16:00 ET, run `abort`, and record what you did beside the evidence.
 
@@ -539,6 +568,9 @@ unchanged (`tests/test_exit_order_life.py`):
   is working, recorded, unresolved or cancel-unconfirmed. An unconfirmed cancel opens
   `EXIT_CANCEL_UNCONFIRMED`. In this mode an exit of unknown outcome is never resent
   (`EXIT_OUTCOME_UNKNOWN`).
+- `exit_price_policy="TOUCH"` without `exit_validity_seconds` is refused when the
+  `ExecutionConfig` is built: the never-resend rule and the stop placed again belong to the
+  bounded mode.
 - In touch mode the exit is priced again after the netting (`EXIT_REQUOTE_SECONDS`), from a
   quote whose age is measured after the read; no usable quote: not sent (`EXIT_WITHOUT_QUOTE`,
   `AFTER_NETTING`).

@@ -81,7 +81,7 @@ def test_the_default_exit_price_keeps_the_collar(tmp_path):
 
 
 def test_a_touch_close_sells_at_the_fresh_bid(tmp_path):
-    h = one_share(tmp_path, exit_price_policy="TOUCH")
+    h = one_share(tmp_path, **BOUNDED)
     opened(h)
     h.broker.set_quote(SYMBOL, "49.97", "49.99")
     out = close(h, rest=False)
@@ -98,7 +98,7 @@ def test_a_touch_close_sells_at_the_fresh_bid(tmp_path):
     (OrderSide.BUY, "49.97", "49.99", "49.99"),
 ])
 def test_the_touch_is_snapped_never_through_the_observed_touch(tmp_path, side, bid, ask, want):
-    h = one_share(tmp_path, exit_price_policy="TOUCH")
+    h = one_share(tmp_path, **BOUNDED)
     h.broker.set_quote(SYMBOL, bid, ask)
     contract = h.broker.resolve(open_action().instrument)
     limit, problem = h.coord._exit_limit(contract, side, h.clock.now())
@@ -107,7 +107,7 @@ def test_the_touch_is_snapped_never_through_the_observed_touch(tmp_path, side, b
 
 
 def test_a_touch_exit_still_needs_a_usable_quote(tmp_path):
-    h = one_share(tmp_path, exit_price_policy="TOUCH")
+    h = one_share(tmp_path, **BOUNDED)
     opened(h)
     h.clock.advance(31)  # the quote is older than max_quote_age_seconds
     out = close(h, rest=False)
@@ -120,7 +120,7 @@ def test_a_touch_exit_still_needs_a_usable_quote(tmp_path):
 
 
 def test_without_a_validity_an_unfilled_exit_keeps_working(tmp_path):
-    h = one_share(tmp_path, exit_price_policy="TOUCH")
+    h = one_share(tmp_path)  # the default mode
     opened(h)
     out = close(h)
     assert out.state == IntentState.WORKING
@@ -323,7 +323,7 @@ def test_in_bounded_mode_an_exit_of_unknown_outcome_is_never_resent(tmp_path):
 
 
 def test_by_default_an_exit_of_unknown_outcome_is_still_resent_after_no_trace(tmp_path):
-    h = one_share(tmp_path, exit_price_policy="TOUCH")
+    h = one_share(tmp_path)  # the default mode
     opened(h)
     h.broker.script_next_submit("LOST_ACK_NOT_PLACED")
     first = h.execute("c1", action("close1", Action.CLOSE, idea="p1:open"))
@@ -458,7 +458,7 @@ def test_nothing_is_placed_again_while_an_exits_outcome_is_unknown(tmp_path):
 
 def test_by_default_a_failed_close_still_leaves_the_share_unprotected(tmp_path):
     from tradingbot.execution.broker import BrokerError
-    h = one_share(tmp_path, exit_price_policy="TOUCH")
+    h = one_share(tmp_path)  # the default mode
     opened(h)
     real = h.broker.submit
 
@@ -472,3 +472,133 @@ def test_by_default_a_failed_close_still_leaves_the_share_unprotected(tmp_path):
     h.coord.sync()
     assert not stops(h) and UNPROTECTED_POSITION in open_kinds(h)  # unchanged without the mode
     h.coord.close()
+
+
+# ---------------------------------------------------------------- 6. review B1: reads lagging a fill
+
+
+class Lag:
+    """The broker's order STATUS says filled while its executions and its position read lag
+    (the reviewer's probe). Invented."""
+
+    def __init__(self, h: Harness):
+        self.hide: set[str] = set()
+        self.position: int | None = None
+        b = h.broker
+        real_exec, real_pos = b.executions, b.positions
+        self.real_pos = real_pos
+
+        def executions(since=None):
+            return [f for f in real_exec(since) if f.order_ref not in self.hide]
+
+        def positions():
+            ps = real_pos()
+            if ps:
+                self.last = ps
+            if self.position is None:
+                return ps
+            return [p.model_copy(update={"quantity": self.position})
+                    for p in (ps or self.last)]
+
+        b.executions, b.positions = executions, positions
+
+    def catch_up(self):
+        self.hide.clear()
+        self.position = None
+
+
+def sells_beyond_the_position(h: Harness) -> int:
+    held = sum(p.quantity for p in h.broker.positions() if p.contract.symbol == SYMBOL)
+    working = sum(o.remaining for o in h.broker.open_orders() if o.side == OrderSide.SELL)
+    return working - held
+
+
+def test_no_stop_is_placed_again_after_a_fill_the_reads_have_not_caught_up_with(tmp_path):
+    """B1, one share: the close fills, the status says Filled, executions and position lag."""
+    h = one_share(tmp_path, **BOUNDED)
+    opened(h)
+    lag = Lag(h)
+    out = close(h)
+    lag.hide.add(out.order_ref)
+    lag.position = 1
+    h.broker.fill(out.order_ref)
+    for dt in (1, 11):
+        h.clock.advance(dt)
+        h.coord.sync()
+        assert not stops(h), "a stop was placed on a flat account"
+    assert h.coord.intent(out.order_ref).state == IntentState.FILLED
+    assert "PROTECTIVE_STOP_REPLACE_SUBMIT" not in h.events(out.order_ref)
+    assert open_kinds(h)  # visible while the reads lag
+    lag.catch_up()
+    h.clock.advance(5)
+    h.coord.sync()
+    [pos] = h.coord.ledger()
+    assert pos.quantity == 0 and h.broker.open_orders() == [] and not stops(h)
+    assert h.broker.submit_calls == 2 and h.coord.reconcile().clean
+    h.coord.close()
+
+
+def test_a_part_filled_exit_restores_only_what_is_held_once_the_fills_are_applied(tmp_path):
+    """B1, two shares: 1 of 2 fills, the rest is cancelled at expiry; executions and the
+    position read lag. Nothing is placed while they lag; then a stop for 1, never for 2."""
+    from tradingbot.execution.coordinator import EXIT_FILLS_NOT_APPLIED
+    h = Harness(tmp_path, policy=MockPolicy(quantity=2, quantity_per_add=1,
+                                            max_notional_usd=Decimal(1000)), **BOUNDED)
+    h.execute("p1", open_action(entry="50.02", stop="48", target=None))
+    [pos] = h.coord.ledger()
+    assert pos.quantity == 2
+    lag = Lag(h)
+    out = close(h)
+    lag.hide.add(out.order_ref)
+    lag.position = 2
+    h.broker.fill(out.order_ref, quantity=1)
+    h.clock.advance(11)
+    h.coord.sync()  # expiry: cancelled, 1 of 2 filled at the broker, nothing applied yet
+    h.clock.advance(5)
+    h.coord.sync()
+    assert h.coord.intent(out.order_ref).state == IntentState.CANCELLED
+    assert not stops(h)
+    assert EXIT_FILLS_NOT_APPLIED in open_kinds(h)
+    lag.catch_up()
+    h.clock.advance(5)
+    h.coord.sync()
+    [stop] = stops(h)
+    assert stop.remaining == 1 and h.coord.ledger()[0].quantity == 1
+    assert sells_beyond_the_position(h) <= 0
+    assert EXIT_FILLS_NOT_APPLIED not in open_kinds(h)
+    assert h.coord._protection(pos.idea_id) == "CONFIRMED"
+    h.coord.close()
+
+
+def test_a_restored_stop_is_never_larger_than_the_broker_position_less_working_sells(tmp_path):
+    """B1 (c), (d): the size is the smallest of the ledger, the broker room, and what the idea
+    held before the exit less what the exit's own status says filled; none when zero."""
+    h = Harness(tmp_path, policy=MockPolicy(quantity=2, quantity_per_add=1,
+                                            max_notional_usd=Decimal(1000)), **BOUNDED)
+    h.execute("p1", open_action(entry="50.02", stop="48", target=None))
+    lag = Lag(h)
+    out = close(h)
+    lag.position = 1  # the broker holds only 1 (invented); the ledger still says 2
+    h.clock.advance(11)
+    h.coord.sync()
+    [stop] = stops(h)
+    assert stop.remaining == 1  # never 2
+    h.coord.close()
+    h2 = Harness(tmp_path / "zero", policy=MockPolicy(quantity=2, quantity_per_add=1,
+                                                      max_notional_usd=Decimal(1000)), **BOUNDED)
+    h2.execute("p1", open_action(entry="50.02", stop="48", target=None))
+    lag2 = Lag(h2)
+    out2 = close(h2)
+    lag2.position = 0
+    h2.clock.advance(11)
+    h2.coord.sync()
+    assert not stops(h2) and "PROTECTIVE_STOP_REPLACE_SUBMIT" not in h2.events(out2.order_ref)
+    assert out.order_ref
+    h2.coord.close()
+
+
+def test_touch_without_a_bounded_life_is_refused_at_construction():
+    with pytest.raises(ValueError, match="exit_validity_seconds"):
+        ExecutionConfig(exit_price_policy="TOUCH")
+    ExecutionConfig(exit_price_policy="TOUCH", exit_validity_seconds=10)
+    ExecutionConfig(exit_validity_seconds=10)  # a bounded collar exit stays allowed

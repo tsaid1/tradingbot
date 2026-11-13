@@ -159,7 +159,11 @@ SourcePost -> PaperEventReplay.process  (gate_source, gate_action, atomic groups
     confirms the cancel and ends it `EXIT_UNFILLED_CANCELLED`; any exit that ends without
     flattening the idea after its stop was cancelled for it gets that stop placed again (once, a
     new order `<entry>.STP<n>`), and in touch mode the limit is priced again after the netting
-    (no usable quote: not sent, `EXIT_WITHOUT_QUOTE` / `AFTER_NETTING`); an unconfirmed cancel opens
+    (no usable quote: not sent, `EXIT_WITHOUT_QUOTE` / `AFTER_NETTING`). No stop is placed again
+    after an exit reported FILLED, nor while the broker reports exit fills the ledger has not
+    applied (`EXIT_FILLS_NOT_APPLIED`), and its size never exceeds the ledger, the broker position
+    less working sells, or what was held before the exit less its reported fill. TOUCH requires
+    `exit_validity_seconds` (refused at construction otherwise). An unconfirmed cancel opens
     `EXIT_CANCEL_UNCONFIRMED` and places nothing, and an exit of unknown outcome is never resent
     (`EXIT_OUTCOME_UNKNOWN`).
   * MODIFY amends the working stop or target to an absolute price, then confirms the new price at

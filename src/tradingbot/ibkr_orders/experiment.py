@@ -193,9 +193,15 @@ NO_SELL_ON_NUMBERS = "do not sell on this script's numbers"
 TWS_SELL = ("Look at the TLT position in the TWS window. Only if it shows 1: sell 1 there with a "
             "limit at the bid (lower it a tick at a time until it fills) and wait until it shows "
             "0. If it shows 0: do NOT sell.")
+# A closing limit whose cancel TWS has not completed can still fill beside a sale by hand (a
+# one-share short): the sale waits until TWS itself shows that limit Cancelled.
+WAIT_FOR_CANCELLED = ("If you cancelled one, do not sell by hand until the TWS window shows that "
+                      "closing limit as Cancelled; while it shows PendingCancel or working, do not "
+                      "sell and do nothing more.")
 TWS_PROCEDURE = ("In the TWS window: (1) open the Trades panel: if it already shows a TLT sale of "
                  "this experiment today, skip step (3); (2) cancel a resting TLT closing limit "
-                 "only if you can see it working there, never the stop; (3) " + TWS_SELL + " (4) "
+                 "only if you can see it working there, never the stop. " + WAIT_FOR_CANCELLED +
+                 " (3) " + TWS_SELL + " (4) "
                  "After a manual sale, run abort at once: the protective stop is still working "
                  "until then and must not trigger on a share you no longer hold. Abort cancels "
                  "the stop only when this script itself reads the account flat; if it reports the "
@@ -211,7 +217,7 @@ ABNORMAL_ENDINGS = frozenset({
     "STAGE3_CLOSE_REFUSED", "STAGE3_CLOSE_NOT_FILLED", "STAGE3_NOT_CLEAN",
     "STAGE3_NO_USABLE_QUOTE", "STAGE3_ENTRY_REFUSED", "STAGE3_CLOSE_NO_QUOTE",
     "STAGE3_CLOSE_OUTCOME_UNKNOWN", "STAGE3_PROTECTION_NOT_RESTORED",
-    "ABORT_STOP_LEFT_WORKING"})
+    "ABORT_STOP_LEFT_WORKING", "ABORT_NOT_FLAT_NO_STOP"})
 
 
 def _instruction(state: dict) -> str:
@@ -875,13 +881,16 @@ def _abort(cfg: PaperOrderConfig, ev: dict) -> None:
         targets = mine if flat else [o for o in mine if not protective(o)
                                      and o.order_id not in guarded]
         ev["left_working"] = [_row(o) for o in mine if o not in targets]
-        ev["cancelled"], ev["cancel_errors"] = [], []
+        # "requested": a cancel frame was sent (the answer may still say PendingCancel);
+        # "confirmed": a LATER read shows the order gone from open orders and Cancelled in the
+        # completed orders. Only a confirmed cancel is ever reported as cancelled.
+        ev["cancels_requested"], ev["cancel_errors"] = [], []
         for o in sorted(targets, key=lambda o: (o.parent_id == 0, o.order_id)):
             t = s._tracks.get(o.order_id)
             if t is not None and t.status in FINAL_STATUSES:
                 continue  # cancelled with its parent
             try:
-                ev["cancelled"].append(_row(s.cancel(o.order_id)))
+                ev["cancels_requested"].append(_row(s.cancel(o.order_id)))
             except Exception as exc:  # noqa: BLE001 - reported, the next one is still tried
                 ev["cancel_errors"].append({"order_id": o.order_id,
                                             "error": redact_accounts(str(exc))})
@@ -891,18 +900,42 @@ def _abort(cfg: PaperOrderConfig, ev: dict) -> None:
         remaining = [r for r in after["open_orders"].get("rows", []) if r["own"]]
         ev["remaining_own_working"] = remaining
         ev["position"] = after["positions"].get("rows")
+        still = {r["order_id"] for r in remaining}
+        done = {r["order_id"]: r["status"] for r in after["completed_orders"].get("rows", [])
+                if r["own"]}
+        reads_ok = after["open_orders"].get("completed") and after["completed_orders"].get(
+            "completed")
+        ev["cancels_confirmed"] = [
+            r for r in ev["cancels_requested"]
+            if reads_ok and r["order_id"] not in still
+            and done.get(r["order_id"]) in ("Cancelled", "ApiCancelled")]
+        confirmed = {r["order_id"] for r in ev["cancels_confirmed"]}
+        ev["cancels_unconfirmed"] = [
+            {**r, "status_now": next((x["status"] for x in remaining
+                                      if x["order_id"] == r["order_id"]),
+                                     done.get(r["order_id"], "unknown"))}
+            for r in ev["cancels_requested"] if r["order_id"] not in confirmed]
         if flat:
-            ev["passed"] = after["open_orders"]["completed"] and not remaining
+            ev["passed"] = bool(after["open_orders"]["completed"]) and not remaining
             return
         ev["passed"] = False
-        ev["result"] = "ABORT_STOP_LEFT_WORKING"
         kept = [r["order_id"] for r in ev["left_working"]]
+        result = "ABORT_STOP_LEFT_WORKING" if kept else "ABORT_NOT_FLAT_NO_STOP"
+        ev["result"] = result
+        n_req, n_ok = len(ev["cancels_requested"]), len(ev["cancels_confirmed"])
+        cancels = f"asked TWS to cancel {n_req} other order(s); {n_ok} confirmed cancelled by a " \
+                  "later read"
+        if ev["cancels_unconfirmed"]:
+            cancels += "; NOT confirmed: " + ", ".join(
+                f"order {r['order_id']} ({r['status_now']})" for r in ev["cancels_unconfirmed"])
+            cancels += " - treat it as still working"
         what = (f"this script does not read the account flat, so abort left this client's "
-                f"protective stop(s) {kept} working and cancelled only {len(ev['cancelled'])} "
-                "other order(s)" if kept else
+                f"protective stop(s) {kept} working; it {cancels}" if kept else
                 "this script does not read the account flat; no protective stop of this client "
-                f"is working, and abort cancelled {len(ev['cancelled'])} other order(s)")
-        ev["why_failed"] = _ending_message("ABORT_STOP_LEFT_WORKING", what, state) + (
+                f"is working; abort {cancels}")
+        # the instruction follows what is read now, after the cancel requests
+        ev["state_after"] = now = _position_state(s)
+        ev["why_failed"] = _ending_message(result, what, now) + (
             " " + ABORT_STOP_NOTE if kept else "")
     finally:
         s.disconnect()
