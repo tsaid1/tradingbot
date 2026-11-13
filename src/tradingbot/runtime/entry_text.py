@@ -128,6 +128,37 @@ def read_price_problem(prices, *texts: str | None) -> str | None:
     return None
 
 
+# A sentence end for the cost-basis window: ". ! ? ;" or a line break, a full stop not before a
+# digit and not ending the abbreviation "avg.".
+_COST_SENTENCE_END_RE = re.compile(r"[!?;\n]|(?<![Aa][Vv][Gg])\.(?!\d)")
+_WORD_RE = re.compile(r"[A-Za-z]+")
+
+
+def entry_is_cost_basis(entry, words, *texts: str | None) -> bool:
+    """The owner's rule of 13 November 2026: is the action's stated entry price, as written in the
+    post, introduced by an average or cost-basis word (``words``)? Introduced by = such a word in
+    the same sentence before the number ("avg 71.60", "cost basis, 71.60", "at an average of
+    71.60"), or the word directly after it, with nothing but spaces between ("71.60 avg", "71.60
+    cost basis"). Every place the value is written counts: if any one is so introduced, which
+    number is the fresh entry cannot be told and the answer is True."""
+    try:
+        value = Decimal(str(entry).replace(",", "").lstrip("$"))
+    except (InvalidOperation, TypeError, ValueError):
+        return False
+    for text in texts:
+        for m in _READ_NUMBER_RE.finditer(text or ""):
+            if Decimal(m.group(1).replace(",", "") + (m.group(2) or "")) != value:
+                continue
+            before = text[:m.start()]
+            ends = list(_COST_SENTENCE_END_RE.finditer(before))
+            sentence = before[ends[-1].end():] if ends else before
+            after = re.match(r"[ \t]+([A-Za-z]+)", text[m.end():])
+            if {w.lower() for w in _WORD_RE.findall(sentence)} & words or (
+                    after and after.group(1).lower() in words):
+                return True
+    return False
+
+
 def _letter_or_mark(ch: str) -> bool:
     return ch.isalpha() or unicodedata.category(ch).startswith("M")
 

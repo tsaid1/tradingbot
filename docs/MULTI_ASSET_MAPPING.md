@@ -665,9 +665,44 @@ is checked once more (`tradingbot.runtime.entry_text`); the check can only turn 
 
 Pure ASCII text is decided exactly as before, except the odd number forms above.
 
-*Existing policy, for the owner to decide:* the single-market checks (a second market named in
-the post) run only for anchored entries. On the explicit path a post such as "...at 88.42. Stop
-87.20. Zorbex 12.40." executes, in ASCII and in any other script alike.
+### Explicit entries (owner, 13 November 2026)
+
+"An average price or cost basis is NOT automatically a fresh entry price. If the source announces
+a position and an average without an independently resolved fresh actionable entry, HOLD.
+Explicit-entry TLT instructions must receive the same relevant multi-market ambiguity checks as
+anchored entries. Do not silently choose one instrument from a post containing multiple unresolved
+actions."
+
+* *Cost basis, every family* (`ENTRY_PRICE_IS_COST_BASIS`). A SUPPORTED OPEN or ADD with a stated
+  entry price holds when that price, found in the post as written (the read-price locator of the
+  number rule above, every place the value is written), is introduced by an average or
+  cost-basis word (`instruction_terms.COST_BASIS_ENTRY_WORDS`: avg, avg., average, averaged,
+  averaging, cost, costs, basis, blended; so "average cost", "avg cost" and "cost basis" too).
+  Introduced by: such a word anywhere in the same sentence before the number (a sentence ends at
+  ". ! ? ;" or a line break; a full stop before a digit or ending "avg." does not end it), or the
+  word directly after the number with only spaces between. Hold: "long $TLT, avg 88.42 now",
+  "cost basis 88.42 now", "avg cost, 88.40 now", "at an average of 88.42", "blended 88.42",
+  "at 88.42 avg", "at 88.42 cost basis". Still sends: "at 88.42", "Our avg is 87.90. We are now
+  long more at 88.42." (the fresh entry is a different number in another sentence), "at 88.42 on
+  average volume" (not directly after). If the entry value is written twice and one place is an
+  average ("Avg 88.42 and we buy more at 88.42"), which number is the fresh entry cannot be told:
+  hold. The interpreter's reading does not matter: the check runs on the action's own entry
+  price at the mapping layer. "filled", "entered" and "paid" are not on the list (they report an
+  entry, not an average). Collateral: an unrelated "average" earlier in the entry's own sentence
+  ("above average, we are now long at 88.42") holds.
+* *Multi-market checks for explicit entries.* For a family with `anchor_scope =
+  "SINGLE_MARKET_POST"` (TLT), a CURRENT explicit-entry OPEN or ADD now receives the post-level
+  competing-instrument checks of an anchored entry, with the same codes (the `ENTRY_ANCHOR_POST_*`
+  codes now also apply to explicit entries of such a family): another trading action in the post
+  (`ENTRY_ANCHOR_POST_SEVERAL_ACTIONS`), an action for another family, an unresolved instrument, a
+  foreign cashtag or another family named (`ENTRY_ANCHOR_POST_SEVERAL_MARKETS`), a market mention
+  in a trading context or the additive ellipsis (`ENTRY_ANCHOR_POST_UNRESOLVED_MARKET`), an
+  instruction sentence outside the action's clause (`ENTRY_ANCHOR_POST_UNATTRIBUTED_ACTION`).
+  Not the level rules (exactly one marked sentence, the reference-series naming rule, the
+  level-kind sentence rules): they decide whether a number is a market quotation, which an
+  explicit entry does not need. So "...at 88.42. Stop 87.20. Zorbex 12.40." now holds; "...at
+  88.42. Stop 87.20. Bonds look firm this week." still sends. Exits, stop amendments and families
+  without that scope are unchanged.
 
 ## Level contract rule
 

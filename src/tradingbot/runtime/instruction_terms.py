@@ -601,6 +601,13 @@ COST_BASIS_WORDS = frozenset((
     "fill", "filled", "fills", "entered",
 ))
 CONTEXT_LEVEL_WORDS = LEVEL_WORDS | COST_BASIS_WORDS
+# Owner, 13 November 2026: an average price or cost basis is not a fresh entry price. The words
+# that make a stated entry price an average or cost basis (a narrower list than
+# COST_BASIS_WORDS: "filled", "entered" or "paid" report an entry, they do not average one).
+# Multi-word forms ("average cost", "avg cost", "cost basis") are covered by their words.
+COST_BASIS_ENTRY_WORDS = frozenset((
+    "avg", "average", "averaged", "averaging", "cost", "costs", "basis", "blended",
+))
 
 
 def level_kind_of_words(words) -> AnchorLevelKind | None:

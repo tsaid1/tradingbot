@@ -65,6 +65,7 @@ from tradingbot.models import (
 )
 from tradingbot.runtime.entry_text import (
     ascii_shadow,
+    entry_is_cost_basis,
     entry_text_placeholder,
     entry_text_problem,
     has_non_ascii_word,
@@ -76,6 +77,7 @@ from tradingbot.runtime.instruction_terms import (
     ADD_WORDS,
     ADDITIVE_PHRASES,
     ADDITIVE_WORDS,
+    COST_BASIS_ENTRY_WORDS,
     INSTRUMENT_NOUNS,
     MARKET_NOUNS,
     MENTION_ACTION_PHRASES,
@@ -168,6 +170,10 @@ ENTRY_ANCHOR_LEVEL_NOT_MARKET_QUOTE = "ENTRY_ANCHOR_LEVEL_NOT_MARKET_QUOTE"
 # TWO_STOP_VALUES, STOP_DIFFERS_FROM_ACTION, STOP_SHARED_WITH_ANOTHER_ACTION). D5: a short entry
 # in a long-only family.
 ENTRY_ANCHOR_POST_UNATTRIBUTED_ACTION = "ENTRY_ANCHOR_POST_UNATTRIBUTED_ACTION"
+# Owner, 13 November 2026: "An average price or cost basis is NOT automatically a fresh entry
+# price." An OPEN or ADD whose stated entry price is, as written, introduced by an average or
+# cost-basis word (``instruction_terms.COST_BASIS_ENTRY_WORDS``; every family).
+ENTRY_PRICE_IS_COST_BASIS = "ENTRY_PRICE_IS_COST_BASIS"
 PROTECTIVE_STOP_NOT_UNIQUE = "PROTECTIVE_STOP_NOT_UNIQUE"
 MAPPING_LONG_ONLY = "MAPPING_LONG_ONLY"
 # Runtime modes in which a family may carry entry_rule = REFERENCE_AS_COLLAR: an allow-list, so a
@@ -1156,6 +1162,19 @@ class FamilyMapping(StrictModel):
             kind_out[:] = [level_kind_of_words(words) or kind] if kind else []
             return None, None, problems
 
+        if (self.entry_rule == "REFERENCE_AS_COLLAR"
+                and action.action in (Action.OPEN, Action.ADD)
+                and action.timing == Timing.CURRENT and action.entry_reference is not None
+                and self.entry_anchor.anchor_scope == "SINGLE_MARKET_POST"):
+            # Owner, 13 November 2026: an explicit entry in a SINGLE_MARKET_POST family gets the
+            # post-level competing-instrument checks of an anchored entry (same codes), not the
+            # level rules (whether a number is a market quotation).
+            lexicon = lexicon or AnchorLexicon()
+            problems = self._single_market_problems(
+                action, asset, _level(action.entry_reference), terms.clause, post_text,
+                (*PRESENT_MARKERS, *lexicon.present_markers), post or {}, lexicon,
+                own_clause=terms.clause, evidence=evidence, level_rules=False)
+            return held(problems, None) if problems else (None, None, [])
         if not (self.entry_rule == "REFERENCE_AS_COLLAR"
                 and action.action in (Action.OPEN, Action.ADD)
                 and action.timing == Timing.CURRENT and action.entry_reference is None):
@@ -1434,7 +1453,8 @@ class FamilyMapping(StrictModel):
     def _single_market_problems(self, action, asset, anchor, source, post_text, markers,
                                 post, lexicon: AnchorLexicon | None = None,
                                 own_clause: str | None = None,
-                                evidence: _EvidenceSink | None = None) -> list[str]:
+                                evidence: _EvidenceSink | None = None,
+                                level_rules: bool = True) -> list[str]:
         """anchor_scope = SINGLE_MARKET_POST: the post as a whole attributes the level. (c) this is
         the post's only action besides commentary, and no action is conditional, retrospective or
         uncertain; (b) every action is this family's, no instrument is unresolved, and the post
@@ -1479,6 +1499,8 @@ class FamilyMapping(StrictModel):
                                              evidence)
         if problem:
             return problem
+        if not level_rules:  # an explicit entry: (a) and (d) are about a quoted level
+            return []
         marked = [s for s, _ in sentences(text) if marked_numbers(s, markers)]
         if len(marked) != 1:
             return [ENTRY_ANCHOR_POST_SEVERAL_LEVELS, f"MARKED_SENTENCES:{len(marked)}"]
@@ -1940,6 +1962,14 @@ class MappingPolicy:
         d, instrument = self._resolve(action, **kw)
         if d.status != "SUPPORTED" or action.action not in (Action.OPEN, Action.ADD):
             return d, instrument
+        if action.entry_reference is not None and entry_is_cost_basis(
+                action.entry_reference, COST_BASIS_ENTRY_WORDS,
+                kw.get("post_text") or kw.get("clause")):
+            # Owner, 13 November 2026: every family; an independent fresh entry (a different
+            # number) is the action's entry as today and is not looked at here.
+            return MappingDecision(status="UNRESOLVED", reason=ENTRY_PRICE_IS_COST_BASIS,
+                                   **d.model_dump(include={"action_id", "source_asset", "family",
+                                                           "broker_symbol", "basis"})), None
         entry = self.entries.get(d.family) if d.family else None
         if not isinstance(entry, FamilyMapping) or not (
             entry.entry_rule == "REFERENCE_AS_COLLAR" or getattr(entry, "max_stop_distance", None)

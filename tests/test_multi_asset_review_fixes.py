@@ -952,9 +952,18 @@ def test_f3c_the_whole_post_reaches_the_policy_from_the_service(tmp_path):
     "Call me cautious: long TLT at 90, stop 88.",
 ])
 def test_verb_and_idiom_uses_of_call_and_put_buy_the_stock_as_on_main(clause):
-    d, inst = MappingPolicy.from_toml(SHIPPED).resolve(tlt(Action.OPEN, idea=None), clause=clause,
-                                                       now=MAP_NOW)
-    assert d.status == "SUPPORTED" and d.family == "TLT" and inst.symbol == "TLT", clause
+    """Never routed to an option family. Since 13 November 2026 an explicit TLT entry also gets
+    the multi-market checks of an anchored one (the post's actions are passed, as the service
+    does): a sentence-initial capitalised word in a trading sentence ("Put a stop", "Call it")
+    is an unresolved mention there and holds."""
+    a = tlt(Action.OPEN, idea=None)
+    d, inst = MappingPolicy.from_toml(SHIPPED).resolve(a, clause=clause, now=MAP_NOW,
+                                                       post_actions=[a])
+    assert d.family == "TLT", clause
+    if d.status == "SUPPORTED":
+        assert inst.symbol == "TLT", clause
+    else:
+        assert d.reason.startswith("ENTRY_ANCHOR_POST_UNRESOLVED_MARKET"), (clause, d.reason)
 
 
 @pytest.mark.parametrize("clause", [
