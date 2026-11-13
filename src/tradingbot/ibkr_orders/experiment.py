@@ -51,7 +51,12 @@ from tradingbot.ibkr_orders.config import PaperOrderConfig, load_order_config
 from tradingbot.ibkr_orders.counter import JOURNAL_DIR, CounterError, SubmissionCounter
 from tradingbot.ibkr_orders.guard import parse_hours
 from tradingbot.ibkr_orders.mapping import FINAL_STATUSES
-from tradingbot.ibkr_orders.records import OrderModeSettingRefused, OrderSpec
+from tradingbot.ibkr_orders.records import (
+    OrderModeSettingRefused,
+    OrderOutcomeUnknown,
+    OrderSpec,
+    PartialBracket,
+)
 from tradingbot.ibkr_orders.session import PaperOrderSession
 from tradingbot.models import Action, AssetClass, GateDecision, Instrument, MockPolicy, PositionSide
 
@@ -213,7 +218,8 @@ ABORT_STOP_NOTE = ("Cancel that TLT stop in the TWS window yourself at once if t
                    "1, leave the stop working.")
 
 ABNORMAL_ENDINGS = frozenset({
-    "STAGE2_UNEXPECTED_FILL", "STAGE2_PARENT_NOT_CONFIRMED_CANCELLED", "STAGE2_FAILED",
+    "STAGE2_UNEXPECTED_FILL", "STAGE2_ACK_BY_RECONCILIATION",
+    "STAGE2_PARENT_NOT_CONFIRMED_CANCELLED", "STAGE2_FAILED",
     "STAGE3_ENTRY_NOT_FILLED", "STAGE3_PROTECTION_UNCONFIRMED", "STAGE3_PROTECTION_LOST",
     "STAGE3_CLOSE_REFUSED", "STAGE3_CLOSE_NOT_FILLED", "STAGE3_NOT_CLEAN",
     "STAGE3_NO_USABLE_QUOTE", "STAGE3_ENTRY_REFUSED", "STAGE3_CLOSE_NO_QUOTE",
@@ -334,6 +340,7 @@ def _row(s) -> dict:
     return {"order_id": s.order_id, "order_id_present": s.order_id > 0,
             "order_ref": s.order_ref, "order_ref_present": bool(s.order_ref),
             "experiment_prefix": s.experiment, "perm_id_present": s.perm_id > 0, "own": s.own,
+            "client_id": s.client_id, "parent_id": s.parent_id,
             "status": s.status.value, "raw_status": s.raw_status, "action": s.action,
             "order_type": s.order_type, "filled": str(s.filled), "remaining": str(s.remaining)}
 
@@ -354,6 +361,14 @@ def _lookup(name: str, fn, rowfn) -> dict:
                 "error": redact_accounts(f"{type(exc).__name__}: {exc}")}
     return {"lookup": name, "completed": True, "seconds": round(time.monotonic() - t0, 3),
             "rows": [rowfn(r) for r in rows]}
+
+
+def _diagnose(s: PaperOrderSession, ev: dict) -> None:
+    """Every ending (normal or not) keeps what the session observed (masked by ``_write``)."""
+    try:
+        ev["session_diagnostics"] = s.diagnostics()
+    except Exception as exc:  # noqa: BLE001 - evidence must never mask the real ending
+        ev["session_diagnostics"] = {"error": redact_accounts(f"{type(exc).__name__}: {exc}")}
 
 
 def _lookups(s: PaperOrderSession) -> dict:
@@ -436,6 +451,7 @@ def _stage1(cfg: PaperOrderConfig, ev: dict) -> None:
                 "needs a LIVE or DELAYED quote with a bid and an ask, stage 3 a LIVE one. no order "
                 "was sent; run stage 1 again.")
     finally:
+        _diagnose(s, ev)
         s.disconnect()
 
 
@@ -465,8 +481,24 @@ def _stage2(cfg: PaperOrderConfig, ev: dict) -> None:
         ev["quote"] = {"quality": q.quality.value, "bid": str(q.bid), "ask": str(q.ask)}
         ev["bracket"] = {"buy_limit": str(limit), "sell_stop": str(stop)}
         ref = f"TB-{cfg.experiment.name}-stage2"
-        snaps = s.place([OrderSpec(ref, "BUY", 1, "LMT", limit_price=limit),
-                         OrderSpec(f"{ref}.STP", "SELL", 1, "STP", stop_price=stop)])
+        late_ack = False
+        try:
+            snaps = s.place([OrderSpec(ref, "BUY", 1, "LMT", limit_price=limit),
+                             OrderSpec(f"{ref}.STP", "SELL", 1, "STP", stop_price=stop)])
+        except PartialBracket:
+            raise
+        except OrderOutcomeUnknown as exc:
+            rec = exc.reconciliation or {}
+            ev["reconciliation"] = {str(k): v for k, v in sorted(rec.items())}
+            ev["ack_error"] = redact_accounts(str(exc))
+            # Never re-sent. Only when the read-only lookup shows BOTH orders working does the
+            # stage go on (read back, then the same confirmed cancels, parent first); any other
+            # picture (held, not found, another client's row) ends here: run abort.
+            if len(rec) != 2 or set(rec.values()) != {"WORKING"}:
+                raise
+            late_ack = True
+            with s._cond:
+                snaps = [s._snap(s._tracks[i]) for i in sorted(rec)]
         parent, child = snaps[0].order_id, snaps[1].order_id
         ev["placed"] = [_row(x) for x in snaps]
         time.sleep(READ_BACK_WAIT_SECONDS)
@@ -518,7 +550,18 @@ def _stage2(cfg: PaperOrderConfig, ev: dict) -> None:
                                 for k in (parent, child))
                         and all(v["completed"] for v in ev["read_back"].values()))
         ev["result"] = "STAGE2_PASSED" if ev["passed"] else "STAGE2_FAILED"
-        if parent_filled:
+        ev["ack_by"] = "reconciliation" if late_ack else "callback"
+        if late_ack and not parent_filled and parent_clean:
+            # Proposal (d): the bracket was cancelled as usual, but its acknowledgement came only
+            # from the read-only lookup after the wait: the ack path is NOT proven. Not a pass.
+            ev["passed"] = False
+            ev["result"] = "STAGE2_ACK_BY_RECONCILIATION"
+            ev["state"] = state = _position_state(s)
+            ev["why_failed"] = _ending_message(
+                "STAGE2_ACK_BY_RECONCILIATION", "no acknowledgement callback within the wait; the "
+                "read-only lookup showed both orders working; they were cancelled (parent "
+                "first, confirmed); nothing was re-sent", state)
+        elif parent_filled:
             ct = s._tracks[child]
             ev["result"] = "STAGE2_UNEXPECTED_FILL"
             ev["passed"] = False
@@ -557,6 +600,7 @@ def _stage2(cfg: PaperOrderConfig, ev: dict) -> None:
                 "STAGE2_FAILED", "the read-back, the cancels or the completed orders did not "
                 "show what stage 2 needs", state)
     finally:
+        _diagnose(s, ev)
         s.disconnect()
 
 
@@ -853,6 +897,7 @@ def _stage3(cfg: PaperOrderConfig, ev: dict) -> None:
             fail("STAGE3_NOT_CLEAN", f"reconciliation clean={bool(report.clean)}, submissions "
                  f"used {s.submissions_used} (a clean close on attempt {filled_on} uses {want})")
     finally:
+        _diagnose(s, ev)
         if coord is not None:
             coord.close()
         s.disconnect()
@@ -939,6 +984,7 @@ def _abort(cfg: PaperOrderConfig, ev: dict) -> None:
         ev["why_failed"] = _ending_message(result, what, now) + (
             " " + ABORT_STOP_NOTE if kept else "")
     finally:
+        _diagnose(s, ev)
         s.disconnect()
 
 
