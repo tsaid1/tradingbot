@@ -152,7 +152,14 @@ SourcePost -> PaperEventReplay.process  (gate_source, gate_action, atomic groups
     are unchanged by the entry-side correction of 12 November 2026). With no usable quote nothing is
     sent and `EXIT_WITHOUT_QUOTE` opens; the broker-side stop stays the protection. They are
     refused if they exceed the ledger or the broker position. Before one is sent, it is netted
-    (next section).
+    (next section). Two options, off by default and used by the paper experiment's stage 3
+    (docs/IBKR_PAPER_ORDERS.md, "Stage 3: the close"): `exit_price_policy="TOUCH"` prices the
+    exit at the touch itself (a sell at the bid snapped up, a buy at the ask snapped down), and
+    `exit_validity_seconds` bounds its life: `sync` cancels an exit still working after that long,
+    confirms the cancel, ends it `EXIT_UNFILLED_CANCELLED` and places the stop the netting cancelled
+    again (once, a new order `<entry>.STP<n>`); an unconfirmed cancel opens
+    `EXIT_CANCEL_UNCONFIRMED` and places nothing, and an exit of unknown outcome is never resent
+    (`EXIT_OUTCOME_UNKNOWN`).
   * MODIFY amends the working stop or target to an absolute price, then confirms the new price at
     the broker.
 

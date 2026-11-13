@@ -5,7 +5,8 @@ one stage at a time, following docs/IBKR_PAPER_ORDERS.md ("Staged runbook").
     python scripts/ibkr_paper_experiment.py stage0-refusal            # Read-Only ON; 0 orders
     python scripts/ibkr_paper_experiment.py stage1-lookups            # Read-Only OFF; 0 orders
     python scripts/ibkr_paper_experiment.py stage2-unfillable-bracket # 2 submissions
-    python scripts/ibkr_paper_experiment.py stage3-lifecycle          # 4 submissions (6 total)
+    python scripts/ibkr_paper_experiment.py stage3-lifecycle          # 4 or 6 on a pass, at most 7
+                                                                      # (9 total)
     python scripts/ibkr_paper_experiment.py abort                     # cancels this client's
                                                                       # working orders by id
 

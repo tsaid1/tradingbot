@@ -13,7 +13,7 @@ Whether anything was sent is decided from the durable submission counter, not fr
 from __future__ import annotations
 
 from collections.abc import Sequence
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import ROUND_CEILING, Decimal
 from typing import Any
 
@@ -34,6 +34,7 @@ from tradingbot.execution.broker import (
     TimeInForce,
 )
 from tradingbot.execution.coordinator import snap_to_tick
+from tradingbot.execution.shadow_quotes import map_snapshot
 from tradingbot.ibkr.errors import IbkrError
 from tradingbot.ibkr_orders.records import (
     AmendRejected,
@@ -77,16 +78,38 @@ def _int_qty(value: Decimal, what: str) -> int:
 class IbkrPaperBroker:
     """``exit_collar_pct`` is the execution core's ``MockPolicy.max_price_deviation_pct``: the
     core prices a close as a marketable SELL limit at the bid less this collar, snapped up to the
-    tick, and the exit dry check prices its probe the same way. Without it (a binding used only
-    for reads) no protective stop can be cancelled or shrunk while a position is held."""
+    tick, and the exit dry check prices its probe the same way. ``exit_at_touch`` matches the
+    core's ``ExecutionConfig.exit_price_policy="TOUCH"`` instead: the probe is the fresh bid itself,
+    snapped up. With neither (a binding used only for reads) no protective stop can be cancelled or
+    shrunk while a position is held.
 
-    def __init__(self, session: Any, *, exit_collar_pct: Decimal | None = None) -> None:
+    ``strict_quotes`` (stage 3): the quote handed to the core is mapped from the adapter's stream
+    evidence by ``execution.shadow_quotes.map_snapshot``, the shadow mode's own mapping, so it is
+    never fresher or more live than the adapter measured it: per-side times measured on the
+    adapter's monotonic clock, ``received_at`` the OLDER side, and a side without a live tick time
+    makes the whole quote UNAVAILABLE. The wall time those ages are subtracted from is taken BEFORE
+    the read, or the reference set by ``set_reference_time`` when that is earlier (the caller sets
+    it no later than the core's own ``now``, so the age the core measures is at least the
+    adapter's). Off (default): the quote is mapped exactly as before."""
+
+    def __init__(self, session: Any, *, exit_collar_pct: Decimal | None = None,
+                 exit_at_touch: bool = False, strict_quotes: bool = False) -> None:
         self._s = session
         self._exit_collar_pct = exit_collar_pct
+        self._exit_at_touch = exit_at_touch
+        self._strict_quotes = strict_quotes
+        self._reference: datetime | None = None
         self.last_quote_report: dict | None = None  # evidence: the adapter's label and reason
+        self.quote_reports: list[dict] = []  # evidence: every strict read, in order
         self._asset_class: dict[int, AssetClass] = {}
         self._stops_cancelled: set[str] = set()  # protective stops this binding cancelled
         self.protection_lost = ""  # set when an exit failed after its stop was cancelled
+
+    def set_reference_time(self, at: datetime | None) -> None:
+        """Strict quotes: every read until the next call is stamped as if read at
+        ``min(at, now)`` (``execution.shadow_broker`` does the same). None: the time before the
+        read."""
+        self._reference = at
 
     # ------------------------------------------------------------------ helpers
     def _contract_for(self, con_id: int, symbol: str, sec_type: str, currency: str,
@@ -168,8 +191,9 @@ class IbkrPaperBroker:
         core's ``_exit_limit`` prices it (bid less the collar, snapped UP to the min tick), but
         from a fresh quote taken now, so it can differ from the limit the core computed a moment
         earlier and from the one finally sent. None when it cannot be priced (no collar, no
-        quote, no positive bid, a malformed quote)."""
-        if self._exit_collar_pct is None:
+        quote, no positive bid, a malformed quote). At the touch: the fresh bid itself, snapped
+        up, as the core's ``exit_price_policy="TOUCH"`` prices it."""
+        if self._exit_collar_pct is None and not self._exit_at_touch:
             return None
         pinned = self._s.contract
         try:
@@ -179,8 +203,11 @@ class IbkrPaperBroker:
             return None
         if q.quality == QuoteQuality.UNAVAILABLE or q.bid is None or q.bid <= 0:
             return None
+        tick = Decimal(str(pinned.min_tick))
+        if self._exit_at_touch:
+            return snap_to_tick(q.bid, tick, ROUND_CEILING)
         band = self._exit_collar_pct / Decimal(100)
-        return snap_to_tick(q.bid * (1 - band), Decimal(str(pinned.min_tick)), ROUND_CEILING)
+        return snap_to_tick(q.bid * (1 - band), tick, ROUND_CEILING)
 
     def _exit_failed(self, order: OrderIntent, children: Sequence[OrderIntent],
                      exc: Exception) -> BrokerError:
@@ -232,6 +259,8 @@ class IbkrPaperBroker:
         pinned = self._s.contract
         if contract.con_id not in (None, pinned.con_id) or contract.symbol != pinned.symbol:
             raise BrokerError("quotes are available for the experiment's contract only")
+        now = datetime.now(UTC)  # taken BEFORE the read: any lag only ages the sides
+        at = now if self._reference is None else min(now, self._reference)
         try:
             report = self._s.quote(pinned)
         except IbkrError as exc:
@@ -248,6 +277,12 @@ class IbkrPaperBroker:
                 "reason": str(getattr(report, "reason", "")),
                 "flags": [str(f) for f in getattr(best, "flags", ())],
                 "market_data_type": getattr(best, "market_data_type", None)}
+            if self._strict_quotes:
+                q, evidence = map_snapshot(best, contract, at=at)
+                self.last_quote_report.update(evidence.as_dict())
+                self.quote_reports.append({**self.last_quote_report, "bid": str(q.bid),
+                                           "ask": str(q.ask)})
+                return q
             return BrokerQuote(contract=contract, bid=dec(best.bid), ask=dec(best.ask),
                                last=dec(best.last), received_at=datetime.fromisoformat(
                                    best.received_at), quality=QuoteQuality(best.quality.value))

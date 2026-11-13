@@ -63,7 +63,7 @@ def test_paper_test_1_caps_are_the_specified_constants():
     c = C.EXPERIMENTS["paper-test-1"]
     assert c is C.PAPER_TEST_1
     assert (c.symbol, c.sec_type, c.currency) == ("TLT", "STK", "USD")
-    assert (c.max_order_quantity, c.max_net_position, c.max_submissions) == (1, 1, 6)
+    assert (c.max_order_quantity, c.max_net_position, c.max_submissions) == (1, 1, 9)
     assert c.max_order_notional == Decimal(150)
     assert c.order_types == {"LMT", "STP"} and c.tifs == {"DAY"}
     assert c.long_only and not c.outside_rth_allowed
@@ -250,10 +250,11 @@ def test_151_usd_notional_refused_150_allowed():
 
 
 def test_seventh_submission_refused():
-    assert refused(order(), ctx(submissions_used=6)) == RefusalReason.EXPERIMENT_FINISHED
-    assert order_guard(order(), ctx(submissions_used=5)) is ALLOW
+    cap = C.PAPER_TEST_1.max_submissions  # 9 since the owner's exit decision (13 Nov 2026)
+    assert refused(order(), ctx(submissions_used=cap)) == RefusalReason.EXPERIMENT_FINISHED
+    assert order_guard(order(), ctx(submissions_used=cap - 1)) is ALLOW
     # a bracket needing two placements with one left is refused at its first order
-    assert refused(order(), ctx(submissions_used=5, still_to_send=1)) == \
+    assert refused(order(), ctx(submissions_used=cap - 1, still_to_send=1)) == \
         RefusalReason.SUBMISSION_CAP
     assert refused(order(), ctx(submissions_used=None)) == RefusalReason.SUBMISSION_COUNT_UNKNOWN
 
@@ -394,7 +395,7 @@ def test_counter_is_durable_locked_and_capped(tmp_path):
     init_journal(tmp_path, C.PAPER_TEST_1, MASKED)
     c = opened(tmp_path)
     assert c.used == 0
-    for i in range(6):
+    for i in range(9):
         assert rec(c, 100 + i) == i + 1
     with pytest.raises(CapReached):
         rec(c, 200)
@@ -403,8 +404,8 @@ def test_counter_is_durable_locked_and_capped(tmp_path):
         second.open()
     c.close()
     second.open()  # a restart: the count survives
-    assert second.used == 6 and second.max_order_id == 105
-    assert [e["action"] for e in second.entries] == ["BUY"] * 6
+    assert second.used == 9 and second.max_order_id == 108
+    assert [e["action"] for e in second.entries] == ["BUY"] * 9
     with pytest.raises(CapReached):
         rec(second, 201)
     second.close()

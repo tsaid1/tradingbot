@@ -8,11 +8,14 @@ stage                       what it does                                   submi
 ``stage0-refusal``          Read-Only ON: order mode must refuse to start          0
 ``stage1-lookups``          Read-Only OFF: lookups and positions, no order         0
 ``stage2-unfillable-bracket`` one bracket that cannot fill, read back, cancelled   2
-``stage3-lifecycle``        the one-share lifecycle through the coordinator       4
+``stage3-lifecycle``        the one-share lifecycle through the coordinator  up to 7
 ``abort``                   cancels this client's working orders by order id       0
 =========================== ============================================== ===========
 
-2 + 4 = 6 = ``PAPER_TEST_1.max_submissions`` (asserted in a test).
+Stage 3 at worst: entry 1 + stop 1 + one stop amendment 1 + two close attempts x (closing limit 1
++ the protective stop placed again after the unfilled limit was cancelled 1) = 7; a pass uses 4
+(the first close fills) or 6 (the second does). 2 + 7 = 9 = ``PAPER_TEST_1.max_submissions``
+(asserted in a test).
 
 Order: a stage refuses unless the previous stage's evidence exists and passed, and refuses if its
 own evidence already passed. A stage whose evidence failed may run again only while the durable
@@ -36,8 +39,12 @@ from zoneinfo import ZoneInfo
 
 from tradingbot.event_models import PriceBasis, ReplaySource, Timing, TradeAction
 from tradingbot.execution.broker import OrderStatus, QuoteQuality, TimeInForce
-from tradingbot.execution.coordinator import ExecutionConfig, ExecutionCoordinator
-from tradingbot.execution.store import IntentState
+from tradingbot.execution.coordinator import (
+    EXIT_UNFILLED_CANCELLED,
+    ExecutionConfig,
+    ExecutionCoordinator,
+)
+from tradingbot.execution.store import UNRESOLVED_STATES, IntentState
 from tradingbot.ibkr.redact import redact_accounts
 from tradingbot.ibkr_orders.broker import IbkrPaperBroker
 from tradingbot.ibkr_orders.config import PaperOrderConfig, load_order_config
@@ -52,12 +59,12 @@ STAGES = ("stage0-refusal", "stage1-lookups", "stage2-unfillable-bracket", "stag
 ABORT = "abort"
 PREREQUISITE = {STAGES[1]: STAGES[0], STAGES[2]: STAGES[1], STAGES[3]: STAGES[2]}
 SUBMISSIONS_BEFORE = {STAGES[0]: 0, STAGES[1]: 0, STAGES[2]: 0, STAGES[3]: 2}
-SUBMISSIONS_OF = {STAGES[0]: 0, STAGES[1]: 0, STAGES[2]: 2, STAGES[3]: 4}
+SUBMISSIONS_OF = {STAGES[0]: 0, STAGES[1]: 0, STAGES[2]: 2, STAGES[3]: 7}
 
 UNFILLABLE_FRACTION = Decimal("0.90")  # stage 2: the BUY limit 10% below the bid
 STOP_DISTANCE = Decimal("1.00")  # the protective stop this far below the entry
 STOP_RAISE = Decimal("0.10")  # stage 3: the one amendment
-FILL_TIMEOUT_SECONDS = 120.0  # stage 3: wait this long for the entry and for the close
+FILL_TIMEOUT_SECONDS = 120.0  # stage 3: wait this long for the entry to fill
 POLL_SECONDS = 1.0
 READ_BACK_WAIT_SECONDS = 2.0  # stage 2: let the views settle before reading back
 # Stage 1 takes up to this many bounded quote samples in a row and passes on the first one the
@@ -77,6 +84,23 @@ MIN_MINUTES_TO_CLOSE = 60
 # wall-clock time (hour, minute). The runbook still recommends starting stage 3 by 14:30.
 LATEST_START_NEW_YORK = (15, 0)
 NEW_YORK = ZoneInfo("America/New_York")
+# Stage 3 quotes (owner's decision, 13 Nov 2026): LIVE, a bid and an ask, each side at most this many
+# seconds old (the core's policy.max_quote_age_seconds, measured on the older side), for the entry
+# price and for every close attempt. A read that is not usable is retried, reads only, for at most
+# QUOTE_RETRY_SECONDS before the entry and before each close attempt; then nothing is sent.
+STAGE3_QUOTE_MAX_AGE_SECONDS = 3
+QUOTE_RETRY_SECONDS = 20.0
+# The close: at most this many attempts. Each is a SELL 1 LMT at the fresh bid (the core's
+# exit_price_policy TOUCH) working at most CLOSE_WAIT_SECONDS (the core's exit_validity_seconds);
+# unfilled, the core cancels it with broker confirmation and places the protective stop again. The
+# script waits, reads only, at most CLOSE_SETTLE_SECONDS more for that, then PROTECTION_SETTLE_SECONDS
+# for the restored stop to be CONFIRMED, before the next attempt may start.
+STAGE3_CLOSE_ATTEMPTS = 2
+CLOSE_WAIT_SECONDS = 10.0
+CLOSE_SETTLE_SECONDS = 25.0
+# The core's cancel / resize confirmation: this many broker reads, this far apart.
+CONFIRM_ATTEMPTS = 10
+CONFIRM_WAIT_SECONDS = 1.0
 
 
 def _wall_clock() -> datetime:
@@ -177,14 +201,16 @@ TWS_PROCEDURE = ("In the TWS window: (1) open the Trades panel: if it already sh
                  "the stop only when this script itself reads the account flat; if it reports the "
                  "stop left working while TWS shows 0, cancel that TLT stop in the TWS window "
                  "yourself at once. Never cancel the stop while TWS shows 1.")
-ABORT_STOP_NOTE = ("If the TWS window shows TLT 0 (for example after your manual sale), cancel that "
-                   "TLT stop there yourself at once: it is still working. If TWS shows 1, leave "
-                   "the stop working.")
+ABORT_STOP_NOTE = ("Cancel that TLT stop in the TWS window yourself at once if the TWS window shows "
+                   "TLT 0 (for example after your manual sale): it is still working. If TWS shows "
+                   "1, leave the stop working.")
 
 ABNORMAL_ENDINGS = frozenset({
     "STAGE2_UNEXPECTED_FILL", "STAGE2_PARENT_NOT_CONFIRMED_CANCELLED", "STAGE2_FAILED",
     "STAGE3_ENTRY_NOT_FILLED", "STAGE3_PROTECTION_UNCONFIRMED", "STAGE3_PROTECTION_LOST",
     "STAGE3_CLOSE_REFUSED", "STAGE3_CLOSE_NOT_FILLED", "STAGE3_NOT_CLEAN",
+    "STAGE3_NO_USABLE_QUOTE", "STAGE3_ENTRY_REFUSED", "STAGE3_CLOSE_NO_QUOTE",
+    "STAGE3_CLOSE_OUTCOME_UNKNOWN", "STAGE3_PROTECTION_NOT_RESTORED",
     "ABORT_STOP_LEFT_WORKING"})
 
 
@@ -399,9 +425,9 @@ def _stage1(cfg: PaperOrderConfig, ev: dict) -> None:
             ev["why_failed"] = (
                 f"STAGE1_QUOTE_NOT_USABLE: {len(samples)} bounded quote sample(s) labelled "
                 f"{[x['quality'] for x in samples]} by the adapter (last reason: "
-                f"{last.get('reason') or 'none given'}; flags {last.get('flags', [])}). Stage 3 "
-                "needs a LIVE or DELAYED quote with a bid and an ask. no order was sent; run "
-                "stage 1 again.")
+                f"{last.get('reason') or 'none given'}; flags {last.get('flags', [])}). Stage 2 "
+                "needs a LIVE or DELAYED quote with a bid and an ask, stage 3 a LIVE one. no order "
+                "was sent; run stage 1 again.")
     finally:
         s.disconnect()
 
@@ -537,12 +563,56 @@ def _wait(pred, timeout: float) -> bool:
         time.sleep(POLL_SECONDS)
 
 
+def _passing_count(filled_on_attempt: int) -> int:
+    """The durable count after a CLEAN stage 3 whose close filled on attempt ``k``: stage 2's 2,
+    the entry and its stop 2, the amendment 1, then per attempt the closing limit 1, and per
+    unfilled attempt before it the stop placed again 1. 6 for the first attempt, 8 for the second;
+    STAGE3_PASSED accepts exactly that number and nothing else."""
+    return SUBMISSIONS_BEFORE[STAGES[3]] + 3 + 1 + 2 * (filled_on_attempt - 1)
+
+
+def _stage3_quote(broker: IbkrPaperBroker, contract) -> tuple[object | None, list[dict]]:
+    """READS ONLY, bounded by ``QUOTE_RETRY_SECONDS``: the first strict quote that is LIVE, has a
+    positive bid and ask (bid not above ask) and both sides at most
+    ``STAGE3_QUOTE_MAX_AGE_SECONDS`` old, each age measured from the read's reference time (the
+    same stamps the core measures). Returns (that quote or None, every read as evidence)."""
+    reads: list[dict] = []
+    deadline = time.monotonic() + QUOTE_RETRY_SECONDS
+    while True:
+        t = datetime.now(UTC)
+        broker.set_reference_time(t)
+        q = None
+        try:
+            q = broker.quote(contract)
+            ages = [None if at is None else round((t - at).total_seconds(), 6)
+                    for at in (q.bid_at, q.ask_at)]
+            ok = (q.quality == QuoteQuality.LIVE and q.bid is not None and q.ask is not None
+                  and q.bid > 0 and q.ask > 0 and q.bid <= q.ask
+                  and all(a is not None and a <= STAGE3_QUOTE_MAX_AGE_SECONDS for a in ages))
+            rep = broker.last_quote_report or {}
+            rec = {"quality": q.quality.value, "bid": str(q.bid), "ask": str(q.ask),
+                   "bid_age_seconds": ages[0], "ask_age_seconds": ages[1],
+                   "adapter_label": rep.get("adapter_label"),
+                   "problems": list(rep.get("problems", [])), "usable": ok}
+        except Exception as exc:  # noqa: BLE001 - evidence: the read failed, nothing was sent
+            ok = False
+            rec = {"quality": None, "usable": False,
+                   "error": redact_accounts(f"{type(exc).__name__}: {exc}")}
+        rec["read_at"] = t.isoformat()
+        reads.append(rec)
+        if ok:
+            return q, reads
+        if time.monotonic() >= deadline:
+            return None, reads
+        time.sleep(POLL_SECONDS)
+
+
 def _stage3(cfg: PaperOrderConfig, ev: dict) -> None:
     _check_start_time(STAGES[3])
     quality = (_read(evidence_path(cfg, STAGES[1])) or {}).get("quote", {}).get("quality")
-    if quality not in (QuoteQuality.LIVE.value, QuoteQuality.DELAYED.value):
-        raise StageRefused(f"stage 1 recorded quote quality {quality!r}; stage 3 needs LIVE or "
-                           "DELAYED")
+    if quality != QuoteQuality.LIVE.value:
+        raise StageRefused(f"stage 1 recorded quote quality {quality!r}; stage 3 needs LIVE (a "
+                           "DELAYED quote does not qualify for stage 3)")
     s = _session(cfg)
     s.connect()
     coord = None
@@ -550,21 +620,36 @@ def _stage3(cfg: PaperOrderConfig, ev: dict) -> None:
         _require_count(s, STAGES[3])
         _check_time_to_close(s.contract, STAGES[3], _wall_clock())
         policy = MockPolicy(quantity=1, quantity_per_add=1, max_notional_usd=Decimal(150),
-                            max_price_deviation_pct=Decimal(1))
-        # the exit dry check prices the close exactly as the core will (bid less this collar)
-        broker = IbkrPaperBroker(s, exit_collar_pct=policy.max_price_deviation_pct)
+                            max_price_deviation_pct=Decimal(1),
+                            max_quote_age_seconds=STAGE3_QUOTE_MAX_AGE_SECONDS)
+        # The owner's exit decision: the close is a SELL limit AT the fresh bid (no haircut); the
+        # exit dry check prices its probe the same way. Quotes are strict: never fresher or more
+        # live than the adapter measured them (both sides' times, the older one is the quote's).
+        broker = IbkrPaperBroker(s, exit_at_touch=True, strict_quotes=True)
         config = ExecutionConfig(halt_file=evidence_dir(cfg) / "HALT",
                                  expected_account=s.account_id,
-                                 accepted_quote_qualities=frozenset({QuoteQuality(quality)}),
-                                 protective_tif=TimeInForce.DAY, confirm_attempts=10,
-                                 confirm_wait_seconds=1.0)
+                                 accepted_quote_qualities=frozenset({QuoteQuality.LIVE}),
+                                 protective_tif=TimeInForce.DAY, confirm_attempts=CONFIRM_ATTEMPTS,
+                                 confirm_wait_seconds=CONFIRM_WAIT_SECONDS,
+                                 exit_price_policy="TOUCH",
+                                 exit_validity_seconds=CLOSE_WAIT_SECONDS)
         coord = ExecutionCoordinator(broker, evidence_dir(cfg) / "stage3-execution.sqlite3",
                                      policy, config)
         c = s.contract
         tick = Decimal(str(c.min_tick))
-        q = broker.quote(broker.resolve(Instrument(asset_class=AssetClass.ETF, symbol=c.symbol)))
-        if q.ask is None or q.ask <= 0:
-            ev.update(passed=False, why_failed="no ask to state the entry from; nothing was sent")
+        contract = broker.resolve(Instrument(asset_class=AssetClass.ETF, symbol=c.symbol))
+
+        def fail(result: str, what: str) -> None:
+            ev["state"] = state = _position_state(s)  # retried until read and fills agree
+            ev.update(passed=False, result=result,
+                      why_failed=_ending_message(result, what, state))
+
+        q, reads = _stage3_quote(broker, contract)
+        ev["entry_quote_reads"] = reads
+        if q is None:
+            fail("STAGE3_NO_USABLE_QUOTE", f"no LIVE quote with a bid and an ask, each side at "
+                 f"most {STAGE3_QUOTE_MAX_AGE_SECONDS} s old, in {QUOTE_RETRY_SECONDS:.0f} s of "
+                 f"reads ({len(reads)} read(s)); nothing was sent and stage 3 may run again")
             return
         # The owner's choice (private config, 0 when absent, at most caps ceiling): the entry is
         # STATED at the ask plus that many ticks; the core sends exactly the stated price.
@@ -598,14 +683,14 @@ def _stage3(cfg: PaperOrderConfig, ev: dict) -> None:
                           "submissions_used": s.submissions_used})
             return outcome
 
+        broker.set_reference_time(datetime.now(UTC))  # no later than the core's own now
         opened = step("open", coord.execute(src, act("open", Action.OPEN,
                                                      entry_reference=str(entry),
                                                      stop_price=str(stop)), gate))
-        def fail(result: str, what: str) -> None:
-            ev["state"] = state = _position_state(s)  # retried until read and fills agree
-            ev.update(passed=False, result=result,
-                      why_failed=_ending_message(result, what, state))
-
+        if opened.state in (IntentState.REFUSED, IntentState.REJECTED, IntentState.HALTED):
+            fail("STAGE3_ENTRY_REFUSED", f"the entry was {opened.state.value} "
+                 f"({', '.join(opened.reasons) or 'no reason given'})")
+            return
         if not _wait(lambda: coord.sync() and bool(coord.ledger())
                      and coord.ledger()[0].quantity == 1, FILL_TIMEOUT_SECONDS):
             fail("STAGE3_ENTRY_NOT_FILLED", "the entry did not fill in time")
@@ -624,21 +709,95 @@ def _stage3(cfg: PaperOrderConfig, ev: dict) -> None:
         step("raise-stop", coord.execute(src, act("raise-stop", Action.MODIFY,
                                                   idea_reference=ledger.idea_id,
                                                   stop_price=str(stop + STOP_RAISE)), gate))
-        closed = step("close", coord.execute(src, act("close", Action.CLOSE,
-                                                      idea_reference=ledger.idea_id), gate))
-        if broker.protection_lost:  # the close was refused after its stop was cancelled
-            coord.sync()  # the core raises UNPROTECTED_POSITION now, not at a later read
-            ev["protection_lost"] = broker.protection_lost
-            fail("STAGE3_PROTECTION_LOST", "POSITION OPEN, PROTECTION ABSENT: the close was not "
-                 "sent after the stop was cancelled")
-            return
-        if closed.state in (IntentState.REFUSED, IntentState.REJECTED, IntentState.HALTED):
-            fail("STAGE3_CLOSE_REFUSED", f"the close was {closed.state.value} and not working "
-                 f"({', '.join(closed.reasons) or 'no reason given'})")
-            return
-        if not _wait(lambda: coord.sync() and coord.ledger()[0].quantity == 0,
-                     FILL_TIMEOUT_SECONDS):
-            fail("STAGE3_CLOSE_NOT_FILLED", "the closing limit was sent but did not fill in time")
+        idea = ledger.idea_id
+        attempts = ev["close_attempts"] = []
+        filled_on = None
+        for k in range(1, STAGE3_CLOSE_ATTEMPTS + 1):
+            rec: dict = {"attempt": k, "submissions_before": s.submissions_used}
+            attempts.append(rec)
+            q, reads = _stage3_quote(broker, contract)
+            rec["quote_reads"] = reads
+            if q is None:
+                rec["outcome"] = "NOT_SENT_NO_USABLE_QUOTE"
+                fail("STAGE3_CLOSE_NO_QUOTE", f"close attempt {k}: no LIVE quote with a bid and "
+                     f"an ask, each side at most {STAGE3_QUOTE_MAX_AGE_SECONDS} s old, in "
+                     f"{QUOTE_RETRY_SECONDS:.0f} s of reads; no closing limit was sent and the "
+                     "protective stop was left as it was")
+                return
+            rec["quote"] = reads[-1]
+            first_read = len(broker.quote_reports)
+            broker.set_reference_time(datetime.now(UTC))  # no later than the core's own now
+            closed = step(f"close-{k}", coord.execute(src, act(f"close-{k}", Action.CLOSE,
+                                                               idea_reference=idea), gate))
+            # the first read is the one the core priced the limit on; a later one is the stop
+            # cancel's dry-check estimate
+            rec["core_quote_reads"] = broker.quote_reports[first_read:]
+            ref = closed.order_ref
+            sent = coord.intent(ref)
+            rec.update(order_ref=ref, limit=sent.limit_price if sent else None,
+                       state_after_send=closed.state.value, wait_seconds=CLOSE_WAIT_SECONDS)
+            if broker.protection_lost:  # the close was refused after its stop was cancelled
+                coord.sync()  # the core raises UNPROTECTED_POSITION now, not at a later read
+                ev["protection_lost"] = broker.protection_lost
+                rec["outcome"] = "NOT_SENT_PROTECTION_LOST"
+                fail("STAGE3_PROTECTION_LOST", "POSITION OPEN, PROTECTION ABSENT: the close was "
+                     "not sent after the stop was cancelled")
+                return
+            if closed.state in (IntentState.REFUSED, IntentState.REJECTED, IntentState.HALTED):
+                rec["outcome"] = closed.state.value
+                fail("STAGE3_CLOSE_REFUSED", f"the close was {closed.state.value} and not working "
+                     f"({', '.join(closed.reasons) or 'no reason given'})")
+                return
+            t0 = time.monotonic()
+            if closed.state not in UNRESOLVED_STATES:
+                # the core cancels it once CLOSE_WAIT_SECONDS have passed (sync, confirmed)
+                _wait(lambda ref=ref: coord.sync() and (coord.ledger()[0].quantity == 0
+                                                        or coord.intent(ref).state
+                                                        != IntentState.WORKING),
+                      CLOSE_WAIT_SECONDS + CLOSE_SETTLE_SECONDS)
+            now_i = coord.intent(ref)
+            events = {e.event for e in coord.store.journal(ref)}
+            rec.update(waited_seconds=round(time.monotonic() - t0, 3),
+                       outcome=now_i.state.value, reasons=list(now_i.reasons),
+                       cancel_requested="EXIT_EXPIRY_CANCEL_REQUESTED" in events,
+                       cancel_confirmed="EXIT_EXPIRED_CANCEL_CONFIRMED" in events)
+            if now_i.state == IntentState.FILLED or coord.ledger()[0].quantity == 0:
+                rec["submissions_after"] = s.submissions_used
+                filled_on = k
+                break
+            if now_i.state != IntentState.CANCELLED or EXIT_UNFILLED_CANCELLED not in now_i.reasons:
+                rec["submissions_after"] = s.submissions_used
+                fail("STAGE3_CLOSE_OUTCOME_UNKNOWN", f"close attempt {k}: the closing limit {ref} "
+                     f"(1 share, limit {rec['limit']}, DAY) MAY STILL BE WORKING OR MAY HAVE FILLED: "
+                     f"its outcome is not known from broker evidence (core state "
+                     f"{now_i.state.value}, cancel requested {rec['cancel_requested']}, cancel "
+                     f"confirmed {rec['cancel_confirmed']}); nothing more was sent and no "
+                     "protective stop was placed again, so a share still held may be UNPROTECTED")
+                return
+            # cancelled unfilled: the core placed the stop again in the same sync; wait (reads
+            # only) until it is CONFIRMED by the core and seen working, before anything else
+            restored = _wait(lambda: coord.sync() and coord.ledger()[0].protection == "CONFIRMED"
+                             and _read_state(s)["stop_working"], PROTECTION_SETTLE_SECONDS)
+            after = coord.ledger()[0]
+            read = _read_state(s)
+            rec.update(protection_after=after.protection, stop_ref_after=after.stop_ref,
+                       stop_status_after=read["stop_status"],
+                       stop_working_after=read["stop_working"],
+                       submissions_after=s.submissions_used)
+            if not restored:
+                fail("STAGE3_PROTECTION_NOT_RESTORED", "SHARE POSSIBLY UNPROTECTED: close attempt "
+                     f"{k}'s closing limit {ref} was cancelled unfilled (confirmed), but the "
+                     "protective stop placed again for the share was not confirmed working within "
+                     f"{PROTECTION_SETTLE_SECONDS:.0f} s (core protection {after.protection}, stop "
+                     f"read {read['stop_status'] or 'absent'}); nothing more was sent")
+                return
+        if filled_on is None:
+            read = _read_state(s)
+            fail("STAGE3_CLOSE_NOT_FILLED", f"the closing limit (1 share at the bid) did not "
+                 f"fill in {STAGE3_CLOSE_ATTEMPTS} attempts of {CLOSE_WAIT_SECONDS:.0f} s; each "
+                 "was cancelled with broker confirmation and the protective stop was placed "
+                 f"again: a protective stop is working ({read['stop_status'] or 'not seen'}) as "
+                 "read; nothing more was sent")
             return
         # The position read can lag the closing fill: retry the reconciliation (reads only, no
         # order frame) before calling it not clean.
@@ -650,11 +809,13 @@ def _stage3(cfg: PaperOrderConfig, ev: dict) -> None:
         ev["entry_ref"] = opened.order_ref
         ev["lookups_after"] = _lookups(s)
         ev["submissions_used"] = s.submissions_used
-        ev["passed"] = bool(report.clean) and s.submissions_used == 6
+        ev["close_filled_on_attempt"] = filled_on
+        want = _passing_count(filled_on)
+        ev["passed"] = bool(report.clean) and s.submissions_used == want
         ev["result"] = "STAGE3_PASSED" if ev["passed"] else "STAGE3_NOT_CLEAN"
         if not ev["passed"]:
             fail("STAGE3_NOT_CLEAN", f"reconciliation clean={bool(report.clean)}, submissions "
-                 f"used {s.submissions_used}")
+                 f"used {s.submissions_used} (a clean close on attempt {filled_on} uses {want})")
     finally:
         if coord is not None:
             coord.close()

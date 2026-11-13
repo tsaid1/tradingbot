@@ -7,7 +7,8 @@ import json
 import re
 import socket
 import threading
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -15,8 +16,9 @@ import pytest
 
 pytest.importorskip("ibapi")
 
+import _clock
 import ibapi.client
-from _ibkr_fake_tws_orders import PAPER, FakeOrderTws
+from _ibkr_fake_tws_orders import PAPER, FakeOrderTws, all_day_hours, core_ref
 from _ibkr_paper_testing import OfflineTestSession
 from test_ibkr_paper_orders_pure import write_cfg
 
@@ -37,8 +39,16 @@ def tws(monkeypatch):
     monkeypatch.setattr(socket.socket, "connect", no_network)
     monkeypatch.setattr(socket.socket, "connect_ex", no_network)
     monkeypatch.setattr(socket, "create_connection", no_network)
+    # Every wall clock the stage, the guard (the session's clock), the execution core, the counter
+    # and the fake TWS read starts at MIDDAY and runs from there, whatever the machine's clock says
+    # (tests/_clock.py). Before this, only the stage's start check was pinned: the guard and the
+    # fake's liquid hours followed the real date, so these tests failed outside 10-12 Nov 2026.
+    _clock.install()
+    monkeypatch.setattr(_clock.ShiftedDatetime, "offset", _clock.ShiftedDatetime.offset)
+    _clock.set_now(MIDDAY)
     server = FakeOrderTws()
     server.server_version = 226
+    server.liquid_hours = all_day_hours(MIDDAY)
     monkeypatch.setattr(ibapi.client, "Connection", server.connection_factory)
     # test-only seams, reached by patching module attributes inside the test
     monkeypatch.setattr(X, "PaperOrderSession", OfflineTestSession)
@@ -48,6 +58,10 @@ def tws(monkeypatch):
     monkeypatch.setattr(X, "PROTECTION_SETTLE_SECONDS", 3.0)
     monkeypatch.setattr(X, "POSITION_SETTLE_SECONDS", 2.0)
     monkeypatch.setattr(X, "RECONCILE_SETTLE_SECONDS", 3.0)
+    monkeypatch.setattr(X, "QUOTE_RETRY_SECONDS", 1.0)
+    monkeypatch.setattr(X, "CLOSE_WAIT_SECONDS", 0.5)
+    monkeypatch.setattr(X, "CLOSE_SETTLE_SECONDS", 4.0)
+    monkeypatch.setattr(X, "CONFIRM_WAIT_SECONDS", 0.05)
     monkeypatch.setattr(X, "_wall_clock", lambda: MIDDAY)  # before the start cut-off
     return server
 
@@ -80,8 +94,13 @@ def stage0(tws, cfg_path):
 
 def test_submission_arithmetic_is_exactly_the_cap():
     assert X.SUBMISSIONS_OF["stage2-unfillable-bracket"] == 2
-    assert X.SUBMISSIONS_OF["stage3-lifecycle"] == 4
-    assert sum(X.SUBMISSIONS_OF.values()) == C.PAPER_TEST_1.max_submissions == 6
+    # stage 3 at worst: entry 1 + its stop 1 + one amendment 1 + per close attempt (the closing
+    # limit 1 + the stop placed again, a NEW order, 1) x 2 attempts
+    assert X.STAGE3_CLOSE_ATTEMPTS == 2
+    assert X.SUBMISSIONS_OF["stage3-lifecycle"] == 1 + 1 + 1 + (1 + 1) * 2 == 7
+    assert sum(X.SUBMISSIONS_OF.values()) == C.PAPER_TEST_1.max_submissions == 9
+    # a clean pass: the first close fills (no stop placed again) or the second does
+    assert [X._passing_count(k) for k in (1, 2)] == [6, 8]
     for stage, before in X.SUBMISSIONS_BEFORE.items():
         i = X.STAGES.index(stage)
         assert before == sum(X.SUBMISSIONS_OF[s] for s in X.STAGES[:i])
@@ -137,7 +156,7 @@ def test_stages_0_to_3_then_nothing_more(tws, cfg_path):
     stage0(tws, cfg_path)
     assert run("stage1-lookups", cfg_path)["passed"]
     ev2 = run("stage2-unfillable-bracket", cfg_path)
-    assert ev2["passed"], ev2
+    assert ev2["passed"], {k: ev2.get(k) for k in ("why_failed", "error", "result")}
     assert ev2["submissions_before"] == 0 and ev2["submissions_after"] == 2
     assert not ev2["filled"] and ev2["gone_from_open_orders"]
     assert set(ev2["in_completed_orders"].values()) == {"Cancelled"}
@@ -152,10 +171,13 @@ def test_stages_0_to_3_then_nothing_more(tws, cfg_path):
     tws.autofill = True
     ev3 = run("stage3-lifecycle", cfg_path)
     assert ev3["passed"], ev3
-    assert [s["step"] for s in ev3["steps"]] == ["open", "raise-stop", "close"]
+    assert [s["step"] for s in ev3["steps"]] == ["open", "raise-stop", "close-1"]
     assert [s["submissions_used"] for s in ev3["steps"]] == [4, 5, 6]
     assert ev3["submissions_before"] == 2 and ev3["submissions_after"] == 6
     assert ev3["reconcile_clean"] and placed(tws) == 6
+    close = tws.placed()[-1].order
+    assert (close.action, close.orderType, close.tif) == ("SELL", "LMT", "DAY")
+    assert close.lmtPrice == pytest.approx(tws.bid)  # at the bid: no 1 % haircut
     with pytest.raises(X.StageRefused):
         X.run_stage("stage3-lifecycle", cfg_path)
 
@@ -253,17 +275,19 @@ def test_a_stage2_fill_whose_stop_the_broker_cancelled_reports_it_unprotected(tw
         X.run_stage("stage3-lifecycle", cfg_path)
 
 
-def test_stage3_refuses_without_a_live_or_delayed_quote_in_stage1(tws, cfg_path):
+@pytest.mark.parametrize("quality", ["FROZEN", "DELAYED"])
+def test_stage3_refuses_without_a_live_quote_in_stage1(tws, cfg_path, quality):
+    """DELAYED passes stage 1 (unchanged) but no longer qualifies for stage 3."""
     stage0(tws, cfg_path)
     run("stage1-lookups", cfg_path)
     assert run("stage2-unfillable-bracket", cfg_path)["passed"]
     cfg = load_order_config(cfg_path)
     p1 = X.evidence_path(cfg, "stage1-lookups")
     data = json.loads(p1.read_text())
-    p1.write_text(json.dumps({**data, "quote": {"quality": "FROZEN"}}))
+    p1.write_text(json.dumps({**data, "quote": {"quality": quality}}))
     names = list(tws.names())
     ev = run("stage3-lifecycle", cfg_path)
-    assert not ev["passed"] and "FROZEN" in ev["why_failed"]
+    assert not ev["passed"] and quality in ev["why_failed"] and "needs LIVE" in ev["why_failed"]
     assert tws.names() == names and placed(tws) == 2  # refused before connecting
 
 
@@ -300,7 +324,7 @@ def test_the_script_does_nothing_without_one_explicit_stage(tws, monkeypatch, ar
 def test_stage_names_and_per_stage_budget_are_the_runbooks():
     assert X.STAGES == ("stage0-refusal", "stage1-lookups", "stage2-unfillable-bracket",
                         "stage3-lifecycle")
-    assert [X.SUBMISSIONS_OF[s] for s in X.STAGES] == [0, 0, 2, 4]
+    assert [X.SUBMISSIONS_OF[s] for s in X.STAGES] == [0, 0, 2, 7]
     assert [X.SUBMISSIONS_BEFORE[s] for s in X.STAGES] == [0, 0, 0, 2]
     assert X.SUBMISSIONS_OF.get(X.ABORT, 0) == 0
 
@@ -338,17 +362,28 @@ def _to_stage3(tws, cfg_path):
 
 def test_a_refused_close_is_reported_refused_and_never_says_abort_first(tws, cfg_path):
     """SHOULD FIX 2 (i, ii): the close is refused for want of a bid: REFUSED with its reason;
-    the stop still works, so: close by hand first, then abort."""
+    the stop still works, so: close by hand first, then abort. (Since the owner's exit decision
+    the script's own read before the close passes; the core's read then has no bid.)"""
     from _ibkr_fake_tws_orders import FakeOrderTws
     _to_stage3(tws, cfg_path)
+    raised = {"reads": 0}
+    quote = tws.on["REQ_MKT_DATA"]
 
-    def place_then_no_bid(s, conn, req):
+    def place(s, conn, req):
         amend = req.orderId in s.orders
         FakeOrderTws.place(s, conn, req)
-        if amend:  # the stop raise: from now on the quote has no bid
-            s.bid = 0.0
+        if amend:  # the stop raise: the next read is the script's, then no bid
+            raised["reads"] = 1
 
-    tws.on["PLACE_ORDER"] = place_then_no_bid
+    def read(s, conn, req):
+        if raised["reads"]:
+            raised["reads"] += 1
+            if raised["reads"] > 2:
+                s.bid = 0.0
+        quote(s, conn, req)
+
+    tws.on["PLACE_ORDER"] = place
+    tws.on["REQ_MKT_DATA"] = read
     ev = run("stage3-lifecycle", cfg_path)
     assert not ev["passed"]
     assert ev["result"] == "STAGE3_CLOSE_REFUSED", ev
@@ -699,3 +734,180 @@ def test_an_allowance_absorbs_a_one_tick_rise_of_the_ask(tws, tmp_path, ticks, f
     assert ev["passed"] is fills
     if not fills:
         assert ev["result"] == "STAGE3_ENTRY_NOT_FILLED"
+
+
+# --- the owner's exit decision (13 Nov 2026): the close at the bid, bounded, protected ----------
+def _close_fills_on(tws, attempt):
+    """The fake fills a closing limit only from close attempt ``attempt`` on (None: never)."""
+    n = {"close": 0}
+
+    def place(s, conn, req):
+        o, auto = req.order, s.autofill
+        if req.orderId not in s.orders and o.action == "SELL" and o.orderType == "LMT":
+            n["close"] += 1
+            s.autofill = attempt is not None and n["close"] >= attempt
+        try:
+            FakeOrderTws.place(s, conn, req)
+        finally:
+            s.autofill = auto
+
+    tws.on["PLACE_ORDER"] = place
+    return n
+
+
+def _sent(tws):
+    return [(p.order.action, p.order.orderType, p.order.parentId != 0) for p in tws.placed()]
+
+
+def test_the_first_close_does_not_fill_and_the_second_does(tws, cfg_path):
+    _to_stage3(tws, cfg_path)
+    _close_fills_on(tws, 2)
+    ev = run("stage3-lifecycle", cfg_path)
+    assert ev["passed"] and ev["result"] == "STAGE3_PASSED", ev
+    assert ev["close_filled_on_attempt"] == 2 and ev["submissions_after"] == 8
+    assert _sent(tws)[2:] == [("BUY", "LMT", False), ("SELL", "STP", True),  # the bracket
+                              ("SELL", "STP", True),  # the amendment (same order id)
+                              ("SELL", "LMT", False),  # close 1
+                              ("SELL", "STP", False),  # the stop placed again: a new order
+                              ("SELL", "LMT", False)]  # close 2
+    first, second = ev["close_attempts"]
+    assert first["outcome"] == "CANCELLED" and first["cancel_confirmed"] is True
+    assert "EXIT_UNFILLED_CANCELLED" in first["reasons"]
+    assert first["protection_after"] == "CONFIRMED" and first["stop_working_after"] is True
+    assert first["stop_ref_after"].endswith(".STP2")
+    assert (first["submissions_before"], first["submissions_after"]) == (5, 7)
+    assert second["outcome"] == "FILLED" and second["submissions_after"] == 8
+    for a in (first, second):
+        q = a["quote"]
+        assert q["usable"] and q["quality"] == "LIVE"
+        assert 0 <= q["bid_age_seconds"] <= 3 and 0 <= q["ask_age_seconds"] <= 3
+        assert Decimal(a["limit"]) == Decimal(q["bid"])  # at the bid read before it
+        assert a["core_quote_reads"] and a["wait_seconds"] == X.CLOSE_WAIT_SECONDS
+    restored = tws.placed()[6].order
+    assert restored.auxPrice == pytest.approx(float(Decimal(ev["entry_price"]["stated_entry"])
+                                                    - 1 + Decimal("0.1")))  # the raised stop
+    assert not [o for o in tws.orders.values() if o.working]
+    assert ev["reconcile_clean"]
+
+
+def test_neither_close_fills_the_share_is_held_and_the_stop_confirmed(tws, cfg_path):
+    _to_stage3(tws, cfg_path)
+    _close_fills_on(tws, None)
+    ev = run("stage3-lifecycle", cfg_path)
+    assert not ev["passed"] and ev["result"] == "STAGE3_CLOSE_NOT_FILLED", ev
+    assert placed(tws) == 9 and ev["submissions_after"] == 9 == C.PAPER_TEST_1.max_submissions
+    assert [a["outcome"] for a in ev["close_attempts"]] == ["CANCELLED", "CANCELLED"]
+    assert all(a["protection_after"] == "CONFIRMED" for a in ev["close_attempts"])
+    assert ev["state"]["held"] == "1" and ev["state"]["stop_working"] is True
+    assert not ev["state"]["close_working"]
+    text = ev["why_failed"]
+    assert "a protective stop is working (Submitted) as read" in text
+    assert "Protective stop working (Submitted)" in text and X.TWS_PROCEDURE in text
+    _assert_no_unconditional_sell(text)
+    working = [o for o in tws.orders.values() if o.working]
+    assert [(o.order.action, o.order.orderType) for o in working] == [("SELL", "STP")]
+
+
+def test_a_close_cancel_that_is_not_confirmed_sends_nothing_more(tws, cfg_path):
+    _to_stage3(tws, cfg_path)
+    _close_fills_on(tws, None)
+    cancel = tws.on["CANCEL_ORDER"]
+
+    def ignore_close_cancels(s, conn, req):
+        fo = s.orders.get(req.orderId)
+        if fo is not None and fo.order.action == "SELL" and fo.order.orderType == "LMT":
+            return  # invented: TWS never answers the closing limit's cancel
+        cancel(s, conn, req)
+
+    tws.on["CANCEL_ORDER"] = ignore_close_cancels
+    ev = run("stage3-lifecycle", cfg_path)
+    assert not ev["passed"] and ev["result"] == "STAGE3_CLOSE_OUTCOME_UNKNOWN", ev
+    assert placed(tws) == 6  # no stop placed again, no second close
+    [a] = ev["close_attempts"]
+    assert a["cancel_requested"] and not a["cancel_confirmed"] and a["outcome"] == "WORKING"
+    text = ev["why_failed"]
+    assert "MAY STILL BE WORKING OR MAY HAVE FILLED" in text and "UNPROTECTED" in text
+    assert "A closing limit of this client is resting" in text and X.TWS_PROCEDURE in text
+    _assert_no_unconditional_sell(text)
+
+
+def test_a_stop_that_is_not_placed_again_says_possibly_unprotected_first(tws, cfg_path):
+    _to_stage3(tws, cfg_path)
+    _close_fills_on(tws, None)
+    place = tws.on["PLACE_ORDER"]
+
+    def reject_restored_stop(s, conn, req):
+        o = req.order
+        if req.orderId not in s.orders and o.orderType == "STP" and not o.parentId:
+            s.reject_refs[core_ref(o.orderRef)] = (201, "Order rejected - reason: invented")
+        place(s, conn, req)
+
+    tws.on["PLACE_ORDER"] = reject_restored_stop
+    ev = run("stage3-lifecycle", cfg_path)
+    assert not ev["passed"] and ev["result"] == "STAGE3_PROTECTION_NOT_RESTORED", ev
+    assert ev["why_failed"].startswith("STAGE3_PROTECTION_NOT_RESTORED: SHARE POSSIBLY UNPROTECTED")
+    assert placed(tws) == 7  # the rejected stop counts; nothing after it
+    assert ev["state"]["stop_working"] is False
+    _assert_no_unconditional_sell(ev["why_failed"])
+
+
+def test_no_usable_quote_before_the_entry_sends_nothing_and_stage3_may_run_again(tws, cfg_path):
+    _to_stage3(tws, cfg_path)
+    tws.market_data_type = 3  # invented: delayed only now; stage 1 had LIVE
+    ev = run("stage3-lifecycle", cfg_path)
+    assert not ev["passed"] and ev["result"] == "STAGE3_NO_USABLE_QUOTE", ev
+    assert placed(tws) == 2 and len(ev["entry_quote_reads"]) >= 2  # retried, reads only
+    assert all(not r["usable"] for r in ev["entry_quote_reads"])
+    tws.market_data_type = 1
+    assert run("stage3-lifecycle", cfg_path)["passed"]
+
+
+def test_no_usable_quote_before_a_close_sends_no_close_and_keeps_the_stop(tws, cfg_path):
+    _to_stage3(tws, cfg_path)
+
+    def place(s, conn, req):
+        amend = req.orderId in s.orders
+        FakeOrderTws.place(s, conn, req)
+        if amend:
+            s.market_data_type = 3  # invented: delayed only from now on
+
+    tws.on["PLACE_ORDER"] = place
+    ev = run("stage3-lifecycle", cfg_path)
+    assert not ev["passed"] and ev["result"] == "STAGE3_CLOSE_NO_QUOTE", ev
+    assert placed(tws) == 5 and tws.count("CANCEL_ORDER") == 1  # stage 2's only
+    assert ev["state"]["stop_working"] is True and ev["state"]["held"] == "1"
+    assert ev["close_attempts"][0]["outcome"] == "NOT_SENT_NO_USABLE_QUOTE"
+
+
+def test_a_stale_side_is_retried_with_reads_only(tws, cfg_path, monkeypatch):
+    _to_stage3(tws, cfg_path)
+
+    class Later(datetime):  # the script's reference 10 s after the reads: every side too old
+        @classmethod
+        def now(cls, tz=None):
+            return datetime.now(tz) + timedelta(seconds=10)
+
+    monkeypatch.setattr(X, "datetime", Later)
+    ev = run("stage3-lifecycle", cfg_path)
+    assert ev["result"] == "STAGE3_NO_USABLE_QUOTE" and placed(tws) == 2
+    assert all(r["quality"] == "LIVE" and not r["usable"] for r in ev["entry_quote_reads"])
+
+
+def test_the_abort_note_says_cancel_the_stop_in_tws_first():
+    assert X.ABORT_STOP_NOTE.startswith("Cancel that TLT stop in the TWS window")
+
+
+def test_every_wall_clock_the_stage_reads_is_the_tests(tws):
+    """No test here depends on the machine's date or time of day: the stage, the session (the
+    guard's clock), the read-only session, the counter, the execution core and the fake TWS all
+    read the fixture's moment."""
+    import _ibkr_fake_tws_orders as fake
+
+    from tradingbot.execution import coordinator, store
+    from tradingbot.ibkr import session as read_session
+    from tradingbot.ibkr_orders import counter
+    from tradingbot.ibkr_orders import session as order_session
+    for mod in (X, order_session, read_session, counter, coordinator, store, fake):
+        assert abs((mod.datetime.now(UTC) - MIDDAY).total_seconds()) < 60, mod.__name__
+    assert X._wall_clock() == MIDDAY
+    assert MIDDAY.strftime("%Y%m%d") in tws.liquid_hours

@@ -42,7 +42,9 @@ PAPER_TEST_1 = ExperimentCaps(
     max_order_quantity=1,
     max_net_position=1,
     max_order_notional=Decimal(150),
-    max_submissions=6,
+    # 2 (stage 2) + 7 (stage 3 at worst: entry, stop, one amendment, and two close attempts of a
+    # closing limit plus the stop placed again after it was cancelled unfilled); see experiment.py
+    max_submissions=9,
     order_types=frozenset({"LMT", "STP"}),
     tifs=frozenset({"DAY"}),
     long_only=True,
