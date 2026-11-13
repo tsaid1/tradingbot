@@ -6,14 +6,14 @@ owner's explicit, separate authorization of one bounded experiment and an indepe
 
 | Module | SDK? | Purpose |
 |---|---|---|
-| `caps.py` | no | `PAPER_TEST_1`: the experiment caps, as code constants |
+| `caps.py` | no | `PAPER_TEST_1`, `PAPER_TEST_2`: the experiment caps, as code constants |
 | `config.py` | no | `load_order_config`: the read-only config plus the hand-written `orders` entry |
 | `guard.py` | no | `order_guard(order, ctx) -> ALLOW / Refusal(reason)`: pure, no I/O |
 | `counter.py` | no | durable, fsync'd, `flock`ed, hash-chained submission journal; `init_journal` |
 | `mapping.py`, `timefmt.py`, `records.py` | no | status mapping, broker times, plain records and errors |
 | `broker.py` | no | `IbkrPaperBroker`: the execution core's `Broker` protocol |
 | `session.py` | **yes** | `PaperOrderSession(IbkrSession)`, `_OrderClient`, `_OrderGuardedConnection` |
-| `experiment.py` | **yes** | the staged first experiment (`scripts/ibkr_paper_experiment.py`) |
+| `experiment.py` | **yes** | the staged experiments and their stage plans (`scripts/ibkr_paper_experiment.py`) |
 
 The read-only `IbkrSession` is unchanged and still cannot send an order message. The order code
 lives in this separate package; the read-only package's AST test still forbids order names there.
@@ -517,6 +517,77 @@ nothing working, "nothing to do; confirm in TWS ...". No message contains an unc
 | `ABORT_STOP_LEFT_WORKING` | abort does not read the account flat; it left the protective stop(s) working and asked TWS to cancel the other orders (requested and confirmed counts apart) | the TWS procedure; if TWS shows TLT 0, cancel that stop in TWS yourself at once; if it shows 1, leave it |
 | `STAGE1_QUOTE_NOT_USABLE` | no sample labelled LIVE or DELAYED with a bid and an ask (labels and last reason) | nothing to do in TWS (no order was sent); run stage 1 again |
 
+## `paper-test-2` (YOUR CALL 17): defined in code, NOT authorized
+
+**Nothing here may run.** `paper-test-2` is an experiment definition only: it needs the owner's
+approval of the design (OWNER_DECISIONS YOUR CALL 17), an independent review of this code, the
+owner's confirmations on the day and stage-by-stage authorization, as for `paper-test-1`.
+
+**What is the same as `paper-test-1`** (`caps.py`: `PAPER_TEST_2` is `PAPER_TEST_1` with another
+name and cap): the verified paper account only; TLT long, one share, $150 notional; LMT and STP,
+DAY, regular hours only; the lifecycle stage's entry at the fresh ask (plus the optional
+`stage3_entry_allowance_ticks`, which here applies to stage 4), the close at the fresh bid in two
+attempts; the start cut-off (no stage 2, 3 or 4 starts at or after 15:00 New York) and the
+liquid-hours rule; the halt file; `abort`. **What differs:** `max_submissions = 10`; five stages
+(below); its own journal and evidence, both named after the experiment
+(`<state_dir>/ibkr_paper_orders/paper-test-2.submissions` and `paper-test-2.evidence/`), so
+`paper-test-1`'s journal is never touched. `paper-test-1` keeps its stages and behaviour.
+
+**Config:** the same private file with `orders = "paper-test-2"`, then
+`python scripts/ibkr_paper_init_journal.py` once (a new journal for this experiment). A stage name
+of the other experiment is refused before connecting.
+
+**After an acknowledgement timeout** (`ExperimentPlan.ack_timeout` in `experiment.py`): the session
+always makes its bounded read-only reconciliation. For `paper-test-2` the value is `ACK_HALT` (the
+owner's DECIDED 15 rule) in every stage: the reconciliation is written into the evidence, the stage
+ends `STAGEn_ACK_UNKNOWN_HALTED` and raises; nothing is cancelled or re-sent; the owner reconciles
+by hand in TWS. The alternative, `ACK_CANCEL_IF_WORKING` (one line of the definition; tested in
+both settings), applies only to the unfillable stages 2 and 3: when the read shows every order
+WORKING, the stage's confirmed cancels run and the stage ends `STAGEn_ACK_BY_RECONCILIATION`,
+never a pass and never a resend. An acknowledgement found only by the reconciliation is never a
+pass in either setting.
+
+**"By callback"** (stages 2 and 3): for each order an `openOrder` AND an `orderStatus` carrying this
+client's id must arrive within the acknowledgement wait (5 s) after that order's send, read from
+the session's own event record. A message without a client id, a row of a later lookup and the
+reconciliation do not count. The evidence (`callback_ack`, `working_order_messages`,
+`session_diagnostics`) shows which fields TWS sent for the working order (client id, account and
+perm id presence, status, whyHeld, the order's prices, OCA group, transmit).
+
+| Stage | Command | Passes only if | Count |
+|---|---|---|---|
+| 0 | `python scripts/ibkr_paper_experiment.py stage0-refusal` | as `paper-test-1` stage 0 | 0 |
+| 1 | `python scripts/ibkr_paper_experiment.py stage1-lookups` | as `paper-test-1` stage 1 (stage 4 needs a LIVE quote recorded here) | 0 |
+| 2 | `python scripts/ibkr_paper_experiment.py stage2-single-unfillable` | ONE BUY 1 LMT at 90% of the bid, transmitted on its own, no child: acknowledged by callback (above); then its cancel; then a later read shows it gone from open orders and Cancelled in completed orders, no execution, position 0 | 1 |
+| 3 | `python scripts/ibkr_paper_experiment.py stage3-unfillable-bracket` | `paper-test-1`'s unfillable bracket, both orders acknowledged by callback; parent cancelled first and confirmed; both confirmed by a later read; what TWS did to the child when the parent was cancelled is recorded (`child_on_parent_cancel`) | 2 |
+| 4 | `python scripts/ibkr_paper_experiment.py stage4-lifecycle` | `paper-test-1`'s stage 3 (entry, stop 1.00 below, one raise of 0.10, the close in two attempts, reconciliation clean, exactly 7 or 9 used in total), plus, after the entry fills and before the raise (below) | at most 7 |
+| any | `python scripts/ibkr_paper_experiment.py abort` | as `paper-test-1` | 0 |
+
+**Stage 4, the protective stop after the entry fills** (the owner's requirement, DECIDED 16). Reads
+only; nothing is sent. Within `PROTECTION_SETTLE_SECONDS` (15 s) of the entry's fill (its
+`execDetails`, else its Filled status): (1) an `orderStatus` for the stop carrying this client's id,
+received after the fill, PreSubmitted or Submitted (each message is recorded with its time after
+the fill, whether it arrived while a lookup was open, and any whyHeld; TWS uses the same message
+unprompted and in a lookup reply, so both count and are marked); (2) an open-orders read in which
+the BROKER's answer (not the session's own state) shows the stop working at its stop price,
+quantity 1, linked to the entry; (3) the position read 1 equal to the experiment's own fills 1. The
+stop's fields as TWS reports them (`stop_fields_as_reported`: prices, including any limit the
+broker added, OCA group and type, parent perm id) are recorded. Then `STOP_HOLD_SECONDS` (30 s),
+and the read again: the stop still working, the position still 1. A failure of the first check ends
+`STAGE4_PROTECTION_UNCONFIRMED`, of the second `STAGE4_PROTECTION_LOST`, with the TWS procedure;
+nothing more is sent (the stop is left working). The stop is never deliberately triggered. Stage 4
+also needs 61 minutes of liquid hours left (60 plus the 30 s hold, rounded up).
+
+| Stage | Endings (`result`) |
+|---|---|
+| 2 | `STAGE2_PASSED`; `STAGE2_ACK_UNKNOWN_HALTED`; `STAGE2_ACK_BY_RECONCILIATION` (alternative policy only); `STAGE2_ACK_NOT_BY_CALLBACK`; `STAGE2_REJECTED`; `STAGE2_UNEXPECTED_FILL` (a share without a stop: the TWS procedure); `STAGE2_CANCEL_NOT_CONFIRMED_BY_READ`; `STAGE2_FAILED` |
+| 3 | `STAGE3_PASSED`; `STAGE3_ACK_UNKNOWN_HALTED`; `STAGE3_ACK_BY_RECONCILIATION` (alternative only); `STAGE3_ACK_NOT_BY_CALLBACK`; `STAGE3_UNEXPECTED_FILL`; `STAGE3_PARENT_NOT_CONFIRMED_CANCELLED`; `STAGE3_CHILD_NOT_CONFIRMED_CANCELLED`; `STAGE3_CANCEL_NOT_CONFIRMED_BY_READ`; `STAGE3_FAILED`; a `PartialBracket` error (the parent cancel requested) |
+| 4 | `STAGE4_PASSED`; `STAGE4_NO_USABLE_QUOTE`; `STAGE4_ENTRY_REFUSED`; `STAGE4_ENTRY_NOT_FILLED`; `STAGE4_PROTECTION_UNCONFIRMED`; `STAGE4_PROTECTION_LOST`; `STAGE4_CLOSE_NO_QUOTE`; `STAGE4_CLOSE_REFUSED`; `STAGE4_CLOSE_OUTCOME_UNKNOWN`; `STAGE4_PROTECTION_NOT_RESTORED`; `STAGE4_CLOSE_NOT_FILLED`; `STAGE4_NOT_CLEAN` |
+
+Before stage 2 and again before stages 3 and 4: the full suite with the SDK at the exact commit, as
+for `paper-test-1`, recorded beside `paper-test-2.evidence/`; the TWS API message log on at Detail
+level and the state of "Bypass Order Precautions for API orders" recorded.
+
 ## Emergency stop
 
 - **The TWS window is the source of truth.** Check the TLT position and the working TLT orders
@@ -628,7 +699,7 @@ Facts only (paper account, TWS server version 226, ibapi 1052.1):
   orders" (Global Configuration > API > Precautions), and the TWS API message log switched on
   ("Create API message log file", logging level Detail).
 
-### Design items for a next experiment (NOT IMPLEMENTED)
+### Design items for a next experiment (defined in code as `paper-test-2`, NOT authorized; see its runbook)
 
 - A single unfillable order (a BUY LMT far below the bid, transmitted on its own) whose
   open-order and order-status rows must arrive BY CALLBACK, naming this client, within the wait
