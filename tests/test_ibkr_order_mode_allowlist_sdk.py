@@ -90,3 +90,55 @@ def test_historical_request_and_cancel_refused_on_the_order_session_by_every_sen
             n for n, _ in tws.requests}
     finally:
         s.disconnect()
+
+
+# --- review S3: the client-method set is pinned by value too; historical_bars refused first -----
+MAIN_READ_CLIENT_METHODS = frozenset({  # ALLOWED_CLIENT_METHODS on origin/main 2ff2961
+    "connect", "disconnect", "isConnected", "run", "reset", "setConnState", "checkConnected",
+    "validateInvalidSymbols", "useProtoBuf", "serverVersion", "twsConnectionTime", "logRequest",
+    "msgLoopTmo", "msgLoopRec", "keyboardInterrupt", "keyboardInterruptHard", "sendMsg",
+    "sendMsgProtoBuf", "startApi", "startApiProtoBuf", "reqContractDetails",
+    "reqContractDataProtoBuf", "cancelContractData", "cancelContractDataProtoBuf",
+    "reqAccountSummary", "reqAccountSummaryProtoBuf", "cancelAccountSummary",
+    "cancelAccountSummaryProtoBuf", "reqPositions", "reqPositionsProtoBuf", "cancelPositions",
+    "cancelPositionsProtoBuf", "reqMktData", "reqMarketDataProtoBuf", "cancelMktData",
+    "cancelMarketDataProtoBuf", "reqMarketDataType", "reqMarketDataTypeProtoBuf",
+    "reqConfigProtoBuf", "reqSecDefOptParams", "reqSecDefOptParamsProtoBuf"})
+ORDER_METHODS = frozenset({"placeOrderProtoBuf", "validateOrderParameters",
+                           "validateAttachedOrdersParameters", "cancelOrderProtoBuf",
+                           "reqAllOpenOrdersProtoBuf", "reqExecutionsProtoBuf",
+                           "reqCompletedOrdersProtoBuf", "reqIdsProtoBuf"})
+HIST_METHODS = frozenset({"reqHistoricalData", "reqHistoricalDataProtoBuf",
+                          "cancelHistoricalData", "cancelHistoricalDataProtoBuf"})
+
+
+def test_order_mode_client_methods_are_exactly_what_they_were_on_main():
+    from tradingbot.ibkr.session import ALLOWED_CLIENT_METHODS
+
+    assert order_session_module.ORDER_MODE_CLIENT_METHODS == MAIN_READ_CLIENT_METHODS | ORDER_METHODS
+    assert not order_session_module.ORDER_MODE_CLIENT_METHODS & HIST_METHODS
+    # a new read-only method needs a conscious order-mode decision, as for the ids
+    assert ALLOWED_CLIENT_METHODS - order_session_module.ORDER_MODE_READ_CLIENT_METHODS == HIST_METHODS
+
+
+def test_historical_bars_on_the_order_session_is_refused_before_the_pacer(tws, tmp_path):  # noqa: F811
+    from tradingbot.ibkr.historical import DEFAULT_HISTORICAL_PACER
+    from tradingbot.ibkr_orders.records import OrderModeViolation
+
+    s = make(tws, tmp_path)
+    try:
+        s._hist_pacer = DEFAULT_HISTORICAL_PACER
+        before_budget, wire = DEFAULT_HISTORICAL_PACER.sent_in_window(), list(tws.wire)
+        req = HistoricalBarsRequest(
+            contract=HistoricalContract(con_id=100000001, exchange="NYMEX"),
+            end=datetime(2026, 3, 9, 14, 15, tzinfo=UTC), duration="3600 S", bar_size="1 min",
+            what_to_show="MIDPOINT", regular_hours_only=False)
+        with pytest.raises(OrderModeViolation, match="not available on the order session"):
+            s.historical_bars(req)
+        assert DEFAULT_HISTORICAL_PACER.sent_in_window() == before_budget
+        assert s._pending == {} and tws.wire == wire
+        for name in HIST_METHODS:  # the client surface denies them by name now
+            with pytest.raises(ReadOnlyViolation):
+                getattr(s._client, name)(1, 2, 3)
+    finally:
+        s.disconnect()

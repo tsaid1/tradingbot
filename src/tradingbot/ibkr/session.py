@@ -197,19 +197,36 @@ def _outgoing_msg_id(frame: bytes, server_version: int | None) -> int | None:
         return None
 
 
+_HIST_REQUIRED_FIELDS = ("reqId", "contract", "endDateTime", "barSizeSetting", "duration",
+                         "whatToShow", "formatDate")
+
+
 def _check_historical_frame(frame: bytes, server_version: int | None) -> None:
-    """A REQ_HISTORICAL_DATA frame passes only as protobuf with ``keepUpToDate`` unset or false
-    (no streaming subscription through this adapter, whichever send path built the frame)."""
+    """A REQ_HISTORICAL_DATA frame passes only as protobuf whose bytes are exactly the canonical
+    encoding of what Python parsed (so no unknown field, duplicated field, wrong wire type or
+    non-minimal varint, which another parser might read differently), with every request field
+    present, ``formatDate`` 2 and ``keepUpToDate`` absent (no streaming subscription through this
+    adapter, whichever send path built the frame)."""
     body = frame[4:]
     if (server_version is None or server_version < MIN_SERVER_VER_PROTOBUF_HISTORICAL_DATA
             or int.from_bytes(body[:4], "big") <= PROTOBUF_MSG_ID):
         raise ReadOnlyViolation("a text-framed historical-data request is refused")
+    payload = body[4:]
     try:
-        req = HistoricalDataRequest.FromString(body[4:])
+        req = HistoricalDataRequest.FromString(payload)
+        req.DiscardUnknownFields()
+        canonical = req.SerializeToString()
     except Exception:  # noqa: BLE001 - unparseable: refuse
         raise ReadOnlyViolation("unparseable historical-data request refused") from None
-    if req.keepUpToDate:
+    if canonical != payload:
+        raise ReadOnlyViolation("non-canonical historical-data request refused")
+    if req.HasField("keepUpToDate"):
         raise ReadOnlyViolation("historical-data request with keepUpToDate refused")
+    missing = [f for f in _HIST_REQUIRED_FIELDS if not req.HasField(f)]
+    if missing:
+        raise ReadOnlyViolation(f"incomplete historical-data request refused (no {missing})")
+    if req.formatDate != FORMAT_DATE_EPOCH:
+        raise ReadOnlyViolation("historical-data request with formatDate other than 2 refused")
 
 
 # The SDK ``Connection`` (and through it the socket) behind each ``_GuardedConnection``, keyed by an
@@ -411,6 +428,7 @@ _side_clock = time.monotonic
 class _HistState:
     request: HistoricalBarsRequest
     received: int = 0  # bars delivered for this request (kept or not)
+    announced: int = 0  # bars carried by this request's protobuf messages so far
     end_start: str | None = None
     end_end: str | None = None
 
@@ -1432,13 +1450,15 @@ class IbkrSession:
         except BaseException as exc:  # noqa: BLE001 - cleanup must still run (incl. Ctrl-C)
             primary = exc
         finally:
-            if cancel is not None and not p.refused and (cancel_always or not p.ended):
-                failures = self._cancel(kind, p.req_id, cancel)
-            with self._cond:
-                if kind == "positions":
-                    self._positions = None
-                else:
-                    self._pending.pop(p.req_id, None)
+            try:
+                if cancel is not None and not p.refused and (cancel_always or not p.ended):
+                    failures = self._cancel(kind, p.req_id, cancel)
+            finally:  # even if the cancel raised a BaseException: never leave a stale entry
+                with self._cond:
+                    if kind == "positions":
+                        self._positions = None
+                    else:
+                        self._pending.pop(p.req_id, None)
         if isinstance(primary, (AccountIdentityError, ConfigResponseChanged)):
             try:
                 self.disconnect()
@@ -1729,6 +1749,7 @@ class IbkrSession:
                 if missing:
                     self._fail_hist(p, f"bar {i} has no {', '.join(missing)}")
                     return
+            p.hist.announced += len(proto.historicalDataBars)
 
     def _on_hist_bar(self, req_id: int, bar) -> None:
         with self._cond:
@@ -1738,6 +1759,9 @@ class IbkrSession:
                 return
             p.hist.received += 1
             if p.done:
+                return
+            if p.hist.received > p.hist.announced:  # e.g. a text-framed answer: no presence info
+                self._fail_hist(p, "bar arrived without its protobuf message")
                 return
             if len(p.rows) >= MAX_HISTORICAL_BARS:
                 self._fail_hist(p, f"more than {MAX_HISTORICAL_BARS} bars")
@@ -1761,7 +1785,8 @@ class IbkrSession:
                 return
             if p.done:
                 return
-            p.hist.end_start, p.hist.end_end = str(start), str(end)
+            p.hist.end_start = redact_accounts(str(start))
+            p.hist.end_end = redact_accounts(str(end))
             p.ended = p.done = True
             self._cond.notify_all()
 

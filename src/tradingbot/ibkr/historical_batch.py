@@ -150,9 +150,58 @@ def load_plan(path: str | Path) -> BarsPlan:
     return parse_plan(data, str(path))
 
 
+def _identity(path: Path) -> tuple[int, int] | None:
+    """(device, inode), None when the path does not exist; other errors propagate (refused)."""
+    try:
+        st = os.stat(path)
+    except FileNotFoundError:
+        return None
+    return (st.st_dev, st.st_ino)
+
+
+def _repository_identities(repo: Path) -> set[tuple[int, int]]:
+    """File identities of the repository: this checkout, its git directory, the main checkout and
+    every linked worktree recorded under ``<git dir>/worktrees/`` (as in runtime/vocab_review)."""
+    places = [repo]
+    dotgit, common = repo / ".git", None
+    if dotgit.is_dir():
+        common = dotgit
+    elif dotgit.is_file():
+        text = dotgit.read_text(encoding="utf-8").strip()
+        if text.startswith("gitdir:"):
+            gd = Path(text[len("gitdir:"):].strip())
+            gd = gd if gd.is_absolute() else repo / gd
+            common = gd.parent.parent if gd.parent.name == "worktrees" else gd
+    if common is not None:
+        places.append(common)
+        if common.name == ".git":
+            places.append(common.parent)
+        worktrees = common / "worktrees"
+        if worktrees.is_dir():
+            for d in worktrees.iterdir():
+                if (d / "gitdir").is_file():
+                    places.append(Path((d / "gitdir").read_text(encoding="utf-8").strip()).parent)
+    return {i for i in map(_identity, places) if i is not None}
+
+
 def check_output_path(path: str | os.PathLike, repo_root: str | os.PathLike) -> Path:
-    """The private report path: not inside the repository (after resolving symlinks), not
-    existing, not a symlink, in an existing directory owned by the caller."""
+    """The private report path: not inside the repository, not existing, not a symlink, in an
+    existing directory owned by the caller.
+
+    "Inside the repository" is decided by FILE IDENTITY (device, inode) of every existing
+    ancestor against this checkout, the main checkout, every linked worktree and the git
+    directory, never only by comparing strings: a case variant on a case-insensitive volume or a
+    symlinked ancestor cannot slip past. Any error while checking refuses."""
+    try:
+        return _check_output_path(path, repo_root)
+    except OutputPathRefused:
+        raise
+    except (OSError, ValueError) as exc:
+        raise OutputPathRefused(f"report path could not be checked ({type(exc).__name__}); "
+                                "refused") from None
+
+
+def _check_output_path(path: str | os.PathLike, repo_root: str | os.PathLike) -> Path:
     p = Path(path).expanduser()
     if not p.is_absolute():
         p = Path.cwd() / p
@@ -162,6 +211,11 @@ def check_output_path(path: str | os.PathLike, repo_root: str | os.PathLike) -> 
     repo = Path(repo_root).resolve()
     if resolved == repo or resolved.is_relative_to(repo):
         raise OutputPathRefused("report path is inside the repository; use a private directory")
+    ours = _repository_identities(repo)
+    for folder in (resolved.parent, *resolved.parent.parents):
+        if _identity(folder) in ours:
+            raise OutputPathRefused(f"report path is inside the repository ({folder} is the "
+                                    "same directory as a checkout or the git directory)")
     try:
         st = os.stat(resolved.parent)
     except OSError as exc:
@@ -255,7 +309,15 @@ def _run_requests(s: Any, plan: BarsPlan, rep: dict) -> None:
         rep["results"].append(row)
 
 
+NOT_RUN = "NOT_RUN"
+
+
 def _finish(rep: dict, plan: BarsPlan, cfg: PaperConnectionConfig | None) -> dict:
+    if not rep["results"]:  # setup or connect failed: one row per request, with a reason code
+        rep["results"] = [{"index": i, "name": nr.name, "status": SKIPPED, "reason": NOT_RUN,
+                           "request": request_to_jsonable(nr.request),
+                           "detail": f"not run: {rep['failure'] or 'no session'}"}
+                          for i, nr in enumerate(plan.requests)]
     cleanup = rep.get("session", {}).get("cleanup_failures") or []
     if cleanup and rep["failure"] is None:
         rep["failure"] = "cleanup: " + "; ".join(cleanup)

@@ -54,7 +54,8 @@ CFG = validate_config({"mode": "paper", "host": "127.0.0.1", "port": 7497, "clie
                        "tws_os_user": "someone", "read_only_check": "config-read"})  # synthetic
 END = datetime(2026, 3, 9, 14, 15, tzinfo=UTC)
 E0 = int(END.timestamp())
-FUT = HistoricalContract(con_id=100000001, exchange="NYMEX", include_expired=True)  # invented
+FUT = HistoricalContract(con_id=100000001, sec_type="FUT", exchange="NYMEX",
+                         include_expired=True)  # invented
 NY = ZoneInfo("America/New_York")
 
 
@@ -485,7 +486,8 @@ PLAN = {"schema": "tradingbot.ibkr.historical_bars_requests/1", "request_timeout
         "request": [
             {"name": f"r{i}", "end": END - timedelta(hours=i), "duration": "1800 S",
              "bar_size": "1 min", "what_to_show": "TRADES", "regular_hours_only": False,
-             "contract": {"con_id": 100000001, "exchange": "NYMEX", "include_expired": True}}
+             "contract": {"con_id": 100000001, "sec_type": "FUT", "exchange": "NYMEX",
+                          "include_expired": True}}
             for i in range(4)]}
 
 

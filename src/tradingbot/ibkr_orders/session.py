@@ -65,7 +65,6 @@ from tradingbot.ibkr.identity import check_row_account
 from tradingbot.ibkr.models import ContractQuery, ResolvedContract
 from tradingbot.ibkr.redact import redact_accounts
 from tradingbot.ibkr.session import (
-    ALLOWED_CLIENT_METHODS,
     MIN_SERVER_VER_CONFIG,
     IbkrSession,
     SessionState,
@@ -111,16 +110,29 @@ from tradingbot.ibkr_orders.timefmt import parse_broker_time
 ORDER_MESSAGES = frozenset({OUT.PLACE_ORDER, OUT.CANCEL_ORDER})  # need a one-shot permit each
 ORDER_READ_MESSAGES = frozenset({OUT.REQ_ALL_OPEN_ORDERS, OUT.REQ_EXECUTIONS,
                                  OUT.REQ_COMPLETED_ORDERS, OUT.REQ_IDS})
-# The read ids order mode allows: an EXPLICIT set, exactly the read-only allowlist as of 5835566.
-# It does not follow later additions to ``ALLOWED_OUT_MESSAGES`` (e.g. historical bars, 20 / 25):
-# each one needs its own decision and review for order mode.
+# The read ids order mode allows: an EXPLICIT set, exactly the read-only allowlist before
+# historical bars were added. It does not follow later additions to ``ALLOWED_OUT_MESSAGES``
+# (e.g. historical bars, 20 / 25): each one needs its own decision and review for order mode.
 ORDER_MODE_READ_MESSAGES = frozenset({
     OUT.START_API, OUT.REQ_CONTRACT_DATA, OUT.CANCEL_CONTRACT_DATA, OUT.REQ_ACCOUNT_SUMMARY,
     OUT.CANCEL_ACCOUNT_SUMMARY, OUT.REQ_POSITIONS, OUT.CANCEL_POSITIONS, OUT.REQ_MKT_DATA,
     OUT.CANCEL_MKT_DATA, OUT.REQ_MARKET_DATA_TYPE, OUT.REQ_CONFIG, OUT.REQ_SEC_DEF_OPT_PARAMS,
 })
 ORDER_MODE_OUT_MESSAGES = ORDER_MODE_READ_MESSAGES | ORDER_MESSAGES | ORDER_READ_MESSAGES
-ORDER_MODE_CLIENT_METHODS = ALLOWED_CLIENT_METHODS | frozenset({
+# The read client methods order mode allows: EXPLICIT, as for the ids (no historical methods).
+ORDER_MODE_READ_CLIENT_METHODS = frozenset({
+    "connect", "disconnect", "isConnected", "run", "reset", "setConnState", "checkConnected",
+    "validateInvalidSymbols", "useProtoBuf", "serverVersion", "twsConnectionTime", "logRequest",
+    "msgLoopTmo", "msgLoopRec", "keyboardInterrupt", "keyboardInterruptHard", "sendMsg",
+    "sendMsgProtoBuf", "startApi", "startApiProtoBuf",
+    "reqContractDetails", "reqContractDataProtoBuf", "cancelContractData",
+    "cancelContractDataProtoBuf", "reqAccountSummary", "reqAccountSummaryProtoBuf",
+    "cancelAccountSummary", "cancelAccountSummaryProtoBuf", "reqPositions", "reqPositionsProtoBuf",
+    "cancelPositions", "cancelPositionsProtoBuf", "reqMktData", "reqMarketDataProtoBuf",
+    "cancelMktData", "cancelMarketDataProtoBuf", "reqMarketDataType", "reqMarketDataTypeProtoBuf",
+    "reqConfigProtoBuf", "reqSecDefOptParams", "reqSecDefOptParamsProtoBuf",
+})
+ORDER_MODE_CLIENT_METHODS = ORDER_MODE_READ_CLIENT_METHODS | frozenset({
     # placing goes through our own protobuf (explicit transmit/outsideRth presence), never the
     # text-or-proto ``placeOrder`` / ``cancelOrder`` wrappers, which stay denied
     "placeOrderProtoBuf", "validateOrderParameters", "validateAttachedOrdersParameters",
@@ -534,6 +546,12 @@ class PaperOrderSession(IbkrSession):
     def order_ids(self) -> dict[int, str]:
         with self._cond:
             return {i: t.order_ref for i, t in self._tracks.items() if t.own}
+
+    def historical_bars(self, request, *, timeout=None):
+        """Not available on the order session: refused before the pacer or anything else is
+        touched. Use a read-only ``IbkrSession``."""
+        raise OrderModeViolation("historical bars are not available on the order session; use a "
+                                 "read-only IbkrSession")
 
     # ------------------------------------------------------------------ lifecycle
     def connect(self) -> None:

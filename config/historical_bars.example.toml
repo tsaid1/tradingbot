@@ -19,7 +19,7 @@
 # [request.contract]: con_id + exchange, or every identifying field contract discovery returns:
 #   con_id, symbol, sec_type (STK, IND, FUT, CONTFUT, CMDTY, CASH), exchange, currency,
 #   primary_exchange (STK), last_trade_date_or_contract_month, multiplier, trading_class (FUT),
-#   local_symbol, include_expired (true for an expired future).
+#   local_symbol, include_expired (true for an expired future; needs sec_type = "FUT").
 # At most 50 requests per file; the adapter paces them (>= 3 s apart, <= 50 per 10 minutes, no
 # identical request within 60 s) and a broker pacing violation stops the batch.
 
@@ -35,6 +35,7 @@ what_to_show = "TRADES"
 regular_hours_only = false
 [request.contract]
 con_id = 100000001
+sec_type = "FUT"
 exchange = "NYMEX"
 include_expired = true
 

@@ -35,7 +35,8 @@ from tradingbot.ibkr.historical_batch import (
 ROOT = Path(__file__).resolve().parents[1]
 END = datetime(2026, 3, 9, 14, 15, tzinfo=UTC)
 NY = ZoneInfo("America/New_York")
-FUT = HistoricalContract(con_id=100000001, exchange="NYMEX", include_expired=True)
+FUT = HistoricalContract(con_id=100000001, sec_type="FUT", exchange="NYMEX",
+                         include_expired=True)
 
 
 def req(**kw) -> HistoricalBarsRequest:
@@ -155,7 +156,8 @@ def test_build_bar_validation():
     b = _bar()
     assert b.start_utc == END - timedelta(minutes=1) and b.volume == Decimal(3)
     assert _bar(volume=Decimal(-1), bar_count=-1).volume is None
-    assert _bar(o=-37.6, h=-30.0, lo=-40.0, c=-37.0).close == -37.0  # negative prices are data
+    with pytest.raises(H.BarMalformed, match="positive"):  # negative: fails closed by decision
+        _bar(o=-37.6, h=-30.0, lo=-40.0, c=-37.0)
     for kw in ({"h": 0.9}, {"lo": 1.6}, {"o": float("inf")}, {"c": True}, {"o": "1"},
                {"date": "1773065700"}, {"volume": Decimal("NaN")}, {"bar_count": 1.5}):
         with pytest.raises(H.BarMalformed):

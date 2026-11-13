@@ -42,6 +42,17 @@ END_TIME_FORMAT = "%Y%m%d-%H:%M:%S"  # IBKR's UTC form, e.g. 20160127-23:59:59 (
 MAX_HISTORICAL_BARS = 2000  # 1 D of 1 min bars is at most 1440; more is a malformed answer
 DEFAULT_HISTORICAL_TIMEOUT = 60.0
 MAX_HISTORICAL_TIMEOUT = 300.0
+# The end time must lie between a fixed floor and now plus a small tolerance (clock skew), so a
+# typo is refused instead of silently read by TWS as "up to now".
+HIST_END_FLOOR = datetime(2010, 1, 1, tzinfo=UTC)
+HIST_END_FUTURE_TOLERANCE_SECONDS = 300
+# Bars must start inside the requested window. Durations in seconds are calendar time: one bar of
+# tolerance (60 s) covers the alignment of the first bar to its minute. Durations in D / W / M / Y
+# count TRADING days at IBKR (documented: "1 D" is the last trading session), so a window can reach
+# back over a weekend plus a holiday: allow that many extra calendar days.
+HIST_BAR_ALIGN_SECONDS = 60
+HIST_CALENDAR_SLACK_DAYS = 4
+_UNIT_DAYS = {"D": 1, "W": 7, "M": 31, "Y": 366}
 
 # --- pacing (IBKR documentation, applied conservatively) ------------------------------------------
 # Documented: no identical request within 15 s; no six or more requests for the same contract,
@@ -116,8 +127,8 @@ class HistoricalContract:
             raise HistoricalRequestInvalid("contract.exchange is required")
         if self.sec_type and self.sec_type not in SEC_TYPES:
             raise HistoricalRequestInvalid(f"contract.sec_type must be one of {SEC_TYPES}")
-        if self.include_expired and self.sec_type not in ("FUT", ""):
-            raise HistoricalRequestInvalid("include_expired applies to futures only")
+        if self.include_expired and self.sec_type != "FUT":
+            raise HistoricalRequestInvalid("include_expired needs sec_type FUT (given explicitly)")
         ltd = self.last_trade_date_or_contract_month
         if ltd and not re.fullmatch(r"\d{6}|\d{8}", ltd):
             raise HistoricalRequestInvalid("last_trade_date_or_contract_month: YYYYMM or YYYYMMDD")
@@ -143,8 +154,13 @@ class HistoricalContract:
                    local_symbol=d.local_symbol, include_expired=include_expired)
 
 
+def _now() -> datetime:  # a seam for tests only
+    return datetime.now(UTC)
+
+
 def _check_end(end: object) -> datetime:
-    """Aware, whole seconds, unambiguous in its own zone; returned in UTC."""
+    """Aware, whole seconds (also after conversion to UTC), unambiguous in its own zone, between
+    ``HIST_END_FLOOR`` and now plus ``HIST_END_FUTURE_TOLERANCE_SECONDS``; returned in UTC."""
     if not isinstance(end, datetime):
         raise HistoricalRequestInvalid("end must be a datetime")
     if end.tzinfo is None or end.utcoffset() is None:
@@ -156,7 +172,14 @@ def _check_end(end: object) -> datetime:
         raise HistoricalRequestInvalid(
             f"end {end.replace(tzinfo=None).isoformat()} is ambiguous or does not exist in "
             f"{end.tzinfo}; give it in UTC or with a fixed offset")
-    return end.astimezone(UTC)
+    utc = end.astimezone(UTC)
+    if utc.microsecond:  # an offset with sub-second precision: refused, never truncated
+        raise HistoricalRequestInvalid("end must be a whole second in UTC (sub-second offset)")
+    if utc < HIST_END_FLOOR:
+        raise HistoricalRequestInvalid(f"end is before {HIST_END_FLOOR.date().isoformat()}")
+    if utc > _now() + timedelta(seconds=HIST_END_FUTURE_TOLERANCE_SECONDS):
+        raise HistoricalRequestInvalid("end is in the future")
+    return utc
 
 
 @dataclass(frozen=True)
@@ -194,8 +217,30 @@ class HistoricalBarsRequest:
     def intraday(self) -> bool:
         return self.bar_size != BAR_1_DAY
 
+    def window_start(self) -> datetime:
+        """Earliest start a bar of this request may have (see HIST_CALENDAR_SLACK_DAYS)."""
+        n, unit = self.duration.split()
+        if unit == "S":
+            return self.end - timedelta(seconds=int(n) + HIST_BAR_ALIGN_SECONDS)
+        return self.end - timedelta(days=int(n) * _UNIT_DAYS[unit] + HIST_CALENDAR_SLACK_DAYS)
+
     def pacing_key(self) -> tuple:
-        return (self.contract, self.end, self.duration, self.bar_size, self.what_to_show,
+        """Canonical: the same contract written two ways is the same request. With a conId the
+        conId alone identifies it; otherwise the identifying fields, case-folded, multiplier as a
+        number, local symbol ignored. (conId versus fields cannot be matched without a broker
+        lookup; the spacing and the cap still apply.)"""
+        k = self.contract
+        if k.con_id:
+            ident: tuple = ("conId", k.con_id)
+        else:
+            try:
+                mult = format(Decimal(k.multiplier).normalize(), "f") if k.multiplier else ""
+            except Exception:  # noqa: BLE001 - not a number: keep as written
+                mult = k.multiplier
+            ident = ("fields", k.symbol.upper(), k.sec_type.upper(), k.exchange.upper(),
+                     k.currency.upper(), k.primary_exchange.upper(),
+                     k.last_trade_date_or_contract_month, mult, k.trading_class.upper())
+        return (ident, self.end, self.duration, self.bar_size, self.what_to_show,
                 self.regular_hours_only)
 
 
@@ -265,8 +310,17 @@ def build_bar(raw_date: object, open_: object, high: object, low: object, close:
             raise BarMalformed(f"bar {name} is not a finite number")
         prices.append(float(v))
     o, h, lo, c = prices
+    if min(prices) <= 0:
+        # zero, -1 (an unset sentinel) and any negative price fail the read; by decision this
+        # also fails closed on a genuinely negative futures price
+        raise BarMalformed("bar prices must be positive")
     if not (lo <= min(o, c) and h >= max(o, c) and lo <= h):
         raise BarMalformed("bar high / low do not bound open and close")
+    window = request.window_start()
+    if start is not None and start < window:
+        raise BarMalformed("bar starts before the requested window")
+    if session_date is not None and date.fromisoformat(session_date) < window.date():
+        raise BarMalformed("day bar dated before the requested window")
     if start is not None and start >= request.end:
         raise BarMalformed("bar starts at or after the requested end")
     # a day bar is dated by its session (which may close after the UTC date of the end)
@@ -364,7 +418,10 @@ class HistoricalPacer:
     ``admit`` waits out the minimum spacing (at most ``HIST_MIN_SPACING_SECONDS``), and refuses
     (returns a reason, records nothing) when the rolling cap is reached, when an identical
     request was admitted within ``HIST_IDENTICAL_INTERVAL_SECONDS``, or after ``latch`` (a
-    broker-reported pacing violation)."""
+    broker-reported pacing violation; there is no way to un-latch).
+
+    Scope: one process. Separate script runs do not share a pacer (each run is its own unit);
+    the operator spaces runs. ``IbkrSession(historical_pacer=...)`` exists for tests only."""
 
     def __init__(self, *, clock: Callable[[], float] = time.monotonic,
                  sleep: Callable[[float], None] = time.sleep,
@@ -377,16 +434,21 @@ class HistoricalPacer:
         self._lock = threading.Lock()
         self._sent: deque[float] = deque()
         self._keys: dict[tuple, float] = {}
-        self.latched: str | None = None
+        self._latched: str | None = None
         self.waited_seconds = 0.0
+
+    @property
+    def latched(self) -> str | None:
+        """Why the pacer is latched (None if not). Read-only: nothing un-latches it."""
+        return self._latched
 
     def latch(self, why: str) -> None:
         with self._lock:
-            self.latched = self.latched or why
+            self._latched = self._latched or why
 
     def admit(self, key: tuple) -> str | None:
         with self._lock:
-            if self.latched is not None:
+            if self._latched is not None:
                 return R_LOCAL_PACING_LATCHED
             now = self._clock()
             while self._sent and now - self._sent[0] >= self.window:
