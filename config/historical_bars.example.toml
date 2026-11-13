@@ -1,0 +1,71 @@
+# Example request file for scripts/ibkr_historical_bars.py (read-only historical bars).
+# EVERY VALUE BELOW IS INVENTED: the conIds, months and times are placeholders, not real
+# contracts and not tied to any post. Copy this file to a private location and edit it there.
+#
+# Top level: schema (required), request_timeout (seconds per request, 1..300, default 60).
+# [[request]] keys (all required except time_zone):
+#   name               unique label (stays in the private report; never printed)
+#   end                TOML date-time. Either with an offset (2026-03-09T10:15:00-04:00, or ...Z)
+#                      or a local date-time plus time_zone (an IANA name). A local date-time
+#                      without time_zone is refused, as is a wall-clock time that is ambiguous or
+#                      skipped by a DST change in that zone. Whole seconds only.
+#   time_zone          e.g. "America/New_York" (only with a local end)
+#   bar_size           "1 min" or "1 day"
+#   duration           1 min: "1800 S", "3600 S", "7200 S", "14400 S", "28800 S", "1 D"
+#                      1 day: "1 W", "1 M", "3 M", "6 M", "1 Y"
+#   what_to_show       "TRADES", "MIDPOINT", "BID" or "ASK" (an index has no BID / ASK history:
+#                      the broker's refusal is reported as such)
+#   regular_hours_only true / false
+# [request.contract]: con_id + exchange, or every identifying field contract discovery returns:
+#   con_id, symbol, sec_type (STK, IND, FUT, CONTFUT, CMDTY, CASH), exchange, currency,
+#   primary_exchange (STK), last_trade_date_or_contract_month, multiplier, trading_class (FUT),
+#   local_symbol, include_expired (true for an expired future; needs sec_type = "FUT").
+# At most 50 requests per file; the adapter paces them (>= 3 s apart, <= 50 per 10 minutes, no
+# identical request within 60 s) and a broker pacing violation stops the batch.
+
+schema = "tradingbot.ibkr.historical_bars_requests/1"
+request_timeout = 60.0
+
+[[request]]
+name = "example-future-by-conid"
+end = 2026-03-09T10:15:00-04:00
+bar_size = "1 min"
+duration = "3600 S"
+what_to_show = "TRADES"
+regular_hours_only = false
+[request.contract]
+con_id = 100000001
+sec_type = "FUT"
+exchange = "NYMEX"
+include_expired = true
+
+[[request]]
+name = "example-future-by-fields-local-time"
+end = 2026-11-02T09:30:00
+time_zone = "America/New_York"
+bar_size = "1 min"
+duration = "1800 S"
+what_to_show = "MIDPOINT"
+regular_hours_only = false
+[request.contract]
+symbol = "XYZ"
+sec_type = "FUT"
+exchange = "NYMEX"
+currency = "USD"
+last_trade_date_or_contract_month = "20261218"
+multiplier = "1000"
+trading_class = "XYZ"
+include_expired = true
+
+[[request]]
+name = "example-index-daily"
+end = 2026-06-30T21:00:00Z
+bar_size = "1 day"
+duration = "1 M"
+what_to_show = "TRADES"
+regular_hours_only = true
+[request.contract]
+symbol = "ABC"
+sec_type = "IND"
+exchange = "CBOE"
+currency = "USD"

@@ -116,7 +116,8 @@ def test_runtime_execution_core_and_read_only_adapter_do_not_load_the_order_pack
 # --- row 2: the read-only adapter's outgoing allowlist is unchanged -------------------------------
 READ_ONLY_OUT = {"START_API", "REQ_CONTRACT_DATA", "CANCEL_CONTRACT_DATA", "REQ_ACCOUNT_SUMMARY",
                  "CANCEL_ACCOUNT_SUMMARY", "REQ_POSITIONS", "CANCEL_POSITIONS", "REQ_MKT_DATA",
-                 "CANCEL_MKT_DATA", "REQ_MARKET_DATA_TYPE", "REQ_CONFIG", "REQ_SEC_DEF_OPT_PARAMS"}
+                 "CANCEL_MKT_DATA", "REQ_MARKET_DATA_TYPE", "REQ_CONFIG", "REQ_SEC_DEF_OPT_PARAMS",
+                 "REQ_HISTORICAL_DATA", "CANCEL_HISTORICAL_DATA"}
 
 
 def test_read_only_allowlist_is_exactly_the_reviewed_read_set():

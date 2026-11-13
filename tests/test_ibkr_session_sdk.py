@@ -67,7 +67,7 @@ CFG = validate_config(CFG_DATA)
 def stub_preflight(cfg):  # the real preflight reads the local socket table; tested elsewhere
     return {"stub": True}
 DATA_REQUESTS = {"REQ_CONTRACT_DATA", "REQ_ACCOUNT_SUMMARY", "REQ_POSITIONS", "REQ_MKT_DATA",
-                 "REQ_MARKET_DATA_TYPE"}
+                 "REQ_MARKET_DATA_TYPE", "REQ_HISTORICAL_DATA"}
 SERVER_VERSIONS = [219, 226]  # lowest accepted (MIN_SERVER_VERSION) and this SDK's maximum
 
 
@@ -585,7 +585,8 @@ def test_allowlist_is_exactly_known_and_exists_in_sdk():
         "reqPositionsProtoBuf", "cancelPositions", "cancelPositionsProtoBuf", "reqMktData",
         "reqMarketDataProtoBuf", "cancelMktData", "cancelMarketDataProtoBuf", "reqMarketDataType",
         "reqMarketDataTypeProtoBuf", "reqConfigProtoBuf", "reqSecDefOptParams",
-        "reqSecDefOptParamsProtoBuf"}
+        "reqSecDefOptParamsProtoBuf", "reqHistoricalData", "reqHistoricalDataProtoBuf",
+        "cancelHistoricalData", "cancelHistoricalDataProtoBuf"}
 
 
 def test_every_non_allowlisted_eclient_method_raises_and_sends_nothing(tws):
