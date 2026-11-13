@@ -674,22 +674,32 @@ anchored entries. Do not silently choose one instrument from a post containing m
 actions."
 
 * *Cost basis, every family* (`ENTRY_PRICE_IS_COST_BASIS`). A SUPPORTED OPEN or ADD with a stated
-  entry price holds when that price, found in the post as written (the read-price locator of the
-  number rule above, every place the value is written), is introduced by an average or
-  cost-basis word (`instruction_terms.COST_BASIS_ENTRY_WORDS`: avg, avg., average, averaged,
-  averaging, cost, costs, basis, blended; so "average cost", "avg cost" and "cost basis" too).
-  Introduced by: such a word anywhere in the same sentence before the number (a sentence ends at
-  ". ! ? ;" or a line break; a full stop before a digit or ending "avg." does not end it), or the
-  word directly after the number with only spaces between. Hold: "long $TLT, avg 88.42 now",
-  "cost basis 88.42 now", "avg cost, 88.40 now", "at an average of 88.42", "blended 88.42",
-  "at 88.42 avg", "at 88.42 cost basis". Still sends: "at 88.42", "Our avg is 87.90. We are now
-  long more at 88.42." (the fresh entry is a different number in another sentence), "at 88.42 on
-  average volume" (not directly after). If the entry value is written twice and one place is an
-  average ("Avg 88.42 and we buy more at 88.42"), which number is the fresh entry cannot be told:
-  hold. The interpreter's reading does not matter: the check runs on the action's own entry
-  price at the mapping layer. "filled", "entered" and "paid" are not on the list (they report an
-  entry, not an average). Collateral: an unrelated "average" earlier in the entry's own sentence
-  ("above average, we are now long at 88.42") holds.
+  entry price is checked at the mapping layer, whatever the interpreter made of the post, on the
+  text as written and on its ASCII-folded shadow. The price is found as written (the read-price
+  locator of the number rule above; every place the value is written counts). The words:
+  `instruction_terms.COST_BASIS_ENTRY_WORDS` (avg, av, avrg, average, averaged, averaging, cost,
+  costs, basis, blended, and breakeven taken from `COST_BASIS_WORDS`; so "average cost", "avg
+  cost", "cost basis", "avg." and "av." too, also glued to the number as in "avg.88.42") and the
+  phrases "break-even", "b/e", "mean price", "mean cost". A sentence ends at ". ! ?" or a line
+  break, never at ";" (a full stop before a digit or ending "avg." / "av." does not end it). The
+  entry holds when:
+  (i) such a word is anywhere in the entry's sentence, before or after the number ("avg 88.42
+  now", "at 88.42, our average", "at 88.42 (our average)", "at 88.42; cost basis", "at 88.42 on
+  average volume", the last as collateral);
+  (ii) the directly following sentence has one and carries no number of its own ("...at 88.42.
+  That is our average.");
+  (iii) the post has a cost-basis expression anywhere and the entry's sentence holds another price
+  that is not the action's own stop or target: which of several fills is the fresh entry cannot
+  be told ("Bought at 88.42 and 87.80. Average 88.10. We are long $TLT." with either fill);
+  (iv) "from" or "since" stands directly before the price ("long from 88.42", "in from 88.42",
+  "holding from 88.42", "long since 88.42"; collateral: a range written "from 88.40 to 88.60");
+  (v) a word holding a non-ASCII letter is in the entry's sentence or the following one: it is
+  unreadable for this purpose (an accented, Cyrillic or full-width "avg" never passes).
+  Still sends: "at 88.42"; "Our average is 88.10. We are long $TLT at 88.42." (a separately
+  stated single entry); "...at 88.42. Our average is 87.90." (the next sentence has its own
+  number); "...at 88.42, stop 87.20. Our avg is 87.90." (the other number is the action's stop);
+  "a mean reversion trade". Decided behaviour: "filled at 88.42" and "in at 88.42" are reports of
+  the publisher's own entry and are followed at that stated price, as before.
 * *Multi-market checks for explicit entries.* For a family with `anchor_scope =
   "SINGLE_MARKET_POST"` (TLT), a CURRENT explicit-entry OPEN or ADD now receives the post-level
   competing-instrument checks of an anchored entry, with the same codes (the `ENTRY_ANCHOR_POST_*`
@@ -702,7 +712,13 @@ actions."
   level-kind sentence rules): they decide whether a number is a market quotation, which an
   explicit entry does not need. So "...at 88.42. Stop 87.20. Zorbex 12.40." now holds; "...at
   88.42. Stop 87.20. Bonds look firm this week." still sends. Exits, stop amendments and families
-  without that scope are unchanged.
+  without that scope are unchanged. A part after a semicolon that states only the action's own
+  protective levels belongs to the action ("...at 88.42; stop 87.20; target 90." sends); any other
+  part is checked as before. Decided behaviour: figurative instruction words in a later commentary
+  sentence ("Buy the dip.", "The long end is bid.") hold the post, on both paths. A word in a
+  script without letter case (Japanese, Arabic, Hebrew, Thai, Chinese) is read as a possible name
+  on both paths: its shadow placeholder is capitalised, so "...<such a word> is near 12.40." holds
+  like "Qorvex sits near 12.40.".
 
 ## Level contract rule
 

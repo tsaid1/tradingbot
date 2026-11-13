@@ -606,8 +606,11 @@ CONTEXT_LEVEL_WORDS = LEVEL_WORDS | COST_BASIS_WORDS
 # COST_BASIS_WORDS: "filled", "entered" or "paid" report an entry, they do not average one).
 # Multi-word forms ("average cost", "avg cost", "cost basis") are covered by their words.
 COST_BASIS_ENTRY_WORDS = frozenset((
-    "avg", "average", "averaged", "averaging", "cost", "costs", "basis", "blended",
-))
+    "avg", "av", "avrg", "average", "averaged", "averaging", "cost", "costs", "basis", "blended",
+)) | (COST_BASIS_WORDS & {"breakeven"})
+# Cost-basis forms that are not one plain word ("break-even", "b/e", "mean price", "mean cost").
+COST_BASIS_ENTRY_PHRASES_RE = re.compile(
+    r"\bbreak-even\b|\bb/e\b|\bmean\s+(?:price|cost)\b", re.IGNORECASE)
 
 
 def level_kind_of_words(words) -> AnchorLevelKind | None:

@@ -67,7 +67,6 @@ def test_an_add_at_the_average_holds_too(tmp_path):
 @pytest.mark.parametrize("text,entry", [
     ("We are now long $QETF at 50.10. Stop 48.90.", "50.10"),  # a plain explicit entry
     ("Our avg is 49.80. We are now long more $QETF at 50.10. Stop 48.90.", "50.10"),  # independent
-    ("We are now long $QETF at 50.10 on average volume. Stop 48.90.", "50.10"),  # not directly
 ])
 def test_an_independent_fresh_entry_is_used_as_today(tmp_path, text, entry):
     d = decide(tmp_path, text, entry, rule=NO_RULE)
@@ -118,7 +117,6 @@ def test_the_additive_ellipsis_holds_an_explicit_entry():
 @pytest.mark.parametrize("text", [
     EXPLICIT,
     f"{EXPLICIT} Bonds look firm this week.",  # plain commentary
-    "We are now long $TLT at 88.42 on average volume. Stop 87.20.",
 ])
 def test_a_clean_explicit_tlt_entry_still_sends(text):
     rows, sent = run(text)
@@ -135,3 +133,97 @@ def test_a_family_without_the_scope_is_unchanged(tmp_path):
     before."""
     d = decide(tmp_path, "We are now long $QETF at 50.10. Stop 48.90. Zorbex 12.40.", "50.10")
     assert d.status == "SUPPORTED", d
+
+
+# ---------------------------------------------------------------- fix round of PR #75
+
+
+@pytest.mark.parametrize("text,entry", [
+    # (i) a cost-basis word anywhere in the entry's sentence, before or after; ";" does not end it
+    ("We are long $QETF at 50.10, our average. Stop 48.90.", "50.10"),
+    ("We are long $QETF at 50.10 (our average). Stop 48.90.", "50.10"),
+    ("We are long $QETF at 50.10 - our average. Stop 48.90.", "50.10"),
+    ("We are long $QETF at 50.10 is our avg. Stop 48.90.", "50.10"),
+    ("We are long $QETF at 50.10; cost basis. Stop 48.90.", "50.10"),
+    ("We are now long $QETF at 50.10 on average volume. Stop 48.90.", "50.10"),  # collateral
+    # (ii) the next sentence refers back and carries no number of its own
+    ("We are long $QETF at 50.10. That is our average. Stop 48.90.", "50.10"),
+    # a past fill sent as the entry
+    ("Bought at 50.42 and 49.80, average 50.10. We are long $QETF. Stop 48.90.", "49.80"),
+    # (iii) a cost-basis expression in the post and other prices in the entry's sentence
+    ("Bought at 50.42 and 49.80. Average 50.10. We are long $QETF. Stop 48.90.", "50.42"),
+    ("Bought at 50.42 and 49.80. Average 50.10. We are long $QETF. Stop 48.90.", "49.80"),
+    # the word list: break-even forms, abbreviations, "mean price", glued "avg."
+    ("We are now long $QETF, breakeven 50.10. Stop 48.90.", "50.10"),
+    ("We are now long $QETF, break-even 50.10. Stop 48.90.", "50.10"),
+    ("We are now long $QETF, b/e 50.10. Stop 48.90.", "50.10"),
+    ("We are now long $QETF, av. 50.10. Stop 48.90.", "50.10"),
+    ("We are now long $QETF, avrg 50.10. Stop 48.90.", "50.10"),
+    ("We are now long $QETF, mean price 50.10. Stop 48.90.", "50.10"),
+    ("We are now long $QETF, mean cost 50.10. Stop 48.90.", "50.10"),
+    ("We are now long $QETF, avg.50.10. Stop 48.90.", "50.10"),
+    # a non-ASCII letter in the checked window is unreadable: look-alikes of "avg" never pass
+    ("We are now long $QETF, аvg 50.10. Stop 48.90.", "50.10"),  # Cyrillic a
+    ("We are now long $QETF, ávg 50.10. Stop 48.90.", "50.10"),  # accented
+    ("We are now long $QETF, ａｖｇ 50.10. Stop 48.90.", "50.10"),  # full-width
+    # position-from phrasing
+    ("We are long $QETF from 50.10. Stop 48.90.", "50.10"),
+    ("We are in from 50.10 on $QETF. Stop 48.90.", "50.10"),
+    ("Holding $QETF from 50.10. Stop 48.90.", "50.10"),
+    ("We are long $QETF since 50.10. Stop 48.90.", "50.10"),
+])
+def test_an_average_or_position_from_price_is_never_the_fresh_entry(tmp_path, text, entry):
+    d = decide(tmp_path, text, entry, rule=NO_RULE)
+    assert d.status == "UNRESOLVED" and d.reason.split(",")[0] == ENTRY_PRICE_IS_COST_BASIS, d
+
+
+@pytest.mark.parametrize("text,entry", [
+    ("Our average is 50.10. We are long $QETF at 50.42. Stop 48.90.", "50.42"),  # kept pin
+    ("We are long $QETF at 50.10. Our average is 49.90. Stop 48.90.", "50.10"),  # its own number
+    ("We are long $QETF at 50.10, stop 48.90. Our avg is 49.90.", "50.10"),  # the stop is the
+    ("We are long $QETF at 50.10, a mean reversion trade. Stop 48.90.", "50.10"),  # action's own
+    # decided behaviour: a report of the publisher's own entry is followed at that price
+    ("We filled at 50.10 on $QETF. Stop 48.90.", "50.10"),
+    ("We are in at 50.10 on $QETF. Stop 48.90.", "50.10"),
+])
+def test_a_separately_stated_single_entry_still_sends(tmp_path, text, entry):
+    d = decide(tmp_path, text, entry, rule=NO_RULE)
+    assert d.status == "SUPPORTED", d
+
+
+CASELESS = ["ゾルベックス",  # Japanese (katakana)
+            "زوربكس",  # Arabic
+            "זורבקס",  # Hebrew
+            "ซอร์เบกซ์",  # Thai
+            "佐贝克"]  # Chinese
+
+
+@pytest.mark.parametrize("word", CASELESS, ids=["ja", "ar", "he", "th", "zh"])
+@pytest.mark.parametrize("shape", [
+    "We are now long $TLT at 88.42. Stop 87.20. {w} is near 12.40.",  # explicit
+    "We are now long $TLT, 88.42 now. Stop 87.20. {w} is near 12.40.",  # anchored
+], ids=["explicit", "anchored"])
+def test_a_name_in_a_caseless_script_is_a_possible_market(word, shape):
+    rows, sent = run(shape.format(w=word))
+    assert sent == [], rows
+    assert any(r[0] == "OPEN" and r[2].startswith("ENTRY_ANCHOR_POST_UNRESOLVED_MARKET")
+               for r in rows), rows
+
+
+@pytest.mark.parametrize("text", [
+    "We are now long $TLT at 88.42; stop 87.20.",
+    "Buying $TLT at 88.42; stop 87.20; target 90.",
+])
+def test_the_actions_own_protective_levels_after_a_semicolon_belong_to_it(text):
+    rows, sent = run(text)
+    assert len(sent) == 1, rows
+
+
+@pytest.mark.parametrize("text", [
+    "We are now long $TLT at 88.42; buy more at 87.50. Stop 87.20.",  # not only protective
+    f"{EXPLICIT} Buy the dip.",  # figurative instruction words hold (decided)
+    f"{EXPLICIT} The long end is bid.",
+])
+def test_other_semicolon_and_commentary_sentences_still_hold(text):
+    rows, sent = run(text)
+    assert sent == [], rows

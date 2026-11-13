@@ -77,6 +77,7 @@ from tradingbot.runtime.instruction_terms import (
     ADD_WORDS,
     ADDITIVE_PHRASES,
     ADDITIVE_WORDS,
+    COST_BASIS_ENTRY_PHRASES_RE,
     COST_BASIS_ENTRY_WORDS,
     INSTRUMENT_NOUNS,
     MARKET_NOUNS,
@@ -1496,7 +1497,7 @@ class FamilyMapping(StrictModel):
         # "may contain multiple actionable instruments".
         problem = self._competing_instrument(text, asset, mine, mine_lower, markers,
                                              lexicon or AnchorLexicon(), own_clause,
-                                             evidence)
+                                             evidence, action=action, anchor=anchor)
         if problem:
             return problem
         if not level_rules:  # an explicit entry: (a) and (d) are about a quoted level
@@ -1514,7 +1515,9 @@ class FamilyMapping(StrictModel):
         return []
 
     def _competing_instrument(self, text, asset, mine, mine_lower, markers, lexicon,
-                              own_clause, evidence: _EvidenceSink | None = None) -> list[str]:
+                              own_clause, evidence: _EvidenceSink | None = None, *,
+                              action: TradeAction | None = None,
+                              anchor: Decimal | None = None) -> list[str]:
         """(a) a mention the bot cannot tie to this family (``unresolved_market_mentions``, and a
         sentence-initial unknown capitalised word) holds only when its own sentence gives it a
         trading context: an instruction, stop or target word (``ACTION_SEMANTIC_WORDS``), a
@@ -1557,9 +1560,22 @@ class FamilyMapping(StrictModel):
                     or has_phrase(sentence, ADDITIVE_PHRASES)):
                 return [ENTRY_ANCHOR_POST_UNRESOLVED_MARKET, "RULE:ADDITIVE_ELLIPSIS"]
         for sentence in texts:
-            if sentence not in own_sentences and instruction_word_in(sentence):
+            if sentence not in own_sentences and instruction_word_in(sentence) \
+                    and not self._own_semicolon_levels(sentence, own_clause, action, anchor,
+                                                       lexicon):
                 return [ENTRY_ANCHOR_POST_UNATTRIBUTED_ACTION, "RULE:UNATTRIBUTED_ACTION_SENTENCE"]
         return []
+
+    def _own_semicolon_levels(self, sentence, own_clause, action, anchor, lexicon) -> bool:
+        """PR #75 review: "...at 88.42; stop 87.20; target 90." is one sentence whose first part
+        is the action's own clause and whose every later part (after a semicolon) states only the
+        action's own protective levels (``_own_protective_levels``): it belongs to the action."""
+        parts = [p.strip() for p in sentence.split(";")]
+        if len(parts) < 2 or not own_clause or anchor is None or action is None \
+                or parts[0] not in own_clause:
+            return False
+        return all(p and self._own_protective_levels(p, False, anchor, action, lexicon,
+                                                     require_key=False) for p in parts[1:])
 
     def _month_spans(self, text: str) -> list[tuple[int, int]]:
         """A future's contract months in ``text``: left to the contract check."""
@@ -1953,6 +1969,25 @@ class MappingPolicy:
         return self.resolve(action, **kwargs)[0]
 
     def resolve(self, action: TradeAction, **kw) -> tuple[MappingDecision, Instrument | None]:
+        """``_resolve_text``, then the owner's cost-basis rule of 13 November 2026 for a SUPPORTED
+        OPEN or ADD with a stated entry price, in every family (``entry_is_cost_basis``)."""
+        d, instrument = self._resolve_text(action, **kw)
+        if d.status != "SUPPORTED" or action.action not in (Action.OPEN, Action.ADD):
+            return d, instrument
+        text = kw.get("post_text") or kw.get("clause")
+        own_levels = [action.stop_price, action.target_price,
+                      *(v for r, v in (kw.get("levels") or ()) if r in ("STOP", "TARGET"))]
+        if action.entry_reference is not None and entry_is_cost_basis(
+                action.entry_reference, COST_BASIS_ENTRY_WORDS, COST_BASIS_ENTRY_PHRASES_RE,
+                own_levels, text, ascii_shadow(text)[0]):
+            # Owner, 13 November 2026: every family; an independent fresh entry (a different
+            # number) is the action's entry as today and is not looked at here.
+            return MappingDecision(status="UNRESOLVED", reason=ENTRY_PRICE_IS_COST_BASIS,
+                                   **d.model_dump(include={"action_id", "source_asset", "family",
+                                                           "broker_symbol", "basis"})), None
+        return d, instrument
+
+    def _resolve_text(self, action: TradeAction, **kw) -> tuple[MappingDecision, Instrument | None]:
         """``_resolve``, then the entry rule's check of text that is not plain ASCII
         (``tradingbot.runtime.entry_text``), for an OPEN or ADD in a family with an entry rule
         (entry_rule = REFERENCE_AS_COLLAR or a family stop distance). It only ever turns a
@@ -1962,14 +1997,6 @@ class MappingPolicy:
         d, instrument = self._resolve(action, **kw)
         if d.status != "SUPPORTED" or action.action not in (Action.OPEN, Action.ADD):
             return d, instrument
-        if action.entry_reference is not None and entry_is_cost_basis(
-                action.entry_reference, COST_BASIS_ENTRY_WORDS,
-                kw.get("post_text") or kw.get("clause")):
-            # Owner, 13 November 2026: every family; an independent fresh entry (a different
-            # number) is the action's entry as today and is not looked at here.
-            return MappingDecision(status="UNRESOLVED", reason=ENTRY_PRICE_IS_COST_BASIS,
-                                   **d.model_dump(include={"action_id", "source_asset", "family",
-                                                           "broker_symbol", "basis"})), None
         entry = self.entries.get(d.family) if d.family else None
         if not isinstance(entry, FamilyMapping) or not (
             entry.entry_rule == "REFERENCE_AS_COLLAR" or getattr(entry, "max_stop_distance", None)
