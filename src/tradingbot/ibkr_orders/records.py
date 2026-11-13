@@ -98,9 +98,13 @@ class OrderRefused(IbkrError):
 class OrderOutcomeUnknown(IbkrError):
     """The request was (or may have been) sent and no acknowledgement arrived: never retried."""
 
-    def __init__(self, message: str, *, orders: tuple = ()) -> None:
+    def __init__(self, message: str, *, orders: tuple = (),
+                 reconciliation: dict[int, str] | None = None) -> None:
         super().__init__(message)
         self.orders = orders
+        # per order id, what a bounded read-only lookup after the wait showed (session labels);
+        # None when no lookup was made. Informative only: the outcome is still not acknowledged.
+        self.reconciliation = reconciliation
 
 
 class PartialBracket(OrderOutcomeUnknown):

@@ -145,6 +145,14 @@ JOURNAL_SETTLE_SECONDS = 120.0
 # close, the binding and the core each wait for a quote (up to the stream and quote timeouts).
 EXIT_HOURS_MARGIN_SECONDS = 60
 REQ_ID_BASE = 1_900_000_000  # request ids live above every order id, so error routing is exact
+WIRE_RECORD_LIMIT = 500  # protobuf order messages kept as field-presence records (evidence)
+# Read-only reconciliation after an acknowledgement timeout: labels per order id.
+RECONCILE_WORKING = "WORKING"  # in open orders, Submitted / PreSubmitted / partly filled
+RECONCILE_HELD = "AT_BROKER_NOT_WORKING"  # in open orders, but PendingSubmit/ApiPending/Inactive...
+RECONCILE_EXECUTED = "EXECUTED"  # an execution of this client for the order id
+RECONCILE_FOREIGN = "FOREIGN_CLIENT_ROW"  # a row with this id and reference, another client id
+RECONCILE_NOT_FOUND = "NOT_FOUND"
+_RECONCILE_SETTLED = frozenset({RECONCILE_WORKING, RECONCILE_EXECUTED})
 
 # Order-proto fields this session sets itself; every other field must equal the SDK default.
 _OWN_ORDER_FIELDS = frozenset({"action", "totalQuantity", "orderType", "lmtPrice", "auxPrice",
@@ -319,6 +327,20 @@ class _OrderWrapper(_Wrapper):
     def nextValidId(self, orderId):
         self._call(self._s._on_next_valid_id_value, orderId)
 
+    # The protobuf callbacks arrive on the SDK thread immediately BEFORE the classic ones (and
+    # also when the SDK then drops the message: no contract / order / orderState). They are
+    # recorded as field presence only (never the account) for the evidence, and an open order's
+    # clientId presence is kept for ``_on_open_order``. Overriding them also stops the SDK's
+    # default ``logAnswer`` from logging the account.
+    def openOrderProtoBuf(self, openOrderProto):
+        self._call(self._s._on_order_proto, "openOrder", openOrderProto)
+
+    def orderStatusProtoBuf(self, orderStatusProto):
+        self._call(self._s._on_order_proto, "orderStatus", orderStatusProto)
+
+    def completedOrderProtoBuf(self, completedOrderProto):
+        self._call(self._s._on_order_proto, "completedOrder", completedOrderProto)
+
     def openOrder(self, orderId, contract, order, orderState):
         self._call(self._s._on_open_order, orderId, contract, order, orderState)
 
@@ -462,7 +484,7 @@ class PaperOrderSession(IbkrSession):
                  cancel_wait: float = 3.0, connect_timeout: float = 15.0,
                  request_timeout: float = 10.0, quote_timeout: float = 20.0,
                  stream_seconds: float = 8.0, stream_settle_seconds: float = 1.0,
-                 shutdown_timeout: float = 5.0) -> None:
+                 shutdown_timeout: float = 5.0, reconcile_timeout: float = 6.0) -> None:
         """Only the config and timeouts: there is no parameter that replaces or skips the local
         profile and listener checks (the read-only session's ``run_preflight``), the identity
         gate, the order-mode config read, the guard, the counter or the clock (structural
@@ -480,6 +502,7 @@ class PaperOrderSession(IbkrSession):
         self._caps = config.experiment
         self._ack_timeout = ack_timeout
         self._cancel_wait = cancel_wait
+        self._reconcile_timeout = reconcile_timeout
         self._wrapper = _OrderWrapper(self)
         self._client = _OrderClient(self._wrapper)  # the read-only client is discarded unused
         self._next_req_id = REQ_ID_BASE
@@ -503,6 +526,13 @@ class PaperOrderSession(IbkrSession):
         self.order_frames_sent = 0  # PLACE_ORDER and CANCEL_ORDER frames handed to the SDK
         # this session's own order events with receipt times (evidence; no account in it)
         self.order_events: list[dict] = []
+        # every protobuf order message as field presence (evidence; no account in it)
+        self.wire_events: list[dict] = []
+        self._open_client_absent: dict[int, bool] = {}  # order id -> last OpenOrder lacked it
+        self.ignored = {"foreign_open_rows": 0, "status_other_client": 0,
+                        "status_before_track": 0, "wire_records_dropped": 0,
+                        "completed_same_id_other_order": 0}
+        self.last_reconciliation: dict[int, str] | None = None
 
     def _event(self, event: str, order_id: int, **detail) -> None:
         """Caller holds the lock (or is the only writer). Receipt times for the evidence."""
@@ -1139,11 +1169,96 @@ class PaperOrderSession(IbkrSession):
                 + ", ".join(f"{c.order_id}={'rejected ' + c.rejected if c.rejected else 'no ack'}"
                             for c in children if c.rejected or not c.status)
                 + "; parent cancel requested", orders=snaps)
+        missing = [t.order_id for t in tracks if t.status is None]
+        reconciliation = self._reconcile_unacknowledged(tracks)
+        with self._cond:
+            snaps = tuple(self._snap(t) for t in tracks)
         raise OrderOutcomeUnknown(
-            f"no acknowledgement for orders {[t.order_id for t in tracks if t.status is None]} in "
+            f"no acknowledgement for orders {missing} in "
             f"{self._ack_timeout:.1f}s" + (" (the SDK reported a send failure)"
-                                           if any(t.send_failed for t in tracks) else ""),
-            orders=snaps)
+                                           if any(t.send_failed for t in tracks) else "")
+            + f"; read-only reconciliation: {reconciliation or 'not possible'}",
+            orders=snaps, reconciliation=reconciliation)
+
+    def _reconcile_unacknowledged(self, tracks: list[_Track]) -> dict[int, str]:
+        """After an acknowledgement timeout: READ-ONLY lookups (open orders of every client,
+        completed orders, executions), repeated for at most ``reconcile_timeout`` until every
+        order is working or executed. Own rows update the tracks through the usual callbacks
+        (an open order without a clientId only by ``_is_own_without_client_id``); another
+        client's row is reported, never adopted. Sends no order or cancel frame, ever. The caller
+        still raises ``OrderOutcomeUnknown``: what to do with a known state is the caller's."""
+        deadline = time.monotonic() + self._reconcile_timeout
+        result: dict[int, str] = {}
+        while True:
+            try:
+                self._require_ready()
+                rows = self._open_snapshot()
+                self.completed_orders()  # own final rows are merged into the tracks
+                execs = self.executions()
+            except Exception as exc:  # noqa: BLE001 - evidence; the outcome stays unknown
+                self.internal_errors.append(redact_accounts(
+                    f"reconciliation read failed: {type(exc).__name__}: {exc}"))
+                break
+            with self._cond:
+                for t in tracks:
+                    result[t.order_id] = self._reconcile_label(t, rows, execs)
+            if set(result.values()) <= _RECONCILE_SETTLED or time.monotonic() >= deadline:
+                break
+            with self._cond:
+                self._wait(lambda: False, min(0.5, max(deadline - time.monotonic(), 0.0)))
+        with self._cond:
+            for oid, label in result.items():
+                self._event("RECONCILED", oid, result=label)
+            self.last_reconciliation = dict(result)
+        return result
+
+    def _reconcile_label(self, t: _Track, rows: list[OrderSnapshot],
+                         execs: list[ExecRecord]) -> str:
+        """Caller holds the lock."""
+        if any(e.order_id == t.order_id and e.client_id == self._cfg.client_id and e.shares > 0
+               for e in execs):
+            return RECONCILE_EXECUTED
+        if t.rejected or t.status == OrderStatus.REJECTED:
+            return "REJECTED"
+        if t.status in FINAL_STATUSES:
+            return f"FINAL:{t.status.value}"
+        if t.status in (OrderStatus.SUBMITTED, OrderStatus.PRE_SUBMITTED,
+                        OrderStatus.PARTIALLY_FILLED):
+            return RECONCILE_WORKING
+        if t.status is not None:
+            return RECONCILE_HELD
+        if any(not r.own and r.order_id == t.order_id and r.experiment
+               and r.order_ref == t.order_ref for r in rows):
+            return RECONCILE_FOREIGN
+        return RECONCILE_NOT_FOUND
+
+    def diagnostics(self) -> dict:
+        """Everything the session observed about orders, for the evidence of any ending: its own
+        events (each send, callback, error and reconciliation, with times), the protobuf order
+        messages as field presence, internal and SDK errors, notices, ignored-row counts. No
+        account value (error texts are redacted; ``_write`` redacts the file again)."""
+        with self._cond:
+            def rows(items):
+                return [[rid, code, redact_accounts(str(msg))] for rid, code, msg in items]
+            return {
+                "order_events": [dict(e) for e in self.order_events],
+                "wire": [dict(w) for w in self.wire_events],
+                "internal_errors": [redact_accounts(e) for e in self.internal_errors],
+                "notices": rows(self.notices), "unrouted_errors": rows(self.unrouted_errors),
+                "connection_events": rows(self.connection_events),
+                "cleanup_failures": [redact_accounts(e) for e in self.cleanup_failures],
+                "ignored": dict(self.ignored),
+                "reconciliation": (None if self.last_reconciliation is None else
+                                   {str(k): v for k, v in self.last_reconciliation.items()}),
+                "poisoned": None if self._poisoned is None else redact_accounts(
+                    f"{type(self._poisoned).__name__}: {self._poisoned}"),
+                "connection_lost": self._connection_lost,
+                "order_frames_sent": self.order_frames_sent,
+                "tracks": {str(i): {"status": None if t.status is None else t.status.value,
+                                    "raw_status": t.raw_status, "own": t.own,
+                                    "errors": [[c, redact_accounts(m), k] for c, m, k in t.errors]}
+                           for i, t in self._tracks.items()},
+            }
 
     # ------------------------------------------------------------------ snapshots
     def _snap(self, t: _Track, reason: str = "") -> OrderSnapshot:
@@ -1190,21 +1305,28 @@ class PaperOrderSession(IbkrSession):
         if not self._account_ok(order.account, "openOrder"):
             return
         with self._cond:
-            own = (order.clientId == self._cfg.client_id and int(order_id) > 0)
-            if own:
-                self._event("openOrder", int(order_id), status=state.status)
-                t = self._tracks.get(int(order_id))
+            oid = int(order_id)
+            absent = self._open_client_absent.pop(oid, False)
+            own = (order.clientId == self._cfg.client_id and oid > 0)
+            adopted = not own and absent and self._is_own_without_client_id(oid, contract, order)
+            if own or adopted:
+                self._event("openOrder", oid, status=state.status,
+                            **({"client_id": "ABSENT_ADOPTED"} if adopted else {}))
+                t = self._tracks.get(oid)
                 if t is None:
-                    t = self._tracks[int(order_id)] = _Track(order_id=int(order_id), own=True)
-                cached = self._status_cache.pop(int(order_id), None)
+                    t = self._tracks[oid] = _Track(order_id=oid, own=True)
+                cached = self._status_cache.pop(oid, None)
                 t.fill_from_order(contract, order, state.status, self._caps.ref_prefix)
+                if adopted:
+                    t.client_id = self._cfg.client_id
                 if cached is not None:
                     self._apply_status(t, *cached)
                 t.open_seq += 1
                 t.event_seq += 1
                 row: tuple = ("own", t.order_id)
             else:
-                t = _Track(order_id=int(order_id), own=False)
+                self.ignored["foreign_open_rows"] += 1
+                t = _Track(order_id=oid, own=False)
                 t.fill_from_order(contract, order, state.status, self._caps.ref_prefix)
                 t.remaining = t.total  # nothing known filled: counted at full size (conservative)
                 row = ("foreign", t)
@@ -1212,6 +1334,63 @@ class PaperOrderSession(IbkrSession):
                 if p.kind == "open_orders" and not p.done:
                     p.rows.append(row)
             self._cond.notify_all()
+
+    @staticmethod
+    def _same_order(known: _Track, row: _Track) -> bool:
+        """A completed row is this track's order only if, beyond the order id, the permanent id
+        matches when both are known, else the broker reference (prefix flag included)."""
+        if known.perm_id and row.perm_id:
+            return known.perm_id == row.perm_id
+        return (known.order_ref, known.experiment) == (row.order_ref, row.experiment)
+
+    def _is_own_without_client_id(self, oid: int, contract, order) -> bool:
+        """Caller holds the lock. An open order whose protobuf message has NO clientId field (the
+        SDK then leaves 0, its default) is this client's only if this session itself sent that
+        order id, with exactly this broker reference (prefix included) and this contract. An
+        explicit other client id is never adopted (``_on_open_order`` checks presence)."""
+        t = self._tracks.get(oid)
+        return (oid > 0 and t is not None and t.own and t.proposed is not None
+                and (order.orderRef or "") == self._caps.ref_prefix + t.proposed.order_ref
+                and int(contract.conId or 0) == t.proposed.con_id)
+
+    def _on_order_proto(self, kind: str, proto) -> None:
+        """Field presence of an incoming protobuf order message (never the account value)."""
+        rec: dict[str, Any] = {"at": datetime.now(UTC).isoformat(timespec="microseconds"),
+                               "mono": time.monotonic(), "msg": kind}
+        if kind == "orderStatus":
+            has_cid = proto.HasField("clientId")
+            rec.update(order_id=proto.orderId if proto.HasField("orderId") else None,
+                       status=proto.status if proto.HasField("status") else None,
+                       has_client_id=has_cid, client_id=proto.clientId if has_cid else None,
+                       why_held=proto.whyHeld if proto.HasField("whyHeld") else None,
+                       has_perm_id=proto.HasField("permId"),
+                       parent_id=proto.parentId if proto.HasField("parentId") else None)
+        else:
+            o = proto.order if proto.HasField("order") else None
+            oid = proto.orderId if kind == "openOrder" and proto.HasField("orderId") else (
+                o.orderId if o is not None and o.HasField("orderId") else None)
+            st = proto.orderState if proto.HasField("orderState") else None
+            has_cid = o is not None and o.HasField("clientId")
+            ref = o.orderRef if o is not None and o.HasField("orderRef") else None
+            rec.update(order_id=oid, has_contract=proto.HasField("contract"),
+                       has_order=o is not None, has_order_state=st is not None,
+                       status=st.status if st is not None and st.HasField("status") else None,
+                       has_client_id=has_cid, client_id=o.clientId if has_cid else None,
+                       has_account=o is not None and o.HasField("account"),
+                       order_ref=ref, has_perm_id=o is not None and o.HasField("permId"),
+                       parent_id=o.parentId if o is not None and o.HasField("parentId")
+                       else None,
+                       order_type=o.orderType if o is not None and o.HasField("orderType")
+                       else None,
+                       warning=bool(st is not None and st.warningText))
+            if kind == "openOrder" and oid is not None:
+                with self._cond:
+                    self._open_client_absent[int(oid)] = o is not None and not has_cid
+        with self._cond:
+            if len(self.wire_events) < WIRE_RECORD_LIMIT:
+                self.wire_events.append(rec)
+            else:
+                self.ignored["wire_records_dropped"] += 1
 
     def _apply_status(self, t: _Track, status, filled, remaining, avg, perm_id) -> None:
         f, r = _dec(filled), _dec(remaining)
@@ -1236,11 +1415,13 @@ class PaperOrderSession(IbkrSession):
         """No account field in this callback; only this client's order ids are applied."""
         with self._cond:
             if client_id not in (self._cfg.client_id, UNSET_INTEGER):
+                self.ignored["status_other_client"] += 1
                 return
             self._event("orderStatus", int(order_id), status=status, filled=str(filled),
                         remaining=str(remaining))
             t = self._tracks.get(int(order_id))
             if t is None:
+                self.ignored["status_before_track"] += 1
                 self._status_cache[int(order_id)] = (status, filled, remaining, avg, perm_id)
                 return
             self._apply_status(t, status, filled, remaining, avg, perm_id)
@@ -1281,6 +1462,13 @@ class PaperOrderSession(IbkrSession):
                        own=order.clientId == self._cfg.client_id)
             t.fill_from_order(contract, order, None, self._caps.ref_prefix)
             known = self._tracks.get(t.order_id) if t.own else None
+            if known is not None and not self._same_order(known, t):
+                # the same order id, another order (an id sequence reset, an earlier day): never
+                # merged into this session's track; counted and recorded
+                self.ignored["completed_same_id_other_order"] += 1
+                self._event("COMPLETED_ROW_NOT_MERGED", t.order_id, status=state.status,
+                            order_ref=t.order_ref)
+                known = None
             status = map_status(state.status)
             if known is not None and known.rejected and status in (
                     OrderStatus.CANCELLED, OrderStatus.INACTIVE, OrderStatus.UNKNOWN):

@@ -15,7 +15,7 @@ from tradingbot.ibkr_orders.session import PaperOrderSession
 
 FAST = {"connect_timeout": 2.0, "request_timeout": 2.0, "quote_timeout": 2.0,
         "stream_seconds": 1.0, "stream_settle_seconds": 0.05, "shutdown_timeout": 3.0,
-        "ack_timeout": 0.4, "cancel_wait": 1.0}
+        "ack_timeout": 0.4, "cancel_wait": 1.0, "reconcile_timeout": 0.5}
 
 
 def stub_preflight(cfg) -> dict:
