@@ -169,15 +169,24 @@ def test_a_read_price_glued_to_a_letter_or_followed_by_another_number_holds(text
 
 @pytest.mark.parametrize("text", [
     "We are now long $TLT at 88.42, stop 87.20.",
-    "We are now long $TLT at 88.42. Stop 87.20. The index sat at 4,512.25 and volume 1,250 lots.",
     "We are now long $TLT at 88.42. Stop 87.20. Nov 12 2026 was quiet.",
     "We are now long $TLT at 88.42. Stop 87.20. Eyes on the 10Y and the 20yr.",
     "We are now long $TLT at 88.42. Stop 87.20. It sits above the 200DMA into 3pm.",
-    "We are now long $TLT at 88.42. Stop 87.20. The S&P 500 is calm.",
 ])
 def test_ordinary_numbers_that_are_not_the_actions_prices_still_send(text):
     opens, _ = run(text)
     assert opens[0]["status"] == "EXECUTED", opens
+
+
+@pytest.mark.parametrize("text", [
+    "We are now long $TLT at 88.42. Stop 87.20. The index sat at 4,512.25 and volume 1,250 lots.",
+    "We are now long $TLT at 88.42. Stop 87.20. The S&P 500 is calm.",
+])
+def test_numbers_beside_another_market_hold_for_the_market_not_the_number(text):
+    """Sent before 13 November 2026; an explicit TLT entry now gets the multi-market checks. The
+    number rule still does not fire on a number that is not the action's own price."""
+    [o] = held(text)[:1]
+    assert o["mapping_reason"].startswith("ENTRY_ANCHOR_POST_"), o
 
 
 def test_a_comma_list_of_prices_reads_as_before():
