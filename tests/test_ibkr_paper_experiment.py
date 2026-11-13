@@ -492,7 +492,8 @@ STATES = {
 def _assert_no_unconditional_sell(text: str) -> None:
     assert "Only if it shows 1" in X.TWS_SELL and "If it shows 0: do NOT sell" in X.TWS_SELL
     rest = text.replace(X.TWS_SELL, "").replace(X.NO_SELL_ON_NUMBERS, "").replace(
-        X.WAIT_FOR_CANCELLED, "")  # a prohibition ("do not sell until ..."), not an instruction
+        X.WAIT_FOR_CANCELLED, "").replace(X.NO_SALE_WHILE_RUNNING, "")  # prohibitions, not
+    # instructions to sell
     assert not re.search(r"\bsell", rest, re.IGNORECASE), rest
     assert "by hand" not in rest.lower(), rest
 
@@ -1032,9 +1033,17 @@ def test_abort_with_no_stop_says_so(tws, cfg_path):
 # --- review round 2: no manual sale beside a closing limit still pending its cancel -------------
 def test_the_procedure_waits_for_the_closing_limit_to_show_cancelled():
     assert X.WAIT_FOR_CANCELLED in X.TWS_PROCEDURE
-    assert "do not sell by hand until the TWS window shows that closing limit as Cancelled" in \
-        X.WAIT_FOR_CANCELLED
-    assert "PendingCancel" in X.WAIT_FOR_CANCELLED
+    # W1: the rule does not depend on who asked for the cancel (abort, the core or the owner)
+    assert X.WAIT_FOR_CANCELLED == (
+        "While any TLT closing limit of this experiment shows working or PendingCancel in the TWS "
+        "window (whoever cancelled it), do not sell by hand and do nothing more; wait until it "
+        "shows Cancelled or Filled.")
+    assert "If you cancelled one" not in X.TWS_PROCEDURE
+    assert "only if you can see it working there, never the stop" in X.TWS_PROCEDURE
+    # the plain rule, once, at the top
+    assert X.TWS_PROCEDURE.startswith(X.NO_SALE_WHILE_RUNNING)
+    assert X.NO_SALE_WHILE_RUNNING == "Never sell by hand in TWS while this script is still running."
+    assert X.TWS_PROCEDURE.count(X.NO_SALE_WHILE_RUNNING) == 1
     # step (2) comes before the sale in step (3)
     assert X.TWS_PROCEDURE.index(X.WAIT_FOR_CANCELLED) < X.TWS_PROCEDURE.index(X.TWS_SELL)
     assert "ABORT_NOT_FLAT_NO_STOP" in X.ABNORMAL_ENDINGS

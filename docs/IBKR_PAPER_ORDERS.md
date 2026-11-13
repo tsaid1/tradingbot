@@ -471,11 +471,11 @@ be read.
 
 The **procedure** is the same for every ending that is not a confirmed flat:
 
-> In the TWS window: (1) open the Trades panel: if it already shows a TLT sale of this experiment
+> Never sell by hand in TWS while this script is still running. In the TWS window: (1) open the Trades panel: if it already shows a TLT sale of this experiment
 > today, skip step (3); (2) cancel a resting TLT closing limit only if you can see it working
-> there, never the stop. If you cancelled one, do not sell by hand until the TWS window shows that
-> closing limit as Cancelled; while it shows PendingCancel or working, do not sell and do nothing
-> more. (3) Look at the TLT position in the TWS window. Only if it shows 1: sell
+> there, never the stop. While any TLT closing limit of this experiment shows working or
+> PendingCancel in the TWS window (whoever cancelled it), do not sell by hand and do nothing more;
+> wait until it shows Cancelled or Filled. (3) Look at the TLT position in the TWS window. Only if it shows 1: sell
 > 1 there with a limit at the bid (lower it a tick at a time until it fills) and wait until it
 > shows 0. If it shows 0: do NOT sell. (4) After a manual sale, run abort at once: the protective
 > stop is still working until then and must not trigger on a share you no longer hold. Abort
@@ -513,7 +513,7 @@ nothing working, "nothing to do; confirm in TWS ...". No message contains an unc
 | `STAGE3_NO_USABLE_QUOTE` | before the entry no such quote; nothing was sent | nothing in TWS; stage 3 may run again (the count is still 2) |
 | `STAGE3_ENTRY_REFUSED` | the core refused the entry (its reasons, e.g. `BROKER_QUOTE_STALE`); nothing was sent | nothing in TWS; stage 3 may run again |
 | `STAGE3_NOT_CLEAN` | after the 15 s retry, reconciliation still not clean, or the count is not exactly 6 (first close filled) or 8 (second close filled) | the TWS procedure; with read and fills disagreeing, do not sell on the script's numbers; keep the evidence |
-| `ABORT_NOT_FLAT_NO_STOP` | abort does not read the account flat and no protective stop of this client is working; it asked TWS to cancel the other orders and says how many a later read confirmed | the TWS procedure (step 2: no sale while a closing limit shows PendingCancel or working) |
+| `ABORT_NOT_FLAT_NO_STOP` | abort does not read the account flat and no protective stop of this client is working; it asked TWS to cancel the other orders and says how many a later read confirmed | the TWS procedure (no sale while any closing limit shows working or PendingCancel, whoever cancelled it) |
 | `ABORT_STOP_LEFT_WORKING` | abort does not read the account flat; it left the protective stop(s) working and asked TWS to cancel the other orders (requested and confirmed counts apart) | the TWS procedure; if TWS shows TLT 0, cancel that stop in TWS yourself at once; if it shows 1, leave it |
 | `STAGE1_QUOTE_NOT_USABLE` | no sample labelled LIVE or DELAYED with a bid and an ask (labels and last reason) | nothing to do in TWS (no order was sent); run stage 1 again |
 
@@ -528,8 +528,9 @@ nothing working, "nothing to do; confirm in TWS ...". No message contains an unc
   amendments and cancels working entries, not the stop or a placed close.
 - **The certain stop:** in the paper Trader Workstation window, cancel every working TLT order of
   the experiment that you can see working there (Orders / Activity panel, right-click, Cancel),
-  wait until TWS shows every one of them Cancelled (while one shows PendingCancel or working, do
-  not sell), then look at the TLT position in TWS: only if it shows 1, sell 1 with a limit at the bid; if it
+  and while any TLT closing limit of this experiment shows working or PendingCancel in the TWS
+  window (whoever cancelled it), do not sell by hand and do nothing more; wait until it shows
+  Cancelled or Filled. Then look at the TLT position in TWS: only if it shows 1, sell 1 with a limit at the bid; if it
   shows 0, do not sell. Confirm in the Portfolio that TLT is 0.
 - **The software path:** `python scripts/ibkr_paper_experiment.py abort` re-reads the position
   and the experiment's own fills first. When they agree on flat it cancels every working order of
@@ -544,9 +545,9 @@ nothing working, "nothing to do; confirm in TWS ...". No message contains an unc
   unprotected; nothing can be placed after 16:00 ET. The experiment must end flat the same day.
   **If the share is not closed by 15:30 ET** (the script reports the close within about two
   minutes, normally `STAGE3_CLOSE_NOT_FILLED` with the stop working): in TWS cancel any resting
-  closing limit you can see working, and do not sell by hand until the TWS window shows that
-  closing limit as Cancelled (while it shows PendingCancel or working, do not sell and do nothing
-  more); then look at the TLT position there: only if it shows 1,
+  closing limit you can see working; while any TLT closing limit of this experiment shows working
+  or PendingCancel in the TWS window (whoever cancelled it), do not sell by hand and do nothing
+  more; wait until it shows Cancelled or Filled; then look at the TLT position there: only if it shows 1,
   sell 1 with a limit at the bid (lower it a tick at a time until it fills); if it shows 0, do
   not sell. Confirm 0 before 16:00 ET, run `abort`, and record what you did beside the evidence.
 

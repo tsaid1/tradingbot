@@ -194,11 +194,12 @@ TWS_SELL = ("Look at the TLT position in the TWS window. Only if it shows 1: sel
             "limit at the bid (lower it a tick at a time until it fills) and wait until it shows "
             "0. If it shows 0: do NOT sell.")
 # A closing limit whose cancel TWS has not completed can still fill beside a sale by hand (a
-# one-share short): the sale waits until TWS itself shows that limit Cancelled.
-WAIT_FOR_CANCELLED = ("If you cancelled one, do not sell by hand until the TWS window shows that "
-                      "closing limit as Cancelled; while it shows PendingCancel or working, do not "
-                      "sell and do nothing more.")
-TWS_PROCEDURE = ("In the TWS window: (1) open the Trades panel: if it already shows a TLT sale of "
+# one-share short), whoever asked for that cancel (abort, the execution core or the owner).
+NO_SALE_WHILE_RUNNING = "Never sell by hand in TWS while this script is still running."
+WAIT_FOR_CANCELLED = ("While any TLT closing limit of this experiment shows working or PendingCancel "
+                      "in the TWS window (whoever cancelled it), do not sell by hand and do nothing "
+                      "more; wait until it shows Cancelled or Filled.")
+TWS_PROCEDURE = (NO_SALE_WHILE_RUNNING + " In the TWS window: (1) open the Trades panel: if it already shows a TLT sale of "
                  "this experiment today, skip step (3); (2) cancel a resting TLT closing limit "
                  "only if you can see it working there, never the stop. " + WAIT_FOR_CANCELLED +
                  " (3) " + TWS_SELL + " (4) "
