@@ -128,6 +128,12 @@ class RealisticTws(FakeOrderTws):
             o.clientId = self.open_client_id
         return o
 
+    def _status(self, fo: FakeOrder, status: str | None = None, filled=None) -> bytes:
+        """The base fake's status (lookups, cancels), with the same client-id knob."""
+        if self.status_client_id == PRESENT:
+            return super()._status(fo, status, filled)
+        return self._status_frame(fo, status or fo.status, "")
+
     def _status_frame(self, fo: FakeOrder, status: str, why_held: str) -> bytes:
         cid = self.status_client_id
         if self.text_status:
@@ -386,7 +392,7 @@ def test_wire_record_shows_field_presence_without_the_account(rtws, tmp_path):
 
 # --- safety ---------------------------------------------------------------------------------------
 def test_explicit_other_client_id_with_our_ref_is_never_adopted(rtws, tmp_path):
-    rtws.open_client_id, rtws.send_status = 99, False
+    rtws.open_client_id = rtws.status_client_id = 99
     s = make(rtws, tmp_path)
     try:
         with pytest.raises(OrderOutcomeUnknown) as info:
