@@ -208,8 +208,11 @@ def rtws(monkeypatch):
     server = RealisticTws()
     monkeypatch.setattr(ibapi.client, "Connection", server.connection_factory)
     yield server
-    for t in server.timers:
-        t.cancel()
+    for t in server.timers:  # a finished Timer keeps its function (and the fake transport in
+        t.cancel()           # its closure) reachable from threading's registries: drop it, so
+        t.join(timeout=2.0)  # the object-graph tests of later sessions do not see it
+        t.function, t.args, t.kwargs = (lambda: None), (), {}
+    server.timers.clear()
 
 
 def place_bracket(s):
