@@ -530,7 +530,8 @@ class PaperOrderSession(IbkrSession):
         self.wire_events: list[dict] = []
         self._open_client_absent: dict[int, bool] = {}  # order id -> last OpenOrder lacked it
         self.ignored = {"foreign_open_rows": 0, "status_other_client": 0,
-                        "status_before_track": 0, "wire_records_dropped": 0}
+                        "status_before_track": 0, "wire_records_dropped": 0,
+                        "completed_same_id_other_order": 0}
         self.last_reconciliation: dict[int, str] | None = None
 
     def _event(self, event: str, order_id: int, **detail) -> None:
@@ -1334,6 +1335,14 @@ class PaperOrderSession(IbkrSession):
                     p.rows.append(row)
             self._cond.notify_all()
 
+    @staticmethod
+    def _same_order(known: _Track, row: _Track) -> bool:
+        """A completed row is this track's order only if, beyond the order id, the permanent id
+        matches when both are known, else the broker reference (prefix flag included)."""
+        if known.perm_id and row.perm_id:
+            return known.perm_id == row.perm_id
+        return (known.order_ref, known.experiment) == (row.order_ref, row.experiment)
+
     def _is_own_without_client_id(self, oid: int, contract, order) -> bool:
         """Caller holds the lock. An open order whose protobuf message has NO clientId field (the
         SDK then leaves 0, its default) is this client's only if this session itself sent that
@@ -1453,6 +1462,13 @@ class PaperOrderSession(IbkrSession):
                        own=order.clientId == self._cfg.client_id)
             t.fill_from_order(contract, order, None, self._caps.ref_prefix)
             known = self._tracks.get(t.order_id) if t.own else None
+            if known is not None and not self._same_order(known, t):
+                # the same order id, another order (an id sequence reset, an earlier day): never
+                # merged into this session's track; counted and recorded
+                self.ignored["completed_same_id_other_order"] += 1
+                self._event("COMPLETED_ROW_NOT_MERGED", t.order_id, status=state.status,
+                            order_ref=t.order_ref)
+                known = None
             status = map_status(state.status)
             if known is not None and known.rejected and status in (
                     OrderStatus.CANCELLED, OrderStatus.INACTIVE, OrderStatus.UNKNOWN):

@@ -31,6 +31,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import time
 from datetime import UTC, datetime
 from decimal import ROUND_FLOOR, Decimal
@@ -52,7 +53,9 @@ from tradingbot.ibkr_orders.counter import JOURNAL_DIR, CounterError, Submission
 from tradingbot.ibkr_orders.guard import parse_hours
 from tradingbot.ibkr_orders.mapping import FINAL_STATUSES
 from tradingbot.ibkr_orders.records import (
+    CancelFailed,
     OrderModeSettingRefused,
+    OrderNotWorking,
     OrderOutcomeUnknown,
     OrderSpec,
     PartialBracket,
@@ -72,6 +75,10 @@ STOP_RAISE = Decimal("0.10")  # stage 3: the one amendment
 FILL_TIMEOUT_SECONDS = 120.0  # stage 3: wait this long for the entry to fill
 POLL_SECONDS = 1.0
 READ_BACK_WAIT_SECONDS = 2.0  # stage 2: let the views settle before reading back
+# Stage 2: the read after the cancels is repeated (reads only) up to this many times, each after
+# READ_BACK_WAIT_SECONDS, until it confirms both orders gone and Cancelled.
+STAGE2_CONFIRM_READS = 3
+CANCELLED_TEXT = ("Cancelled", "ApiCancelled")
 # Stage 1 takes up to this many bounded quote samples in a row and passes on the first one the
 # adapter labels LIVE or DELAYED with a bid and an ask (each sample is recorded).
 STAGE1_QUOTE_SAMPLES = 3
@@ -219,7 +226,8 @@ ABORT_STOP_NOTE = ("Cancel that TLT stop in the TWS window yourself at once if t
 
 ABNORMAL_ENDINGS = frozenset({
     "STAGE2_UNEXPECTED_FILL", "STAGE2_ACK_BY_RECONCILIATION",
-    "STAGE2_PARENT_NOT_CONFIRMED_CANCELLED", "STAGE2_FAILED",
+    "STAGE2_PARENT_NOT_CONFIRMED_CANCELLED", "STAGE2_CHILD_NOT_CONFIRMED_CANCELLED",
+    "STAGE2_CANCEL_NOT_CONFIRMED_BY_READ", "STAGE2_FAILED",
     "STAGE3_ENTRY_NOT_FILLED", "STAGE3_PROTECTION_UNCONFIRMED", "STAGE3_PROTECTION_LOST",
     "STAGE3_CLOSE_REFUSED", "STAGE3_CLOSE_NOT_FILLED", "STAGE3_NOT_CLEAN",
     "STAGE3_NO_USABLE_QUOTE", "STAGE3_ENTRY_REFUSED", "STAGE3_CLOSE_NO_QUOTE",
@@ -317,9 +325,10 @@ def _write(cfg: PaperOrderConfig, stage: str, evidence: dict) -> Path:
     d = evidence_dir(cfg)
     d.mkdir(mode=0o700, parents=False, exist_ok=True)
     path = evidence_path(cfg, stage)
+    # serialised first: a failure here leaves the earlier attempt's file where it is
+    text = redact_accounts(json.dumps(evidence, indent=2, sort_keys=True, default=str))
     if path.exists():  # an earlier failed attempt is kept, never overwritten
         path.rename(d / f"{stage}.attempt-{datetime.now(UTC):%Y%m%dT%H%M%S%fZ}.json")
-    text = redact_accounts(json.dumps(evidence, indent=2, sort_keys=True, default=str))
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "w") as fh:
         fh.write(text + "\n")
@@ -340,7 +349,7 @@ def _row(s) -> dict:
     return {"order_id": s.order_id, "order_id_present": s.order_id > 0,
             "order_ref": s.order_ref, "order_ref_present": bool(s.order_ref),
             "experiment_prefix": s.experiment, "perm_id_present": s.perm_id > 0, "own": s.own,
-            "client_id": s.client_id, "parent_id": s.parent_id,
+            "client_id": s.client_id, "parent_id": s.parent_id, "reason": s.reason,
             "status": s.status.value, "raw_status": s.raw_status, "action": s.action,
             "order_type": s.order_type, "filled": str(s.filled), "remaining": str(s.remaining)}
 
@@ -395,7 +404,11 @@ def _stage0(cfg: PaperOrderConfig, ev: dict) -> None:
             and s.order_frames_sent == 0
         if not ev["passed"]:
             ev["why_failed"] = "refused, but not because Read-Only API is ON"
+        _diagnose(s, ev)
         return
+    except BaseException:
+        _diagnose(s, ev)  # any other failed connect: still in the evidence
+        raise
     try:
         ev["refused"] = False
         ev["read_only_settings"] = s.read_only_settings
@@ -403,13 +416,14 @@ def _stage0(cfg: PaperOrderConfig, ev: dict) -> None:
         ev["why_failed"] = "order mode STARTED: Read-Only API is OFF. Turn it ON for stage 0."
     finally:
         ev["order_frames_sent"] = s.order_frames_sent
+        _diagnose(s, ev)
         s.disconnect()
 
 
 def _stage1(cfg: PaperOrderConfig, ev: dict) -> None:
     s = _session(cfg)
-    s.connect()
     try:
+        s.connect()  # inside: a failed connect still leaves its diagnostics in the evidence
         c = s.contract
         ev["contract"] = {"con_id": c.con_id, "symbol": c.symbol, "min_tick": str(c.min_tick),
                           "time_zone_id": c.time_zone_id, "liquid_hours": c.liquid_hours}
@@ -462,11 +476,50 @@ def _require_count(s: PaperOrderSession, stage: str) -> None:
                            f"{s.submissions_used}. It cannot run (again).")
 
 
+def _orders_as_read(after: dict, ids: tuple[int, ...]) -> dict[int, dict]:
+    """Each order as one read after the cancels shows it (own rows only). ``in_open_orders`` is
+    None when the open-orders read failed; ``completed_status`` None when there is no row."""
+    opened, done = after["open_orders"], after["completed_orders"]
+    out = {}
+    for k in ids:
+        o = next((r for r in opened.get("rows", []) if r["own"] and r["order_id"] == k), None)
+        d = next((r for r in done.get("rows", []) if r["own"] and r["order_id"] == k), None)
+        out[k] = {"in_open_orders": (o is not None) if opened.get("completed") else None,
+                  "open_status": o["status"] if o else None,
+                  "completed_read": bool(done.get("completed")),
+                  "completed_status": d["raw_status"] if d else None,
+                  "completed_reason": d.get("reason") if d else None}
+    return out
+
+
+def _confirmed_cancelled(r: dict) -> bool:
+    return (r["in_open_orders"] is False and r["completed_read"]
+            and r["completed_status"] in CANCELLED_TEXT)
+
+
+def _as_read_text(k: int, r: dict) -> str:
+    where = ("open orders not read" if r["in_open_orders"] is None else
+             f"in open orders (status {r['open_status']})" if r["in_open_orders"] else
+             "not in open orders")
+    done = (f"{r['completed_status']} in completed orders" if r["completed_status"] else
+            "no completed-order row" if r["completed_read"] else "completed orders not read")
+    return f"order {k}: {where}, {done}"
+
+
+def _refusal_kind(exc: BaseException) -> str:
+    """A refused cancel: the session's own refusal, or the broker's code (``CancelFailed`` reads
+    'cancel of order N refused: <code> <text>', see ``PaperOrderSession.cancel``)."""
+    if isinstance(exc, OrderNotWorking):
+        return "NOT_A_WORKING_ORDER_OF_THIS_CLIENT"
+    m = re.search(r"refused: (\d+) ", str(exc))
+    return {"161": "NOT_CANCELLABLE", "10147": "NOT_FOUND"}.get(m.group(1) if m else "", "OTHER")
+
+
 def _stage2(cfg: PaperOrderConfig, ev: dict) -> None:
     _check_start_time(STAGES[2])  # an unexpected fill must be closable by hand before 16:00
     s = _session(cfg)
-    s.connect()
     try:
+        s.connect()
         _require_count(s, STAGES[2])
         _check_time_to_close(s.contract, STAGES[2], _wall_clock())
         b = IbkrPaperBroker(s)
@@ -522,9 +575,46 @@ def _stage2(cfg: PaperOrderConfig, ev: dict) -> None:
         if parent_clean:
             ct = s._tracks[child]
             if ct.status not in FINAL_STATUSES:
-                ev["cancel"].append(_row(s.cancel(child)))
-        time.sleep(READ_BACK_WAIT_SECONDS)
-        ev["after_cancel"] = _lookups(s)
+                try:
+                    ev["cancel"].append(_row(s.cancel(child)))
+                except (CancelFailed, OrderNotWorking) as exc:
+                    # TWS cancels a child with its parent and may tell this client nothing about
+                    # the child (13 Nov 2026): the refusal is recorded and the READ decides.
+                    kind = _refusal_kind(exc)
+                    ev["child_cancel_refused"] = {"order_id": child, "kind": kind,
+                                                  "error": redact_accounts(
+                                                      f"{type(exc).__name__}: {exc}")}
+                    if kind == "OTHER":
+                        ev["cancel_errors"].append({"order_id": child,
+                                                    "error": redact_accounts(str(exc))})
+        after: dict = {}
+        as_read: dict[int, dict] = {}
+        for _ in range(STAGE2_CONFIRM_READS):  # reads only
+            time.sleep(READ_BACK_WAIT_SECONDS)
+            after = _lookups(s)
+            as_read = _orders_as_read(after, (parent, child))
+            if not parent_clean or all(_confirmed_cancelled(r) for r in as_read.values()):
+                break
+        ev["after_cancel"] = after
+        ev["orders_as_read"] = {str(k): v for k, v in as_read.items()}
+        both_confirmed = parent_clean and all(_confirmed_cancelled(r) for r in as_read.values())
+        # what TWS did to the child when the parent was cancelled: the first callback for the
+        # child after the parent's cancel (and before any cancel of the child), then the read
+        parent_cancel_at = next((e["mono"] for e in s.order_events if e["event"] == "SENT_CANCEL"
+                                 and e["order_id"] == parent), None)
+        if parent_cancel_at is not None:
+            child_cancel_at = next((e["mono"] for e in s.order_events
+                                    if e["event"] == "SENT_CANCEL" and e["order_id"] == child),
+                                   float("inf"))
+            first = next((e for e in s.order_events if e["order_id"] == child
+                          and parent_cancel_at < e["mono"] < child_cancel_at
+                          and e["event"] in ("openOrder", "orderStatus", "error")), None)
+            ev["child_on_parent_cancel"] = {
+                "callback_for_child_after_parent_cancel": None if first is None else {
+                    k: v for k, v in first.items() if k in ("at", "event", "status", "code")},
+                "child_cancel_sent": child_cancel_at != float("inf"),
+                **{k: as_read[child][k] for k in ("in_open_orders", "completed_status",
+                                                  "completed_reason")}}
         events = [e for e in s.order_events if e["order_id"] in (parent, child)]
         ev["events"] = events
         child_sent = next((e["mono"] for e in events if e["event"] == "SENT_PLACE"
@@ -545,23 +635,18 @@ def _stage2(cfg: PaperOrderConfig, ev: dict) -> None:
         ev["in_completed_orders"] = {str(k): done.get(k) for k in (parent, child)}
         ev["submissions_used"] = s.submissions_used
         ev["passed"] = (not filled and not still_open and s.submissions_used == 2
+                        and both_confirmed
                         and not ev["parent_answered_before_child_sent"]
-                        and all(done.get(k) in ("Cancelled", "ApiCancelled")
-                                for k in (parent, child))
+                        and all(done.get(k) in CANCELLED_TEXT for k in (parent, child))
                         and all(v["completed"] for v in ev["read_back"].values()))
         ev["result"] = "STAGE2_PASSED" if ev["passed"] else "STAGE2_FAILED"
         ev["ack_by"] = "reconciliation" if late_ack else "callback"
-        if late_ack and not parent_filled and parent_clean:
-            # Proposal (d): the bracket was cancelled as usual, but its acknowledgement came only
-            # from the read-only lookup after the wait: the ack path is NOT proven. Not a pass.
-            ev["passed"] = False
-            ev["result"] = "STAGE2_ACK_BY_RECONCILIATION"
-            ev["state"] = state = _position_state(s)
-            ev["why_failed"] = _ending_message(
-                "STAGE2_ACK_BY_RECONCILIATION", "no acknowledgement callback within the wait; the "
-                "read-only lookup showed both orders working; they were cancelled (parent "
-                "first, confirmed); nothing was re-sent", state)
-        elif parent_filled:
+        read_text = "; ".join(_as_read_text(k, as_read[k]) for k in (parent, child)) \
+            if as_read else "the read after the cancels failed"
+        refused = ev.get("child_cancel_refused")
+        refused_text = (f"; the child's cancel was refused ({refused['kind']})" if refused
+                        else "")
+        if parent_filled:
             ct = s._tracks[child]
             ev["result"] = "STAGE2_UNEXPECTED_FILL"
             ev["passed"] = False
@@ -594,6 +679,27 @@ def _stage2(cfg: PaperOrderConfig, ev: dict) -> None:
             ev["why_failed"] = _ending_message(
                 "STAGE2_PARENT_NOT_CONFIRMED_CANCELLED", "the parent was not confirmed "
                 "cancelled; its stop child was left alone", state)
+        elif not both_confirmed:
+            # Never "cancelled" without the confirming read: each order is stated as read.
+            result = ("STAGE2_CHILD_NOT_CONFIRMED_CANCELLED"
+                      if _confirmed_cancelled(as_read[parent]) else
+                      "STAGE2_CANCEL_NOT_CONFIRMED_BY_READ")
+            ev["result"], ev["passed"] = result, False
+            ev["state"] = state = _position_state(s)
+            ev["why_failed"] = _ending_message(
+                result, f"after the cancels the read shows {read_text}{refused_text}; "
+                "nothing was re-sent" + ("; the acknowledgement came only from the read-only "
+                                         "lookup after the wait" if late_ack else ""), state)
+        elif late_ack:
+            # The acknowledgement came only from the read-only lookup after the wait: the ack
+            # path is NOT proven. The cancels are confirmed by a later read. Not a pass.
+            ev["passed"] = False
+            ev["result"] = "STAGE2_ACK_BY_RECONCILIATION"
+            ev["state"] = state = _position_state(s)
+            ev["why_failed"] = _ending_message(
+                "STAGE2_ACK_BY_RECONCILIATION", "no acknowledgement callback within the wait; the "
+                "read-only lookup showed both orders working; both are cancelled (confirmed by "
+                f"a later read: {read_text}){refused_text}; nothing was re-sent", state)
         elif not ev["passed"]:
             ev["state"] = state = _position_state(s)
             ev["why_failed"] = _ending_message(
@@ -666,9 +772,9 @@ def _stage3(cfg: PaperOrderConfig, ev: dict) -> None:
         raise StageRefused(f"stage 1 recorded quote quality {quality!r}; stage 3 needs LIVE (a "
                            "DELAYED quote does not qualify for stage 3)")
     s = _session(cfg)
-    s.connect()
     coord = None
     try:
+        s.connect()
         _require_count(s, STAGES[3])
         _check_time_to_close(s.contract, STAGES[3], _wall_clock())
         policy = MockPolicy(quantity=1, quantity_per_add=1, max_notional_usd=Decimal(150),
@@ -911,8 +1017,8 @@ def _abort(cfg: PaperOrderConfig, ev: dict) -> None:
     orders (an unfilled entry without a working stop, a resting closing limit) and prints the
     TWS procedure. Never a global cancel. Works even when the journal is unknown."""
     s = _session(cfg)
-    s.connect()
     try:
+        s.connect()
         state = ev["state"] = _position_state(s)
         flat = (state["agree"] and Decimal(state["held"]) == 0
                 and state["own_working"] is not None)
@@ -1011,4 +1117,11 @@ def run_stage(stage: str, config_path: str | os.PathLike | None = None) -> tuple
         ev.update(passed=False, error=redact_accounts(f"{type(exc).__name__}: {exc}"))
     ev["submissions_after"] = _journal_used(cfg)
     ev["finished_at"] = datetime.now(UTC).isoformat()
-    return ev, _write(cfg, stage, ev)
+    try:
+        return ev, _write(cfg, stage, ev)
+    except (TypeError, ValueError) as exc:  # the diagnostics must never cost the evidence
+        if "session_diagnostics" not in ev:
+            raise
+        ev["session_diagnostics"] = {"error": redact_accounts(
+            f"diagnostics not serialisable: {type(exc).__name__}: {exc}")}
+        return ev, _write(cfg, stage, ev)

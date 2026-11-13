@@ -603,6 +603,51 @@ unchanged (`tests/test_exit_order_life.py`):
 - **The stop placed again is DAY** like every order here: a share held at 16:00 ET is unprotected
   overnight. The experiment must end flat the same day.
 
+## What the 13 November run showed
+
+Facts only (paper account, TWS server version 226, ibapi 1052.1):
+
+- Stages 0 and 1 passed. Stage 2 placed its bracket (order 1, BUY 1 TLT LMT, transmit false;
+  order 2, SELL 1 TLT STP, its child, transmit true). TWS accepted both: a later read-only lookup
+  shows them with this client's id, the experiment's references, the parent link and permanent
+  ids. Neither was acknowledged to the client (no open-order or status callback naming this
+  client) within the 5 s wait, so the stage ended with `OrderOutcomeUnknown`; nothing was
+  cancelled or re-sent by the script. The owner cancelled the parent in TWS; TWS cancelled the
+  child with it. Nothing filled; the account is flat. Why no acknowledgement arrived is not
+  established (see `orchestration/reviews/STAGE2_ACK_INVESTIGATION.md`).
+- What exists since: after the acknowledgement wait the session makes a bounded read-only
+  reconciliation (open orders of every client, completed orders, executions; no order or cancel
+  frame) and labels each order (`WORKING`, `AT_BROKER_NOT_WORKING`, `EXECUTED`, `REJECTED`,
+  `FINAL:<status>`, `FOREIGN_CLIENT_ROW`, `NOT_FOUND`); `OrderOutcomeUnknown` is still raised.
+  Every stage and `abort` write `session_diagnostics` (each send and callback with its time, the
+  protobuf order messages as field presence, error callbacks, internal errors, ignored-row counts)
+  on every ending, a failed connect included. Stage 2 reports each order as read after its cancels
+  and says "cancelled" only when a later read shows it gone from open orders and Cancelled in
+  completed orders.
+- To be recorded before any further run: the TWS setting "Bypass Order Precautions for API
+  orders" (Global Configuration > API > Precautions), and the TWS API message log switched on
+  ("Create API message log file", logging level Detail).
+
+### Design items for a next experiment (NOT IMPLEMENTED)
+
+- A single unfillable order (a BUY LMT far below the bid, transmitted on its own) whose
+  open-order and order-status rows must arrive BY CALLBACK, naming this client, within the wait
+  (a reconciliation does not count), and which is then cancelled with confirmation, before any
+  bracket or fillable order is sent.
+- The first fillable stage verifies the protective stop's acceptance and behaviour AFTER the
+  parent entry fills: which callback shows it (the child's order status, then an open-orders
+  read), with which status and within what time, beside the position read and the experiment's
+  own fills.
+
+## Known limits of the acknowledgement handling
+
+- An own order from an EARLIER process whose open-order message carries no client id is treated
+  as another client's (conservative: only an order this session itself sent, with the same id,
+  reference and contract, is adopted without a client id). `abort` then cannot cancel it; the
+  owner cancels it in TWS.
+- An order TWS reports as PreSubmitted is labelled `WORKING` by the reconciliation even if it is
+  in fact held at TWS; stage 2 then cancels it, which is harmless.
+
 ## Not modelled relative to the real broker
 
 - Whether TWS honours an explicit protobuf `transmit=false`. The SDK omits a false bool, and TWS's
