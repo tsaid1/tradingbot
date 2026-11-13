@@ -643,9 +643,11 @@ before the requested window, more than 2000 bars),
 `LOCAL_PACING_CAP`, `LOCAL_IDENTICAL_REQUEST`, `LOCAL_PACING_LATCHED`. Connection, identity,
 poison and read-only failures raise as for every read; a failed cancel raises `CleanupError`.
 
-The window: for durations in seconds, end minus the duration minus one bar (60 s, the first
-bar's alignment); for D / W / M / Y, which IBKR counts in trading days, end minus the duration in
-calendar days (1, 7, 31, 366 per unit) minus 4 days (a weekend plus a holiday). End-marker strings
+The window is a sanity bound, not a gate: a bar fails the read only if it starts earlier than the
+end minus the duration minus `HIST_CALENDAR_SLACK_DAYS` (10 calendar days), because IBKR may count
+durations in trading time (across the daily maintenance break, weekends and closures). D / W / M / Y
+count as 1, 7, 31, 366 calendar days per unit; seconds durations also get one bar (60 s) for the
+first bar's alignment. End-marker strings
 are redacted like every broker text.
 
 **Pacing** (`HistoricalPacer`, shared by every session in the process). IBKR documents, for bars of
@@ -703,4 +705,4 @@ PYTHONPATH="$PWD/src" ~/.venvs/tradingbot/bin/python scripts/ibkr_historical_bar
   would make every CONTFUT row `REQUEST_INVALID`), and what `volume` / `barCount` look like for
   MIDPOINT, BID and ASK bars, in particular whether -1 ever appears in a price field.
 - Whether TWS answers on the protobuf path only (a text-framed answer fails as `MALFORMED`), and
-  whether duration in seconds is calendar time (the window check assumes so).
+  whether durations in seconds are calendar or trading time (the window check tolerates both).

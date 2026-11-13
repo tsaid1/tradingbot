@@ -46,12 +46,15 @@ MAX_HISTORICAL_TIMEOUT = 300.0
 # typo is refused instead of silently read by TWS as "up to now".
 HIST_END_FLOOR = datetime(2010, 1, 1, tzinfo=UTC)
 HIST_END_FUTURE_TOLERANCE_SECONDS = 300
-# Bars must start inside the requested window. Durations in seconds are calendar time: one bar of
-# tolerance (60 s) covers the alignment of the first bar to its minute. Durations in D / W / M / Y
-# count TRADING days at IBKR (documented: "1 D" is the last trading session), so a window can reach
-# back over a weekend plus a holiday: allow that many extra calendar days.
+# Bars must start inside the requested window: a sanity bound, not a gate, so it must never refuse
+# legitimate data. IBKR may count durations in TRADING time (documented for D: "1 D" is the last
+# trading session; possibly also for seconds), so a window can reach back across the daily
+# maintenance break, a weekend or a long closure. Every duration therefore gets
+# HIST_CALENDAR_SLACK_DAYS of calendar slack (10 days: longer than any market closure we expect);
+# seconds durations also get one bar (60 s) for the first bar's alignment. A bar earlier than
+# end - duration - slack fails the read; the upper bound (no bar at or after the end) is separate.
 HIST_BAR_ALIGN_SECONDS = 60
-HIST_CALENDAR_SLACK_DAYS = 4
+HIST_CALENDAR_SLACK_DAYS = 10
 _UNIT_DAYS = {"D": 1, "W": 7, "M": 31, "Y": 366}
 
 # --- pacing (IBKR documentation, applied conservatively) ------------------------------------------
@@ -221,7 +224,8 @@ class HistoricalBarsRequest:
         """Earliest start a bar of this request may have (see HIST_CALENDAR_SLACK_DAYS)."""
         n, unit = self.duration.split()
         if unit == "S":
-            return self.end - timedelta(seconds=int(n) + HIST_BAR_ALIGN_SECONDS)
+            return self.end - timedelta(days=HIST_CALENDAR_SLACK_DAYS,
+                                        seconds=int(n) + HIST_BAR_ALIGN_SECONDS)
         return self.end - timedelta(days=int(n) * _UNIT_DAYS[unit] + HIST_CALENDAR_SLACK_DAYS)
 
     def pacing_key(self) -> tuple:

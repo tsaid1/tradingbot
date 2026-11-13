@@ -112,25 +112,34 @@ def test_end_in_the_future_or_before_the_floor_is_refused(monkeypatch):
 
 # --- N4: bars outside the requested window -------------------------------------------------------
 def test_intraday_bar_before_the_window_fails_the_read():
-    start = int((END - timedelta(seconds=1800)).timestamp())
-    assert bar(str(start)).start_utc == END - timedelta(seconds=1800)
-    assert bar(str(start - 60)).start_utc  # one bar of tolerance (alignment)
+    assert H.HIST_CALENDAR_SLACK_DAYS == 10
+    hour = req(duration="3600 S")
+    start = END - timedelta(seconds=3600)
+    edge = start - timedelta(days=H.HIST_CALENDAR_SLACK_DAYS, seconds=H.HIST_BAR_ALIGN_SECONDS)
+    assert bar(str(int(edge.timestamp())), request=hour).start_utc == edge
     with pytest.raises(H.BarMalformed, match="before the requested window"):
-        bar(str(start - 61))
-    with pytest.raises(H.BarMalformed, match="before the requested window"):
-        bar(str(int((END - timedelta(hours=10)).timestamp())))
+        bar(str(int(edge.timestamp()) - 1), request=hour)
+    with pytest.raises(H.BarMalformed, match="before the requested window"):  # far outside
+        bar(str(int((END - timedelta(days=30)).timestamp())), request=hour)
 
 
-def test_trading_day_durations_allow_weekends_but_not_more():
+def test_one_hour_request_whose_first_bar_is_three_days_early_is_accepted():
+    # trading-time semantics across a weekend: the hour before Monday's end began on Friday
+    hour = req(duration="3600 S")
+    first = END - timedelta(days=3)
+    assert bar(str(int(first.timestamp())), request=hour).start_utc == first
+
+
+def test_trading_day_durations_allow_long_closures_but_not_more():
     r = req(duration="1 D")
     ok = int((END - timedelta(days=1 + H.HIST_CALENDAR_SLACK_DAYS)).timestamp())
     assert bar(str(ok), request=r)
     with pytest.raises(H.BarMalformed, match="before the requested window"):
         bar(str(ok - 1), request=r)
     daily = req(bar_size="1 day", duration="1 W")
-    assert bar("20260226", request=daily)  # 7 + 4 days back from 2026-03-09
+    assert bar("20260220", request=daily)  # 7 + 10 days back from 2026-03-09
     with pytest.raises(H.BarMalformed, match="before the requested window"):
-        bar("20260225", request=daily)
+        bar("20260219", request=daily)
 
 
 # --- N5: pacer key is canonical, latch cannot be reset -------------------------------------------
