@@ -511,7 +511,7 @@ def test_allowlists_are_byte_for_byte_unchanged():
         OUT.START_API, OUT.REQ_CONTRACT_DATA, OUT.CANCEL_CONTRACT_DATA, OUT.REQ_ACCOUNT_SUMMARY,
         OUT.CANCEL_ACCOUNT_SUMMARY, OUT.REQ_POSITIONS, OUT.CANCEL_POSITIONS, OUT.REQ_MKT_DATA,
         OUT.CANCEL_MKT_DATA, OUT.REQ_MARKET_DATA_TYPE, OUT.REQ_CONFIG,
-        OUT.REQ_SEC_DEF_OPT_PARAMS})
+        OUT.REQ_SEC_DEF_OPT_PARAMS, OUT.REQ_HISTORICAL_DATA, OUT.CANCEL_HISTORICAL_DATA})
     assert ALLOWED_CLIENT_METHODS == frozenset({
         "connect", "disconnect", "isConnected", "run", "reset", "setConnState",
         "checkConnected", "validateInvalidSymbols", "useProtoBuf", "serverVersion",
@@ -523,7 +523,8 @@ def test_allowlists_are_byte_for_byte_unchanged():
         "reqPositionsProtoBuf", "cancelPositions", "cancelPositionsProtoBuf", "reqMktData",
         "reqMarketDataProtoBuf", "cancelMktData", "cancelMarketDataProtoBuf",
         "reqMarketDataType", "reqMarketDataTypeProtoBuf", "reqConfigProtoBuf",
-        "reqSecDefOptParams", "reqSecDefOptParamsProtoBuf"})
+        "reqSecDefOptParams", "reqSecDefOptParamsProtoBuf", "reqHistoricalData",
+        "reqHistoricalDataProtoBuf", "cancelHistoricalData", "cancelHistoricalDataProtoBuf"})
 
 
 def test_streams_send_only_market_data_messages(tws, feed):  # noqa: F811

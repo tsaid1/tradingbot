@@ -131,6 +131,11 @@ class AmbiguousContract(IbkrError):
         self.count = count
 
 
+class HistoricalDataMalformed(IbkrError):
+    """A historical-bars answer failed validation (missing field, unparseable time, inconsistent
+    prices, times not increasing, too many bars). The read fails; no bar is kept."""
+
+
 class SessionStateError(IbkrError):
     """Method called in the wrong lifecycle state (e.g. a request before the identity gate passed)."""
 

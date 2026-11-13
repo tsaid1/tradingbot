@@ -154,7 +154,7 @@ def test_order_mode_allowlist_is_exactly_the_read_set_plus_six_ids():
                   OUT.UPDATE_CONFIG, OUT.REQ_OPEN_ORDERS, OUT.REQ_AUTO_OPEN_ORDERS,
                   OUT.UPDATE_DISPLAY_GROUP, OUT.SET_SERVER_LOGLEVEL):
         assert never not in ORDER_MODE_OUT_MESSAGES
-    added = ORDER_MODE_CLIENT_METHODS - order_session_module.ALLOWED_CLIENT_METHODS
+    added = ORDER_MODE_CLIENT_METHODS - order_session_module.ORDER_MODE_READ_CLIENT_METHODS
     assert added == {"placeOrderProtoBuf", "validateOrderParameters",
                      "validateAttachedOrdersParameters", "cancelOrderProtoBuf",
                      "reqAllOpenOrdersProtoBuf", "reqExecutionsProtoBuf",
