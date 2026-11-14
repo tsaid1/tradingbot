@@ -170,9 +170,9 @@ class ConfirmationDesk:
                           by_source_id=post.source_id)
 
     def _offer_holds(self, post, linked, apply_kw, decisions, result, now) -> None:
-        by_decision = {d.action_id: d for d in decisions}
+        production = {d.action_id: d for d in decisions}
         for o in result.outcomes:
-            if o.status not in C.HELD_STATUSES or o.action_id not in by_decision:
+            if o.status not in C.HELD_STATUSES or o.action_id not in production:
                 continue
             a = next((x for x in linked.actions if x.action_id == o.action_id), None)
             if a is None or a.action != Action.OPEN:
@@ -190,7 +190,7 @@ class ConfirmationDesk:
                 post_hash=post.text_sha256, published_at=post.published_at,
                 received_at=post.received_at, verified_author=post.verified_author,
                 text_complete=post.text_complete, action_id=a.action_id,
-                actions=tuple(linked.actions), production=by_decision[a.action_id],
+                actions=tuple(linked.actions), production=production[a.action_id],
                 waived=waived, outcome_status=o.status, outcome_reasons=tuple(o.reasons),
                 entry=entry, policy=self.policy, now=now, quote=quote,
                 is_repost=getattr(post, "is_repost", False),

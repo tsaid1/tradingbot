@@ -20,7 +20,6 @@ from pathlib import Path
 
 import streamlit as st
 
-from tradingbot.execution.operator_catalog import offer_phrase
 from tradingbot.runtime import operator_actions as Q
 from tradingbot.runtime.config import DEFAULT_CONFIG_PATH, ConfigError, load_config
 from tradingbot.runtime.confirmation_view import card, load_offers
@@ -164,7 +163,8 @@ if config.operator_confirmation.enabled:
                               key=f"offer_{word}_{row['id']}_{row['hash'][:8]}"):
                     queue_request(operator=op_name, action=action, target=str(row["id"]),
                                   kind=row["hash"], note="",
-                                  confirmation=offer_phrase(action, row["id"], row["hash"]))
+                                  confirmation=Q.expected_confirmation(
+                                      action, str(row["id"]), kind=row["hash"]))
 
 # ------------------------------------------------------------------ settlement
 st.subheader("Intents of unknown outcome")
