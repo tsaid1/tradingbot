@@ -1,6 +1,7 @@
 """Trading signal adjudication: the bundle, the reviewers file, the annotation log, the comparison
 with the interpreter's reading and the frozen ground-truth versions (docs/ADJUDICATION_WORKSPACE.md;
-contract: the adjudication workspace specification, version 1).
+contract: the adjudication workspace specification, version 1, and the rubric, version 2.1, whose
+fields and checks live in ``adjudication_rubric`` and are enforced here on every append).
 
 Pure (no Streamlit). Like ``vocab_recommend`` it must not import the runtime service, mapping,
 execution, ``ibkr``, order-capable, storage or validator modules. Every private file is read
@@ -26,6 +27,7 @@ from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
+from tradingbot.runtime import adjudication_rubric as R
 from tradingbot.runtime.vocab_recommend import (  # noqa: F401 - re-exported for the app
     LOCAL_IDENTITY_ENV,
     PUBLISHED_HOST_ENV,
@@ -48,7 +50,8 @@ from tradingbot.runtime.vocab_review import (  # noqa: F401 - PrivatePathError f
 
 BUNDLE_SCHEMA = "tradingbot.adjudication.bundle/1"
 ANNOTATION_SCHEMA = "tradingbot.adjudication.annotation/1"
-GROUND_TRUTH_SCHEMA = "tradingbot.adjudication.ground_truth/1"
+GROUND_TRUTH_SCHEMA = "tradingbot.adjudication.ground_truth/2"
+RUBRIC = R.RUBRIC_VERSION  # every new record carries "rubric": 2; none: rubric 1
 DIR_ENV = "TRADINGBOT_ADJUDICATION_DIR"
 
 # Closed value sets (section 3 of the specification; the export must use exactly these).
@@ -88,27 +91,21 @@ IGNORED_FILE = ".DS_Store"  # macOS Finder: ignored by the loader and by the bun
 FREE_TEXT_FIELDS = ("instrument_as_read", "amendment_from", "amendment_to")
 FREE_TEXT_MAPPING = ("reference_series", "proposed_execution_instrument")
 YES_NO_UNSURE, YES_NO = ("YES", "NO", "UNSURE"), ("YES", "NO")
-FLAGS = ("MISSING_CONTEXT", "AMBIGUOUS_PRICE_SEMANTICS", "NEEDS_MORE_EVIDENCE", "CHART_NEEDED")
+FLAGS = R.FLAGS  # the reviewer's flags (rubric 2 adds FORM_CANNOT_EXPRESS)
 CONFIDENCE = ("HIGH", "MEDIUM", "LOW")
-VERDICTS, OUTCOMES = ("CONFIRM", "CORRECT", "UNSURE"), ("ACCEPT", "AMEND", "RETURN")
+VERDICTS, OUTCOMES = R.VERDICTS, ("ACCEPT", "AMEND", "RETURN")
 IDEA_FIXED = ("SAME_AS_PREVIOUS", "NEW_IDEA", "UNKNOWN")  # or "SEQUENCE:<sequence_id>"
 MAX_NOTES, MAX_TEXT, MAX_MEDIA_BYTES = 2000, 80, 5 * 1024 * 1024
 
-# The reader's form: every field of the ``ai`` block, flat ("" = not stated), plus the idea
-# association and the two mapping questions. Value kinds: a tuple is a closed set.
-FIELDS: dict[str, tuple | str] = {
-    "post_label": POST_LABELS, "action": ACTIONS, "family": "family",
-    "instrument_as_read": "text", "side": SIDES, "effect": EFFECTS, "timing": TIMINGS,
-    "explicit": YES_NO, "entry_price": "price", "entry_role": ENTRY_ROLES,
-    "entry_exactness": EXACTNESS, "stop_price": "price", "targets": "prices",
-    "amendment_field": "code", "amendment_from": "text", "amendment_to": "text",
-    "ambiguities": "codes", "position_state": POSITION_STATES, "position_side": SIDES,
-    "position_last_stop": "price", "idea": "idea",
-    "reference_series_right": YES_NO_UNSURE, "execution_instrument_right": YES_NO_UNSURE,
-}
-NOT_COMPARED = ("reference_series_right", "execution_instrument_right")
-LABEL_ONLY_FIELDS = ("post_label",)
-LEVELS = "levels"  # the price table: reading[LEVELS] = [{row, role, exactness, contract_month}]
+# The system's reading, flat (section 3 of the specification; "" = the system stated nothing).
+SYSTEM_FIELDS = ("post_label", "timing", "action", "explicit", "family", "instrument_as_read",
+                 "side", "position_state", "position_side", "position_last_stop", "effect",
+                 "entry_price", "entry_role", "entry_exactness", "stop_price", "targets",
+                 "amendment_field", "amendment_to", "amendment_from", "idea", "ambiguities")
+SYSTEM_LABEL_ONLY = ("post_label", "timing", "ambiguities")
+LEVELS = R.LEVELS  # the price table: reading[LEVELS] = [{row, role, exactness, contract_month,
+#                                                         month_named}]
+fields_for = R.fields_for
 DEFAULT_SCOPE = 20
 
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")
@@ -122,9 +119,11 @@ _MAGIC = (b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"GIF87a", b"GIF89a")
 class AdjudicationError(ValueError):
     """Refused; ``code`` is a constant and at most a field name, never a path or content."""
 
-    def __init__(self, code: str):
+    def __init__(self, code: str, codes=(), fields=()):
         super().__init__(code)
         self.code = code
+        self.codes = list(codes) or [code]  # the rubric's blocking codes, when Save is refused
+        self.fields = list(fields)
 
 
 # ------------------------------------------------------------------ the bundle
@@ -530,12 +529,9 @@ def ordered(bundle: Bundle, scope: int | None = None) -> list[tuple[str | None, 
 # ------------------------------------------------------------------ the system's reading
 
 
-def fields_for(kind: str) -> tuple[str, ...]:
-    return LABEL_ONLY_FIELDS if kind == "LABEL_ONLY" else tuple(FIELDS)
-
-
 def system_reading(bundle: Bundle, item: dict) -> dict:
-    """The ``ai`` block as a reading (the idea association derived from ``idea_ref``)."""
+    """The ``ai`` block as a flat reading (the idea association derived from ``idea_ref``).
+    Shown beside the reviewer's fields after the reveal; never used to fill one of them."""
     ai = dict(item["ai"])
     ref, seq = ai.pop("idea_ref"), item["sequence_id"]
     sequences = {s["sequence_id"] for s in bundle.sequences}
@@ -549,29 +545,91 @@ def system_reading(bundle: Bundle, item: dict) -> dict:
         idea = f"SEQUENCE:{target}"
     else:
         idea = "UNKNOWN"
-    out = {**ai, "idea": idea, "reference_series_right": "", "execution_instrument_right": ""}
-    return {f: out[f] for f in fields_for(item["kind"])}
+    out = {**ai, "idea": idea}
+    keys = SYSTEM_LABEL_ONLY if item["kind"] == "LABEL_ONLY" else SYSTEM_FIELDS
+    return {f: out[f] for f in keys}
 
 
-def _norm(f: str, v: str) -> str:
-    """"" is "not stated", a first-class answer: equal to "" (and, for the entry role, to
-    NOT_STATED)."""
-    if f == "entry_role" and v == "NOT_STATED":
-        return ""
-    if FIELDS[f] == "price" and v:
-        try:
-            return format(Decimal(v).normalize(), "f")
-        except InvalidOperation:
-            return v
-    if FIELDS[f] in ("prices", "codes"):
-        return ",".join(sorted(x.strip().upper() for x in v.split(",") if x.strip()))
-    return v.strip().casefold()
+def post_forms(bundle: Bundle, item: dict) -> list[dict]:
+    """The INSTRUCTION items of the bundle that share ``item``'s post, in slot order: its forms
+    (rubric section 1). A label-only item is a form of its own."""
+    if item["kind"] != "INSTRUCTION":
+        return [item]
+    order = list(bundle.items)
+    forms = [i for i in bundle.items.values()
+             if i["post_ref"] == item["post_ref"] and i["kind"] == "INSTRUCTION"]
+    return sorted(forms, key=lambda i: (i["slot"] or 0, i["order_in_sequence"] or 0,
+                                        order.index(i["item_id"])))
 
 
-def prefill_verdicts(reading: dict, system: dict, kind: str) -> dict[str, str]:
-    """Per compared field: CONFIRM when the reviewer's value equals the system's, else CORRECT."""
-    return {f: "CONFIRM" if _norm(f, reading.get(f, "")) == _norm(f, system.get(f, ""))
-            else "CORRECT" for f in fields_for(kind) if f not in NOT_COMPARED}
+def post_siblings(bundle: Bundle, item: dict, scope: int | None) -> list[str]:
+    """Every item of ``item``'s post within the scope (blind-first holds per POST)."""
+    scoped = {i["item_id"] for _, items in ordered(bundle, scope) for i in items}
+    return [i for i, x in bundle.items.items() if x["post_ref"] == item["post_ref"]
+            and (i in scoped or i == item["item_id"])]
+
+
+def form_context(bundle: Bundle, item: dict, *, revealed: bool, rows=None,
+                 earlier_positions=()) -> R.FormContext:
+    """The rubric's context for ``item``: its form number among the post's forms, the reveal,
+    the system's mapping block, the price table's rows (by default this session's rows; the
+    freeze passes the reading's own) and the reviewer's earlier actions of the post."""
+    forms = post_forms(bundle, item)
+    k = next(n for n, i in enumerate(forms, 1) if i["item_id"] == item["item_id"])
+    m = item["mapping"]
+    return R.FormContext(
+        kind=item["kind"], form_index=k, forms_in_post=len(forms), revealed=revealed,
+        mapping=(bool(m.get("reference_series")), bool(m.get("proposed_execution_instrument"))),
+        rows=tuple(k for k, _ in table_rows(bundle, item)) if rows is None else tuple(rows),
+        earlier_positions=tuple(earlier_positions))
+
+
+def latest_own_reading(records: list[dict], item_id: str, bundle: Bundle, login: str):
+    """This login's latest rubric-2 reading of the item (AFTER_REVEAL first, else INDEPENDENT)."""
+    for phase in (AFTER_REVEAL, INDEPENDENT):
+        found = [r for r in _of(records, item_id, bundle.bundle_id, phase, login)
+                 if r.get("rubric") == RUBRIC]
+        if found:
+            return found[-1]
+    return None
+
+
+def earlier_positions(records: list[dict], bundle: Bundle, item: dict, login: str) -> list:
+    """``(family, position_after)`` of this login's saved readings of the earlier forms of the
+    post, in form order (section 13.1)."""
+    out = []
+    for f in post_forms(bundle, item):
+        if f["item_id"] == item["item_id"]:
+            break
+        rec = latest_own_reading(records, f["item_id"], bundle, login)
+        if rec is not None:
+            out.append((rec["reading"].get("family", ""), R.position_after(rec["reading"])))
+    return out
+
+
+def position_compared(bundle: Bundle, item: dict, reading: dict) -> bool:
+    """False on a form whose post has an earlier form in the same market (the reviewer's market
+    or the system's): the system's position block is shown there but not compared (13.1)."""
+    mine = {reading.get("family", ""), item["ai"].get("family", "")} - {"", R.NOT_APPLICABLE}
+    for f in post_forms(bundle, item):
+        if f["item_id"] == item["item_id"]:
+            return True
+        if f["ai"].get("family") in mine:
+            return False
+    return True
+
+
+def compared_fields(bundle: Bundle, item: dict, reading: dict, earlier=()) -> tuple[str, ...]:
+    pos = position_compared(bundle, item, reading) and not any(
+        fam and fam == reading.get("family") for fam, _ in earlier)
+    return R.compared_fields(item["kind"], position_compared=pos)
+
+
+def prefill_verdicts(reading: dict, system: dict, kind: str, fields=None) -> dict[str, str]:
+    """Per compared field, a verdict on the SYSTEM's value pre-filled from the comparison
+    (section 8): NOT_APPLICABLE when the field does not apply to the reviewer's reading."""
+    return {f: R.prefill_verdict(f, reading.get(f, ""), system.get(f, ""))
+            for f in (R.compared_fields(kind) if fields is None else fields)}
 
 
 def table_rows(bundle: Bundle, item: dict) -> list[tuple[str, str]]:
@@ -583,6 +641,40 @@ def table_rows(bundle: Bundle, item: dict) -> list[tuple[str, str]]:
     if bundle.posts is not None:
         return [(f"n:{k}", t) for k, t in enumerate(bundle.posts[item["post_ref"]]["numbers"])]
     return [(f"level:{k}", lv["price"] or "-") for k, lv in enumerate(item["levels"])]
+
+
+CONTEXT_WORDS = 4
+
+
+def table_row_details(bundle: Bundle, item: dict) -> list[dict]:
+    """Per row: ``key``, ``label`` (the number as written), ``k`` and ``m`` (its occurrence
+    among equal numbers of the table) and, FULL only, ``context``: a few words either side of
+    THAT occurrence in the post text (publisher text: plain-text rendering only)."""
+    rows = table_rows(bundle, item)
+    seen: dict[str, int] = {}
+    counts: dict[str, int] = {}
+    for _, label in rows:
+        counts[R.norm_price(label)] = counts.get(R.norm_price(label), 0) + 1
+    text = bundle.posts[item["post_ref"]]["text"] if bundle.posts is not None else None
+    pos, out = 0, []
+    for key, label in rows:
+        n = R.norm_price(label)
+        seen[n] = seen.get(n, 0) + 1
+        context = None
+        if text is not None:
+            hit = re.search(r"(?<![\d.,])" + re.escape(label) + r"(?![\d])", text[pos:])
+            if hit:
+                start, end = pos + hit.start(), pos + hit.end()
+                before = text[:start].split()[-CONTEXT_WORDS:]
+                after = text[end:].split()[:CONTEXT_WORDS]
+                mark = f"[{label}]"
+                if after and text[end:end + 1] and not text[end].isspace():
+                    mark, after = mark + after[0], after[1:]  # "[70]." stays together
+                context = clean_text(" ".join([*before, mark, *after]))
+                pos = end
+        out.append({"key": key, "label": label, "k": seen[n], "m": counts[n],
+                    "context": context})
+    return out
 
 
 def system_rows(bundle: Bundle, item: dict) -> dict[str, dict]:
@@ -601,74 +693,127 @@ def system_rows(bundle: Bundle, item: dict) -> dict[str, dict]:
 
 
 def prefill_row_verdicts(levels: list[dict], system: dict[str, dict]) -> dict[str, str]:
-    """Per row: NOT_READ when the system read no level there (no verdict on a claim it never
-    made); else CONFIRM when role, exactness and contract month equal the system's (two
-    NOT_A_PRICE rows agree whatever else), else CORRECT; an unanswered row is UNSURE."""
-    out = {}
-    for row in levels:
-        sys_row = system.get(row["row"], {})
-        if sys_row.get("not_read"):
-            out[row["row"]] = NOT_READ
-            continue
-        same = (row["role"] == sys_row.get("role") == "NOT_A_PRICE") or all(
-            row[f] == sys_row.get(f, "") for f in LEVEL_KEYS)
-        out[row["row"]] = "UNSURE" if not row["role"] else "CONFIRM" if same else "CORRECT"
-    return out
+    """Per row: NOT_APPLICABLE when the table does not apply to the reviewer's reading; NOT_READ
+    when the system read no level there (no verdict on a claim it never made); else CONFIRM when
+    role, exactness and contract month equal the system's (two NOT_A_PRICE rows agree whatever
+    else), else CORRECT; an unanswered row is UNSURE."""
+    return {row["row"]: R.prefill_row_verdict(row, system.get(row["row"], {})) for row in levels}
+
+
+_THOUSANDS = re.compile(r"^\d{1,3}(,\d{3})+(\.\d+)?$")
+
+
+def _reviewer_price(v: str, f: str) -> str:
+    return _price(v.replace(",", "") if _THOUSANDS.match(v) else v, f)
 
 
 def _clean_levels(rows, bundle: Bundle, item: dict, partial: bool) -> list[dict]:
     keys = [k for k, _ in table_rows(bundle, item)]
     if not isinstance(rows, list) or not all(isinstance(r, dict) and set(r) <= {
-            "row", *LEVEL_KEYS} and r.get("row") in keys for r in rows):
+            "row", *R.ROW_KEYS} and r.get("row") in keys for r in rows):
         raise AdjudicationError("BAD_VALUE:levels")
     given = {r["row"]: r for r in rows}
     out = []
+    allowed = {"role": (*R.TABLE_ROLES, R.NOT_APPLICABLE),
+               "exactness": (*R.ROW_EXACTNESS, R.NOT_APPLICABLE),
+               "contract_month": (*R.ROW_MONTHS, R.NOT_APPLICABLE)}
     for k in keys:
         if partial and k not in given:
             continue
         r = given.get(k, {})
-        row = {"row": k, **{f: str(r.get(f) or "") for f in LEVEL_KEYS}}
-        for f, allowed in zip(LEVEL_KEYS, (TABLE_ROLES, EXACTNESS, CONTRACT_MONTHS), strict=True):
-            if row[f] and row[f] not in allowed:
-                raise AdjudicationError(f"UNKNOWN_VALUE:levels.{f}")
+        if not all(isinstance(r.get(c, ""), str) for c in R.ROW_KEYS):
+            raise AdjudicationError("BAD_VALUE:levels")
+        row = {"row": k, **{c: str(r.get(c) or "") for c in R.ROW_KEYS}}
+        for c, values in allowed.items():
+            if row[c] and row[c] not in values:
+                raise AdjudicationError(f"UNKNOWN_VALUE:levels.{c}")
+        row["month_named"] = R.clean_month(row["month_named"])
+        if row["month_named"] and not re.fullmatch(r"[A-Z0-9]{1,12}", row["month_named"]):
+            raise AdjudicationError("BAD_VALUE:levels.month_named")
         out.append(row)
     return out
 
 
+def _clean_extras(v, bundle: Bundle) -> list[dict]:
+    if not isinstance(v, list) or len(v) > R.MAX_ADDITIONAL:
+        raise AdjudicationError("BAD_VALUE:additional_actions")
+    allowed = {"timing": R.ADDITIONAL_TIMINGS, "action": R.ADDITIONAL_ACTIONS,
+               "family": tuple(bundle.families), "side": R.SIDES}
+    out = []
+    for x in v:
+        if not isinstance(x, dict) or not set(x) <= set(R.ADDITIONAL_KEYS) or not all(
+                isinstance(x.get(k, ""), str) for k in R.ADDITIONAL_KEYS):
+            raise AdjudicationError("BAD_VALUE:additional_actions")
+        rec = {k: x.get(k, "").strip() for k in R.ADDITIONAL_KEYS}
+        if any(rec[k] and rec[k] not in allowed[k] for k in R.ADDITIONAL_KEYS):
+            raise AdjudicationError("UNKNOWN_VALUE:additional_actions")
+        out.append(rec)
+    return out
+
+
 def clean_reading(reading: dict, item: dict, bundle: Bundle, *, partial: bool = False) -> dict:
-    """A reader's values checked against the closed sets; "" = not stated (or, in the price
-    table, unanswered)."""
-    allowed = fields_for(item["kind"])
+    """A reviewer's rubric-2 values checked against the closed sets and shapes ("" =
+    unanswered). Whether they fit together is the rubric's ``validate``."""
+    allowed = R.fields_for(item["kind"])
     table = item["kind"] != "LABEL_ONLY"
     if not isinstance(reading, dict) or not set(reading) <= set(allowed) | (
             {LEVELS} if table else set()):
         raise AdjudicationError("UNKNOWN_FIELD")
-    sequences = {s["sequence_id"] for s in bundle.sequences}
+    sequences = [s["sequence_id"] for s in bundle.sequences]
     out = {}
     if table and (LEVELS in reading or not partial):
         out[LEVELS] = _clean_levels(reading.get(LEVELS, []), bundle, item, partial)
     for f in (reading if partial else allowed):
         if f == LEVELS:
             continue
-        v = reading.get(f, "")
+        v = reading.get(f, [] if f in R.LIST_FIELDS else "")
+        if f == "ambiguities":
+            if not isinstance(v, list) or not all(isinstance(c, str) and c in R.AMBIGUITIES
+                                                  for c in v):
+                raise AdjudicationError("UNKNOWN_VALUE:ambiguities")
+            out[f] = list(dict.fromkeys(v))
+            continue
+        if f == "additional_actions":
+            out[f] = _clean_extras(v, bundle)
+            continue
         if not isinstance(v, str) or _CTRL.search(v) or len(v) > MAX_TEXT:
             raise AdjudicationError(f"BAD_VALUE:{f}")
-        v, kind = v.strip(), FIELDS[f]
-        if v and isinstance(kind, tuple) and v not in kind:
-            raise AdjudicationError(f"UNKNOWN_VALUE:{f}")
-        if v and kind == "family" and v not in bundle.families:
-            raise AdjudicationError("UNKNOWN_VALUE:family")
-        if v and kind in ("code", "codes") and not all(
-                _CODE.match(c.strip()) for c in v.split(",")):
-            raise AdjudicationError(f"BAD_VALUE:{f}")
-        if kind == "price":
-            v = _price(v, f)
-        if kind == "prices":
+        v = v.strip()
+        if f in R.PRICE_FIELDS and v and v not in R.VALUE_SENTINELS[f] + (R.NOT_APPLICABLE,):
+            v = _reviewer_price(v, f)
+        elif f == "targets" and v and v not in R.VALUE_SENTINELS[f] + (R.NOT_APPLICABLE,):
             v = ", ".join(_price(x.strip(), f) for x in v.split(",") if x.strip())
-        if v and kind == "idea" and v not in IDEA_FIXED and not (
-                v.startswith("SEQUENCE:") and v.removeprefix("SEQUENCE:") in sequences):
-            raise AdjudicationError("UNKNOWN_VALUE:idea")
+        elif f in ("amendment_to", "amendment_from") and R.is_price(v.replace(",", "")):
+            v = _reviewer_price(v, f)
+        problem = R.value_problem(f, v, bundle.families, sequences)
+        if problem:
+            raise AdjudicationError(problem)
         out[f] = v
+    return out
+
+
+def merge_amendment(reading: dict, amended: dict, ctx: R.FormContext | None = None) -> dict:
+    """The reviewed reading with the approver's amended fields; price-table rows by row. With
+    ``ctx`` (rubric 2): every field the approver did not amend that is derived or does not apply
+    in the merged reading is derived again (so an amended action re-derives what follows)."""
+    out = {**reading, **{k: v for k, v in amended.items() if k != LEVELS}}
+    rows = {r["row"]: dict(r) for r in reading.get(LEVELS, [])}
+    rows.update({r["row"]: {**rows.get(r["row"], {}), **r} for r in amended.get(LEVELS, [])})
+    if rows or LEVELS in reading:
+        out[LEVELS] = list(rows.values())
+    if ctx is None:
+        return out
+    for _ in range(6):
+        before = repr(out)
+        st = R.applicability(out, ctx)
+        for f, s in st.items():
+            if f != LEVELS and f not in amended and s.state in (R.DERIVED, R.NA, R.PENDING):
+                out[f] = [] if f in R.LIST_FIELDS else ""
+        if st.get(LEVELS, R.Status(R.NA)).state != R.ASK and LEVELS not in amended:
+            out[LEVELS] = [{"row": r["row"]} for r in out.get(LEVELS, [])]
+        out = R.complete(out, ctx)
+        if repr(out) == before:
+            break
     return out
 
 
@@ -774,13 +919,59 @@ def _of(records, item_id, bundle_id, phase=None, login=None):
             and (login is None or (r.get("annotator") or {}).get("login") == login)]
 
 
+def rubric2(records: list[dict]) -> list[dict]:
+    """The records of rubric 2 (a record without ``rubric`` is rubric 1: never edited, still
+    verified, not an adjudication under rubric 2)."""
+    return [r for r in records if r.get("rubric") == RUBRIC]
+
+
+def check_reading(bundle: Bundle, item: dict, reading: dict, *, revealed: bool,
+                  records: list[dict], login: str, flags=(), confidence: str = "",
+                  notes: str = "", rows=None) -> tuple[dict, R.Checks, R.FormContext]:
+    """The rubric's checks of a (cleaned) reading, as Save runs them: the completed reading,
+    the blocking codes and warnings, and the context used (the app shows the same)."""
+    ctx = form_context(bundle, item, revealed=revealed, rows=rows,
+                       earlier_positions=earlier_positions(records, bundle, item, login))
+    done = R.complete(reading, ctx)
+    return done, R.validate(done, ctx, flags=flags, confidence=confidence, notes=notes), ctx
+
+
+def _enforce(checks: R.Checks, acknowledged: list[str]) -> None:
+    if checks.blocking:
+        raise AdjudicationError("BLOCKED:" + ",".join(checks.codes), checks.codes,
+                                [f for _, f in checks.blocking])
+    if set(checks.warnings) != set(acknowledged):
+        raise AdjudicationError("WARNINGS_NOT_ACKNOWLEDGED")
+
+
+def _check_verdicts(bundle: Bundle, item: dict, done: dict, verdicts: dict, ctx) -> None:
+    compared = set(compared_fields(bundle, item, done, ctx.earlier_positions))
+    withheld = set(item.get("withheld", ()))  # a withheld field: no verdict due
+    flat = {f: v for f, v in verdicts.items() if f != LEVELS}
+    ok = set(flat) <= compared and compared - withheld <= set(flat) and all(
+        (v == R.VERDICT_NOT_APPLICABLE) if done.get(f) == R.NOT_APPLICABLE else v in VERDICTS
+        for f, v in flat.items())
+    rows, sys_rows = done.get(LEVELS, []), system_rows(bundle, item)
+    if rows:
+        given = verdicts.get(LEVELS)
+        ok = ok and isinstance(given, dict) and set(given) == {r["row"] for r in rows} and all(
+            given[r["row"]] == want if (want := R.expected_row_verdict(
+                r, sys_rows.get(r["row"], {}))) else given[r["row"]] in VERDICTS for r in rows)
+    elif LEVELS in verdicts:
+        ok = False
+    if not ok:
+        raise AdjudicationError("VERDICT_FOR_EVERY_COMPARED_FIELD")
+
+
 def append_annotation(base: str | Path, bundle: Bundle, session: Session, *, item_id: str,
                       phase: str, blind: bool, reading: dict, field_verdicts: dict | None = None,
                       flags=(), confidence: str = "", notes: str = "",
                       refers_to: int | None = None, outcome: str | None = None,
-                      now: datetime | None = None) -> dict:
+                      acknowledged_warnings=(), now: datetime | None = None) -> dict:
     """Append ONE annotation record (the app's only write), validated against the bundle, the
-    session's role and the records already in the log (under the log's lock)."""
+    session's role, the rubric (every blocking check of Save, the acknowledged warnings; for an
+    AMEND, on the merged reading) and the records already in the log (under the log's lock).
+    Every record carries ``rubric: 2`` and ``acknowledged_warnings``."""
     item = bundle.items.get(item_id)
     if item is None:
         raise AdjudicationError("UNKNOWN_ITEM")
@@ -791,15 +982,18 @@ def append_annotation(base: str | Path, bundle: Bundle, session: Session, *, ite
         raise AdjudicationError("UNKNOWN_PHASE")
     if (phase == APPROVAL) != (session.role == APPROVER):
         raise AdjudicationError("ROLE_MAY_NOT_WRITE_PHASE")
-    flags = list(flags)
-    if not set(flags) <= set(FLAGS) or (confidence and confidence not in CONFIDENCE) or (
-            phase != APPROVAL and not confidence):
+    flags = list(dict.fromkeys(flags))
+    if not set(flags) <= set(FLAGS) or (confidence and confidence not in CONFIDENCE):
         raise AdjudicationError("FLAGS_OR_CONFIDENCE")
     if not isinstance(notes, str):
         raise AdjudicationError("NOTES_TOO_LONG_OR_UNPRINTABLE")
     notes = clean_text(notes)
     if len(notes) > MAX_NOTES:
         raise AdjudicationError("NOTES_TOO_LONG_OR_UNPRINTABLE")
+    ack = list(acknowledged_warnings)
+    if not all(isinstance(c, str) and c in R.WARNING_CODES for c in ack):
+        raise AdjudicationError("BAD_VALUE:acknowledged_warnings")
+    ack = sorted(set(ack))
     verdicts = dict(field_verdicts or {})
     if phase == APPROVAL:
         if outcome not in OUTCOMES:
@@ -810,45 +1004,64 @@ def append_annotation(base: str | Path, bundle: Bundle, session: Session, *, ite
         blind = False
     else:
         reading = clean_reading(reading, item, bundle)
-        compared = {f for f in fields_for(item["kind"]) if f not in NOT_COMPARED}
         if phase == INDEPENDENT and (not blind or verdicts or refers_to is not None
                                      or outcome):
             raise AdjudicationError("INDEPENDENT_IS_BLIND_WITHOUT_VERDICTS")
-        rows = verdicts.get(LEVELS)
-        flat = {f: v for f, v in verdicts.items() if f != LEVELS}
-        expected_rows = {k: NOT_READ if v.get("not_read") else None
-                         for k, v in system_rows(bundle, item).items()}
-        rows_ok = LEVELS not in reading and LEVELS not in verdicts or (
-            isinstance(rows, dict) and set(rows) == set(expected_rows) and all(
-                (rows[k] == NOT_READ) if want == NOT_READ else rows[k] in VERDICTS
-                for k, want in expected_rows.items()))
-        required = compared - set(item.get("withheld", ()))  # a withheld field: no verdict due
-        if phase == AFTER_REVEAL and (not required <= set(flat) <= compared or not set(
-                flat.values()) <= set(VERDICTS) or outcome or not rows_ok):
+        if phase == AFTER_REVEAL and outcome:
             raise AdjudicationError("VERDICT_FOR_EVERY_COMPARED_FIELD")
 
     def make(v: Verification) -> dict:
         recs, me = v.records, session.login
-        if phase == INDEPENDENT and _of(recs, item_id, bundle.bundle_id, login=me):
-            raise AdjudicationError("SYSTEM_READING_ALREADY_SEEN")  # a marker or any reading
+        new = rubric2(recs)
+        stored = reading
+        siblings = post_siblings(bundle, item, session.scope)
+        if phase == INDEPENDENT and (_of(recs, item_id, bundle.bundle_id, login=me) or any(
+                _of(recs, s, bundle.bundle_id, SYSTEM_SHOWN, me) for s in siblings)):
+            raise AdjudicationError("SYSTEM_READING_ALREADY_SEEN")  # a marker or a reading
         if phase == AFTER_REVEAL:
-            mine = {r["seq"] for r in _of(recs, item_id, bundle.bundle_id, INDEPENDENT, me)}
+            mine = {r["seq"] for r in _of(new, item_id, bundle.bundle_id, INDEPENDENT, me)}
             if (refers_to in mine) != bool(blind) or (not blind and refers_to is not None):
                 raise AdjudicationError("AFTER_REVEAL_REFERS_TO_OWN_INDEPENDENT")
-        if phase == APPROVAL:
-            reviewed = {r["seq"]: r for r in _of(recs, item_id, bundle.bundle_id, AFTER_REVEAL)}
+            if blind and not all(_of(new, s, bundle.bundle_id, INDEPENDENT, me) or _of(
+                    recs, s, bundle.bundle_id, SYSTEM_SHOWN, me) for s in siblings):
+                raise AdjudicationError("BLIND_FIRST_PER_POST")  # every form saved first
+        if phase != APPROVAL:
+            done, checks, ctx = check_reading(
+                bundle, item, reading, revealed=phase == AFTER_REVEAL, records=recs, login=me,
+                flags=flags, confidence=confidence, notes=notes)
+            _enforce(checks, ack)
+            if phase == AFTER_REVEAL:
+                _check_verdicts(bundle, item, done, verdicts, ctx)
+            stored = done
+        else:
+            reviewed = {r["seq"]: r for r in _of(new, item_id, bundle.bundle_id, AFTER_REVEAL)}
             if refers_to not in reviewed:
-                raise AdjudicationError("APPROVAL_REFERS_TO_A_REVIEWED_RECORD")
+                old = {r["seq"] for r in _of(recs, item_id, bundle.bundle_id, AFTER_REVEAL)}
+                raise AdjudicationError("RUBRIC_1_RECORD_NOT_APPROVABLE" if refers_to in old
+                                        else "APPROVAL_REFERS_TO_A_REVIEWED_RECORD")
             if _of([r for r in recs if r.get("phase") != APPROVAL], item_id, bundle.bundle_id,
                    login=me):
                 raise AdjudicationError("APPROVER_IS_REVIEWER")
+            source = reviewed[refers_to]
+            if outcome == "AMEND":
+                rows = [r["row"] for r in source["reading"].get(LEVELS, [])]
+                ctx = form_context(bundle, item, revealed=True, rows=rows,
+                                   earlier_positions=earlier_positions(
+                                       recs, bundle, item, source["annotator"]["login"]))
+                merged = merge_amendment(source["reading"], reading, ctx)
+                _enforce(R.validate(merged, ctx, flags=source["flags"],
+                                    confidence=source["confidence"],
+                                    notes=source["notes"] or notes), ack)
+            elif ack:
+                raise AdjudicationError("WARNINGS_NOT_ACKNOWLEDGED")
         return {"at": (now or datetime.now(UTC)).astimezone(UTC).isoformat(),
                 "bundle_id": bundle.bundle_id, "item_id": item_id,
                 "annotator": {"login": me, "name": session.name, "role": session.role,
                               "access": session.access},
-                "phase": phase, "blind": bool(blind), "reading": reading,
+                "phase": phase, "blind": bool(blind), "reading": stored,
                 "field_verdicts": verdicts, "flags": flags, "confidence": confidence,
-                "notes": notes, "refers_to": refers_to, "decision": outcome}
+                "notes": notes, "refers_to": refers_to, "decision": outcome, "rubric": RUBRIC,
+                "acknowledged_warnings": ack}
 
     try:
         return append_chained(annotations_path(base), "annotation log", ANNOTATION_SCHEMA, make)
@@ -861,28 +1074,29 @@ def append_annotation(base: str | Path, bundle: Bundle, session: Session, *, ite
 
 def mark_system_shown(base: str | Path, bundle: Bundle, session: Session, item_id: str) -> None:
     """Record, BEFORE the system's reading of ``item_id`` is served to a reviewer, that it was
-    (once per login and item). Raises when it cannot be recorded: the caller then does not show
-    it. Approvers write no reading, so they need no marker."""
+    (once per login and item), for EVERY item of the same post within the scope: blind-first
+    holds per post. Raises when it cannot be recorded: the caller then does not show it.
+    Approvers write no reading, so they need no marker."""
     if session.role != REVIEWER or item_id not in bundle.items:
         return
+    for sid in post_siblings(bundle, bundle.items[item_id], session.scope):
+        def make(v: Verification, sid=sid) -> dict:
+            if _of(v.records, sid, bundle.bundle_id, SYSTEM_SHOWN, session.login):
+                raise _AlreadyMarked
+            return {"at": datetime.now(UTC).isoformat(), "bundle_id": bundle.bundle_id,
+                    "item_id": sid,
+                    "annotator": {"login": session.login, "name": session.name,
+                                  "role": session.role, "access": session.access},
+                    "phase": SYSTEM_SHOWN, "blind": False, "reading": {}, "field_verdicts": {},
+                    "flags": [], "confidence": "", "notes": "", "refers_to": None,
+                    "decision": None, "rubric": RUBRIC, "acknowledged_warnings": []}
 
-    def make(v: Verification) -> dict:
-        if _of(v.records, item_id, bundle.bundle_id, SYSTEM_SHOWN, session.login):
-            raise _AlreadyMarked
-        return {"at": datetime.now(UTC).isoformat(), "bundle_id": bundle.bundle_id,
-                "item_id": item_id,
-                "annotator": {"login": session.login, "name": session.name,
-                              "role": session.role, "access": session.access},
-                "phase": SYSTEM_SHOWN, "blind": False, "reading": {}, "field_verdicts": {},
-                "flags": [], "confidence": "", "notes": "", "refers_to": None,
-                "decision": None}
-
-    try:
-        append_chained(annotations_path(base), "annotation log", ANNOTATION_SCHEMA, make)
-    except _AlreadyMarked:
-        return
-    except RecommendationError as exc:
-        raise AdjudicationError(exc.code) from None
+        try:
+            append_chained(annotations_path(base), "annotation log", ANNOTATION_SCHEMA, make)
+        except _AlreadyMarked:
+            continue
+        except RecommendationError as exc:
+            raise AdjudicationError(exc.code) from None
 
 
 class _AlreadyMarked(Exception):
@@ -891,7 +1105,8 @@ class _AlreadyMarked(Exception):
 
 def effective_approval(records: list[dict], item_id: str, bundle: Bundle) -> dict | None:
     """The latest APPROVAL of the item, when it still refers to its reviewer's LATEST
-    AFTER_REVEAL of the item; a later revision by that reviewer returns it to PROVISIONAL."""
+    AFTER_REVEAL of the item; a later revision by that reviewer returns it to PROVISIONAL.
+    (Pass the records of one rubric.)"""
     approvals = _of(records, item_id, bundle.bundle_id, APPROVAL)
     if not approvals:
         return None
@@ -905,45 +1120,76 @@ def effective_approval(records: list[dict], item_id: str, bundle: Bundle) -> dic
     return last if max(by_same) == reviewed["seq"] else None
 
 
+def _resolve_one(recs: list[dict], item: dict, bundle: Bundle, rubric: int) -> dict:
+    item_id = item["item_id"]
+    after = {r["seq"]: r for r in _of(recs, item_id, bundle.bundle_id, AFTER_REVEAL)}
+    last = effective_approval(recs, item_id, bundle)
+    if last is not None and _outcome(last) in ("ACCEPT", "AMEND"):
+        source = after[last["refers_to"]]
+        status = "APPROVED" if _outcome(last) == "ACCEPT" else "AMENDED"
+        if rubric == RUBRIC:
+            ctx = form_context(bundle, item, revealed=True,
+                               rows=[r["row"] for r in source["reading"].get(LEVELS, [])])
+            reading = merge_amendment(source["reading"], last["reading"], ctx) if \
+                status == "AMENDED" else source["reading"]
+        else:
+            reading = merge_amendment(source["reading"], last["reading"])
+        ack = last.get("acknowledged_warnings", []) if status == "AMENDED" else source.get(
+            "acknowledged_warnings", [])
+    else:
+        source = after[max(after)]
+        status, reading = "PROVISIONAL", source["reading"]
+        ack = source.get("acknowledged_warnings", [])
+    independent = next((r for r in recs if r["seq"] == source["refers_to"]
+                        and r.get("phase") == INDEPENDENT), None)
+    forms = post_forms(bundle, item)
+    two = rubric == RUBRIC
+    return {"schema": GROUND_TRUTH_SCHEMA, "rubric": rubric, "bundle_id": bundle.bundle_id,
+            "item_id": item_id, "kind": item["kind"], "set": item["set"],
+            "sequence_id": item["sequence_id"], "post_ref": item["post_ref"],
+            "form_index": next(n for n, i in enumerate(forms, 1) if i["item_id"] == item_id),
+            "forms_in_post": len(forms), "status": status, "reading": reading,
+            "field_verdicts": source["field_verdicts"], "blind": source["blind"],
+            "independent_reading": independent["reading"] if independent else None,
+            "position_after": R.position_after(reading) if two else None,
+            "additional_actions": list(reading.get("additional_actions") or []) if two else [],
+            "announcement": reading.get("announcement") if two else None,
+            "follower_implication": reading.get("follower_implication") if two else None,
+            "post_label_overall": None,
+            "acknowledged_warnings": list(ack) if two else [],
+            "escalated": two and R.FORM_CANNOT_EXPRESS in (source.get("flags") or []),
+            "flags": list(source.get("flags") or []), "confidence": source.get("confidence"),
+            "reviewer": source["annotator"]["login"],
+            "approver": last["annotator"]["login"] if last else None,
+            "decision": _outcome(last) if last else None,
+            "source_seqs": {"independent": independent["seq"] if independent else None,
+                            "after_reveal": source["seq"],
+                            "approval": last["seq"] if last else None}}
+
+
 def resolve(records: list[dict], bundle: Bundle) -> list[dict]:
     """Per item: the approver's accepted or amended reading; else the latest AFTER_REVEAL
-    reading, PROVISIONAL; with the INDEPENDENT reading it followed (anchoring)."""
+    reading, PROVISIONAL; with the INDEPENDENT reading it followed (anchoring). Rubric-2 records
+    first; an item with rubric-1 records only gets a row marked ``rubric: 1`` (counted, not
+    scored). ``post_label_overall``: the strongest label of the post's actions once every form
+    of the post has a rubric-2 row (a label-only row: its own post label)."""
+    new = rubric2(records)
+    old = [r for r in records if "rubric" not in r]
     out = []
     for item_id, item in bundle.items.items():
-        after = {r["seq"]: r for r in _of(records, item_id, bundle.bundle_id, AFTER_REVEAL)}
-        if not after:
+        if _of(new, item_id, bundle.bundle_id, AFTER_REVEAL):
+            out.append(_resolve_one(new, item, bundle, RUBRIC))
+        elif _of(old, item_id, bundle.bundle_id, AFTER_REVEAL):
+            out.append(_resolve_one(old, item, bundle, 1))
+    by_item = {r["item_id"]: r for r in out if r["rubric"] == RUBRIC}
+    for row in by_item.values():
+        if row["kind"] == "LABEL_ONLY":
+            row["post_label_overall"] = row["reading"].get("post_label") or None
             continue
-        last = effective_approval(records, item_id, bundle)
-        if last is not None and _outcome(last) in ("ACCEPT", "AMEND"):
-            source, status = after[last["refers_to"]], ("APPROVED" if _outcome(last) ==
-                                                          "ACCEPT" else "AMENDED")
-            reading = merge_amendment(source["reading"], last["reading"])
-        else:
-            source = after[max(after)]
-            status, reading = "PROVISIONAL", source["reading"]
-        independent = next((r for r in records if r["seq"] == source["refers_to"]
-                            and r.get("phase") == INDEPENDENT), None)
-        out.append({"schema": GROUND_TRUTH_SCHEMA, "bundle_id": bundle.bundle_id,
-                    "item_id": item_id, "kind": item["kind"], "set": item["set"],
-                    "sequence_id": item["sequence_id"], "status": status, "reading": reading,
-                    "field_verdicts": source["field_verdicts"], "blind": source["blind"],
-                    "independent_reading": independent["reading"] if independent else None,
-                    "reviewer": source["annotator"]["login"],
-                    "approver": last["annotator"]["login"] if last else None,
-                    "decision": _outcome(last) if last else None,
-                    "source_seqs": {"independent": independent["seq"] if independent else None,
-                                    "after_reveal": source["seq"],
-                                    "approval": last["seq"] if last else None}})
-    return out
-
-
-def merge_amendment(reading: dict, amended: dict) -> dict:
-    """The reviewed reading with the approver's amended fields; price-table rows by row."""
-    out = {**reading, **{k: v for k, v in amended.items() if k != LEVELS}}
-    if LEVELS in amended:
-        rows = {r["row"]: r for r in reading.get(LEVELS, [])}
-        rows.update({r["row"]: r for r in amended[LEVELS]})
-        out[LEVELS] = list(rows.values())
+        forms = [by_item.get(f["item_id"]) for f in post_forms(bundle, bundle.items[
+            row["item_id"]])]
+        if all(forms):
+            row["post_label_overall"] = R.overall_label([f["reading"] for f in forms])
     return out
 
 
@@ -976,12 +1222,14 @@ def freeze(base: str | Path, now: datetime | None = None) -> tuple[Path, dict]:
                        for r in rows).encode("utf-8")
         name = f"ground_truth_v{n}.jsonl"
         manifest = {"schema": GROUND_TRUTH_SCHEMA + ":manifest", "version": n, "file": name,
-                    "sha256": _sha(data), "bundle_id": bundle.bundle_id,
+                    "sha256": _sha(data), "bundle_id": bundle.bundle_id, "rubric": RUBRIC,
                     "created_at": (now or datetime.now(UTC)).astimezone(UTC).isoformat(),
                     "annotation_log": {"count": log.count, "head_sha256": log.head},
                     "items": len(rows), "by_status": {s: sum(r["status"] == s for r in rows)
                                                       for s in ("APPROVED", "AMENDED",
-                                                                "PROVISIONAL")}}
+                                                                "PROVISIONAL")},
+                    "by_rubric": {str(k): sum(r["rubric"] == k for r in rows) for k in (1, 2)},
+                    "escalated": sum(bool(r["escalated"]) for r in rows)}
         d.create(name, data)
         d.create(f"ground_truth_v{n}.manifest.json",
                  json.dumps(manifest, indent=1, sort_keys=True).encode("utf-8") + b"\n")
@@ -1009,8 +1257,9 @@ class Progress:
 
 
 def progress(bundle: Bundle, records: list[dict], session: Session) -> Progress:
-    """Per item for this session: a reviewer's OPEN / INDEPENDENT_SAVED / DONE; an approver's
-    NOT_REVIEWED / AWAITING / RETURNED / DECIDED."""
+    """Per item for this session, under rubric 2 (rubric-1 records do not count): a reviewer's
+    OPEN / INDEPENDENT_SAVED / DONE; an approver's NOT_REVIEWED / AWAITING / RETURNED / DECIDED."""
+    records = rubric2(records)
     in_scope = [i["item_id"] for _, items in ordered(bundle, session.scope) for i in items]
     p = Progress(total=len(in_scope))
     for item_id in in_scope:
