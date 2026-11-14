@@ -520,7 +520,7 @@ def test_s7_current_or_historical_is_decided_by_the_posts_time_words():
 
 def test_s8_the_guide_is_one_page_and_defines_its_terms():
     guide = R.REVIEWER_GUIDE
-    assert len(guide.split()) <= R.REVIEWER_GUIDE_MAX_WORDS == 700  # one page, plain sentences
+    assert len(guide.split()) <= R.REVIEWER_GUIDE_MAX_WORDS == 720  # one page, plain sentences
     assert sum(line.startswith("#") for line in guide.splitlines()) <= \
         R.REVIEWER_GUIDE_MAX_HEADINGS == 6
     flat = " ".join(guide.split())
@@ -947,7 +947,9 @@ def test_c5_the_freeze_writes_validation_codes_and_verify_checks_the_counts(base
 
 def test_c7_the_guide_fits_one_page_and_defines_first_report_and_repeat():
     guide = R.REVIEWER_GUIDE
-    assert len(guide.split()) <= 700
+    assert len(guide.split()) <= 720
+    assert "answer the post's label, which is the strongest label among its actions" in " ".join(guide.split())
+    assert "leave unanswered only what cannot be answered truthfully" in " ".join(guide.split())
     assert "An unsaved form is lost when you leave the page." in " ".join(guide.split())
     assert "Your access is personal and can be withdrawn." in " ".join(guide.split())
     assert "any other tool or assistant" in " ".join(guide.split())
