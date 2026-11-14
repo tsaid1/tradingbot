@@ -15,6 +15,11 @@ The runtime config comes from ``TRADINGBOT_RUNTIME_CONFIG`` or ``~/.config/tradi
 it must set ``[interpreter] review_log_path`` and ``lexicon_path``. A proposals file is read from
 ``TRADINGBOT_VOCAB_PROPOSALS``, else beside the review log (``<log>.proposals.jsonl``); without one
 the page builds a plain batch from the review log.
+
+When the outside reviewer's recommendations log exists (beside ``TRADINGBOT_VOCAB_REVIEWER_EXPORT``,
+docs/VOCAB_REVIEWER.md), each proposal also shows each reviewer's latest recommendation as one
+plain-text line, read only: the verdict controls are never pre-set by it. Applying a batch then
+appends, beside the lexicon, the owner's decision per word with the recommendations shown.
 """
 
 from __future__ import annotations
@@ -25,6 +30,7 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
+from tradingbot.runtime import vocab_recommend as R
 from tradingbot.runtime import vocab_review as V
 from tradingbot.runtime.config import DEFAULT_CONFIG_PATH, ConfigError, load_config
 
@@ -82,6 +88,45 @@ def _show_result(r: V.BatchResult) -> None:
                    "candidate in a separate replay config with a new state_dir, then run:")
         st.code(f"lexicon_path = \"{r.path}\"\nscripts/run_service.py --config <replay.toml> "
                 "--source replay:<posts.jsonl> --allow-candidate-lexicon", language=None)
+
+
+def _recommendations() -> tuple[dict, dict] | None:
+    """({proposal id: {login: latest record}}, log head) when the reviewer's recommendations log
+    exists, else None (the page is then exactly as without a reviewer)."""
+    configured = os.environ.get(R.EXPORT_ENV)
+    if not configured:
+        return None
+    path = R.recommendations_path(Path(configured).expanduser())
+    if not path.exists():
+        return None
+    try:
+        checked = R.verify_log(path)
+    except (OSError, V.PrivatePathError) as exc:
+        st.error(f"The reviewer's recommendations could not be read ({type(exc).__name__}); "
+                 "none shown.")
+        return {}, {"count": None, "sha256": None}
+    if checked is None or not checked.ok:
+        st.error("The reviewer's recommendations log fails verification ("
+                 f"{checked.problem if checked else 'missing'}): none shown.")
+        return {}, {"count": None, "sha256": None}
+    st.caption("Reviewer recommendations are shown under each proposal: advice only, your "
+               "decisions are not pre-set.")
+    return R.latest(checked.records), {"count": checked.count, "sha256": checked.head}
+
+
+def _audit(lexicon, proposals, verdicts, result, shown, head) -> None:
+    """Record the owner's decisions with the recommendations they were shown with."""
+    if result.status == "REFUSED":
+        return
+    decided = [(V.proposal_id(p), i) for p, i in zip(proposals, V.batch_items(proposals, verdicts),
+                                                      strict=True) if i.verdict != V.PENDING]
+    if not decided:
+        return
+    try:
+        R.record_owner_decisions(lexicon, decided, result.status,
+                                 result.backup.name if result.backup else None, shown, head)
+    except (OSError, V.PrivatePathError) as exc:
+        result.message += f" The reviewer audit could not be written ({type(exc).__name__})."
 
 
 def _reset_selections() -> None:
@@ -164,6 +209,7 @@ def main() -> None:
     c3.metric("Unreadable lines", bad)
 
     families = _families(config)
+    recs = _recommendations()
     verdicts: dict[str, V.Verdict] = {}
     n = 0
     for group, label in V.GROUPS.items():
@@ -176,6 +222,8 @@ def main() -> None:
             pid = V.proposal_id(p)
             with st.expander(f"Proposal {n}: {p.posts} held post(s), {p.holds} hold(s)"):
                 st.code(_details(p), language=None)
+                for rec in (recs[0].get(pid, {}) if recs else {}).values():
+                    st.text(R.describe(rec))
                 if p.market_warning:
                     st.text(f"Warning: {V.MAY_BE_MARKET}.")
                 if p.measured:
@@ -228,6 +276,11 @@ def main() -> None:
                                key="vr_confirm_undo")
     previous = st.session_state.get("vr_shown_digest")
     st.session_state["vr_shown_digest"] = digest
+    if recs is not None:  # logins, verdicts and line numbers only: what this render showed
+        shown = st.session_state.get("vr_recs_shown")
+        st.session_state["vr_recs_shown"] = {
+            V.proposal_id(p): R.shown_summary(recs[0].get(V.proposal_id(p), {}))
+            for p in proposals}
     b1, b2, b3 = st.columns(3)
     if b1.button("Apply batch to the production lexicon", key="vr_apply", type="primary"):
         if previous != digest:
@@ -237,7 +290,11 @@ def main() -> None:
         elif not confirmed:
             st.error("Not applied: tick the confirmation of the final table first.")
         else:
-            _done(V.apply_reviewed(lexicon, log, prop_path, verdicts, previous))
+            result = V.apply_reviewed(lexicon, log, prop_path, verdicts, previous)
+            if recs is not None:
+                _audit(lexicon, proposals, verdicts, result,
+                       shown if shown is not None else st.session_state["vr_recs_shown"], recs[1])
+            _done(result)
     if b2.button("Write a candidate lexicon (experiment)", key="vr_candidate"):
         if not confirm_candidate:
             st.error("Not written: tick the candidate confirmation first.")
