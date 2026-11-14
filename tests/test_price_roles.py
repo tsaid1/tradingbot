@@ -248,3 +248,16 @@ def test_price_roles_no_decision_change():
     assert not missing and not changed
     with tempfile.TemporaryDirectory() as d:
         assert DC.decision_digests(Path(d)) == golden["decisions"]
+
+
+def test_a_reader_fault_never_disturbs_the_interpretation(monkeypatch):
+    import tradingbot.price_roles as PR
+    text = SCENARIOS[1][0]
+    before = TklInterpreter().interpret(post(text))
+
+    def boom(*_a, **_k):
+        raise RuntimeError("invented fault")
+    monkeypatch.setattr(PR, "read_price_roles", boom)
+    after = TklInterpreter().interpret(post(text))
+    assert after.model_dump(exclude={"price_readings"}) == before.model_dump(exclude={"price_readings"})
+    assert [r.reasons for r in after.price_readings] == [["READER_FAULT"]] * 3
