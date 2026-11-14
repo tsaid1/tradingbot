@@ -3,7 +3,7 @@
 A stand-alone, loopback-only Streamlit app in which reviewers record what each trading post
 really instructs, and an approver settles it, to make a versioned ground truth for evaluating the
 interpreter. It implements the adjudication workspace specification version 1.3 (app side) and
-the adjudication rubric version 2.2: the reviewer's fields, their questions, tooltips, values,
+the adjudication rubric version 2.3: the reviewer's fields, their questions, tooltips, values,
 which fields apply and what Save checks are defined ONCE, in
 `src/tradingbot/runtime/adjudication_rubric.py`, and rendered to
 [ADJUDICATION_RUBRIC.md](ADJUDICATION_RUBRIC.md) (the authoritative rubric) and
@@ -114,14 +114,16 @@ access = "FULL"          # FULL or RESTRICTED
   (`blind: true`, referring to the independent record). With the switch off, the form starts
   **unanswered** with the system's values beside it (nothing of the system's reading fills an
   answer, in any mode) and only AFTER_REVEAL is written (`blind: false`).
-* **The form** (rubric 2.2): "Form k of m for this post" (m = the post's instruction items), a
+* **The form** (rubric 2.3): "Form k of m for this post" (m = the post's instruction items), a
   "How to review" expander, then field groups A to I, each field labelled with a plain-English
   question and its name in brackets, with a tooltip and option texts that give each value's
   meaning. A field that does not apply to the reviewer's own timing and action is greyed with the
   reason (and stored NOT_APPLICABLE); values the form derives (the label of the action from its
   timing, the announcement FIRST_REPORT for CURRENT and CANNOT_DETERMINE for UNCERTAIN,
   `follower_implication` (with "inferred from context: not counted as executable" when `explicit`
-  is NO), the effect NONE for a REPEAT and AMENDS_PROTECTION for a MODIFY, the stop of a stop
+  is NO), the effect NONE for a REPEAT and for a MODIFY from FLAT (a change to an order that is
+  not yet a position; the warning ACTS_ON_FLAT still shows) and AMENDS_PROTECTION for any other
+  MODIFY, the stop of a stop
   MODIFY, `amendment_from` for STOP, the NOT_STATED entry role when the entry price is NOT_STATED)
   are shown read-only. Effect NONE is never offered: only the form sets it. Price and text fields carry an answer-state choice (value
   given | not stated | cannot determine). The **price table** (instruction items) has one row per
@@ -145,8 +147,12 @@ access = "FULL"          # FULL or RESTRICTED
   (each option with its meaning and a tooltip): ACCEPT, AMEND (only the amended fields; what
   follows from them is derived again; every field not amended whose kind (asked, derived, not
   applicable) changes through the amendment, or that was derived and is now asked, is reset to
-  unanswered and never preselected, so Save waits until the approver answers it; Save's checks
-  run on the merged reading, its warnings acknowledged in the approval) or RETURN. A
+  unanswered and never preselected, so Save waits until the approver answers it; amending
+  `action`, `timing` or `announcement` also resets `effect` when it is asked and not amended; a
+  field the amendment reset (or the approver blanked) must be answered even when the reviewer's
+  record carries FORM_CANNOT_EXPRESS, which lifts REQUIRED_UNANSWERED only for the other fields;
+  a reset field answered again counts as amended even with its earlier value; Save's checks run
+  on the merged reading, its warnings acknowledged in the approval) or RETURN. A
   rubric-1 record cannot be approved (`RUBRIC_1_RECORD_NOT_APPROVABLE`). Refused when the approver's login wrote any
   reading of that item, and a REVIEWER cannot write APPROVAL.
 * Navigation: sequences in `review_order` (each with its label-only items). Only the first
@@ -216,7 +222,7 @@ streamlit run dashboard/reviewer/adjudication_app.py --server.address 127.0.0.1 
 # Stop: Ctrl-C in that terminal.
 
 python scripts/adjudication_freeze.py freeze   # next versions/ground_truth_v<N>.jsonl + manifest
-python scripts/adjudication_freeze.py verify   # the log's chain and every version's sha256
+python scripts/adjudication_freeze.py verify   # the log's chain, every version's sha256, counts
 ```
 
 **Freeze** refuses when the log fails verification, a folder is not 0700 or the `bundle_id` does
@@ -267,6 +273,7 @@ One JSON object per line (keys sorted, UTF-8), one line per resolved item, in bu
 | `post_label_overall` | the label of the WHOLE post: the strongest of the post's action labels and its additional actions' labels, in the order ACTIONABLE, CONDITIONAL, RETROSPECTIVE, UNRESOLVED, COMMENTARY; set only once EVERY form of the post has a rubric-2 row and none of them is escalated (else null); a label-only row: its own `post_label` (null when escalated) |
 | `acknowledged_warnings` | the warning codes acknowledged for the resolved reading (the approval's for AMENDED, else the source's) |
 | `escalated` | true when the source record carries the flag `FORM_CANNOT_EXPRESS` (count, do not score). An escalated row MAY contain unanswered `""` fields (the escalation lifts only `REQUIRED_UNANSWERED`). It may NOT contain a value in a field that waits on an unanswered answer (such a field is `""` or `NOT_APPLICABLE`), a derived value other than the form's (`post_label`, `announcement` for CURRENT or UNCERTAIN, `follower_implication`, `component` on a single-form post, the effect of a REPEAT or a MODIFY), or any combination Save refuses between answered fields. Every row of a post with an escalated form has `post_label_overall` null. The notes are not frozen: the escalation list for the owner is read from the log |
+| `validation_codes` | (rubric 2.3) the blocking codes the rubric's validation finds on the resolved `reading` after the freeze has recomputed its derived values (with the source's flags, confidence and notes; for AMENDED, the fields the amendment reset must be answered), as a list in the order found; `[]` when the reading is clean. The freeze refuses nothing and repairs nothing beyond the derived values. A consumer counts a row with a non-empty list apart and does not score it |
 | `all_readings` | one entry per reviewer login that saved an AFTER_REVEAL reading of the item (its latest), in log order, the resolved reading's reviewer included: `{reviewer, reading, independent_reading, blind, source_seqs: {independent, after_reveal}}`; `reading` is that reviewer's own (never the approver's amendment). It adds no rule for choosing the ground truth; it makes agreement between reviewers measurable |
 | `flags`, `confidence` | of the source AFTER_REVEAL |
 | `reviewer`, `approver` | logins (approver null without an effective approval) |
@@ -305,10 +312,13 @@ nothing else. On a form whose post has an earlier form in the same market the po
 carry no verdict (the system's position block is before the post).
 
 The manifest (`ground_truth_v<N>.manifest.json`, schema `...ground_truth/2:manifest`) adds
-`rubric: 2`, `by_rubric` (`{"1": n, "2": n}`), `escalated` (a count) and `rubric1`
-(`{file, schema, sha256, items}`; `file` and `sha256` null when there is no rubric-1 row) to the
-version-1 keys; `items` and `by_status` count both files. `verify` checks the sibling file's
-sha256 too. A rubric-1 row keeps the row keys above (with the /2-only values null or empty) and
+`rubric: 2`, `by_rubric` (`{"1": n, "2": n}`), `escalated` (a count), `with_validation_codes`
+(the number of /2 rows whose `validation_codes` is not empty) and `rubric1` (`{file, schema,
+sha256, items}`; `file` and `sha256` null when there is no rubric-1 row) to the version-1 keys;
+`items`, `by_status` and `escalated` count both files. `verify` checks the sibling file's sha256
+too and, for a rubric-2 manifest, recomputes every count (`items`, `by_status`, `by_rubric`,
+`escalated`, `with_validation_codes`, `rubric1.items`) from the two files: a version whose
+manifest disagrees with its files fails. The manifest itself is not hashed. A rubric-1 row keeps the row keys above (with the /2-only values null or empty) and
 has no `all_readings`.
 
 **The log** never changes: a later record supersedes. Each line carries the sha256 of the

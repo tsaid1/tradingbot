@@ -1,4 +1,4 @@
-# Adjudication rubric (version 2.2)
+# Adjudication rubric (version 2.3)
 
 <!-- Rendered from RUBRIC in src/tradingbot/runtime/adjudication_rubric.py by scripts/adjudication_rubric_docs.py. Do not edit by hand. -->
 
@@ -30,7 +30,7 @@ Invented examples:
 
 ### `timing`: When does THIS action happen relative to the post?
 
-Answered per action. The post's own time words decide, not the time that has passed. CURRENT: the post presents the action as happening now or just done: present tense, "now", "just", "here", "a few minutes ago", or a plain past with no time placed on it ("Bought gold at 2,395."). HISTORICAL: the post itself places the action at an earlier time than the post ("this morning", "earlier today", "overnight", "yesterday", "last week"), or the action was done by an existing order (a stop-out, a target hit). Neither: UNCERTAIN with TIMING_UNCLEAR. "Bought gold at 2,395 a few minutes ago." is CURRENT; "We bought gold this morning at 2,395." is HISTORICAL (a first report: a position to reconcile, not an instruction). UNCERTAIN needs an action (no action is COMMENTARY). Timing says nothing about how directly the action is worded (that is 'explicit'). A post-level label never sets it.
+Answered per action. The post's own time words decide, not the time that has passed. CURRENT: the post presents the action as happening now or just done: present tense, "now", "just", "here", "a few minutes ago", or a plain past with no time placed on it ("Bought gold at 2,395."). HISTORICAL: the post itself places the action at an earlier time than the post ("this morning", "earlier today", "overnight", "yesterday", "last week"), or the action was done by an existing order (a stop-out, a target hit). A plain past with no time word is CURRENT: "Bought gold at 2,395." is CURRENT. Neither: UNCERTAIN with TIMING_UNCLEAR. "Bought gold at 2,395 a few minutes ago." is CURRENT; "We bought gold this morning at 2,395." is HISTORICAL (a first report: a position to reconcile, not an instruction). UNCERTAIN needs an action (no action is COMMENTARY). Timing says nothing about how directly the action is worded (that is 'explicit'). A post-level label never sets it.
 
 Applies: every instruction form that records an action.
 
@@ -44,6 +44,7 @@ Invented examples:
 
 - "Bought gold at 2,395 a few minutes ago." CURRENT
 - "We bought gold this morning at 2,395." HISTORICAL, FIRST_REPORT: a position to reconcile, not an instruction
+- "Bought gold at 2,395." CURRENT (a plain past with no time word)
 - "Bought the S&P at 5,012 a few minutes ago." CURRENT (a fresh fill)
 - "We were stopped out overnight at 2.84." HISTORICAL
 - "If silver closes above 31.50 we go long." CONDITIONAL
@@ -210,15 +211,15 @@ Invented examples:
 
 - "Covered the gold short." SHORT
 
-### `position_state`: Immediately BEFORE this action, was a position open?
+### `position_state`: Immediately BEFORE this action, was a position open? (FLAT only when the posts establish that none existed)
 
-BEFORE this action: as established by the earlier posts shown AND by the earlier actions of this same post, in text order (this post may restate it: "our long from 70, stop was 68"). For a REPEAT (a recap of an action an earlier post already announced) the position BEFORE this action is the position as the earlier posts shown already leave it, that is AFTER the earlier announcement (a recap of a close announced last week: FLAT). A position the posts shown do not establish: CANNOT_DETERMINE with the flag MISSING_CONTEXT. The position AFTER this action is shown separately.
+BEFORE this action: as established by the publisher's own account, the earlier posts shown AND the earlier actions of this same post, in text order (this post may restate it: "our long from 70, stop was 68"). FLAT: they establish that NO position exists before this action (it was closed, or this action begins the idea). CANNOT_DETERMINE: the posts shown do not settle it; "the posts shown do not show a position" is CANNOT_DETERMINE with the flag MISSING_CONTEXT, never FLAT. For a FIRST_REPORT of an exit the position before is still OPEN (the earlier posts did not know of the exit). For a REPEAT (a recap of an action an earlier post already announced) the position BEFORE this action is the position as the earlier posts shown already leave it, that is AFTER the earlier announcement (a recap of a close announced last week: FLAT). The position AFTER this action is shown separately.
 
 Applies: OPEN, ADD, MODIFY, REDUCE, CLOSE.
 
-- `OPEN`: a position was open in this market before this action
-- `FLAT`: no position before this action
-- `CANNOT_DETERMINE`: the posts shown do not settle it
+- `OPEN`: a position was open in this market before this action (for a FIRST_REPORT of an exit: still OPEN)
+- `FLAT`: the publisher's own account or the earlier posts shown establish that NO position exists before this action (it was closed, or this action begins the idea)
+- `CANNOT_DETERMINE`: the posts shown do not settle it; "the posts shown do not show a position" is this, with the flag MISSING_CONTEXT, never FLAT
 
 Invented examples:
 
@@ -246,29 +247,30 @@ Applies: when the position before this action was OPEN or CANNOT_DETERMINE.
 
 ### `effect`: How does this action change the position BEFORE this action?
 
-The action comes from the words; the effect from the position. For CONDITIONAL: the effect the action would have. Allowed pairs: OPEN with OPENS or INCREASES; ADD with INCREASES or OPENS; MODIFY with AMENDS_PROTECTION (set by the form); REDUCE with REDUCES or CLOSES; CLOSE with CLOSES or REDUCES; CANNOT_DETERMINE with any action. NONE is never chosen: the form sets it only for announcement REPEAT (the position before already reflects it) and for timing COMMENTARY; a first report changes the position. The effect must be possible from the position before: from FLAT it cannot be INCREASES, REDUCES, CLOSES or AMENDS_PROTECTION; from a position open on the same side it cannot be OPENS.
+The action comes from the words; the effect from the position. For CONDITIONAL: the effect the action would have. Allowed pairs: OPEN with OPENS or INCREASES; ADD with INCREASES or OPENS; MODIFY with AMENDS_PROTECTION (set by the form; NONE from FLAT); REDUCE with REDUCES or CLOSES; CLOSE with CLOSES or REDUCES; CANNOT_DETERMINE with any action. NONE is never chosen: the form sets it only for announcement REPEAT (the position before already reflects it), for timing COMMENTARY, and for a MODIFY from FLAT (a change to an order that is not yet a position: "moving our buy limit from 70 to 69.50"); a first report changes the position. Except for a CONDITIONAL action, the effect must be possible from the position before: from FLAT it cannot be INCREASES, REDUCES, CLOSES or AMENDS_PROTECTION; from a position open on the same side it cannot be OPENS. If the earlier posts shown do not show the position, the position before is CANNOT_DETERMINE with the flag MISSING_CONTEXT, not FLAT.
 
 Applies: OPEN, ADD, MODIFY, REDUCE, CLOSE.
 
-Set by the form: NONE for announcement REPEAT and for action NONE; AMENDS_PROTECTION for MODIFY unless REPEAT.
+Set by the form: NONE for announcement REPEAT, for action NONE and for a MODIFY from FLAT; AMENDS_PROTECTION for any other MODIFY.
 
 - `OPENS`: flat to a position
 - `INCREASES`: a larger position
 - `REDUCES`: smaller, still open
 - `CLOSES`: to flat
 - `AMENDS_PROTECTION`: size unchanged; stop or target changed
-- `NONE`: no change: set by the form only, for a REPEAT and for COMMENTARY (never chosen)
+- `NONE`: no change: set by the form only, for a REPEAT, for COMMENTARY and for a MODIFY from FLAT (never chosen)
 - `CANNOT_DETERMINE`: context missing (flag MISSING_CONTEXT)
 
 Invented examples:
 
-- "Adding to our long" with no position on record: ADD with OPENS, or CANNOT_DETERMINE with MISSING_CONTEXT
+- "Adding to our long" when the posts shown do not show the position: position CANNOT_DETERMINE with MISSING_CONTEXT, effect INCREASES; ADD with OPENS only when the posts shown establish that the position had been closed
+- "Moving our buy limit from 70 to 69.50" with nothing filled yet: MODIFY from FLAT, effect NONE (set by the form), warning ACTS_ON_FLAT
 
 ## D. Entry (OPEN and ADD only)
 
 ### `entry_price`: Which ONE number does the post tie to the entry of this action?
 
-Whatever kind of number it is; 'entry_role' says which kind. It is NOT by itself an order price. When several numbers relate to the entry, take the first that exists in this order: the instructed price, the reported fill, the market observation, the average. Never copy a number from a chart or an earlier post into it. A level that must be confirmed first ("if it CLOSES above 31.50") is not the entry price.
+Whatever kind of number it is; 'entry_role' says which kind. It is NOT by itself an order price. When several numbers relate to the entry, take the first that exists in this order: the instructed price, the reported fill, the market observation, the average. This order and the role order of the price table answer different questions: this one, which number is the entry reference; the table's, what kind of number a row is. Never copy a number from a chart or an earlier post into it. A level that must be confirmed first ("if it CLOSES above 31.50") is not the entry price.
 
 Applies: OPEN, ADD.
 
@@ -392,7 +394,7 @@ Applies: OPEN, ADD, MODIFY, REDUCE, CLOSE.
 
 ### `role`: What is this number?
 
-One row per number of the post, in text order (FULL access), or, in restricted access (no post text), one row per level the SYSTEM typed. Every occurrence is its own row. The FIRST role that applies, top to bottom. The price at which a trade was actually executed is HISTORICAL_FILL even when it was the stop or the target ("stopped out at 2.84", "took profits at 75"). A level the post names AS the stop or the target, without giving it as the price obtained, is STOP or TARGET ("the 69.50 stop was hit, filled 69.40": 69.50 STOP, 69.40 HISTORICAL_FILL). Context still decides. The function wins over the description: a level used AS the stop is STOP; "stop below support at 70" leaves 70 a CHART_LEVEL and stop_price CANNOT_DETERMINE. A STOP row needs the stop in stop_price (a number or CANNOT_DETERMINE), position_last_stop or amendment_from. Ask of the number: is the publisher telling subscribers a price to transact at (INTENDED_ENTRY)? Reporting the price they themselves got (HISTORICAL_FILL)? Saying where the market is (CURRENT_MARKET)? Giving the average of several entries (AVERAGE_OR_COST_BASIS)? Pointing at a level on the chart (CHART_LEVEL)? Setting a stop or a target (STOP, TARGET)? Cue words are indications only, never rules: "bought at", "filled", "long from" often report a fill; "buy at", "limit", "bids", "the order is working" often give an order price; "trading at", "now at", "here at" often describe the market. Context decides: order words, tense, what surrounds the number, the chart, the earlier posts shown, how the post speaks of its other numbers. If two readings remain: UNRESOLVED with AMBIGUOUS_PRICE_SEMANTICS, never a guess.
+One row per number of the post, in text order (FULL access), or, in restricted access (no post text), one row per level the SYSTEM typed. Every occurrence is its own row. The FIRST role that applies, top to bottom. The price at which a trade was actually executed is HISTORICAL_FILL even when it was the stop or the target ("stopped out at 2.84", "took profits at 75"). A level the post names AS the stop or the target, without giving it as the price obtained, is STOP or TARGET ("the 69.50 stop was hit, filled 69.40": 69.50 STOP, 69.40 HISTORICAL_FILL). "Stopped out at 2.84" gives the price obtained (HISTORICAL_FILL); "our 69.50 stop was hit" names the stop level (STOP). Context still decides. The function wins over the description: a level used AS the stop is STOP; "stop below support at 70" leaves 70 a CHART_LEVEL and stop_price CANNOT_DETERMINE. A STOP row needs the stop in stop_price (a number or CANNOT_DETERMINE), position_last_stop or amendment_from. This role order and the order in which 'entry_price' is chosen answer different questions: this one, what kind of number a row is; that one, which number is the entry reference. Ask of the number: is the publisher telling subscribers a price to transact at (INTENDED_ENTRY)? Reporting the price they themselves got (HISTORICAL_FILL)? Saying where the market is (CURRENT_MARKET)? Giving the average of several entries (AVERAGE_OR_COST_BASIS)? Pointing at a level on the chart (CHART_LEVEL)? Setting a stop or a target (STOP, TARGET)? Cue words are indications only, never rules: "bought at", "filled", "long from" often report a fill; "buy at", "limit", "bids", "the order is working" often give an order price; "trading at", "now at", "here at" often describe the market. Context decides: order words, tense, what surrounds the number, the chart, the earlier posts shown, how the post speaks of its other numbers. If two readings remain: UNRESOLVED with AMBIGUOUS_PRICE_SEMANTICS, never a guess.
 
 Applies: OPEN, ADD, MODIFY, REDUCE, CLOSE.
 
@@ -552,8 +554,8 @@ A field that does not apply is not shown (or greyed with the reason) and is stor
 - `REQUIRED_UNANSWERED`: every applicable field must be answered
 - `TIMING_ACTION`: timing COMMENTARY needs action NONE; CURRENT, HISTORICAL and CONDITIONAL need a real action; UNCERTAIN needs a real action or CANNOT_DETERMINE; CANNOT_DETERMINE as action only with UNCERTAIN
 - `POST_LABEL_ACTIONS`: on a label-only form the post label must equal the strongest label of the listed actions
-- `ACTION_EFFECT`: the action and the effect are not an allowed pair (effect NONE is set by the form only, for a REPEAT and for COMMENTARY)
-- `EFFECT_POSITION`: the effect is impossible from the position before this action: from FLAT not INCREASES, REDUCES, CLOSES or AMENDS_PROTECTION; from a position open on the same side not OPENS
+- `ACTION_EFFECT`: the action and the effect are not an allowed pair (effect NONE is set by the form only, for a REPEAT, for COMMENTARY and for a MODIFY from FLAT)
+- `EFFECT_POSITION`: the effect is impossible from the position before this action: from FLAT not INCREASES, REDUCES, CLOSES or AMENDS_PROTECTION; from a position open on the same side not OPENS (not checked for a CONDITIONAL action). If the earlier posts shown do not show the position, answer CANNOT_DETERMINE with the flag MISSING_CONTEXT, not FLAT.
 - `SIDE_POSITION`: for ADD, MODIFY, REDUCE and CLOSE, side and position_side must be equal
 - `ENTRY_FIELDS`: an entry number needs an entry role and EXACT or APPROXIMATE; an entry price CANNOT_DETERMINE needs an entry role; NOT_STATED needs neither
 - `TABLE_STOP`: a row with role STOP needs the stop in one of three fields: stop_price (a number or CANNOT_DETERMINE), position_last_stop (a number) or amendment_from (a number)
@@ -575,10 +577,10 @@ With the flag FORM_CANNOT_EXPRESS (notes required) only `REQUIRED_UNANSWERED` is
 - `ENTRY_NOT_IN_TABLE`: an entry number is given but no row carries its role
 - `STOP_NOT_IN_TABLE`: a stop number is given but no row is STOP
 - `TARGET_NOT_IN_TABLE`: target numbers are given but no row is TARGET
-- `REPEAT_POSITION`: a REPEAT whose action would still change the position given before it (a repeat CLOSE with OPEN before, a repeat OPEN with FLAT before): for a REPEAT the position before is the one after the earlier announcement
+- `REPEAT_POSITION`: a REPEAT whose position before does not already reflect the action (a repeat OPEN, ADD, REDUCE or MODIFY with FLAT before; a repeat CLOSE with OPEN before; a repeat OPEN or ADD with a position open on the other side): for a REPEAT the position before is the one after the earlier announcement
 - `ENTRY_ROLE_ORDER`: a row carries an entry kind that ranks before entry_role
 - `STOP_SIDE`: a long's stop above its entry, or a short's below
-- `ACTS_ON_FLAT`: ADD, MODIFY, REDUCE or CLOSE on a FLAT position with an effect other than NONE (for example ADD with OPENS)
+- `ACTS_ON_FLAT`: ADD, REDUCE or CLOSE on a FLAT position with an effect other than NONE (for example ADD with OPENS), or a MODIFY on a FLAT position other than a REPEAT (a change to an order that is not yet a position: effect NONE)
 - `OPEN_ON_OPEN`: OPEN with a position already open on the other side (a reversal is two actions)
 - `NEW_IDEA_NOT_OPEN`: NEW_IDEA with an action other than OPEN
 - `POSITION_CHAIN`: the position before this action differs from the position after your reading of the previous action of this post in this market
@@ -601,4 +603,4 @@ A field `NOT_APPLICABLE` in your reading gets `NOT_APPLICABLE`. A price row the 
 - `AMEND`: some fields are wrong; I change only those
 - `RETURN`: send it back to the reviewer
 
-An amendment re-derives what follows from it; every field it does not amend whose kind (asked, derived, not applicable) changes, or that was derived and is now asked, is reset to unanswered and must be answered by the approver.
+An amendment re-derives what follows from it; every field it does not amend whose kind (asked, derived, not applicable) changes, or that was derived and is now asked, is reset to unanswered and must be answered by the approver. Amending `action`, `timing` or `announcement` also resets `effect` when it is asked and not amended. A field the amendment reset (or the approver blanked) must be answered even when the reviewer's record carries FORM_CANNOT_EXPRESS: the escalation lifts `REQUIRED_UNANSWERED` only for the other fields.
