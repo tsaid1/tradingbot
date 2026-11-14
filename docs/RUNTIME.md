@@ -287,6 +287,8 @@ classifications (words, kinds, counts and public codes only; no sentence, meanin
 read-only under each proposal here; the owner still decides and applies every word, and each
 apply records the recommendations it was shown with. See [VOCAB_REVIEWER.md](VOCAB_REVIEWER.md).
 Without its recommendations log this page is unchanged.
+The wider adjudication of complete trade interpretations, which also offers this vocabulary page
+as its restricted vocabulary mode, is described in [ADJUDICATION_WORKSPACE.md](ADJUDICATION_WORKSPACE.md).
 
 **Config** (both optional; the review log is off by default):
 

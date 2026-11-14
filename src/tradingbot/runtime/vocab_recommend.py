@@ -12,7 +12,7 @@
 
 Advice only: nothing here reads or writes the lexicon, and no recommendation changes the owner's
 batch. This module (and the reviewer page) must not import the runtime service, mapping,
-execution, ``ibkr``, ``ibkr_orders`` or storage modules (tests/test_vocab_recommend.py).
+execution, ``ibkr``, order-capable or storage modules (tests/test_vocab_recommend.py).
 """
 
 from __future__ import annotations
@@ -220,7 +220,7 @@ def _sha(line: bytes) -> str:
     return hashlib.sha256(line).hexdigest()
 
 
-def verify_bytes(data: bytes) -> Verification:
+def verify_bytes(data: bytes, schema: str = REC_SCHEMA) -> Verification:
     """Check every line: schema, sequence 1, 2, ... and the previous line's sha256."""
     if data and not data.endswith(b"\n"):
         return Verification(False, problem="LAST_LINE_INCOMPLETE")
@@ -230,7 +230,7 @@ def verify_bytes(data: bytes) -> Verification:
             rec = json.loads(line)
         except ValueError:
             return Verification(False, n - 1, f"NOT_JSON at line {n}")
-        if not isinstance(rec, dict) or rec.get("schema") != REC_SCHEMA or rec.get("seq") != n:
+        if not isinstance(rec, dict) or rec.get("schema") != schema or rec.get("seq") != n:
             return Verification(False, n - 1, f"SCHEMA_OR_SEQUENCE at line {n}")
         if rec.get("prev_sha256") != prev:
             return Verification(False, n - 1, f"CHAIN_BROKEN at line {n}")
@@ -239,10 +239,35 @@ def verify_bytes(data: bytes) -> Verification:
     return Verification(True, len(records), None, records, prev)
 
 
-def verify_log(path: str | Path) -> Verification | None:
+def verify_log(path: str | Path, schema: str = REC_SCHEMA,
+               what: str = "recommendations log") -> Verification | None:
     """The log's verification, None when there is no log."""
-    data = _read_private(path, "recommendations log")
-    return None if data is None else verify_bytes(data)
+    data = _read_private(path, what)
+    return None if data is None else verify_bytes(data, schema)
+
+
+def append_chained(log_path: str | Path, what: str, schema: str, make) -> dict:
+    """Append ONE line to a chained log under an exclusive lock: ``make(verification)`` returns
+    the record (without ``schema``, ``seq``, ``prev_sha256``) or raises to write nothing. Refused
+    when the log fails verification or its path fails the private-path guards."""
+    with PrivateDir(log_path, what) as d:
+        fd = d.open(d.name, os.O_RDWR | os.O_APPEND | os.O_CREAT)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            os.lseek(fd, 0, os.SEEK_SET)
+            chunks = []
+            while chunk := os.read(fd, 1 << 16):
+                chunks.append(chunk)
+            v = verify_bytes(b"".join(chunks), schema)
+            if not v.ok:
+                raise RecommendationError("LOG_FAILS_VERIFICATION")
+            rec = {**make(v), "schema": schema, "seq": v.count + 1, "prev_sha256": v.head}
+            line = json.dumps(rec, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            os.write(fd, line.encode("utf-8") + b"\n")
+            os.fsync(fd)
+        finally:
+            os.close(fd)  # releases the lock
+    return rec
 
 
 def append_recommendation(log_path: str | Path, rows: list[dict], *, login: str, name: str,
@@ -270,29 +295,12 @@ def append_recommendation(log_path: str | Path, rows: list[dict], *, login: str,
     note = (note or "").strip()
     if len(note) > MAX_NOTE or re.search(r"[\x00-\x08\x0b-\x1f\x7f]", note):
         raise RecommendationError("NOTE_TOO_LONG_OR_UNPRINTABLE")
-    with PrivateDir(log_path, "recommendations log") as d:
-        fd = d.open(d.name, os.O_RDWR | os.O_APPEND | os.O_CREAT)
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
-            os.lseek(fd, 0, os.SEEK_SET)
-            chunks = []
-            while chunk := os.read(fd, 1 << 16):
-                chunks.append(chunk)
-            v = verify_bytes(b"".join(chunks))
-            if not v.ok:
-                raise RecommendationError("LOG_FAILS_VERIFICATION")
-            rec = {"schema": REC_SCHEMA, "seq": v.count + 1,
-                   "at": (now or datetime.now(UTC)).astimezone(UTC).isoformat(),
-                   "reviewer": {"login": login, "name": name or ""}, "proposal_id": proposal,
-                   "token": row["token"],
-                   "recommendation": {"verdict": verdict, "group": group, "family": family},
-                   "note": note, "prev_sha256": v.head}
-            line = json.dumps(rec, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-            os.write(fd, line.encode("utf-8") + b"\n")
-            os.fsync(fd)
-        finally:
-            os.close(fd)  # releases the lock
-    return rec
+    return append_chained(log_path, "recommendations log", REC_SCHEMA, lambda _v: {
+        "at": (now or datetime.now(UTC)).astimezone(UTC).isoformat(),
+        "reviewer": {"login": login, "name": name or ""}, "proposal_id": proposal,
+        "token": row["token"],
+        "recommendation": {"verdict": verdict, "group": group, "family": family},
+        "note": note})
 
 
 def latest(records: list[dict]) -> dict[str, dict[str, dict]]:
