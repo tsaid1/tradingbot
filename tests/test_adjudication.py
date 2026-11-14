@@ -110,6 +110,11 @@ def records(base) -> list[dict]:
     ("posts.jsonl", lambda rs: [{**r, "media": ["../secret.png"]} for r in rs],
      "BAD_MEDIA_NAME"),
     ("sequences.jsonl", lambda rs: [{**r, "review_order": 1} for r in rs], "BAD_REVIEW_ORDER"),
+    ("items.jsonl", lambda rs: [{**r, "ai": {**r["ai"], "entry": {
+        "role": "ENTRY_AT_STATED_PRICE"}}} for r in rs], "UNKNOWN_VALUE:entry.role"),  # 1.1 value
+    ("items.jsonl", lambda rs: [{**r, "ai": {**r["ai"], "levels": [{"n": 9, "price": 1,
+                                                                    "role": "STOP"}]}}
+                                for r in rs], "LEVEL_NOT_IN_NUMBERS"),
 ])
 def test_the_validator_refuses_with_a_code_never_a_path_or_content(base, file, edit, code):
     path = base / "bundle" / file
@@ -207,6 +212,11 @@ def test_blind_first_hides_the_system_until_an_independent_reading_and_writes_on
     assert "Hidden until you save an independent reading" in text
     assert "holds SHIPPED" not in text and "system:" not in text
     assert "Short Zed Metals around 412" in plain(at) and "Zed Metals" not in rendered(at)
+    # The price table: one row per number of the post, shown as its token, nothing pre-filled.
+    assert [at.selectbox(key=f"aw_i07_ind_lv_n:{k}_{f}").value for k in (0, 1)
+            for f in A.LEVEL_KEYS] == [""] * 6
+    assert "412" in plain(at) and "CURRENT_MARKET" not in text and "CHART_LEVEL" not in text
+    at.selectbox(key="aw_i07_ind_lv_n:0_role").set_value("CURRENT_MARKET").run()
     at.selectbox(key="aw_i07_ind_action").set_value("OPEN").run()
     at.radio(key="aw_i07_ind_confidence").set_value("MEDIUM").run()
     at.button(key="aw_i07_ind_save").click().run()
@@ -220,6 +230,9 @@ def test_blind_first_hides_the_system_until_an_independent_reading_and_writes_on
     assert (after["phase"], after["blind"], after["refers_to"]) == (A.AFTER_REVEAL, True, 1)
     assert after["field_verdicts"]["action"] == "CONFIRM"
     assert after["field_verdicts"]["side"] == "CORRECT"  # the reviewer left it not stated
+    assert ind["reading"]["levels"][0] == {"row": "n:0", "role": "CURRENT_MARKET",
+                                           "exactness": "", "contract_month": ""}
+    assert after["field_verdicts"]["levels"] == {"n:0": "CORRECT", "n:1": "UNSURE"}
     changed = {k for k in set(before) | set(tree(base)) if before.get(k) != tree(base).get(k)}
     assert changed == {"annotations.jsonl"}
     assert {str(p) for p in (REPO / "src").rglob("*.py")} == repo_before
@@ -236,9 +249,11 @@ def test_a_single_field_correction_leaves_every_other_field_confirmed(monkeypatc
     [rec] = records(base)
     system = A.system_reading(bundle(base), bundle(base).items["i04"])
     assert (rec["phase"], rec["blind"], rec["refers_to"]) == (A.AFTER_REVEAL, False, None)
-    assert {f for f, v in rec["reading"].items() if v != system[f]} == {"stop_price"}
+    assert {f for f in system if rec["reading"][f] != system[f]} == {"stop_price"}
     assert rec["reading"]["stop_price"] == "88"
-    assert {f for f, v in rec["field_verdicts"].items() if v != "CONFIRM"} == {"stop_price"}
+    assert {f for f, v in rec["field_verdicts"].items() if v != "CONFIRM"} == {
+        "stop_price", "levels"}
+    assert rec["field_verdicts"]["levels"] == {"n:0": "CONFIRM"}
     assert rec["field_verdicts"]["stop_price"] == "CORRECT"
     # Toggling blind-first back on cannot produce an "independent" reading of a seen item.
     with pytest.raises(A.AdjudicationError, match="SYSTEM_READING_ALREADY_SEEN"):
@@ -261,7 +276,10 @@ def review(base, item_id, **reading) -> dict:
     item, system = b.items[item_id], A.system_reading(b, b.items[item_id])
     return A.append_annotation(base, b, REVIEWER, item_id=item_id, phase=A.AFTER_REVEAL,
                                blind=True, reading=system, confidence="HIGH",
-                               field_verdicts=A.prefill_verdicts(system, system, item["kind"]),
+                               field_verdicts={**A.prefill_verdicts(system, system,
+                                                                    item["kind"]),
+                                               "levels": {k: "UNSURE" for k, _ in
+                                                          A.table_rows(b, item)}},
                                refers_to=ind["seq"])
 
 
@@ -300,7 +318,9 @@ def test_freeze_resolves_approver_then_provisional_and_keeps_the_independent_rea
     b = bundle(base)
     amended = review(base, "i01", action="ADD")  # independent differs from the final reading
     A.append_annotation(base, b, APPROVER, item_id="i01", phase=A.APPROVAL, blind=False,
-                        reading={"stop_price": "87.1"}, refers_to=amended["seq"],
+                        reading={"stop_price": "87.1", "levels": [
+                            {"row": "n:1", "role": "STOP", "exactness": "EXACT",
+                             "contract_month": "NOT_APPLICABLE"}]}, refers_to=amended["seq"],
                         outcome="AMEND")
     provisional = review(base, "i03")
     returned = review(base, "i05")
@@ -314,6 +334,7 @@ def test_freeze_resolves_approver_then_provisional_and_keeps_the_independent_rea
     assert set(rows) == {"i01", "i03", "i05"} and path.name == "ground_truth_v1.jsonl"
     assert rows["i01"]["status"] == "AMENDED" and rows["i01"]["reading"]["stop_price"] == "87.1"
     assert rows["i01"]["reading"]["action"] == "OPEN"
+    assert [r["role"] for r in rows["i01"]["reading"]["levels"]] == ["", "STOP", ""]
     assert rows["i01"]["independent_reading"]["action"] == "ADD"
     assert rows["i03"]["status"] == "PROVISIONAL"
     assert rows["i03"]["source_seqs"]["after_reveal"] == provisional["seq"]
@@ -377,3 +398,34 @@ def test_the_vocabulary_page_is_reachable_as_the_restricted_vocabulary_mode(
     at.switch_page(str(APP.with_name("reviewer_app.py"))).run()
     assert not at.exception
     assert "No review material is configured." in rendered(at)  # the vocabulary page's own check
+
+
+def test_a_per_row_price_correction_is_saved_alone(monkeypatch, local, base):
+    at = app(monkeypatch, base, "reviewer@example.invalid")
+    at.toggle(key="aw_blind").set_value(False).run()
+    at = pick(at, "i04")
+    prefix = "aw_i04_after_0"
+    assert at.selectbox(key=f"{prefix}_lv_n:0_role").value == "CURRENT_MARKET"  # blind off
+    at.selectbox(key=f"{prefix}_lv_n:0_role").set_value("STOP").run()
+    at.text_input(key=f"{prefix}_stop_price").set_value("87").run()  # keep the system's stop
+    at.radio(key=f"{prefix}_confidence").set_value("HIGH").run()
+    at.button(key=f"{prefix}_save").click().run()
+    [rec] = records(base)
+    system = A.system_reading(bundle(base), bundle(base).items["i04"])
+    assert all(rec["reading"][f] == system[f] for f in system)
+    assert rec["reading"]["levels"] == [{"row": "n:0", "role": "STOP", "exactness": "EXACT",
+                                         "contract_month": "NOT_APPLICABLE"}]
+    assert rec["field_verdicts"]["levels"] == {"n:0": "CORRECT"}
+    assert all(v == "CONFIRM" for f, v in rec["field_verdicts"].items() if f != "levels")
+
+
+def test_only_the_scope_is_offered(monkeypatch, local, base):
+    path = base / "reviewers.toml"
+    path.write_text(path.read_text().replace("scope_sequences = 20", "scope_sequences = 1"))
+    at = app(monkeypatch, base, "reviewer@example.invalid")
+    assert [o.split(":")[0] for o in at.selectbox(key="aw_pick").options] == ["seqB 1", "seqB 2"]
+    assert "Scope: first 1 ideas (of 2)" in plain(at)
+    scoped = A.Session(REVIEWER.login, "Ria", A.REVIEWER, A.FULL, False, 1)
+    with pytest.raises(A.AdjudicationError, match="OUTSIDE_SCOPE"):
+        A.append_annotation(base, bundle(base), scoped, item_id="i01", phase=A.INDEPENDENT,
+                            blind=True, reading={}, confidence="LOW")

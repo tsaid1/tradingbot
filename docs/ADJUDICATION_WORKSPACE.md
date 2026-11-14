@@ -2,7 +2,9 @@
 
 A stand-alone, loopback-only Streamlit app in which reviewers record what each trading post
 really instructs, and an approver settles it, to make a versioned ground truth for evaluating the
-interpreter. It implements the adjudication workspace specification version 1.1 (app side).
+interpreter. It implements the adjudication workspace specification version 1.2 (app side). It is the single system for vocabulary, post-level and
+trading-idea review: the remote reviewer interface is this app behind Tailscale Serve, once the
+owner activates that separately.
 **It is not an execution path.** It has no broker, order, mapping-approval, lexicon or risk-policy
 write path and imports none of those modules (tested in a subprocess). Its only write is the
 annotation log. Publishing it through any proxy is **the owner's separate decision**; nothing
@@ -26,14 +28,23 @@ the chained append-only log, private-path guards and the same server refusals.
 
 Every file is read only through the private-path guards: refused inside this repository, never
 through a link, link count 1, mode 0600 (directories 0700). A bundle with an unknown schema, a
-value outside a closed set (`post_label`, `action`, `side`, `effect`, `entry.role`,
-`entry.exactness`, `timing`, `holds.status`, families = `manifest.families` plus OTHER and
-UNKNOWN), a broken `review_order`, a media name that is not a plain image file name, or a
-reference to a post outside the bundle is refused with a code, never a path or content.
+value outside a closed set (`post_label`, `action`, `side`, `effect`, price `role`,
+`exactness`, `contract_month`, `timing`, `holds.status`, families = `manifest.families` plus
+OTHER and UNKNOWN), a broken `review_order`, a level pointing outside the post's `numbers`, a
+media name that is not a plain image file name, or a reference to a post outside the bundle is
+refused with a code, never a path or content.
+
+**Price roles** (the owner's taxonomy, for every level and for `entry.role`): CURRENT_MARKET (a
+current market observation), INTENDED_ENTRY (an explicit intended entry price), HISTORICAL_FILL,
+AVERAGE_OR_COST_BASIS, STOP, TARGET, CHART_LEVEL (support or resistance), OTHER_CONTRACT_MONTH,
+UNRESOLVED; in the reviewer's table also NOT_A_PRICE; for `entry.role` also NOT_STATED.
+`exactness`: EXACT, APPROXIMATE (an approximate quotation is any role marked APPROXIMATE),
+NOT_APPLICABLE. `contract_month`: FRONT, NEXT, NAMED, NOT_STATED, NOT_APPLICABLE.
 
 ```toml
 # reviewers.toml (chmod 600)
 remote_full_context_authorized = false   # true only after the publisher's permission
+scope_sequences = 20                     # the first 20 balanced ideas; raise to cover all
 [[reviewer]]
 login = "you@example.com"
 name = "Owner"
@@ -56,20 +67,32 @@ access = "FULL"          # FULL or RESTRICTED
   then shown beside the reader's form with a per-field verdict (CONFIRM / CORRECT / UNSURE)
   pre-filled from the comparison and editable, saved as AFTER_REVEAL (`blind: true`, referring to
   the independent record). With the switch off, the form starts from the system's reading and
-  only AFTER_REVEAL is written (`blind: false`). Any field is corrected on its own: the record
+  only AFTER_REVEAL is written (`blind: false`). The **price table** (instruction items) has one
+  row per number of the post's `numbers` (FULL; shown as the token) or per level the system
+  typed (RESTRICTED: no text), each with a role, an exactness and a contract month (always
+  asked). Every row starts unanswered in a blind reading, never filled from the system; after
+  reveal the system's answer stands beside each row with its own CONFIRM / CORRECT pre-fill (an
+  unanswered row: UNSURE). A number the system typed no level for counts as NOT_A_PRICE in its
+  reading. Any field, and any row, is corrected on its own: the record
   keeps every other field and its CONFIRM. An item whose system reading was shown can no longer
   receive an "independent" reading. Empty means "not stated", a first-class answer for prices,
   stop and targets. LABEL_ONLY items ask only for the post label, flags, confidence and notes.
 * **APPROVER** sees the reviewers' records (and the independent readings) and writes APPROVAL:
   ACCEPT, AMEND (only the amended fields) or RETURN. Refused when the approver's login wrote any
   reading of that item, and a REVIEWER cannot write APPROVAL.
-* Navigation: sequences in `review_order` (each with its label-only items), then the sampled
-  label-only posts; "sequences completed", "items done", and "Next item not yet adjudicated".
+* Navigation: sequences in `review_order` (each with its label-only items). Only the first
+  `scope_sequences` (default 20) are offered, shown as "Scope: first 20 ideas"; the 40 sampled
+  label-only posts come once the scope covers all sequences. Progress ("sequences completed",
+  "items done") counts within the scope; "Next item not yet adjudicated". A record for an item
+  outside the scope is refused.
 * The sidebar also offers the vocabulary recommendations page ([VOCAB_REVIEWER.md](VOCAB_REVIEWER.md)),
   which keeps its own checks and sanitized export.
-* Nobody can change production vocabulary, risk policies, account permissions or broker settings
-  from here, and nobody sees the sealed holdout, credentials, IBKR or the filesystem: the app has
-  no such code. Every publisher or bundle string is shown as plain text, never Markdown or HTML.
+* **What a remote reviewer cannot do**, by construction (the app has no such code and imports
+  none of those modules): apply vocabulary or rules to production; change risk, mapping or
+  execution policy, or account permissions; reach IBKR, an order function or an execution
+  endpoint; see credentials, the filesystem (no file browser, upload, download or path input) or
+  sealed holdout material; and, while `remote_full_context_authorized` is false, see any
+  publisher text or image. Every publisher or bundle string is shown as plain text, never Markdown or HTML.
   Images are shown only from `media/`, by a name the post lists, at most 5 MB, PNG/JPEG/GIF/WEBP.
 
 ## Identity, and its limit

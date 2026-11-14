@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import struct
 import sys
 import zlib
@@ -51,10 +52,24 @@ POSTS = [
 ]
 
 
+NA = "NOT_APPLICABLE"
+
+
+def lv(n, price, role, exactness="EXACT", month=NA) -> dict:
+    return {"n": n, "price": price, "role": role, "exactness": exactness,
+            "contract_month": month}
+
+
+def _numbers(text: str) -> list[dict]:
+    """A stand-in for the product's number reader: every number of the text, in order."""
+    return [{"n": k, "token": t} for k, t in enumerate(re.findall(r"\d+(?:\.\d+)?", text))]
+
+
 def _ai(**kw) -> dict:
     base = {"post_label": "ACTIONABLE", "action": "NONE", "family": None,
             "instrument_as_read": None, "side": "NONE", "effect": "NONE", "timing": "CURRENT",
-            "explicit": True, "entry": {}, "stop": {}, "targets": [], "amendment": {},
+            "explicit": True, "levels": [], "entry": {}, "stop": {}, "targets": [],
+            "amendment": {},
             "idea_ref": None, "ambiguities": [], "position_context": {"state": "FLAT"}}
     return {**base, **kw}
 
@@ -73,9 +88,11 @@ def _items() -> list[dict]:
         {"item_id": "i01", "kind": "INSTRUCTION", "sequence_id": "seqA", "set": "DESIGN",
          "post_ref": "p01", "slot": 0, "order_in_sequence": 1, "context_refs": [],
          "ai": _ai(action="OPEN", family="TLT", instrument_as_read="TLT", side="LONG",
-                   effect="OPENS", entry={"price": 88.4, "role": "ENTRY_AT_STATED_PRICE",
+                   effect="OPENS", entry={"price": 88.4, "role": "INTENDED_ENTRY",
                                           "exactness": "APPROXIMATE"},
-                   stop={"price": 87.2}, targets=[{"price": 91}]),
+                   stop={"price": 87.2}, targets=[{"price": 91}],
+                   levels=[lv(0, 88.4, "INTENDED_ENTRY", "APPROXIMATE"), lv(1, 87.2, "STOP"),
+                           lv(2, 91, "TARGET")]),
          "holds": HELD, "mapping": TLT_MAP},
         {"item_id": "i02", "kind": "LABEL_ONLY", "sequence_id": "seqA", "set": "DESIGN",
          "post_ref": "p02", "slot": None, "order_in_sequence": None, "context_refs": ["p01"],
@@ -84,25 +101,28 @@ def _items() -> list[dict]:
         {"item_id": "i03", "kind": "INSTRUCTION", "sequence_id": "seqA", "set": "DESIGN",
          "post_ref": "p03", "slot": 0, "order_in_sequence": 2, "context_refs": ["p01", "p02"],
          "ai": _ai(action="ADD", family="TLT", instrument_as_read="TLT", side="LONG",
-                   effect="INCREASES", entry={"price": 88.1, "role": "ENTRY_AT_STATED_PRICE",
+                   effect="INCREASES", entry={"price": 88.1, "role": "INTENDED_ENTRY",
                                               "exactness": "EXACT"},
-                   stop={"price": 87.2}, idea_ref="i01", position_context=open_tlt),
+                   stop={"price": 87.2}, idea_ref="i01", position_context=open_tlt,
+                   levels=[lv(0, 88.1, "INTENDED_ENTRY")]),
          "holds": HELD, "mapping": TLT_MAP},
         {"item_id": "i04", "kind": "INSTRUCTION", "sequence_id": "seqA", "set": "DESIGN",
          "post_ref": "p04", "slot": 0, "order_in_sequence": 3,
          "context_refs": ["p01", "p02", "p03"],
-         # The invented interpreter misreads the new stop (87.00): a one-field correction.
+         # The invented interpreter misreads the new stop (87.00) and types the level as a
+         # current market observation: each is a correction on its own.
          "ai": _ai(action="MODIFY", family="TLT", instrument_as_read="TLT", side="LONG",
                    effect="AMENDS_PROTECTION", stop={"price": 87.0},
                    amendment={"field": "STOP", "from": "87.2", "to": "87.0"}, idea_ref="i03",
-                   position_context=open_tlt),
+                   position_context=open_tlt, levels=[lv(0, 88, "CURRENT_MARKET")]),
          "holds": HELD, "mapping": TLT_MAP},
         {"item_id": "i05", "kind": "INSTRUCTION", "sequence_id": "seqA", "set": "DESIGN",
          "post_ref": "p05", "slot": 0, "order_in_sequence": 4,
          "context_refs": ["p01", "p03", "p04"],
          "ai": _ai(action="CLOSE", family="TLT", instrument_as_read="TLT", side="LONG",
-                   effect="CLOSES", entry={"price": 90.6, "role": "CURRENT_MARKET_REFERENCE",
+                   effect="CLOSES", entry={"price": 90.6, "role": "CURRENT_MARKET",
                                            "exactness": "EXACT"}, idea_ref="i04",
+                   levels=[lv(0, 90.6, "HISTORICAL_FILL")],
                    position_context={"state": "OPEN", "side": "LONG", "last_stop": 88.0}),
          "holds": HELD, "mapping": TLT_MAP},
         {"item_id": "i06", "kind": "INSTRUCTION", "sequence_id": "seqA", "set": "DESIGN",
@@ -117,8 +137,11 @@ def _items() -> list[dict]:
          "post_ref": "p07", "slot": 0, "order_in_sequence": 1, "context_refs": [],
          "ai": _ai(action="OPEN", family="OTHER", instrument_as_read="Zed Metals",
                    side="SHORT", effect="OPENS",
-                   entry={"price": 412, "role": "CURRENT_MARKET_REFERENCE",
-                          "exactness": "APPROXIMATE"}, stop={"price": 420}),
+                   entry={"price": 412, "role": "CURRENT_MARKET",
+                          "exactness": "APPROXIMATE"}, stop={"price": 420},
+                   levels=[lv(0, 412, "CURRENT_MARKET", "APPROXIMATE", "NOT_STATED"),
+                           lv(1, 420, "STOP", "EXACT", "NOT_STATED"),
+                           lv(None, 415, "CHART_LEVEL", "APPROXIMATE", "NOT_STATED")]),
          "holds": {"SHIPPED": {"status": "HOLD", "reasons": ["UNSUPPORTED_INSTRUMENT_MAPPING"]},
                    "FIVE_FAMILY": {"status": "HOLD",
                                    "reasons": ["UNSUPPORTED_INSTRUMENT_MAPPING"]}},
@@ -127,9 +150,9 @@ def _items() -> list[dict]:
          "post_ref": "p08", "slot": 0, "order_in_sequence": 2, "context_refs": ["p07"],
          "ai": _ai(action="CLOSE", family="OTHER", instrument_as_read="Zed Metals",
                    side="SHORT", effect="CLOSES", entry={"price": 404,
-                                                         "role": "CURRENT_MARKET_REFERENCE",
+                                                         "role": "CURRENT_MARKET",
                                                          "exactness": "EXACT"},
-                   idea_ref="i07",
+                   idea_ref="i07", levels=[lv(0, 404, "HISTORICAL_FILL", "EXACT", "NOT_STATED")],
                    position_context={"state": "OPEN", "side": "SHORT", "last_stop": 420}),
          "holds": {"SHIPPED": {"status": "HOLD", "reasons": ["UNSUPPORTED_INSTRUMENT_MAPPING"]}},
          "mapping": OTHER_MAP},
@@ -153,6 +176,7 @@ def bundle_digest(files: dict[str, bytes]) -> str:
 
 
 REVIEWERS = """remote_full_context_authorized = false
+scope_sequences = 20
 
 [[reviewer]]
 login = "owner@example.invalid"
@@ -180,7 +204,8 @@ def write_demo(out: str | Path) -> Path:
         raise SystemExit("refused: the directory is not empty")
     out.mkdir(mode=0o700, parents=True, exist_ok=True)
     posts = [{"post_ref": r, "published_at": T0.format(m), "text": t, "media": media,
-              "revision": 0, "reply_to": None, "quotes": None} for r, m, t, media in POSTS]
+              "revision": 0, "reply_to": None, "quotes": None, "numbers": _numbers(t)}
+             for r, m, t, media in POSTS]
     sequences = [{"sequence_id": "seqA", "set": "DESIGN",
                   "post_refs": ["p01", "p02", "p03", "p04", "p05", "p06"], "review_order": 2},
                  {"sequence_id": "seqB", "set": "CHECK", "post_refs": ["p07", "p08"], "review_order": 1}]

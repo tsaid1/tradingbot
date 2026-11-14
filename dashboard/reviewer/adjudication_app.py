@@ -66,6 +66,10 @@ def _system(bundle: A.Bundle, item: dict) -> None:
     reading = A.system_reading(bundle, item)
     st.code("\n".join(f"{f}: {v or NOT_STATED}" for f, v in reading.items()
                       if f not in A.NOT_COMPARED), language=None)
+    if item["levels"]:
+        st.code("\n".join(f"level {k} (number {'-' if lv['n'] is None else lv['n']}): "
+                          f"{lv['price'] or '-'} " + " / ".join(lv[f] or "-" for f in A.LEVEL_KEYS)
+                          for k, lv in enumerate(item["levels"])), language=None)
     if item["holds"]:
         st.code("\n".join(f"holds {k}: {v['status']} {', '.join(v['reasons'])}"
                           for k, v in item["holds"].items()), language=None)
@@ -110,7 +114,51 @@ def _inputs(prefix: str, bundle: A.Bundle, item: dict, defaults: dict,
             verdicts[f] = cols[2].radio(f"verdict on {f}", A.VERDICTS, horizontal=True,
                                         index=A.VERDICTS.index(pre),
                                         key=f"{prefix}_verdict_{f}_{tag}")
+    rows = A.table_rows(bundle, item)
+    if rows:
+        reading[A.LEVELS], row_verdicts = _price_table(prefix, bundle, item, rows, defaults,
+                                                       system)
+        if system is not None:
+            verdicts[A.LEVELS] = row_verdicts
     return reading, verdicts
+
+
+def _price_table(prefix, bundle, item, rows, defaults, system) -> tuple[list, dict]:
+    """One row per number of the post (FULL) or per typed level (RESTRICTED): role, exactness,
+    contract month, unanswered unless the defaults say otherwise; after reveal, the system's
+    answer and a per-row verdict beside it."""
+    st.caption("Price table: " + ("one row per number of the post" if bundle.posts is not None
+                                  else "one row per level the system typed (restricted: no "
+                                       "text)") + ". Empty means unanswered.")
+    given = {r["row"]: r for r in defaults.get(A.LEVELS, [])}
+    sys_rows = A.system_rows(bundle, item) if system is not None else {}
+    levels, verdicts = [], {}
+    for k, (key, label) in enumerate(rows, 1):
+        cols = st.columns([1, 2, 2, 2] + ([2, 3] if system is not None else []))
+        cols[0].text(label)
+        row = {"row": key}
+        for col, f, allowed in zip(cols[1:4], A.LEVEL_KEYS,
+                                   (A.TABLE_ROLES, A.EXACTNESS, A.CONTRACT_MONTHS), strict=True):
+            options, default = ["", *allowed], given.get(key, {}).get(f, "")
+            row[f] = col.selectbox(f"{f}, row {k}", options, key=f"{prefix}_lv_{key}_{f}",
+                                   index=options.index(default) if default in options else 0,
+                                   format_func=lambda v: v or "(unanswered)")
+        levels.append(row)
+        if system is not None:
+            sr = sys_rows[key]
+            cols[4].text("system: " + " / ".join(sr[f] or "-" for f in A.LEVEL_KEYS))
+            pre = A.prefill_row_verdicts([row], sys_rows)[key]
+            tag = hashlib.sha256("|".join(row[f] for f in A.LEVEL_KEYS).encode()).hexdigest()[:8]
+            verdicts[key] = cols[5].radio(f"verdict, row {k}", A.VERDICTS, horizontal=True,
+                                          index=A.VERDICTS.index(pre),
+                                          key=f"{prefix}_lvv_{key}_{tag}")
+    return levels, verdicts
+
+
+def _with_rows(bundle, item, reading: dict) -> dict:
+    """The system's reading with its price-table answers (the blind-off starting point)."""
+    rows = A.system_rows(bundle, item)
+    return {**reading, A.LEVELS: [{"row": k, **v} for k, v in rows.items()]} if rows else reading
 
 
 def _extras(prefix: str, *, approval: bool = False) -> tuple[list, str, str]:
@@ -170,8 +218,8 @@ def _reviewer(base, bundle, session, item, records, writable) -> None:
             st.caption("Your reading beside the system's: correct any field on its own; each "
                        "verdict is pre-filled from the comparison and can be changed.")
             prefix = f"aw_{iid}_after_{source['seq'] if source else 0}"
-            reading, verdicts = _inputs(prefix, bundle, item,
-                                        source["reading"] if source else system, system)
+            reading, verdicts = _inputs(prefix, bundle, item, source["reading"] if source
+                                        else _with_rows(bundle, item, system), system)
             flags, confidence, notes = _extras(prefix)
             if st.button("Save reading after reveal", key=f"{prefix}_save", type="primary"):
                 _save(base, bundle, session, writable, item_id=iid, phase=A.AFTER_REVEAL,
@@ -192,7 +240,11 @@ def _describe(rec: dict) -> str:
               f" (blind {rec['blind']}, confidence {rec['confidence'] or '-'})")]
     lines += [f"{f}: {v or '-'}" + (f"   [{rec['field_verdicts'][f]}]"
                                     if f in rec["field_verdicts"] else "")
-              for f, v in rec["reading"].items()]
+              for f, v in rec["reading"].items() if f != A.LEVELS]
+    row_verdicts = rec["field_verdicts"].get(A.LEVELS) or {}
+    lines += [f"price {r['row']}: " + " / ".join(r[f] or "-" for f in A.LEVEL_KEYS)
+              + (f"   [{row_verdicts[r['row']]}]" if r["row"] in row_verdicts else "")
+              for r in rec["reading"].get(A.LEVELS, [])]
     lines += [f"flags: {', '.join(rec['flags']) or '-'}", f"notes: {rec['notes'] or '-'}"]
     return "\n".join(lines)
 
@@ -229,7 +281,12 @@ def _approver(base, bundle, session, item, records, writable) -> None:
             if decision == "AMEND":
                 st.caption("Amend only the fields that are wrong:")
                 values, _ = _inputs(prefix, bundle, item, rec["reading"])
-                amended = {f: v for f, v in values.items() if v != rec["reading"].get(f, "")}
+                old_rows = {r["row"]: r for r in rec["reading"].get(A.LEVELS, [])}
+                amended = {f: v for f, v in values.items()
+                           if f != A.LEVELS and v != rec["reading"].get(f, "")}
+                changed = [r for r in values.get(A.LEVELS, []) if r != old_rows.get(r["row"])]
+                if changed:
+                    amended[A.LEVELS] = changed
             _flags, _conf, notes = _extras(prefix, approval=True)
             if st.button("Save decision", key=f"{prefix}_save", type="primary",
                          disabled=bool(own) or decision is None):
@@ -253,10 +310,14 @@ def _workspace(base: Path, bundle: A.Bundle, session: A.Session) -> None:
     records = log.records if log.ok else []
     if msg := st.session_state.pop("aw_msg", None):
         st.success(msg)
-    order = [(sid, i) for sid, items in A.ordered(bundle) for i in items]
+    scoped = A.ordered(bundle, session.scope)
+    order = [(sid, i) for sid, items in scoped for i in items]
+    covers_all = session.scope is None or session.scope >= len(bundle.sequences)
+    st.text(f"Scope: all {len(bundle.sequences)} ideas and the sampled posts" if covers_all
+            else f"Scope: first {session.scope} ideas (of {len(bundle.sequences)})")
     prog = A.progress(bundle, records, session)
     labels = {}
-    for sid, items in A.ordered(bundle):
+    for sid, items in scoped:
         for n, i in enumerate(items, 1):
             labels[i["item_id"]] = (f"{sid or 'no sequence'} {n}: {i['kind'].lower()}, "
                                     f"{prog.status[i['item_id']].lower()}")

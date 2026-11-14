@@ -50,9 +50,14 @@ POST_LABELS = ("ACTIONABLE", "CONDITIONAL", "COMMENTARY", "RETROSPECTIVE", "UNRE
 ACTIONS = ("OPEN", "ADD", "MODIFY", "REDUCE", "CLOSE", "NONE")
 SIDES = ("LONG", "SHORT", "NONE")
 EFFECTS = ("OPENS", "INCREASES", "REDUCES", "CLOSES", "AMENDS_PROTECTION", "NONE")
-ENTRY_ROLES = ("ENTRY_AT_STATED_PRICE", "CURRENT_MARKET_REFERENCE", "COST_BASIS_OR_AVERAGE",
-               "CHART_LEVEL", "NOT_STATED")
-EXACTNESS = ("EXACT", "APPROXIMATE", "CURRENT_MARKET", "NOT_APPLICABLE")
+# Price roles (specification 1.2, the owner's taxonomy), for every level and for entry.role.
+PRICE_ROLES = ("CURRENT_MARKET", "INTENDED_ENTRY", "HISTORICAL_FILL", "AVERAGE_OR_COST_BASIS",
+               "STOP", "TARGET", "CHART_LEVEL", "OTHER_CONTRACT_MONTH", "UNRESOLVED")
+TABLE_ROLES = (*PRICE_ROLES, "NOT_A_PRICE")  # the reviewer's price table
+ENTRY_ROLES = (*PRICE_ROLES, "NOT_STATED")
+EXACTNESS = ("EXACT", "APPROXIMATE", "NOT_APPLICABLE")  # APPROXIMATE: an approximate quotation
+CONTRACT_MONTHS = ("FRONT", "NEXT", "NAMED", "NOT_STATED", "NOT_APPLICABLE")
+LEVEL_KEYS = ("role", "exactness", "contract_month")
 TIMINGS = ("CURRENT", "HISTORICAL", "CONDITIONAL", "COMMENTARY", "UNCERTAIN")
 HOLD_STATUSES = ("SENT", "HOLD", "BLOCK", "REFUSED", "HALTED", "UNRESOLVED", "EXCEPTION",
                  "REJECTED", "NO_TRADE", "RECONCILE", "NOT_DECIDED")
@@ -84,6 +89,8 @@ FIELDS: dict[str, tuple | str] = {
 }
 NOT_COMPARED = ("reference_series_right", "execution_instrument_right")
 LABEL_ONLY_FIELDS = ("post_label",)
+LEVELS = "levels"  # the price table: reading[LEVELS] = [{row, role, exactness, contract_month}]
+DEFAULT_SCOPE = 20
 
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")
 _CODE = re.compile(r"^[A-Z][A-Z0-9_:.]{0,63}$")
@@ -297,8 +304,29 @@ def _item(raw: dict, sequences: dict, families) -> dict:
             "slot": num(raw.get("slot"), "slot"),
             "order_in_sequence": num(raw.get("order_in_sequence"), "order_in_sequence"),
             "context_refs": [_id(r, "context_refs") for r in refs],
-            "ai": _ai(raw.get("ai"), families), "holds": _holds(raw.get("holds")),
-            "mapping": _mapping(raw.get("mapping"))}
+            "ai": _ai(raw.get("ai"), families), "levels": _levels(raw.get("ai")),
+            "holds": _holds(raw.get("holds")), "mapping": _mapping(raw.get("mapping"))}
+
+
+def _levels(ai) -> list[dict]:
+    """The interpreter's typed levels: ``{n, price, role, exactness, contract_month}``."""
+    raw = (ai or {}).get("levels") if isinstance(ai, dict) else None
+    if raw is None:
+        return []
+    if not isinstance(raw, list) or not all(isinstance(lv, dict) for lv in raw):
+        raise AdjudicationError("BAD_SHAPE:levels")
+    out = []
+    for lv in raw:
+        n = lv.get("n")
+        if n is not None and (isinstance(n, bool) or not isinstance(n, int) or n < 0):
+            raise AdjudicationError("BAD_NUMBER:levels.n")
+        out.append({"n": n, "price": _price(lv.get("price"), "levels.price"),
+                    "role": _closed(lv.get("role"), PRICE_ROLES, "levels.role") or "",
+                    "exactness": _closed(lv.get("exactness"), EXACTNESS, "levels.exactness")
+                    or "",
+                    "contract_month": _closed(lv.get("contract_month"), CONTRACT_MONTHS,
+                                              "levels.contract_month") or ""})
+    return out
 
 
 def _post(raw: dict) -> dict:
@@ -313,8 +341,15 @@ def _post(raw: dict) -> dict:
         datetime.fromisoformat(published)
     except ValueError:
         raise AdjudicationError("BAD_POST:published_at") from None
+    numbers = raw.get("numbers") or []
+    if not isinstance(numbers, list) or not all(
+            isinstance(x, dict) and x.get("n") == k and isinstance(x.get("token"), str)
+            and 0 < len(x["token"]) <= 32 and not _CTRL.search(x["token"])
+            for k, x in enumerate(numbers)):
+        raise AdjudicationError("BAD_NUMBERS")
     return {"post_ref": _id(raw.get("post_ref"), "post_ref"), "published_at": published,
             "text": text, "media": media, "revision": raw.get("revision"),
+            "numbers": [x["token"] for x in numbers],
             "reply_to": _id(raw.get("reply_to"), "reply_to", optional=True),
             "quotes": _id(raw.get("quotes"), "quotes", optional=True)}
 
@@ -371,6 +406,9 @@ def load_bundle(path: str | Path, access: str) -> Bundle:
             p[k] for p in posts.values() for k in ("reply_to", "quotes") if p[k]}
         if not wanted <= set(posts):
             raise AdjudicationError("UNKNOWN_POST_REF")
+        if any(lv["n"] is not None and lv["n"] >= len(posts[i["post_ref"]]["numbers"])
+               for i in items.values() for lv in i["levels"]):
+            raise AdjudicationError("LEVEL_NOT_IN_NUMBERS")
         bundle.posts = posts
     return bundle
 
@@ -395,19 +433,23 @@ def read_media(bundle: Bundle, post_ref: str, name: str) -> bytes:
     return data
 
 
-def ordered(bundle: Bundle) -> list[tuple[str | None, list[dict]]]:
+def ordered(bundle: Bundle, scope: int | None = None) -> list[tuple[str | None, list[dict]]]:
     """Items by sequence in ``review_order`` (a balanced round-robin: any prefix is a balanced
     sample), each sequence's label-only items with it, then the items of no sequence (the
     sampled label-only posts). Within a sequence: in time order (the post's place in the
-    sequence's time-ordered ``post_refs``), then slot, then order."""
+    sequence's time-ordered ``post_refs``), then slot, then order. With ``scope``: only the
+    first ``scope`` sequences, and the items of no sequence only once the scope covers all."""
     out = []
-    for s in bundle.sequences:  # already in review_order
+    shown = bundle.sequences if scope is None else bundle.sequences[:scope]
+    for s in shown:  # already in review_order
         refs = s["post_refs"]
         mine = [i for i in bundle.items.values() if i["sequence_id"] == s["sequence_id"]]
         mine.sort(key=lambda i: (refs.index(i["post_ref"]) if i["post_ref"] in refs else 1e9,
                                  i["slot"] or 0, i["order_in_sequence"] or 0))
         out.append((s["sequence_id"], mine))
     rest = [i for i in bundle.items.values() if i["sequence_id"] is None]
+    if scope is not None and scope < len(bundle.sequences):
+        rest = []
     return out + ([(None, rest)] if rest else [])
 
 
@@ -458,14 +500,78 @@ def prefill_verdicts(reading: dict, system: dict, kind: str) -> dict[str, str]:
             else "CORRECT" for f in fields_for(kind) if f not in NOT_COMPARED}
 
 
+def table_rows(bundle: Bundle, item: dict) -> list[tuple[str, str]]:
+    """The price table's rows (key, label). FULL: one per number of the post's ``numbers``,
+    labelled with its token (source-derived, no role). RESTRICTED (no text): one per typed level
+    of the system's reading, labelled with its price. LABEL_ONLY items have no table."""
+    if item["kind"] == "LABEL_ONLY":
+        return []
+    if bundle.posts is not None:
+        return [(f"n:{k}", t) for k, t in enumerate(bundle.posts[item["post_ref"]]["numbers"])]
+    return [(f"level:{k}", lv["price"] or "-") for k, lv in enumerate(item["levels"])]
+
+
+def system_rows(bundle: Bundle, item: dict) -> dict[str, dict]:
+    """The system's answer per table row; a number the interpreter typed no level for is, in
+    its reading, not a price."""
+    out = {}
+    for key, _label in table_rows(bundle, item):
+        kind, k = key.split(":")
+        if kind == "level":
+            lv = item["levels"][int(k)]
+        else:
+            lv = next((x for x in item["levels"] if x["n"] == int(k)), None)
+        out[key] = ({f: lv[f] for f in LEVEL_KEYS} if lv else
+                    {"role": "NOT_A_PRICE", "exactness": "", "contract_month": ""})
+    return out
+
+
+def prefill_row_verdicts(levels: list[dict], system: dict[str, dict]) -> dict[str, str]:
+    """Per row: CONFIRM when role, exactness and contract month equal the system's (two
+    NOT_A_PRICE rows agree whatever else), else CORRECT; an unanswered row is UNSURE."""
+    out = {}
+    for row in levels:
+        sys_row = system.get(row["row"], {})
+        same = (row["role"] == sys_row.get("role") == "NOT_A_PRICE") or all(
+            row[f] == sys_row.get(f, "") for f in LEVEL_KEYS)
+        out[row["row"]] = "UNSURE" if not row["role"] else "CONFIRM" if same else "CORRECT"
+    return out
+
+
+def _clean_levels(rows, bundle: Bundle, item: dict, partial: bool) -> list[dict]:
+    keys = [k for k, _ in table_rows(bundle, item)]
+    if not isinstance(rows, list) or not all(isinstance(r, dict) and set(r) <= {
+            "row", *LEVEL_KEYS} and r.get("row") in keys for r in rows):
+        raise AdjudicationError("BAD_VALUE:levels")
+    given = {r["row"]: r for r in rows}
+    out = []
+    for k in keys:
+        if partial and k not in given:
+            continue
+        r = given.get(k, {})
+        row = {"row": k, **{f: str(r.get(f) or "") for f in LEVEL_KEYS}}
+        for f, allowed in zip(LEVEL_KEYS, (TABLE_ROLES, EXACTNESS, CONTRACT_MONTHS), strict=True):
+            if row[f] and row[f] not in allowed:
+                raise AdjudicationError(f"UNKNOWN_VALUE:levels.{f}")
+        out.append(row)
+    return out
+
+
 def clean_reading(reading: dict, item: dict, bundle: Bundle, *, partial: bool = False) -> dict:
-    """A reader's values checked against the closed sets; "" = not stated."""
+    """A reader's values checked against the closed sets; "" = not stated (or, in the price
+    table, unanswered)."""
     allowed = fields_for(item["kind"])
-    if not isinstance(reading, dict) or not set(reading) <= set(allowed):
+    table = item["kind"] != "LABEL_ONLY"
+    if not isinstance(reading, dict) or not set(reading) <= set(allowed) | (
+            {LEVELS} if table else set()):
         raise AdjudicationError("UNKNOWN_FIELD")
     sequences = {s["sequence_id"] for s in bundle.sequences}
     out = {}
+    if table and (LEVELS in reading or not partial):
+        out[LEVELS] = _clean_levels(reading.get(LEVELS, []), bundle, item, partial)
     for f in (reading if partial else allowed):
+        if f == LEVELS:
+            continue
         v = reading.get(f, "")
         if not isinstance(v, str) or _CTRL.search(v) or len(v) > MAX_TEXT:
             raise AdjudicationError(f"BAD_VALUE:{f}")
@@ -503,6 +609,7 @@ class Reviewer:
 class Reviewers:
     entries: dict[str, Reviewer]  # casefolded login -> entry
     remote_full_context_authorized: bool = False
+    scope_sequences: int = DEFAULT_SCOPE
 
 
 def load_reviewers(path: str | Path) -> Reviewers:
@@ -514,6 +621,9 @@ def load_reviewers(path: str | Path) -> Reviewers:
         name = "Ria"
         role = "REVIEWER"   # or APPROVER
         access = "FULL"     # or RESTRICTED
+
+    plus ``scope_sequences = 20`` (default): only the first that many sequences in review order
+    are offered (the sampled label-only posts once it covers all).
     """
     data = _read_private(path, "reviewers file")
     if data is None:
@@ -523,8 +633,10 @@ def load_reviewers(path: str | Path) -> Reviewers:
     except (ValueError, UnicodeDecodeError):
         raise AdjudicationError("REVIEWERS_FILE_UNREADABLE") from None
     switch = raw.get("remote_full_context_authorized", False)
-    if not isinstance(switch, bool) or not set(raw) <= {"remote_full_context_authorized",
-                                                         "reviewer"}:
+    scope = raw.get("scope_sequences", DEFAULT_SCOPE)
+    if not isinstance(switch, bool) or not set(raw) <= {
+            "remote_full_context_authorized", "reviewer", "scope_sequences"} or isinstance(
+            scope, bool) or not isinstance(scope, int) or scope < 1:
         raise AdjudicationError("REVIEWERS_FILE_UNREADABLE")
     entries = {}
     for r in raw.get("reviewer") or []:
@@ -534,7 +646,7 @@ def load_reviewers(path: str | Path) -> Reviewers:
                 or r.get("access") not in (FULL, RESTRICTED) or login.casefold() in entries:
             raise AdjudicationError("REVIEWERS_FILE_ENTRY")
         entries[login.casefold()] = Reviewer(login, name, r["role"], r["access"])
-    return Reviewers(entries, switch)
+    return Reviewers(entries, switch, scope)
 
 
 @dataclass(frozen=True)
@@ -544,6 +656,7 @@ class Session:
     role: str
     access: str  # the EFFECTIVE access of this session
     via_proxy: bool
+    scope: int | None = None  # sequences offered (reviewers file); None: all (tools, tests)
 
 
 def resolve_session(headers, env, reviewers: Reviewers, port: int) -> Session:
@@ -573,7 +686,8 @@ def resolve_session(headers, env, reviewers: Reviewers, port: int) -> Session:
         raise AdjudicationError("NOT_LISTED")
     access = entry.access if (not via_proxy or reviewers.remote_full_context_authorized) \
         else RESTRICTED
-    return Session(entry.login, entry.name, entry.role, access, via_proxy)
+    return Session(entry.login, entry.name, entry.role, access, via_proxy,
+                   reviewers.scope_sequences)
 
 
 # ------------------------------------------------------------------ the annotation log
@@ -604,6 +718,9 @@ def append_annotation(base: str | Path, bundle: Bundle, session: Session, *, ite
     item = bundle.items.get(item_id)
     if item is None:
         raise AdjudicationError("UNKNOWN_ITEM")
+    if session.scope is not None and item_id not in {
+            i["item_id"] for _, items in ordered(bundle, session.scope) for i in items}:
+        raise AdjudicationError("OUTSIDE_SCOPE")
     if phase not in (INDEPENDENT, AFTER_REVEAL, APPROVAL):
         raise AdjudicationError("UNKNOWN_PHASE")
     if (phase == APPROVAL) != (session.role == APPROVER):
@@ -628,8 +745,12 @@ def append_annotation(base: str | Path, bundle: Bundle, session: Session, *, ite
         if phase == INDEPENDENT and (not blind or verdicts or refers_to is not None
                                      or outcome):
             raise AdjudicationError("INDEPENDENT_IS_BLIND_WITHOUT_VERDICTS")
-        if phase == AFTER_REVEAL and (set(verdicts) != compared or not set(
-                verdicts.values()) <= set(VERDICTS) or outcome):
+        rows = verdicts.get(LEVELS) if LEVELS in reading else None
+        flat = {f: v for f, v in verdicts.items() if f != LEVELS}
+        if phase == AFTER_REVEAL and (set(flat) != compared or not set(flat.values()) <= set(
+                VERDICTS) or outcome or (LEVELS in reading and not (
+                    isinstance(rows, dict) and set(rows) == {r["row"] for r in reading[LEVELS]}
+                    and set(rows.values()) <= set(VERDICTS)))):
             raise AdjudicationError("VERDICT_FOR_EVERY_COMPARED_FIELD")
 
     def make(v: Verification) -> dict:
@@ -677,7 +798,7 @@ def resolve(records: list[dict], bundle: Bundle) -> list[dict]:
         if last is not None and _outcome(last) in ("ACCEPT", "AMEND"):
             source, status = after[last["refers_to"]], ("APPROVED" if _outcome(last) ==
                                                           "ACCEPT" else "AMENDED")
-            reading = {**source["reading"], **last["reading"]}
+            reading = merge_amendment(source["reading"], last["reading"])
         else:
             source = after[max(after)]
             status, reading = "PROVISIONAL", source["reading"]
@@ -694,6 +815,16 @@ def resolve(records: list[dict], bundle: Bundle) -> list[dict]:
                     "source_seqs": {"independent": independent["seq"] if independent else None,
                                     "after_reveal": source["seq"],
                                     "approval": last["seq"] if last else None}})
+    return out
+
+
+def merge_amendment(reading: dict, amended: dict) -> dict:
+    """The reviewed reading with the approver's amended fields; price-table rows by row."""
+    out = {**reading, **{k: v for k, v in amended.items() if k != LEVELS}}
+    if LEVELS in amended:
+        rows = {r["row"]: r for r in reading.get(LEVELS, [])}
+        rows.update({r["row"]: r for r in amended[LEVELS]})
+        out[LEVELS] = list(rows.values())
     return out
 
 
@@ -758,8 +889,9 @@ class Progress:
 def progress(bundle: Bundle, records: list[dict], session: Session) -> Progress:
     """Per item for this session: a reviewer's OPEN / INDEPENDENT_SAVED / DONE; an approver's
     NOT_REVIEWED / AWAITING / RETURNED / DECIDED."""
-    p = Progress(total=len(bundle.items))
-    for item_id in bundle.items:
+    in_scope = [i["item_id"] for _, items in ordered(bundle, session.scope) for i in items]
+    p = Progress(total=len(in_scope))
+    for item_id in in_scope:
         if session.role == REVIEWER:
             phases = {r["phase"] for r in _of(records, item_id, bundle.bundle_id,
                                               login=session.login)}
@@ -772,7 +904,8 @@ def progress(bundle: Bundle, records: list[dict], session: Session) -> Progress:
                  if _outcome(appr[-1]) == "RETURN" else "DECIDED")
         p.status[item_id] = s
         p.done += s in ("DONE", "DECIDED")
-    p.sequences = len(bundle.sequences)
+    scoped = [(sid, items) for sid, items in ordered(bundle, session.scope) if sid is not None]
+    p.sequences = len(scoped)
     p.sequences_done = sum(all(p.status[i["item_id"]] in ("DONE", "DECIDED") for i in items)
-                           for sid, items in ordered(bundle) if sid is not None)
+                           for _sid, items in scoped)
     return p
