@@ -1,4 +1,4 @@
-"""The INVENTED scenarios of the adjudication rubric (contract sections 12 and 13.6): posts, the
+"""The INVENTED scenarios of the adjudication rubric (contract sections 12, 13.6 and 14): posts, the
 reviewer's expected answers per form, the expected frozen values, and one contradictory variant
 per scenario with the blocking code Save must refuse it with.
 
@@ -112,7 +112,7 @@ SCENARIOS: list[dict] = [
              amendment_field="STOP", amendment_to="5012", targets=NS,
              ambiguities=["LEVEL_BY_REFERENCE"], idea="SAME_AS_PREVIOUS"),
          expect={"stop_price": "5012", "amendment_from": NS},
-         warnings=["STOP_NOT_IN_TABLE"],
+         # 14.9: no STOP_NOT_IN_TABLE (the level is given by reference, not in the text).
          variant=V("CANNOT_DETERMINE_NEEDS_REASON", amendment_to=CD, ambiguities=[]))]},
     {"n": 7.5, "post": "s07b", "text": "Stop on the S&P long moved to breakeven.",
      "context": [], "forms": [form(
@@ -149,18 +149,24 @@ SCENARIOS: list[dict] = [
              family="NATGAS", instrument_as_read="natural gas", side="LONG",
              position_state="OPEN", position_side="LONG", position_last_stop=NS,
              effect="CLOSES", idea="SAME_AS_PREVIOUS"),
+         # 14.1: the price obtained at a stop-out is HISTORICAL_FILL (it comes before STOP).
          rows=[R("HISTORICAL_FILL")],
-         expect={"post_label": "RETROSPECTIVE", "effect": "CLOSES",
-                 "follower_implication": "RECONCILE_EXIT"},
-         variant=V("TIMING_ACTION", action="NONE"))]},
+         expect={"post_label": "RETROSPECTIVE", "announcement": "FIRST_REPORT",
+                 "effect": "CLOSES", "follower_implication": "RECONCILE_EXIT",
+                 "position_after": {"state": "FLAT", "side": NA, "stop": NA}},
+         # 14.2: a first report changes the position; effect NONE is the form's, for a REPEAT.
+         variant=V("ACTION_EFFECT", effect="NONE"))]},
     {"n": 11, "post": "s11",
      "text": "Recap: last week we closed crude at 74.90 for a gain of 5.2%.",
      "context": ["s01", "s11c"], "forms": [form(
          act(timing="HISTORICAL", announcement="REPEAT", action="CLOSE", family="CRUDE",
              instrument_as_read="crude", side="LONG", position_state="FLAT",
              idea="SAME_AS_PREVIOUS"),
+         # 14.4: for a REPEAT the position before is the one after the earlier announcement
+         # (s11c closed it): FLAT, not the OPEN position of before the close.
          rows=[R("HISTORICAL_FILL"), NOT_A_PRICE],
-         expect={"effect": "NONE", "follower_implication": "NO_NEW_INFORMATION",
+         expect={"announcement": "REPEAT", "effect": "NONE",
+                 "follower_implication": "NO_NEW_INFORMATION",
                  "position_after": {"state": "FLAT", "side": NA, "stop": NA}},
          variant=V("ACTION_EFFECT", effect="CLOSES"))]},
     {"n": 12, "post": "s12",
@@ -189,7 +195,10 @@ SCENARIOS: list[dict] = [
                   **CRUDE_LONG_BEFORE, effect="CLOSES", idea="SAME_AS_PREVIOUS"),
               rows=[R("HISTORICAL_FILL"), OTHER, OTHER],
               expect={"action": "CLOSE"},
-              variant=V("TABLE_STOP", rows={1: R("STOP")})),
+              # 14.4: a close from FLAT is impossible (a STOP row is no longer refused on a
+              # CLOSE whose position had a stop: 14.1).
+              variant=V("EFFECT_POSITION", position_state="FLAT", position_side="",
+                        position_last_stop="")),
          form(act(component="ACTION_RECORDED_HERE", timing="CURRENT", action="OPEN",
                   family="GOLD", instrument_as_read="gold", side="SHORT",
                   position_state="FLAT", effect="OPENS", entry_price="2410",
@@ -274,8 +283,11 @@ SCENARIOS: list[dict] = [
          {"timing": "CURRENT", "action": "OPEN", "explicit": "YES", "family": "SPX",
           "traded_instrument": "OPTIONS", "quoted_series": "OPTION"},
          flags=["FORM_CANNOT_EXPRESS"], notes="an options spread: two strikes and one premium",
-         confidence="MEDIUM", expect={"escalated": True},
-         variant=V("ESCALATION_NEEDS_NOTES", notes=""))]},
+         confidence="MEDIUM", expect={"escalated": True, "follower_implication":
+                                      "INSTRUCTION_CANDIDATE"},
+         variant=V("ESCALATION_NEEDS_NOTES", notes=""))],
+     # 14.3: a post with an escalated form has no whole-post label in the frozen version.
+     "overall": None},
     {"n": 24, "post": "s24",
      "text": "Last week's crude long was closed at 74.90. Today we are buying it back at the "
              "market.",
@@ -332,10 +344,14 @@ SCENARIOS: list[dict] = [
                   announcement="FIRST_REPORT", action="CLOSE", family="CRUDE",
                   instrument_as_read="crude", side="LONG", **CRUDE_LONG_BEFORE,
                   effect="CLOSES", idea="SAME_AS_PREVIOUS"),
+              # 14.1: "stopped at 69.50" gives the price obtained: HISTORICAL_FILL, although
+              # 69.50 was also the stop s01 gave (the fill role comes before STOP).
               rows=[R("HISTORICAL_FILL"), OTHER],
               expect={"timing": "HISTORICAL", "post_label": "RETROSPECTIVE",
+                      "announcement": "FIRST_REPORT", "effect": "CLOSES",
                       "follower_implication": "RECONCILE_EXIT"},
-              variant=V("TIMING_ACTION", timing="COMMENTARY")),
+              # 14.2: a first report is never effect NONE.
+              variant=V("ACTION_EFFECT", effect="NONE")),
          form(act(component="ACTION_RECORDED_HERE", timing="CURRENT", action="OPEN",
                   family="GOLD", instrument_as_read="gold", side="LONG",
                   position_state="FLAT", effect="OPENS", entry_price=NS, stop_price=NS,

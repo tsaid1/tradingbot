@@ -51,6 +51,7 @@ from tradingbot.runtime.vocab_review import (  # noqa: F401 - PrivatePathError f
 BUNDLE_SCHEMA = "tradingbot.adjudication.bundle/1"
 ANNOTATION_SCHEMA = "tradingbot.adjudication.annotation/1"
 GROUND_TRUTH_SCHEMA = "tradingbot.adjudication.ground_truth/2"
+GROUND_TRUTH_SCHEMA_1 = "tradingbot.adjudication.ground_truth/1"  # rubric-1 rows: sibling file
 RUBRIC = R.RUBRIC_VERSION  # every new record carries "rubric": 2; none: rubric 1
 DIR_ENV = "TRADINGBOT_ADJUDICATION_DIR"
 
@@ -792,10 +793,23 @@ def clean_reading(reading: dict, item: dict, bundle: Bundle, *, partial: bool = 
     return out
 
 
+def reset_by_amendment(reading: dict, merged: dict, amended: dict,
+                       ctx: R.FormContext) -> set[str]:
+    """14.3: the fields the approver did not amend whose state (asked, derived, not applicable,
+    pending) differs between the source reading and ``merged``, or that were derived in the
+    source and are asked in ``merged``: they are reset to unanswered."""
+    src = R.applicability(R.complete(reading, ctx), ctx)
+    now = R.applicability(merged, ctx)
+    return {f for f, s in now.items() if f != LEVELS and f not in amended and (
+        f not in src or src[f].state != s.state)}
+
+
 def merge_amendment(reading: dict, amended: dict, ctx: R.FormContext | None = None) -> dict:
     """The reviewed reading with the approver's amended fields; price-table rows by row. With
     ``ctx`` (rubric 2): every field the approver did not amend that is derived or does not apply
-    in the merged reading is derived again (so an amended action re-derives what follows)."""
+    in the merged reading is derived again (so an amended action re-derives what follows), and
+    every such field whose state changes through the amendment, or that was derived and is now
+    asked, is reset to unanswered (14.3: REQUIRED_UNANSWERED until the approver answers it)."""
     out = {**reading, **{k: v for k, v in amended.items() if k != LEVELS}}
     rows = {r["row"]: dict(r) for r in reading.get(LEVELS, [])}
     rows.update({r["row"]: {**rows.get(r["row"], {}), **r} for r in amended.get(LEVELS, [])})
@@ -803,11 +817,13 @@ def merge_amendment(reading: dict, amended: dict, ctx: R.FormContext | None = No
         out[LEVELS] = list(rows.values())
     if ctx is None:
         return out
-    for _ in range(6):
+    for _ in range(8):
         before = repr(out)
         st = R.applicability(out, ctx)
+        changed = reset_by_amendment(reading, out, amended, ctx)
         for f, s in st.items():
-            if f != LEVELS and f not in amended and s.state in (R.DERIVED, R.NA, R.PENDING):
+            if f != LEVELS and f not in amended and (
+                    s.state in (R.DERIVED, R.NA, R.PENDING) or f in changed):
                 out[f] = [] if f in R.LIST_FIELDS else ""
         if st.get(LEVELS, R.Status(R.NA)).state != R.ASK and LEVELS not in amended:
             out[LEVELS] = [{"row": r["row"]} for r in out.get(LEVELS, [])]
@@ -1140,31 +1156,60 @@ def _resolve_one(recs: list[dict], item: dict, bundle: Bundle, rubric: int) -> d
         source = after[max(after)]
         status, reading = "PROVISIONAL", source["reading"]
         ack = source.get("acknowledged_warnings", [])
-    independent = next((r for r in recs if r["seq"] == source["refers_to"]
-                        and r.get("phase") == INDEPENDENT), None)
+    independent = _independent_of(recs, source)
     forms = post_forms(bundle, item)
     two = rubric == RUBRIC
-    return {"schema": GROUND_TRUTH_SCHEMA, "rubric": rubric, "bundle_id": bundle.bundle_id,
-            "item_id": item_id, "kind": item["kind"], "set": item["set"],
-            "sequence_id": item["sequence_id"], "post_ref": item["post_ref"],
-            "form_index": next(n for n, i in enumerate(forms, 1) if i["item_id"] == item_id),
-            "forms_in_post": len(forms), "status": status, "reading": reading,
-            "field_verdicts": source["field_verdicts"], "blind": source["blind"],
-            "independent_reading": independent["reading"] if independent else None,
-            "position_after": R.position_after(reading) if two else None,
-            "additional_actions": list(reading.get("additional_actions") or []) if two else [],
-            "announcement": reading.get("announcement") if two else None,
-            "follower_implication": reading.get("follower_implication") if two else None,
-            "post_label_overall": None,
-            "acknowledged_warnings": list(ack) if two else [],
-            "escalated": two and R.FORM_CANNOT_EXPRESS in (source.get("flags") or []),
-            "flags": list(source.get("flags") or []), "confidence": source.get("confidence"),
-            "reviewer": source["annotator"]["login"],
-            "approver": last["annotator"]["login"] if last else None,
-            "decision": _outcome(last) if last else None,
-            "source_seqs": {"independent": independent["seq"] if independent else None,
-                            "after_reveal": source["seq"],
-                            "approval": last["seq"] if last else None}}
+    if two:  # 14.3: derived values recomputed at the freeze too, whatever was stored
+        reading = R.rederive(reading, form_context(
+            bundle, item, revealed=True, rows=[r["row"] for r in reading.get(LEVELS, [])]))
+    row = {"schema": GROUND_TRUTH_SCHEMA if two else GROUND_TRUTH_SCHEMA_1, "rubric": rubric,
+           "bundle_id": bundle.bundle_id,
+           "item_id": item_id, "kind": item["kind"], "set": item["set"],
+           "sequence_id": item["sequence_id"], "post_ref": item["post_ref"],
+           "form_index": next(n for n, i in enumerate(forms, 1) if i["item_id"] == item_id),
+           "forms_in_post": len(forms), "status": status, "reading": reading,
+           "field_verdicts": source["field_verdicts"], "blind": source["blind"],
+           "independent_reading": independent["reading"] if independent else None,
+           "position_after": R.position_after(reading) if two else None,
+           "additional_actions": list(reading.get("additional_actions") or []) if two else [],
+           "announcement": reading.get("announcement") if two else None,
+           "follower_implication": reading.get("follower_implication") if two else None,
+           "post_label_overall": None,
+           "acknowledged_warnings": list(ack) if two else [],
+           "escalated": two and R.FORM_CANNOT_EXPRESS in (source.get("flags") or []),
+           "flags": list(source.get("flags") or []), "confidence": source.get("confidence"),
+           "reviewer": source["annotator"]["login"],
+           "approver": last["annotator"]["login"] if last else None,
+           "decision": _outcome(last) if last else None,
+           "source_seqs": {"independent": independent["seq"] if independent else None,
+                           "after_reveal": source["seq"],
+                           "approval": last["seq"] if last else None}}
+    if two:
+        row["all_readings"] = _all_readings(recs, item_id, bundle)
+    return row
+
+
+def _independent_of(recs: list[dict], source: dict) -> dict | None:
+    return next((r for r in recs if r["seq"] == source["refers_to"]
+                 and r.get("phase") == INDEPENDENT), None)
+
+
+def _all_readings(recs: list[dict], item_id: str, bundle: Bundle) -> list[dict]:
+    """14.8: one entry per reviewer login that saved an AFTER_REVEAL reading of the item (its
+    latest), in the order of those records; the resolved reading's reviewer included. It adds
+    no rule for choosing the ground truth: it makes agreement between reviewers measurable."""
+    latest: dict[str, dict] = {}
+    for r in _of(recs, item_id, bundle.bundle_id, AFTER_REVEAL):
+        latest[r["annotator"]["login"]] = r
+    out = []
+    for login, r in sorted(latest.items(), key=lambda kv: kv[1]["seq"]):
+        ind = _independent_of(recs, r)
+        out.append({"reviewer": login, "reading": r["reading"],
+                    "independent_reading": ind["reading"] if ind else None,
+                    "blind": r["blind"],
+                    "source_seqs": {"independent": ind["seq"] if ind else None,
+                                    "after_reveal": r["seq"]}})
+    return out
 
 
 def resolve(records: list[dict], bundle: Bundle) -> list[dict]:
@@ -1184,11 +1229,13 @@ def resolve(records: list[dict], bundle: Bundle) -> list[dict]:
     by_item = {r["item_id"]: r for r in out if r["rubric"] == RUBRIC}
     for row in by_item.values():
         if row["kind"] == "LABEL_ONLY":
-            row["post_label_overall"] = row["reading"].get("post_label") or None
+            if not row["escalated"]:
+                row["post_label_overall"] = row["reading"].get("post_label") or None
             continue
         forms = [by_item.get(f["item_id"]) for f in post_forms(bundle, bundle.items[
             row["item_id"]])]
-        if all(forms):
+        # 14.3: null for every row of a post that has an escalated form.
+        if all(forms) and not any(f["escalated"] for f in forms):
             row["post_label_overall"] = R.overall_label([f["reading"] for f in forms])
     return out
 
@@ -1213,14 +1260,18 @@ def freeze(base: str | Path, now: datetime | None = None) -> tuple[Path, dict]:
     if not log.ok:
         raise AdjudicationError("ANNOTATION_LOG_FAILS_VERIFICATION")
     rows = resolve(log.records, bundle)
+    old = [r for r in rows if r["rubric"] != RUBRIC]  # 14.8: never in the /2 file
     versions = base / "versions"
     with PrivateDir(versions / "manifest", "versions folder", create=True) as d:
         taken = [int(m.group(1)) for n in os.listdir(d.fd)
-                 if (m := re.fullmatch(r"ground_truth_v(\d+)\.jsonl", n))]
+                 if (m := re.fullmatch(r"ground_truth_v(\d+)(\.rubric1)?\.jsonl", n))]
         n = max(taken, default=0) + 1
         data = "".join(json.dumps(r, ensure_ascii=False, sort_keys=True) + "\n"
-                       for r in rows).encode("utf-8")
+                       for r in rows if r["rubric"] == RUBRIC).encode("utf-8")
+        old_data = "".join(json.dumps(r, ensure_ascii=False, sort_keys=True) + "\n"
+                           for r in old).encode("utf-8")
         name = f"ground_truth_v{n}.jsonl"
+        old_name = f"ground_truth_v{n}.rubric1.jsonl" if old else None
         manifest = {"schema": GROUND_TRUTH_SCHEMA + ":manifest", "version": n, "file": name,
                     "sha256": _sha(data), "bundle_id": bundle.bundle_id, "rubric": RUBRIC,
                     "created_at": (now or datetime.now(UTC)).astimezone(UTC).isoformat(),
@@ -1229,8 +1280,13 @@ def freeze(base: str | Path, now: datetime | None = None) -> tuple[Path, dict]:
                                                       for s in ("APPROVED", "AMENDED",
                                                                 "PROVISIONAL")},
                     "by_rubric": {str(k): sum(r["rubric"] == k for r in rows) for k in (1, 2)},
-                    "escalated": sum(bool(r["escalated"]) for r in rows)}
+                    "escalated": sum(bool(r["escalated"]) for r in rows),
+                    "rubric1": {"file": old_name, "schema": GROUND_TRUTH_SCHEMA_1,
+                                "sha256": _sha(old_data) if old else None,
+                                "items": len(old)}}
         d.create(name, data)
+        if old_name:
+            d.create(old_name, old_data)
         d.create(f"ground_truth_v{n}.manifest.json",
                  json.dumps(manifest, indent=1, sort_keys=True).encode("utf-8") + b"\n")
     return versions / name, manifest
@@ -1243,7 +1299,12 @@ def verify_versions(base: str | Path) -> list[tuple[str, bool]]:
     for m in sorted(versions.glob("ground_truth_v*.manifest.json")):
         manifest = json.loads(_read_private(m, "version manifest") or b"{}")
         data = _read_private(versions / str(manifest.get("file")), "frozen version")
-        out.append((m.name, data is not None and _sha(data) == manifest.get("sha256")))
+        ok = data is not None and _sha(data) == manifest.get("sha256")
+        old = manifest.get("rubric1") or {}
+        if ok and old.get("file"):  # 14.8: the rubric-1 sibling file, when there is one
+            data = _read_private(versions / str(old["file"]), "frozen version")
+            ok = data is not None and _sha(data) == old.get("sha256")
+        out.append((m.name, ok))
     return out
 
 

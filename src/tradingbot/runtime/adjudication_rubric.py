@@ -6,7 +6,7 @@ Pure: no Streamlit, no I/O, no publisher content (every example is invented). Th
 sets of the bundle's ``ai`` block stay in ``adjudication.py``; this module holds the REVIEWER side.
 
 A reading is a dict of field -> value. Values are strings, except ``ambiguities`` (a list of
-codes), ``additional_actions`` (a list of ``{post_label, action, family, side}``) and ``levels``
+codes), ``additional_actions`` (a list of ``{timing, action, family, side}``) and ``levels``
 (the price table: ``[{row, role, exactness, contract_month, month_named}]``). Four answer states
 are never interchangeable: ``""`` UNANSWERED, ``NOT_STATED``, ``CANNOT_DETERMINE`` and
 ``NOT_APPLICABLE`` (set by the form only).
@@ -18,7 +18,7 @@ import re
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 
-RUBRIC_VERSION = 2  # the records' "rubric" value; the text is version 2.1
+RUBRIC_VERSION = 2  # the records' "rubric" value; the text is version 2.2
 
 UNANSWERED = ""
 NOT_STATED = "NOT_STATED"
@@ -76,10 +76,13 @@ AMBIGUITIES = ("ACTION_UNCLEAR", "SIDE_UNCLEAR", "MARKET_UNCLEAR", "INSTRUMENT_U
 FLAGS = ("MISSING_CONTEXT", "AMBIGUOUS_PRICE_SEMANTICS", "NEEDS_MORE_EVIDENCE", "CHART_NEEDED",
          FORM_CANNOT_EXPRESS)
 CONFIDENCE = ("HIGH", "MEDIUM", "LOW")
-# Section 6: the price table, roles in the order "the first that applies, top to bottom".
+# Section 6 (as amended by 14.1): the price table, roles in the order "the first that applies,
+# top to bottom". HISTORICAL_FILL comes before STOP and TARGET: the price at which a trade was
+# actually executed is a fill even when it was the stop or the target.
 NON_PRICE_ROLES = ("NOT_A_PRICE", "OTHER_ACTION_OR_MARKET")
-TABLE_ROLES = (*NON_PRICE_ROLES, "STOP", "TARGET", *ENTRY_KINDS, "OTHER_CONTRACT_MONTH",
-               "CHART_LEVEL", "UNRESOLVED")
+TABLE_ROLES = (*NON_PRICE_ROLES, "HISTORICAL_FILL", "STOP", "TARGET", "INTENDED_ENTRY",
+               "CURRENT_MARKET", "AVERAGE_OR_COST_BASIS", "OTHER_CONTRACT_MONTH", "CHART_LEVEL",
+               "UNRESOLVED")
 ROW_EXACTNESS = ("EXACT", "APPROXIMATE")
 ROW_MONTHS = ("FRONT", "NEXT", "NAMED", NOT_STATED)
 ROW_KEYS = ("role", "exactness", "contract_month", "month_named")
@@ -89,9 +92,32 @@ ADDITIONAL_TIMINGS = ("CURRENT", "HISTORICAL", "CONDITIONAL", "UNCERTAIN")
 ADDITIONAL_ACTIONS = (*REAL_ACTIONS, CANNOT_DETERMINE)
 ADDITIONAL_KEYS = ("timing", "action", "family", "side")
 ACTION_LABELS = ("ACTIONABLE", "CONDITIONAL", "RETROSPECTIVE")  # label-only: actions required
-# Section 8: verdicts on the SYSTEM's value.
+OPTIONAL_ACTION_LABELS = ("UNRESOLVED",)  # label-only: actions offered, optional (14.5)
+# Section 8: verdicts on the SYSTEM's value (14.7: every option carries its meaning).
 VERDICTS = ("CONFIRM", "CORRECT", "UNSURE")
 VERDICT_NOT_APPLICABLE = NOT_APPLICABLE
+VERDICT_TEXT = {"CONFIRM": "CONFIRM: the system's value is right",
+                "CORRECT": "CORRECT: the system's value is wrong, mine is right",
+                "UNSURE": "UNSURE"}
+VERDICT_HELP = ("A verdict on the SYSTEM's value, never on yours. CONFIRM: the system's value "
+                "is right. CORRECT: the system's value is wrong and your reading gives the right "
+                "one. UNSURE: you cannot tell. Pre-filled from the comparison; editable.")
+DECISION_TEXT = {"ACCEPT": "ACCEPT: the reviewer's reading is right as it stands",
+                 "AMEND": "AMEND: some fields are wrong; I change only those",
+                 "RETURN": "RETURN: send it back to the reviewer"}
+DECISION_HELP = ("Your decision on the reviewer's reading. ACCEPT freezes it as it stands. AMEND "
+                 "changes only the fields you correct (what follows from them is derived again, "
+                 "and a field that changes kind must be answered again). RETURN sends it back "
+                 "to the reviewer. Nothing here approves a trade, a rule or a mapping.")
+ADDITIONAL_HELP = {
+    "timing": "When this further action happens relative to the post (as the field 'timing').",
+    "action": "What the publisher does in this further action (as the field 'action').",
+    "family": "The market of this further action (as the field 'family').",
+    "side": "The direction of the position this further action concerns (as the field 'side').",
+}
+INFERRED_NOTE = "inferred from context: not counted as executable"
+# Values only the form sets (never offered to a reviewer or an approver; section 14.2).
+FORM_ONLY = {"effect": ("NONE",)}
 
 # Section 3 C: the allowed (action, effect) pairs.
 ALLOWED_EFFECTS = {"OPEN": ("OPENS", "INCREASES"), "ADD": ("INCREASES", "OPENS"),
@@ -200,19 +226,30 @@ RUBRIC: tuple[Field, ...] = (
                   "ACTION_RECORDED_HERE by the form when the post has one form",
           examples=("A post with two forms and one action: form 2 is NO_SEPARATE_ACTION.",)),
     Field("timing", "A", "When does THIS action happen relative to the post?",
-          "Answered per action. CURRENT: the post is the announcement of the publisher's own "
-          "decision, made at the time of acting, in whatever tense (\"buying now\", \"just went "
-          "long\", \"out here\"). HISTORICAL: completed before the announcement in a way that "
-          "makes the post a report: something done earlier (hours, days), and every exit done by "
-          "an existing order (a stop-out, a target hit). It says nothing about how directly the "
-          "action is worded (that is 'explicit'). A post-level label never sets it.",
-          (("CURRENT", "the publisher acts as they announce it"),
-           ("HISTORICAL", "a report of something completed before the announcement"),
+          "Answered per action. The post's own time words decide, not the time that has passed. "
+          "CURRENT: the post presents the action as happening now or just done: present tense, "
+          "\"now\", \"just\", \"here\", \"a few minutes ago\", or a plain past with no time "
+          "placed on it (\"Bought gold at 2,395.\"). HISTORICAL: the post itself places the "
+          "action at an earlier time than the post (\"this morning\", \"earlier today\", "
+          "\"overnight\", \"yesterday\", \"last week\"), or the action was done by an existing "
+          "order (a stop-out, a target hit). Neither: UNCERTAIN with TIMING_UNCLEAR. "
+          "\"Bought gold at 2,395 a few minutes ago.\" is CURRENT; \"We bought gold this morning "
+          "at 2,395.\" is HISTORICAL (a first report: a position to reconcile, not an "
+          "instruction). UNCERTAIN needs an action (no action is COMMENTARY). Timing says "
+          "nothing about how directly the action is worded (that is 'explicit'). A post-level "
+          "label never sets it.",
+          (("CURRENT", "the post presents the action as happening now or just done"),
+           ("HISTORICAL", ("the post places the action earlier than the post, or an existing "
+                           "order did it")),
            ("CONDITIONAL", "it will happen only if or when something stated happens later"),
            ("COMMENTARY", "no action (the form sets action NONE)"),
-           ("UNCERTAIN", "the evidence does not settle it (add TIMING_UNCLEAR)")),
+           ("UNCERTAIN", ("the evidence does not settle it (add TIMING_UNCLEAR); needs an "
+                          "action"))),
           applies="every instruction form that records an action",
-          examples=("\"Bought the S&P at 5,012 a few minutes ago.\" CURRENT (a fresh fill)",
+          examples=("\"Bought gold at 2,395 a few minutes ago.\" CURRENT",
+                    ("\"We bought gold this morning at 2,395.\" HISTORICAL, FIRST_REPORT: a "
+                     "position to reconcile, not an instruction"),
+                    "\"Bought the S&P at 5,012 a few minutes ago.\" CURRENT (a fresh fill)",
                     "\"We were stopped out overnight at 2.84.\" HISTORICAL",
                     "\"If silver closes above 31.50 we go long.\" CONDITIONAL",
                     "\"Still long, stop unchanged at 70.\" COMMENTARY")),
@@ -220,10 +257,13 @@ RUBRIC: tuple[Field, ...] = (
                              "(label-only form)",
           "On an instruction form it follows from the timing and is shown read-only: CURRENT "
           "gives ACTIONABLE, HISTORICAL gives RETROSPECTIVE, CONDITIONAL gives CONDITIONAL, "
-          "COMMENTARY gives COMMENTARY, UNCERTAIN gives UNRESOLVED. On a label-only form you "
-          "answer the label of the WHOLE post: the strongest label among its actions, in the "
-          "order ACTIONABLE, CONDITIONAL, RETROSPECTIVE, COMMENTARY; UNRESOLVED only when no "
-          "action is clearer. It must equal the strongest label of the actions you list.",
+          "COMMENTARY gives COMMENTARY, UNCERTAIN gives UNRESOLVED. A label-only form labels a "
+          "whole post rather than one action (a post the system did not read as an "
+          "instruction): there you answer the label of the WHOLE post, the strongest label "
+          "among its actions, in this order: ACTIONABLE, CONDITIONAL, RETROSPECTIVE, "
+          "UNRESOLVED, COMMENTARY. List the post's actions as further actions (required for "
+          "ACTIONABLE, CONDITIONAL and RETROSPECTIVE, optional for UNRESOLVED); the label must "
+          "equal the strongest label of the actions you list.",
           (("ACTIONABLE", "an action announced as the publisher acts (timing CURRENT)"),
            ("CONDITIONAL", "an intention that depends on something later"),
            ("RETROSPECTIVE", "a report of an action completed earlier or by an existing order"),
@@ -233,19 +273,21 @@ RUBRIC: tuple[Field, ...] = (
           applies="every form; answered on label-only forms only",
           set_by_form="on instruction forms, from the timing"),
     Field("announcement", "A", "Is this post the FIRST to tell subscribers of this action?",
-          "Asked when the timing is HISTORICAL (and UNCERTAIN). FIRST_REPORT: this post is the "
-          "first to tell subscribers: the publisher's position changes with it. REPEAT: an "
-          "earlier post shown already announced or reflected it (a recap); the form then sets "
-          "the effect to NONE. Not compared with the system.",
+          "Asked when the timing is HISTORICAL. FIRST_REPORT: this post is the first to tell "
+          "subscribers: the publisher's position changes with it (the effect is answered and "
+          "cannot be NONE). REPEAT: an earlier post shown already announced or reflected it (a "
+          "recap); the form then sets the effect to NONE. Not compared with the system.",
           (("FIRST_REPORT", "the first report: the position changes with it"),
            ("REPEAT", "an earlier post shown already announced or reflected it"),
            (CANNOT_DETERMINE, "the posts shown do not settle it")),
-          applies="timing HISTORICAL or UNCERTAIN",
-          set_by_form="FIRST_REPORT for CURRENT; NOT_APPLICABLE for CONDITIONAL and COMMENTARY",
+          applies="timing HISTORICAL",
+          set_by_form=("FIRST_REPORT for CURRENT; CANNOT_DETERMINE for UNCERTAIN; NOT_APPLICABLE "
+                       "for CONDITIONAL and COMMENTARY"),
           examples=(("\"Recap: last week we closed crude at 74.90\" after the close was announced: "
                     "REPEAT"),)),
     Field("follower_implication", "A", "What this means for a follower",
-          FOLLOWER_SENTENCE + " Derived, read-only.",
+          FOLLOWER_SENTENCE + " Derived, read-only. With explicit NO the line adds \""
+          + INFERRED_NOTE + "\".",
           (("INSTRUCTION_CANDIDATE", "timing CURRENT"),
            ("RECONCILE_EXIT", ("HISTORICAL, FIRST_REPORT, CLOSE or REDUCE: the publisher is "
                               "already out (or smaller)")),
@@ -280,10 +322,10 @@ RUBRIC: tuple[Field, ...] = (
           examples=("\"Closing this here.\" YES (the market may come from context)",
                     "\"Nothing left on in crude after today.\" NO")),
     Field("family", "B", "Which market does the action concern?",
-          "One of the bundle's families, OTHER (a market outside the list) or UNKNOWN (cannot "
-          "determine). From this post, or from the earlier posts shown when this post does not "
-          "name it.",
-          (("<family>", "a market of the bundle's list"), ("OTHER", "a market outside the list"),
+          "One of the markets listed in the form, OTHER (a market outside the list) or UNKNOWN "
+          "(cannot determine). From this post, or from the earlier posts shown when this post "
+          "does not name it.",
+          (("<family>", "a market of the form's list"), ("OTHER", "a market outside the list"),
            ("UNKNOWN", "cannot determine")),
           kind="family", applies="OPEN, ADD, MODIFY, REDUCE, CLOSE"),
     Field("instrument_as_read", "B", "How does this post name the instrument?",
@@ -322,7 +364,12 @@ RUBRIC: tuple[Field, ...] = (
     Field("position_state", "C", "Immediately BEFORE this action, was a position open?",
           "BEFORE this action: as established by the earlier posts shown AND by the earlier "
           "actions of this same post, in text order (this post may restate it: \"our long from "
-          "70, stop was 68\"). The position AFTER this action is shown separately.",
+          "70, stop was 68\"). For a REPEAT (a recap of an action an earlier post already "
+          "announced) the position BEFORE this action is the position as the earlier posts "
+          "shown already leave it, that is AFTER the earlier announcement (a recap of a close "
+          "announced last week: FLAT). A position the posts shown do not establish: "
+          "CANNOT_DETERMINE with the flag MISSING_CONTEXT. The position AFTER this action is "
+          "shown separately.",
           (("OPEN", "a position was open in this market before this action"),
            ("FLAT", "no position before this action"),
            (CANNOT_DETERMINE, "the posts shown do not settle it")),
@@ -330,16 +377,19 @@ RUBRIC: tuple[Field, ...] = (
           examples=(("Form 2 of \"Closed the crude long ... we are now short crude\": FLAT "
                     "(after form 1's close)"),)),
     Field("position_side", "C", "BEFORE this action, on which side was that position?",
-          "BEFORE this action (earlier posts shown and earlier actions of this post). "
-          "NOT_APPLICABLE when the position before this action was FLAT (set by the form).",
+          "BEFORE this action (earlier posts shown and earlier actions of this post; for a "
+          "REPEAT, as the earlier posts shown already leave it). NOT_APPLICABLE when the "
+          "position before this action was FLAT (set by the form).",
           (("LONG", "long"), ("SHORT", "short"),
            (CANNOT_DETERMINE, "the posts shown do not settle it")),
           applies="when the position before this action was OPEN or CANNOT_DETERMINE"),
     Field("position_last_stop", "C", "BEFORE this action, what was the last stop "
                                      "communicated?",
           "The most recent stop the publisher had communicated for that position BEFORE this "
-          "action (earlier posts shown and earlier actions of this post). 'stop_price' is the "
-          "stop this post communicates; this is the stop that was in force before this action.",
+          "action (earlier posts shown and earlier actions of this post; for a REPEAT, as the "
+          "earlier posts shown already leave it; this post may restate it: \"our 72 stop was "
+          "never touched\"). 'stop_price' is the stop this post communicates; this is the stop "
+          "that was in force before this action.",
           (("<number>", "the stop"), (NOT_STATED, ("open, but no stop communicated in the posts "
                                                   "shown")),
            (CANNOT_DETERMINE, "the posts shown do not settle it")),
@@ -347,19 +397,23 @@ RUBRIC: tuple[Field, ...] = (
                                 "CANNOT_DETERMINE"),
     Field("effect", "C", "How does this action change the position BEFORE this action?",
           "The action comes from the words; the effect from the position. For CONDITIONAL: the "
-          "effect the action would have. For HISTORICAL: with announcement REPEAT the form sets "
-          "NONE (the position before already reflects it). Allowed pairs: OPEN with OPENS or "
-          "INCREASES; ADD with INCREASES or OPENS; MODIFY with AMENDS_PROTECTION; REDUCE with "
-          "REDUCES or CLOSES; CLOSE with CLOSES or REDUCES; CANNOT_DETERMINE with any action; "
-          "NONE with any action when the timing is HISTORICAL.",
+          "effect the action would have. Allowed pairs: OPEN with OPENS or INCREASES; ADD with "
+          "INCREASES or OPENS; MODIFY with AMENDS_PROTECTION (set by the form); REDUCE with "
+          "REDUCES or CLOSES; CLOSE with CLOSES or REDUCES; CANNOT_DETERMINE with any action. "
+          "NONE is never chosen: the form sets it only for announcement REPEAT (the position "
+          "before already reflects it) and for timing COMMENTARY; a first report changes the "
+          "position. The effect must be possible from the position before: from FLAT it cannot "
+          "be INCREASES, REDUCES, CLOSES or AMENDS_PROTECTION; from a position open on the same "
+          "side it cannot be OPENS.",
           (("OPENS", "flat to a position"), ("INCREASES", "a larger position"),
            ("REDUCES", "smaller, still open"), ("CLOSES", "to flat"),
            ("AMENDS_PROTECTION", "size unchanged; stop or target changed"),
-           ("NONE", "no change (a repeat already reflected in the position before)"),
+           ("NONE", ("no change: set by the form only, for a REPEAT and for COMMENTARY (never "
+                     "chosen)")),
            (CANNOT_DETERMINE, "context missing (flag MISSING_CONTEXT)")),
           applies="OPEN, ADD, MODIFY, REDUCE, CLOSE",
           set_by_form="NONE for announcement REPEAT and for action NONE; AMENDS_PROTECTION for "
-                      "MODIFY unless the timing is HISTORICAL",
+                      "MODIFY unless REPEAT",
           examples=(("\"Adding to our long\" with no position on record: ADD with OPENS, or "
                     "CANNOT_DETERMINE with MISSING_CONTEXT"),)),
     Field("entry_price", "D", "Which ONE number does the post tie to the entry of this action?",
@@ -384,8 +438,11 @@ RUBRIC: tuple[Field, ...] = (
            ("AVERAGE_OR_COST_BASIS", "the average price of the position after several entries"),
            ("UNRESOLVED", ("the context leaves two readings (flag AMBIGUOUS_PRICE_SEMANTICS); "
                           "there is no default role")),
-           (NOT_STATED, "set by the form when there is no entry number")),
-          applies="OPEN, ADD, with an entry number", set_by_form="NOT_STATED without a number",
+           (NOT_STATED, "set by the form when the entry price is NOT_STATED")),
+          applies="OPEN, ADD, with an entry number or an entry price CANNOT_DETERMINE (the kind "
+                  "of entry can be known when the level is not: \"bids in at yesterday's low\" "
+                  "is INTENDED_ENTRY with LEVEL_BY_REFERENCE)",
+          set_by_form="NOT_STATED when the entry price is NOT_STATED",
           examples=("\"Going long crude at 71.20.\" and nothing else: UNRESOLVED",
                     "\"Going long crude at 71.20, the order is working.\" INTENDED_ENTRY",
                     "\"Going long crude at 71.20, filled on the open.\" HISTORICAL_FILL")),
@@ -395,7 +452,8 @@ RUBRIC: tuple[Field, ...] = (
           (("EXACT", "a precise figure with no hedge"),
            ("APPROXIMATE", "hedged (around, about, near, ~), an end of a range, or shorthand"),
            (NOT_APPLICABLE, "set by the form without a number")),
-          applies="OPEN, ADD, with an entry number", set_by_form="NOT_APPLICABLE without a number"),
+          applies="OPEN, ADD, with an entry number",
+          set_by_form="NOT_APPLICABLE without a number (NOT_STATED or CANNOT_DETERMINE)"),
     Field("stop_price", "E", "Which stop does THIS post communicate for the position after "
                              "this action?",
           "New, amended or restated (\"stop stays 69.50\"). NOT_STATED when this post "
@@ -406,7 +464,8 @@ RUBRIC: tuple[Field, ...] = (
           applies="OPEN, ADD, MODIFY, REDUCE", set_by_form="for MODIFY of the STOP: amendment_to",
           examples=("\"Stop goes below yesterday's low.\" CANNOT_DETERMINE",)),
     Field("targets", "E", "Which profit targets does this post communicate?",
-          "In the order stated, separated by commas.",
+          "In the order stated, separated by commas. On a MODIFY of a target: the targets in "
+          "force after the change (they must contain the new value when it is a number).",
           (("<numbers>", "the targets, comma-separated"), *_VALUE_STATES), kind="prices",
           applies="OPEN, ADD, MODIFY, REDUCE"),
     Field("amendment_field", "F", "What does the MODIFY change?",
@@ -427,26 +486,38 @@ RUBRIC: tuple[Field, ...] = (
           (("<number or text>", "the replaced value"), *_VALUE_STATES), kind="text",
           applies="MODIFY", set_by_form="for STOP: position_last_stop"),
     Field("idea", "G", "Which idea does this action belong to?",
-          "An idea is one position from its opening to its final close.",
+          "An idea is one position from its opening to its final close. The other listed ideas "
+          "are named by their identifier (SEQUENCE:<id>).",
           (("NEW_IDEA", "this action starts one (normally an OPEN from flat)"),
-           ("SAME_AS_PREVIOUS", "it continues the idea this sequence follows"),
+           ("SAME_AS_PREVIOUS", "it continues the idea of the earlier posts shown"),
            ("SEQUENCE:<id>", "it belongs to another listed idea; choose it only when sure"),
            ("UNKNOWN", "cannot tell")),
           kind="idea", applies="OPEN, ADD, MODIFY, REDUCE, CLOSE"),
     Field("role", "T", "What is this number?",
-          "One row per number of the post, in text order (FULL access), or per level the system "
-          "typed (RESTRICTED). Every occurrence is its own row. The FIRST role that applies, top "
-          "to bottom. The function wins over the description: a level used AS the stop is STOP; "
-          "\"stop below support at 70\" leaves 70 a CHART_LEVEL and stop_price CANNOT_DETERMINE. "
+          "One row per number of the post, in text order (FULL access), or, in restricted "
+          "access (no post text), one row per level the SYSTEM typed. Every occurrence is its "
+          "own row. The FIRST role that applies, top to bottom. The price at which a trade was "
+          "actually executed is HISTORICAL_FILL even when it was the stop or the target "
+          "(\"stopped out at 2.84\", \"took profits at 75\"). A level the post names AS the "
+          "stop or the target, without giving it as the price obtained, is STOP or TARGET "
+          "(\"the 69.50 stop was hit, filled 69.40\": 69.50 STOP, 69.40 HISTORICAL_FILL). "
+          "Context still decides. The function wins over the description: a level used AS the "
+          "stop is STOP; \"stop below support at 70\" leaves 70 a CHART_LEVEL and stop_price "
+          "CANNOT_DETERMINE. A STOP row needs the stop in stop_price (a number or "
+          "CANNOT_DETERMINE), position_last_stop or amendment_from. "
           + PRICE_QUESTIONS + " " + CUE_WORDS,
           (("NOT_A_PRICE", ("not a price of any market: an indicator reading, a percentage, a "
                            "date, a size, a profit, the period of a moving average")),
            ("OTHER_ACTION_OR_MARKET", ("a price of another market, or of another action than "
                                       "this form records")),
-           ("STOP", "a stop of this position: new, amended, restated or the one replaced"),
-           ("TARGET", "a profit target of this position"),
+           ("HISTORICAL_FILL", ("a price at which a trade was actually executed, even at the "
+                                "stop or the target (\"closed at 74.90\", \"stopped out at "
+                                "2.84\")")),
+           ("STOP", ("a level named AS a stop of this position, not as the price obtained: "
+                     "new, amended, restated, the one in force or the one replaced")),
+           ("TARGET", ("a level named AS a profit target of this position, not as the price "
+                       "obtained: new, restated, reached or the one replaced")),
            ("INTENDED_ENTRY", "a price the publisher instructs or plans to transact at"),
-           ("HISTORICAL_FILL", "a price at which a trade was executed (\"closed at 74.90\")"),
            ("CURRENT_MARKET", "where the market is (\"closing here, market 2,395\")"),
            ("AVERAGE_OR_COST_BASIS", "the average price of the position"),
            ("OTHER_CONTRACT_MONTH", ("a price of another contract month, given only as a "
@@ -458,6 +529,9 @@ RUBRIC: tuple[Field, ...] = (
           applies="OPEN, ADD, MODIFY, REDUCE, CLOSE",
           examples=(("\"Crude bounced from 70 last week. Our stop goes to 70.\" row 1 of 2 "
                     "CHART_LEVEL, row 2 of 2 STOP"),
+                    "\"We were stopped out overnight at 2.84.\" 2.84 HISTORICAL_FILL",
+                    ("\"Stopped out: the 69.50 stop was hit, filled 69.40.\" 69.50 STOP, 69.40 "
+                     "HISTORICAL_FILL"),
                     "\"RSI at 31\" NOT_A_PRICE")),
     Field("exactness", "T", "How is this number expressed?",
           "How the publisher expresses it, never how close it is to the market.",
@@ -482,12 +556,14 @@ RUBRIC: tuple[Field, ...] = (
           applies="rows with contract_month NAMED"),
     Field("reference_series_right", "H", "Is the system's reference series the price series "
                                          "this post's numbers are quoted in?",
-          "A check of a source fact, about the system's mapping block. Not part of the "
-          "independent reading.",
+          "The system's mapping is its proposal of which price series and which instrument "
+          "would follow this idea; the reference series is the price series it reads the "
+          "numbers against. A check of a source fact. Not part of the independent reading.",
           (("YES", "yes"), ("NO", "no"), ("UNSURE", "cannot tell")),
           applies="after the reveal, when the system's mapping names a reference series"),
     Field("execution_instrument_right", "H", "Would the instrument the system PROPOSES be a "
                                              "faithful way to follow this idea?",
+          "The system's mapping is its proposal of which instrument would follow this idea. "
           "Your opinion on a policy proposal. It approves nothing: approving a mapping is the "
           "owner's separate decision.",
           (("YES", "yes"), ("NO", "no"), ("UNSURE", "cannot tell")),
@@ -509,17 +585,21 @@ RUBRIC: tuple[Field, ...] = (
                                      "form covers?",
           "At most 5 compact records {timing, action, family, side}; details go in notes. "
           "Offered on the LAST form of a post, and on a label-only form whose label is "
-          "ACTIONABLE, CONDITIONAL or RETROSPECTIVE (there at least one record is required, "
-          "unless FORM_CANNOT_EXPRESS is set, and the post label must equal the strongest label "
-          "of the records). Never merge two actions into one form.",
+          "ACTIONABLE, CONDITIONAL, RETROSPECTIVE (there at least one record is required, "
+          "unless FORM_CANNOT_EXPRESS is set) or UNRESOLVED (optional; a record may have timing "
+          "UNCERTAIN). On a label-only form the post label must equal the strongest label of "
+          "the records, in the order ACTIONABLE, CONDITIONAL, RETROSPECTIVE, UNRESOLVED, "
+          "COMMENTARY. Never merge two actions into one form.",
           (("{timing, action, family, side}", ("one record per action; timing CURRENT, "
                                               "HISTORICAL, CONDITIONAL or UNCERTAIN")),),
-          kind="records", applies="the last form of a post; label-only forms with an action "
-                                  "label",
+          kind="records", applies="the last form of a post; label-only forms labelled "
+                                  "ACTIONABLE, CONDITIONAL, RETROSPECTIVE or UNRESOLVED",
           examples=(("\"Sold half our silver at 32.10.\" on a label-only form: ACTIONABLE plus "
                     "{CURRENT, REDUCE, SILVER, LONG}"),)),
     Field("flags", "I", "What does the REVIEW need?",
-          "Flags are about the review, ambiguities about the message.",
+          "Flags are about the review, ambiguities about the message. FORM_CANNOT_EXPRESS "
+          "lifts only the rule that every field be answered: leave unanswered what cannot be "
+          "answered truthfully; every check between the answers you give still applies.",
           (("MISSING_CONTEXT", "an earlier post needed to answer is not among those shown"),
            ("AMBIGUOUS_PRICE_SEMANTICS", "a number's role cannot be settled (role UNRESOLVED)"),
            ("NEEDS_MORE_EVIDENCE", ("cannot be settled from the material at all; the approver "
@@ -562,19 +642,29 @@ APPLICABILITY_HEAD = ("Field group", "OPEN", "ADD", "MODIFY", "REDUCE", "CLOSE",
 BLOCKING_CODES = {
     "REQUIRED_UNANSWERED": "every applicable field must be answered",
     "TIMING_ACTION": "timing COMMENTARY needs action NONE; CURRENT, HISTORICAL and CONDITIONAL "
-                     "need a real action; CANNOT_DETERMINE as action only with UNCERTAIN",
+                     "need a real action; UNCERTAIN needs a real action or CANNOT_DETERMINE; "
+                     "CANNOT_DETERMINE as action only with UNCERTAIN",
     "POST_LABEL_ACTIONS": "on a label-only form the post label must equal the strongest label "
                           "of the listed actions",
-    "ACTION_EFFECT": "the action and the effect are not an allowed pair",
+    "ACTION_EFFECT": "the action and the effect are not an allowed pair (effect NONE is set by "
+                     "the form only, for a REPEAT and for COMMENTARY)",
+    "EFFECT_POSITION": "the effect is impossible from the position before this action: from "
+                       "FLAT not INCREASES, REDUCES, CLOSES or AMENDS_PROTECTION; from a "
+                       "position open on the same side not OPENS",
     "SIDE_POSITION": "for ADD, MODIFY, REDUCE and CLOSE, side and position_side must be equal",
-    "ENTRY_FIELDS": "an entry number needs an entry role and EXACT or APPROXIMATE; no number "
-                    "needs neither",
-    "TABLE_STOP": "a row with role STOP needs stop_price to be a number",
-    "TABLE_TARGET": "a row with role TARGET needs targets to be numbers",
+    "ENTRY_FIELDS": "an entry number needs an entry role and EXACT or APPROXIMATE; an entry "
+                    "price CANNOT_DETERMINE needs an entry role; NOT_STATED needs neither",
+    "TABLE_STOP": "a row with role STOP needs the stop in one of three fields: stop_price (a "
+                  "number or CANNOT_DETERMINE), position_last_stop (a number) or "
+                  "amendment_from (a number)",
+    "TABLE_TARGET": "a row with role TARGET needs targets (numbers or CANNOT_DETERMINE), or the "
+                    "action CLOSE or REDUCE, or a MODIFY of a target with a number in "
+                    "amendment_from or amendment_to",
     "TABLE_ROW": "a price role needs an exactness and, when asked, a contract month; NAMED needs "
                  "month_named",
     "AMENDMENT": "MODIFY needs amendment_field and amendment_to (a number or CANNOT_DETERMINE "
-                 "for STOP and TARGET)",
+                 "for STOP and TARGET); on a MODIFY of a target with a number, targets must "
+                 "contain it",
     "CANNOT_DETERMINE_NEEDS_REASON": "a CANNOT_DETERMINE, UNCERTAIN or UNRESOLVED answer needs "
                                      "at least one ambiguity or flag",
     "CANNOT_DETERMINE_NEEDS_NOTES": "action CANNOT_DETERMINE needs notes",
@@ -582,8 +672,9 @@ BLOCKING_CODES = {
     "ADDITIONAL_ACTION_REQUIRED": "a label-only form labelled ACTIONABLE, CONDITIONAL or "
                                   "RETROSPECTIVE needs at least one additional action",
     "CONFIDENCE": "confidence is required",
-    "NOT_APPLICABLE_FIELD": "a field that does not apply carries a value, or NOT_APPLICABLE was "
-                            "given for a field that applies",
+    "NOT_APPLICABLE_FIELD": "a field that does not apply, or that waits on an unanswered "
+                            "answer, carries a value; or NOT_APPLICABLE was given for a field "
+                            "that applies",
     "DERIVED_VALUE": "a value the form derives (the action's label, the announcement for "
                      "CURRENT, the follower implication, component) was given differently",
 }
@@ -591,10 +682,13 @@ WARNING_CODES = {
     "ENTRY_NOT_IN_TABLE": "an entry number is given but no row carries its role",
     "STOP_NOT_IN_TABLE": "a stop number is given but no row is STOP",
     "TARGET_NOT_IN_TABLE": "target numbers are given but no row is TARGET",
+    "REPEAT_POSITION": "a REPEAT whose action would still change the position given before it "
+                       "(a repeat CLOSE with OPEN before, a repeat OPEN with FLAT before): for a "
+                       "REPEAT the position before is the one after the earlier announcement",
     "ENTRY_ROLE_ORDER": "a row carries an entry kind that ranks before entry_role",
     "STOP_SIDE": "a long's stop above its entry, or a short's below",
     "ACTS_ON_FLAT": "ADD, MODIFY, REDUCE or CLOSE on a FLAT position with an effect other than "
-                    "NONE",
+                    "NONE (for example ADD with OPENS)",
     "OPEN_ON_OPEN": "OPEN with a position already open on the other side (a reversal is two "
                     "actions)",
     "NEW_IDEA_NOT_OPEN": "NEW_IDEA with an action other than OPEN",
@@ -692,11 +786,15 @@ def strongest_label(labels) -> str | None:
     return min(found, key=LABEL_STRENGTH.index) if found else None
 
 
-def overall_label(readings: list[dict]) -> str | None:
+def overall_label(readings: list[dict], escalated=None) -> str | None:
     """The label of the WHOLE post (section 13.2): the strongest label among the actions the
-    reviewer recorded for it (its instruction forms and their ``additional_actions``)."""
+    reviewer recorded for it (its instruction forms and their ``additional_actions``). Escalated
+    forms (``escalated``: one bool per reading) are ignored (14.3); the freeze leaves the whole
+    post's label null when any form is escalated."""
     labels = []
-    for r in readings:
+    for k, r in enumerate(readings):
+        if escalated is not None and escalated[k]:
+            continue
         if r.get("component") != "NO_SEPARATE_ACTION":
             labels.append(r.get("post_label"))
         labels += [LABEL_BY_TIMING.get(x.get("timing")) for x in r.get("additional_actions") or []
@@ -713,9 +811,9 @@ def applicability(r: dict, ctx: FormContext) -> dict[str, Status]:
     if ctx.kind == LABEL_ONLY:
         label = r.get("post_label", "")
         s.update(post_label=ask, ambiguities=ask)
-        s["additional_actions"] = ask if label in ACTION_LABELS else Status(
-            NA, reason="offered on a label-only form only when its label is ACTIONABLE, "
-                       "CONDITIONAL or RETROSPECTIVE")
+        s["additional_actions"] = ask if label in (*ACTION_LABELS, *OPTIONAL_ACTION_LABELS) \
+            else Status(NA, reason="offered on a label-only form only when its label is "
+                                   "ACTIONABLE, CONDITIONAL, RETROSPECTIVE or UNRESOLVED")
         s[LEVELS] = Status(NA, reason="a label-only form has no price table")
         return s
 
@@ -744,10 +842,12 @@ def applicability(r: dict, ctx: FormContext) -> dict[str, Status]:
     s["timing"] = ask
     s["post_label"] = Status(DERIVED, LABEL_BY_TIMING[timing]) if timing in LABEL_BY_TIMING \
         else Status(PENDING, reason="answer the timing first")
-    if timing in ("HISTORICAL", "UNCERTAIN"):
+    if timing == "HISTORICAL":
         s["announcement"] = ask
     elif timing == "CURRENT":
         s["announcement"] = Status(DERIVED, "FIRST_REPORT")
+    elif timing == "UNCERTAIN":  # 14.2: not asked; the effect is asked as for any action
+        s["announcement"] = Status(DERIVED, CANNOT_DETERMINE)
     elif timing in ("CONDITIONAL", "COMMENTARY"):
         s["announcement"] = Status(NA, reason="asked for a historical action only")
     else:
@@ -784,9 +884,9 @@ def applicability(r: dict, ctx: FormContext) -> dict[str, Status]:
         na(("position_side", "position_last_stop"), "the position before this action was FLAT")
     else:
         s["position_side"] = s["position_last_stop"] = ask
-    if r.get("announcement") == "REPEAT" and timing in ("HISTORICAL", "UNCERTAIN"):
+    if r.get("announcement") == "REPEAT" and timing == "HISTORICAL":
         s["effect"] = Status(DERIVED, "NONE")
-    elif action == "MODIFY" and timing != "HISTORICAL":
+    elif action == "MODIFY":  # 14.2: a HISTORICAL MODIFY too, unless REPEAT
         s["effect"] = Status(DERIVED, "AMENDS_PROTECTION")
     else:
         s["effect"] = ask
@@ -795,9 +895,12 @@ def applicability(r: dict, ctx: FormContext) -> dict[str, Status]:
         price = r.get("entry_price", "")
         if price == "":
             pending(("entry_role", "entry_exactness"), "answer the entry price first")
-        elif price in (NOT_STATED, CANNOT_DETERMINE):
+        elif price == NOT_STATED:
             s["entry_role"] = Status(DERIVED, NOT_STATED)
             s["entry_exactness"] = Status(NA, reason="there is no entry number")
+        elif price == CANNOT_DETERMINE:  # 14.5: the kind of entry can be known, not the level
+            s["entry_role"] = ask
+            s["entry_exactness"] = Status(NA, reason="there is no readable entry number")
         else:
             s["entry_role"] = s["entry_exactness"] = ask
     else:
@@ -913,6 +1016,28 @@ def complete(reading: dict, ctx: FormContext) -> dict:
     return r
 
 
+def rederive(reading: dict, ctx: FormContext) -> dict:
+    """14.3: the reading with every derived value recomputed (whatever was stored), every field
+    waiting on an unanswered answer blank unless NOT_APPLICABLE, and every field that does not
+    apply NOT_APPLICABLE. A reading that passed ``validate`` is unchanged. The freeze applies
+    it, so a frozen row never carries a derived value its own answers contradict."""
+    r = complete(reading, ctx)
+    for _ in range(8):
+        before = repr(r)
+        for f, s in applicability(r, ctx).items():
+            if f == LEVELS:
+                continue
+            if s.state == DERIVED:
+                r[f] = s.value
+            elif s.state == PENDING and r[f] not in ("", [], NOT_APPLICABLE):
+                r[f] = _blank(f)
+            elif s.state == NA:
+                r[f] = _na(f)
+        if repr(r) == before:
+            break
+    return r
+
+
 def position_before(r: dict) -> dict:
     out = {"state": r.get("position_state", ""), "side": r.get("position_side", ""),
            "stop": r.get("position_last_stop", "")}
@@ -931,16 +1056,23 @@ def position_after(r: dict) -> dict | None:
         return None
     before = position_before(r)
     if r.get("timing") == "CONDITIONAL" or effect == "NONE":
-        return before
+        return _open_stop(before)
     stop = r.get("stop_price", "")
     if effect == "OPENS":
-        return {"state": "OPEN", "side": r.get("side", ""), "stop": stop}
+        return _open_stop({"state": "OPEN", "side": r.get("side", ""), "stop": stop})
     if effect in ("INCREASES", "REDUCES", "AMENDS_PROTECTION"):
-        return {"state": "OPEN", "side": r.get("side", ""),
-                "stop": stop if is_price(stop) else before["stop"]}
+        return _open_stop({"state": "OPEN", "side": r.get("side", ""),
+                           "stop": stop if is_price(stop) else before["stop"]})
     if effect == "CLOSES":
         return {"state": "FLAT", "side": NOT_APPLICABLE, "stop": NOT_APPLICABLE}
     return {"state": CANNOT_DETERMINE, "side": CANNOT_DETERMINE, "stop": CANNOT_DETERMINE}
+
+
+def _open_stop(p: dict) -> dict:
+    """14.4: an OPEN position never carries NOT_APPLICABLE as its stop (NOT_STATED)."""
+    if p.get("state") == "OPEN" and p.get("stop") == NOT_APPLICABLE:
+        return {**p, "stop": NOT_STATED}
+    return p
 
 
 def describe_position(p: dict | None) -> str:
@@ -1013,6 +1145,9 @@ def validate(reading: dict, ctx: FormContext, *, flags=(), confidence: str = "",
             block(_DERIVED_CODE.get(f, "DERIVED_VALUE"), f)
         elif s.state == NA and v not in ("", [], NOT_APPLICABLE):
             block(_NA_CODE.get(f, "NOT_APPLICABLE_FIELD"), f)
+        elif s.state == PENDING and v not in ("", [], NOT_APPLICABLE):
+            # 14.3: a field waiting on an unanswered answer holds no value, escalated or not.
+            block("NOT_APPLICABLE_FIELD", f)
     # The price table.
     table = st.get(LEVELS, Status(NA))
     rows = r.get(LEVELS, []) if ctx.kind != LABEL_ONLY else []
@@ -1038,12 +1173,20 @@ def validate(reading: dict, ctx: FormContext, *, flags=(), confidence: str = "",
     if timing and action and NOT_APPLICABLE not in (timing, action) and _timing_action_wrong(
             timing, action):
         block("TIMING_ACTION", "action")
-    # ACTION_EFFECT.
+    # ACTION_EFFECT (14.2: NONE only where the form sets it, which the derived check covers).
     effect = r.get("effect", "")
-    if action in ALLOWED_EFFECTS and effect not in ("", NOT_APPLICABLE, CANNOT_DETERMINE) and \
-            effect not in ALLOWED_EFFECTS[action] and not (
-                effect == "NONE" and timing == "HISTORICAL"):
+    effect_asked = st.get("effect", Status(NA)).state == ASK
+    if effect_asked and action in ALLOWED_EFFECTS and effect not in (
+            "", NOT_APPLICABLE, CANNOT_DETERMINE) and effect not in ALLOWED_EFFECTS[action]:
         block("ACTION_EFFECT", "effect")
+    # EFFECT_POSITION (14.4).
+    state, side_ = r.get("position_state", ""), r.get("side", "")
+    if action in REAL_ACTIONS and (
+            (state == "FLAT" and effect in ("INCREASES", "REDUCES", "CLOSES",
+                                            "AMENDS_PROTECTION")) or
+            (state == "OPEN" and effect == "OPENS" and side_ in ("LONG", "SHORT")
+             and r.get("position_side") == side_)):
+        block("EFFECT_POSITION", "effect")
     # SIDE_POSITION.
     side, pside = r.get("side", ""), r.get("position_side", "")
     if action in ("ADD", "MODIFY", "REDUCE", "CLOSE") and side in ("LONG", "SHORT") and \
@@ -1053,12 +1196,15 @@ def validate(reading: dict, ctx: FormContext, *, flags=(), confidence: str = "",
     if st.get("entry_price", Status(NA)).state == ASK and is_price(r.get("entry_price", "")) \
             and (r["entry_role"] == NOT_STATED or r["entry_exactness"] == NOT_APPLICABLE):
         block("ENTRY_FIELDS", "entry_role")
-    # TABLE_STOP / TABLE_TARGET.
+    if st.get("entry_price", Status(NA)).state == ASK and r.get("entry_price") == \
+            CANNOT_DETERMINE and r.get("entry_role") == NOT_STATED:
+        block("ENTRY_FIELDS", "entry_role")  # 14.5: the kind of entry is asked
+    # TABLE_STOP / TABLE_TARGET (14.1).
     if table.state == ASK:
         roles = [row["role"] for row in rows]
-        if "STOP" in roles and not is_price(r.get("stop_price", "")):
+        if "STOP" in roles and not _stop_referred(r):
             block("TABLE_STOP", "stop_price")
-        if "TARGET" in roles and not are_prices(r.get("targets", "")):
+        if "TARGET" in roles and not _target_referred(r):
             block("TABLE_TARGET", "targets")
     # AMENDMENT.
     if action == "MODIFY" and st.get("amendment_field", Status(NA)).state == ASK:
@@ -1071,6 +1217,9 @@ def validate(reading: dict, ctx: FormContext, *, flags=(), confidence: str = "",
         if fld == "TARGET" and frm and not (is_price(frm) or frm in (NOT_STATED,
                                                                      CANNOT_DETERMINE)):
             block("AMENDMENT", "amendment_from")
+        if fld == "TARGET" and is_price(to) and norm_price(to) not in [
+                norm_price(x) for x in _prices(r.get("targets", "")) if is_price(x)]:
+            block("AMENDMENT", "targets")  # 14.1: the targets in force contain the new one
     # The additional actions.
     extras = r.get("additional_actions") or []
     if st.get("additional_actions", Status(NA)).state == ASK:
@@ -1080,12 +1229,12 @@ def validate(reading: dict, ctx: FormContext, *, flags=(), confidence: str = "",
             if x.get("timing") and x.get("action") and _timing_action_wrong(
                     x["timing"], x["action"]):
                 block("TIMING_ACTION", "additional_actions")
-        if ctx.kind == LABEL_ONLY and not escalated:
-            if not extras:
+        if ctx.kind == LABEL_ONLY:
+            if not extras and not escalated and r.get("post_label") in ACTION_LABELS:
                 block("ADDITIONAL_ACTION_REQUIRED", "additional_actions")
             elif strongest_label(LABEL_BY_TIMING.get(x.get("timing")) for x in extras) not in (
                     None, r.get("post_label")):
-                block("POST_LABEL_ACTIONS", "post_label")
+                block("POST_LABEL_ACTIONS", "post_label")  # escalated too (14.1)
     # CANNOT_DETERMINE / UNCERTAIN / UNRESOLVED need a reason.
     undetermined = [f for f in fields_for(ctx.kind) if f not in LIST_FIELDS and _cd(r[f])]
     undetermined += [LEVELS for row in rows if _cd(row["role"])]
@@ -1099,8 +1248,23 @@ def validate(reading: dict, ctx: FormContext, *, flags=(), confidence: str = "",
         block("ESCALATION_NEEDS_NOTES", "notes")
     if not confidence:
         block("CONFIDENCE", "confidence")
-    out.warnings = _warnings(r, st, rows, table, ctx)
+    out.warnings = _warnings(r, st, rows, table, ctx, flags)
     return out
+
+
+def _stop_referred(r: dict) -> bool:
+    """14.1: a STOP row is accepted when the reading carries the stop somewhere."""
+    return is_price(r.get("stop_price", "")) or r.get("stop_price") == CANNOT_DETERMINE or \
+        is_price(r.get("position_last_stop", "")) or is_price(r.get("amendment_from", ""))
+
+
+def _target_referred(r: dict) -> bool:
+    """14.1: a TARGET row is accepted when targets carry one, on an exit (a target reached or
+    spoken of), or on a MODIFY of a target with a number replaced or set."""
+    return are_prices(r.get("targets", "")) or r.get("targets") == CANNOT_DETERMINE or \
+        r.get("action") in ("CLOSE", "REDUCE") or (
+            r.get("action") == "MODIFY" and r.get("amendment_field") == "TARGET" and (
+                is_price(r.get("amendment_from", "")) or is_price(r.get("amendment_to", ""))))
 
 
 def _timing_action_wrong(timing: str, action: str) -> bool:
@@ -1108,22 +1272,30 @@ def _timing_action_wrong(timing: str, action: str) -> bool:
         return action != "NONE"
     if timing in ("CURRENT", "HISTORICAL", "CONDITIONAL"):
         return action not in REAL_ACTIONS
-    return False  # UNCERTAIN: any action, CANNOT_DETERMINE included
+    if timing == "UNCERTAIN":  # 14.2 (N4): no action is COMMENTARY
+        return action not in (*REAL_ACTIONS, CANNOT_DETERMINE)
+    return False
 
 
-def _warnings(r: dict, st: dict, rows: list, table: Status, ctx: FormContext) -> list[str]:
+NOT_IN_TABLE_EXEMPT = ("LEVEL_BY_REFERENCE", "CHART_NEEDED")  # 14.9
+
+
+def _warnings(r: dict, st: dict, rows: list, table: Status, ctx: FormContext,
+              flags=()) -> list[str]:
     out = []
     action = r.get("action", "")
     if action not in REAL_ACTIONS:
         return out
     roles = [row["role"] for row in rows] if table.state == ASK else []
     entry_asked = st.get("entry_price", Status(NA)).state == ASK
-    if entry_asked and is_price(r.get("entry_price", "")) and r.get("entry_role") in \
-            ENTRY_ROLES and r["entry_role"] not in roles:
+    # 14.9: a level given by reference, or one on a chart, is not in the text by nature.
+    exempt = bool(set(NOT_IN_TABLE_EXEMPT) & {*(r.get("ambiguities") or []), *flags})
+    if not exempt and entry_asked and is_price(r.get("entry_price", "")) and r.get(
+            "entry_role") in ENTRY_ROLES and r["entry_role"] not in roles:
         out.append("ENTRY_NOT_IN_TABLE")
-    if is_price(r.get("stop_price", "")) and "STOP" not in roles:
+    if not exempt and is_price(r.get("stop_price", "")) and "STOP" not in roles:
         out.append("STOP_NOT_IN_TABLE")
-    if are_prices(r.get("targets", "")) and "TARGET" not in roles:
+    if not exempt and are_prices(r.get("targets", "")) and "TARGET" not in roles:
         out.append("TARGET_NOT_IN_TABLE")
     if entry_asked and r.get("entry_role") in ENTRY_KINDS:
         rank = ENTRY_KINDS.index(r["entry_role"])
@@ -1142,6 +1314,10 @@ def _warnings(r: dict, st: dict, rows: list, table: Status, ctx: FormContext) ->
         out.append("OPEN_ON_OPEN")
     if r.get("idea") == "NEW_IDEA" and action != "OPEN":
         out.append("NEW_IDEA_NOT_OPEN")
+    if r.get("announcement") == "REPEAT" and r.get("timing") == "HISTORICAL" and (
+            (action == "CLOSE" and r.get("position_state") == "OPEN") or
+            (action == "OPEN" and r.get("position_state") == "FLAT")):
+        out.append("REPEAT_POSITION")  # 14.4
     prev = previous_position(r, ctx)
     if prev is not None and r.get("position_state") and not _same_position(
             position_before(r), prev):
@@ -1232,6 +1408,11 @@ def options(f: str, families=(), sequences=()) -> tuple[str, ...]:
     }.get(f, ())
 
 
+def offered(f: str, families=(), sequences=()) -> tuple[str, ...]:
+    """The values a widget offers: ``options`` without the values only the form sets."""
+    return tuple(v for v in options(f, families, sequences) if v not in FORM_ONLY.get(f, ()))
+
+
 def value_problem(f: str, v, families=(), sequences=()) -> str | None:
     """A code when ``v`` is not a storable value of field ``f`` (closed sets, shapes), else
     None. Whether it fits the rest of the reading is ``validate``'s job."""
@@ -1262,129 +1443,94 @@ def clean_month(v) -> str:
 
 REVIEWER_GUIDE = """# Reviewer guide
 
-This page is self-contained: everything a reviewer needs to adjudicate a post is here. The field
-reference (a separate page) lists every field and value.
+The Field reference page gives every field and value in detail.
 
-## What adjudication is for
+## Purpose
 
-You read a publisher's trading posts and record, field by field, what each post really says: what
-the publisher does, in which market, on which side, and what every number is. Your readings
-become the ground truth against which the system's own reading is measured.
+You record what a publisher's posts really say: the action, market, side and every number. Your
+readings are the ground truth the system's reading is measured against.
 
 ## Interpretation is not execution
 
-Nothing you save places, changes or approves a trade, a rule or a mapping. The workspace has no
-connection to a broker, to orders or to the system's settings. You record a reading; that is all.
+Nothing you save places, changes or approves a trade, a rule or a mapping (the system's proposal
+of which instrument would follow an idea). "What this means for a follower" describes the
+publisher's message: it is not an order and authorizes none.
 
-## One form, one action
+## Forms and actions
 
-An instruction form records ONE action: one thing the publisher does, reports or says they will
-do, to one position in one market. A post with several forms shows "Form k of m for this post".
-Record the actions in the order they first appear in the post. Fewer actions than forms: each
-surplus form answers "no separate action". More actions than forms: record the extras as
-additional actions on the last form. Never merge two actions into one form. An opening with its
-stop and target is ONE action; closing one position and opening another is TWO; the same action
-in two markets is TWO; trimming and moving the stop of the rest is ONE (REDUCE with the new stop).
+An instruction form records ONE action: one thing the publisher does, reports or plans, to one
+position in one market. "Form k of m for this post": record the actions in text order; a surplus
+form answers "no separate action"; extra actions go in "further actions" on the last form. A close
+and a new opening are two actions. A label-only form labels a whole post the system did not read
+as an instruction: the strongest label of its actions (ACTIONABLE, CONDITIONAL, RETROSPECTIVE,
+UNRESOLVED, COMMENTARY), with those actions listed as further actions (required for the first
+three).
 
-## The field groups
+## The fields
 
-- A. What kind of statement. The TIMING of this action: CURRENT (the publisher acts as they
-  announce it, in whatever tense), HISTORICAL (a report of something completed earlier, or done
-  by an existing order such as a stop-out), CONDITIONAL (only if or when something happens),
-  COMMENTARY (no action), UNCERTAIN. The label of this action follows from the timing (CURRENT
-  is ACTIONABLE, HISTORICAL is RETROSPECTIVE). For a historical action: is this post the FIRST
-  report of it, or a REPEAT of something an earlier post already told? Then the action (OPEN,
-  ADD, MODIFY, REDUCE, CLOSE) and whether the post's own words state it. The label of the WHOLE
-  post is the strongest label among its actions (a post may hold a historical exit, a fresh
-  entry, a condition and commentary); it never changes an action's timing.
-- B. Market and instrument: the market, the post's own words for the instrument, the kind of
-  price series the numbers are quoted in, and what the publisher SAYS they traded.
-- C. Direction and position: the side of the position the action concerns (closing a long has
-  side LONG), the position immediately BEFORE THIS ACTION (from the earlier posts shown and the
-  earlier actions of this same post, in text order), and how the action changes it. The form
-  shows the resulting "Position AFTER this action" separately, and on a later form the position
-  after your reading of the previous action in the same market.
-- D. Entry (OPEN and ADD only): the one number tied to the entry, what kind of number it is, and
-  how it is expressed.
-- E. Stop and targets: the stop and targets THIS post communicates.
-- F. Amendment (MODIFY only): what changes, to what, from what.
-- G. Idea: does this action start an idea, continue it, or belong to another?
-- H. The system's mapping: two opinions, asked only after the reveal.
-- I. Ambiguities in the message, flags for the review, confidence and notes.
+A: timing, announcement, action, whether the words state it. B: market and instrument. C: side,
+the position BEFORE THIS ACTION (earlier posts shown and earlier actions of this post) and the
+effect. D: entry. E: stop and targets this post communicates. F: amendment (MODIFY). G: idea (one
+position from opening to final close). H: two opinions on the system's mapping, after the reveal.
+I: ambiguities, flags, confidence, notes. A field that does not apply is greyed with the reason.
 
-A field that does not apply disappears or is greyed with the reason. Values the form derives are
-shown read-only, among them "What this means for a follower" (an instruction candidate, an exit
-or a position to reconcile, no new information, wait for the condition, none). That line
-describes the publisher's message. It is not an order and authorizes none.
+## Timing
 
-## The price roles
+The post's own time words decide. CURRENT: now or just done ("now", "here", "a few minutes ago",
+or a plain past with no time: "Bought gold at 2,395."). HISTORICAL: the post places it earlier
+("this morning", "overnight", "last week"), or an existing order did it (a stop-out). "We bought
+gold this morning at 2,395." is HISTORICAL: a first report to reconcile, not an instruction.
+CONDITIONAL: only if something happens later. Otherwise UNCERTAIN. A historical action is a FIRST
+report or a REPEAT; for a REPEAT the position before is the one after the earlier announcement.
 
-Every number of the post is a row of the price table. Give each the FIRST role that applies, top
-to bottom: NOT_A_PRICE (an indicator reading, a percentage, a date, a size, a profit);
-OTHER_ACTION_OR_MARKET (a price of another market or of another action of the post); STOP;
-TARGET; INTENDED_ENTRY; HISTORICAL_FILL; CURRENT_MARKET; AVERAGE_OR_COST_BASIS;
-OTHER_CONTRACT_MONTH; CHART_LEVEL (support, resistance, a prior high or low, a trigger level);
-UNRESOLVED.
+## Price roles
 
-No phrase has a fixed role: context decides. Ask of each number: is the publisher telling
-subscribers a price to transact at (INTENDED_ENTRY)? Reporting the price they themselves got
-(HISTORICAL_FILL)? Saying where the market is (CURRENT_MARKET)? Giving the average of several
-entries (AVERAGE_OR_COST_BASIS)? Pointing at a level on the chart (CHART_LEVEL)? Setting a stop
-or a target? Cue words such as "bought at", "limit", "the order is working" or "trading at" are
-indications only. "Going long crude at 71.20" alone may be any of three: if the context leaves
-two readings, answer UNRESOLVED with the flag AMBIGUOUS_PRICE_SEMANTICS; there is no default.
-A freshly reported fill ("bought at 5,012 a few minutes ago") can open a position (timing
-CURRENT) while its price stays HISTORICAL_FILL: a fact about the publisher's execution, never a
-limit instruction. Only INTENDED_ENTRY is a price instruction. Exactness is how the number is
-written: EXACT unless hedged ("around", "near", "~", a range, "4.5k").
+Each number of the post is a row (in restricted access: each level the system typed). Give each
+the first role that applies, top to bottom; context decides, never a phrase alone. The price at
+which a trade was executed is HISTORICAL_FILL even at the stop ("stopped out at 2.84"); a level
+named as the stop, not as the price obtained, is STOP ("the 69.50 stop was hit, filled 69.40":
+69.50 STOP, 69.40 HISTORICAL_FILL). Only INTENDED_ENTRY, a price to transact at, is an
+instruction. Two readings left: UNRESOLVED with AMBIGUOUS_PRICE_SEMANTICS; there is no default.
 
-When the same number occurs twice, the table shows "1 of 2" and "2 of 2" with a few words around
-each occurrence, so you can tell them apart.
+## Earlier posts
 
-## Using the earlier posts
+Use only the earlier posts shown. An answer that needs a post not shown is CANNOT_DETERMINE with
+the flag MISSING_CONTEXT.
 
-The earlier posts shown tell you the position before this post, the last stop, the market when
-this post does not name it, and the idea. Use only the posts shown. If an answer needs a post
-that is not shown, answer CANNOT_DETERMINE and set the flag MISSING_CONTEXT. Never work a
-contract month out from the date, the price level or today's contracts.
+## When the evidence does not settle it
 
-## When the evidence does not settle something
-
-Answer CANNOT_DETERMINE (UNCERTAIN for a timing, UNRESOLVED for a label or a price role) and
-say why: at least one ambiguity or flag is required. Prefer CANNOT_DETERMINE and a flag to a low-confidence guess.
-NOT_STATED means the publisher did not state it; CANNOT_DETERMINE means it probably exists but
-the evidence does not settle it. If the form has no truthful way to record the case, set the
-flag FORM_CANNOT_EXPRESS and explain in the notes.
+Answer CANNOT_DETERMINE (UNCERTAIN for a timing, UNRESOLVED for a label or a role) with an
+ambiguity or a flag; never guess. NOT_STATED: the publisher did not state it. If the form cannot
+record the case truthfully, set FORM_CANNOT_EXPRESS, explain in the notes and leave unanswered
+what cannot be answered; every answer you give is still checked.
 
 ## Saving, the reveal, resuming
 
-1. Read the post and only the earlier posts shown.
-2. Decide what the publisher does and what each number is, on your own.
-3. Fill in the fields. Save lists anything unanswered or contradictory; warnings need the tick
-   "I have checked these".
-4. Save your independent reading. On a post with several forms, save every form first.
-5. The system's reading then appears beside yours: confirm or correct each field, answer the two
-   mapping questions, and save again. Change an answer only when the system's reading points to
-   evidence you missed, not because it disagrees.
-
-Every Save is a new line in the log: nothing is overwritten. An unsaved form is lost when you
-leave the page. "Next item not yet adjudicated" takes you to where you stopped.
+Save lists what is unanswered or contradictory; warnings need the tick "I have checked these".
+Once every form of the post has your independent reading, the system's reading appears. Each
+compared field then gets a verdict on the SYSTEM's value: CONFIRM (it is right), CORRECT (it is
+wrong, yours is right) or UNSURE. A row shown as NOT_READ (the system typed no level there) needs
+none. Change an answer only for evidence you missed. Every Save is a new line: nothing is
+overwritten. An unsaved form is lost when you leave. "Next item not yet adjudicated" resumes.
 
 ## Confidentiality
 
 The material is paid subscriber content, shown to you for this review only. Do not copy it, take
-screenshots, forward it, or paste it into any other tool or assistant. In notes, refer to
-numbers by their row; do not paste the post. Your access is personal and can be withdrawn.
+screenshots, forward it, or paste it into any other tool or assistant. Your access is personal and
+can be withdrawn.
 """
+
+REVIEWER_GUIDE_MAX_WORDS = 700  # 14.7: ONE printed page (a test enforces it)
 
 HOW_TO_REVIEW = (
     "1. Read the post and only the earlier posts shown.",
     "2. Decide what the publisher does and what each number is, on your own.",
-    "3. Fill in the fields; a field that does not apply disappears.",
+    "3. Fill in the fields; a field that does not apply is greyed, with the reason.",
     ("4. Where the evidence does not settle something, answer CANNOT_DETERMINE and say why; never "
     "guess."),
     "5. Save your independent reading.",
-    "6. The system's reading then appears: confirm or correct each field, and save again.",
+    ("6. The system's reading then appears: give each field a verdict on the SYSTEM's value "
+     "(CONFIRM: it is right; CORRECT: it is wrong, yours is right; UNSURE), and save again."),
 )
 
 
@@ -1398,7 +1544,7 @@ def applicability_text() -> str:
 def render_rubric_markdown() -> str:
     """docs/ADJUDICATION_RUBRIC.md, rendered from ``RUBRIC`` (scripts/adjudication_rubric_docs.py
     writes it; a test fails when the file and the table drift apart)."""
-    out = ["# Adjudication rubric (version 2.1)", "",
+    out = ["# Adjudication rubric (version 2.2)", "",
            ("<!-- Rendered from RUBRIC in src/tradingbot/runtime/adjudication_rubric.py by "
            "scripts/adjudication_rubric_docs.py. Do not edit by hand. -->"), "",
            ("The authoritative definition of every field a reviewer answers in the adjudication "
@@ -1433,16 +1579,31 @@ def render_rubric_markdown() -> str:
         "required. CONDITIONAL and RETROSPECTIVE use the row of their action."), "",
         "## What Save refuses (blocking)", ""]
     out += [f"- `{c}`: {m}" for c, m in BLOCKING_CODES.items()]
-    out += ["", ("With the flag FORM_CANNOT_EXPRESS, unanswered fields do not block Save (notes "
-            "are required)."), "", ("## Warnings (saving needs the tick \"I have checked these\"; "
-            "stored as `acknowledged_warnings`)"), ""]
+    out += ["", ("With the flag FORM_CANNOT_EXPRESS (notes required) only `REQUIRED_UNANSWERED` "
+            "is lifted: leave unanswered what cannot be answered truthfully. Every check between "
+            "the answers given still applies, the derived values are still checked, and a field "
+            "waiting on an unanswered answer may hold only `\"\"` or `NOT_APPLICABLE`."), "",
+            ("## Warnings (saving needs the tick \"I have checked these\"; stored as "
+             "`acknowledged_warnings`)"), ""]
     out += [f"- `{c}`: {m}" for c, m in WARNING_CODES.items()]
-    out += ["", "## Verdicts after the reveal", "",
-            "Each compared field carries a verdict on the SYSTEM's value: `CONFIRM`, `CORRECT` or "
-            "`UNSURE`; a field `NOT_APPLICABLE` in your reading gets `NOT_APPLICABLE`. Not "
-            "compared: " + ", ".join(f"`{f}`" for f in NOT_COMPARED) + ". The system's empty "
-            "or NONE equals your NOT_STATED or NOT_APPLICABLE; your CANNOT_DETERMINE pre-fills "
-            "UNSURE. Nothing of the system's reading ever fills one of your answers.", ""]
+    out += ["", ("`ENTRY_NOT_IN_TABLE`, `STOP_NOT_IN_TABLE` and `TARGET_NOT_IN_TABLE` are not "
+                 "raised when the reading carries the ambiguity `LEVEL_BY_REFERENCE` or the flag "
+                 "`CHART_NEEDED` (the number is not in the text by nature)."), "",
+            "## Verdicts after the reveal", "",
+            "Each compared field carries a verdict on the SYSTEM's value, never on yours:", ""]
+    out += [f"- `{c}`: {VERDICT_TEXT[c].partition(': ')[2] or 'you cannot tell'}"
+            for c in VERDICTS]
+    out += ["", "A field `NOT_APPLICABLE` in your reading gets `NOT_APPLICABLE`. A price row the "
+            "system typed no level for gets `NOT_READ` (not read by the system: it made no claim "
+            "there, so there is nothing to judge). Not compared: "
+            + ", ".join(f"`{f}`" for f in NOT_COMPARED) + ". The system's empty or NONE equals "
+            "your NOT_STATED or NOT_APPLICABLE; your CANNOT_DETERMINE pre-fills UNSURE. Nothing "
+            "of the system's reading ever fills one of your answers.", "",
+            "## The approver's decision", ""]
+    out += [f"- `{c}`: {t.partition(': ')[2]}" for c, t in DECISION_TEXT.items()]
+    out += ["", ("An amendment re-derives what follows from it; every field it does not amend "
+                 "whose kind (asked, derived, not applicable) changes, or that was derived and is "
+                 "now asked, is reset to unanswered and must be answered by the approver."), ""]
     return "\n".join(out)
 
 

@@ -9,7 +9,8 @@ verification, then writes the next ``versions/ground_truth_v<N>.jsonl`` (never o
 ``ground_truth_v<N>.manifest.json`` with its sha256 (schema ``ground_truth/2``, rows described
 in docs/ADJUDICATION_WORKSPACE.md): per item the approver's accepted or amended reading, else the
 latest AFTER_REVEAL reading marked PROVISIONAL, with the INDEPENDENT reading beside it; items
-with rubric-1 records only are marked ``rubric: 1``. ``verify`` checks the log's chain and every version against its manifest. Both print
+with rubric-1 records only are written to the sibling ``ground_truth_v<N>.rubric1.jsonl`` (schema
+``ground_truth/1``), never to the ground_truth/2 file. ``verify`` checks the log's chain and every version against its manifest. Both print
 counts, codes and file names only. ``repair-head`` repairs the head file of the annotation log
 (or, with ``--recommendations``, of the recommendations log beside
 ``TRADINGBOT_VOCAB_REVIEWER_EXPORT``) in exactly two situations: a crash between a line and its

@@ -1,4 +1,4 @@
-"""Rubric version 2.1 (``runtime/adjudication_rubric.py``) on the INVENTED demo bundle and the
+"""Rubric version 2.2 (``runtime/adjudication_rubric.py``) on the INVENTED demo bundle and the
 invented scenarios (``runtime/adjudication_scenarios.py``): every scenario's expected reading
 passes Save's checks, its contradictory variant is refused with the expected code, and saved,
 resolved and frozen the ground_truth/2 row equals the expectation; plus per-post blind-first,
@@ -168,13 +168,15 @@ def test_each_scenario_passes_its_variant_is_refused_and_the_frozen_row_is_expec
                 item = b.items[iid]
                 assert not set(R.POSITION_FIELDS) & set(
                     afters[k]["field_verdicts"]), sc["n"]
-                assert A.position_compared(b, item, row["reading"]) is want or not want
+                assert A.position_compared(b, item, row["reading"]) is want
             else:
                 assert row["reading"][key] == want, (sc["n"], key)
         assert row["escalated"] is (R.FORM_CANNOT_EXPRESS in f["flags"])
         if "overall" in sc:
             assert row["post_label_overall"] == sc["overall"]
     assert len(SC.SCENARIOS) == 31  # 30 scenarios, scenario 7 with and without its context
+    assert all(row["schema"] == A.GROUND_TRUTH_SCHEMA and "all_readings" in row
+               for row in rows.values())
 
 
 def test_scenario_29_records_three_timings_and_the_post_is_actionable(base):
@@ -302,7 +304,8 @@ def test_warnings_must_be_acknowledged_exactly(base):
     sc = next(s for s in SC.SCENARIOS if s["n"] == 7)
     b = bundle(base)
     item = b.items["s07a"]
-    reading = answers_of(b, item, sc["forms"][0])
+    # Without LEVEL_BY_REFERENCE the stop number not in the table is a warning (14.9).
+    reading = answers_of(b, item, sc["forms"][0], {"ambiguities": []})
     for ack, code in (((), "WARNINGS_NOT_ACKNOWLEDGED"),
                       (("STOP_NOT_IN_TABLE", "STOP_SIDE"), "WARNINGS_NOT_ACKNOWLEDGED"),
                       (("NOT_A_WARNING",), "BAD_VALUE:acknowledged_warnings")):
@@ -372,7 +375,7 @@ def test_the_rubric_and_guide_documents_are_rendered_from_the_code():
         assert f"`{f.name}`" in text and f.tooltip in text
         for code, meaning in f.values:
             assert f"`{code}`: {meaning}" in text
-    guide = R.render_guide_markdown()
+    guide = " ".join(R.render_guide_markdown().split())
     for words in ("not an order", "do not copy", "screenshots", "nothing is overwritten",
                   "Next item not yet adjudicated", "BEFORE THIS ACTION", "no default"):
         assert words.casefold() in guide.casefold(), words

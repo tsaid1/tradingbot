@@ -6,7 +6,7 @@ recommendations page (``reviewer_app.py``) as its restricted vocabulary mode.
 Per item, three areas kept apart: (1) SOURCE EVIDENCE (FULL access only), (2) THE READER'S READING,
 (3) THE SYSTEM'S READING, hidden under blind-first until an INDEPENDENT reading is saved on
 every form of the post. The form follows the rubric (``runtime/adjudication_rubric.py``, version
-2.1); two static pages show the reviewer guide and the field reference. Every
+2.2); two static pages show the reviewer guide and the field reference. Every
 publisher or bundle string is plain text (``st.text`` / ``st.code``); images only from the
 bundle's ``media/`` by a name the post lists. The only write is the annotation log. No broker,
 order, mapping, lexicon or policy code; no upload, download, file browser or path input.
@@ -127,7 +127,7 @@ def _meaning(f: str, code: str) -> str:
 def _options(f: str, bundle: A.Bundle, item: dict) -> tuple[str, ...]:
     sequences = [s["sequence_id"] for s in bundle.sequences
                  if s["sequence_id"] != item["sequence_id"]]
-    return R.options(f, bundle.families, sequences)
+    return R.offered(f, bundle.families, sequences)  # never a value only the form sets
 
 
 def _key(prefix: str, f: str) -> str:
@@ -221,6 +221,7 @@ def _additional(prefix: str, bundle: A.Bundle, defaults: dict, col) -> None:
             options = ("", *allowed[k])
             c.selectbox(f"further action {j + 1}: {k}", options, key=f"{prefix}_aa_{j}_{k}",
                         index=options.index(value) if value in options else 0,
+                        help=R.ADDITIONAL_HELP[k],
                         format_func=lambda v, k=k: _meaning(meaning_of[k], v))
 
 
@@ -235,7 +236,8 @@ def _verdict(prefix: str, f: str, value, system: dict, item: dict, col, verdicts
     withheld = f in item.get("withheld", ())  # never pre-filled: left unanswered
     v = col.radio(f"verdict on the system's {f}", A.VERDICTS, horizontal=True,
                   index=None if withheld else A.VERDICTS.index(pre),
-                  key=f"{prefix}_verdict_{f}_{tag}")
+                  key=f"{prefix}_verdict_{f}_{tag}", help=R.VERDICT_HELP,
+                  format_func=R.VERDICT_TEXT.get)
     if v is not None:
         verdicts[f] = v
 
@@ -283,7 +285,9 @@ def _inputs(prefix: str, bundle: A.Bundle, item: dict, defaults: dict, ctx,
                 shown = s.value if s.value not in ("", None) else "(unanswered)"
                 cols[0].text(f"{_label(f)}: {shown} (set by the form)")
                 if f == "follower_implication":
-                    cols[0].caption(R.FOLLOWER_SENTENCE)
+                    inferred = _peek(prefix, "explicit", defaults) == "NO"
+                    cols[0].caption(R.FOLLOWER_SENTENCE + (f" ({R.INFERRED_NOTE}.)"
+                                                           if inferred else ""))
             elif s.state == R.PENDING:
                 cols[0].caption(f"{_label(f)}: {s.reason}.")
             else:
@@ -371,7 +375,9 @@ def _price_table(prefix, bundle, item, details, defaults, status, system) -> dic
             tag = hashlib.sha256("|".join(row[c] for c in R.ROW_KEYS).encode()).hexdigest()[:8]
             verdicts[d["key"]] = cols[5].radio(f"verdict, row {n}", A.VERDICTS, horizontal=True,
                                                index=A.VERDICTS.index(pre),
-                                               key=f"{prefix}_lvv_{d['key']}_{tag}")
+                                               key=f"{prefix}_lvv_{d['key']}_{tag}",
+                                               help=R.VERDICT_HELP,
+                                               format_func=R.VERDICT_TEXT.get)
     return {"__rows__": verdicts} if system is not None else {}
 
 
@@ -455,7 +461,9 @@ def _overall(records, bundle, item, login) -> None:
         return
     saved = [A.latest_own_reading(records, f["item_id"], bundle, login)
              for f in A.post_forms(bundle, item)]
-    if all(saved):
+    if all(saved) and any(R.FORM_CANNOT_EXPRESS in (r.get("flags") or []) for r in saved):
+        st.text("Label of the whole post: not derived (a form of this post is escalated)")
+    elif all(saved):
         label = R.overall_label([r["reading"] for r in saved])
         st.text(f"Label of the whole post (from your saved readings): {label or '-'}")
 
@@ -571,6 +579,33 @@ def _describe(rec: dict) -> str:
     return "\n".join(lines)
 
 
+def _amendments(source: dict, values: dict, ctx, item: dict, bundle: A.Bundle) -> dict:
+    """The approver's amended fields: the ASKED fields (in the merged reading) whose value
+    differs from the reviewed reading, and the changed price-table rows."""
+    old_rows = {r["row"]: r for r in source.get(A.LEVELS, [])}
+    amended = {f: v for f, v in values.items()
+               if f != A.LEVELS and v != source.get(f, "")
+               and not (v in ("", []) and source.get(f) in (R.NOT_APPLICABLE, []))}
+    changed = [r for r in values.get(A.LEVELS, [])
+               if any(r[c] != old_rows.get(r["row"], {}).get(c, "") and not (
+                   r[c] == "" and old_rows.get(r["row"], {}).get(c) in (
+                       R.NOT_APPLICABLE, "")) for c in R.ROW_KEYS)]
+    if changed:
+        amended[A.LEVELS] = changed
+    merged = A.merge_amendment(source, A.clean_reading(amended, item, bundle, partial=True), ctx)
+    st_ = R.applicability(merged, ctx)
+    return {f: v for f, v in amended.items()
+            if f == A.LEVELS or st_.get(f, R.Status(R.NA)).state == R.ASK}
+
+
+def _amend_defaults(source: dict, amended: dict, ctx, item: dict, bundle: A.Bundle) -> dict:
+    """The approver's form defaults: the reviewed reading, with every field the amendment
+    resets (14.3) left unanswered so that no widget preselects it."""
+    merged = A.merge_amendment(source, A.clean_reading(amended, item, bundle, partial=True), ctx)
+    reset = A.reset_by_amendment(source, merged, amended, ctx)
+    return {**source, **{f: [] if f in R.LIST_FIELDS else "" for f in reset}}
+
+
 def _approver(base, bundle, session, item, records, writable) -> None:
     iid = item["item_id"]
     with st.container(border=True):
@@ -600,26 +635,24 @@ def _approver(base, bundle, session, item, records, writable) -> None:
                 st.error("You wrote a reading of this item: its approval needs another login.")
             prefix = f"aw_{iid}_appr_{chosen}"
             decision = st.radio("decision", A.OUTCOMES, index=None, horizontal=True,
-                                key=f"{prefix}_decision")
+                                key=f"{prefix}_decision", help=R.DECISION_HELP,
+                                format_func=R.DECISION_TEXT.get)
             amended, ok, ack = {}, True, []
             if decision == "AMEND":
                 st.caption("Amend only the fields that are wrong (what follows from them is "
-                           "derived again):")
+                           "derived again; a field that changes kind must be answered again):")
                 rows = [r["row"] for r in rec["reading"].get(A.LEVELS, [])]
                 ctx = A.form_context(bundle, item, revealed=True, rows=rows)
-                values, _ = _inputs(prefix, bundle, item, rec["reading"], ctx)
-                old_rows = {r["row"]: r for r in rec["reading"].get(A.LEVELS, [])}
-                amended = {f: v for f, v in values.items()
-                           if f != A.LEVELS and v != rec["reading"].get(f, "")
-                           and not (v in ("", []) and rec["reading"].get(f) in (
-                               R.NOT_APPLICABLE, []))}
-                changed = [r for r in values.get(A.LEVELS, [])
-                           if any(r[c] != old_rows.get(r["row"], {}).get(c, "") and not (
-                               r[c] == "" and old_rows.get(r["row"], {}).get(c) in (
-                                   R.NOT_APPLICABLE, "")) for c in R.ROW_KEYS)]
-                if changed:
-                    amended[A.LEVELS] = changed
+                details = A.table_row_details(bundle, item)
+                try:  # 14.3: a field the amendment resets is never preselected
+                    defaults = _amend_defaults(rec["reading"], _amendments(
+                        rec["reading"], _collect(prefix, item, rec["reading"], details), ctx,
+                        item, bundle), ctx, item, bundle)
+                except A.AdjudicationError:
+                    defaults = rec["reading"]
+                values, _ = _inputs(prefix, bundle, item, defaults, ctx)
                 try:
+                    amended = _amendments(rec["reading"], values, ctx, item, bundle)
                     merged = A.merge_amendment(rec["reading"], A.clean_reading(
                         amended, item, bundle, partial=True), ctx)
                     checks = R.validate(merged, ctx, flags=rec["flags"],
