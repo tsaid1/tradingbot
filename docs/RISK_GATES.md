@@ -71,6 +71,13 @@ family or from the global `[policy]` collar.
   `permitted`. Writing an option is
   refused in this build whatever the table says (`RISK_SHORT_OPTION_NOT_SUPPORTED`; no key enables
   it); a long, fully paid option is a cash purchase. Futures initial margin is not borrowing.
+  **Known limit (open; independent review, final check at `30b3873`):** the proceeds of a filled
+  short sale are not taken out of total cash, so a purchase paid from those proceeds is not
+  counted as a loan. The borrowed stock is still counted, so the true borrowing can exceed the
+  reported total by at most the short value, never past twice `max_borrowed`. It cannot occur in
+  the cash baseline and needs BOTH `permitted` and `short_sale_permitted`. **Do not enable both
+  keys in a risk table until this is fixed** (mark filled positions in the portfolio view and take
+  filled short value out of total cash in the loan term).
 * **Cash sufficiency is checked only under a `[risk]` table** (G1). The cash baseline does not
   compare a long stock's cost with cash: "fully paid" is not verified there. As on main, only the
   existing absolute notional and exposure caps bound a long stock.
