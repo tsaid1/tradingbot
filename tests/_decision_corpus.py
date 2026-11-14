@@ -1,12 +1,12 @@
 """The invented decision corpus that proves the structured price readings change no execution decision.
 
 Every string literal of the test modules and every post of the invented fixture files is read by the
-interpreter; each reading's EXISTING output (parsed actions and classifications, everything except the
-additive ``price_readings``) is hashed. The fixture posts are also replayed in time order through the
-gateway and the Sprint 1.1 coordinator, and mapped by the shipped instrument mapping, and those
-decisions are hashed too. ``fixtures/price_roles/decisions_before.json`` holds the hashes produced by
-this same module on origin/main 5f8a18f, before the readings existed; ``test_price_roles_no_decision_change``
-recomputes them on the current code. Invented text only (the repository's own tests and fixtures)."""
+interpreter; each reading's EXISTING output (the whole InterpretedPost except the additive
+``price_readings``) is hashed. The fixture posts are also replayed in time order through the gateway
+and the Sprint 1.1 coordinator, and mapped by the shipped instrument mapping, and those decisions are
+hashed too. ``test_price_readings_are_additive`` computes both with the price reader and with the
+price reader patched to return nothing, on the same code: no frozen golden, so it holds for every
+future change. Invented text only (the repository's own tests and fixtures)."""
 from __future__ import annotations
 
 import ast
@@ -21,7 +21,6 @@ REPO = Path(__file__).resolve().parents[1]
 FIXTURE_POSTS = (REPO / "fixtures" / "eval_synthetic" / "posts.jsonl",
                  REPO / "fixtures" / "runtime" / "mock_service_posts.jsonl",
                  REPO / "fixtures" / "runtime" / "shadow_example_posts.jsonl")
-GOLDEN = REPO / "fixtures" / "price_roles" / "decisions_before.json"
 _NUM = re.compile(r"(?<![\w.])\$?(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)")
 
 
@@ -46,10 +45,10 @@ def corpus_texts() -> list[str]:
 
 
 def _reading_digest(ip) -> str:
-    return _sha([ip.parsed.model_dump(mode="json"), [c.model_dump(mode="json") for c in ip.classifications]])
+    return _sha(ip.model_dump(mode="json", exclude={"price_readings"}))
 
 
-def interpreter_digests(texts) -> dict[str, str]:
+def interpreter_digests(texts, readings_seen: list | None = None) -> dict[str, str]:
     from tradingbot.source_events import Provenance, SourcePost
     from tradingbot.tkl_interpreter import TklInterpreter
     t0 = datetime(2026, 1, 5, 15, 0, tzinfo=timezone.utc)
@@ -60,7 +59,10 @@ def interpreter_digests(texts) -> dict[str, str]:
         p = SourcePost(source_id=f"c{i}", post_id=f"c{i}", author_id="A", verified_author=True, text=text,
                        text_complete=True, is_repost=False, published_at=t, received_at=t,
                        provenance=Provenance.SYNTHETIC)
-        out[hashlib.sha256(text.encode()).hexdigest()] = _reading_digest(it.interpret(p))
+        ip = it.interpret(p)
+        if readings_seen is not None:
+            readings_seen.append(len(ip.price_readings))
+        out[hashlib.sha256(text.encode()).hexdigest()] = _reading_digest(ip)
     return out
 
 
@@ -111,18 +113,3 @@ def decision_digests(tmp_dir: Path) -> dict[str, str]:
             it2.observe(p, ip)
         out[f"mapping:{f.name}"] = _sha(rows)
     return out
-
-
-def compute(tmp_dir: Path) -> dict:
-    return {"interpreter": interpreter_digests(corpus_texts() + [p.text for p in fixture_posts()]),
-            "decisions": decision_digests(tmp_dir)}
-
-
-if __name__ == "__main__":  # writes the golden; run only on the code BEFORE the change
-    import sys
-    import tempfile
-    with tempfile.TemporaryDirectory() as d:
-        res = compute(Path(d))
-    GOLDEN.parent.mkdir(parents=True, exist_ok=True)
-    GOLDEN.write_text(json.dumps(res, indent=0, sort_keys=True) + "\n")
-    sys.stdout.write(f"texts={len(res['interpreter'])} decision_groups={len(res['decisions'])}\n")
