@@ -2,7 +2,13 @@
 
 A stand-alone, loopback-only Streamlit app in which reviewers record what each trading post
 really instructs, and an approver settles it, to make a versioned ground truth for evaluating the
-interpreter. It implements the adjudication workspace specification version 1.3 (app side). It is the single system for vocabulary, post-level and
+interpreter. It implements the adjudication workspace specification version 1.3 (app side) and
+the adjudication rubric version 2.3: the reviewer's fields, their questions, tooltips, values,
+which fields apply and what Save checks are defined ONCE, in
+`src/tradingbot/runtime/adjudication_rubric.py`, and rendered to
+[ADJUDICATION_RUBRIC.md](ADJUDICATION_RUBRIC.md) (the authoritative rubric) and
+[REVIEWER_GUIDE.md](REVIEWER_GUIDE.md) (the one-page guide the app shows) by
+`scripts/adjudication_rubric_docs.py`; a test fails when the files and the code drift apart. It is the single system for vocabulary, post-level and
 trading-idea review: the remote reviewer interface is this app behind Tailscale Serve, once the
 owner activates that separately.
 **It is not an execution path.** It has no broker, order, mapping-approval, lexicon or risk-policy
@@ -10,8 +16,12 @@ write path and imports none of those modules (tested in a subprocess). Its only 
 annotation log. Publishing it through any proxy is **the owner's separate decision**; nothing
 here enables remote access.
 
-Code: `src/tradingbot/runtime/adjudication.py` (pure), `dashboard/reviewer/adjudication_app.py`
-(the app), `scripts/adjudication_freeze.py`, `scripts/adjudication_demo_bundle.py`. It reuses the
+Code: `src/tradingbot/runtime/adjudication.py` (pure: bundle, log, versions),
+`src/tradingbot/runtime/adjudication_rubric.py` (pure: the rubric),
+`src/tradingbot/runtime/adjudication_scenarios.py` (the invented scenarios),
+`dashboard/reviewer/adjudication_app.py` (the app) with its two static pages
+`adjudication_guide.py` and `adjudication_fields.py`, `scripts/adjudication_freeze.py`,
+`scripts/adjudication_demo_bundle.py`, `scripts/adjudication_rubric_docs.py`. It reuses the
 reviewed vocabulary-reviewer parts ([VOCAB_REVIEWER.md](VOCAB_REVIEWER.md)): proxy-header identity,
 the chained append-only log, private-path guards and the same server refusals.
 
@@ -24,7 +34,8 @@ the chained append-only log, private-path guards and the same server refusals.
 | `bundle/` | the private export (data side) | `manifest.json`, `posts.jsonl` (the only publisher text), `media/`, `sequences.jsonl`, `items.jsonl` |
 | `reviewers.toml` | the owner, by hand | who may sign in, role and access, `remote_full_context_authorized` |
 | `annotations.jsonl` + `annotations.jsonl.head` | the app (only write) | schema `tradingbot.adjudication.annotation/1`, chained; the head file holds the line count and the last line's sha256 |
-| `versions/ground_truth_v<N>.jsonl` + `.manifest.json` | the freeze command | resolved readings and their sha256 |
+| `versions/ground_truth_v<N>.jsonl` + `.manifest.json` | the freeze command | resolved rubric-2 readings and their sha256 |
+| `versions/ground_truth_v<N>.rubric1.jsonl` | the freeze command, only when there are rubric-1 rows | the rubric-1 rows (schema `tradingbot.adjudication.ground_truth/1`), never in the file above |
 
 Every file is read only through the private-path guards: refused inside this repository, never
 through a link, link count 1, mode 0600. The folders (the base, `bundle/`, `bundle/media/`,
@@ -78,27 +89,71 @@ access = "FULL"          # FULL or RESTRICTED
   verdict is never pre-filled: it stays unanswered and need not be given.
   In RESTRICTED blind mode the price-table rows are labelled with the system's typed prices (there
   is no text to show), so that reading is partly anchored by design.
+* **What a blind form still reveals about the system** (by design; no code hides it): the number
+  of forms per post ("Form k of m": m is the number of instruction items the system produced for
+  the post, so it tells how many actions the system found); whether an item is an instruction or
+  label-only (the sidebar's item label and the header "Label-only form" tell whether the system
+  read the post as an instruction at all); and, in RESTRICTED access, the system's levels as the
+  table's rows. Two bundle strings appear as option texts: market names (the `family` choice) and
+  idea identifiers (`SEQUENCE:<id>` in `idea`); both are strictly pattern-checked at load and
+  option texts are not rendered as Markdown. Revealing one form marks every form of its post
+  within the scope; a form of the same post outside the scope (in another sequence) is marked
+  too, so it can no longer be read blind once the scope is later raised.
 * **REVIEWER** writes INDEPENDENT and AFTER_REVEAL records. With *blind-first* on (the default,
-  a sidebar switch) area 3 stays hidden until the reviewer saves an INDEPENDENT reading. Before the
-  system's reading of an item is served to a reviewer, a SYSTEM_SHOWN marker is appended to the
-  log (once per login and item); from then on that login cannot write an INDEPENDENT reading of
-  the item, in this or any later session, and a second INDEPENDENT is refused too. If the marker
-  cannot be written, the system's reading is not shown. It is
-  then shown beside the reader's form with a per-field verdict (CONFIRM / CORRECT / UNSURE)
-  pre-filled from the comparison and editable, saved as AFTER_REVEAL (`blind: true`, referring to
-  the independent record). With the switch off, the form starts from the system's reading and
-  only AFTER_REVEAL is written (`blind: false`). The **price table** (instruction items) has one
-  row per number of the post's `numbers` (FULL; shown as the token) or per level the system
-  typed (RESTRICTED: no text), each with a role, an exactness and a contract month (always
-  asked). Every row starts unanswered in a blind reading, never filled from the system; after
-  reveal the system's answer stands beside each row with its own CONFIRM / CORRECT pre-fill (an
-  unanswered row: UNSURE). A number the system typed no level for was **not read by the system**:
-  shown as such, with the row verdict NOT_READ (never a CORRECT against a claim it did not make);
-  the reviewer's own answer is recorded as usual. Any field, and any row, is corrected on its own:
-  the record keeps every other field and its CONFIRM. Empty means "not stated", a first-class answer for prices,
-  stop and targets. LABEL_ONLY items ask only for the post label, flags, confidence and notes.
-* **APPROVER** sees the reviewers' records (and the independent readings) and writes APPROVAL:
-  ACCEPT, AMEND (only the amended fields) or RETURN. Refused when the approver's login wrote any
+  a sidebar switch) area 3 stays hidden until the reviewer has saved an INDEPENDENT reading on
+  **every form of the post** (blind-first holds per post; an AFTER_REVEAL with `blind: true`
+  before that is refused, `BLIND_FIRST_PER_POST`). Before the system's reading of an item is
+  served to a reviewer, a SYSTEM_SHOWN marker is appended to the log for that item AND every
+  other item of the same post (once per login and item); from then on that login cannot write an
+  INDEPENDENT reading of any of them, in this or any later session, and a second INDEPENDENT is
+  refused too. If a marker cannot be written, the system's reading is not shown. It is then
+  shown beside the reviewer's form with a verdict on the SYSTEM's value per compared field
+  ("CONFIRM: the system's value is right" / "CORRECT: the system's value is wrong, mine is right"
+  / UNSURE, with a tooltip, pre-filled from the comparison and editable; NOT_APPLICABLE,
+  automatic, where the field does not apply to the reviewer's reading), saved as AFTER_REVEAL
+  (`blind: true`, referring to the independent record). With the switch off, the form starts
+  **unanswered** with the system's values beside it (nothing of the system's reading fills an
+  answer, in any mode) and only AFTER_REVEAL is written (`blind: false`).
+* **The form** (rubric 2.3): "Form k of m for this post" (m = the post's instruction items), a
+  "How to review" expander, then field groups A to I, each field labelled with a plain-English
+  question and its name in brackets, with a tooltip and option texts that give each value's
+  meaning. A field that does not apply to the reviewer's own timing and action is greyed with the
+  reason (and stored NOT_APPLICABLE); values the form derives (the label of the action from its
+  timing, the announcement FIRST_REPORT for CURRENT and CANNOT_DETERMINE for UNCERTAIN,
+  `follower_implication` (with "inferred from context: not counted as executable" when `explicit`
+  is NO), the effect NONE for a REPEAT and for a MODIFY from FLAT (a change to an order that is
+  not yet a position; the warning ACTS_ON_FLAT still shows) and AMENDS_PROTECTION for any other
+  MODIFY, the stop of a stop
+  MODIFY, `amendment_from` for STOP, the NOT_STATED entry role when the entry price is NOT_STATED)
+  are shown read-only. Effect NONE is never offered: only the form sets it. Price and text fields carry an answer-state choice (value
+  given | not stated | cannot determine). The **price table** (instruction items) has one row per
+  number of the post's `numbers` (FULL; shown as the token, with "k of m" for a repeated number
+  and a few words either side of that occurrence, as plain text) or per level the system typed
+  (RESTRICTED: no text): role, exactness, contract month (only for a futures quoted series) and
+  `month_named` (only with NAMED). A number the system typed no level for was **not read by the
+  system**: shown as such, row verdict NOT_READ. The lines "Position after your reading of the
+  previous action of this post in this market", "Position AFTER this action" and, once every form
+  of the post is saved, "Label of the whole post" are shown read-only. The mapping questions
+  appear only after the reveal. Above Save: the required fields still unanswered and every
+  blocking code; warnings need the tick "I have checked these". The same checks run in
+  `append_annotation` (and on an approver's merged amendment), so a record that the form would
+  refuse is refused by the log too. LABEL_ONLY items ask for the label of the whole post,
+  ambiguities, the further actions (required for ACTIONABLE, CONDITIONAL, RETROSPECTIVE; optional
+  for UNRESOLVED), flags, confidence and notes.
+* **Two static pages** in the navigation, in both access modes: "Reviewer guide" (the text of
+  REVIEWER_GUIDE.md) and "Field reference" (rendered from the rubric's table). They read nothing
+  but the rubric module.
+* **APPROVER** sees the reviewers' records (and the independent readings) and writes APPROVAL
+  (each option with its meaning and a tooltip): ACCEPT, AMEND (only the amended fields; what
+  follows from them is derived again; every field not amended whose kind (asked, derived, not
+  applicable) changes through the amendment, or that was derived and is now asked, is reset to
+  unanswered and never preselected, so Save waits until the approver answers it; amending
+  `action`, `timing` or `announcement` also resets `effect` when it is asked and not amended; a
+  field the amendment reset (or the approver blanked) must be answered even when the reviewer's
+  record carries FORM_CANNOT_EXPRESS, which lifts REQUIRED_UNANSWERED only for the other fields;
+  a reset field answered again counts as amended even with its earlier value; Save's checks run
+  on the merged reading, its warnings acknowledged in the approval) or RETURN. A
+  rubric-1 record cannot be approved (`RUBRIC_1_RECORD_NOT_APPROVABLE`). Refused when the approver's login wrote any
   reading of that item, and a REVIEWER cannot write APPROVAL.
 * Navigation: sequences in `review_order` (each with its label-only items). Only the first
   `scope_sequences` (default 20) are offered, shown as "Scope: first 20 ideas"; the 40 sampled
@@ -167,16 +222,104 @@ streamlit run dashboard/reviewer/adjudication_app.py --server.address 127.0.0.1 
 # Stop: Ctrl-C in that terminal.
 
 python scripts/adjudication_freeze.py freeze   # next versions/ground_truth_v<N>.jsonl + manifest
-python scripts/adjudication_freeze.py verify   # the log's chain and every version's sha256
+python scripts/adjudication_freeze.py verify   # the log's chain, every version's sha256, counts
 ```
 
 **Freeze** refuses when the log fails verification, a folder is not 0700 or the `bundle_id` does
 not match, and never overwrites. For each item it records the approver's accepted or amended
 reading (status APPROVED / AMENDED), but only while that approval refers to its reviewer's LATEST
 AFTER_REVEAL of the item; otherwise (no approval, a RETURN, or a reviewer revision after the
-approval) the latest AFTER_REVEAL reading (PROVISIONAL). SYSTEM_SHOWN markers are ignored. It keeps the INDEPENDENT reading beside
-it, so anchoring can be measured. Items with only an independent reading are not included.
-Scoring uses frozen versions only (data side).
+approval) the latest AFTER_REVEAL reading (PROVISIONAL). SYSTEM_SHOWN markers are ignored. It keeps
+the INDEPENDENT reading beside it, so anchoring can be measured. Items with only an independent
+reading are not included. Rubric-2 records are resolved first; an item with only rubric-1 records
+gets a row marked `rubric: 1`, written to the sibling file `ground_truth_v<N>.rubric1.jsonl`
+(schema `tradingbot.adjudication.ground_truth/1`), never to the ground_truth/2 file. The freeze
+recomputes every derived value of a rubric-2 reading from its own answers (a stored value that
+contradicts them never reaches a version). Scoring uses frozen versions only (data side).
+
+### Records (`annotations.jsonl`, envelope schema unchanged)
+
+Every line keeps the envelope `tradingbot.adjudication.annotation/1` (so an existing log and its
+head keep verifying) and the keys of version 1 (`seq`, `prev_sha256`, `at`, `bundle_id`,
+`item_id`, `annotator`, `phase`, `blind`, `reading`, `field_verdicts`, `flags`, `confidence`,
+`notes`, `refers_to`, `decision`), plus, on every line written since rubric 2 (markers too):
+`rubric: 2` and `acknowledged_warnings` (the sorted warning codes the writer ticked; they must be
+exactly the warnings of the reading). A line without `rubric` is rubric 1: never edited or
+converted, still verified and listed, not counted as adjudicated under rubric 2 (progress shows
+the item open), and it still counts as "seen" for blind-first. An INDEPENDENT or AFTER_REVEAL
+`reading` is the COMPLETED rubric-2 reading (every derived value and NOT_APPLICABLE filled in);
+an APPROVAL's `reading` holds the amended fields only.
+
+### The frozen version (`versions/ground_truth_v<N>.jsonl`, schema `tradingbot.adjudication.ground_truth/2`)
+
+One JSON object per line (keys sorted, UTF-8), one line per resolved item, in bundle order:
+
+| key | value |
+| --- | --- |
+| `schema` | `"tradingbot.adjudication.ground_truth/2"` |
+| `rubric` | `2` (rubric-1 rows are in the sibling file, with schema `.../ground_truth/1`: count them, do not score them) |
+| `bundle_id`, `item_id`, `kind` (`INSTRUCTION` / `LABEL_ONLY`), `set` (`DESIGN` / `CHECK`), `sequence_id`, `post_ref` | from the bundle |
+| `form_index`, `forms_in_post` | this item's form number k and m among the post's INSTRUCTION items (slot order); `1, 1` for a label-only item |
+| `status` | `APPROVED`, `AMENDED` (approver's merged amendment) or `PROVISIONAL` |
+| `decision` | the latest effective approval's `ACCEPT` / `AMEND` / `RETURN`, or null |
+| `reading` | the resolved reading: every field of the rubric (below), `levels` included |
+| `independent_reading` | the INDEPENDENT reading the source AFTER_REVEAL followed, or null (blind-first off) |
+| `field_verdicts` | of the source AFTER_REVEAL: field -> `CONFIRM` / `CORRECT` / `UNSURE` / `NOT_APPLICABLE`; `levels` -> {row -> the same or `NOT_READ`} |
+| `blind` | whether the source AFTER_REVEAL followed an independent reading |
+| `position_after` | `{state, side, stop}` derived from `reading`, or null (no separate action, action NONE or CANNOT_DETERMINE, label-only); `state` `OPEN` / `FLAT` / `CANNOT_DETERMINE`; with FLAT `side` and `stop` are `NOT_APPLICABLE`; with OPEN `stop` is a number string, `NOT_STATED` or `CANNOT_DETERMINE`, never `NOT_APPLICABLE` |
+| `additional_actions` | `reading.additional_actions`: a list of `{timing, action, family, side}` (timing `CURRENT` / `HISTORICAL` / `CONDITIONAL` / `UNCERTAIN`; action `OPEN` / `ADD` / `MODIFY` / `REDUCE` / `CLOSE` / `CANNOT_DETERMINE`; side `LONG` / `SHORT` / `CANNOT_DETERMINE`) |
+| `announcement` | `reading.announcement`: `FIRST_REPORT` / `REPEAT` / `CANNOT_DETERMINE` / `NOT_APPLICABLE` (null for rubric 1 and label-only) |
+| `follower_implication` | `reading.follower_implication` (recomputed by the freeze; `INSTRUCTION_CANDIDATE` only with timing CURRENT, `RECONCILE_EXIT` and `RECONCILE_POSITION` only with HISTORICAL and FIRST_REPORT): `INSTRUCTION_CANDIDATE` / `RECONCILE_EXIT` / `RECONCILE_POSITION` / `NO_NEW_INFORMATION` / `WAIT_FOR_CONDITION` / `NONE` / `CANNOT_DETERMINE` / `NOT_APPLICABLE` (null for rubric 1 and label-only). It describes the publisher's message; it is not an order and authorizes none |
+| `post_label_overall` | the label of the WHOLE post: the strongest of the post's action labels and its additional actions' labels, in the order ACTIONABLE, CONDITIONAL, RETROSPECTIVE, UNRESOLVED, COMMENTARY; set only once EVERY form of the post has a rubric-2 row and none of them is escalated (else null); a label-only row: its own `post_label` (null when escalated) |
+| `acknowledged_warnings` | the warning codes acknowledged for the resolved reading (the approval's for AMENDED, else the source's) |
+| `escalated` | true when the source record carries the flag `FORM_CANNOT_EXPRESS` (count, do not score). An escalated row MAY contain unanswered `""` fields (the escalation lifts only `REQUIRED_UNANSWERED`). It may NOT contain a value in a field that waits on an unanswered answer (such a field is `""` or `NOT_APPLICABLE`), a derived value other than the form's (`post_label`, `announcement` for CURRENT or UNCERTAIN, `follower_implication`, `component` on a single-form post, the effect of a REPEAT or a MODIFY), or any combination Save refuses between answered fields. Every row of a post with an escalated form has `post_label_overall` null. The notes are not frozen: the escalation list for the owner is read from the log |
+| `validation_codes` | (rubric 2.3) the blocking codes the rubric's validation finds on the resolved `reading` after the freeze has recomputed its derived values (with the source's flags, confidence and notes; for AMENDED, the fields the amendment reset must be answered), as a list in the order found; `[]` when the reading is clean. The freeze refuses nothing and repairs nothing beyond the derived values. A consumer counts a row with a non-empty list apart and does not score it |
+| `all_readings` | one entry per reviewer login that saved an AFTER_REVEAL reading of the item (its latest), in log order, the resolved reading's reviewer included: `{reviewer, reading, independent_reading, blind, source_seqs: {independent, after_reveal}}`; `reading` is that reviewer's own (never the approver's amendment). It adds no rule for choosing the ground truth; it makes agreement between reviewers measurable |
+| `flags`, `confidence` | of the source AFTER_REVEAL |
+| `reviewer`, `approver` | logins (approver null without an effective approval) |
+| `source_seqs` | `{independent, after_reveal, approval}` log sequence numbers |
+
+The `reading` of an INSTRUCTION row has these keys (values are strings unless said otherwise):
+`component` (`ACTION_RECORDED_HERE` / `NO_SEPARATE_ACTION`; on a NO_SEPARATE_ACTION form every
+other field is `NOT_APPLICABLE` and `levels` rows too), `timing` (`CURRENT` / `HISTORICAL` /
+`CONDITIONAL` / `COMMENTARY` / `UNCERTAIN`, answered), `post_label` (the label of THIS action,
+derived from the timing), `announcement`, `action` (`OPEN` / `ADD` / `MODIFY` / `REDUCE` /
+`CLOSE` / `NONE` / `CANNOT_DETERMINE`), `explicit` (`YES` / `NO`), `follower_implication`,
+`family`, `instrument_as_read` (text), `quoted_series`, `traded_instrument`, `side` (`LONG` /
+`SHORT` / `CANNOT_DETERMINE`), `position_state` (`OPEN` / `FLAT` / `CANNOT_DETERMINE`, BEFORE THIS
+ACTION: earlier posts shown and earlier actions of the post), `position_side`,
+`position_last_stop` (number), `effect`, `entry_price` (number), `entry_role`, `entry_exactness`,
+`stop_price` (number), `targets` (numbers joined by `", "`), `amendment_field` (`STOP` / `TARGET`
+/ `OTHER`), `amendment_to`, `amendment_from`, `idea` (`NEW_IDEA` / `SAME_AS_PREVIOUS` /
+`SEQUENCE:<id>` / `UNKNOWN`), `reference_series_right`, `execution_instrument_right` (`YES` /
+`NO` / `UNSURE`), `ambiguities` (a list of codes), `additional_actions` (a list, above), `levels`
+(a list, one per row in table order: `{row, role, exactness, contract_month, month_named}`;
+`row` is `n:<index into the post's numbers>` (FULL) or `level:<index into the system's levels>`
+(RESTRICTED); `role` one of NOT_A_PRICE, OTHER_ACTION_OR_MARKET, HISTORICAL_FILL, STOP, TARGET,
+INTENDED_ENTRY, CURRENT_MARKET, AVERAGE_OR_COST_BASIS, OTHER_CONTRACT_MONTH, CHART_LEVEL,
+UNRESOLVED (the reviewer's order, "the first that applies"), or `NOT_APPLICABLE` when the table does not apply; `month_named` up to 12 upper-case
+letters and digits, else `""`). A label-only row's `reading` has `post_label` (the whole post),
+`ambiguities` and `additional_actions`.
+
+Value conventions: numbers are plain decimal strings without thousands separators or trailing
+zeros (`"2410"`, `"71.2"`); the four answer states are never interchangeable: `""` unanswered
+(only in escalated rows), `NOT_STATED` (the publisher did not state it), `CANNOT_DETERMINE` (it
+probably exists, the evidence does not settle it; always with an ambiguity or a flag),
+`NOT_APPLICABLE` (does not apply; set by the form; lists use `[]`). `action = NONE`,
+`effect = NONE`, family `UNKNOWN` / `OTHER`, price role `UNRESOLVED` keep their own meanings.
+Executable ground truth (contract 13.4): timing `CURRENT`, a real action and `explicit = YES`,
+nothing else. On a form whose post has an earlier form in the same market the position fields
+carry no verdict (the system's position block is before the post).
+
+The manifest (`ground_truth_v<N>.manifest.json`, schema `...ground_truth/2:manifest`) adds
+`rubric: 2`, `by_rubric` (`{"1": n, "2": n}`), `escalated` (a count), `with_validation_codes`
+(the number of /2 rows whose `validation_codes` is not empty) and `rubric1` (`{file, schema,
+sha256, items}`; `file` and `sha256` null when there is no rubric-1 row) to the version-1 keys;
+`items`, `by_status` and `escalated` count both files. `verify` checks the sibling file's sha256
+too and, for a rubric-2 manifest, recomputes every count (`items`, `by_status`, `by_rubric`,
+`escalated`, `with_validation_codes`, `rubric1.items`) from the two files: a version whose
+manifest disagrees with its files fails. The manifest itself is not hashed. A rubric-1 row keeps the row keys above (with the /2-only values null or empty) and
+has no `all_readings`.
 
 **The log** never changes: a later record supersedes. Each line carries the sha256 of the
 previous line (an edit of line n is reported at line n+1, `CHAIN_BROKEN`), and after every append
@@ -233,3 +376,4 @@ WebSocket request. Not verified without the real Tailscale Serve: that it does a
 
 * `position_context` is read as `{state: OPEN|FLAT, side, last_stop}`; the specification names
   the content but not the keys.
+* The scorer for `ground_truth/2` is private tooling (data side); this page is its contract.

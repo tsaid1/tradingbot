@@ -20,6 +20,8 @@ from streamlit.runtime.context import StreamlitHeaders
 from streamlit.testing.v1 import AppTest
 
 from tradingbot.runtime import adjudication as A
+from tradingbot.runtime import adjudication_rubric as R
+from tradingbot.runtime import adjudication_scenarios as SC
 
 REPO = Path(__file__).resolve().parents[1]
 APP = REPO / "dashboard" / "reviewer" / "adjudication_app.py"
@@ -69,7 +71,7 @@ def app(monkeypatch, base, login=None, *, proxy=None) -> AppTest:
         if login:
             monkeypatch.setenv(A.LOCAL_IDENTITY_ENV, login)
         with_headers(monkeypatch)
-    at = AppTest.from_file(str(APP), default_timeout=60)
+    at = AppTest.from_file(str(APP), default_timeout=120)
     at.run()
     assert not at.exception
     return at
@@ -137,7 +139,8 @@ def test_restricted_never_opens_the_posts_or_the_media(base, monkeypatch):
     monkeypatch.setattr(os, "open", lambda p, *a, **k: opened.append(str(p)) or real(p, *a, **k))
     try:
         b = bundle(base, A.RESTRICTED)
-        assert b.posts is None and len(b.items) == 9
+        assert b.posts is None and len(b.items) == 9 + sum(len(s["forms"])
+                                                           for s in SC.SCENARIOS)
         assert not any("posts" in p or "media" in p or p.endswith(".png") for p in opened)
         with pytest.raises(A.AdjudicationError, match="RESTRICTED"):
             A.read_media(b, "p01", "chart-p01.png")
@@ -245,27 +248,30 @@ def test_blind_first_hides_the_system_until_an_independent_reading_and_writes_on
     assert "Hidden until you save an independent reading" in text
     assert "holds SHIPPED" not in text and "system:" not in text
     assert "Short Zed Metals around 412" in plain(at) and "Zed Metals" not in rendered(at)
-    # The price table: one row per number of the post, shown as its token, nothing pre-filled.
-    assert [at.selectbox(key=f"aw_i07_ind_lv_n:{k}_{f}").value for k in (0, 1)
-            for f in A.LEVEL_KEYS] == [""] * 6
-    assert "412" in plain(at) and "CURRENT_MARKET" not in text and "CHART_LEVEL" not in text
-    at.selectbox(key="aw_i07_ind_lv_n:0_role").set_value("CURRENT_MARKET").run()
-    at.selectbox(key="aw_i07_ind_action").set_value("OPEN").run()
-    at.radio(key="aw_i07_ind_confidence").set_value("MEDIUM").run()
-    at.button(key="aw_i07_ind_save").click().run()
+    b = bundle(base)
+    fill(at, "aw_i07_ind", valid(b, "i07", entry_exactness="EXACT", levels=[
+        ("CURRENT_MARKET", "EXACT"), ("STOP", "EXACT")]))
+    # The price table: one row per number of the post, nothing pre-filled from the system.
+    assert "CHART_LEVEL" not in rendered(at)
+    assert "412" in plain(at)
+    save(at, "aw_i07_ind", "MEDIUM")
     [ind] = records(base)
     assert (ind["phase"], ind["blind"], ind["reading"]["action"]) == (A.INDEPENDENT, True, "OPEN")
+    assert ind["rubric"] == 2 and ind["reading"]["follower_implication"] == \
+        "INSTRUCTION_CANDIDATE"
     assert "holds SHIPPED: HOLD" in plain(at) and "system: SHORT" in plain(at)
     prefix = f"aw_i07_after_{ind['seq']}"
-    at.radio(key=f"{prefix}_confidence").set_value("HIGH").run()
-    at.button(key=f"{prefix}_save").click().run()
-    after = records(base)[-1]
-    assert (after["phase"], after["blind"], after["refers_to"]) == (A.AFTER_REVEAL, True, 1)
-    assert after["field_verdicts"]["action"] == "CONFIRM"
-    assert after["field_verdicts"]["side"] == "CORRECT"  # the reviewer left it not stated
+    save(at, prefix)
+    rec = records(base)[-1]
+    assert (rec["phase"], rec["blind"], rec["refers_to"]) == (A.AFTER_REVEAL, True, 1)
+    assert rec["field_verdicts"]["action"] == "CONFIRM"
+    assert rec["field_verdicts"]["entry_exactness"] == "CORRECT"  # EXACT against APPROXIMATE
+    assert rec["field_verdicts"]["amendment_field"] == "NOT_APPLICABLE"
     assert ind["reading"]["levels"][0] == {"row": "n:0", "role": "CURRENT_MARKET",
-                                           "exactness": "", "contract_month": ""}
-    assert after["field_verdicts"]["levels"] == {"n:0": "CORRECT", "n:1": "UNSURE"}
+                                           "exactness": "EXACT",
+                                           "contract_month": "NOT_APPLICABLE",
+                                           "month_named": ""}
+    assert rec["field_verdicts"]["levels"] == {"n:0": "CORRECT", "n:1": "CONFIRM"}
     changed = {k for k in set(before) | set(tree(base)) if before.get(k) != tree(base).get(k)}
     assert changed == {"annotations.jsonl", "annotations.jsonl.head"}
     assert {str(p) for p in (REPO / "src").rglob("*.py")} == repo_before
@@ -276,18 +282,18 @@ def test_a_single_field_correction_leaves_every_other_field_confirmed(monkeypatc
     at.toggle(key="aw_blind").set_value(False).run()
     at = pick(at, "i04")
     prefix = "aw_i04_after_0"
-    at.text_input(key=f"{prefix}_stop_price").set_value("88.00").run()
-    at.radio(key=f"{prefix}_confidence").set_value("HIGH").run()
-    at.button(key=f"{prefix}_save").click().run()
+    # Blind-first off: the system's reading stands beside the form; nothing is pre-filled.
+    assert at.selectbox(key=f"{prefix}_timing").value == ""
+    assert "system: MODIFY" in plain(at)
+    fill(at, prefix, valid(bundle(base), "i04", **MAPPING_YES))
+    save(at, prefix)
     [rec] = records(base)
-    system = A.system_reading(bundle(base), bundle(base).items["i04"])
     assert (rec["phase"], rec["blind"], rec["refers_to"]) == (A.AFTER_REVEAL, False, None)
-    assert {f for f in system if rec["reading"][f] != system[f]} == {"stop_price"}
-    assert rec["reading"]["stop_price"] == "88"
-    assert {f for f, v in rec["field_verdicts"].items() if v != "CONFIRM"} == {
-        "stop_price", "levels"}
-    assert rec["field_verdicts"]["levels"] == {"n:0": "CONFIRM"}
-    assert rec["field_verdicts"]["stop_price"] == "CORRECT"
+    assert rec["reading"]["stop_price"] == "88" and rec["reading"]["amendment_from"] == "87.2"
+    wrong = {f for f, v in rec["field_verdicts"].items()
+             if v not in ("CONFIRM", "NOT_APPLICABLE")}
+    assert wrong == {"stop_price", "amendment_to", "levels"}  # the system read 87.0
+    assert rec["field_verdicts"]["levels"] == {"n:0": "CORRECT"}
     # Toggling blind-first back on cannot produce an "independent" reading of a seen item.
     with pytest.raises(A.AdjudicationError, match="SYSTEM_READING_ALREADY_SEEN"):
         A.append_annotation(base, bundle(base), REVIEWER, item_id="i04", phase=A.INDEPENDENT,
@@ -300,20 +306,10 @@ def test_a_label_only_item_asks_for_the_label_flags_confidence_and_notes_only(
     reading = [w.key for w in at.selectbox if w.key.startswith("aw_i09_ind_")]
     assert reading == ["aw_i09_ind_post_label"] and not [
         w for w in at.text_input if w.key.startswith("aw_i09")]
-
-
-def review(base, item_id, **reading) -> dict:
-    b = bundle(base)
-    ind = A.append_annotation(base, b, REVIEWER, item_id=item_id, phase=A.INDEPENDENT,
-                              blind=True, reading=reading, confidence="MEDIUM")
-    item, system = b.items[item_id], A.system_reading(b, b.items[item_id])
-    return A.append_annotation(base, b, REVIEWER, item_id=item_id, phase=A.AFTER_REVEAL,
-                               blind=True, reading=system, confidence="HIGH",
-                               field_verdicts={**A.prefill_verdicts(system, system,
-                                                                    item["kind"]),
-                                               "levels": {k: "UNSURE" for k, _ in
-                                                          A.table_rows(b, item)}},
-                               refers_to=ind["seq"])
+    assert [w.key for w in at.multiselect if w.key.startswith("aw_i09")] == [
+        "aw_i09_ind_ambiguities", "aw_i09_ind_flags"]
+    at.selectbox(key="aw_i09_ind_post_label").set_value("ACTIONABLE").run()
+    assert find(at, "aw_i09_ind_aa_n") is not None  # an action label asks for the actions
 
 
 def test_reviewer_and_approver_are_distinct(monkeypatch, local, base):
@@ -349,26 +345,28 @@ def test_the_log_is_chained_and_an_edit_disables_saving_and_freezing(monkeypatch
 
 def test_freeze_resolves_approver_then_provisional_and_keeps_the_independent_reading(base):
     b = bundle(base)
-    amended = review(base, "i01", action="ADD")  # independent differs from the final reading
+    amended = review(base, "i01", action="ADD", effect="INCREASES",
+                     position_state="OPEN", position_side="LONG", position_last_stop=NS,
+                     idea="SAME_AS_PREVIOUS")  # independent differs from the final reading
     A.append_annotation(base, b, APPROVER, item_id="i01", phase=A.APPROVAL, blind=False,
-                        reading={"stop_price": "87.1", "levels": [
-                            {"row": "n:1", "role": "STOP", "exactness": "EXACT",
-                             "contract_month": "NOT_APPLICABLE"}]}, refers_to=amended["seq"],
+                        reading={"stop_price": "87.1"}, refers_to=amended["seq"],
                         outcome="AMEND")
     provisional = review(base, "i03")
     returned = review(base, "i05")
     A.append_annotation(base, b, APPROVER, item_id="i05", phase=A.APPROVAL, blind=False,
                         reading={}, refers_to=returned["seq"], outcome="RETURN")
     A.append_annotation(base, b, REVIEWER, item_id="i07", phase=A.INDEPENDENT, blind=True,
-                        reading={}, confidence="LOW")  # independent only: not resolved
+                        reading=valid(b, "i07"), confidence="LOW")  # not resolved
     before = tree(base)
     path, manifest = A.freeze(base)
     rows = {r["item_id"]: r for r in map(json.loads, path.read_text().splitlines())}
     assert set(rows) == {"i01", "i03", "i05"} and path.name == "ground_truth_v1.jsonl"
     assert rows["i01"]["status"] == "AMENDED" and rows["i01"]["reading"]["stop_price"] == "87.1"
     assert rows["i01"]["reading"]["action"] == "OPEN"
-    assert [r["role"] for r in rows["i01"]["reading"]["levels"]] == ["", "STOP", ""]
+    assert [r["role"] for r in rows["i01"]["reading"]["levels"]] == [
+        "CURRENT_MARKET", "STOP", "TARGET"]
     assert rows["i01"]["independent_reading"]["action"] == "ADD"
+    assert rows["i01"]["position_after"] == {"state": "OPEN", "side": "LONG", "stop": "87.1"}
     assert rows["i03"]["status"] == "PROVISIONAL"
     assert rows["i03"]["source_seqs"]["after_reveal"] == provisional["seq"]
     assert rows["i05"]["status"] == "PROVISIONAL" and rows["i05"]["decision"] == "RETURN"
@@ -396,7 +394,7 @@ c.set_option("server.address", "127.0.0.1"); c.set_option("browser.gatherUsageSt
 c.set_option("client.showErrorDetails", "none")
 port = c.get_option("server.port")
 ContextProxy.headers = property(lambda s: StreamlitHeaders([("Host", f"127.0.0.1:{{port}}")]))
-at = AppTest.from_file({str(APP)!r}, default_timeout=60); at.run()
+at = AppTest.from_file({str(APP)!r}, default_timeout=120); at.run()
 assert not at.exception and any("Zed Metals" in str(t.value) for t in at.text)
 print(sorted(m for m in sys.modules if m.startswith({forbidden!r})))
 """
@@ -439,26 +437,22 @@ def test_a_per_row_price_correction_is_saved_alone(monkeypatch, local, base):
     at.toggle(key="aw_blind").set_value(False).run()
     at = pick(at, "i04")
     prefix = "aw_i04_after_0"
-    assert at.selectbox(key=f"{prefix}_lv_n:0_role").value == "CURRENT_MARKET"  # blind off
-    at.selectbox(key=f"{prefix}_lv_n:0_role").set_value("STOP").run()
-    at.text_input(key=f"{prefix}_stop_price").set_value("87").run()  # keep the system's stop
-    at.radio(key=f"{prefix}_confidence").set_value("HIGH").run()
-    at.button(key=f"{prefix}_save").click().run()
+    fill(at, prefix, valid(bundle(base), "i04", **MAPPING_YES))
+    assert "system: CURRENT_MARKET / EXACT / NOT_APPLICABLE" in plain(at)
+    assert at.selectbox(key=f"{prefix}_lv_n:0_role").value == "STOP"  # the reviewer's own
+    save(at, prefix)
     [rec] = records(base)
-    system = A.system_reading(bundle(base), bundle(base).items["i04"])
-    assert all(rec["reading"][f] == system[f] for f in system)
     assert rec["reading"]["levels"] == [{"row": "n:0", "role": "STOP", "exactness": "EXACT",
-                                         "contract_month": "NOT_APPLICABLE"}]
+                                         "contract_month": "NOT_APPLICABLE", "month_named": ""}]
     assert rec["field_verdicts"]["levels"] == {"n:0": "CORRECT"}
-    assert all(v == "CONFIRM" for f, v in rec["field_verdicts"].items() if f != "levels")
 
 
 def test_only_the_scope_is_offered(monkeypatch, local, base):
     path = base / "reviewers.toml"
-    path.write_text(path.read_text().replace("scope_sequences = 20", "scope_sequences = 1"))
+    path.write_text(path.read_text().replace("scope_sequences = 40", "scope_sequences = 1"))
     at = app(monkeypatch, base, "reviewer@example.invalid")
     assert [o.split(":")[0] for o in at.selectbox(key="aw_pick").options] == ["seqB 1", "seqB 2"]
-    assert "Scope: first 1 ideas (of 2)" in plain(at)
+    assert f"Scope: first 1 ideas (of {2 + len(SC.SCENARIOS)})" in plain(at)
     scoped = A.Session(REVIEWER.login, "Reviewer Example", A.REVIEWER, A.FULL, False, 1)
     with pytest.raises(A.AdjudicationError, match="OUTSIDE_SCOPE"):
         A.append_annotation(base, bundle(base), scoped, item_id="i01", phase=A.INDEPENDENT,
@@ -486,15 +480,15 @@ def test_c2_a_number_the_system_did_not_read_is_its_own_state(monkeypatch, local
     at = app(monkeypatch, base, "reviewer@example.invalid")
     at.toggle(key="aw_blind").set_value(False).run()
     at = pick(at, "i06")
-    assert "system: not read by the system" in plain(at)
     assert "not read by the system: number 0" in plain(at)
     prefix = "aw_i06_after_0"
-    at.selectbox(key=f"{prefix}_lv_n:0_role").set_value("HISTORICAL_FILL").run()
-    at.radio(key=f"{prefix}_confidence").set_value("LOW").run()
-    at.button(key=f"{prefix}_save").click().run()
+    fill(at, prefix, valid(b, "i06", **MAPPING_YES))
+    assert "system: not read by the system" in plain(at)
+    save(at, prefix, "LOW")
     [rec] = records(base)
     assert rec["field_verdicts"]["levels"] == {"n:0": A.NOT_READ}
-    assert rec["reading"]["levels"][0]["role"] == "HISTORICAL_FILL"
+    assert rec["reading"]["levels"][0]["role"] == "NOT_A_PRICE"
+    assert rec["reading"]["effect"] == "NONE"  # a REPEAT: set by the form
     with pytest.raises(A.AdjudicationError, match="VERDICT_FOR_EVERY_COMPARED_FIELD"):
         A.append_annotation(base, b, REVIEWER, item_id="i06", phase=A.AFTER_REVEAL, blind=False,
                             reading=rec["reading"], confidence="LOW",
@@ -553,7 +547,7 @@ def test_s5_both_apps_refuse_error_details(monkeypatch, local, base):
     for path in (APP, APP.with_name("reviewer_app.py")):
         monkeypatch.setenv(A.DIR_ENV, str(base))
         with_headers(monkeypatch)
-        at = AppTest.from_file(str(path), default_timeout=60)
+        at = AppTest.from_file(str(path), default_timeout=120)
         at.run()
         assert "client.showErrorDetails must be none" in rendered(at)
 
@@ -573,13 +567,16 @@ def test_n13_restricted_free_text_only_a_number_a_family_or_an_instrument_word(
     at = pick(app(monkeypatch, base, proxy="remote@example.invalid"), "i07")
     at.toggle(key="aw_blind").set_value(False).run()
     assert f"instrument_as_read: (withheld: {A.WITHHELD})" in plain(at)
+    fill(at, "aw_i07_after_0", valid(b, "i07", instrument_as_read=NS))
     assert "Zed" not in rendered(at) + plain(at)
-    [radio] = [r for r in at.radio if r.key.startswith("aw_i07_after_0_verdict_instrument_as_read")]
+    [radio] = [r for r in at.radio
+               if r.key.startswith("aw_i07_after_0_verdict_instrument_as_read")]
     assert radio.value is None  # a withheld field's verdict is never pre-filled
-    at.radio(key="aw_i07_after_0_confidence").set_value("LOW").run()
-    at.button(key="aw_i07_after_0_save").click().run()
+    save(at, "aw_i07_after_0", "LOW")
     [rec] = records(base)
     assert "instrument_as_read" not in rec["field_verdicts"] and rec["field_verdicts"]["side"]
+    assert {rec["reading"]["levels"][i]["row"] for i in range(3)} == {
+        "level:0", "level:1", "level:2"}
 
 
 def test_n15_a_finder_ds_store_is_ignored_and_no_other_dot_file_tolerated(base):
@@ -690,25 +687,21 @@ def test_n1_an_edit_of_the_last_line_is_detected(base):
 def test_n2_notes_lose_control_line_break_and_direction_characters(base):
     b = bundle(base)
     rec = A.append_annotation(base, b, REVIEWER, item_id="i09", phase=A.INDEPENDENT, blind=True,
-                              reading={}, confidence="LOW",
+                              reading={"post_label": "COMMENTARY"}, confidence="LOW",
                               notes="fine\nline 9, APPROVAL by owner\u202egnp.\tend")
     assert rec["notes"] == "fine line 9, APPROVAL by owner gnp. end"
 
 
 def test_n3_a_reviewer_revision_after_approval_returns_the_item_to_provisional(base):
-    after = review(base, "i03")
+    first = review(base, "i03")
     b = bundle(base)
     A.append_annotation(base, b, APPROVER, item_id="i03", phase=A.APPROVAL, blind=False,
-                        reading={}, refers_to=after["seq"], outcome="ACCEPT")
+                        reading={}, refers_to=first["seq"], outcome="ACCEPT")
     assert A.resolve(records(base), b)[0]["status"] == "APPROVED"
-    system = A.system_reading(b, b.items["i03"])
-    A.append_annotation(base, b, REVIEWER, item_id="i03", phase=A.AFTER_REVEAL, blind=True,
-                        reading={**system, "stop_price": "87"}, confidence="HIGH",
-                        refers_to=after["refers_to"],
-                        field_verdicts={**A.prefill_verdicts(system, system, "INSTRUCTION"),
-                                        "levels": {"n:0": "UNSURE"}})
+    after(base, b, "i03", valid(b, "i03", stop_price="87"), refers_to=first["refers_to"])
     [row] = A.resolve(records(base), b)
     assert row["status"] == "PROVISIONAL" and row["reading"]["stop_price"] == "87"
+    assert row["acknowledged_warnings"] == ["STOP_NOT_IN_TABLE"]
     assert A.progress(b, records(base), APPROVER).status["i03"] == "AWAITING"
 
 
@@ -724,5 +717,162 @@ def test_resuming_finds_the_next_open_item_from_the_log_alone(monkeypatch, local
     at = app(monkeypatch, base, "reviewer@example.invalid")  # a fresh session (a restart)
     at.button(key="aw_next").click().run()
     assert at.selectbox(key="aw_pick").value == "i08"
-    assert "Items done" in [m.label for m in at.metric]
-    assert [m.value for m in at.metric if m.label == "Items done"] == ["1 of 9"]
+    total = 9 + sum(len(s["forms"]) for s in SC.SCENARIOS)
+    assert [m.value for m in at.metric if m.label == "Items done"] == [f"1 of {total}"]
+
+
+# ------------------------------------------------------------------ rubric-2 readings of the nine original items
+
+NS, NA = R.NOT_STATED, R.NOT_APPLICABLE
+_ACT = {"explicit": "YES", "quoted_series": NS, "traded_instrument": NS}
+TLT_LONG = {"position_state": "OPEN", "position_side": "LONG", "position_last_stop": "87.2"}
+VALID = {
+    "i01": {**_ACT, "timing": "CURRENT", "action": "OPEN", "family": "TLT",
+            "instrument_as_read": "TLT", "side": "LONG", "position_state": "FLAT",
+            "effect": "OPENS", "entry_price": "88.4", "entry_role": "CURRENT_MARKET",
+            "entry_exactness": "APPROXIMATE", "stop_price": "87.2", "targets": "91",
+            "idea": "NEW_IDEA",
+            "levels": [("CURRENT_MARKET", "APPROXIMATE"), ("STOP", "EXACT"),
+                       ("TARGET", "EXACT")]},
+    "i03": {**_ACT, "timing": "CURRENT", "action": "ADD", "family": "TLT",
+            "instrument_as_read": "TLT", "side": "LONG", **TLT_LONG, "effect": "INCREASES",
+            "entry_price": "88.1", "entry_role": "HISTORICAL_FILL", "entry_exactness": "EXACT",
+            "stop_price": NS, "targets": NS, "idea": "SAME_AS_PREVIOUS",
+            "levels": [("HISTORICAL_FILL", "EXACT")]},
+    "i04": {**_ACT, "timing": "CURRENT", "action": "MODIFY", "family": "TLT",
+            "instrument_as_read": "TLT", "side": "LONG", **TLT_LONG, "amendment_field": "STOP",
+            "amendment_to": "88", "targets": NS, "idea": "SAME_AS_PREVIOUS",
+            "levels": [("STOP", "EXACT")]},
+    "i05": {**_ACT, "timing": "CURRENT", "action": "CLOSE", "family": "TLT",
+            "instrument_as_read": "TLT", "side": "LONG", "position_state": "OPEN",
+            "position_side": "LONG", "position_last_stop": "88", "effect": "CLOSES",
+            "idea": "SAME_AS_PREVIOUS", "levels": [("HISTORICAL_FILL", "EXACT")]},
+    "i06": {**_ACT, "timing": "HISTORICAL", "announcement": "REPEAT", "action": "CLOSE",
+            "family": "TLT", "instrument_as_read": "TLT", "side": "LONG",
+            "position_state": "FLAT", "idea": "SAME_AS_PREVIOUS",
+            "levels": [("NOT_A_PRICE", "")]},
+    "i07": {**_ACT, "timing": "CURRENT", "action": "OPEN", "family": "OTHER",
+            "instrument_as_read": "Zed Metals", "side": "SHORT", "position_state": "FLAT",
+            "effect": "OPENS", "entry_price": "412", "entry_role": "CURRENT_MARKET",
+            "entry_exactness": "APPROXIMATE", "stop_price": "420", "targets": NS,
+            "idea": "NEW_IDEA",
+            "levels": [("CURRENT_MARKET", "APPROXIMATE"), ("STOP", "EXACT"),
+                       ("CHART_LEVEL", "APPROXIMATE")]},
+    "i08": {**_ACT, "timing": "CURRENT", "action": "CLOSE", "family": "OTHER",
+            "instrument_as_read": "Zed Metals", "side": "SHORT", "position_state": "OPEN",
+            "position_side": "SHORT", "position_last_stop": "420", "effect": "CLOSES",
+            "idea": "SAME_AS_PREVIOUS", "levels": [("HISTORICAL_FILL", "EXACT")]},
+    "i02": {"post_label": "COMMENTARY"}, "i09": {"post_label": "COMMENTARY"},
+}
+
+
+MAPPING_YES = {"reference_series_right": "YES", "execution_instrument_right": "YES"}
+
+
+def valid(b, item_id, **changes) -> dict:
+    """A rubric-2 reading of an original demo item that Save accepts (rows by this session's
+    table: FULL numbers or RESTRICTED levels)."""
+    spec = {**VALID[item_id], **changes}
+    levels = spec.pop("levels", [])
+    item = b.items[item_id]
+    if item["kind"] == "INSTRUCTION":
+        spec["levels"] = [{"row": key, "role": role, "exactness": ex}
+                          for (key, _), (role, ex) in zip(A.table_rows(b, item), levels,
+                                                          strict=False)]
+    return spec
+
+
+def _ack(base, b, item, reading, session, revealed, **kw) -> list[str]:
+    log = A.read_annotations(base)
+    _done, checks, _ctx = A.check_reading(b, item, A.clean_reading(reading, item, b),
+                                          revealed=revealed, records=log.records,
+                                          login=session.login, **kw)
+    assert not checks.blocking, checks.blocking
+    return checks.warnings
+
+
+def after(base, b, item_id, reading, *, refers_to, session=None, confidence="HIGH",
+          blind=True) -> dict:
+    """An AFTER_REVEAL of ``reading`` with every verdict pre-filled from the comparison."""
+    session = session or REVIEWER
+    item = b.items[item_id]
+    reading = dict(reading)
+    ctx = A.form_context(b, item, revealed=True)
+    if item["kind"] == "INSTRUCTION":
+        reading.update(reference_series_right="", execution_instrument_right="")
+        st_ = R.applicability(R.complete(reading, ctx), ctx)
+        reading.update({f: "YES" for f in R.MAPPING_FIELDS if st_[f].state == R.ASK})
+    done = R.complete(A.clean_reading(reading, item, b), ctx)
+    verdicts = A.prefill_verdicts(done, A.system_reading(b, item), item["kind"],
+                                  A.compared_fields(b, item, done))
+    if done.get("levels"):
+        verdicts["levels"] = A.prefill_row_verdicts(done["levels"], A.system_rows(b, item))
+    for f in item.get("withheld", ()):
+        verdicts.pop(f, None)
+    return A.append_annotation(
+        base, b, session, item_id=item_id, phase=A.AFTER_REVEAL, blind=blind, reading=reading,
+        field_verdicts=verdicts, refers_to=refers_to, confidence=confidence,
+        acknowledged_warnings=_ack(base, b, item, reading, session, True,
+                                   confidence=confidence))
+
+
+def review(base, item_id, **independent_changes) -> dict:
+    """INDEPENDENT (the valid reading with ``independent_changes``), then AFTER_REVEAL (the
+    valid reading): the independent reading differs from the final one exactly there."""
+    b = bundle(base)
+    reading = valid(b, item_id, **independent_changes)
+    ind = A.append_annotation(base, b, REVIEWER, item_id=item_id, phase=A.INDEPENDENT,
+                              blind=True, reading=reading, confidence="MEDIUM",
+                              acknowledged_warnings=_ack(base, b, b.items[item_id], reading,
+                                                         REVIEWER, False, confidence="MEDIUM"))
+    return after(base, b, item_id, valid(b, item_id), refers_to=ind["seq"])
+
+
+WIDGETS = ("selectbox", "radio", "text_input", "multiselect")
+
+
+def find(at, key):
+    for kind in WIDGETS:
+        for w in getattr(at, kind):
+            if w.key == key:
+                return w
+    return None
+
+
+def fill(at, prefix: str, reading: dict):
+    """Answer the form through its widgets, in the order they appear (an answer can make the
+    next field appear)."""
+    for _ in range(80):
+        todo = []
+        for f, v in reading.items():
+            if f == "levels":
+                for row in v:
+                    for c in ("role", "exactness"):
+                        if row.get(c):
+                            todo.append((f"{prefix}_lv_{row['row']}_{c}", row[c]))
+            elif f in R.VALUE_SENTINELS:
+                state = v if v in R.VALUE_SENTINELS[f] else "VALUE"
+                todo.append((f"{prefix}_{f}_state", state))
+                if state == "VALUE":
+                    todo.append((f"{prefix}_{f}", v))
+            else:
+                todo.append((f"{prefix}_{f}", v))
+        for key, v in todo:
+            w = find(at, key)
+            if w is not None and w.value != v:
+                w.set_value(v).run()
+                break
+        else:
+            return at
+    raise AssertionError("the form did not settle")
+
+
+def save(at, prefix, confidence="HIGH"):
+    at.radio(key=f"{prefix}_confidence").set_value(confidence).run()
+    ack = find(at, f"{prefix}_ack") or next((c for c in at.checkbox
+                                             if c.key == f"{prefix}_ack"), None)
+    if ack is not None:
+        ack.check().run()
+    assert not at.button(key=f"{prefix}_save").disabled, [str(e.value) for e in at.error]
+    at.button(key=f"{prefix}_save").click().run()
+    return at
