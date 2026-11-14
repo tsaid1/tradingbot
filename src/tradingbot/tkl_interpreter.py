@@ -33,6 +33,7 @@ from pydantic import Field
 from tradingbot.event_models import ParsedPost, PriceBasis, ReplayResult, Timing, TradeAction
 from tradingbot.event_replay import PaperEventReplay
 from tradingbot.models import Action, AssetClass, Instrument, PositionSide, Quote, StrictModel
+from tradingbot.price_roles import ClauseUnit, PriceReading, safe_read_price_roles
 from tradingbot.source_events import SourcePost
 from tradingbot.validator import gate_source
 
@@ -101,6 +102,9 @@ class InterpretedPost(StrictModel):
     parsed: ParsedPost
     classifications: list[Classification] = Field(default_factory=list)
     backend: Literal["deterministic", "ai"] = "deterministic"
+    # Additive and advisory (price_roles.py): what kind of number each price-like number of the post
+    # is, decided from its context. Nothing in the trading path (mapping, gateway, coordinator) reads it.
+    price_readings: list[PriceReading] = Field(default_factory=list)
 
 
 class StructuredBackend(Protocol):
@@ -353,7 +357,81 @@ class TklInterpreter:
         actions = [self._to_trade_action(c) for c in classifications]
         return InterpretedPost(source_id=post.source_id, post_id=post.post_id, revision=post.revision,
                                published_at=post.published_at, parsed=ParsedPost(actions=actions),
-                               classifications=classifications)
+                               classifications=classifications,
+                               price_readings=self._price_readings(post, classifications, actions))
+
+    def _price_readings(self, post: SourcePost, classifications: list[Classification],
+                        actions: list[TradeAction]) -> list[PriceReading]:
+        """The additive structured price readings. Reads the classifications, never changes them, and
+        can never raise (price_roles.safe_read_price_roles)."""
+        try:
+            units = self._price_units(_normalise(post.text), classifications, actions)
+            raw = post.text or ""
+            return safe_read_price_roles(raw, units, lambda p: len(_normalise(raw[:p])))
+        except Exception:  # noqa: BLE001 - advisory output must never disturb the interpretation
+            return safe_read_price_roles(post.text)
+
+    def _price_units(self, text: str, classifications: list[Classification],
+                     actions: list[TradeAction]) -> list[ClauseUnit]:
+        """The clauses of ``_classify`` with their offsets and the classification each one produced
+        (or, for a level line, its host), rebuilt in the same order without classifying again."""
+        if not text.strip():
+            return []
+        spans = self._clause_spans(text)
+        if [c.text for c, _ in spans] != [c.text for c in self._clauses(text)]:
+            return []
+        acts = {a.action_id: a for a in actions}
+
+        def unit(c, start, end, kind):
+            a = acts.get(c.action_id)
+            return ClauseUnit(start=start, end=end, action_id=c.action_id, kind=kind,
+                              trading=a is not None and a.action != Action.NO_TRADE,
+                              month_applicable=c.asset is None or c.asset in _SERIES_CODES,
+                              past_execution=c.message_class in (MessageClass.RETROSPECTIVE, MessageClass.EXIT_ANNOUNCEMENT)
+                              and c.underlying in (Action.OPEN, Action.ADD, Action.CLOSE, Action.REDUCE))
+        summary_mode = self._is_summary(text)
+        units: list[ClauseUnit] = []
+        seen: list[Classification] = []
+        ci = 0
+        for clause, start in spans:
+            end = start + len(clause.text)
+            if summary_mode and _is_summary_clause(clause.text):
+                units.append(ClauseUnit(start=start, end=end, action_id=None, trading=False, kind="OTHER"))
+                continue
+            host = next((c for c in reversed(seen) if c.message_class in _LEVEL_HOSTS), None) \
+                if LEVEL_LINE_RE.match(clause.text) else None
+            if host is not None:
+                units.append(unit(host, start, end, "LEVEL_LINE"))
+                continue
+            c = classifications[ci] if ci < len(classifications) else None
+            if c is not None and c.clause == clause.text[:200] and c.sentence == clause.sentence:
+                ci += 1
+                seen.append(c)
+                units.append(unit(c, start, end, "CLAUSE"))
+            else:   # a descriptive line of a summary post
+                units.append(ClauseUnit(start=start, end=end, action_id=None, trading=False, kind="OTHER"))
+        return units
+
+    def _clause_spans(self, text: str) -> list[tuple[_Clause, int]]:
+        """``_clauses`` with each clause's offset in ``text``."""
+        out: list[tuple[_Clause, int]] = []
+        parts, pos = [], 0
+        for m in SENTENCE_SPLIT.finditer(text):
+            parts.append((text[pos:m.start()], pos))
+            pos = m.end()
+        parts.append((text[pos:], pos))
+        for s_index, (sentence, s_pos) in enumerate((p, q) for p, q in parts if p and p.strip()):
+            stripped = sentence.strip()
+            base = s_pos + (len(sentence) - len(sentence.lstrip()))
+            cursor = 0
+            for part in _split_conjunctions(stripped, self._verbs):
+                if part.strip():
+                    piece = part.strip()
+                    at = stripped.find(piece, cursor)
+                    at = cursor if at < 0 else at
+                    cursor = at + len(piece)
+                    out.append((_Clause(piece, s_index), base + at))
+        return out
 
     def is_source_eligible(self, post: SourcePost) -> bool:
         """The canonical provenance rule, reused from the gateway: a post that `gate_source` would
@@ -431,7 +509,7 @@ class TklInterpreter:
         ]
         return InterpretedPost(source_id=post.source_id, post_id=post.post_id, revision=post.revision,
                                published_at=post.published_at, parsed=parsed, classifications=classifications,
-                               backend="ai")
+                               backend="ai", price_readings=safe_read_price_roles(post.text))
 
     # ------------------------------------------------------------------ deterministic grammar
 
