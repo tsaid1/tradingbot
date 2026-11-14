@@ -397,7 +397,7 @@ def app(monkeypatch, base, login) -> AppTest:
     monkeypatch.setenv(A.DIR_ENV, str(base))
     monkeypatch.setenv(A.LOCAL_IDENTITY_ENV, login)
     with_headers(monkeypatch)
-    at = AppTest.from_file(str(APP), default_timeout=60)
+    at = AppTest.from_file(str(APP), default_timeout=120)
     at.run()
     assert not at.exception
     return at

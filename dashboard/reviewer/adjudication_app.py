@@ -579,9 +579,18 @@ def _describe(rec: dict) -> str:
     return "\n".join(lines)
 
 
-def _amendments(source: dict, values: dict, ctx, item: dict, bundle: A.Bundle) -> dict:
+def _answered(prefix: str, f: str) -> bool:
+    """The approver's own widget holds an answer of ``f`` (not a default from the source)."""
+    ss = st.session_state
+    return _key(prefix, f) in ss or f"{prefix}_{f}_state" in ss
+
+
+def _amendments(source: dict, values: dict, ctx, item: dict, bundle: A.Bundle,
+                prefix: str) -> dict:
     """The approver's amended fields: the ASKED fields (in the merged reading) whose value
-    differs from the reviewed reading, and the changed price-table rows."""
+    differs from the reviewed reading, the fields the amendment resets that the approver has
+    answered in their own widget (even with the value they had before), and the changed
+    price-table rows."""
     old_rows = {r["row"]: r for r in source.get(A.LEVELS, [])}
     amended = {f: v for f, v in values.items()
                if f != A.LEVELS and v != source.get(f, "")
@@ -592,6 +601,17 @@ def _amendments(source: dict, values: dict, ctx, item: dict, bundle: A.Bundle) -
                        R.NOT_APPLICABLE, "")) for c in R.ROW_KEYS)]
     if changed:
         amended[A.LEVELS] = changed
+    for _ in range(4):  # a field the amendment resets counts as amended once the approver
+        # answers it, even with the value it had before the reset (14.3, 15.2)
+        cleaned = A.clean_reading(amended, item, bundle, partial=True)
+        merged = A.merge_amendment(source, cleaned, ctx)
+        asked = R.applicability(merged, ctx)
+        again = {f: values[f] for f in A.reset_by_amendment(source, merged, cleaned, ctx)
+                 if f not in amended and values.get(f) not in (None, "", [])
+                 and asked.get(f, R.Status(R.NA)).state == R.ASK and _answered(prefix, f)}
+        if not again:
+            break
+        amended.update(again)
     merged = A.merge_amendment(source, A.clean_reading(amended, item, bundle, partial=True), ctx)
     st_ = R.applicability(merged, ctx)
     return {f: v for f, v in amended.items()
@@ -643,20 +663,29 @@ def _approver(base, bundle, session, item, records, writable) -> None:
                            "derived again; a field that changes kind must be answered again):")
                 rows = [r["row"] for r in rec["reading"].get(A.LEVELS, [])]
                 ctx = A.form_context(bundle, item, revealed=True, rows=rows)
+                # 15.2: amending action, timing or announcement resets the effect; its widget
+                # (asked before and after) would otherwise keep the reviewer's value.
+                trigger = repr([_peek(prefix, f, rec["reading"])
+                                for f in ("action", "timing", "announcement")])
+                if st.session_state.get(f"{prefix}__trigger", trigger) != trigger:
+                    st.session_state.pop(_key(prefix, "effect"), None)
+                st.session_state[f"{prefix}__trigger"] = trigger
                 details = A.table_row_details(bundle, item)
                 try:  # 14.3: a field the amendment resets is never preselected
                     defaults = _amend_defaults(rec["reading"], _amendments(
                         rec["reading"], _collect(prefix, item, rec["reading"], details), ctx,
-                        item, bundle), ctx, item, bundle)
+                        item, bundle, prefix), ctx, item, bundle)
                 except A.AdjudicationError:
                     defaults = rec["reading"]
                 values, _ = _inputs(prefix, bundle, item, defaults, ctx)
                 try:
-                    amended = _amendments(rec["reading"], values, ctx, item, bundle)
-                    merged = A.merge_amendment(rec["reading"], A.clean_reading(
-                        amended, item, bundle, partial=True), ctx)
+                    amended = _amendments(rec["reading"], values, ctx, item, bundle, prefix)
+                    cleaned = A.clean_reading(amended, item, bundle, partial=True)
+                    merged = A.merge_amendment(rec["reading"], cleaned, ctx)
                     checks = R.validate(merged, ctx, flags=rec["flags"],
-                                        confidence=rec["confidence"], notes=rec["notes"] or "-")
+                                        confidence=rec["confidence"], notes=rec["notes"] or "-",
+                                        required=A.amendment_required(rec["reading"], merged,
+                                                                      cleaned, ctx))
                     ok, ack = _issues(prefix, checks)
                     _positions(merged, ctx)
                 except A.AdjudicationError as exc:

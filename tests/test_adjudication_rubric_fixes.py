@@ -295,13 +295,12 @@ def test_s1_an_amendment_resets_a_derived_value_that_becomes_asked(base):
                          rows=[r["row"] for r in after["reading"]["levels"]])
     merged = A.merge_amendment(after["reading"], {"timing": "HISTORICAL"}, ctx)
     assert merged["announcement"] == "" and merged["follower_implication"] == ""
+    # 15.2: amending the timing also resets the effect, which the approver answers again.
+    change = {"timing": "HISTORICAL", "announcement": "FIRST_REPORT", "effect": "OPENS"}
     A.append_annotation(base, b, APPROVER, item_id="s01a", phase=A.APPROVAL, blind=False,
-                        reading={"timing": "HISTORICAL", "announcement": "FIRST_REPORT"},
-                        refers_to=after["seq"], outcome="AMEND",
+                        reading=change, refers_to=after["seq"], outcome="AMEND",
                         acknowledged_warnings=R.validate(A.merge_amendment(
-                            after["reading"], {"timing": "HISTORICAL",
-                                               "announcement": "FIRST_REPORT"}, ctx), ctx,
-                            confidence="HIGH").warnings)
+                            after["reading"], change, ctx), ctx, confidence="HIGH").warnings)
     [frozen] = [r for r in A.resolve(records(base), b) if r["item_id"] == "s01a"]
     assert (frozen["announcement"], frozen["follower_implication"]) == (
         "FIRST_REPORT", "RECONCILE_POSITION")
@@ -396,7 +395,8 @@ def test_property_instruction_candidate_implies_current_on_every_path(base):
         ctx = A.form_context(b, item, revealed=True,
                              rows=[x["row"] for x in rec["reading"].get("levels", [])])
         merged = A.merge_amendment(rec["reading"], change, ctx)
-        checks = R.validate(merged, ctx, flags=rec["flags"], confidence="LOW", notes="x")
+        checks = R.validate(merged, ctx, flags=rec["flags"], confidence="LOW", notes="x",
+                            required=A.amendment_required(rec["reading"], merged, change, ctx))
         if checks.blocking:
             continue
         _invariant(merged, "approver merge")
@@ -447,12 +447,13 @@ def test_s3_effect_position(state, effect, action, blocked):
     assert ("EFFECT_POSITION" in validate(r).codes) is blocked
 
 
-def test_s3_a_modify_on_flat_is_refused_and_recorded_with_an_unknown_position():
+def test_s3_a_modify_with_an_unknown_position_amends_protection():
+    # (15.1 replaced the refusal of a MODIFY from FLAT: see test_c1_* below.)
     r = reading(timing="CURRENT", action="MODIFY", side="LONG", position_state="FLAT",
                 amendment_field="STOP", amendment_to="70", targets=NS)
-    assert "EFFECT_POSITION" in validate(r).codes
     unknown = {**r, "position_state": CD, "position_side": "LONG", "position_last_stop": CD}
     assert "EFFECT_POSITION" not in validate(unknown, flags=["MISSING_CONTEXT"]).codes
+    assert R.complete(unknown, R.FormContext())["effect"] == "AMENDS_PROTECTION"
 
 
 def test_s3_position_after_never_carries_not_applicable_as_an_open_stop():
@@ -519,7 +520,9 @@ def test_s7_current_or_historical_is_decided_by_the_posts_time_words():
 
 def test_s8_the_guide_is_one_page_and_defines_its_terms():
     guide = R.REVIEWER_GUIDE
-    assert len(guide.split()) <= R.REVIEWER_GUIDE_MAX_WORDS == 700
+    assert len(guide.split()) <= R.REVIEWER_GUIDE_MAX_WORDS == 580  # 15.5 (was 700)
+    assert sum(line.startswith("#") for line in guide.splitlines()) <= \
+        R.REVIEWER_GUIDE_MAX_HEADINGS == 6
     flat = " ".join(guide.split())
     for words in ("Field reference", "not an order", "ONE action", "label-only form labels",
                   "further actions", "BEFORE THIS ACTION", "post's own time words",
@@ -681,3 +684,285 @@ def test_the_page_holds_blind_first_per_post_and_marks_before_serving(
     assert calls, "the system's reading is served once every form is saved"
     assert all({"s22a", "s22b"} <= seen for _name, seen in calls), calls
     assert {"system_reading", "system_rows"} <= {name for name, _ in calls}
+
+
+# ------------------------------------------------------------------ 15 (the confirmation pass)
+# Rubric version 2.3: findings C1 to C11 of the confirmation pass, one test per item of 15.1 to
+# 15.5, on invented readings and the invented demo bundle only.
+
+FLAT_BEFORE = {"position_state": "FLAT", "position_side": "", "position_last_stop": ""}
+
+
+# 15.1 (C1): the three truthful readings of the review are saved.
+C1_READINGS = {
+    # "Moving our buy limit from 70 to 69.50." (nothing filled yet)
+    "modify-a-working-order-from-flat": reading(
+        timing="CURRENT", action="MODIFY", side="LONG", **FLAT_BEFORE, amendment_field="OTHER",
+        amendment_from="buy limit 70", amendment_to="buy limit 69.50", stop_price=NS,
+        targets=NS),
+    # "Once filled, the stop goes to 68."
+    "conditional-modify-of-the-stop-from-flat": reading(
+        [row("STOP")], timing="CONDITIONAL", action="MODIFY", side="LONG", **FLAT_BEFORE,
+        amendment_field="STOP", amendment_to="68", targets=NS),
+    # "If crude breaks 72 we go long, and we add at 70 on a pullback." (form 2: the ADD)
+    "conditional-add-after-a-conditional-open": reading(
+        [row("CHART_LEVEL"), row("INTENDED_ENTRY")], component="ACTION_RECORDED_HERE",
+        timing="CONDITIONAL", action="ADD", side="LONG", **FLAT_BEFORE, effect="INCREASES",
+        entry_price="70", entry_role="INTENDED_ENTRY", entry_exactness="EXACT", stop_price=NS,
+        targets=NS),
+}
+FLAT_AFTER = {"state": "FLAT", "side": NA, "stop": NA}
+
+
+@pytest.mark.parametrize("name", list(C1_READINGS))
+def test_c1_the_three_truthful_readings_are_saved(name):
+    r = C1_READINGS[name]
+    two = name.startswith("conditional-add")
+    ctx = R.FormContext(form_index=2 if two else 1, forms_in_post=2 if two else 1,
+                        rows=tuple(x["row"] for x in r["levels"]),
+                        earlier_positions=(("CRUDE", FLAT_AFTER),) if two else ())
+    checks = R.validate(r, ctx, confidence="HIGH")
+    assert checks.blocking == [], checks.blocking
+    done = R.complete(r, ctx)
+    if r["action"] == "MODIFY":  # a change to an order that is not yet a position
+        assert done["effect"] == "NONE" and "ACTS_ON_FLAT" in checks.warnings
+        assert R.position_after(done) == FLAT_AFTER
+    else:
+        assert "POSITION_CHAIN" not in checks.warnings  # the chain holds: FLAT after form 1
+    # Escalated with the position answered FLAT: saved too (it was refused at 3ff9632).
+    esc = R.validate(r, ctx, flags=[R.FORM_CANNOT_EXPRESS], confidence="HIGH", notes="x")
+    assert "EFFECT_POSITION" not in esc.codes
+
+
+def test_c1_effect_position_still_holds_outside_conditional():
+    add = {**C1_READINGS["conditional-add-after-a-conditional-open"], "timing": "CURRENT",
+           "component": ""}
+    assert ("EFFECT_POSITION", "effect") in validate(add).blocking
+    stopped_flat = {**STOPPED_OUT, **FLAT_BEFORE}  # a first-report stop-out answered FLAT
+    assert "EFFECT_POSITION" in validate(stopped_flat).codes
+    assert "CANNOT_DETERMINE with the flag MISSING_CONTEXT, not FLAT" in \
+        R.BLOCKING_CODES["EFFECT_POSITION"]
+    assert R.BLOCKING_CODES["EFFECT_POSITION"].endswith(
+        "If the earlier posts shown do not show the position, answer CANNOT_DETERMINE with the "
+        "flag MISSING_CONTEXT, not FLAT.")
+    # A MODIFY with OPEN or CANNOT_DETERMINE before keeps AMENDS_PROTECTION.
+    modify = C1_READINGS["modify-a-working-order-from-flat"]
+    for state in ("OPEN", CD):
+        st = R.applicability({**modify, "position_state": state}, R.FormContext())
+        assert st["effect"] == R.Status(R.DERIVED, "AMENDS_PROTECTION")
+
+
+def test_c1_effect_none_is_still_never_a_reviewers_or_an_approvers_choice(base):
+    assert "NONE" not in R.offered("effect")
+    modify_open = {**C1_READINGS["modify-a-working-order-from-flat"], **OPEN_LONG,
+                   "position_last_stop": NS, "effect": "NONE"}
+    assert ("ACTION_EFFECT", "effect") in validate(modify_open).blocking
+    sc = next(s for s in SC.SCENARIOS if s["n"] == 6)  # a stop MODIFY on an open short
+    b = bundle(base)
+    [after] = save_after(base, b, sc, save_independent(base, b, sc, variants=False))
+    with pytest.raises(A.AdjudicationError) as exc:
+        A.append_annotation(base, b, APPROVER, item_id="s06a", phase=A.APPROVAL, blind=False,
+                            reading={"effect": "NONE"}, refers_to=after["seq"], outcome="AMEND")
+    assert "ACTION_EFFECT" in exc.value.codes
+
+
+def test_c4_the_texts_say_what_flat_means_and_how_to_get_out():
+    f = R.BY_NAME["position_state"]
+    meanings = dict(f.values)
+    assert "FLAT only when the posts establish that none existed" in f.question
+    assert "never FLAT" in f.tooltip and "never FLAT" in meanings[CD]
+    assert "MISSING_CONTEXT" in meanings[CD]
+    assert "establish that NO position exists" in meanings["FLAT"]
+    assert "it was closed, or this action begins the idea" in meanings["FLAT"]
+    assert "FIRST_REPORT of an exit the position before is still OPEN" in f.tooltip
+    effect = R.BY_NAME["effect"]
+    examples = " ".join(effect.examples)
+    assert "ADD with OPENS, or" not in examples and "no position on record" not in examples
+    assert "position CANNOT_DETERMINE with MISSING_CONTEXT, effect INCREASES" in examples
+    assert "only when the posts shown establish that the position had been closed" in examples
+    assert "MODIFY from FLAT" in dict(effect.values)["NONE"] and "MODIFY from FLAT" in \
+        effect.tooltip
+    guide = " ".join(R.REVIEWER_GUIDE.split())
+    assert "so is a position they do not establish, never FLAT" in guide
+
+
+# 15.2 (C2, C9): an amendment's reset holds under escalation; amending the action resets the
+# effect.
+
+
+def test_c2_a_reset_field_must_be_answered_on_an_escalated_record(base):
+    sc = next(s for s in SC.SCENARIOS if s["n"] == 23)  # escalated: an options spread
+    b = bundle(base)
+    [after] = save_after(base, b, sc, save_independent(base, b, sc, variants=False))
+    assert R.FORM_CANNOT_EXPRESS in after["flags"]
+    with pytest.raises(A.AdjudicationError) as exc:  # the review's C2 input
+        A.append_annotation(base, b, APPROVER, item_id="s23a", phase=A.APPROVAL, blind=False,
+                            reading={"timing": "HISTORICAL"}, refers_to=after["seq"],
+                            outcome="AMEND")
+    assert "REQUIRED_UNANSWERED" in exc.value.codes and "announcement" in exc.value.fields
+    with pytest.raises(A.AdjudicationError) as exc:  # the effect is reset too (15.2)
+        A.append_annotation(base, b, APPROVER, item_id="s23a", phase=A.APPROVAL, blind=False,
+                            reading={"timing": "HISTORICAL", "announcement": "FIRST_REPORT"},
+                            refers_to=after["seq"], outcome="AMEND")
+    assert exc.value.fields == ["effect"]
+    with pytest.raises(A.AdjudicationError) as exc:  # a field the approver blanks
+        A.append_annotation(base, b, APPROVER, item_id="s23a", phase=A.APPROVAL, blind=False,
+                            reading={"family": ""}, refers_to=after["seq"], outcome="AMEND")
+    assert "REQUIRED_UNANSWERED" in exc.value.codes and "family" in exc.value.fields
+    # A field the amendment did not reset stays lifted by the escalation (side, position...).
+    A.append_annotation(base, b, APPROVER, item_id="s23a", phase=A.APPROVAL, blind=False,
+                        reading={"timing": "HISTORICAL", "announcement": "FIRST_REPORT",
+                                 "effect": "OPENS"},
+                        refers_to=after["seq"], outcome="AMEND")
+    [frozen] = [r for r in A.resolve(records(base), b) if r["item_id"] == "s23a"]
+    assert frozen["escalated"] and frozen["status"] == "AMENDED"
+    assert (frozen["reading"]["announcement"], frozen["reading"]["effect"]) == (
+        "FIRST_REPORT", "OPENS")
+    assert frozen["follower_implication"] == "RECONCILE_POSITION"
+    assert frozen["validation_codes"] == []
+
+
+def test_c9_amending_the_action_resets_the_effect(base):
+    sc = next(s for s in SC.SCENARIOS if s["n"] == 1)  # OPEN with OPENS
+    b = bundle(base)
+    [after] = save_after(base, b, sc, save_independent(base, b, sc, variants=False))
+    item = b.items["s01a"]
+    ctx = A.form_context(b, item, revealed=True,
+                         rows=[r["row"] for r in after["reading"]["levels"]])
+    assert A.merge_amendment(after["reading"], {"action": "ADD"}, ctx)["effect"] == ""
+    assert "effect" in A.reset_by_amendment(
+        after["reading"], A.merge_amendment(after["reading"], {"action": "ADD"}, ctx),
+        {"action": "ADD"}, ctx)
+    with pytest.raises(A.AdjudicationError) as exc:
+        A.append_annotation(base, b, APPROVER, item_id="s01a", phase=A.APPROVAL, blind=False,
+                            reading={"action": "ADD"}, refers_to=after["seq"], outcome="AMEND")
+    assert ("REQUIRED_UNANSWERED" in exc.value.codes) and exc.value.fields == ["effect"]
+    # Not reset when the approver amends it, nor by an amendment of another field.
+    change = {"action": "ADD", "effect": "OPENS"}
+    merged = A.merge_amendment(after["reading"], change, ctx)
+    A.append_annotation(base, b, APPROVER, item_id="s01a", phase=A.APPROVAL, blind=False,
+                        reading=change, refers_to=after["seq"], outcome="AMEND",
+                        acknowledged_warnings=R.validate(merged, ctx, confidence="H").warnings)
+    stop = A.merge_amendment(after["reading"], {"stop_price": "69"}, ctx)
+    assert stop["effect"] == "OPENS"
+
+
+def test_c9_the_approver_page_resets_the_effect_and_accepts_it_answered_again(
+        monkeypatch, local, base):
+    sc = next(s for s in SC.SCENARIOS if s["n"] == 1)
+    b = bundle(base)
+    [after] = save_after(base, b, sc, save_independent(base, b, sc, variants=False))
+    at = pick(app(monkeypatch, base, APPROVER.login), "s01a")
+    prefix = f"aw_s01a_appr_{after['seq']}"
+    at.radio(key=f"{prefix}_decision").set_value("AMEND").run()
+    assert at.selectbox(key=f"{prefix}_effect").value == "OPENS"  # the reviewer's reading
+    at.selectbox(key=f"{prefix}_action").set_value("ADD").run()
+    assert at.selectbox(key=f"{prefix}_effect").value == ""  # reset, never preselected
+    assert at.button(key=f"{prefix}_save").disabled
+    assert any("REQUIRED_UNANSWERED (effect)" in str(e.value) for e in at.error)
+    # Answered again, even with the value it had before the reset: saved.
+    at.selectbox(key=f"{prefix}_effect").set_value("OPENS").run()
+    assert not any("REQUIRED_UNANSWERED" in str(e.value) for e in at.error)
+    at.checkbox(key=f"{prefix}_ack").check().run()
+    assert not at.button(key=f"{prefix}_save").disabled
+    at.button(key=f"{prefix}_save").click().run()
+    assert not at.exception
+    [approval] = [r for r in records(base) if r["phase"] == A.APPROVAL]
+    assert approval["reading"] == {"action": "ADD", "effect": "OPENS"}
+
+
+# 15.3 (C3): REPEAT_POSITION for every repeat whose position before does not reflect it.
+
+
+@pytest.mark.parametrize("action,state,pside,side,warned", [
+    ("OPEN", "FLAT", "", "LONG", True), ("ADD", "FLAT", "", "LONG", True),
+    ("REDUCE", "FLAT", "", "LONG", True), ("MODIFY", "FLAT", "", "LONG", True),
+    ("CLOSE", "OPEN", "LONG", "LONG", True),
+    ("OPEN", "OPEN", "LONG", "SHORT", True), ("ADD", "OPEN", "SHORT", "LONG", True),
+    ("CLOSE", "FLAT", "", "LONG", False), ("OPEN", "OPEN", "LONG", "LONG", False),
+    ("ADD", "OPEN", "LONG", "LONG", False), ("REDUCE", "OPEN", "LONG", "LONG", False),
+    ("MODIFY", "OPEN", "LONG", "LONG", False),
+])
+def test_c3_repeat_position_covers_every_repeat(action, state, pside, side, warned):
+    r = reading(timing="HISTORICAL", announcement="REPEAT", action=action, side=side,
+                position_state=state, position_side=pside,
+                position_last_stop=NS if state == "OPEN" else "")
+    if action in ("OPEN", "ADD"):
+        r["entry_price"] = NS
+    if action != "CLOSE":
+        r.update(targets=NS, stop_price="" if action == "MODIFY" else NS)
+    if action == "MODIFY":
+        r.update(amendment_field="STOP", amendment_to="70")
+    checks = validate(r)
+    # An ADD on the other side is also refused by SIDE_POSITION (unchanged); the others save.
+    assert ("SIDE_POSITION" in checks.codes) is (action == "ADD" and pside not in ("", side))
+    assert checks.codes in ([], ["SIDE_POSITION"]), checks
+    assert ("REPEAT_POSITION" in checks.warnings) is warned, checks
+    if action == "MODIFY" and state == "FLAT":
+        assert "ACTS_ON_FLAT" not in checks.warnings  # a repeat: REPEAT_POSITION says it
+
+
+# 15.4 (C5, C10): the freeze reports what validation finds; verify checks the counts.
+
+
+def test_c5_the_freeze_writes_validation_codes_and_verify_checks_the_counts(base):
+    from tradingbot.runtime.vocab_recommend import append_chained
+    b = bundle(base)
+    clean = next(s for s in SC.SCENARIOS if s["n"] == 1)
+    save_after(base, b, clean, save_independent(base, b, clean, variants=False))
+    sc = next(s for s in SC.SCENARIOS if s["n"] == 10)  # a first-report stop-out
+    [ind] = save_independent(base, b, sc, variants=False)
+    [after] = save_after(base, b, sc, [ind])
+    # A record an earlier version could have saved: FIRST_REPORT with effect NONE (C5).
+    bad = {k: after[k] for k in ("bundle_id", "item_id", "annotator", "phase", "blind",
+                                 "field_verdicts", "flags", "confidence", "notes", "refers_to",
+                                 "decision", "rubric", "acknowledged_warnings")}
+    bad.update(at="2026-11-15T00:00:00+00:00", reading={**after["reading"], "effect": "NONE"})
+    append_chained(A.annotations_path(base), "annotation log", A.ANNOTATION_SCHEMA,
+                   lambda v: dict(bad))
+    path, manifest = A.freeze(base)
+    rows = {r["item_id"]: r for r in map(json.loads, path.read_text().splitlines())}
+    assert rows["s01a"]["validation_codes"] == []
+    assert rows["s10a"]["validation_codes"] == ["ACTION_EFFECT"]
+    assert rows["s10a"]["reading"]["effect"] == "NONE"  # reported, never repaired
+    assert manifest["with_validation_codes"] == 1
+    assert A.verify_versions(base) == [("ground_truth_v1.manifest.json", True)]
+    mpath = path.with_name("ground_truth_v1.manifest.json")
+    original = mpath.read_text()
+    for key, value in (("with_validation_codes", 0), ("escalated", 1), ("items", 3),
+                       ("by_status", {"APPROVED": 2, "AMENDED": 0, "PROVISIONAL": 0}),
+                       ("by_rubric", {"1": 1, "2": 1})):
+        changed = json.loads(original)
+        changed[key] = value
+        mpath.write_text(json.dumps(changed))
+        assert A.verify_versions(base) == [("ground_truth_v1.manifest.json", False)], key
+    mpath.write_text(original)
+    assert A.verify_versions(base) == [("ground_truth_v1.manifest.json", True)]
+
+
+# 15.5 (C4, C7, C8): the guide, and the statements where each field is answered.
+
+
+def test_c7_the_guide_fits_one_page_and_defines_first_report_and_repeat():
+    guide = R.REVIEWER_GUIDE
+    assert len(guide.split()) <= 580
+    assert sum(line.startswith("#") for line in guide.splitlines()) <= 6
+    flat = " ".join(guide.split())
+    assert "FIRST_REPORT (this post first tells subscribers)" in flat
+    assert "REPEAT (an earlier post shown announced it" in flat
+    assert "compared field (shown beside the system's value)" in flat
+
+
+def test_c8_the_statements_are_made_where_each_field_is_answered():
+    timing = R.BY_NAME["timing"].tooltip
+    assert "A plain past with no time word is CURRENT: \"Bought gold at 2,395.\" is CURRENT." \
+        in timing
+    role, entry = R.BY_NAME["role"].tooltip, R.BY_NAME["entry_price"].tooltip
+    assert ("\"Stopped out at 2.84\" gives the price obtained (HISTORICAL_FILL); \"our 69.50 "
+            "stop was hit\" names the stop level (STOP).") in role
+    assert "answer different questions" in role and "answer different questions" in entry
+    assert "what kind of number a row is" in role and "which number is the entry reference" in \
+        entry
+    step6 = R.HOW_TO_REVIEW[5]
+    assert step6.startswith("6. Once the last form of the post is saved")
+    assert "several forms" in step6

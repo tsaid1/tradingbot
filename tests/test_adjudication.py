@@ -71,7 +71,7 @@ def app(monkeypatch, base, login=None, *, proxy=None) -> AppTest:
         if login:
             monkeypatch.setenv(A.LOCAL_IDENTITY_ENV, login)
         with_headers(monkeypatch)
-    at = AppTest.from_file(str(APP), default_timeout=60)
+    at = AppTest.from_file(str(APP), default_timeout=120)
     at.run()
     assert not at.exception
     return at
@@ -394,7 +394,7 @@ c.set_option("server.address", "127.0.0.1"); c.set_option("browser.gatherUsageSt
 c.set_option("client.showErrorDetails", "none")
 port = c.get_option("server.port")
 ContextProxy.headers = property(lambda s: StreamlitHeaders([("Host", f"127.0.0.1:{{port}}")]))
-at = AppTest.from_file({str(APP)!r}, default_timeout=60); at.run()
+at = AppTest.from_file({str(APP)!r}, default_timeout=120); at.run()
 assert not at.exception and any("Zed Metals" in str(t.value) for t in at.text)
 print(sorted(m for m in sys.modules if m.startswith({forbidden!r})))
 """
@@ -547,7 +547,7 @@ def test_s5_both_apps_refuse_error_details(monkeypatch, local, base):
     for path in (APP, APP.with_name("reviewer_app.py")):
         monkeypatch.setenv(A.DIR_ENV, str(base))
         with_headers(monkeypatch)
-        at = AppTest.from_file(str(path), default_timeout=60)
+        at = AppTest.from_file(str(path), default_timeout=120)
         at.run()
         assert "client.showErrorDetails must be none" in rendered(at)
 

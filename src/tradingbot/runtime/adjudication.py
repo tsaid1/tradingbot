@@ -797,11 +797,27 @@ def reset_by_amendment(reading: dict, merged: dict, amended: dict,
                        ctx: R.FormContext) -> set[str]:
     """14.3: the fields the approver did not amend whose state (asked, derived, not applicable,
     pending) differs between the source reading and ``merged``, or that were derived in the
-    source and are asked in ``merged``: they are reset to unanswered."""
+    source and are asked in ``merged``: they are reset to unanswered. 15.2: amending ``action``,
+    ``timing`` or ``announcement`` also resets ``effect`` when it is asked in ``merged`` and was
+    not amended."""
     src = R.applicability(R.complete(reading, ctx), ctx)
     now = R.applicability(merged, ctx)
-    return {f for f, s in now.items() if f != LEVELS and f not in amended and (
+    out = {f for f, s in now.items() if f != LEVELS and f not in amended and (
         f not in src or src[f].state != s.state)}
+    if {"action", "timing", "announcement"} & set(amended) and "effect" not in amended and \
+            now.get("effect", R.Status(R.NA)).state == R.ASK:
+        out.add("effect")
+    return out
+
+
+def amendment_required(reading: dict, merged: dict, amended: dict,
+                       ctx: R.FormContext) -> set[str]:
+    """15.2: the fields the approver must answer even when the reviewer's record is escalated:
+    those the amendment reset, and those the approver blanked (a field answered in the source
+    that the amendment sets to unanswered)."""
+    blanked = {f for f, v in amended.items() if f != LEVELS and v in ("", [])
+               and reading.get(f) not in ("", [], None)}
+    return reset_by_amendment(reading, merged, amended, ctx) | blanked
 
 
 def merge_amendment(reading: dict, amended: dict, ctx: R.FormContext | None = None) -> dict:
@@ -1067,7 +1083,9 @@ def append_annotation(base: str | Path, bundle: Bundle, session: Session, *, ite
                 merged = merge_amendment(source["reading"], reading, ctx)
                 _enforce(R.validate(merged, ctx, flags=source["flags"],
                                     confidence=source["confidence"],
-                                    notes=source["notes"] or notes), ack)
+                                    notes=source["notes"] or notes,
+                                    required=amendment_required(source["reading"], merged,
+                                                                reading, ctx)), ack)
             elif ack:
                 raise AdjudicationError("WARNINGS_NOT_ACKNOWLEDGED")
         return {"at": (now or datetime.now(UTC)).astimezone(UTC).isoformat(),
@@ -1159,9 +1177,18 @@ def _resolve_one(recs: list[dict], item: dict, bundle: Bundle, rubric: int) -> d
     independent = _independent_of(recs, source)
     forms = post_forms(bundle, item)
     two = rubric == RUBRIC
+    codes: list[str] = []
     if two:  # 14.3: derived values recomputed at the freeze too, whatever was stored
-        reading = R.rederive(reading, form_context(
-            bundle, item, revealed=True, rows=[r["row"] for r in reading.get(LEVELS, [])]))
+        ctx = form_context(bundle, item, revealed=True,
+                           rows=[r["row"] for r in reading.get(LEVELS, [])])
+        reading = R.rederive(reading, ctx)
+        # 15.4: then the rubric's validation, reported (never refused or repaired further).
+        required = amendment_required(source["reading"], reading, last["reading"], ctx) if \
+            status == "AMENDED" else set()
+        notes = source.get("notes") or (last.get("notes") if status == "AMENDED" else "") or ""
+        codes = R.validate(reading, ctx, flags=source.get("flags") or [],
+                           confidence=source.get("confidence") or "", notes=notes,
+                           required=required).codes
     row = {"schema": GROUND_TRUTH_SCHEMA if two else GROUND_TRUTH_SCHEMA_1, "rubric": rubric,
            "bundle_id": bundle.bundle_id,
            "item_id": item_id, "kind": item["kind"], "set": item["set"],
@@ -1186,6 +1213,7 @@ def _resolve_one(recs: list[dict], item: dict, bundle: Bundle, rubric: int) -> d
                            "approval": last["seq"] if last else None}}
     if two:
         row["all_readings"] = _all_readings(recs, item_id, bundle)
+        row["validation_codes"] = codes
     return row
 
 
@@ -1249,6 +1277,19 @@ def _sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _counts(rows: list[dict], old: list[dict]) -> dict:
+    """The manifest's counts over the /2 rows and the rubric-1 rows (``verify_versions``
+    recomputes them from the files). 15.4: ``with_validation_codes`` counts the /2 rows whose
+    ``validation_codes`` is not empty (a consumer counts them apart and does not score them)."""
+    every = [*rows, *old]
+    return {"items": len(every),
+            "by_status": {s: sum(r.get("status") == s for r in every)
+                          for s in ("APPROVED", "AMENDED", "PROVISIONAL")},
+            "by_rubric": {"1": len(old), "2": len(rows)},
+            "escalated": sum(bool(r.get("escalated")) for r in every),
+            "with_validation_codes": sum(bool(r.get("validation_codes")) for r in rows)}
+
+
 def freeze(base: str | Path, now: datetime | None = None) -> tuple[Path, dict]:
     """Write the next ``versions/ground_truth_v<N>.jsonl`` and its manifest (never overwrites)."""
     base = Path(base).expanduser()
@@ -1276,11 +1317,7 @@ def freeze(base: str | Path, now: datetime | None = None) -> tuple[Path, dict]:
                     "sha256": _sha(data), "bundle_id": bundle.bundle_id, "rubric": RUBRIC,
                     "created_at": (now or datetime.now(UTC)).astimezone(UTC).isoformat(),
                     "annotation_log": {"count": log.count, "head_sha256": log.head},
-                    "items": len(rows), "by_status": {s: sum(r["status"] == s for r in rows)
-                                                      for s in ("APPROVED", "AMENDED",
-                                                                "PROVISIONAL")},
-                    "by_rubric": {str(k): sum(r["rubric"] == k for r in rows) for k in (1, 2)},
-                    "escalated": sum(bool(r["escalated"]) for r in rows),
+                    **_counts([r for r in rows if r["rubric"] == RUBRIC], old),
                     "rubric1": {"file": old_name, "schema": GROUND_TRUTH_SCHEMA_1,
                                 "sha256": _sha(old_data) if old else None,
                                 "items": len(old)}}
@@ -1293,7 +1330,9 @@ def freeze(base: str | Path, now: datetime | None = None) -> tuple[Path, dict]:
 
 
 def verify_versions(base: str | Path) -> list[tuple[str, bool]]:
-    """Each frozen version's file against the sha256 its manifest records."""
+    """Each frozen version's file against the sha256 its manifest records; for a rubric-2
+    manifest also the rubric-1 sibling's sha256 and (15.4) the manifest's counts against the
+    rows of the two files."""
     versions = Path(base).expanduser() / "versions"
     out = []
     for m in sorted(versions.glob("ground_truth_v*.manifest.json")):
@@ -1301,9 +1340,21 @@ def verify_versions(base: str | Path) -> list[tuple[str, bool]]:
         data = _read_private(versions / str(manifest.get("file")), "frozen version")
         ok = data is not None and _sha(data) == manifest.get("sha256")
         old = manifest.get("rubric1") or {}
+        old_data = b""
         if ok and old.get("file"):  # 14.8: the rubric-1 sibling file, when there is one
-            data = _read_private(versions / str(old["file"]), "frozen version")
-            ok = data is not None and _sha(data) == old.get("sha256")
+            old_data = _read_private(versions / str(old["file"]), "frozen version")
+            ok = old_data is not None and _sha(old_data) == old.get("sha256")
+        if ok and manifest.get("rubric") == RUBRIC:
+            try:
+                rows = [json.loads(x) for x in data.decode("utf-8").splitlines() if x.strip()]
+                olds = [json.loads(x) for x in old_data.decode("utf-8").splitlines()
+                        if x.strip()]
+                counts = _counts(rows, olds)
+            except (ValueError, AttributeError, TypeError):
+                ok = False
+            else:
+                ok = all(manifest.get(k) == v for k, v in counts.items()) and \
+                    old.get("items") == len(olds)
         out.append((m.name, ok))
     return out
 
