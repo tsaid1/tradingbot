@@ -82,14 +82,22 @@ class Harness:
     """A SimBroker, a coordinator and (optionally) a broker-backed replay, sharing one SimClock."""
 
     def __init__(
-        self, folder: Path, *, policy: MockPolicy | None = None, strict: bool = True, **config
+        self, folder: Path, *, policy: MockPolicy | None = None, strict: bool = True,
+        risk_families: tuple[tuple[str, str, str], ...] = (), **config
     ):
+        """``risk_families``: (symbol, sec_type, multiplier) of instruments a test trades beyond a
+        long cash stock (a future, an option, a short sale). They get the INVENTED [risk] table
+        of tests/_risk_fixture.py, family terms and a simulated account (docs/RISK_GATES.md)."""
         self.folder = Path(folder)
         self.strict = strict
+        self.risk_families = risk_families
         self.clock = SimClock(START)
         self.policy = policy or MockPolicy(
             quantity=4, quantity_per_add=2, max_notional_usd=Decimal(1000)
         )
+        if risk_families:
+            from _risk_fixture import INVENTED_RISK
+            self.policy = self.policy.model_copy(update={"risk": INVENTED_RISK})
         self.config = ExecutionConfig(halt_file=self.folder / "HALT", **config)
         self.restart()
         self.broker.set_quote(SYMBOL, "49.98", "50.02")
@@ -110,6 +118,9 @@ class Harness:
             clock=self.clock.now,
         )
         self.replay = BrokerEventReplay(self.folder / "replay.sqlite3", self.coord)
+        if self.risk_families:
+            from _risk_fixture import arm
+            arm(self.coord, self.broker, self.risk_families)
 
     def halt(self) -> None:
         self.config.halt_file.write_text("halt\n")

@@ -323,7 +323,10 @@ class FakeTws:
     def account_summary(s: FakeTws, conn: FakeConnection, req) -> None:
         values = {"AccountType": ("INDIVIDUAL", ""), "NetLiquidation": ("1000000.00", "USD"),
                   "TotalCashValue": ("1000000.00", "USD"), "BuyingPower": ("4000000.00", "USD"),
-                  "AvailableFunds": ("1000000.00", "USD")}
+                  "AvailableFunds": ("1000000.00", "USD"),
+                  # invented: the three tags the risk gates' cross-check requests
+                  "ExcessLiquidity": ("1000000.00", "USD"), "InitMarginReq": ("0.00", "USD"),
+                  "MaintMarginReq": ("0.00", "USD")}
         for tag in req.tags.split(","):
             value, ccy = values[tag]
             conn.push(frame(IN.ACCOUNT_SUMMARY, AccountSummary(

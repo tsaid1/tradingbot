@@ -21,6 +21,7 @@ journaled.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import fcntl
 import hashlib
 import os
@@ -52,6 +53,7 @@ from tradingbot.execution.broker import (
     PriceCondition,
     QuoteQuality,
     TimeInForce,
+    account_values,
     broker_environment,
     supports_price_conditions,
 )
@@ -75,6 +77,10 @@ from tradingbot.models import (
     PositionSide,
     StrictModel,
 )
+from tradingbot.risk.gates import Exposure, Proposal, dollar_risk
+from tradingbot.risk.gates import error_report as risk_error_report
+from tradingbot.risk.gates import evaluate as evaluate_risk
+from tradingbot.risk.policy import FamilyRiskTerms
 from tradingbot.validator import (
     ANCHOR_MAX_QUOTE_AGE_CEILING_SECONDS,
     ANCHOR_RULE_INCOMPLETE,
@@ -83,6 +89,7 @@ from tradingbot.validator import (
     anchor_quote_problem,
     fill_quantity,
     finite_positive,
+    risk_levels,
     source_is_fresh,
     stop_distance_limit,
     stop_distance_problem,
@@ -462,6 +469,11 @@ class ExecutionCoordinator:
         # Review N1: per contract, the consecutive successful position reads that differ from the
         # ledger, as (time, net). In memory: a restart, a failed read or agreement restarts it.
         self._position_runs: dict[str, list[tuple[datetime, int]]] = {}
+        # Risk gates (tradingbot.risk): each mapped family's risk terms, and the owner's per-unit
+        # initial margin by execution symbol, set by the runtime from the mapping. Read only
+        # under a [risk] table (``policy.risk``).
+        self.risk_families: dict[str, FamilyRiskTerms] = {}
+        self.risk_margin_by_symbol: dict[str, Decimal] = {}
 
     # ================================================================== public API
 
@@ -1386,7 +1398,10 @@ class ExecutionCoordinator:
                                             anchor_quote_age=_anchor_quote_age(plan),
                                             anchor_stop=_held_stop(plan, plan.stop if plan
                                                                    else None),
-                                            anchor_stop_distance=_stop_spec(plan))
+                                            anchor_stop_distance=_stop_spec(plan),
+                                            risk_stop=stop, risk_plan=plan,
+                                            risk_backstop=plan.backstop_stop if plan else None,
+                                            action=Action.OPEN)
         if reasons:
             return self._refuse(source, action, gate, ref, account, reasons, now, idea_id=idea_id)
         exit_side = OrderSide.SELL if long else OrderSide.BUY
@@ -1575,6 +1590,8 @@ class ExecutionCoordinator:
             anchor_quote_age=_anchor_quote_age(plan),
             anchor_stop=_held_stop(plan, _dec(pos.stop_price)),
             anchor_stop_distance=_stop_spec(plan),
+            risk_stop=_dec(pos.stop_price), risk_plan=plan,
+            risk_backstop=_dec(pos.backstop_price), action=Action.ADD,
         )
         if reasons:
             return self._refuse(
@@ -2294,6 +2311,11 @@ class ExecutionCoordinator:
             anchor_stop=_held_stop(plan, (plan.stop if plan is not None else None)
                                    if intent.action == Action.OPEN else _dec(pos.stop_price)),
             anchor_stop_distance=_stop_spec(plan),
+            risk_stop=(_dec(intent.stop_price) if plan is None else plan.stop)
+            if intent.action == Action.OPEN else _dec(pos.stop_price),
+            risk_backstop=(plan.backstop_stop if plan else None)
+            if intent.action == Action.OPEN else _dec(pos.backstop_price),
+            risk_plan=plan, action=intent.action,
         )
         if reasons:
             return reasons
@@ -3112,6 +3134,10 @@ class ExecutionCoordinator:
         anchor_quote_age: float | None = None,
         anchor_stop: Decimal | None = None,
         anchor_stop_distance: str | None = None,
+        risk_stop: Decimal | None = None,
+        risk_backstop: Decimal | None = None,
+        risk_plan: ExecutionPlan | None = None,
+        action: Action = Action.OPEN,
     ) -> tuple[Decimal | None, list[str]]:
         """Broker-quote sanity, the price collar and exposure caps, before any entry or add.
         Returns the collar-bounded limit price, or the reasons to refuse. ``fixed_limit`` is the
@@ -3180,22 +3206,164 @@ class ExecutionCoordinator:
         mult = contract.multiplier
         pos = self.store.position(idea_id)
         idea_notional = price * ((pos.quantity if pos else 0) + qty) * mult
+        caps: list[str] = []
+        gross: Decimal | None = None
+        new = limit * qty * mult
         if idea_notional > self.policy.max_notional_usd:
             # The gateway's per-idea notional, with the contract multiplier it cannot see.
-            return None, [f"NOTIONAL_LIMIT:{idea_notional}>{self.policy.max_notional_usd}"]
-        per_cap = self.policy.max_instrument_exposure_usd or self.policy.max_notional_usd
-        new = limit * qty * mult
-        try:
-            symbol_exposure, total_exposure = self._exposure(contract, exclude_ref, now)
-        except BrokerError as exc:
-            self._broker_unreadable("positions", exc)
-            return None, ["BROKER_POSITIONS_UNAVAILABLE"]
-        if symbol_exposure + new > per_cap:
-            return None, [f"INSTRUMENT_EXPOSURE_CAP:{symbol_exposure + new}>{per_cap}"]
-        if total_exposure + new > self.policy.max_aggregate_exposure_usd:
-            cap = self.policy.max_aggregate_exposure_usd
-            return None, [f"AGGREGATE_EXPOSURE_CAP:{total_exposure + new}>{cap}"]
+            caps = [f"NOTIONAL_LIMIT:{idea_notional}>{self.policy.max_notional_usd}"]
+        else:
+            per_cap = self.policy.max_instrument_exposure_usd or self.policy.max_notional_usd
+            try:
+                symbol_exposure, total_exposure = self._exposure(contract, exclude_ref, now)
+            except BrokerError as exc:
+                self._broker_unreadable("positions", exc)
+                return None, ["BROKER_POSITIONS_UNAVAILABLE"]
+            gross = total_exposure + new
+            if symbol_exposure + new > per_cap:
+                caps = [f"INSTRUMENT_EXPOSURE_CAP:{symbol_exposure + new}>{per_cap}"]
+            elif total_exposure + new > self.policy.max_aggregate_exposure_usd:
+                cap = self.policy.max_aggregate_exposure_usd
+                caps = [f"AGGREGATE_EXPOSURE_CAP:{total_exposure + new}>{cap}"]
+        # The independent risk gates, all nine, with every input (docs/RISK_GATES.md). Their
+        # failures are added to any cap refusal above, never replaced by it.
+        entry, stop, in_reference = risk_levels(risk_plan, limit, risk_stop, risk_backstop)
+        risk = self._risk_gates(contract, side, qty, entry, None if in_reference else price,
+                                idea_id, now, exclude_ref, stop=stop,
+                                family=risk_plan.family if risk_plan else None, action=action,
+                                anchored=fixed_limit is not None, gross=gross, exec_price=limit,
+                                reference_series=in_reference)
+        if caps or risk:
+            return None, caps + risk
         return limit, []
+
+    def _risk_gates(self, contract: ContractRef, side: OrderSide, qty: int,
+                    limit: Decimal | None, touch: Decimal | None, idea_id: str, now: datetime,
+                    exclude_ref: str | None, *, stop: Decimal | None, family: str | None,
+                    action: Action, anchored: bool, gross: Decimal | None,
+                    exec_price: Decimal | None = None,
+                    reference_series: bool = False) -> list[str]:
+        """Evaluate the nine risk gates for one entry or add as it would be sent, journal the
+        report (RISK_GATES: numbers and codes only) and return its refusal reasons ([] = pass).
+        Under the cash baseline (no [risk] table) nothing is read for them: no account values,
+        no portfolio, no quote. Any fault refuses this entry with RISK_GATES_ERROR and never
+        escapes, so the cycle (sync, fills, protection, exits) goes on."""
+        policy = self.policy.risk
+        try:
+            report = self._risk_report(contract, side, qty, limit, touch, idea_id, now,
+                                       exclude_ref, stop=stop, family=family, action=action,
+                                       anchored=anchored, exec_price=exec_price,
+                                       reference_series=reference_series)
+            if policy is None and gross is not None:
+                # The baseline records the exposure the caps measured; with no account read
+                # there is no equity figure, so economic leverage stays unknown.
+                report = dataclasses.replace(report, gross_notional=gross)
+        except Exception as exc:  # noqa: BLE001 - refuse this entry, never stop the cycle
+            report = risk_error_report("EXECUTION", policy is None)
+            with contextlib.suppress(Exception):
+                self.store.log(now, "RISK_GATES_ERROR", idea_id=idea_id,
+                               error=type(exc).__name__)
+        with contextlib.suppress(Exception):
+            self.store.log(now, "RISK_GATES", idea_id=idea_id, **report.record())
+        return report.reasons()
+
+    def _risk_report(self, contract, side, qty, limit, touch, idea_id, now, exclude_ref, *,
+                     stop, family, action, anchored, exec_price, reference_series):
+        policy = self.policy.risk
+        long = side == OrderSide.BUY
+        # A mapped family's terms; without a plan, the family named by the contract's symbol and
+        # of its security type (a stock family is named by its symbol), else none.
+        terms = self.risk_families.get(family) if family else next(
+            (t for t in self.risk_families.values()
+             if t.family == contract.symbol and t.sec_type == contract.sec_type), None)
+        if terms is None:
+            terms = FamilyRiskTerms(family=family, sec_type=contract.sec_type,
+                                    multiplier=Decimal(1) if contract.sec_type == "STK" else None)
+        held = Decimal(0)
+        pos = self.store.position(idea_id)
+        if action == Action.ADD and pos is not None and pos.quantity > 0:
+            # The idea's existing units, in the series its stop is in: from the average price,
+            # or (a reference-series stop) from this add's own reference level.
+            start = limit if reference_series else _dec(pos.avg_price)
+            held_risk = dollar_risk(start, stop, contract.multiplier, pos.quantity, long)
+            held = held_risk if held_risk is not None else Decimal(0)
+            if held_risk is None and policy is not None:
+                stop = None  # the idea's own risk is unknown: refuse (RISK_STOP_UNKNOWN)
+        proposal = Proposal(sec_type=contract.sec_type, side="LONG" if long else "SHORT",
+                            units=qty, entry=limit, stop=stop, multiplier=contract.multiplier,
+                            currency=contract.currency, touch=limit if touch is None else touch,
+                            anchored=anchored,
+                            action="ADD" if action == Action.ADD else "OPEN", held_risk=held,
+                            exec_price=exec_price, reference_series=reference_series)
+        env = broker_environment(self.broker)
+        snapshot = account_values(self.broker) if policy is not None else None
+        portfolio = self._risk_portfolio(exclude_ref, now) if policy is not None else None
+        return evaluate_risk(policy, terms, proposal, account=snapshot, portfolio=portfolio,
+                             environment=env.value if env is not None else None, now=now)
+
+    def _risk_portfolio(self, exclude_ref: str | None, now: datetime) -> list[Exposure] | None:
+        """Every open position (ledger and broker-only) and working entry, for the risk gates
+        (G1, G3, G5, G6). None when the broker positions cannot be read (the gates then refuse)."""
+        out: list[Exposure] = []
+        ledger: dict[str, int] = {}
+        try:
+            broker_positions = self.broker.positions()
+        except BrokerError:
+            return None
+        for p in self.store.positions():
+            if p.quantity <= 0:
+                continue
+            stored = _contract_from(p.contract)
+            key = self._key_of(p.symbol, p.asset_class, p.contract_key)
+            ledger[key] = ledger.get(key, 0) + p.quantity
+            contract = stored or Instrument(asset_class=p.asset_class, symbol=p.symbol)
+            mult = stored.multiplier if stored else Decimal(1)
+            sec = stored.sec_type if stored else "STK"
+            avg = _dec(p.avg_price)
+            stop = _dec(p.backstop_price if p.protection_series == "REFERENCE" else p.stop_price)
+            out.append(Exposure(
+                sec_type=sec, units=p.quantity, mark=self._mark(contract, avg, now),
+                short=p.position_side == PositionSide.SHORT,
+                multiplier=mult, entry=avg, stop=stop,
+                protected=self._protection(p.idea_id) in ("CONFIRMED", "EXITING"),
+                margin_initial=self.risk_margin_by_symbol.get(p.symbol),
+                currency=stored.currency if stored else "USD"))
+        for bp in broker_positions:
+            extra = abs(bp.quantity) - ledger.get(bp.contract.contract_key, 0)
+            if extra > 0:  # a broker-only position: no known stop, unbounded risk
+                out.append(Exposure(
+                    sec_type=bp.contract.sec_type, units=extra, short=bp.quantity < 0,
+                    mark=self._mark(bp.contract, bp.avg_cost, now),
+                    multiplier=bp.contract.multiplier, entry=bp.avg_cost, stop=None,
+                    protected=False,
+                    margin_initial=self.risk_margin_by_symbol.get(bp.contract.symbol),
+                    currency=bp.contract.currency))
+        for intent in self.store.intents(UNRESOLVED_STATES | {IntentState.WORKING}):
+            if intent.action not in (Action.OPEN, Action.ADD) or intent.order_ref == exclude_ref:
+                continue
+            price = _dec(intent.limit_price)
+            left = intent.quantity - self.store.filled_quantity(intent.order_ref)
+            if price is None or left <= 0:
+                continue
+            stored = _contract_from(intent.contract)
+            mult = stored.multiplier if stored else Decimal(1)
+            sec = stored.sec_type if stored else "STK"
+            plan = _plan_of(intent.plan)
+            idea = self.store.position(intent.idea_id)
+            if intent.action == Action.OPEN and plan is not None:
+                stop = plan.backstop_stop if plan.protection_series == "REFERENCE" else plan.stop
+            elif intent.action == Action.OPEN:
+                stop = _dec(intent.stop_price)
+            else:
+                stop = _dec(idea.stop_price) if idea else None
+            buy = intent.side == OrderSide.BUY.value
+            out.append(Exposure(
+                sec_type=sec, units=left, mark=price, multiplier=mult, entry=price, stop=stop,
+                short=not buy,
+                margin_initial=self.risk_margin_by_symbol.get(intent.symbol),
+                buy_cost=price * left * mult if buy and sec not in ("FUT", "CFD") else Decimal(0),
+                currency=stored.currency if stored else "USD"))
+        return out
 
     def _mark(
         self, contract: ContractRef | Instrument, fallback: Decimal | None, now: datetime

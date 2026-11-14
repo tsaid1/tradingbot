@@ -53,6 +53,12 @@ resolve against the config file.
   heartbeat_stale_after_seconds` (alerting only), `[service]
   lockout_clear_requires_full_reconnect` (default `true`, see `docs/OPERATIONS.md`), `[mock]
   account, quotes` (a static simulated market).
+* Optional `[risk]`: the owner's risk-gate table (`docs/RISK_GATES.md`). Absent (as shipped): the
+  fixed cash baseline (long cash stock or ETF only; no borrowing, short sale, future, option or
+  CFD). Present: complete or the service refuses to start (field paths only, never a value), and
+  every numeric gate is on; the simulated account then starts at the table's `allocated_equity`
+  and carries each family's `margin` figure. `funded_authorization` is refused. The risk policy
+  is its own table, never a `[policy]` key. The shipped examples carry no `[risk]` values.
 
 ## Sources and the cursor
 
@@ -86,7 +92,8 @@ coverage. See `docs/MULTI_ASSET_MAPPING.md`.
 Every action whose outcome is `HOLD`, `BLOCK`, `REFUSED`, `HALTED`, `UNRESOLVED`, `EXCEPTION` or
 `REJECTED` becomes a `SIGNAL_<status>` exception with the gateway's or the coordinator's reason
 codes: unsupported mapping, edits (`SOURCE_EDIT_REQUIRES_REVIEW`), unverified or truncated
-posts, stale sources or quotes, collar or exposure breaches, the halt, unknown broker outcomes.
+posts, stale sources or quotes, collar or exposure breaches, the halt, unknown broker outcomes,
+and the risk gates (`RISK_GATES_FAILED` followed by every failing gate's codes).
 Commentary (`NO_TRADE`) and recaps (`RECONCILE`) are journaled, not held. Nothing held is traded.
 
 ## Failures, halt, notifications

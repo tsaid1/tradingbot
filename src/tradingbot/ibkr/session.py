@@ -135,8 +135,10 @@ def _silence_sdk_logging() -> None:
 
 _silence_sdk_logging()
 
+# The last three serve the risk gates' cross-check (docs/RISK_GATES.md): more tags on the same
+# allow-listed REQ_ACCOUNT_SUMMARY message; no message or method is added to the allow-lists.
 ACCOUNT_SUMMARY_TAGS = ("AccountType", "NetLiquidation", "TotalCashValue", "BuyingPower",
-                        "AvailableFunds")
+                        "AvailableFunds", "ExcessLiquidity", "InitMarginReq", "MaintMarginReq")
 MIN_SERVER_VER_CANCEL_CONTRACT_DATA = 215  # ibapi.server_versions, 1052.1
 MIN_SERVER_VER_CONFIG = 219  # ibapi.server_versions, 1052.1: reqConfigProtoBuf
 # Lowest TWS server version this adapter accepts: the lowest one the test suite exercises.

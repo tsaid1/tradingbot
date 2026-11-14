@@ -45,6 +45,16 @@
 #   level_contract_rule = "EXPLICIT_MONTH_ONLY"  (default) a futures level needs a named month
 #   level_contract_rule = "FRONT_MONTH"  a DIRECT futures level with no month means the front
 #                                        contract of the entry's own list; HOLD in its roll window
+#
+# Risk-gate fields (docs/RISK_GATES.md), read only under an owner's [risk] runtime table; none is
+# set here and every value is the owner's:
+#   funding = "OWNER_VALUE"              CASH | MARGIN_BORROWING (stock), FUTURES_MARGIN, OPTION_PREMIUM,
+#                                        CFD_MARGIN; must fit execution.sec_type
+#   risk = { max_risk_per_idea = "OWNER_VALUE", max_stop_distance = "OWNER_VALUE" }
+#                                        the family's dollar risk per idea and its own stop rule ("N%")
+#   margin = { initial = "OWNER_VALUE", maintenance = "OWNER_VALUE", currency = "USD",
+#              verified_at = OWNER_VALUE, max_age_days = OWNER_VALUE }   per unit, margin funding only
+#   entry_collar = "OWNER_VALUE"         the family's own price collar ("<price>" or "<pct>%")
 
 version = 2
 

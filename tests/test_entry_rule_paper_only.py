@@ -244,16 +244,24 @@ def test_an_anchored_entry_never_reaches_a_live_or_undeclared_broker(tmp_path, d
     [exc] = [e for e in h.coord.store.exceptions(open_only=True)
              if e.kind == ENTRY_ANCHOR_PAPER_ONLY]
     assert label in exc.detail
-    # A non-anchored entry is unaffected.
     plain = run_entry(h, anchored_gate(rule="EXPLICIT_ENTRY_ONLY"), sid="p2")
-    assert plain.state != IntentState.REFUSED and h.broker.submit_calls == 1, plain.reasons
+    if label == "LIVE":
+        # The risk gates' baseline (docs/RISK_GATES.md): a broker declaring LIVE is refused for
+        # every entry, anchored or not.
+        assert plain.state == IntentState.REFUSED and h.broker.submit_calls == 0
+        assert "RISK_ENVIRONMENT_NOT_AUTHORIZED:LIVE" in plain.reasons
+    else:
+        # A non-anchored entry to an undeclared broker is unaffected (today's rule).
+        assert plain.state != IntentState.REFUSED and h.broker.submit_calls == 1, plain.reasons
     h.coord.close()
 
 
 def test_the_last_step_before_submission_checks_again(tmp_path):
     """An adapter whose declaration changes after the pre-trade checks is still refused."""
     h = Harness(tmp_path)
-    answers = iter([BrokerEnvironment.PAPER])
+    # Two pre-trade reads (the anchored rule's, then the risk gates' G9), then LIVE at the last
+    # step before submission.
+    answers = iter([BrokerEnvironment.PAPER, BrokerEnvironment.PAPER])
     h.broker.environment = lambda: next(answers, BrokerEnvironment.LIVE)
     out = run_entry(h, anchored_gate())
     assert out.state == IntentState.REFUSED and h.broker.submit_calls == 0

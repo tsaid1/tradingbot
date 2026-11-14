@@ -63,6 +63,13 @@ from tradingbot.models import (
     PositionSide,
     StrictModel,
 )
+from tradingbot.risk.policy import (
+    AMOUNT_OR_PCT,
+    FUNDING,
+    FamilyRisk,
+    MarginFigure,
+    check_family_risk_fields,
+)
 from tradingbot.runtime.entry_text import (
     ascii_shadow,
     entry_is_cost_basis,
@@ -669,6 +676,18 @@ class FamilyMapping(StrictModel):
     # entry_rule = REFERENCE_AS_COLLAR, optional otherwise (absent: today's behaviour). An outer
     # rejection boundary, never a stop the bot sets; it does not bound the loss in a gap.
     max_stop_distance: StrictStr | None = Field(default=None, pattern=r"^\d+(?:\.\d+)?%$")
+    # Risk gates (docs/RISK_GATES.md). Parsed and validated here; read by tradingbot.risk only
+    # under an owner's [risk] table (with none, the cash baseline ignores them). No defaults.
+    # funding: how a position in this family is paid for; must fit execution.sec_type (G1, G2).
+    funding: FUNDING | None = None
+    # risk = { max_risk_per_idea, max_stop_distance }: the family's maximum dollar risk per idea,
+    # account currency (G4), and the risk gate's own stop rule, "N%" (G8; see FamilyRisk).
+    risk: FamilyRisk | None = None
+    # margin: the owner's per-unit performance-margin figure, verified_at and max_age_days (G6).
+    margin: MarginFigure | None = None
+    # entry_collar: the family's own price collar, "<price distance>" or "<pct>%" (G8). Never
+    # filled from the global policy collar or from another family.
+    entry_collar: StrictStr | None = Field(default=None, pattern=AMOUNT_OR_PCT)
 
     @field_validator("aliases")
     @classmethod
@@ -680,6 +699,10 @@ class FamilyMapping(StrictModel):
         def bad(msg: str):
             raise ValueError(f"family {self.family}: {msg}")
 
+        for problem in check_family_risk_fields(
+                self.family, self.execution.sec_type if self.execution else None, self.funding,
+                self.margin, self.entry_collar):
+            raise ValueError(problem)
         collar = self.entry_rule == "REFERENCE_AS_COLLAR"
         if collar != (self.entry_anchor is not None):
             bad("entry_rule = REFERENCE_AS_COLLAR needs its [entry_anchor] limits "
@@ -956,8 +979,29 @@ class FamilyMapping(StrictModel):
             max_stop_distance=self.max_stop_distance,
             anchor_max_quote_age_seconds=self.entry_anchor.max_quote_age_seconds
             if self.entry_anchor else None,
+            funding=self.funding,
+            max_risk_per_idea=self.risk.max_risk_per_idea if self.risk else None,
+            risk_max_stop_distance=self.risk.max_stop_distance if self.risk else None,
+            margin_initial=self.margin.initial if self.margin else None,
+            margin_maintenance=self.margin.maintenance if self.margin else None,
+            margin_verified_at=self.margin.verified_at if self.margin else None,
+            margin_max_age_days=self.margin.max_age_days if self.margin else None,
+            entry_collar=self.entry_collar,
+            multiplier_stated=self.risk_terms().multiplier,
+            reference_scale_ratio=self.basis_shift.scale_ratio if self.basis_shift else None,
             problems=out,
         )
+
+    def unset_risk_fields(self) -> set[str]:
+        """The risk-gate fields this entry does not state (left out of a recorded copy, so an
+        entry without them is recorded exactly as before they existed)."""
+        return {k for k in ("funding", "risk", "margin", "entry_collar")
+                if getattr(self, k) is None}
+
+    def risk_terms(self):
+        """The family's risk terms (tradingbot.risk.FamilyRiskTerms)."""
+        from tradingbot.risk.policy import FamilyRiskTerms
+        return FamilyRiskTerms.of(self)
 
     # ---------------------------------------------------------------- selection
 

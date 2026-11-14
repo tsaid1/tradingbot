@@ -293,7 +293,9 @@ def test_p1_a_sale_on_the_wrong_side_explains_nothing(h):
     assert protective(h) == {"STP": 4, "TGT": 4} and differs_open(h)
 
 
-def test_n1_short_mirror(h):
+def test_n1_short_mirror(tmp_path):
+    # A short sale needs an owner's [risk] table: an INVENTED one (docs/RISK_GATES.md).
+    h = Harness(tmp_path, risk_families=((SYMBOL, "STK", "1"),))
     h.execute("p1", open_action(side=PositionSide.SHORT, entry="49.98", stop="52", target="45"))
     assert h.broker.positions()[0].quantity == -4
     real = h.broker.positions
@@ -310,7 +312,13 @@ def test_n1_short_mirror(h):
     h.coord.sync()
 
 
-def test_p1_short_mirror(h):
+def test_p1_short_mirror(tmp_path):
+    # A short sale needs an owner's [risk] table: an INVENTED one (docs/RISK_GATES.md).
+    h = Harness(tmp_path, risk_families=((SYMBOL, "STK", "1"),))
+    # This test is about protective cover. Under a [risk] table the old broker-only buy would
+    # make portfolio risk unbounded and refuse the short (G5; tested in
+    # test_risk_gates_wiring.py), so the risk gates are set aside here for the cover logic only.
+    h.coord._risk_gates = lambda *a, **k: []
     foreign(h, OrderSide.BUY, 1, "OLD-BUY")  # an old buy, then a short idea opens
     h.clock.advance(60)
     h.broker.set_quote(SYMBOL, "49.98", "50.02")

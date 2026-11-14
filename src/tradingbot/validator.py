@@ -37,6 +37,9 @@ from tradingbot.models import (
     SignalCandidate,
     SourceEvent,
 )
+from tradingbot.risk.gates import Proposal, RiskReport
+from tradingbot.risk.gates import evaluate as evaluate_risk
+from tradingbot.risk.policy import FamilyRiskTerms
 
 SYMBOL_RE = re.compile(r"^[A-Z][A-Z0-9.]{0,9}$")
 ALL_ACTIONS = frozenset({Action.OPEN, Action.ADD, Action.REDUCE, Action.CLOSE, Action.MODIFY})
@@ -136,7 +139,82 @@ def gate_action(
     supported_actions: frozenset[Action] = ALL_ACTIONS,
 ) -> GateDecision:
     """Decide one action. `position` is the ledger's active position for `action.idea_reference`
-    (None when there is none). `supported_actions` is engine capability, not risk policy."""
+    (None when there is none). `supported_actions` is engine capability, not risk policy.
+
+    An approved OPEN or ADD in a mapped family is then put to the independent risk gates
+    (tradingbot.risk) at the gateway stage: every gate whose inputs the gateway holds; any failure
+    is a HOLD listing every failing gate's codes. The account and portfolio gates, and every entry
+    of the unmapped stock path that reaches a broker, are decided by the execution core."""
+    decision = _gate_action(action, published_at, quote, policy, position, now=now,
+                            supported_actions=supported_actions)
+    if decision.status != "APPROVE" or action.action not in (Action.OPEN, Action.ADD) \
+            or not isinstance(quote, MappedQuote):
+        # The unmapped stock path serves the fictional Sprint 1 journal and paper replay, which
+        # never reach a broker; anything sent to a broker is gated by the execution core.
+        return decision
+    try:
+        report = gateway_risk(action, quote, policy, position, decision.plan, now)
+    except Exception:  # noqa: BLE001 - a fault holds the action; it never approves or raises
+        return _gate("HOLD", "RISK_GATES_FAILED", "RISK_GATES_ERROR")
+    if report.refused:
+        return _gate("HOLD", *report.reasons())
+    return decision
+
+
+def risk_levels(plan: ExecutionPlan | None, entry: Decimal | None, stop: Decimal | None,
+                backstop: Decimal | None = None
+                ) -> tuple[Decimal | None, Decimal | None, bool]:
+    """(entry, stop, in_reference_series) for the dollar-risk gates, both in one series.
+
+    ``entry`` is the execution-series entry (the limit), ``stop`` the idea's stop as read. A
+    REFERENCE_TRIGGER idea keeps its stop in the reference series: with an execution-priced
+    backstop the risk is measured to the backstop; without one, in the reference series, from the
+    publisher's stated entry (or anchor) to the stop, read at the contract multiplier (one
+    reference point taken as one execution point). Never a synthesized stop."""
+    if plan is None or plan.protection_series != "REFERENCE":
+        return entry, stop, False
+    if backstop is not None:
+        return entry, backstop, False
+    return plan.entry_reference or plan.entry_anchor, stop, True
+
+
+def gateway_risk(a: TradeAction, quote: MappedQuote, policy: MockPolicy,
+                 position: Position | None, plan: ExecutionPlan | None,
+                 now: datetime) -> RiskReport:
+    """The risk gates at the gateway stage for an approved OPEN or ADD in a mapped family."""
+    long = (a.position_side or (position.side if position else None)) == PositionSide.LONG
+    t = quote.terms
+    family = FamilyRiskTerms.of_terms(t)
+    if a.action == Action.OPEN:
+        stop, backstop = (plan.stop, plan.backstop_stop) if plan else (None, None)
+    else:
+        stop = _num(position.stop_price if position else None)
+        backstop = _num(position.backstop_price if position else None)
+    entry, stop, in_reference = risk_levels(plan, plan.execution_reference if plan else None,
+                                            stop, backstop)
+    touch = quote.ask if long else quote.bid
+    if in_reference:
+        touch = _touch(quote.reference, long) if quote.reference is not None else None
+    proposal = Proposal(sec_type=family.sec_type, side="LONG" if long else "SHORT",
+                        units=plan.quantity if plan and plan.quantity else t.units_per_signal,
+                        entry=entry, stop=stop, multiplier=t.multiplier, touch=touch,
+                        anchored=plan is not None and plan.entry_limit is not None,
+                        action=a.action.value,
+                        exec_price=plan.execution_reference if plan else None,
+                        reference_series=in_reference)
+    return evaluate_risk(policy.risk, family, proposal, now=now, stage="GATEWAY")
+
+
+def _gate_action(
+    action: TradeAction,
+    published_at: datetime,
+    quote: Quote | None,
+    policy: MockPolicy,
+    position: Position | None,
+    *,
+    now: datetime,
+    supported_actions: frozenset[Action] = ALL_ACTIONS,
+) -> GateDecision:
     a = action
     # 1. Temporal intent: only a current instruction can authorize anything.
     if a.timing == Timing.HISTORICAL:

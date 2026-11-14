@@ -315,6 +315,12 @@ class ShadowBroker:
     def environment(self) -> BrokerEnvironment:
         return BrokerEnvironment.SIM
 
+    def account_values(self):
+        """The SIMULATED account (risk gates). Orders and fills are simulated, so the real paper
+        account's values say nothing about these positions: they are never read here and never
+        gated on. No read-only request is made."""
+        return self._sim.account_values()
+
     # ------------------------------------------------------------------ real, read-only
     def resolve(self, instrument: Instrument) -> ContractRef:
         if instrument.asset_class not in SHADOW_ASSET_CLASSES:

@@ -20,6 +20,7 @@ from typing import Annotated, Literal
 from pydantic import Field, ValidationError
 
 from tradingbot.models import MockPolicy, StrictModel
+from tradingbot.risk.policy import RiskConfigError, RiskPolicy
 
 DEFAULT_CONFIG_PATH = Path("~/.config/tradingbot/runtime.toml")
 ACCEPTED_MODES = ("mock", "shadow")
@@ -279,6 +280,17 @@ def parse_config(raw: dict, *, base: Path) -> RuntimeConfig:
             f"missing: {', '.join(missing)}"
         )
     raw = {k: (dict(v) if isinstance(v, dict) else v) for k, v in raw.items()}
+    if "risk" in raw["policy"]:
+        raise ConfigError("the risk policy is its own [risk] table, never a [policy] key")
+    if "risk" in raw:
+        # The owner's [risk] table (docs/RISK_GATES.md): complete or refused, field paths only.
+        # Absent: the fixed cash baseline.
+        if not isinstance(raw["risk"], dict):
+            raise ConfigError("[risk] must be a table")
+        try:
+            raw["policy"]["risk"] = RiskPolicy.from_table(raw.pop("risk"))
+        except RiskConfigError as exc:
+            raise ConfigError(str(exc)) from None
     _resolve_paths(raw, base)
     try:
         return RuntimeConfig.model_validate(raw)

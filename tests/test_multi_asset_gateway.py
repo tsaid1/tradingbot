@@ -9,6 +9,7 @@ from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
 import pytest
+from _risk_fixture import INVENTED_RISK, market_terms_fields
 
 from tradingbot.event_models import PriceBasis, Timing, TradeAction
 from tradingbot.models import (
@@ -26,7 +27,8 @@ from tradingbot.models import (
 from tradingbot.validator import business_days_until, fill_quantity, gate_action
 
 NOW = datetime(2026, 6, 1, 14, 0, tzinfo=UTC)  # Monday
-POLICY = MockPolicy(max_notional_usd=Decimal(100000))
+# Futures need an owner's [risk] table (docs/RISK_GATES.md): an INVENTED, deliberately wide one.
+POLICY = MockPolicy(max_notional_usd=Decimal(100000), risk=INVENTED_RISK)
 FUT = Instrument(asset_class=AssetClass.FUTURE, symbol="QXF", exchange="SIMX",
                  futures_contract="202609")
 KEY = FUT.quote_key
@@ -49,6 +51,7 @@ def terms(basis="DIRECT", **kw) -> MarketTerms:
             "max_abs_basis": Decimal(40), "max_basis_age_seconds": 5,
         })
     base.update(kw)
+    base = {**market_terms_fields(base["asset_class"], base["multiplier"]), **base}
     return MarketTerms(**base)
 
 
@@ -316,13 +319,19 @@ def ref_terms(**kw):
 
 
 def test_reference_trigger_prices_the_entry_from_the_execution_quote():
-    g = gate(act(entry="5010", stop="4980", target="5070"), mq(ref_terms(), reference=leg()))
+    # A loadable family: a reference trigger with an execution-priced backstop.
+    g = gate(act(entry="5010", stop="4980", target="5070"),
+             mq(ref_terms(require_backstop=True), reference=leg()))
     assert g.status == "APPROVE" and "MAPPING_REFERENCE_TRIGGER" in g.reasons
     p = g.plan
     # The reference level 5010 is never an execution price: the entry is the future's own ask.
     assert p.execution_reference == Decimal("5025.25") and p.entry_reference == Decimal(5010)
     assert (p.stop, p.target, p.protection_series) == (Decimal(4980), Decimal(5070), "REFERENCE")
-    assert p.reference_contract_key == "IND:QREF:-:-:-:78" and p.backstop_stop is None
+    assert p.reference_contract_key == "IND:QREF:-:-:-:78"
+    assert p.backstop_stop == Decimal("4995.00")  # 4980 shifted by the observed basis 15
+    # Without a backstop, reference levels cannot be measured: refused under a [risk] table.
+    bare = gate(act(entry="5010", stop="4980", target="5070"), mq(ref_terms(), reference=leg()))
+    assert bare.status == "HOLD" and bare.reasons == ["RISK_GATES_FAILED", "RISK_STOP_UNKNOWN"]
 
 
 def test_reference_trigger_collar_and_stop_side_use_the_reference_quote():

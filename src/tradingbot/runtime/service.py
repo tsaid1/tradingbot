@@ -85,6 +85,7 @@ from tradingbot.execution.coordinator import (
 from tradingbot.execution.reconcile import DiscrepancyKind, ReconciliationReport
 from tradingbot.execution.replay import BrokerEventReplay
 from tradingbot.execution.shadow_broker import FILL_LABEL, ShadowBroker
+from tradingbot.execution.sim_broker import SimBroker
 from tradingbot.execution.store import LEDGER_REVERSAL, UNRESOLVED_STATES, IntentState
 from tradingbot.models import Action, ExecutionPlan, Instrument, LegQuote, MappedQuote, Quote
 from tradingbot.runtime import notify as N
@@ -384,6 +385,7 @@ class RuntimeService:
         self.coordinator = ExecutionCoordinator(
             broker, config.execution_db, config.policy, execution_config(config), clock=self.clock
         )
+        self._wire_risk(broker)
         # Review F3: never created here; a missing or broken queue disables operator actions only.
         self.queue: OperatorQueue | None = None
         self.queue_problem: str | None = None
@@ -451,6 +453,25 @@ class RuntimeService:
     @property
     def halted(self) -> bool:
         return self.coordinator.halted()
+
+    def _wire_risk(self, broker: Broker) -> None:
+        """The risk gates' family terms and margin figures from the mapping (docs/RISK_GATES.md).
+        Under an owner's [risk] table the simulated account starts at the table's allocated
+        equity and carries the owner's per-unit margin figures; with none (the cash baseline) the
+        simulation keeps no account values, exactly as before."""
+        families = {f: e for f, e in self.mapping.entries.items()
+                    if isinstance(e, FamilyMapping) and e.execution is not None}
+        self.coordinator.risk_families = {f: e.risk_terms() for f, e in families.items()}
+        self.coordinator.risk_margin_by_symbol = {
+            e.execution.symbol: e.margin.initial for e in families.values() if e.margin}
+        risk = self.config.policy.risk
+        sim = broker._sim if isinstance(broker, ShadowBroker) else broker
+        if risk is None or not isinstance(sim, SimBroker):
+            return
+        if sim.account_cash is None:
+            sim.account_cash = risk.allocated_equity
+        sim.margin_per_unit = {e.execution.symbol: (e.margin.initial, e.margin.maintenance)
+                               for e in families.values() if e.margin}
 
     def run_once(self) -> CycleReport:
         now = self.clock()
@@ -1110,7 +1131,9 @@ class RuntimeService:
             idea_id = f"{source_id}:{a.action_id}"
             pos = store.position(idea_id)
             if pos is not None and pos.mapping_terms is None:
-                store.update_position(idea_id, self.clock(), mapping_terms=entry.model_dump_json())
+                store.update_position(idea_id, self.clock(),
+                                      mapping_terms=entry.model_dump_json(
+                                          exclude=entry.unset_risk_fields()))
 
     def _gate_quotes(
         self,

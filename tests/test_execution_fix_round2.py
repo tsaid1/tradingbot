@@ -378,7 +378,8 @@ def test_f9_a_retrospective_opposite_entry_report_is_reconciled_not_held(tmp_pat
 
 
 def test_f9_a_publisher_reversal_is_a_close_then_an_open(tmp_path):
-    h = Harness(tmp_path)
+    # A short sale needs an owner's [risk] table: an INVENTED one (docs/RISK_GATES.md).
+    h = Harness(tmp_path, risk_families=((SYMBOL, "STK", "1"),))
     h.post("p1", open_action())
     result = h.post("p2", action("close", Action.CLOSE, idea="p1:open"), _short_open("open2"))
     assert [o.status for o in result.outcomes] == ["EXECUTED", "EXECUTED"]

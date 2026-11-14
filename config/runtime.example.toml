@@ -48,6 +48,23 @@ max_quote_age_seconds = 30          # broker quote freshness
 max_instrument_exposure_usd = "2000"
 max_aggregate_exposure_usd = "10000"
 
+# Optional risk gates (docs/RISK_GATES.md). Absent, as shipped: the cash baseline (long cash stock
+# or ETF only; no borrowing, short sale, future, option or CFD). Every value is the owner's; none
+# is suggested here. A table must be complete or the service refuses to start.
+# [risk]
+# approved_by = "OWNER_VALUE"
+# approved_at = OWNER_VALUE                       # a past date-time with its UTC offset
+# currency = "USD"
+# environments = [OWNER_VALUE]                    # a subset of "SIM", "PAPER"
+# allocated_equity = "OWNER_VALUE"                # USD; compared with net liquidation (the smaller is used)
+# max_gross_notional_ratio = "OWNER_VALUE"        # gross notional / effective equity
+# max_portfolio_risk = "OWNER_VALUE"              # USD, every open and working idea's stop distance
+# max_margin_utilisation = "OWNER_VALUE"          # fraction of effective equity, at most 1
+# min_excess_liquidity = "OWNER_VALUE"            # USD, or "N%" of effective equity
+# account_values_max_age_seconds = OWNER_VALUE
+# borrowing = { permitted = OWNER_VALUE, short_sale_permitted = OWNER_VALUE }   # max_borrowed if permitted
+# eligibility = { futures = OWNER_VALUE, options = OWNER_VALUE, cfd = OWNER_VALUE }
+
 [interpreter]
 # lexicon_path = "/path/outside/the/repo/lexicon.json"   # optional private extension
 # review_log_path = "/path/outside/the/repo/review.jsonl"   # optional PRIVATE vocabulary review log (docs/RUNTIME.md)

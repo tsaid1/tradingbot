@@ -89,6 +89,7 @@ contract_selection = {{{{ rule = "EXPLICIT_OR_NEAREST", min_business_days_to_rol
 contracts = [ {{{{ month = "202606", roll_date = 2026-06-12 }}}}, {{{{ month = "202609", roll_date = 2026-09-11 }}}} ]
 sizing = {{{{ units_per_signal = 2, max_units = 4, max_notional = "60000" }}}}
 {SESSION}
+{{risk_FUT}}
 roll = {{{{ business_days_before = 3, action = "FLATTEN" }}}}
 reference_trigger = {{{{ released_order_type = "MKT", reference_hours = ["13:30-20:00"], require_backstop = true }}}}
 basis_shift = {{{{ max_abs_basis = "40", max_age_seconds = 5, scale_ratio = "1" }}}}
@@ -104,6 +105,7 @@ contract_selection = {{{{ rule = "EXPLICIT_ONLY", min_business_days_to_roll = 6 
 contracts = [ {{{{ month = "202606", roll_date = 2026-06-03 }}}}, {{{{ month = "202607", roll_date = 2026-07-06 }}}} ]
 sizing = {{{{ units_per_signal = 2, max_units = 4, max_notional = "5000" }}}}
 {SESSION}
+{{risk_FUT}}
 roll = {{{{ business_days_before = 3, action = "FLATTEN" }}}}
 
 [[mapping]]
@@ -117,6 +119,7 @@ contract_selection = {{{{ rule = "EXPLICIT_OR_NEAREST", min_business_days_to_rol
 contracts = [ {{{{ month = "202608", roll_date = 2026-07-28 }}}} ]
 sizing = {{{{ units_per_signal = 2, max_units = 4, max_notional = "50000" }}}}
 {SESSION}
+{{risk_FUT}}
 roll = {{{{ business_days_before = 3, action = "FLATTEN" }}}}
 basis_shift = {{{{ max_abs_basis = "20", max_age_seconds = 5, scale_ratio = "1" }}}}
 
@@ -129,11 +132,37 @@ reference = {{{{ sec_type = "OPT", symbol = "QSTK", exchange = "SIMOPT", currenc
 execution = {{{{ sec_type = "OPT", symbol = "QSTK", exchange = "SIMOPT", currency = "USD", multiplier = "100", min_tick = "0.01" }}}}
 sizing = {{{{ units_per_signal = 2, max_units = 4, max_notional = "2000" }}}}
 {SESSION}
+{{risk_OPT}}
 """
 
 
+# Risk gates (docs/RISK_GATES.md). EVERY VALUE BELOW IS INVENTED DEMONSTRATION DATA, deliberately
+# wide so that each scenario decides exactly as it did before the gates existed; none is a
+# proposal, an owner's value or a contract specification. Without the [risk] table (``risk=False``)
+# the cash baseline refuses every one of these futures and options entries (G2).
+INVENTED_RISK_TABLE = {
+    "approved_by": "invented-demo-owner", "approved_at": datetime(2026, 5, 29, 12, tzinfo=UTC),
+    "currency": "USD", "environments": ["SIM"],
+    "allocated_equity": "100000000", "max_gross_notional_ratio": "1000",
+    "max_portfolio_risk": "100000000", "max_margin_utilisation": "1",
+    "min_excess_liquidity": "1", "account_values_max_age_seconds": 86400,
+    "borrowing": {"permitted": False, "short_sale_permitted": False},
+    "eligibility": {"futures": True, "options": True, "cfd": False},
+}
+INVENTED_FAMILY_RISK = {
+    "FUT": ('funding = "FUTURES_MARGIN"\nrisk = {{ max_risk_per_idea = "100000000", max_stop_distance = "100%" }}\n'
+            'margin = {{ initial = "1", maintenance = "1", currency = "USD", '
+            'verified_at = 2026-05-29, max_age_days = 3650 }}\n'
+            'entry_collar = "100%"'),
+    "OPT": ('funding = "OPTION_PREMIUM"\nrisk = {{ max_risk_per_idea = "100000000", max_stop_distance = "100%" }}\n'
+            'entry_collar = "100%"'),
+}
+
+
 def mapping_toml(*, approved: bool) -> str:
-    return MAPPING.format(approval=APPROVAL if approved else "approved = false")
+    return MAPPING.format(approval=APPROVAL if approved else "approved = false",
+                          risk_FUT=INVENTED_FAMILY_RISK["FUT"].format(),
+                          risk_OPT=INVENTED_FAMILY_RISK["OPT"].format())
 
 
 # ------------------------------------------------------------------ quotes
@@ -312,7 +341,7 @@ class MockMultiAssetRun:
     """One scenario's runtime on temp files (the shape of tests/runtime_harness.Runtime)."""
 
     def __init__(self, folder: Path, scenario: Scenario, *, approved: bool = True,
-                 source_offset: int = 0, mapping_text: str | None = None):
+                 source_offset: int = 0, mapping_text: str | None = None, risk: bool = True):
         self.folder = Path(folder)
         self.folder.mkdir(parents=True, exist_ok=True)
         self.scenario = scenario
@@ -335,6 +364,8 @@ class MockMultiAssetRun:
             "policy": dict(POLICY),
             "execution": dict(EXECUTION),
         }
+        if risk:
+            raw["risk"] = dict(INVENTED_RISK_TABLE)
         self.config = parse_config(raw, base=self.folder)
         self.store = RuntimeStore(self.config.runtime_db)
         self.broker = SimBroker(self.config.broker_db, clock=self.clock.now)
@@ -375,8 +406,9 @@ class _Quiet:
 
 
 def run_scenario(folder: Path, scenario: Scenario, *, approved: bool = True,
-                 source_offset: int = 0) -> ScenarioResult:
-    run = MockMultiAssetRun(folder, scenario, approved=approved, source_offset=source_offset)
+                 source_offset: int = 0, risk: bool = True) -> ScenarioResult:
+    run = MockMultiAssetRun(folder, scenario, approved=approved, source_offset=source_offset,
+                            risk=risk)
     try:
         run.run()
         return _result(run)
@@ -443,12 +475,13 @@ def _result(run: MockMultiAssetRun) -> ScenarioResult:
     )
 
 
-def run_all(root: Path) -> list[ScenarioResult]:
+def run_all(root: Path, *, risk: bool = True) -> list[ScenarioResult]:
+    """Every scenario; ``risk=False`` runs them without the invented [risk] table."""
     base = scenarios()
     out = []
     for i, s in enumerate(base):
-        out.append(run_scenario(root / s.name, s, source_offset=100 * i))
+        out.append(run_scenario(root / s.name, s, source_offset=100 * i, risk=risk))
     for i, s in enumerate(unapproved(base)):
         out.append(run_scenario(root / f"{base[i].name}-unapproved", s, approved=False,
-                                source_offset=1000 + 100 * i))
+                                source_offset=1000 + 100 * i, risk=risk))
     return out

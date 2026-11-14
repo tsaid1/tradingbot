@@ -497,7 +497,9 @@ def test_refused_intent_is_not_retried_on_redelivery(h):
     assert again.duplicate and again.state == IntentState.REFUSED and h.broker.submit_calls == 0
 
 
-def test_short_entry_collar_and_protection(h):
+def test_short_entry_collar_and_protection(tmp_path):
+    # A short sale needs an owner's [risk] table: an INVENTED one (docs/RISK_GATES.md).
+    h = Harness(tmp_path, risk_families=((SYMBOL, "STK", "1"),))
     out = h.execute("s1", open_action(side=PositionSide.SHORT, entry="49.98", stop="52",
                                       target="45"))
     assert out.state == IntentState.FILLED and out.protection == "CONFIRMED"

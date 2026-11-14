@@ -60,6 +60,7 @@ from tradingbot.execution.broker import (
     TimeInForce,
 )
 from tradingbot.models import AssetClass, Instrument
+from tradingbot.risk.gates import AccountSnapshot
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sim_orders (
@@ -245,6 +246,12 @@ class SimBroker:
         self.next_session_account: str | None = None  # the account the next session comes back as
         self.fail_identity_check = False  # the adapter's own identity check fails on reconnect
         self.identity_checks = 0
+        # The simulated account (risk gates, additive). None: the simulation has no account values
+        # (the shipped configuration). The runtime sets the starting cash to the owner's allocated
+        # equity under a [risk] table; ``margin_per_unit`` (symbol -> initial, maintenance) is the
+        # owner's per-unit figure for margin-funded contracts.
+        self.account_cash: Decimal | None = None
+        self.margin_per_unit: dict[str, tuple[Decimal, Decimal]] = {}
         with self._tx() as c:
             c.executescript(SCHEMA)
             cols = {r["name"] for r in c.execute("PRAGMA table_info(sim_orders)")}
@@ -529,6 +536,62 @@ class SimBroker:
     def environment(self) -> BrokerEnvironment:
         """The simulated broker: no account exists (entry-rule paper-only declaration)."""
         return BrokerEnvironment.SIM
+
+    def account_values(self) -> AccountSnapshot:
+        """The simulated account, from its own fills, positions and quotes (AccountValues). A pure
+        read: it settles nothing and consumes no scripted lookup failure, so it never changes
+        what the simulation does. Every instrument's fills move cash at notional; a future or CFD
+        position is then valued at its mark, so net liquidation counts its profit or loss, and
+        total cash is net liquidation less the value of the securities held. Margin is the owner's
+        per-unit figure x units; unknown when a margin-funded position has none."""
+        self._check_session()
+        now = self._now()
+        if self.account_cash is None:
+            return AccountSnapshot(read_at=now)
+        with self._tx() as c:
+            fills = c.execute(
+                """SELECT e.side, e.quantity, e.price, o.symbol, o.asset_class, o.con_id,
+                o.contract_json FROM sim_executions e
+                JOIN sim_orders o ON o.broker_order_id = e.broker_order_id"""
+            ).fetchall()
+            rows = c.execute(
+                "SELECT * FROM sim_contract_positions WHERE quantity<>0").fetchall()
+            marks = []
+            for r in rows:
+                contract = ContractRef.model_validate_json(r["contract_json"])
+                q = self._quote_for(c, contract)
+                marks.append((contract, r["quantity"], q, _d(r["avg_cost"])))
+        cash = self.account_cash
+        for f in fills:
+            mult = self._contract(f).multiplier
+            flow = Decimal(f["price"]) * f["quantity"] * mult
+            cash += flow if f["side"] == OrderSide.SELL.value else -flow
+        securities = Decimal(0)
+        margin_funded = Decimal(0)
+        init = maint = Decimal(0)
+        known = True
+        for contract, qty, q, avg in marks:
+            mark = None
+            if q is not None:
+                bid, ask, last = _d(q["bid"]), _d(q["ask"]), _d(q["last"])
+                mark = (bid + ask) / 2 if bid and ask else last
+            mark = mark or avg or Decimal(0)
+            value = mark * qty * contract.multiplier
+            if contract.sec_type in ("FUT", "CFD"):
+                margin_funded += value
+                figure = self.margin_per_unit.get(contract.symbol)
+                if figure is None:
+                    known = False
+                else:
+                    init += figure[0] * abs(qty)
+                    maint += figure[1] * abs(qty)
+            else:
+                securities += value
+        net = cash + securities + margin_funded
+        return AccountSnapshot(
+            read_at=now, net_liquidation=net, total_cash=net - securities,
+            init_margin=init if known else None, maint_margin=maint if known else None,
+            excess_liquidity=net - maint if known else None)
 
     def resolve(self, instrument: Instrument) -> ContractRef:
         if self is not None:  # tests call SimBroker.resolve(None, ...) for a stock's contract
