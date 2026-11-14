@@ -282,6 +282,12 @@ understood). The journal records only the reason code and the mention kinds, and
 see the publisher's words. Dashboard page *Vocabulary Review* (`10_Vocabulary_Review.py`) shows
 them to the owner, locally, as one batch of proposed lexicon additions.
 
+**Outside reviewer (optional).** A separate, sanitized page lets ONE trusted reviewer recommend
+classifications (words, kinds, counts and public codes only; no sentence, meaning or id), shown
+read-only under each proposal here; the owner still decides and applies every word, and each
+apply records the recommendations it was shown with. See [VOCAB_REVIEWER.md](VOCAB_REVIEWER.md).
+Without its recommendations log this page is unchanged.
+
 **Config** (both optional; the review log is off by default):
 
 ```toml

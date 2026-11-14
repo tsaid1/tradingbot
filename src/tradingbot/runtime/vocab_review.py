@@ -57,12 +57,33 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from tradingbot.runtime.config import ConfigError
-from tradingbot.runtime.mapping import _VOCABULARY_DETAILS, vocabulary_hold
 
-# The public reason codes of holds a lexicon word can resolve (``mapping.vocabulary_hold`` decides
-# with the detail). Anything else (an unattributed action sentence, an additive ellipsis, a stop
-# refusal, long-only) is never offered for review.
-VOCABULARY_REASON_CODES = frozenset(_VOCABULARY_DETAILS)
+# The mapping module (and through it execution and the validator) is imported only when a function
+# needs it: the reviewer page (``vocab_recommend``) imports this module's path guards and group
+# names and must load none of them (tests/test_vocab_recommend.py proves it in a subprocess).
+
+
+def vocabulary_hold(code: str, detail) -> bool:
+    """``mapping.vocabulary_hold``, imported on first use."""
+    from tradingbot.runtime.mapping import vocabulary_hold as hold
+
+    return hold(code, detail)
+
+
+def _vocabulary_reason_codes() -> frozenset[str]:
+    """The public reason codes of holds a lexicon word can resolve (``mapping.vocabulary_hold``
+    decides with the detail). Anything else (an unattributed action sentence, an additive
+    ellipsis, a stop refusal, long-only) is never offered for review."""
+    from tradingbot.runtime.mapping import _VOCABULARY_DETAILS
+
+    return frozenset(_VOCABULARY_DETAILS)
+
+
+def __getattr__(name: str):
+    if name == "VOCABULARY_REASON_CODES":
+        return _vocabulary_reason_codes()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
@@ -675,7 +696,7 @@ def _proposal(raw: dict) -> Proposal | None:
         return None
     cited = (raw.get("categories") or {}).get("reasons") if isinstance(
         raw.get("categories"), dict) else None
-    if cited and not any(str(r) in VOCABULARY_REASON_CODES for r in cited):
+    if cited and not any(str(r) in _vocabulary_reason_codes() for r in cited):
         return None  # cites only holds no lexicon word may remove
     evidence = raw.get("evidence") if isinstance(raw.get("evidence"), dict) else {}
     cats = raw.get("categories") if isinstance(raw.get("categories"), dict) else {}
