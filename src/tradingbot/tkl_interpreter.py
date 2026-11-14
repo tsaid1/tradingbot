@@ -34,7 +34,7 @@ from pydantic import Field
 from tradingbot.event_models import ParsedPost, PriceBasis, ReplayResult, Timing, TradeAction
 from tradingbot.event_replay import PaperEventReplay
 from tradingbot.models import Action, AssetClass, Instrument, PositionSide, Quote, StrictModel
-from tradingbot.price_roles import ClauseUnit, PriceReading, note_fault, safe_read_price_roles
+from tradingbot.price_roles import ClauseUnit, PriceReading, note_fault, safe_note_fault, safe_read_price_roles
 from tradingbot.source_events import SourcePost
 from tradingbot.validator import gate_source
 
@@ -379,7 +379,13 @@ class TklInterpreter:
             note_fault(fault)
             return [r.model_copy(update={"reasons": [*r.reasons, "NO_CLAUSE_CONTEXT"]}) for r in safe_read_price_roles(raw)]
         except Exception:  # noqa: BLE001 - advisory output must never disturb the interpretation
-            return safe_read_price_roles(raw)
+            # even when counting the fault failed: count it again on the safe path and mark the readings
+            safe_note_fault("CLAUSE_CONTEXT_FAULT")
+            try:
+                return [r.model_copy(update={"reasons": [*r.reasons, "NO_CLAUSE_CONTEXT"]})
+                        for r in safe_read_price_roles(raw)]
+            except Exception:  # noqa: BLE001
+                return []
 
     def _price_units(self, text: str, classifications: list[Classification],
                      actions: list[TradeAction]) -> list[ClauseUnit]:
@@ -400,6 +406,7 @@ class TklInterpreter:
         def unit(c, start, end, kind):
             a = acts.get(c.action_id)
             return ClauseUnit(start=start, end=end, action_id=c.action_id, kind=kind, asset=c.asset,
+                              named_assets=_named_assets(text[start:end]),
                               trading=a is not None and a.action != Action.NO_TRADE,
                               month_applicable=c.asset is None or c.asset in _SERIES_CODES,
                               past_execution=c.message_class in (MessageClass.RETROSPECTIVE, MessageClass.EXIT_ANNOUNCEMENT)
@@ -793,7 +800,19 @@ def _norm_offsets(raw: str):
     character by character except the em dash (one character to three); with an entity each query
     normalises the prefix (the price reader asks at most price_roles.MAX_NUMBERS times)."""
     if "&" in raw:
-        return lambda p: len(_normalise(raw[:p]))
+        # _normalise is additive at a whitespace boundary (an entity never contains whitespace): each answer
+        # is the nearest known boundary's plus the normalised piece after it, and every boundary asked is
+        # kept, so the price reader's queries in text order cost one pass
+        anchors, values = [0], [0]
+
+        def entity_map(p: int) -> int:
+            k = bisect.bisect_right(anchors, p) - 1
+            v = values[k] + len(_normalise(raw[anchors[k]:p]))
+            if p > anchors[k] and raw[p - 1].isspace():
+                anchors.insert(k + 1, p)
+                values.insert(k + 1, v)
+            return v
+        return entity_map
     dashes = [i for i, ch in enumerate(raw) if ch == "\u2014"]
     return lambda p: p + 2 * bisect.bisect_left(dashes, p)
 
@@ -829,6 +848,13 @@ def _split_conjunctions(sentence: str, verbs=None) -> list[str]:
         return [sentence]
     head, tail = sentence[:cut.start()].strip(), sentence[cut.end():].strip()
     return [head, *_split_conjunctions(tail, verbs)] if head and tail else [sentence]
+
+
+def _named_assets(text: str) -> tuple[str, ...]:
+    """Every market a clause names in its own words (series codes and tickers), never a carried one."""
+    tickers = list(dict.fromkeys(TICKER_RE.findall(text)))
+    tickers += [t for t in dict.fromkeys(BARE_ETF_RE.findall(text)) if t not in tickers]
+    return tuple(tickers + list(dict.fromkeys(code for rx, code in SERIES_RES if rx.search(text))))
 
 
 def _asset(text: str) -> tuple[str | None, str | None, str | None]:

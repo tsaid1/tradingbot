@@ -1,16 +1,19 @@
-"""The independent review's 161 invented sentences (orchestration/reviews/PRICE_ROLES_review.md) as a
-regression set for the structured price readings. Invented text only.
+"""The independent reviews' invented sentences (orchestration/reviews/PRICE_ROLES_review.md) as regression
+sets for the structured price readings: the first review's 161 (TABLE) and the confirmation review's 118
+(CONF). Invented text only.
 
-Each row: id, sentence, the review's verdict on the readings it observed, the roles observed by the
-review (before the fixes), and the roles expected now.
-  * R (right): the readings must stay exactly as observed.
-  * D (dangerous: a wrong INTENDED_ENTRY or CURRENT_MARKET, or an entry price tied to the wrong
-    action): the expected roles below are asserted exactly, and no number may be INTENDED_ENTRY or
-    CURRENT_MARKET unless the expected role says so.
-  * W (wrong in a safe direction) and C (too cautious): where a finding of the review fixes the row
-    (S1, S2, S3, N4) the expected roles are asserted exactly; otherwise each number must be either
-    the role observed before or the role the review expects (never a third role), and never a new
-    INTENDED_ENTRY or CURRENT_MARKET that the review does not expect."""
+Since the second correction round INTENDED_ENTRY, CURRENT_MARKET and HISTORICAL_FILL are granted by an
+allow-list (price_roles._allow) and withheld otherwise; UNRESOLVED is the safe outcome. Each row: id,
+sentence, the review's verdict on the readings it observed, the roles it observed, and its expectation.
+  * D (dangerous: a wrong INTENDED_ENTRY, CURRENT_MARKET or HISTORICAL_FILL, or an entry-type price tied to
+    the wrong action), 58 rows: every number is the expected role, or UNRESOLVED where one of the three
+    roles was expected; no number has one of the three roles unless the expectation says so; the numbers
+    of UNTIE are tied to no action (or, for P20, not to the gold action of their clause).
+  * R (right): every number stays as observed, or becomes UNRESOLVED where it was one of the three roles
+    (the recall cost, listed exactly in RECALL_COST); never a different role.
+  * W (wrong in a safe direction) and C (too cautious): every number is the role observed, the role the
+    review expects, or UNRESOLVED where either was one of the three roles; the rows a finding fixes are
+    asserted as expected (UNRESOLVED accepted in place of one of the three roles)."""
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -24,6 +27,7 @@ from tradingbot.tkl_interpreter import TklInterpreter
 CM, IE, HF, AVG = R.CURRENT_MARKET, R.INTENDED_ENTRY, R.HISTORICAL_FILL, R.AVERAGE_OR_COST_BASIS
 STOP, TGT, CHART, OCM, UNR, NAP = R.STOP, R.TARGET, R.CHART_LEVEL, R.OTHER_CONTRACT_MONTH, R.UNRESOLVED, R.NOT_A_PRICE
 EXEC = (IE, CM)
+GRANTED = (IE, CM, HF)
 T0 = datetime(2026, 11, 5, 14, 30, tzinfo=timezone.utc)
 
 # id: (sentence, verdict, observed before, expected now). In the expected list a set means "either".
@@ -195,6 +199,138 @@ TABLE = {
     "F02": ("Long crude here at 71.20. Silver stop 30.20 for those still holding.", "R", [CM, STOP], None),
 }
 
+# The confirmation review's 118 sentences (verdicts R 55, D 35, W 14, C 14). An expectation of None:
+# the review found the observed roles right.
+CONF = {
+    "N01": ("We are not, as of this morning, bidding gold at 2,380.", "D", [IE], [UNR]),
+    "N02": ("Not something we do often, but we are bidding crude at 70.", "R", [IE], None),
+    "N03": ("I don't think we will be buying crude, at least not at 71.20.", "R", [UNR], None),
+    "N04": ("There is no way we are bidding gold here, at 2,380.", "R", [UNR], None),
+    "N05": ("We never said to buy gold, certainly not with a limit at 2,380.", "R", [UNR], None),
+    "N06": ("It is not true that we are not bidding gold at 2,380.", "C", [UNR], [IE]),
+    "N07": ("We would not say no to buying crude at 70 on a limit.", "R", [UNR], None),
+    "N08": ("Not cancelling: our bid at 2,380 stays.", "C", [UNR], [IE]),
+    "N09": ("Cancelled the 70 bid. New bid at 69 on a limit.", "R", [UNR, IE], None),
+    "N10": ("Our old limit at 70 is cancelled; new limit at 69.", "R", [UNR, IE], None),
+    "N11": ("We cancelled the gold order and placed a new limit at 2,375.", "C", [UNR], [IE]),
+    "N12": ("Scrap that, buy crude at 70 on a limit instead.", "C", [UNR], [IE]),
+    "N13": ('He said "buy gold at 2,380 on a limit" but we disagree.', "D", [IE], [UNR]),
+    "N14": ('A subscriber asked: "should I bid crude at 70?"', "R", [UNR], None),
+    "N15": ("My friend is bidding gold at 2,380.", "D", [IE], [UNR]),
+    "N16": ("Goldman is bidding gold at 2,380 according to the desk.", "D", [IE], [UNR]),
+    "N17": ("Clients are bidding crude at 70 on a limit.", "D", [IE], [UNR]),
+    "N18": ("He bids at 2,380; we bid at 2,370.", "D", [IE, IE], [UNR, IE]),
+    "N19": ("The desk next to us is buying crude at 70 on a limit, we stay out.", "D", [IE], [UNR]),
+    "N20": ("Should we buy crude at 70? Yes, bid at 70 on a limit.", "R", [UNR, IE], None),
+    "N21": ("Buy crude at 70 on a limit? No.", "R", [UNR], None),
+    "N22": ("Bid gold at 2,380? Undecided for now.", "R", [UNR], None),
+    "N23": ("Should crude trade at 71.20, we buy.", "R", [UNR], None),
+    "N24": ("Were gold at 2,400, we would sell.", "R", [UNR], None),
+    "N25": ("Assuming crude is trading at 71.20 at the open, we buy.", "D", [CM], [UNR]),
+    "N26": ("Crude trading at 71.20 and we buy, otherwise we wait.", "D", [CM], [UNR]),
+    "N27": ("In case gold trades at 2,400 we sell on a limit.", "R", [UNR], None),
+    "N28": ("Gold could be trading at 2,500 by Christmas.", "D", [CM], [UNR]),
+    "N29": ("Gold may be sitting at 2,500 in a month.", "D", [CM], [UNR]),
+    "N30": ("Crude is trading at 80 in my dreams.", "D", [CM], [UNR]),
+    "N31": ("I think gold trades at 2,500 by the end of the year.", "D", [CM], [UNR]),
+    "N32": ("Gold seems headed to 2,500, we will see.", "R", [UNR], None),
+    "N33": ("I reckon crude sits at 75 by spring.", "D", [CM], [UNR]),
+    "N34": ("Gold might well be quoted at 2,500 in March.", "D", [CM], [UNR]),
+    "N35": ("We hold crude from 70 and are happy.", "W", [UNR], [HF]),
+    "N36": ("We own gold at 2,380 and keep it.", "W", [UNR], [HF]),
+    "N37": ("We remain long crude at 70 with the stop at 68.", "W", [UNR, STOP], [HF, STOP]),
+    "N38": ("We are holding the gold long at 2,380.", "W", [UNR], [HF]),
+    "N39": ("Our gold long at 2,380 is open and working.", "W", [UNR], [HF]),
+    "N40": ("Still bidding? No, the bid at 2,380 got filled yesterday.", "R", [HF], None),
+    "N41": ("Crude is trading at 71.20 and gold at 2,400.", "C", [CM, UNR], [CM, CM]),
+    "N42": ("We bid gold at 2,380 while crude trades at 71.", "R", [IE, CM], None),
+    "N43": ("Long crude at 70 on a limit, with Brent at 74.", "R", [IE, CM], None),
+    "N44": ("Long crude at 70 on a limit; Brent bids at 74.", "R", [IE, IE], None),
+    "N45": ("Long crude at 70 on a limit. WTI-Brent spread bid at 4.", "D", [IE, IE], [IE, UNR]),
+    "N46": ("Buy crude at 70 on a limit. The yellow metal bids at 2,380.", "R", [IE, IE], None),
+    "N47": ("Buy crude at 70 on a limit. Copper bids at 4.10.", "R", [IE, IE], None),
+    "N48": ("Buy gold at 2,380 on a limit; silver is trading at 31.", "R", [IE, CM], None),
+    "N49": ("Bids at 2,380 to 2,390 on gold.", "W", [IE, IE], [IE, IE]),
+    "N50": ("Bids between 2,380 and 2,390.", "R", [IE, IE], None),
+    "N51": ("Buy limits at 70, 69 and 68.", "R", [IE, IE, IE], None),
+    "N52": ("Levels to watch: 2,380, 2,400, 2,420. Bids at the first.", "R", [CHART, CHART, CHART], None),
+    "N53": ("Support at 2,380 and 2,350, bid at 2,360.", "R", [CHART, CHART, IE], None),
+    "N54": ("Bid 70 to 72 is the zone we like.", "W", [IE, IE], [IE, IE]),
+    "N55": ("Crude at 71.20, not 72, is where we would bid.", "C", [UNR, UNR], None),
+    "N56": ("No bid at 70 until crude closes above 72.", "R", [UNR, CHART], None),
+    "N57": ("Bids at 70, unless crude breaks 69 first.", "R", [IE, CHART], None),
+    "N58": ("Bid at 70 on a limit, but only if the dollar weakens.", "R", [IE], None),
+    "N59": ("The market isn't at 2,400 yet, it is at 2,390.", "C", [UNR, UNR], [UNR, CM]),
+    "N60": ("Gold is not trading at 2,400, it is trading at 2,390.", "R", [UNR, CM], None),
+    "N61": ("Crude never traded at 71.20 today, it sits at 70.50.", "R", [CHART, CM], None),
+    "N62": ("Spot is no longer 2,400.", "R", [UNR], None),
+    "N63": ("We are buying gold at 2,380 on a limit, not at 2,400.", "R", [IE, UNR], None),
+    "N64": ("Forget the 2,380 bid; bid at 2,370 instead.", "D", [IE, IE], [UNR, IE]),
+    "N65": ("We withdrew the 2,380 order this morning and we bid 2,370 now.", "C", [UNR, UNR], [UNR, IE]),
+    "N66": ("They told us to buy crude at 70, so we did.", "W", [UNR], [HF]),
+    "N67": ("The market is quoting 71.20 if you can believe it.", "C", [UNR], [CM]),
+    "N68": ("Bid at 70 on a limit, if nothing changes.", "C", [UNR], [IE]),
+    "N69": ("We bid crude at 70 on a limit.", "R", [IE], None),
+    "N70": ("Crude now trades at 71.20.", "R", [CM], None),
+    "N71": ("Gold is trading at 2,400 right now.", "R", [CM], None),
+    "N72": ("Buy crude at 70 on a limit, stop 68, target 75.", "R", [IE, STOP, TGT], None),
+    "N73": ("Gold sits at 2,400 while we wait to buy at 2,380.", "C", [CM, UNR], [CM, IE]),
+    "N74": ("Our order to buy gold at 2,380 is still working.", "R", [IE], None),
+    "N75": ("Bought crude at 70 this morning. Brent bids at 74 look strong.", "D", [HF, IE], [HF, UNR]),
+    "N76": ("We bought crude at 70. The bid at 2,380 on the yellow metal is ours too.", "D", [HF, IE], [HF, IE]),
+    "N77": ("Long gold at 2,380 on a limit. Adding on any dip to 2,350 in silver.", "R", [IE, IE], None),
+    "N78": ("We sold crude at 74 yesterday. Bids at 72 on the next one.", "R", [HF, IE], None),
+    "N79": ("Never not bidding gold at 2,380, that's our rule.", "R", [UNR], None),
+    "N80": ("We will not be bidding gold at 2,380, they will.", "R", [UNR], None),
+    "P01": ("We are not going to, at these levels, bid gold at 2,380.", "D", [IE], [UNR]),
+    "P02": ("The 2,380 bid is off.", "D", [IE], [UNR]),
+    "P03": ("Ignore the bid at 2,380.", "D", [IE], [UNR]),
+    "P04": ("Drop the 2,380 bid, it is void.", "D", [IE], [UNR]),
+    "P05": ("The bid at 2,380 is no longer valid.", "R", [UNR], None),
+    "P06": ("We were going to bid gold at 2,380 but changed our mind.", "D", [IE], [UNR]),
+    "P07": ("She is buying crude at 70 on a limit.", "D", [IE], [UNR]),
+    "P08": ("It bids at 2,380 according to the screen.", "D", [IE], [UNR]),
+    "P09": ("Somebody on the forum is bidding gold at 2,380.", "R", [UNR], None),
+    "P10": ("The fund I follow bids gold at 2,380.", "D", [IE], [UNR]),
+    "P11": ("JPM sees gold at 2,600.", "R", [UNR], None),
+    "P12": ("We are buying gold now. A reader suggested a limit at 2,350.", "D", [IE], [UNR]),
+    "P13": ("We are buying gold now. My friend bids at 2,350.", "D", [IE], [UNR]),
+    "P14": ("Long Dec gold at 2,380 on a limit. Bid Feb gold at 2,400.", "R", [IE, IE], None),
+    "P15": ("We are buying gold at 2,380 on a limit. A friend is bidding at 2,360.", "D", [IE, IE], [IE, UNR]),
+    "P16": ("We are buying gold now. Bids at 2,350 would have been better.", "R", [UNR], None),
+    "P17": ("We are buying gold now. The old order at 2,350 is dead.", "D", [IE], [UNR]),
+    "P18": ("We are buying gold now. Silver: bids at 30.", "R", [IE], None),
+    "P19": ("We are buying gold now. The white metal: bids at 30.", "D", [IE], [IE]),
+    "P20": ("We are buying gold now, Ag bids at 30.", "D", [IE], [IE]),
+    "P21": ("We are buying gold at 2,380 on a limit. Watching platinum too, bid 950 there.", "D", [IE, IE], [IE, IE]),
+    "P22": ("Gold could be trading at 2,500 soon.", "R", [UNR], None),
+    "P23": ("Gold will be trading at 2,500.", "R", [UNR], None),
+    "P24": ("Gold is going to be trading at 2,500.", "R", [UNR], None),
+    "P25": ("Gold, if anything, is trading at 2,400.", "C", [UNR], [CM]),
+    "P26": ("Gold trading at 2,400 is the base case for next week.", "R", [UNR], None),
+    "P27": ("Bids at 2,380 are in, though nobody expects a fill.", "C", [UNR], [IE]),
+    "P28": ("Bids at 2,380 are in.", "R", [IE], None),
+    "P29": ("Gold at 2,410 now; our bid is not at 2,400 but at 2,390.", "C", [CM, UNR, UNR], [CM, UNR, IE]),
+    "P30": ("We hold gold; the market sits at 2,410.", "R", [CM], None),
+    "H01": ("He bought crude at 70.", "W", [HF], [UNR]),
+    "H02": ("My friend bought gold at 2,380 this morning.", "W", [HF], [UNR]),
+    "H03": ("We almost bought crude at 70.", "W", [HF], [UNR]),
+    "H04": ("We nearly sold gold at 2,450.", "W", [HF], [UNR]),
+    "H05": ("We bought crude at 70 in the backtest.", "W", [HF], [UNR]),
+    "H06": ("Clients bought gold at 2,380.", "W", [HF], [UNR]),
+    "H07": ("We are buying gold now. My friend bought at 2,350.", "D", [HF], [UNR]),
+    "H08": ("We are buying gold now. He is out at 2,350.", "R", [UNR], None),
+}
+
+# D rows whose danger was (also) a wrong action tie: these numbers must be tied to no action.
+UNTIE = {"N76": [1], "P12": [0], "P13": [0], "P15": [1], "P17": [0], "P19": [0], "P20": [0], "P21": [1], "H07": [0]}
+# R rows in which a number with one of the three roles is now UNRESOLVED: the recall cost of the allow-list.
+RECALL_COST = frozenset((
+    "A18", "B27", "C06", "C18", "S13",                                              # first review
+    "N02", "N40", "N44", "N46", "N47", "N57", "N58", "N60", "N61", "N63"))          # confirmation review
+# W rows of the confirmation review the allow-list fixes (a third party's or a nearly made fill): exact.
+FIXED_BY_ALLOWLIST = {"H01", "H02", "H03", "H04", "H06"}
+
 # W and C rows a finding of the review fixes in this round: asserted exactly.
 FIXED_BY_FINDING = {"A01": "S2", "A04": "S2", "A08": "S2", "A72": "S2", "C13": "S2", "C30": "S2",
                     "A12": "S1", "D01": "S1", "D03": "S1", "D05": "S1", "D06": "S1",
@@ -207,6 +343,9 @@ EXACTNESS = {"S1": [X.APPROXIMATE, X.EXACT, X.EXACT], "S17": [X.EXACT, X.APPROXI
              "B01": [X.EXACT], "B02": [X.APPROXIMATE, X.APPROXIMATE], "B03": [X.APPROXIMATE, X.APPROXIMATE],
              "B16": [X.APPROXIMATE], "B17": [X.EXACT], "B19": [X.APPROXIMATE], "E02": [X.EXACT], "E03": [X.EXACT],
              "E04": [X.EXACT]}
+# C9: both ends of a range joined by "to" are APPROXIMATE (a move "from X to Y" is not a range)
+CONF_EXACTNESS = {"N49": [X.APPROXIMATE, X.APPROXIMATE], "N54": [X.APPROXIMATE, X.APPROXIMATE],
+                  "N50": [X.APPROXIMATE, X.APPROXIMATE]}
 NS = (M.NOT_STATED, None)
 MONTHS = {"S15": [(M.NAMED, "DEC"), (M.NAMED, "JAN")], "S16": [NS, NS], "A30": [(M.NAMED, "DEC")], "A31": [NS],
           "A32": [(M.NAMED, "DEC")], "A34": [NS], "A35": [NS], "B05": [NS, NS], "B06": [NS],
@@ -227,41 +366,78 @@ def _ok(got, want):
     return got in want if isinstance(want, set) else got == want
 
 
-def test_the_table_is_the_reviews():
+def test_the_tables_are_the_reviews():
     verdicts = [v for _t, v, _o, _e in TABLE.values()]
     assert len(TABLE) == 161
     assert (verdicts.count("R"), verdicts.count("D"), verdicts.count("W"), verdicts.count("C")) == (107, 23, 20, 11)
     assert all((e is None) == (v == "R") for _t, v, _o, e in TABLE.values())
+    verdicts = [v for _t, v, _o, _e in CONF.values()]
+    assert len(CONF) == 118
+    assert (verdicts.count("R"), verdicts.count("D"), verdicts.count("W"), verdicts.count("C")) == (55, 35, 14, 14)
+    assert not set(TABLE) & set(CONF)
+    assert sum(1 for row in list(TABLE.values()) + list(CONF.values()) if row[1] == "D") == 58
 
 
-@pytest.mark.parametrize("key", sorted(k for k, row in TABLE.items() if row[1] == "R"))
-def test_right_rows_stay_right(key):
-    text, _v, observed, _e = TABLE[key]
-    assert [r.role for r in _read(text)] == observed
+ROWS = {**TABLE, **CONF}
 
 
-@pytest.mark.parametrize("key", sorted(k for k, row in TABLE.items() if row[1] == "D"))
+def _right_or_withheld(got, observed):
+    """Each number as observed, or UNRESOLVED where it was one of the three granted roles."""
+    return len(got) == len(observed) and all(g == o or (o in GRANTED and g == UNR) for g, o in zip(got, observed))
+
+
+@pytest.mark.parametrize("key", sorted(k for k, row in ROWS.items() if row[1] == "R"))
+def test_right_rows_stay_right_or_become_unresolved(key):
+    text, _v, observed, _e = ROWS[key]
+    got = [r.role for r in _read(text)]
+    assert _right_or_withheld(got, observed)
+    assert (got != observed) == (key in RECALL_COST), "the recall cost list is exact"
+
+
+def test_the_recall_cost():
+    """How many RIGHT rows lose one of the three roles to UNRESOLVED: 15 of 162 (5 of 107, 10 of 55)."""
+    rights = [k for k, row in ROWS.items() if row[1] == "R"]
+    lost = [k for k in rights if [r.role for r in _read(ROWS[k][0])] != ROWS[k][2]]
+    assert sorted(lost) == sorted(RECALL_COST) and len(rights) == 162
+
+
+def _ok_or_withheld(g, e):
+    return _ok(g, e) or (not isinstance(e, set) and e in GRANTED and g == UNR)
+
+
+@pytest.mark.parametrize("key", sorted(k for k, row in ROWS.items() if row[1] == "D"))
 def test_dangerous_rows_are_safe(key):
-    text, _v, observed, expected = TABLE[key]
-    got = [r.role for r in _read(text)]
-    assert len(got) == len(expected) and all(_ok(g, e) for g, e in zip(got, expected))
-    for g, e in zip(got, expected):
-        if g in EXEC:
-            assert _ok(g, e), "an execution-relevant role the review does not expect"
+    text, _v, _observed, expected = ROWS[key]
+    got = _read(text)
+    roles = [r.role for r in got]
+    assert len(roles) == len(expected) and all(_ok_or_withheld(g, e) for g, e in zip(roles, expected))
+    for g, e in zip(roles, expected):
+        if g in GRANTED:
+            assert _ok(g, e), "a granted role the review does not expect"
+    for i in UNTIE.get(key, []):
+        if key == "P20":   # the silver bid of a gold clause: never the gold action's
+            assert got[i].role not in GRANTED or got[i].action_id is None
+        else:
+            assert got[i].action_id is None and got[i].association == "NONE"
 
 
-@pytest.mark.parametrize("key", sorted(k for k, row in TABLE.items() if row[1] in ("W", "C")))
+@pytest.mark.parametrize("key", sorted(k for k, row in ROWS.items() if row[1] in ("W", "C")))
 def test_wrong_and_cautious_rows_never_get_worse(key):
-    text, _v, observed, expected = TABLE[key]
+    text, _v, observed, expected = ROWS[key]
     got = [r.role for r in _read(text)]
-    assert len(got) == len(expected)
-    if key in FIXED_BY_FINDING:
-        assert all(_ok(g, e) for g, e in zip(got, expected))
-    else:
-        assert all(_ok(g, e) or g == o for g, o, e in zip(got, observed, expected))
-    for g, o, e in zip(got, observed, expected):
-        if g in EXEC:
-            assert _ok(g, e) or g == o
+    assert len(got) == len(observed)
+    exp = expected or observed
+    if key in FIXED_BY_FINDING or key in FIXED_BY_ALLOWLIST:
+        assert all(_ok_or_withheld(g, e) for g, e in zip(got, exp))
+    for g, o, e in zip(got, observed, exp):
+        assert g == o or _ok(g, e) or (g == UNR and (o in GRANTED or (not isinstance(e, set) and e in GRANTED)))
+        if g in GRANTED:
+            assert g == o or _ok(g, e)
+
+
+@pytest.mark.parametrize("key", sorted(CONF_EXACTNESS))
+def test_range_ends_are_approximate(key):
+    assert [r.exactness for r in _read(CONF[key][0])] == CONF_EXACTNESS[key]
 
 
 @pytest.mark.parametrize("key", sorted(EXACTNESS))

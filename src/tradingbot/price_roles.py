@@ -23,18 +23,29 @@ How a role is decided. Context, never one phrase, and no default:
     with ENTRY_KIND_NOT_STATED. Two readings that conflict (an order word AND a market-state word)
     are UNRESOLVED with CONFLICTING_CUES. Only INTENDED_ENTRY is a price instruction; a freshly
     reported fill stays HISTORICAL_FILL;
-  * INTENDED_ENTRY and CURRENT_MARKET (the two roles an execution could one day rest on) need their
-    positive cue AND no defeater in the number's own clause: a question, a counterfactual, a
-    cancelled or withdrawn order, a negation, a third party's view, a forecast, a plan with no
-    transaction, a position already held, a market state under a condition, a modal or a future
-    time, a chain with an unresolved number. A defeated reading is UNRESOLVED with the defeater's
-    code first; a hit or completed order is HISTORICAL_FILL; a negated fill is no fill;
+  * INTENDED_ENTRY, CURRENT_MARKET and HISTORICAL_FILL (the roles an execution or a reconciliation could
+    one day rest on) are GRANTED by an allow-list, never merely left standing (``_allow``): (a) the
+    positive cue is in the number's own clause (the interpreter's clause, cut at a coordinating
+    conjunction that starts another verb phrase); (b) every word of that clause before the number is a
+    function word, the publisher's own word, generic trading vocabulary or a market's name, so the
+    subject is the publisher, absent (a note, an imperative) or, for a market state, the market itself,
+    and no person follows the number; (c) the number's whole SENTENCE carries no veto of a closed class:
+    a question, quoted or reported speech, a counterfactual, a cancellation or an abandoned plan, a near
+    miss, a negation, a condition, a forecast, a modal or an opinion, and for a market state a future
+    time or "will"; (d) a market state is present tense and carries no order cue. A later sentence with
+    no price that cancels, abandons or flatly negates withholds the price instructions before it; one
+    that names another person or reports speech withholds the granted roles next to it. A
+    withheld reading is UNRESOLVED with the code of what vetoed it or what was missing first; a hit or
+    completed order is HISTORICAL_FILL; a negated fill is no fill;
   * an executed price is HISTORICAL_FILL even at the stop or the target ("exited at our 75 target",
     "stop hit at 69.50"); a level named AS the stop or target stays STOP or TARGET (rubric 14.1).
-A number is tied to an action only by its own clause, or to the post's only trading action unless its
-own clause is another action's that names a different market. Cost: one pass per post over at
+A number with one of the three granted roles is tied only to the action of its own clause, and not when
+its segment names a market the rest of the clause does not or the clause names two markets; never to the
+post's only action by fallback. STOP, TARGET and AVERAGE_OR_COST_BASIS keep that fallback unless their
+clause NAMES (in its own words) a market the action's clauses do not. Cost: one pass per post over at
 most MAX_NUMBERS numbers (the rest UNRESOLVED, NUMBER_CAP_REACHED) with bounded word windows.
-Exactness is how the number is written (a hedge word, an approximation mark, an end of a range).
+Exactness is how the number is written (a hedge word, an approximation mark, an end of a range: "between
+X and Y", "X to Y", never a move "from X to Y").
 The contract month is assigned only on evidence in the text: a month named as a contract month (not
 as a time: "in December", "December was", "the December high" and "Dec 12" are times or dates), a
 futures code, "front month", "second month" (not "the second month of the trade"); a month named in
@@ -42,7 +53,8 @@ another segment of the sentence counts only when that segment has no price of it
 the post's date, the listed contracts or the price.
 
 A fault anywhere in this path is counted in FAULT_COUNTS and logged with its public code only (never
-text); the readings then carry READER_FAULT or NO_CLAUSE_CONTEXT."""
+text); the readings then carry READER_FAULT or NO_CLAUSE_CONTEXT (also when the clauses exist but no
+number lies in one: CLAUSE_OFFSET_MISMATCH)."""
 from __future__ import annotations
 
 import bisect
@@ -124,6 +136,10 @@ REASON_CODES = frozenset((
     "QUESTION", "COUNTERFACTUAL", "CANCELLED_OR_WITHDRAWN", "NEGATED", "NOT_FILLED", "THIRD_PARTY",
     "FORECAST", "NO_TRANSACTION_WORD", "POSITION_ALREADY_HELD", "CONDITIONAL_MARKET_STATE",
     "HYPOTHETICAL_MARKET_STATE", "FUTURE_MARKET_STATE", "CHAIN_WITH_UNRESOLVED",
+    # the allow-list of INTENDED_ENTRY, CURRENT_MARKET and HISTORICAL_FILL (what vetoed, or what was missing)
+    "REPORTED_SPEECH", "ABANDONED_PLAN", "NEAR_MISS", "CONDITIONAL", "MODAL_OR_OPINION", "SUBJECT_NOT_PUBLISHER",
+    "SUBJECT_NOT_THE_MARKET", "CUE_OUTSIDE_CLAUSE", "WITHDRAWN_LATER_IN_POST",
+    "ATTRIBUTED_NEXT_SENTENCE",
     # the interpreter's clauses were not available (a fault, counted and logged)
     "NO_CLAUSE_CONTEXT",
     # contract month evidence
@@ -132,7 +148,8 @@ REASON_CODES = frozenset((
 ))
 
 # Public codes of the faults counted in FAULT_COUNTS (and logged, code only).
-FAULT_CODES = frozenset(("READER_FAULT", "READER_FAULT_NO_NUMBERS", "CLAUSE_CONTEXT_FAULT", "CLAUSE_SPLIT_MISMATCH"))
+FAULT_CODES = frozenset(("READER_FAULT", "READER_FAULT_NO_NUMBERS", "CLAUSE_CONTEXT_FAULT", "CLAUSE_SPLIT_MISMATCH",
+                         "CLAUSE_OFFSET_MISMATCH"))
 FAULT_COUNTS: Counter = Counter()
 _log = logging.getLogger(__name__)
 
@@ -226,7 +243,7 @@ YEAR_PREPS = frozenset(("in", "since", "during", "year", "fy", "by"))
 # defeaters (generic English)
 NEGATIONS = frozenset(("not", "no", "never", "nobody", "none", "neither", "nor", "nothing", "don't", "dont",
                        "doesn't", "didn't", "won't", "wouldn't", "isn't", "aren't", "wasn't", "weren't", "can't",
-                       "cannot", "couldn't", "shouldn't", "haven't", "hasn't", "hadn't", "without"))
+                       "cannot", "couldn't", "shouldn't", "haven't", "hasn't", "hadn't", "without", "nope", "nah"))
 CANCEL_WORDS = frozenset(("cancel", "cancels", "cancelled", "canceled", "cancelling", "canceling", "cancellation",
                           "pulled", "scrapped", "scrap", "scrapping", "removed", "withdrawn", "withdrew", "withdraw",
                           "deleted", "killed", "gone"))
@@ -259,6 +276,76 @@ LEVEL_FOLLOW = frozenset(("of", "at", "@", "is", "was", "were", "near", "around"
                           "here", "printed", "prints", "made", "set", "yesterday", "today", "this", "last"))
 # a word after a month name that makes it a time, not a contract ("December was", "the December high")
 MONTH_TIME_NEXT = frozenset(("was", "were", "has", "had", "been", "month", "months")) | LEVEL_NOUNS
+# ------------------------------------------------------------------ the allow-list (closed classes, generic English)
+# INTENDED_ENTRY, CURRENT_MARKET and HISTORICAL_FILL are GRANTED, never merely left standing: see ``_allow``.
+QUOTE_MARKS = ('"', "“", "”", "«", "»")
+REPORT_WORDS = frozenset((
+    "said", "says", "say", "saying", "suggested", "suggests", "suggest", "suggesting", "asked", "asks", "ask",
+    "asking", "told", "tells", "tell", "telling", "according", "claims", "claimed", "claim", "claiming", "reported",
+    "reports", "reportedly", "heard", "hear", "hears", "rumor", "rumors", "rumour", "rumours", "rumored", "rumoured",
+    "recommended", "recommends", "recommend", "recommending", "advised", "advises", "advise", "advising",
+    "mentioned", "mentions", "wrote", "writes", "tweeted", "quoting"))
+VETO_MODALS = frozenset(("could", "might", "may", "would", "should", "must", "can", "cannot", "ought", "we'd", "i'd",
+                         "you'd", "they'd", "he'd", "she'd", "it'd"))
+FUTURE_MODALS = frozenset(("will", "shall", "gonna", "won't"))
+OPINION_WORDS = frozenset((
+    "think", "thinks", "thought", "thinking", "believe", "believes", "believed", "assume", "assumes", "assumed",
+    "assuming", "suppose", "supposes", "supposed", "supposing", "guess", "guessing", "reckon", "reckons", "feel",
+    "feels", "hope", "hopes", "hoped", "hoping", "hopefully", "wish", "wishes", "wished", "potentially",
+    "presumably", "apparently", "allegedly", "supposedly", "seemingly", "seem", "seems", "seemed", "appears",
+    "appear", "looks", "see", "sees", "seeing", "headed", "heading", "scenario", "scenarios", "odds", "chance",
+    "chances", "bet", "ideally", "theoretically", "imagine", "imagining"))
+CONDITION_VETO = frozenset(("if", "unless", "provided", "providing", "once", "whenever", "when", "assuming", "until",
+                            "till", "otherwise", "lest", "whether", "upon", "depending", "contingent",
+                            "suppose", "supposing", "given"))
+NEAR_MISS_WORDS = frozenset(("almost", "nearly", "narrowly", "missed", "miss", "misses", "missing"))
+FUTURE_MARKET_WORDS = FUTURE_TIME | frozenset(("by", "spring", "summer", "autumn", "winter", "christmas",
+                                               "year-end", "eventually"))
+CANCEL_VETO = CANCEL_WORDS | frozenset((
+    "remove", "removing", "withdrawing", "delete", "kill", "killing", "forget", "ignore", "ignored", "disregard",
+    "disregarded", "void", "voided", "dead", "expired", "expire", "expires", "expiring", "scratch", "scratched",
+    "abandon", "abandoned", "abandoning", "nix", "nixed", "revoke", "revoked", "rescind", "rescinded", "retract",
+    "retracted", "invalid", "invalidated", "invalidate", "replace", "replaced", "replacing", "skip", "skipping",
+    "skipped", "stale", "obsolete", "nevermind", "scraps", "lapsed", "lapse", "lapses", "lapsing"))
+_OBJECT_STARTS = frozenset(("the", "our", "my", "that", "this", "it", "all", "those", "these", "a", "an", "any",
+                            "every", "them"))
+_BE_FORMS = frozenset(("is", "are", "was", "were", "be", "been", "being", "am", "called"))
+INTENT_WORDS = frozenset(("going", "planning", "planned", "intending", "intended", "hoping", "hoped", "looking",
+                          "thinking", "meaning", "meant", "wanting", "wanted", "aiming", "aimed", "considering",
+                          "tempted", "set", "ready", "prepared", "due", "supposed", "about"))
+_INTENT_ADVERBS = frozenset(("just", "really", "originally", "initially", "actually", "all", "still", "first"))
+# who else may be the subject or the beneficiary of a number (read after the number; before it, every word
+# must be in the allow-list below)
+PERSON_WORDS = THIRD_PARTY | frozenset((
+    "he", "she", "him", "her", "his", "hers", "them", "their", "theirs", "you", "your", "yours", "client",
+    "clients", "customer", "customers", "friend", "friends", "reader", "readers", "subscriber", "subscribers",
+    "member", "members", "follower", "followers", "desk", "fund", "bank", "broker", "brokers", "analyst",
+    "trader", "buyer", "seller", "guy", "guys", "colleague", "colleagues", "partner", "partners"))
+_ADDRESSEE = frozenset(("you", "your", "yours"))   # the reader addressed ("thank you") is not another trader
+# the words that may stand in the number's clause before an INTENDED_ENTRY or HISTORICAL_FILL: function
+# words, the publisher's own words and generic trading vocabulary. Any other word may be an explicit subject
+# that is not the publisher ("a reader", "the desk", "the yellow metal", "my friend") and withholds the role.
+ALLOWED_FUNCTION = frozenset((
+    "the", "a", "an", "this", "these", "those", "some", "any", "all", "both", "each", "every", "another", "of",
+    "to", "at", "@", "in", "on", "for", "from", "with", "by", "into", "onto", "and", "&", "or", "/", "plus", "but",
+    "so", "then", "also", "too", "just", "still", "again", "already", "now", "here", "there", "today", "tonight",
+    "morning", "afternoon", "evening", "session", "up", "down", "out", "off", "over", "under", "above", "below",
+    "near", "around", "about", "between", "more", "less", "new", "fresh", "first", "second", "third", "final",
+    "is", "are", "am", "was", "were", "be", "been", "being", "has", "have", "had", "do", "does", "did", "done",
+    "got", "get", "gets", "getting", "ok", "okay", "yes", "right", "while", "as", "because", "since", "flat",
+    "->", "-", "=", "$", "~", "+", "update", "finally", "only", "full", "initial", "starter",
+    "size", "tranche", "re", "let's", "lets", "me", "myself", "ourselves", "i'll", "we'll", "back", "price",
+    "stopped", "averaged", "went", "dip", "rally", "bounce", "spot", "futures", "front", "month", "contract",
+    "contracts", "open", "close", "market", "working", "resting", "pending", "live", "active", "recap", "alert",
+    "noon", "midday", "tranches"))
+ALLOWED_TRADING = (STOP_NOUNS | TARGET_NOUNS | LEVEL_NOUNS | AVERAGE_NOUNS | ENTRY_NOUNS | EXIT_NOUNS
+                   | MARKET_STATE_ADVERBS | MARKET_STATE_VERBS | OWN_PAST | OWN_OR_MARKET_PAST | MARKET_MOVE_PAST
+                   | MARKET_MOVE_PRESENT | PLAN_WORDS | PLAN_BEFORE_TO | DIP_WORDS | ORDER_WORDS | FILL_WORDS
+                   | ACTION_CONTEXT | EXIT_CONTEXT | PAST_MARKERS | HOLDER_WORDS | POSITION_WORDS | APPROX_BEFORE
+                   | APPROX_AFTER | ATTACHERS | CHAIN_WORDS | TIME_PREPS | SIZE_UNITS | PERIOD_UNITS | TIME_UNITS
+                   | CHANGE_UNITS | TRANSACTION_WORDS | COMPLETION_WORDS | PRIOR_WORDS)
+_ALLOWED_BEFORE = ALLOWED_FUNCTION | ALLOWED_TRADING
+_MARKET_SINGLE = frozenset(w for name in IT.MARKET_NOUNS for w in name.split()) - PERSON_WORDS
 _MONTH3 = {"jan": "JAN", "feb": "FEB", "mar": "MAR", "apr": "APR", "may": "MAY", "jun": "JUN", "jul": "JUL",
            "aug": "AUG", "sep": "SEP", "oct": "OCT", "nov": "NOV", "dec": "DEC"}
 _SEG_CHARS = ".,;:!?"
@@ -350,7 +437,8 @@ class ClauseUnit:
     kind: Literal["CLAUSE", "LEVEL_LINE", "OTHER"] = "CLAUSE"
     month_applicable: bool = True  # False when the clause's market is a ticker (no contract month)
     past_execution: bool = False   # the interpreter read the clause as the publisher's past execution
-    asset: str | None = None       # the market the interpreter read for that action
+    asset: str | None = None       # the market the interpreter read for that action (may be carried in)
+    named_assets: tuple[str, ...] = ()   # the markets the clause names in its OWN words (interpreter codes)
 
 
 # ------------------------------------------------------------------ reading
@@ -617,6 +705,11 @@ class _Ctx:
     holder_before: bool              # a holder word (we, our) earlier in the sentence
     cond_before: bool                # a condition word (if, once) earlier in the sentence
     question: bool                   # the sentence is a question
+    # the allow-list of INTENDED_ENTRY, CURRENT_MARKET and HISTORICAL_FILL (``_allow``)
+    before: list[_Tok] = None        # the number's clause before it (within its sentence), numbers excluded
+    after_words: list[str] = None    # the number's clause after it (within its sentence)
+    sent_veto: dict = None           # the first veto of the number's sentence, per role family
+    clause_ctx: Callable[[], _Ctx | None] | None = None   # the same context cut to the number's own clause
 
 
 def read_price_roles(text: str | None, units: list[ClauseUnit] | tuple = (),
@@ -672,16 +765,33 @@ def read_price_roles(text: str | None, units: list[ClauseUnit] | tuple = (),
             if u.trading:
                 asset_of.setdefault(u.action_id, u.asset)
 
-    def unit_for(t: _Tok) -> ClauseUnit | None:
-        if not units or to_norm is None:
-            return None
-        p = to_norm(t.start)
+    offset_fault = [False]
+
+    def unit_index(p: int) -> int | None:
         if not ordered:
-            inside = [u for u in units if u.start <= p < u.end]
-            return inside[0] if inside else None
+            return next((k for k, u in enumerate(units) if u.start <= p < u.end), None)
         # disjoint units in order: only the last unit starting at or before p can contain it
         k = bisect.bisect_right(starts, p) - 1
-        return units[k] if k >= 0 and units[k].start <= p < units[k].end else None
+        return k if k >= 0 and units[k].start <= p < units[k].end else None
+
+    # the interpreter's clause of every token (one pass; None without the interpreter's clauses)
+    tok_unit: list[int | None] = [None] * n_tok
+    if units and to_norm is not None:
+        for x in toks:
+            tok_unit[x.i] = unit_index(to_norm(x.start))
+        if not any(tok_unit[x.i] is not None for x in nums):
+            # the clauses exist but no number lies in one: a wrong offset map, never silent
+            _note("CLAUSE_OFFSET_MISMATCH")
+            offset_fault[0] = True
+    sent_last: dict[int, int] = {}
+    for x in toks:
+        sent_last[sent_id[x.i]] = x.i
+    sent_veto_cache: dict[int, dict] = {}
+
+    def sentence_veto(si: int) -> dict:
+        if si not in sent_veto_cache:
+            sent_veto_cache[si] = _sentence_vetoes(toks[sent_first[si]:sent_last[si] + 1])
+        return sent_veto_cache[si]
 
     results: dict[int, dict] = {}
     unit_of: dict[int, ClauseUnit | None] = {}
@@ -694,50 +804,116 @@ def read_price_roles(text: str | None, units: list[ClauseUnit] | tuple = (),
         si, gi = sent_id[t.i], seg_id[t.i]
         floor = last_price_tok.get(si, -1)
         seg_start = seg_first[gi]
-        lo0 = max(seg_start, floor + 1)
-        lo = max(lo0, t.i - WINDOW)
-        left_toks = [x for x in toks[lo:t.i] if x.n is None or results.get(x.n, {}).get("role") == PriceReadingRole.NOT_A_PRICE]
-        if not left_toks and seg_start > floor + 1 and seg_start > 0 and sent_id[seg_start - 1] == si:
-            prev_seg = seg_id[seg_start - 1]   # "Stop: 86.00", "stop at yesterday's low, 69.80": a label
-            a = max(floor + 1, seg_first[prev_seg], seg_start - WINDOW)
-            left_toks = [x for x in toks[a:seg_start] if x.n is None]
         sent_start = sent_first[si]
-        ext_toks = [x for x in toks[max(sent_start, floor + 1, lo0 - WINDOW):lo0] if x.n is None]
-        # the words after: to the next number in the segment, plus the next segment when it has no number
-        right_toks: list[_Tok] = []
-        k = t.i + 1
-        while k < n_tok and seg_id[k] == gi and toks[k].n is None and sent_id[k] == si and len(right_toks) < WINDOW:
-            right_toks.append(toks[k])
-            k += 1
-        nxt_seg: list[_Tok] = []
-        end_own = seg_last[gi] + 1
-        if end_own < n_tok and sent_id[end_own] == si and not t.sent_end and seg_id[end_own] not in seg_has_number:
-            g2 = seg_id[end_own]
-            nxt_seg = toks[seg_first[g2]:min(seg_last[g2] + 1, seg_first[g2] + WINDOW)]
-        if k < n_tok and seg_id[k] != gi and sent_id[k] == si and not t.sent_end and nxt_seg:
-            right_toks += nxt_seg
-        wide = _words(toks[t.i + 1:min(end_own, t.i + 1 + WINDOW)] + nxt_seg)
-        left = _words(left_toks)
-        holder = holder_before[t.i]
-        sentence_initial = bool(left_toks) and left_toks[0].i == sent_start
-        cues = _left_cues(left, sentence_initial, holder)
-        ext_words = _words(ext_toks)
-        ext_cues = _left_cues(ext_words, bool(ext_toks) and ext_toks[0].i == sent_start, holder)
-        right_words = _words(right_toks)
+        ui = tok_unit[t.i]
+        unit_of[t.n] = units[ui] if ui is not None else None
         pk = last_price_tok.get(si)
         prev_price = results.get(toks[pk].n) if pk is not None else None
-        unit_of[t.n] = unit_for(t)
-        ctx = _Ctx(left=left, cues=cues, ext_words=ext_words, ext_cues=ext_cues, right=_right_cues(right_words),
-                   right_words=right_words, wide_words=wide,
-                   first_after=right_toks[0].word if right_toks and not t.seg_end else "",
-                   prev_price=prev_price, same_seg_prev=prev_price is not None and seg_id[prev_price["tok"].i] == gi,
-                   unit=unit_of[t.n], holder_before=holder, cond_before=cond_before[t.i],
-                   question=question.get(si, False))
+
+        def in_clause(x: _Tok, ui=ui) -> bool:
+            return ui is None or tok_unit[x.i] == ui
+
+        def build(keep, t=t, si=si, gi=gi, floor=floor, seg_start=seg_start, sent_start=sent_start,
+                  prev_price=prev_price, unit=None) -> _Ctx:
+            lo0 = max(seg_start, floor + 1)
+            lo = max(lo0, t.i - WINDOW)
+            left_toks = [x for x in toks[lo:t.i] if keep(x) and (
+                x.n is None or results.get(x.n, {}).get("role") == PriceReadingRole.NOT_A_PRICE)]
+            if not left_toks and seg_start > floor + 1 and seg_start > 0 and sent_id[seg_start - 1] == si:
+                prev_seg = seg_id[seg_start - 1]   # "Stop: 86.00", "stop at yesterday's low, 69.80": a label
+                a = max(floor + 1, seg_first[prev_seg], seg_start - WINDOW)
+                left_toks = [x for x in toks[a:seg_start] if x.n is None and keep(x)]
+            ext_toks = [x for x in toks[max(sent_start, floor + 1, lo0 - WINDOW):lo0] if x.n is None and keep(x)]
+            # the words after: to the next number in the segment, plus the next segment when it has no number
+            right_toks: list[_Tok] = []
+            k = t.i + 1
+            while k < n_tok and seg_id[k] == gi and toks[k].n is None and sent_id[k] == si and len(right_toks) < WINDOW:
+                if keep(toks[k]):
+                    right_toks.append(toks[k])
+                k += 1
+            nxt_seg: list[_Tok] = []
+            end_own = seg_last[gi] + 1
+            if end_own < n_tok and sent_id[end_own] == si and not t.sent_end and seg_id[end_own] not in seg_has_number:
+                g2 = seg_id[end_own]
+                nxt_seg = [x for x in toks[seg_first[g2]:min(seg_last[g2] + 1, seg_first[g2] + WINDOW)] if keep(x)]
+            if k < n_tok and seg_id[k] != gi and sent_id[k] == si and not t.sent_end and nxt_seg:
+                right_toks += nxt_seg
+            wide = _words([x for x in toks[t.i + 1:min(end_own, t.i + 1 + WINDOW)] if keep(x)] + nxt_seg)
+            left = _words(left_toks)
+            holder = holder_before[t.i]
+            sentence_initial = bool(left_toks) and left_toks[0].i == sent_start
+            cues = _left_cues(left, sentence_initial, holder)
+            ext_words = _words(ext_toks)
+            ext_cues = _left_cues(ext_words, bool(ext_toks) and ext_toks[0].i == sent_start, holder)
+            right_words = _words(right_toks)
+            prev = prev_price if prev_price is None or keep(prev_price["tok"]) else None
+            return _Ctx(left=left, cues=cues, ext_words=ext_words, ext_cues=ext_cues, right=_right_cues(right_words),
+                        right_words=right_words, wide_words=wide,
+                        first_after=right_toks[0].word if right_toks and not t.seg_end and right_toks[0].i == t.i + 1
+                        else "",
+                        prev_price=prev, same_seg_prev=prev is not None and seg_id[prev["tok"].i] == gi,
+                        unit=None if unit is False else unit_of[t.n], holder_before=holder,
+                        cond_before=cond_before[t.i],
+                        question=question.get(si, False))
+        ctx = build(lambda x: True)
+        # the allow-list reads the number's own clause (within its sentence), bounded
+        b_lo = max(sent_start, t.i - 2 * WINDOW)
+        ctx.before = [x for x in toks[b_lo:t.i] if in_clause(x) and (
+            x.n is None or results.get(x.n, {}).get("role") == PriceReadingRole.NOT_A_PRICE)]
+        ctx.after_words = [x.word for x in toks[t.i + 1:min(sent_last[si] + 1, t.i + 1 + WINDOW)]
+                           if in_clause(x) and x.n is None]
+        ctx.sent_veto = sentence_veto(si)
+        # (a) the number's own clause, cut at a coordinating conjunction that starts another verb phrase
+        # ("bid gold at 2,380 and we bought crude", "long gold at 2,380, then buy crude on a limit")
+        lb, rb = sent_start, sent_last[si] + 1
+        for k in range(t.i - 1, max(sent_start, t.i - 2 * WINDOW) - 1, -1):
+            if _conj_boundary(toks, k):
+                lb = k
+                break
+        for k in range(t.i + 1, min(sent_last[si] + 1, t.i + 1 + WINDOW)):
+            if _conj_boundary(toks, k):
+                rb = k
+                break
+        cut = any(in_clause(x) for x in toks[sent_start:lb]) or any(in_clause(x) for x in toks[rb:sent_last[si] + 1])
+
+        def own_clause(x: _Tok, f=in_clause, lb=lb, rb=rb) -> bool:
+            return f(x) and lb <= x.i < rb
+        ctx.clause_ctx = (lambda b=build, f=own_clause, cut=cut: b(f, unit=False if cut else None)) \
+            if (ui is not None or cut) else None
         res = _decide(toks, t, ctx)
         res["tok"] = t
         results[t.n] = res
         if res["role"] != PriceReadingRole.NOT_A_PRICE:
             last_price_tok[si] = t.i
+    # a later sentence with no price that cancels, abandons or flatly negates ("Actually, cancel that.",
+    # "Scrap it.", "Not anymore.") withholds every price instruction before it
+    priced_sents = {sent_id[r["tok"].i] for r in results.values() if r["role"] != PriceReadingRole.NOT_A_PRICE}
+    last_retraction = -1
+    for sx in sent_first:
+        if sx in priced_sents or sx <= last_retraction:
+            continue
+        code = sentence_veto(sx)["entry"]
+        sw = [x.word for x in toks[sent_first[sx]:sent_last[sx] + 1] if x.n is None]
+        back_to_past = len(sw) > 1 and sw[0] in ("that", "this", "it", "which") and sw[1] in ("was", "were", "had")
+        if code in ("CANCELLED_OR_WITHDRAWN", "ABANDONED_PLAN", "COUNTERFACTUAL") or back_to_past \
+                or (code in ("NEGATED", "MODAL_OR_OPINION", "FORECAST") and len(sw) <= 4):   # "Not anymore.", "Just a thought."
+            last_retraction = sx
+    if last_retraction >= 0:
+        for r in results.values():
+            if r["role"] == PriceReadingRole.INTENDED_ENTRY and sent_id[r["tok"].i] < last_retraction:
+                r["role"], r["reasons"] = PriceReadingRole.UNRESOLVED, ["WITHDRAWN_LATER_IN_POST"] + r["reasons"]
+    # a sentence with no price that names another person or reports speech ("From a reader's email.",
+    # "That's what my friend does.") withholds the granted roles of the sentences next to it
+    attributed: set[int] = set()
+    for sx in sent_first:
+        if sx in priced_sents:
+            continue
+        sw = [x.word.removesuffix("'s") for x in toks[sent_first[sx]:sent_last[sx] + 1] if x.n is None]
+        if any(w in PERSON_WORDS - _ADDRESSEE for w in sw) or sentence_veto(sx)["entry"] == "REPORTED_SPEECH":
+            attributed.update((sx - 1, sx + 1))
+    for r in results.values():
+        if r["role"] in GRANTED_ROLES and sent_id[r["tok"].i] in attributed:
+            r["role"], r["reasons"] = PriceReadingRole.UNRESOLVED, ["ATTRIBUTED_NEXT_SENTENCE"] + r["reasons"]
     # contract month (evidence of the number's own segment; else of a segment of its sentence that has no
     # price of its own), association, other month
     price_segs = {seg_id[r["tok"].i] for r in results.values() if r["role"] != PriceReadingRole.NOT_A_PRICE} \
@@ -755,6 +931,17 @@ def read_price_roles(text: str | None, units: list[ClauseUnit] | tuple = (),
             sent_ev[sx] = next((ev for gx in sent_segs[sx] if gx not in price_segs for ev in [seg_month(gx)] if ev),
                                None)
         return sent_ev[sx]
+    unit_toks: dict[int, list[_Tok]] = {}
+    for x in toks:
+        if tok_unit[x.i] is not None:
+            unit_toks.setdefault(tok_unit[x.i], []).append(x)
+    names_cache: dict[int, set] = {}
+
+    def unit_names(k: int) -> set:
+        """The markets clause ``k`` names in its own words (and the interpreter's codes for them)."""
+        if k not in names_cache:
+            names_cache[k] = _names(unit_toks.get(k, [])) | set(units[k].named_assets)
+        return names_cache[k]
     readings: list[PriceReading] = []
     month_of: dict[int, tuple] = {}
     action_month: dict[str, tuple] = {}
@@ -776,21 +963,33 @@ def read_price_roles(text: str | None, units: list[ClauseUnit] | tuple = (),
         role, reasons, exact = r["role"], list(r["reasons"]), r["exactness"]
         u = unit_of[n]
         action_id, assoc = None, "NONE"
-        if role != PriceReadingRole.NOT_A_PRICE:
+        ui = tok_unit[t.i]
+        if role in GRANTED_ROLES:
+            # tied only to the action of the number's own clause, never by fallback, and never when the
+            # number's own segment names a market that the rest of its clause does not ("we are buying gold
+            # now, silver bids at 30")
+            if u is not None and u.trading and u.action_id and u.kind == "CLAUSE":
+                seg_names = _names([x for x in toks[seg_first[seg_id[t.i]]:seg_last[seg_id[t.i]] + 1]
+                                    if tok_unit[x.i] == ui])
+                rest = _names([x for x in unit_toks.get(ui, []) if seg_id[x.i] != seg_id[t.i]])
+                two_markets = len(_mentions(unit_toks.get(ui, []))) > 1   # "buying gold now and silver at 30"
+                if not two_markets and not (seg_names and rest and not seg_names <= rest):
+                    action_id, assoc = u.action_id, "CLAUSE"
+        elif role != PriceReadingRole.NOT_A_PRICE:
             if u is not None and u.trading and u.action_id:
                 action_id, assoc = u.action_id, ("LEVEL_LINE" if u.kind == "LEVEL_LINE" else "CLAUSE")
             elif len(trading_ids) == 1 and role in (PriceReadingRole.STOP, PriceReadingRole.TARGET,
-                                                    PriceReadingRole.AVERAGE_OR_COST_BASIS,
-                                                    PriceReadingRole.HISTORICAL_FILL,
-                                                    PriceReadingRole.INTENDED_ENTRY):
-                # the post's only trading action, never when the number's own clause is another action's
-                # about a market that is not the target action's ("we bought crude ... gold looks heavy,
-                # bids at 2,380")
+                                                    PriceReadingRole.AVERAGE_OR_COST_BASIS):
+                # the post's only trading action, never when the number's own clause NAMES a market (in its
+                # own words, not the market the interpreter carried into it) that the action's clauses do not
                 target = trading_ids[0]
-                other_market = u is not None and u.action_id is not None and u.asset is not None \
-                    and u.asset != asset_of.get(target)
-                if not other_market:
+                own = unit_names(ui) if ui is not None else set()
+                theirs = set().union(*(unit_names(k) for k, x in enumerate(units) if x.action_id == target)) \
+                    | {asset_of.get(target)} - {None}
+                if not own or own <= theirs:
                     action_id, assoc = target, "SOLE_ACTION_IN_POST"
+        if offset_fault[0]:
+            reasons.append("NO_CLAUSE_CONTEXT")
         month, named = ContractMonthEvidence.NOT_STATED, None
         applicable = role != PriceReadingRole.NOT_A_PRICE
         unit_for_month = u if u is not None else first_unit_of.get(action_id) if action_id else None
@@ -844,8 +1043,10 @@ _REACHED = frozenset(("hit", "reached", "touched", "tagged"))
 
 
 def _decide(toks, t, c: _Ctx) -> dict:
-    """The role from the positive evidence, then the defeaters of an execution-relevant role."""
-    return _defeat(_evidence(toks, t, c), c)
+    """The role from the positive evidence; INTENDED_ENTRY, CURRENT_MARKET and HISTORICAL_FILL are then
+    granted only by the allow-list (``_allow``)."""
+    res = _evidence(toks, t, c)
+    return _allow(toks, t, res, c) if res["role"] in GRANTED_ROLES else res
 
 
 def _evidence(toks, t, c: _Ctx) -> dict:
@@ -860,12 +1061,17 @@ def _evidence(toks, t, c: _Ctx) -> dict:
               or (first_after == "or" and t.i + 2 < len(toks) and toks[t.i + 2].word == "so"))
     if prev_price is not None and left in (["and"], ["-"]) and prev_price.get("between"):
         approx = True
+    # both ends of a range joined by "to" ("bids at 2,380 to 2,390"; never a move "from 2,440 to 2,425")
+    range_to = first_after == "to" and t.i + 2 < len(toks) and toks[t.i + 2].n is not None \
+        and not toks[t.i + 1].seg_end and "from" not in left
+    if range_to or (prev_price is not None and c.same_seg_prev and left == ["to"] and prev_price.get("range_to")):
+        approx = True
     exact = Exactness.APPROXIMATE if approx else Exactness.EXACT
     chained_unresolved = False
 
     def done(role, *reasons):
         return {"role": role, "reasons": list(reasons), "exactness": exact, "between": att == "between",
-                "skipped": skipped, "chained_unresolved": chained_unresolved}
+                "skipped": skipped, "chained_unresolved": chained_unresolved, "range_to": range_to}
 
     nxt_word = toks[t.i + 1].word if t.i + 1 < len(toks) else ""
     if nxt_word in STRIKE_WORDS or att == "strike" or att in STRIKE_WORDS:
@@ -998,67 +1204,214 @@ def _evidence(toks, t, c: _Ctx) -> dict:
     return done(R.UNRESOLVED, "NO_ROLE_EVIDENCE")
 
 
-def _counterfactual(words: list[str]) -> bool:
-    return any(w in COUNTERFACTUAL_WORDS or (w in MODALS - {"will", "can", "may"} and j + 1 < len(words)
-                                             and words[j + 1] == "have")
-               for j, w in enumerate(words))
+_EXEC_ROLES = (PriceReadingRole.INTENDED_ENTRY, PriceReadingRole.CURRENT_MARKET)
+# the three roles an execution or a reconciliation could one day rest on: granted by the allow-list only
+GRANTED_ROLES = frozenset((PriceReadingRole.INTENDED_ENTRY, PriceReadingRole.CURRENT_MARKET,
+                           PriceReadingRole.HISTORICAL_FILL))
+_OBJECT_PREV = TRANSACTION_WORDS | OWN_PAST | frozenset(("to", "into", "of", "on", "in", "for", "at", "from", "with"))
+# the order of the sentence vetoes (the first found is the reading's first reason code)
+_ENTRY_VETO_ORDER = ("QUESTION", "REPORTED_SPEECH", "COUNTERFACTUAL", "CANCELLED_OR_WITHDRAWN", "ABANDONED_PLAN",
+                     "NEAR_MISS", "NEGATED", "CONDITIONAL", "FORECAST", "MODAL_OR_OPINION")
+_MARKET_VETO_ORDER = ("QUESTION", "REPORTED_SPEECH", "COUNTERFACTUAL", "CANCELLED_OR_WITHDRAWN", "ABANDONED_PLAN",
+                      "NEAR_MISS", "NEGATED", "CONDITIONAL_MARKET_STATE", "FORECAST", "HYPOTHETICAL_MARKET_STATE",
+                      "FUTURE_MARKET_STATE")
 
 
-def _cancelled(words: list[str]) -> bool:
-    for j, w in enumerate(words):
-        nxt = words[j + 1] if j + 1 < len(words) else ""
-        if w in CANCEL_WORDS and not (w == "gone" and nxt in ("long", "short", "in")) \
-                and not (w == "pulled" and nxt == "back"):
-            return True
+def _names(toks: list[_Tok]) -> set:
+    """The markets named by these tokens' own words (generic market nouns and cashtags)."""
+    out = set()
+    for x in toks:
+        w = x.word.removesuffix("'s")
+        if w in _MARKET_SINGLE:
+            out.add(w)
+        elif w.startswith("$") and w[1:].isalpha():
+            out.add(w[1:].upper())
+    return out
+
+
+_MARKET_PHRASES = frozenset(n for n in IT.MARKET_NOUNS if " " in n)
+
+
+def _mentions(toks: list[_Tok]) -> set:
+    """The distinct markets these tokens mention: generic market nouns (two-word names first) and cashtags."""
+    out, words, j = set(), [x.word.removesuffix("'s") for x in toks], 0
+    while j < len(words):
+        pair = " ".join(words[j:j + 2])
+        if pair in _MARKET_PHRASES:
+            out.add(pair)
+            j += 2
+            continue
+        if words[j] in IT.MARKET_NOUNS or (words[j].startswith("$") and words[j][1:].isalpha()):
+            out.add(words[j])
+        j += 1
+    return out
+
+
+_CONJ_BOUNDARY = frozenset(("and", "then", "but", "while", "whereas", "&"))
+
+
+def _conj_boundary(toks: list[_Tok], k: int) -> bool:
+    """A coordinating conjunction followed by a word (not "70 and 72", not "and/or")."""
+    if toks[k].word not in _CONJ_BOUNDARY or k + 1 >= len(toks):
+        return False
+    nxt = toks[k + 1]
+    return nxt.n is None and nxt.word not in ("or", "/")
+
+
+def _cancel_at(words: list[str], j: int) -> bool:
+    """A cancellation, withdrawal or abandonment at word ``j`` (a closed class of verbs and particles)."""
+    w = words[j]
+    prev = words[j - 1] if j else ""
+    nxt = words[j + 1] if j + 1 < len(words) else ""
+    nxt2 = words[j + 2] if j + 2 < len(words) else ""
+    if w in CANCEL_VETO:
+        return not ((w == "gone" and nxt in ("long", "short", "in")) or (w in ("pulled", "pulling") and nxt == "back"))
+    if w in ("drop", "dropped", "dropping", "pull") and nxt in _OBJECT_STARTS:
+        return True    # "drop the 2,380 bid" (never "a drop to 68")
+    if w == "off":     # "the bid is off", "called off", "off the table" (never "took half off at")
+        return prev in _BE_FORMS or prev.endswith("'s") or (nxt == "the" and nxt2 == "table")
+    if w == "history":   # "the order is history"
+        return prev in _BE_FORMS or prev.endswith("'s")
+    if w == "mind":    # "changed our mind", "never mind"
+        return prev in ("changed", "change", "changing", "never") or (j > 1 and words[j - 2] in ("changed", "change"))
     return False
 
 
-_EXEC_ROLES = (PriceReadingRole.INTENDED_ENTRY, PriceReadingRole.CURRENT_MARKET)
+def _abandoned_at(words: list[str], j: int) -> bool:
+    """A past intention ("we were going to bid", "had planned to", "wanted to"): abandoned."""
+    w = words[j]
+    nxt = words[j + 1] if j + 1 < len(words) else ""
+    if w in ("wanted", "meant", "intended", "planned", "hoped") and nxt == "to":
+        return True
+    if w not in ("was", "were", "had", "we'd", "i'd"):
+        return False
+    k = j + 1
+    while k < len(words) and words[k] in _INTENT_ADVERBS | {"been"}:
+        k += 1
+    if k >= len(words) or words[k] not in INTENT_WORDS:
+        return False
+    return words[k] != "about" or (k + 1 < len(words) and words[k + 1] == "to")
 
 
-def _defeat(res: dict, c: _Ctx) -> dict:
-    """INTENDED_ENTRY and CURRENT_MARKET (and a fill) stand only when nothing in the number's own clause
-    defeats them; a defeated reading is UNRESOLVED with the defeater's code first."""
+def _sentence_vetoes(stoks: list[_Tok]) -> dict:
+    """The first veto of a sentence, from closed classes, for INTENDED_ENTRY and HISTORICAL_FILL ("entry")
+    and for CURRENT_MARKET ("market"); None when the sentence carries none. Read once per sentence."""
+    words = [x.word for x in stoks]
+    L = len(words)
+    found: set[str] = set()
+    for j, (x, w) in enumerate(zip(stoks, words)):
+        prev = words[j - 1] if j else ""
+        nxt = words[j + 1] if j + 1 < L else ""
+        if x.q_end or "?" in x.raw_tail or "?" in x.token or w == "whether":
+            found.add("QUESTION")
+        per_source = w == "per" and j + 1 < L and (words[j + 1] in ("the", "our", "my", "their", "his", "her")
+                                                  or stoks[j + 1].token[:1].isupper())   # "per the desk", never "per contract"
+        if w in REPORT_WORDS or per_source or any(q in x.raw_head or q in x.raw_tail or q in x.token for q in QUOTE_MARKS):
+            found.add("REPORTED_SPEECH")
+        if w in COUNTERFACTUAL_WORDS or w in ("dream", "dreams", "dreaming", "kidding", "joking", "joke") or (
+                w in ("would", "could", "should", "might", "must", "we'd", "i'd") and nxt == "have"):
+            found.add("COUNTERFACTUAL")
+        if _cancel_at(words, j):
+            found.add("CANCELLED_OR_WITHDRAWN")
+        if _abandoned_at(words, j):
+            found.add("ABANDONED_PLAN")
+        if w in NEAR_MISS_WORDS or (w == "about" and nxt == "to") or (
+                w == "close" and prev in ("came", "come", "comes", "coming", "got")):
+            found.add("NEAR_MISS")
+        if _negation(w) or w in ("hardly", "scarcely"):
+            found.add("NEGATED")
+        if w in CONDITION_VETO or (w == "case" and prev == "in") or (w == "else" and prev == "or") or (w in ("long", "soon") and prev == "as" and nxt == "as") \
+                or (w == "subject" and nxt == "to"):
+            found.update(("CONDITIONAL", "CONDITIONAL_MARKET_STATE"))
+        if w in FORECAST_WORDS:
+            found.add("FORECAST")
+        month_may = w == "may" and x.token == "May" and (
+            prev in TRANSACTION_WORDS | {"the", "in", "of", "for", "since", "until", "by"} or nxt in _MARKET_SINGLE
+            or nxt in ("contract", "futures") or nxt[:1].isdigit())
+        if (w in VETO_MODALS and not month_may) or w in OPINION_WORDS or w.endswith("'d") \
+                or (w in ("look", "looking") and nxt not in ("to", "at")):
+            found.update(("MODAL_OR_OPINION", "HYPOTHETICAL_MARKET_STATE"))
+        if w in FUTURE_MODALS or w.endswith("'ll") or (w == "going" and nxt == "to") or w in FUTURE_MARKET_WORDS \
+                or (w == "end" and prev in ("the", "year", "month", "week", "quarter")):
+            found.add("FUTURE_MARKET_STATE")
+    return {"entry": next((k for k in _ENTRY_VETO_ORDER if k in found), None),
+            "market": next((k for k in _MARKET_VETO_ORDER if k in found), None)}
+
+
+def _allowed_before(x: _Tok, prev: str, nxt: str, market: bool) -> bool:
+    """A word that may stand in the number's clause before an INTENDED_ENTRY or HISTORICAL_FILL (or, with
+    ``market``, a CURRENT_MARKET): function words, the publisher's own words, generic trading vocabulary,
+    the market's own name."""
+    w = x.word
+    w0 = w.removesuffix("'s")
+    if any(ch.isdigit() for ch in w):
+        return True
+    if w0 in MARKET_NOUNS:    # "the market is at", never "the market bids at" for an order or a fill
+        return market or nxt in ("order", "orders") or nxt in _MARKET_SINGLE
+    if w in _ALLOWED_BEFORE or w0 in _ALLOWED_BEFORE or w0 in _MARKET_SINGLE:
+        return True
+    if w.startswith("$") and w[1:].isalpha():
+        return True
+    if IT.MONTH_WORD_RE.fullmatch(w) or IT.CONTRACT_CODE_RE.fullmatch(x.token):
+        return True
+    if w in ("it", "it's"):   # the market as the subject of a market state; an object otherwise ("buy it at")
+        return market or prev in _OBJECT_PREV
+    return market and w in ("price", "prices", "quote", "quotes")
+
+
+def _subject_veto(c: _Ctx, market: bool) -> str | None:
+    """(b): the number's clause has the publisher, or no explicit subject (a note, an imperative) for an order
+    or a fill, and the market itself for a market state. Every word before the number must be in the
+    allow-list; a person after it ("bids at 2,380 for clients") withholds the role too."""
+    before = c.before or []
+    words = [x.word for x in before]
+    if any(w in PERSON_WORDS or w.removesuffix("'s") in PERSON_WORDS for w in words + (c.after_words or [])):
+        return "THIRD_PARTY"
+    if not market:   # a market as the subject of an order verb is a quote: "Brent bids at 74", "copper offers"
+        for j, x in enumerate(before[:-1]):
+            if x.word.removesuffix("'s") in _MARKET_SINGLE and not x.seg_end \
+                    and before[j + 1].word in ("bid", "bids", "bidding", "offer", "offers", "offered", "offering"):
+                return "SUBJECT_NOT_PUBLISHER"
+    for j, x in enumerate(before):
+        if not _allowed_before(x, words[j - 1] if j else "", words[j + 1] if j + 1 < len(words) else "", market):
+            return "SUBJECT_NOT_THE_MARKET" if market else "SUBJECT_NOT_PUBLISHER"
+    return None
+
+
+def _allow(toks, t, res: dict, c: _Ctx) -> dict:
+    """INTENDED_ENTRY, CURRENT_MARKET and HISTORICAL_FILL are granted only when ALL hold:
+      (a) the positive cue is in the number's own clause (the evidence recomputed on that clause alone
+          gives the same role; CUE_OUTSIDE_CLAUSE otherwise);
+      (b) the clause's subject is the publisher or absent (an order, a fill) or the market itself (a market
+          state): ``_subject_veto``;
+      (c) the number's SENTENCE carries no veto of a closed class: a question, quoted or reported speech, a
+          counterfactual, a cancellation or an abandoned plan, a near miss, a negation, a condition, a
+          forecast, a modal or an opinion, and for a market state a future time or "will";
+      (d) a market state is present tense (PAST_MARKET_PRICE) and no order cue (CONFLICTING_CUES);
+    plus the evidence's own checks (NO_TRANSACTION_WORD, POSITION_ALREADY_HELD, CHAIN_WITH_UNRESOLVED).
+    Otherwise UNRESOLVED, with the code of what was missing or what vetoed first."""
     R = PriceReadingRole
-    role = res["role"]
-    if role not in (R.INTENDED_ENTRY, R.CURRENT_MARKET, R.HISTORICAL_FILL):
-        return res
-    left, near = c.left, c.right_words
-    near_mkt: list[str] = []   # the words after a market price, up to the publisher's own clause
-    for w in near:
-        if w in HOLDER_WORDS:
-            break
-        near_mkt.append(w)
-    reasons = res["reasons"]
+    role, reasons = res["role"], res["reasons"]
+    market = role == R.CURRENT_MARKET
+    code = (c.sent_veto or {}).get("market" if market else "entry")
+    if code is None:
+        code = _subject_veto(c, market)
+    if code is None and market:
+        if "ORDER" in c.right or any(x.cat == "ORDER" for x in c.cues):
+            code = "CONFLICTING_CUES"
+        elif "PAST" in c.right or any(x.cat in ("PAST", "MOVE_PAST") for x in c.cues):
+            code = "PAST_MARKET_PRICE"
+    if code is None and c.clause_ctx is not None:
+        own = c.clause_ctx()
+        if own is not None and _evidence(toks, t, own)["role"] != role:
+            code = "CUE_OUTSIDE_CLAUSE"
     chained = reasons[:1] == ["SAME_ROLE_AS_PREVIOUS_NUMBER"]
-    code = None
-    if c.question:
-        code = "QUESTION"
-    elif _counterfactual(left + near):
-        code = "COUNTERFACTUAL"
-    elif role in _EXEC_ROLES and (_cancelled(left) or _cancelled(c.ext_words) or _cancelled(c.wide_words)):
-        code = "CANCELLED_OR_WITHDRAWN"
-    elif any(_negation(w) for w in (left + near if role == R.INTENDED_ENTRY else
-                                    left + near_mkt if role == R.CURRENT_MARKET else left)):
-        code = "NEGATED"
-    elif any(w in THIRD_PARTY for w in left) and not any(w in HOLDER_WORDS for w in left):
-        code = "THIRD_PARTY"
-    elif role in _EXEC_ROLES and any(w in FORECAST_WORDS for w in left + (near if role == R.INTENDED_ENTRY else near_mkt)):
-        code = "FORECAST"
-    elif role == R.INTENDED_ENTRY and not chained and set(reasons) <= {"PLANNED_TRANSACTION"} \
-            and not any(w in TRANSACTION_WORDS for w in left + c.ext_words + near):
+    if code is None and role == R.INTENDED_ENTRY and not chained and set(reasons) <= {"PLANNED_TRANSACTION"} \
+            and not any(w in TRANSACTION_WORDS for w in c.left + c.ext_words + c.right_words):
         code = "NO_TRANSACTION_WORD"   # "we will look at gold near 2,380", "crude will retest 70"
-    elif role == R.INTENDED_ENTRY and res.get("skipped", [])[:1] == ["from"] \
-            and any(w in ("long", "short", "in", "position") for w in left):
+    if code is None and role == R.INTENDED_ENTRY and res.get("skipped", [])[:1] == ["from"] \
+            and any(w in ("long", "short", "in", "position") for w in c.left):
         code = "POSITION_ALREADY_HELD"   # "long from 70": a held position, never an order
-    elif role == R.CURRENT_MARKET:
-        if c.cond_before or any(x.cat == "CONDITION" for x in c.cues + c.ext_cues) \
-                or any(w in CONDITION_WORDS for w in near_mkt):
-            code = "CONDITIONAL_MARKET_STATE"
-        elif c.first_after in MODALS:
-            code = "HYPOTHETICAL_MARKET_STATE"
-        elif any(w in FUTURE_TIME for w in left + near_mkt):
-            code = "FUTURE_MARKET_STATE"
     if code is None and res.get("chained_unresolved") and role in _EXEC_ROLES:
         code = "CHAIN_WITH_UNRESOLVED"
     if code is None:
@@ -1083,6 +1436,11 @@ def safe_read_price_roles(text: str | None, units=(), to_norm=None) -> list[Pric
         except Exception:  # noqa: BLE001
             _note("READER_FAULT_NO_NUMBERS")
             return []
+
+
+def safe_note_fault(code: str) -> None:
+    """``note_fault`` that never raises (a fault path must never become a fault)."""
+    _note(code)
 
 
 def _note(code: str) -> None:

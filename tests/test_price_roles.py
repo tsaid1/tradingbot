@@ -48,7 +48,8 @@ SCENARIOS = {
     10: ("We were stopped out of natural gas overnight at 2.84.", [HF]),
     11: ("Recap: last week we closed crude at 74.90 for a gain of 5.2%.", [HF]),
     12: ("If silver closes above 31.50 we will go long with a stop at 30.20.", [CHART, STOP]),
-    13: ("Will buy silver at 30.80 if it pulls back.", [IE]),
+    # rubric: INTENDED_ENTRY; the allow-list withholds an order under a condition (CONDITIONAL): a recall cost
+    13: ("Will buy silver at 30.80 if it pulls back.", [UNR]),
     14: ("Closed the crude long at 74.90. We sold gold short at 2,410, stop 2,440.", [HF, HF, STOP]),
     15: ("Long December natural gas at 3.42 on a limit; January is trading at 3.61.", [IE, OCM]),
     16: ("Long natural gas at 3.42 on a limit; the market is trading at 3.61.", [IE, CM]),
@@ -293,6 +294,16 @@ CODE_EXAMPLES = {
     "HYPOTHETICAL_MARKET_STATE": ("Crude trading at 71.20 would be a gift.", 0),
     "FUTURE_MARKET_STATE": ("Crude is trading at 71.20 tomorrow.", 0),
     "CHAIN_WITH_UNRESOLVED": ("Long crude between 70 and 72 on a limit.", 1),
+    "REPORTED_SPEECH": ('He said "buy gold at 2,380 on a limit" but we disagree.', 0),
+    "ABANDONED_PLAN": ("We had planned to buy crude at 70 on a limit.", 0),
+    "NEAR_MISS": ("We almost bought crude at 70.", 0),
+    "CONDITIONAL": ("Will buy silver at 30.80 if it pulls back.", 0),
+    "MODAL_OR_OPINION": ("We think a bid at 2,380 works.", 0),
+    "SUBJECT_NOT_PUBLISHER": ("The white metal: bids at 30.", 0),
+    "SUBJECT_NOT_THE_MARKET": ("The yellow metal is trading at 2,400.", 0),
+    "CUE_OUTSIDE_CLAUSE": ("Long gold at 2,380, then buy crude on a limit.", 0),
+    "WITHDRAWN_LATER_IN_POST": ("Bid gold at 2,380 on a limit. Actually, cancel that.", 0),
+    "ATTRIBUTED_NEXT_SENTENCE": ("From a reader's email. Bid gold at 2,380 on a limit.", 0),
     "MONTH_NAMED_IN_SEGMENT": ("Long the Z6 contract at 70 on a limit.", 0),
     "MONTH_NAMED_IN_SENTENCE": ("Long the December contract, limit 70.", 0),
     "MONTH_OF_ACTION": ("Going long December crude at 71.20 on a limit. Stop 69.50.", 1),
@@ -426,7 +437,8 @@ def test_s3_a_contract_year_after_a_month_still_names_it():
 
 
 @pytest.mark.parametrize("text,want", [
-    ("High conviction long crude at 71.20 on a limit.", [IE]),
+    # no longer CHART_LEVEL; "conviction" is outside the allow-list, so the order is withheld (recall cost)
+    ("High conviction long crude at 71.20 on a limit.", [UNR]),
     ("Bought protective puts at 2,300.", [UNR]),
     ("Raise the stop to breakeven at 70.10.", [STOP]),
     ("Crude made a new high at 75.", [CHART]),
