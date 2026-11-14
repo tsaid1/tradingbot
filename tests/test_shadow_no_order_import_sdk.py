@@ -27,6 +27,7 @@ DRIVER = textwrap.dedent(r'''
     import importlib.abc, json, os, socket, stat, sys, time
     sys.path.insert(0, sys.argv[4])  # this checkout's src/ (the interpreter runs isolated, -I)
     ATTEMPTS = []
+    CONFIRM = os.environ.get("SHADOW_PROBE_CONFIRMATION") == "1"  # operator confirmation on
 
     class OrderPackageGuard(importlib.abc.MetaPathFinder):
         def find_spec(self, name, path, target=None):
@@ -88,7 +89,9 @@ DRIVER = textwrap.dedent(r'''
     with open(posts, "w") as f:
         for sid, off, text in (("1", 0, "We are now long $TLT at 88.42. Stop 87.20."),  # at the ask
                                ("2", 120, "Raising our $TLT stop to 87.90."),
-                               ("3", 240, "Closing the rest of our $TLT long at 88.40.")):
+                               ("3", 240, "Closing the rest of our $TLT long at 88.40."),
+                               *((("4", 360, "We are now long $TLT, ~88.41 now. Stop 87.20."),)
+                                 if CONFIRM else ())):
             at = base + timedelta(seconds=off)
             f.write(json.dumps({
                 "schema_version": "1.2", "source_id": sid, "post_id": sid, "revision": 1,
@@ -116,6 +119,8 @@ DRIVER = textwrap.dedent(r'''
                       "confirm_wait_seconds": 0},
         "shadow": {"paper_config": paper},
     }
+    if CONFIRM:
+        raw["operator_confirmation"] = {"enabled": True}
     config = parse_config(raw, base=__import__("pathlib").Path(folder))
     OperatorQueue.initialise(config.operator_db)
     clock = SimClock(datetime(2026, 6, 1, 14, 0, tzinfo=UTC))  # Monday, US regular session
@@ -144,6 +149,8 @@ DRIVER = textwrap.dedent(r'''
             time.sleep(0.01)
 
     dropped = False
+    want = 4 if CONFIRM else 3
+    confirmed = []
     for cycle in range(200):
         if subs and broker.connected():
             tick()
@@ -153,7 +160,18 @@ DRIVER = textwrap.dedent(r'''
             tws.drop()  # TWS restarts: the session must be reopened with every check
             dropped = True
             time.sleep(0.2)
-        if len(service.store.signals()) >= 3 and broker.reconnects >= 1:
+        if CONFIRM:
+            from tradingbot.execution.operator_catalog import offer_phrase
+            for o in service.store.offers(states=("OFFERED",)):
+                if o["id"] not in confirmed:
+                    confirmed.append(o["id"])
+                    OperatorQueue(config.operator_db).enqueue(
+                        at=clock.now(), operator="owner", origin="test",
+                        action="CONFIRM_SIGNAL", target=str(o["id"]), kind=o["hash"], note="",
+                        confirmation=offer_phrase("CONFIRM_SIGNAL", o["id"], o["hash"]))
+            if any(o["state"] == "OFFERED" for o in service.store.offers()):
+                continue
+        if len(service.store.signals()) >= want and broker.reconnects >= 1:
             for _ in range(2):
                 tick(); service.run_once(); clock.advance(5)
             break
@@ -169,6 +187,7 @@ DRIVER = textwrap.dedent(r'''
         "positions": len(broker.positions()),
         "wire": sorted({name for name, _ in tws.requests}),
         "reconnected": any(e["event"] == "BROKER_RECONNECT_ATTEMPT" for e in events),
+        "offers": [o["state"] for o in service.store.offers()],
     }))
 ''')
 READ_ONLY = {"START_API", "REQ_CONTRACT_DATA", "CANCEL_CONTRACT_DATA", "REQ_ACCOUNT_SUMMARY",
@@ -176,13 +195,15 @@ READ_ONLY = {"START_API", "REQ_CONTRACT_DATA", "CANCEL_CONTRACT_DATA", "REQ_ACCO
              "CANCEL_MKT_DATA", "REQ_MARKET_DATA_TYPE", "REQ_CONFIG", "REQ_SEC_DEF_OPT_PARAMS"}
 
 
-def _run(tmp_path: Path, inject: bool = False) -> subprocess.CompletedProcess:
+def _run(tmp_path: Path, inject: bool = False,
+         confirmation: bool = False) -> subprocess.CompletedProcess:
     script = tmp_path / "driver.py"
     script.write_text(DRIVER)
     work = tmp_path / "run"
     work.mkdir()
     env = {**os.environ, "PYTHONPATH": str(ROOT / "src"), "HOME": str(tmp_path),
-           "SHADOW_PROBE_INJECT": "1" if inject else "0"}
+           "SHADOW_PROBE_INJECT": "1" if inject else "0",
+           "SHADOW_PROBE_CONFIRMATION": "1" if confirmation else "0"}
     env.pop("TRADINGBOT_BLOCK_IBAPI", None)
     return subprocess.run(
         [sys.executable, "-I", str(script), str(work), str(ROOT / "tests"),
@@ -216,3 +237,17 @@ def test_the_proof_fails_when_the_session_factory_imports_the_order_package(tmp_
         out = json.loads(r.stdout.strip().splitlines()[-1])
         failed = bool(out["attempts"] or out["loaded"])
     assert failed and "tradingbot.ibkr_orders" in (r.stdout + r.stderr)
+
+
+def test_with_operator_confirmation_on_a_confirmed_entry_never_imports_the_order_package(
+        tmp_path):
+    """Operator confirmation (docs/OPERATOR_CONFIRMATION.md) switched on: the same lifecycle
+    plus a held anchored entry the owner confirms, released through the gateway and simulated at
+    a live quote. Still no import of the order package, and only read-only messages on the wire."""
+    r = _run(tmp_path, confirmation=True)
+    assert r.returncode == 0, r.stderr[-3000:]
+    out = json.loads(r.stdout.strip().splitlines()[-1])
+    assert out["attempts"] == [] and out["loaded"] == []
+    assert out["offers"] == ["EXECUTED"] and out["signals"] == 4
+    assert out["fills"].count(["BUY", "SIMULATED_AT_LIVE_QUOTE"]) == 2
+    assert set(out["wire"]) <= READ_ONLY, out["wire"]

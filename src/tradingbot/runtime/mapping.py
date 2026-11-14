@@ -63,6 +63,7 @@ from tradingbot.models import (
     PositionSide,
     StrictModel,
 )
+from tradingbot.runtime.confirmation_table import check_pairs, detail_key
 from tradingbot.runtime.entry_text import (
     ascii_shadow,
     entry_is_cost_basis,
@@ -254,6 +255,41 @@ class VocabEvidence:
         return hash((self.tokens, self.sentences))
 
 
+class _Waiver:
+    """The operator-confirmation pre-check only (docs/OPERATOR_CONFIRMATION.md): steps over a
+    hold whose (code, detail key) is in ``allowed`` (a subset of the closed table,
+    ``confirmation_table.check_pairs``) AT THAT CHECK'S OWN SITE, records it, and lets the rest of
+    the chain run on exactly the inputs it would have seen. It never changes a value. The
+    production decision never carries one (``MappingPolicy.resolve`` has no such argument)."""
+
+    __slots__ = ("allowed", "stepped")
+
+    def __init__(self, allowed: frozenset[tuple[str, str]]):
+        self.allowed = allowed
+        self.stepped: list[tuple[str, str, tuple[str, ...]]] = []
+
+    def step(self, code: str, keys, problem) -> bool:
+        """True (stepped over and recorded) only if every (code, key) is allowed."""
+        keys = [keys] if isinstance(keys, str) else list(keys)
+        if not keys or any((code, k) not in self.allowed for k in keys):
+            return False
+        for k in keys:
+            entry = (code, k, tuple(str(p) for p in problem))
+            if entry not in self.stepped:
+                self.stepped.append(entry)
+        return True
+
+
+def _why_keys(why: list[str]) -> list[str]:
+    """``anchor_not_current``'s reasons as detail keys (an unknown reason keeps its own text, so
+    it is never in the table)."""
+    return sorted({detail_key(w) for w in why})
+
+
+def _step(waiver: _Waiver | None, code: str, keys, problem) -> bool:
+    return waiver is not None and waiver.step(code, keys, problem)
+
+
 @dataclass
 class _EvidenceSink:
     """Collects private evidence while one action is decided (only when the policy collects)."""
@@ -307,6 +343,46 @@ class MappingDecision(StrictModel):
     @property
     def vocab_evidence(self) -> VocabEvidence | None:
         return self._vocab_evidence
+
+
+@dataclass(frozen=True)
+class WaivedResolution:
+    """What the mapping would decide if the listed holds were confirmed by the owner: the result
+    of ``MappingPolicy.resolve_waived`` (the operator-confirmation pre-check only). Deliberately
+    NOT a ``MappingDecision``: the ordinary gate and replay path refuses it (``ensure_production``),
+    so it can never become an action except inside the apply step of a confirmed offer.
+    ``waived``: (code, detail key, the full problem) for every hold stepped over, in order."""
+
+    action_id: str
+    status: str
+    reason: str
+    family: str | None
+    source_asset: str | None
+    broker_symbol: str | None
+    basis: str | None
+    mapped: bool
+    entry_anchor: str | None
+    month_source: str | None
+    anchor_level_kind: str | None
+    instrument: Instrument | None
+    waived: tuple[tuple[str, str, tuple[str, ...]], ...]
+    WAIVED = True
+
+    @property
+    def pairs(self) -> list[tuple[str, str]]:
+        return list(dict.fromkeys((c, k) for c, k, _ in self.waived))
+
+
+class WaivedDecisionRefused(TypeError):
+    """A waived evaluation reached the ordinary decision path."""
+
+
+def ensure_production(decisions) -> None:
+    """The ordinary path takes production ``MappingDecision`` objects only (safeguard 3)."""
+    for d in decisions:
+        if not isinstance(d, MappingDecision) or getattr(d, "WAIVED", False):
+            raise WaivedDecisionRefused(
+                "a waived (operator-confirmation) evaluation cannot be used as a mapping decision")
 
 
 class MappingFile(StrictModel):
@@ -1126,6 +1202,8 @@ class FamilyMapping(StrictModel):
         post: dict | None = None,
         kind_out: list[AnchorLevelKind] | None = None,
         evidence: _EvidenceSink | None = None,
+        *,
+        waiver: _Waiver | None = None,
     ) -> tuple[Decimal | None, str | None, list[str]]:
         """entry_rule = REFERENCE_AS_COLLAR: the stated market level that may anchor this action's
         entry, the text it is written in, or why none may. ``levels`` are the interpreter's price
@@ -1174,7 +1252,7 @@ class FamilyMapping(StrictModel):
             problems = self._single_market_problems(
                 action, asset, _level(action.entry_reference), terms.clause, post_text,
                 (*PRESENT_MARKERS, *lexicon.present_markers), post or {}, lexicon,
-                own_clause=terms.clause, evidence=evidence, level_rules=False)
+                own_clause=terms.clause, evidence=evidence, level_rules=False, waiver=waiver)
             return held(problems, None) if problems else (None, None, [])
         if not (self.entry_rule == "REFERENCE_AS_COLLAR"
                 and action.action in (Action.OPEN, Action.ADD)
@@ -1226,27 +1304,31 @@ class FamilyMapping(StrictModel):
         markers = (*PRESENT_MARKERS, *lexicon.present_markers)
         why = anchor_not_current(source, anchor, markers)
         bad_words = [w.split(":", 1)[1] for w in why if w.startswith("NOT_CURRENT_WORD:")]
-        if "NO_PRESENT_MARKER" in why:  # no positive evidence at all
+        if "NO_PRESENT_MARKER" in why and not _step(  # no positive evidence at all
+                waiver, ENTRY_ANCHOR_NOT_CURRENT, _why_keys(why), [ENTRY_ANCHOR_NOT_CURRENT, *why]):
             return held([ENTRY_ANCHOR_NOT_CURRENT, *why], words=bad_words)
         own = self.anchor_names(asset, lexicon)
         if self.entry_anchor.anchor_scope == "SINGLE_MARKET_POST":
             problems = self._single_market_problems(action, asset, anchor, source, post_text,
                                                     markers, post or {}, lexicon,
-                                                    own_clause=terms.clause, evidence=evidence)
+                                                    own_clause=terms.clause, evidence=evidence,
+                                                    waiver=waiver)
             if problems:
                 return held(problems, None)  # the post, not the level, is in doubt
         attributed: list[str] = []
         unknown: list[str] = []
         problems = self._sentence_problems(action, anchor, source, terms, levels, post_text,
                                            markers, own, lexicon, unknown_out=unknown,
-                                           attribution=attributed, evidence=evidence)
+                                           attribution=attributed, evidence=evidence,
+                                           waiver=waiver)
         if problems:
             return held(problems, words=unknown)
-        if why:  # the disqualifying words: a second, redundant check
+        if why and not _step(  # the disqualifying words: a second, redundant check
+                waiver, ENTRY_ANCHOR_NOT_CURRENT, _why_keys(why), [ENTRY_ANCHOR_NOT_CURRENT, *why]):
             return held([ENTRY_ANCHOR_NOT_CURRENT, *why], words=bad_words)
         kind, detail = self._level_kind(anchor, source, post_text, own, markers, action=action,
                                         levels=levels, terms=terms, lexicon=lexicon,
-                                        attribution=attributed, evidence=evidence)
+                                        attribution=attributed, evidence=evidence, waiver=waiver)
         if kind != AnchorLevelKind.MARKET_QUOTE:
             return held([ENTRY_ANCHOR_LEVEL_NOT_MARKET_QUOTE, f"LEVEL_KIND:{kind.value}", detail],
                         kind)
@@ -1264,7 +1346,9 @@ class FamilyMapping(StrictModel):
         if source != terms.clause:
             allowed = set(own) | set(markers) | {"at"}
             foreign = foreign_words(source, anchor, allowed, self._month_spans(source))
-            if foreign:
+            if foreign and not _step(waiver, ENTRY_ANCHOR_INSTRUMENT_UNCLEAR, "OTHER_WORDS",
+                                     [ENTRY_ANCHOR_INSTRUMENT_UNCLEAR,
+                                      f"OTHER_WORDS:{len(foreign)}"]):
                 if evidence is not None:
                     evidence.add("LEVEL_LINE_WORD", foreign, "LEVEL_LINE", source)
                 return held([ENTRY_ANCHOR_INSTRUMENT_UNCLEAR, f"OTHER_WORDS:{len(foreign)}"])
@@ -1276,7 +1360,8 @@ class FamilyMapping(StrictModel):
                     markers, *, action: TradeAction | None = None, levels=None,
                     terms: InstructionTerms | None = None, lexicon: AnchorLexicon | None = None,
                     attribution: list[str] | None = None,
-                    evidence: _EvidenceSink | None = None) -> tuple[AnchorLevelKind, str]:
+                    evidence: _EvidenceSink | None = None,
+                    waiver: _Waiver | None = None) -> tuple[AnchorLevelKind, str]:
         """The owner's ambiguity safeguard: what the candidate level is, as one closed kind. Only
         an explicit contemporaneous market quotation (MARKET_QUOTE) may anchor.
 
@@ -1344,10 +1429,21 @@ class FamilyMapping(StrictModel):
         places = level_places(source, anchor)
         if not places:
             return AnchorLevelKind.AMBIGUOUS, "NOT_FOUND"
+        code = ENTRY_ANCHOR_LEVEL_NOT_MARKET_QUOTE
+
+        def stepped(kind: AnchorLevelKind, detail: str, key: str | None = None) -> bool:
+            return _step(waiver, code, key or detail, [code, f"LEVEL_KIND:{kind.value}", detail])
+
         for sentence, clause, earlier in places:
-            kind = clause_kind(quote_clause_words(clause, allowed, self._month_spans(clause)))
+            own_words = quote_clause_words(clause, allowed, self._month_spans(clause))
+            kind = clause_kind(own_words)
             if kind is not None:
-                return kind, "OWN_CLAUSE"
+                key = ("OWN_CLAUSE:APPROXIMATION_MARK"
+                       if kind == AnchorLevelKind.AMBIGUOUS
+                       and set(own_words) == {"approximation-mark"}
+                       else f"LEVEL_KIND:{kind.value}")
+                if not stepped(kind, "OWN_CLAUSE", key):
+                    return kind, "OWN_CLAUSE"
             at = next((i for i, w in enumerate(whole) if w == sentence), None)
             if at is None:
                 at = next((i for i, w in enumerate(whole) if sentence in w), None)
@@ -1363,7 +1459,8 @@ class FamilyMapping(StrictModel):
             if at + 1 < len(whole):
                 after, question = whole_q[at + 1]
                 if not (instruction_sentence(after) or self._own_protective_levels(
-                        after, question, anchor, action, lexicon, require_key=False)):
+                        after, question, anchor, action, lexicon, require_key=False)) \
+                        and not stepped(AnchorLevelKind.AMBIGUOUS, "FOLLOWING_NOT_UNDERSTOOD"):
                     neighbour_evidence(sentence, after, question, require_key=False)
                     return AnchorLevelKind.AMBIGUOUS, "FOLLOWING_NOT_UNDERSTOOD"
             if self._names_family(clause, own):
@@ -1372,7 +1469,8 @@ class FamilyMapping(StrictModel):
                 # The level inside the instruction itself; the deny-list still reads the clauses
                 # before it ("We are long $X, stop 40.10, 41.20 now." holds as before).
                 problem = context_problem(earlier)
-                if problem:
+                if problem and not stepped(problem[0], problem[1],
+                                           f"LEVEL_KIND:{problem[0].value}"):
                     return problem
                 continue
             # Fallback (review F1): an elliptical level never anchors unless the owner enables
@@ -1394,7 +1492,16 @@ class FamilyMapping(StrictModel):
                                                      fractions, words)
                         evidence.add("UNKNOWN_WORD", words, "INSTRUCTION", t)
                     evidence.add("UNKNOWN_WORD", (), "LEVEL", sentence)
-                return AnchorLevelKind.AMBIGUOUS, "INSTRUCTION_NOT_UNDERSTOOD"
+                # Stepped over only when every own instruction sentence fails on unknown words
+                # alone: a question or a second number there is never waived through this site.
+                if not (waiver is not None and own_instructions and all(
+                        not p or (p[0] == ENTRY_ANCHOR_CONTEXT_UNCLEAR
+                                  and detail_key(p[1]) == "WORDS")
+                        for p in (self._whole_sentence_problem(t, q, allowed_all,
+                                                               consumed | {anchor}, fractions)
+                                  for t, q in own_instructions))
+                        and stepped(AnchorLevelKind.AMBIGUOUS, "INSTRUCTION_NOT_UNDERSTOOD")):
+                    return AnchorLevelKind.AMBIGUOUS, "INSTRUCTION_NOT_UNDERSTOOD"
             # R2, an elliptical level: its preceding neighbour (the earlier clauses of its
             # sentence, else the sentence before) is the action's own instruction sentence or,
             # only with standalone_level_sentence, its own protective levels. Nothing
@@ -1403,18 +1510,21 @@ class FamilyMapping(StrictModel):
                 neighbour, question = " ".join(earlier), False
             elif at > 0:
                 neighbour, question = whole_q[at - 1]
+            elif stepped(AnchorLevelKind.AMBIGUOUS, "NEIGHBOUR_NOT_UNDERSTOOD"):
+                continue  # no neighbour at all: nothing further to read
             else:
                 return AnchorLevelKind.AMBIGUOUS, "NEIGHBOUR_NOT_UNDERSTOOD"
             if self._own_protective_levels(neighbour, question, anchor, action, lexicon):
                 if attribution is not None and "AFTER_OWN_PROTECTIVE_LEVELS" not in attribution:
                     attribution.append("AFTER_OWN_PROTECTIVE_LEVELS")
                 continue
-            if earlier or not instruction_sentence(neighbour):
+            if (earlier or not instruction_sentence(neighbour)) and not stepped(
+                    AnchorLevelKind.AMBIGUOUS, "NEIGHBOUR_NOT_UNDERSTOOD"):
                 neighbour_evidence(sentence, neighbour, question, require_key=True)
                 return AnchorLevelKind.AMBIGUOUS, "NEIGHBOUR_NOT_UNDERSTOOD"
             # The deny-list, a second check that can only add a hold.
             problem = context_problem([neighbour])
-            if problem:
+            if problem and not stepped(problem[0], problem[1], f"LEVEL_KIND:{problem[0].value}"):
                 return problem
         return AnchorLevelKind.MARKET_QUOTE, ""
 
@@ -1455,7 +1565,8 @@ class FamilyMapping(StrictModel):
                                 post, lexicon: AnchorLexicon | None = None,
                                 own_clause: str | None = None,
                                 evidence: _EvidenceSink | None = None,
-                                level_rules: bool = True) -> list[str]:
+                                level_rules: bool = True,
+                                waiver: _Waiver | None = None) -> list[str]:
         """anchor_scope = SINGLE_MARKET_POST: the post as a whole attributes the level. (c) this is
         the post's only action besides commentary, and no action is conditional, retrospective or
         uncertain; (b) every action is this family's, no instrument is unresolved, and the post
@@ -1497,7 +1608,8 @@ class FamilyMapping(StrictModel):
         # "may contain multiple actionable instruments".
         problem = self._competing_instrument(text, asset, mine, mine_lower, markers,
                                              lexicon or AnchorLexicon(), own_clause,
-                                             evidence, action=action, anchor=anchor)
+                                             evidence, action=action, anchor=anchor,
+                                             waiver=waiver)
         if problem:
             return problem
         if not level_rules:  # an explicit entry: (a) and (d) are about a quoted level
@@ -1517,7 +1629,8 @@ class FamilyMapping(StrictModel):
     def _competing_instrument(self, text, asset, mine, mine_lower, markers, lexicon,
                               own_clause, evidence: _EvidenceSink | None = None, *,
                               action: TradeAction | None = None,
-                              anchor: Decimal | None = None) -> list[str]:
+                              anchor: Decimal | None = None,
+                              waiver: _Waiver | None = None) -> list[str]:
         """(a) a mention the bot cannot tie to this family (``unresolved_market_mentions``, and a
         sentence-initial unknown capitalised word) holds only when its own sentence gives it a
         trading context: an instruction, stop or target word (``ACTION_SEMANTIC_WORDS``), a
@@ -1549,12 +1662,14 @@ class FamilyMapping(StrictModel):
                        or instruction_word_in(sentence, MENTION_ACTION_WORDS)
                        or has_phrase(sentence, MENTION_ACTION_PHRASES))
             if mention and context:
-                if evidence is not None:
-                    for word, kind in words or ():
-                        evidence.add(kind.value, [word], "MENTION", sentence)
                 found = sorted({*kinds, *([initial] if initial else [])}, key=lambda m: m.value)
-                return [ENTRY_ANCHOR_POST_UNRESOLVED_MARKET, "RULE:MENTION_WITH_CONTEXT",
-                        *(f"MENTION:{m.value}" for m in found)]
+                problem = [ENTRY_ANCHOR_POST_UNRESOLVED_MARKET, "RULE:MENTION_WITH_CONTEXT",
+                           *(f"MENTION:{m.value}" for m in found)]
+                if not _step(waiver, problem[0], problem[1], problem):
+                    if evidence is not None:
+                        for word, kind in words or ():
+                            evidence.add(kind.value, [word], "MENTION", sentence)
+                    return problem
             if mention and k > 0 and texts[k - 1] in own_sentences and (
                     words_with_parts(sentence) & ADDITIVE_WORDS
                     or has_phrase(sentence, ADDITIVE_PHRASES)):
@@ -1563,7 +1678,10 @@ class FamilyMapping(StrictModel):
             if sentence not in own_sentences and instruction_word_in(sentence) \
                     and not self._own_semicolon_levels(sentence, own_clause, action, anchor,
                                                        lexicon):
-                return [ENTRY_ANCHOR_POST_UNATTRIBUTED_ACTION, "RULE:UNATTRIBUTED_ACTION_SENTENCE"]
+                problem = [ENTRY_ANCHOR_POST_UNATTRIBUTED_ACTION,
+                           "RULE:UNATTRIBUTED_ACTION_SENTENCE"]
+                if not _step(waiver, problem[0], problem[1], problem):
+                    return problem
         return []
 
     def _own_semicolon_levels(self, sentence, own_clause, action, anchor, lexicon) -> bool:
@@ -1585,14 +1703,17 @@ class FamilyMapping(StrictModel):
                 *(m.span() for m in MONTH_WORD_RE.finditer(text))]
 
     def _whole_sentence_problem(self, sentence: str, question: bool, allowed, consumed,
-                                fractions, unknown_out: list[str] | None = None) -> list[str]:
+                                fractions, unknown_out: list[str] | None = None,
+                                waiver: _Waiver | None = None) -> list[str]:
         """The whole-sentence allow-list a level's own sentence must pass (and, with
         ``standalone_level_sentence``, every own instruction sentence): not a question, every
         alphabetic token allow-listed, no number but the action's own levels and months."""
-        if question:
+        if question and not _step(waiver, ENTRY_ANCHOR_CONTEXT_UNCLEAR, "QUESTION",
+                                  [ENTRY_ANCHOR_CONTEXT_UNCLEAR, "QUESTION"]):
             return [ENTRY_ANCHOR_CONTEXT_UNCLEAR, "QUESTION"]
         unknown = unknown_tokens(sentence, allowed, self._month_spans(sentence))
-        if unknown:
+        if unknown and not _step(waiver, ENTRY_ANCHOR_CONTEXT_UNCLEAR, "WORDS",
+                                 [ENTRY_ANCHOR_CONTEXT_UNCLEAR, f"WORDS:{len(unknown)}"]):
             if unknown_out is not None:  # a local analysis tool's hook; never logged
                 unknown_out += unknown
             return [ENTRY_ANCHOR_CONTEXT_UNCLEAR, f"WORDS:{len(unknown)}"]
@@ -1608,7 +1729,8 @@ class FamilyMapping(StrictModel):
     def _sentence_problems(self, action, anchor, source, terms, levels, post_text, markers, own,
                            lexicon, unknown_out: list[str] | None = None,
                            attribution: list[str] | None = None,
-                           evidence: _EvidenceSink | None = None) -> list[str]:
+                           evidence: _EvidenceSink | None = None,
+                           waiver: _Waiver | None = None) -> list[str]:
         """The final rule (last review pass): the scope of the marked number is its whole
         sentence. Every alphabetic token in it must be on the allow-list (markers, connectors,
         function words, units, this family's names, the action's own side, verb and level words,
@@ -1626,7 +1748,7 @@ class FamilyMapping(StrictModel):
         for sentence, question in found:
             words: list[str] = []
             problem = self._whole_sentence_problem(sentence, question, allowed, consumed,
-                                                   fractions, words)
+                                                   fractions, words, waiver=waiver)
             if unknown_out is not None:
                 unknown_out += words
             if problem:
@@ -1648,7 +1770,8 @@ class FamilyMapping(StrictModel):
                     # passes the same whole-sentence allow-list as the level's sentence.
                     for s in own_block:
                         other = unknown_tokens(s, allowed, self._month_spans(s))
-                        if other:
+                        if other and not _step(waiver, ENTRY_ANCHOR_CONTEXT_UNCLEAR, "OWN_CLAUSE",
+                                               [ENTRY_ANCHOR_CONTEXT_UNCLEAR, "OWN_CLAUSE"]):
                             if unknown_out is not None:
                                 unknown_out += other
                             if evidence is not None:
@@ -1661,13 +1784,18 @@ class FamilyMapping(StrictModel):
                     case = "AFTER_OWN_INSTRUCTION"
                 else:
                     other = unknown_tokens(before, allowed, self._month_spans(before))
-                    if other:
+                    if other and _step(waiver, ENTRY_ANCHOR_INSTRUMENT_UNCLEAR,
+                                       "PRECEDING_SENTENCE",
+                                       [ENTRY_ANCHOR_INSTRUMENT_UNCLEAR, "PRECEDING_SENTENCE"]):
+                        case = "WAIVED_PRECEDING_SENTENCE"
+                    elif other:
                         if unknown_out is not None:
                             unknown_out += other
                         if evidence is not None:
                             evidence.add("UNKNOWN_WORD", other, "PRECEDING", before, sentence)
                         return [ENTRY_ANCHOR_INSTRUMENT_UNCLEAR, "PRECEDING_SENTENCE"]
-                    case = "AFTER_ALLOW_LISTED_SENTENCE"
+                    else:
+                        case = "AFTER_ALLOW_LISTED_SENTENCE"
             else:
                 case = "OWN_SENTENCE"
             if attribution is not None and case not in attribution:
@@ -1970,8 +2098,29 @@ class MappingPolicy:
 
     def resolve(self, action: TradeAction, **kw) -> tuple[MappingDecision, Instrument | None]:
         """``_resolve_text``, then the owner's cost-basis rule of 13 November 2026 for a SUPPORTED
-        OPEN or ADD with a stated entry price, in every family (``entry_is_cost_basis``)."""
-        d, instrument = self._resolve_text(action, **kw)
+        OPEN or ADD with a stated entry price, in every family (``entry_is_cost_basis``). The
+        production decision: it never steps over a hold (no waiver argument exists here)."""
+        return self._resolve_full(action, None, kw)
+
+    def resolve_waived(self, action: TradeAction, *, waive, **kw) -> WaivedResolution:
+        """The operator-confirmation pre-check ONLY (docs/OPERATOR_CONFIRMATION.md): the same
+        evaluation as ``resolve`` with the holds in ``waive`` stepped over at their own sites and
+        recorded. ``waive`` must be pairs of the closed table (``confirmation_table``); anything
+        else raises ValueError. The result is a ``WaivedResolution``, never a ``MappingDecision``:
+        the ordinary path refuses it, and it can become an action only inside the apply step of a
+        confirmed, unexpired offer whose hash matches."""
+        waiver = _Waiver(check_pairs(waive))
+        d, instrument = self._resolve_full(action, waiver, kw)
+        return WaivedResolution(
+            action_id=d.action_id, status=d.status, reason=d.reason, family=d.family,
+            source_asset=d.source_asset, broker_symbol=d.broker_symbol, basis=d.basis,
+            mapped=d.mapped, entry_anchor=d.entry_anchor, month_source=d.month_source,
+            anchor_level_kind=d.anchor_level_kind, instrument=instrument,
+            waived=tuple(waiver.stepped))
+
+    def _resolve_full(self, action: TradeAction, waiver: _Waiver | None,
+                      kw: dict) -> tuple[MappingDecision, Instrument | None]:
+        d, instrument = self._resolve_text(action, waiver=waiver, **kw)
         if d.status != "SUPPORTED" or action.action not in (Action.OPEN, Action.ADD):
             return d, instrument
         text = kw.get("post_text") or kw.get("clause")
@@ -1987,14 +2136,15 @@ class MappingPolicy:
                                                            "broker_symbol", "basis"})), None
         return d, instrument
 
-    def _resolve_text(self, action: TradeAction, **kw) -> tuple[MappingDecision, Instrument | None]:
+    def _resolve_text(self, action: TradeAction, *, waiver: _Waiver | None = None,
+                      **kw) -> tuple[MappingDecision, Instrument | None]:
         """``_resolve``, then the entry rule's check of text that is not plain ASCII
         (``tradingbot.runtime.entry_text``), for an OPEN or ADD in a family with an entry rule
         (entry_rule = REFERENCE_AS_COLLAR or a family stop distance). It only ever turns a
         SUPPORTED decision into a hold: an invisible character or a number outside ASCII holds; a
         word holding a non-ASCII letter is decided once more as an unknown ASCII word (the shadow
         text) and the stricter decision wins. Pure ASCII text is decided exactly as before."""
-        d, instrument = self._resolve(action, **kw)
+        d, instrument = self._resolve(action, waiver=waiver, **kw)
         if d.status != "SUPPORTED" or action.action not in (Action.OPEN, Action.ADD):
             return d, instrument
         entry = self.entries.get(d.family) if d.family else None
@@ -2034,7 +2184,7 @@ class MappingPolicy:
         kw2 = dict(kw)
         kw2["post_text"], kw2["clause"] = shadow_all(post_text), shadow_all(clause)
         kw2["others"] = [(a, shadow_all(c), v) for a, c, v in others]
-        d2, _ = self._resolve(action, **kw2)
+        d2, _ = self._resolve(action, waiver=waiver, **kw2)
         if d2.status == "SUPPORTED":
             return d, instrument
         held = MappingDecision(status=d2.status, reason=restore(d2.reason, originals),
@@ -2061,6 +2211,7 @@ class MappingPolicy:
         others: list[tuple[str | None, str | None, set[Decimal]]] = (),
         post_actions: list[TradeAction] | None = None,
         trading_values: list[set[Decimal]] | None = None,
+        waiver: _Waiver | None = None,
     ) -> tuple[MappingDecision, Instrument | None]:
         """One action's mapping decision and, when SUPPORTED, its execution instrument.
         ``clause`` is the instruction text the action came from (contract terms are read from it);
@@ -2147,7 +2298,7 @@ class MappingPolicy:
         anchor, source, problems = (None, None, []) if revoked else entry.entry_anchor_for(
             action, asset, terms, levels, others, post_text, self.anchor_lexicon, attribution,
             {"actions": post_actions, "vocabulary": self.vocabulary(),
-             "trading_values": trading_values}, kind_out=kind, evidence=sink)
+             "trading_values": trading_values}, kind_out=kind, evidence=sink, waiver=waiver)
         if kind:
             out["anchor_level_kind"] = kind[0].value
         if problems:
@@ -2230,19 +2381,10 @@ class MappingPolicy:
         entry with entry_rule = REFERENCE_AS_COLLAR reads them (its entry anchor)."""
         actions: list[TradeAction] = []
         decisions: list[MappingDecision] = []
-        clauses, levels = clauses or {}, levels or {}
-        stated = {a.action_id: {v for _, raw in levels.get(a.action_id, ())
-                                if (v := _level(raw)) is not None} for a in parsed.actions}
         for a in parsed.actions:
-            others = [(b.source_market_symbol, clauses.get(b.action_id), stated[b.action_id])
-                      for b in parsed.actions if b.action_id != a.action_id]
-            d, instrument = self.resolve(
-                a, clause=clauses.get(a.action_id), now=now, held=held, recorded=recorded,
-                post_text=post_text, levels=levels.get(a.action_id), others=others,
-                post_actions=list(parsed.actions),
-                trading_values=[stated[b.action_id] for b in parsed.actions
-                                if b.action_id != a.action_id and b.action != Action.NO_TRADE],
-            )
+            d, instrument = self.resolve(a, **self._post_kwargs(
+                parsed, a, clauses=clauses, now=now, held=held, recorded=recorded,
+                post_text=post_text, levels=levels))
             decisions.append(d)
             marks: list[str] = []
             if d.status == "UNSUPPORTED":
@@ -2264,3 +2406,34 @@ class MappingPolicy:
                 a = a.model_copy(update={"instrument": instrument})
             actions.append(a)
         return ParsedPost(actions=actions, summary=parsed.summary), decisions
+
+    @staticmethod
+    def _post_kwargs(parsed: ParsedPost, a: TradeAction, *, clauses, now, held, recorded,
+                     post_text, levels) -> dict:
+        """The inputs one action of a post is decided on (``apply`` and ``apply_waived`` alike)."""
+        clauses, levels = clauses or {}, levels or {}
+        stated = {b.action_id: {v for _, raw in levels.get(b.action_id, ())
+                                if (v := _level(raw)) is not None} for b in parsed.actions}
+        return {
+            "clause": clauses.get(a.action_id), "now": now, "held": held, "recorded": recorded,
+            "post_text": post_text, "levels": levels.get(a.action_id),
+            "others": [(b.source_market_symbol, clauses.get(b.action_id), stated[b.action_id])
+                       for b in parsed.actions if b.action_id != a.action_id],
+            "post_actions": list(parsed.actions),
+            "trading_values": [stated[b.action_id] for b in parsed.actions
+                               if b.action_id != a.action_id and b.action != Action.NO_TRADE],
+        }
+
+    def apply_waived(self, parsed: ParsedPost, action_id: str, *, waive,
+                     clauses: dict[str, str] | None = None, now: datetime | None = None,
+                     held: dict[str, ContractRef] | None = None,
+                     recorded: dict[str, FamilyMapping] | None = None,
+                     post_text: str | None = None,
+                     levels: dict[str, list[tuple[str, str]]] | None = None) -> WaivedResolution:
+        """``resolve_waived`` for one action of ``parsed`` (the interpreter's actions, before
+        ``apply``) on exactly the inputs ``apply`` decides it on. The operator-confirmation
+        pre-check and the evaluation hook only; never the production decision."""
+        a = next(x for x in parsed.actions if x.action_id == action_id)
+        return self.resolve_waived(a, waive=waive, **self._post_kwargs(
+            parsed, a, clauses=clauses, now=now, held=held, recorded=recorded,
+            post_text=post_text, levels=levels))

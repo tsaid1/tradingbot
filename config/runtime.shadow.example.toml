@@ -58,3 +58,6 @@ max_exit_intent_age_seconds = 120
 lookup_horizon_seconds = 21600
 confirm_attempts = 3
 confirm_wait_seconds = 0
+
+[operator_confirmation]        # optional; docs/OPERATOR_CONFIRMATION.md
+enabled = false               # one-press owner confirmation of interpretation holds; paper only

@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Operator actions on the runtime service's state (mock mode). None of them sends an order.
+"""Operator actions on the runtime service's state (mock and shadow modes). None of them sends an
+order; ``confirm`` (operator confirmation, off by default) releases a held action into the
+unchanged gateway and execution core, on the simulated broker only.
 
     PYTHONPATH=src python scripts/tb_operator.py --config runtime.toml init
     PYTHONPATH=src python scripts/tb_operator.py --config runtime.toml list
@@ -11,6 +13,11 @@
     PYTHONPATH=src python scripts/tb_operator.py --config runtime.toml ack 9 EXIT_WITHOUT_QUOTE ...
     PYTHONPATH=src python scripts/tb_operator.py --config runtime.toml ack-signal 3 SIGNAL_HOLD ...
     PYTHONPATH=src python scripts/tb_operator.py --config runtime.toml clear-lockout SIM-PAPER-0001 ...
+    PYTHONPATH=src python scripts/tb_operator.py --config runtime.toml offers
+    PYTHONPATH=src python scripts/tb_operator.py --config runtime.toml confirm 4 1a2b3c4d \\
+        --confirm "CONFIRM 4 1a2b3c4d"
+    PYTHONPATH=src python scripts/tb_operator.py --config runtime.toml dismiss 4 1a2b3c4d \\
+        --confirm "DISMISS 4 1a2b3c4d"
     PYTHONPATH=src python scripts/tb_operator.py --config runtime.toml apply
     PYTHONPATH=src python scripts/tb_operator.py --config runtime.toml history
 
@@ -33,7 +40,9 @@ from datetime import UTC, datetime
 
 from tradingbot.runtime import operator_actions as Q
 from tradingbot.runtime.config import DEFAULT_CONFIG_PATH, ConfigError, load_config
+from tradingbot.runtime.confirmation_view import card, load_offers
 from tradingbot.runtime.register import load_register
+from tradingbot.runtime.store import RuntimeStore
 
 
 def _journal_request_ids(config) -> set[str]:
@@ -119,6 +128,13 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("list", help="open exceptions, unresolved intents, open alerts (read-only)")
     sub.add_parser("history", help="every operator request and its result")
     sub.add_parser("apply", help="apply pending requests now (service stopped)")
+    sub.add_parser("offers", help="operator-confirmation offers and their cards (read-only)")
+    for name in ("confirm", "dismiss"):
+        p = sub.add_parser(name, help=f"{name} an operator-confirmation offer")
+        p.add_argument("offer_id")
+        p.add_argument("hash8", help="the first 8 characters of the offer's hash (its card)")
+        p.add_argument("--note", default="", help="optional")
+        p.add_argument("--confirm", required=True, help="the exact confirmation words")
     init = sub.add_parser("init", help="create the operator queue (once)")
     init.add_argument("--replace-lost", action="store_true",
                       help="start a new queue although the journal shows one was in use")
@@ -149,6 +165,11 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.cmd == "init":
         return _init(config, args.replace_lost)
+    if args.cmd == "offers":
+        now = datetime.now(UTC)
+        store = RuntimeStore(config.runtime_db)
+        print(json.dumps([card(r, now) for r in load_offers(store)], indent=2, default=str))
+        return 0
     try:
         queue = Q.OperatorQueue(config.operator_db)
     except Q.OperatorQueueUnavailable as exc:
@@ -157,6 +178,24 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     if args.cmd == "history":
         print(json.dumps(queue.requests(), indent=2, default=str))
+        return 0
+    if args.cmd in ("confirm", "dismiss"):
+        row = RuntimeStore(config.runtime_db).offer(int(args.offer_id)) \
+            if args.offer_id.isdigit() else None
+        if row is None or not row["hash"].startswith(args.hash8.lower()):
+            print("not queued: no offer with this id and hash (see `offers`)", file=sys.stderr)
+            return 2
+        try:
+            request_id = queue.enqueue(
+                at=datetime.now(UTC), operator=args.operator or getpass.getuser(), origin="cli",
+                action=Q.CONFIRM_SIGNAL if args.cmd == "confirm" else Q.DISMISS_SIGNAL,
+                target=str(row["id"]), kind=row["hash"], note=args.note,
+                confirmation=args.confirm)
+        except Q.OperatorInputError as exc:
+            print(f"not queued: {exc}", file=sys.stderr)
+            return 2
+        print(f"queued as request {request_id}; the running service applies it on its next "
+              "cycle (an offline apply refuses it)")
         return 0
     if args.cmd != "apply":
         spec = {

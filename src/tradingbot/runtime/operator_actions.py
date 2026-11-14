@@ -8,7 +8,11 @@ by the process that holds the execution store (the running service, or ``scripts
 apply`` while the service is stopped), which checks it again against the broker.
 
 No action in this queue sends, amends or cancels an order. Each one only records what a human has
-established at the broker, or closes a record that blocks nothing, or lifts a lockout.
+established at the broker, closes a record that blocks nothing, lifts a lockout or, where
+``[operator_confirmation]`` is enabled in a simulated or paper mode, confirms or dismisses the
+reading of a held signal whose only hold reasons are on the closed list
+(docs/OPERATOR_CONFIRMATION.md). A confirmed action passes the gateway and the execution core
+again, unchanged, and nothing an operator enters becomes an order value.
 
 Review F3: the queue is created only by an explicit initialisation step
 (``OperatorQueue.initialise``, ``scripts/tb_operator.py init``); opening a missing, unreadable or
@@ -34,7 +38,12 @@ CLEAR = "CLEAR"
 ACKNOWLEDGE = "ACKNOWLEDGE"
 ACKNOWLEDGE_SIGNAL = "ACKNOWLEDGE_SIGNAL"
 CLEAR_IDENTITY_LOCKOUT = "CLEAR_IDENTITY_LOCKOUT"
-ACTIONS = (SETTLE, CLEAR, ACKNOWLEDGE, ACKNOWLEDGE_SIGNAL, CLEAR_IDENTITY_LOCKOUT)
+# Operator confirmation (optional, off by default): target = the offer id, kind = its full hash.
+CONFIRM_SIGNAL = "CONFIRM_SIGNAL"
+DISMISS_SIGNAL = "DISMISS_SIGNAL"
+SIGNAL_OFFER_ACTIONS = (CONFIRM_SIGNAL, DISMISS_SIGNAL)
+ACTIONS = (SETTLE, CLEAR, ACKNOWLEDGE, ACKNOWLEDGE_SIGNAL, CLEAR_IDENTITY_LOCKOUT,
+           *SIGNAL_OFFER_ACTIONS)
 MIN_NOTE_CHARS = 8
 
 SCHEMA = """
@@ -116,6 +125,8 @@ def expected_confirmation(action: str, target: str, *, kind: str | None = None,
         return cat.acknowledge_signal_phrase(int(target), kind or "?")
     if action == CLEAR_IDENTITY_LOCKOUT:
         return cat.lockout_phrase(target)
+    if action in SIGNAL_OFFER_ACTIONS:
+        return cat.offer_phrase(action, int(target), kind or "?")
     raise OperatorInputError(f"unknown operator action {action!r}")
 
 
@@ -215,10 +226,15 @@ class OperatorQueue:
             raise OperatorInputError(f"unknown operator action {action!r}")
         if not operator.strip():
             problems.append("operator name required")
-        if len(note.strip()) < MIN_NOTE_CHARS:
+        if len(note.strip()) < MIN_NOTE_CHARS and action not in SIGNAL_OFFER_ACTIONS:
+            # A confirmation is one press on its card (lead's decision): the note is optional.
             problems.append(f"a note of at least {MIN_NOTE_CHARS} characters is required")
         if action in (CLEAR, ACKNOWLEDGE, ACKNOWLEDGE_SIGNAL) and not str(target).isdigit():
             problems.append("target must be the exception id")
+        if action in SIGNAL_OFFER_ACTIONS and (
+                not str(target).isdigit() or not kind or len(kind) != 64
+                or any(ch not in "0123456789abcdef" for ch in kind)):
+            problems.append("target must be the offer id and kind its full hash")
         if action == SETTLE:
             if outcome not in cat.SETTLEMENT_OUTCOMES:
                 problems.append(f"outcome must be one of {', '.join(cat.SETTLEMENT_OUTCOMES)}")
