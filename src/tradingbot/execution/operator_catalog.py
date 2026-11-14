@@ -103,3 +103,10 @@ def acknowledge_signal_phrase(exc_id: int, kind: str) -> str:
 
 def lockout_phrase(account: str) -> str:
     return f"CLEAR LOCKOUT {account}"
+
+
+def offer_phrase(action: str, offer_id: int, offer_hash: str) -> str:
+    """Confirm or dismiss one offer: it names the offer and the first 8 characters of its hash,
+    so a request can only ever act on the proposal the operator saw."""
+    verb = "CONFIRM" if action == "CONFIRM_SIGNAL" else "DISMISS"
+    return f"{verb} {offer_id} {offer_hash[:8]}"

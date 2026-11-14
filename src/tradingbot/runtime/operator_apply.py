@@ -35,19 +35,27 @@ def apply_pending(
     locked_out: bool = False,
     require_full_reconnect: bool = True,
     session_opened_at: datetime | None = None,
+    signal_handler: Callable[[dict], settlement.OperatorResult] | None = None,
 ) -> list[dict]:
     """Apply every pending request in order. While the broker session is locked out (another
     account identity) only CLEAR_IDENTITY_LOCKOUT is applied; the rest wait. Returns one summary
     per request applied or refused (identifiers and reason codes only).
     ``require_full_reconnect`` (review N2): a lockout clears only through a full reconnect;
     ``session_opened_at``: when this process opened its broker session (a session opened after
-    the lockout began is itself a full reconnect)."""
+    the lockout began is itself a full reconnect). ``signal_handler``: the running service's
+    apply step for CONFIRM_SIGNAL and DISMISS_SIGNAL (operator confirmation); without one (the
+    offline ``tb_operator.py apply``) they are refused: a confirmation needs the live quote path."""
     out = []
     for req in queue.pending():
         if locked_out and req["action"] != Q.CLEAR_IDENTITY_LOCKOUT:
             continue
-        result = _apply_one(coordinator, runtime_store, req, expected_account, clock,
-                            require_full_reconnect, session_opened_at)
+        if req["action"] in Q.SIGNAL_OFFER_ACTIONS:
+            result = (signal_handler(req) if signal_handler is not None else
+                      settlement.OperatorResult(status="REFUSED",
+                                                reasons=["CONFIRM_NEEDS_RUNNING_SERVICE"]))
+        else:
+            result = _apply_one(coordinator, runtime_store, req, expected_account, clock,
+                                require_full_reconnect, session_opened_at)
         queue.record_result(req["id"], clock(), status=result.status, reasons=result.reasons,
                             before=result.before, after=result.after)
         runtime_store.event(

@@ -1,226 +1,165 @@
-# Operator confirmation of held signals (DESIGN DRAFT, not implemented)
+# Operator confirmation of held signals
 
-Owner decision: an optional, paper-only, off-by-default one-tap confirmation for a signal held only
-for interpretation ambiguity. A confirmation is an input to the deterministic chain, never a way
-around it. No order submission through it without separate authorization.
+Owner decision: an optional, paper-only, off-by-default one-press confirmation for a signal held
+only because its meaning is in doubt. A confirmation is an INPUT to the deterministic chain, never a
+way around it: it removes the listed interpretation doubts and nothing else. It does not authorize
+order submission to any real broker (`main` runs the simulated broker only).
 
-## 1. What is persisted today, and what must be added
+```toml
+[operator_confirmation]
+enabled = false   # default. true is refused unless the broker declares SIM or PAPER
+```
 
-A post is interpreted, mapped (`MappingPolicy.apply`), gated and committed in one pass
-(`RuntimeService._handle`); the cursor then moves past it. What survives a held action:
-`signal_actions` (action, timing, asset, side, mapping status/basis/reason, status, reasons, no
-prices, no instrument), a `SIGNAL_<status>` row in `runtime_exceptions`, the outcome in
-`replay_actions`, and the interpreter context (the publisher's book: a present-tense OPEN is recorded
-as idea `<source_id>:<action_id>` with its stop and target even when the follower held it). The
-typed `TradeAction`, the `MappingDecision` (selected instrument, candidate anchor) and the post text
-are not kept. Two facts shape the design:
+Version 1 offers only a CURRENT, explicit OPEN that is the only trading action of its post, with
+one approved family, a side, a price reference (the stated level of an anchored entry, or the
+explicit entry price) and the protective stop as read. Confirm or dismiss only: nothing the operator
+enters becomes an order value.
 
-* **The mapping stops at the first failing check.** `entry_anchor_for`, `_resolve` and `resolve`
-  return on the first problem, so a hold says nothing about the checks after it. To know whether
-  confirming would leave another blocker, the pre-check must evaluate the action again with the
-  confirmable problems *waived* (recorded and stepped over, at their own sites only) and see what
-  the rest of the chain says.
-* **Post text is gone after the pass.** The text-dependent mapping checks (stop uniqueness, cost
-  basis, unexplained prices, contract selection) can be run only during the pass that has the text.
+## What happens
 
-So: (a) `MappingPolicy.resolve(..., waive=CONFIRMABLE)`, a second evaluation run only for a held
-action and only when the feature is on; the production decision never runs with a waiver. (b) A
-new `confirmation_offers` table in the runtime store, created only when the feature is on: the typed
-proposal (no text), the waived codes, the pre-check result, the hash, the state and timestamps, and
-the latest quote view (the service refreshes it each cycle for the card). (c) At apply time the
-service rebuilds the typed action from the offer (the original ambiguity marks minus exactly the
-confirmed codes, the waived run's instrument, the candidate anchor on the `MappedQuote`), re-checks
-the family entry (still approved, terms hash unchanged) and the lexicon hash, reads a fresh quote
-(`_gate_quotes`), and runs `BrokerEventReplay` as a new `attempt` of the same `(source_id,
-revision)` (the column hydration already uses), re-running `gate_source` (an edit on record holds it)
-and `gate_action`, then the coordinator. The order ref stays `order_ref_for(source_id, revision,
-action_id)`, so the coordinator's own idempotency makes the action executable at most once.
+1. **Hold.** The post is interpreted, mapped and gated exactly as on `main`; the action holds.
+2. **Pre-check** (`runtime/confirmation.py`, pure). Only with the switch on, for a held OPEN, the
+   service asks the mapping once more with the table's holds waived
+   (`MappingPolicy.apply_waived`, same inputs as `apply`). `offer_for` then requires: the post
+   passes `gate_source` and is not a duplicate; one trading action; every doubt the waived run
+   stepped over, and every interpreter ambiguity, in the closed table; the waived run SUPPORTED with
+   one instrument in an approved family; side, stop and price reference present; a dry gateway run
+   of the action a confirmation would release fails on nothing time cannot change (an allow-list of
+   market-dependent codes, `MARKET_DEPENDENT`; anything else is "not confirmable"); not expired.
+   Every doubt in the CONFIRMABLE tier gives an **offer**; anything else gives a journaled reason.
+3. **Offer.** Stored in `confirmation_offers` (runtime store; the table exists only once the switch
+   has been on), journaled `CONFIRMATION_OFFERED`, alerted `SIGNAL_CONFIRMABLE` on the existing
+   channels, shown as a card on *Exceptions* and by `tb_operator.py offers`.
+4. **Confirm.** One press on the card (or `tb_operator.py confirm <id> <hash8> --confirm "CONFIRM
+   <id> <hash8>"`) queues `CONFIRM_SIGNAL` with the offer id and its full hash; the note is
+   optional. The running service applies it at the start of its next cycle.
+5. **Apply.** The offer is re-checked (state OFFERED, hash, tier, not expired, broker SIM or PAPER,
+   no halt, the family entry and the lexicon unchanged by hash, same session date, no other revision
+   on record), moved OFFERED -> CONFIRMED -> APPLYING, and the action is evaluated by
+   `BrokerEventReplay.process_confirmed`: a new evaluation pass of the same post revision that runs
+   `gate_source`, the gateway on a fresh quote and the execution core unchanged. The order ref is
+   `order_ref_for(source_id, revision, action_id)`, so the core's own idempotency allows one order
+   at most. The outcome ends the offer: EXECUTED (it reached the execution core), HELD (the gateway
+   held it, e.g. the market moved) or REJECTED (refused, e.g. exposure, account, a stale ledger).
 
-## 2. Reason codes
+**An approximation mark adds no tolerance.** The stated number is the anchor as written; the
+family's collar, move limits and quote rules apply unchanged against the fresh quote.
 
-Default deny: `CONFIRMABLE` is a closed table of (code, detail) pairs; anything else, including any
-code added later, is not confirmable. The table is in `runtime/confirmation.py` with a test that
-every code it names exists and every code in the never-list below is absent.
+## The closed table (`runtime/confirmation_table.py`)
 
-**Confirmable (interpretation only; the level, side and stop are read and unique).**
+Default deny: a (code, detail) pair not written there is never stepped over, never offered.
 
-| Code (detail) | Why confirmable |
-|---|---|
-| `ENTRY_ANCHOR_POST_UNRESOLVED_MARKET` (`RULE:MENTION_WITH_CONTEXT`) | an unknown market word near the level: the owner can tell whether it is another market |
-| `ENTRY_ANCHOR_NOT_CURRENT` (`NO_PRESENT_MARKER` only) | the level is not marked as the current price; whether it is the market now is judgement |
-| `ENTRY_ANCHOR_CONTEXT_UNCLEAR` (`WORDS:<n>`, `OWN_CLAUSE`) | a word next to the level is not on the allow-list |
-| `ENTRY_ANCHOR_INSTRUMENT_UNCLEAR` (`OTHER_WORDS:<n>`, `PRECEDING_SENTENCE`) | a level line holds an unknown word; whose level it is is judgement |
-| `ENTRY_ANCHOR_LEVEL_NOT_MARKET_QUOTE` (`LEVEL_KIND:AMBIGUOUS` with `FOLLOWING_`, `INSTRUCTION_`, `NEIGHBOUR_NOT_UNDERSTOOD`, `CONTEXT_UNKNOWN`, or `OWN_CLAUSE` from an approximation mark) | a neighbouring or instruction sentence is not understood, or the number carries "~" |
-| `ENTRY_ANCHOR_POST_UNATTRIBUTED_ACTION` (`RULE:UNATTRIBUTED_ACTION_SENTENCE`) | another sentence carries an instruction word; with one trading action in the post, whether it is a second instruction is judgement (doubtful, Q2) |
-| `HEADLINE_POSITION_LINE_WITHOUT_ENTRY_VERB`, `POSITION_STATEMENT_OR_ENTRY` (interpreter) | entry or position summary? (doubtful, Q2) |
+| Tier | Code (detail key) | Plain words on the card |
+|---|---|---|
+| CONFIRMABLE | `ENTRY_ANCHOR_POST_UNRESOLVED_MARKET` (`RULE:MENTION_WITH_CONTEXT`) | an unknown market name next to a price or trading word |
+| CONFIRMABLE | `ENTRY_ANCHOR_NOT_CURRENT` (`NO_PRESENT_MARKER`) | the level is not marked as the current price |
+| CONFIRMABLE | `ENTRY_ANCHOR_CONTEXT_UNCLEAR` (`WORDS`, `OWN_CLAUSE`) | a word of the level's or the instruction's sentence is not understood |
+| CONFIRMABLE | `ENTRY_ANCHOR_INSTRUMENT_UNCLEAR` (`OTHER_WORDS`, `PRECEDING_SENTENCE`) | whose level it is: a word of the level line or the sentence before |
+| CONFIRMABLE | `ENTRY_ANCHOR_LEVEL_NOT_MARKET_QUOTE` (`FOLLOWING_`, `INSTRUCTION_`, `NEIGHBOUR_NOT_UNDERSTOOD`) | a neighbouring or instruction sentence is not understood |
+| CONFIRMABLE | `ENTRY_ANCHOR_LEVEL_NOT_MARKET_QUOTE` (`OWN_CLAUSE:APPROXIMATION_MARK`) | the level carries "~" and nothing else |
+| REPORT_ONLY | `HEADLINE_POSITION_LINE_WITHOUT_ENTRY_VERB`, `POSITION_STATEMENT_OR_ENTRY` | entry or position summary |
+| REPORT_ONLY | `ENTRY_ANCHOR_POST_UNATTRIBUTED_ACTION` (`RULE:UNATTRIBUTED_ACTION_SENTENCE`) | another sentence holds an instruction word |
+| REPORT_ONLY | `ENTRY_ANCHOR_NOT_CURRENT` (`NOT_CURRENT_WORD`), `..._LEVEL_NOT_MARKET_QUOTE` (`LEVEL_KIND:ENTRY_OR_COST_BASIS`, `LEVEL_KIND:HISTORICAL`), `..._CONTEXT_UNCLEAR` (`QUESTION`) | positive evidence the level is something else, or a question |
 
-**Doubtful (owner decides, Q1/Q2):** `ENTRY_PRICE_IS_COST_BASIS` (recommend never: the stated price
-would change meaning, not just be confirmed); `ENTRY_ANCHOR_NOT_CURRENT` with `NOT_CURRENT_WORD:<w>`
-and `LEVEL_KIND:ENTRY_OR_COST_BASIS` or `HISTORICAL` (recommend never: the reader found positive
-evidence that the level is something else); `ENTRY_ANCHOR_CONTEXT_UNCLEAR` (`QUESTION`) (recommend
-never: a question is not an instruction).
+REPORT_ONLY is never offered: only the evaluation hook reports it ("would be offered if the owner
+allowed this tier", `NoOffer.reason = TIER_NOT_ALLOWED`, `would_be`), so the owner decides with
+counts. Never (not in the table): every mapping, contract, option, stop, collar, quote, exposure,
+age, environment, halt, reconnect, source (edited, unverified, truncated, before first start,
+duplicate) and unreadable-number code, `ENTRY_PRICE_IS_COST_BASIS`, several levels or markets or
+actions, `SIDE_UNCLEAR`, `SECOND_NUMBER`, `LEVEL_KIND:STOP_OR_TARGET`, `STANDALONE_LEVEL_NOT_ENABLED`,
+`RULE:ADDITIVE_ELLIPSIS`, and `CONTEXT_UNKNOWN` (moved from the design draft: once stepped over, the
+later checks cannot run, so it is never waived). A test checks every code named exists, the
+never-list is absent and an unknown pair raises.
 
-**Never**, each because confirming would supply a value, choose among alternatives, or override a
-deterministic or safety rule:
-* mapping and contract: `UNSUPPORTED_INSTRUMENT_MAPPING`, `MAPPING_NOT_APPROVED`, `BASIS_UNSUPPORTED`,
-  `SOURCE_ASSET_UNRESOLVED`/`_NOT_MAPPED`, `INTERPRETED_INSTRUMENT_DIFFERS_FROM_MAPPING`,
-  `CONTRACT_SELECTION_AMBIGUOUS`, `CONTRACT_MONTH_UNRECOGNISED`, `FRONT_MONTH_*`, `OPTION_TERMS_INCOMPLETE`,
-  `OPTION_STRATEGY_NOT_SINGLE_LEG`, `IDEA_CONTRACT_MISMATCH`, `MAPPING_LONG_ONLY`,
-  `SHORT_NOT_PERMITTED_FOR_FAMILY`, `ENTRY_ANCHOR_RULE_INCOMPLETE`, `_LIMIT_ABOVE_CEILING`, `_BASIS_CAP_MISSING`;
-* several candidates (v1 has no picking): `ENTRY_ANCHOR_SEVERAL_LEVELS`, `_SECOND_PRICE`,
-  `_SOURCE_AMBIGUOUS`, `_INSTRUMENT_AMBIGUOUS`, `_UNEXPLAINED_PRICE`, `_REFERENCE_UNNAMED`,
-  `_POST_SEVERAL_LEVELS`/`_MARKETS`/`_ACTIONS`, `CONTEXT_UNCLEAR` (`SECOND_NUMBER`), `SIDE_UNCLEAR`,
-  `MULTIPLE_OPEN_IDEAS_IN_CONTEXT`, `EXISTING_OPEN_IDEA_SAME_SIDE_IN_CONTEXT` (a duplicate entry risk);
-* unreadable or missing: `ENTRY_ANCHOR_UNREADABLE`, `_NOT_IN_POST`, `_NOT_STATED`, `ENTRY_TEXT_*`,
-  `OPEN_ENTRY_PRICE_MISSING`, `ASSET_UNRESOLVED`, `INVALID_STOP_PRICE`, `NO_OPEN_IDEA_IN_CONTEXT`,
-  `LEVEL_KIND:STOP_OR_TARGET`, `STANDALONE_LEVEL_NOT_ENABLED` (a family switch, not an ambiguity),
-  `POST_UNRESOLVED_MARKET` (`RULE:ADDITIVE_ELLIPSIS`: the post may continue);
-* stops: `PROTECTIVE_STOP_MISSING`, `PROTECTIVE_STOP_NOT_UNIQUE`, `PROTECTIVE_STOP_TOO_FAR_FROM_*`,
-  `STOP_DIRECTION_CONTRADICTION`, `STOP_ALREADY_CROSSED_AT_ENTRY`;
-* timing and authority: `TEMPORAL_INTENT_UNCERTAIN`, `CONDITIONAL_TRIGGER_NOT_IMPLEMENTED`,
-  `FUTURE_INTENT_WITHOUT_EXPLICIT_CONDITION`, `NOT_EXPLICITLY_AUTHORITATIVE`;
-* source: `SOURCE_EDIT_REQUIRES_REVIEW`, `SOURCE_NOT_AUTHENTICATED`, `SOURCE_TEXT_TRUNCATED`,
-  `SOURCE_HASH_CHANGED_WITHOUT_REVISION`, `POST_BEFORE_FIRST_START`, duplicates, `SOURCE_STALE_OR_FUTURE`,
-  `ENTRY_ANCHOR_SIGNAL_TOO_OLD`;
-* market and risk: every `QUOTE_*` and `ENTRY_ANCHOR_QUOTE_*`, `INVALID_BID_ASK`, `SPREAD_TOO_WIDE`,
-  `ENTRY_PRICE_COLLAR`, `ENTRY_ANCHOR_ADVERSE_MOVE`/`_FAVOURABLE_MOVE`, `NOTIONAL_LIMIT`,
-  `UNIT_CAP_OR_INCREMENT`, the coordinator's exposure caps, `OPPOSITE_IDEA_IN_SAME_CONTRACT`;
-* environment and state: `ENTRY_ANCHOR_PAPER_ONLY`, `BROKER_ACCOUNT_MISMATCH`, `BROKER_UNREADABLE`,
-  `BROKER_RECONNECT_PENDING`, `HALTED` and the halt codes, the identity lockout.
+## The waiver's safeguards (`runtime/mapping.py`)
 
-## 3. When an offer exists (deterministic pre-check, repeated at apply)
+1. `resolve_waived(action, *, waive, ...)` / `apply_waived(parsed, action_id, *, waive, ...)` take
+   `waive` keyword-only and accept only pairs of the closed table; anything else raises.
+2. The production decision never passes one: `resolve` and `apply` have no such argument. With the
+   switch off the waived evaluation is never run (test patches it to raise).
+3. The result is a `WaivedResolution`, never a `MappingDecision`; `ensure_production` refuses it
+   on the ordinary gate path (`_gate_quotes`). The replay's ordinary `process` treats the post as a
+   duplicate; `process_confirmed` requires a `ConfirmationAuthority`, which `confirmation.authorize`
+   issues only for an APPLYING offer of the CONFIRMABLE tier, intact and unexpired, and which
+   permits exactly that post revision and that action.
+4. Each check steps over only its own hold, at its own site, records it and returns to the chain
+   with the inputs unchanged; the checks after it run as on `main`. `INSTRUCTION_NOT_UNDERSTOOD` is
+   stepped over only when every instruction sentence fails on unknown words alone (never a
+   question or a second number).
 
-Offered only if all hold: feature on, mode mock or shadow, broker declares SIM or PAPER; the post
-passes `gate_source` and is not before first start or a duplicate; the post has exactly one trading
-action and it is a CURRENT, explicit OPEN (ADD, exits and MODIFY are out of v1); every hold code on
-it is in `CONFIRMABLE`; the waived mapping run is SUPPORTED with one instrument in an approved
-family, a side, a price reference (the candidate anchor or the explicit entry) and the stop as read;
-and a dry `gate_action` of the waived action on the decision's own quote fails on nothing that time
-cannot change (stop direction and distance from the stated level, unit cap, side permitted). A
-market-dependent failure at that moment (quote age, collar, adverse move) does not prevent the offer;
-the card shows it. Otherwise the hold is shown as **not confirmable**, with its reasons.
+## Binding, expiry, state machine
 
-## 4. Offer state machine
+The hash binds the post identity and revision, its sha256, the typed proposal (with the
+interpreter's evidence replaced by its hash), the family, execution instrument, basis, price
+reference, stop, target, the doubts and tier, the publication, receipt and expiry times, the entry
+terms hash, the lexicon hash and the session date. Expiry is the existing signal age limit, from
+publication (anchored: the family's `max_signal_age_seconds`, 90 s for TLT, and the policy's, the
+smaller; explicit: the policy's), unchanged; `gate_confirmed` and the apply step refuse at or after
+it.
 
-`OFFERED` -> `CONFIRMED` (request applied) -> `APPLYING` -> `EXECUTED` | `HELD` | `REJECTED`
-(the gateway's or coordinator's outcome and reasons, recorded on the offer and the signal).
-`OFFERED` -> `DISMISSED` (operator) | `EXPIRED` (signal age limit) | `INVALIDATED` with
-`REVISION` (any other revision of the post), `LATER_INSTRUCTION` (a later action whose
-`idea_reference` is the offer's idea, or any later trading action in the same family),
-`HALT` (halt engaged), `MAPPING_CHANGED` / `LEXICON_CHANGED` (hash differs after a restart),
-`FEATURE_DISABLED` (switched off). Every exit from `OFFERED` is final (one-shot). A request whose
-hash differs from the offer's is refused `PROPOSAL_CHANGED`; one for a non-`OFFERED` offer is refused
-`OFFER_NOT_OPEN`. An `APPLYING` offer found at start is never re-run: the coordinator's recovery
-decides the intent if one exists; otherwise it ends `REJECTED` (`APPLY_INTERRUPTED`).
+`OFFERED` -> `CONFIRMED` -> `APPLYING` -> `EXECUTED` | `HELD` | `REJECTED`; `OFFERED` -> `DISMISSED`
+| `EXPIRED` (journaled `unanswered = true` when no one answered) | `INVALIDATED` (`REVISION`,
+`LATER_INSTRUCTION`: a later post's trading action on the offer's idea or family, `HALT`,
+`MAPPING_CHANGED`, `LEXICON_CHANGED`, `DATE_CHANGED`, `ENVIRONMENT_NOT_SIM_OR_PAPER`,
+`FEATURE_DISABLED`, `OFFER_RECORD_CORRUPT`). Every exit is final. A request with another hash is
+refused `PROPOSAL_CHANGED`; one for an offer no longer open `OFFER_NOT_OPEN:<state>`. An offer
+found CONFIRMED or APPLYING at start is never evaluated again: the execution core's recovery
+decides an intent that exists (`RECOVERED_BY_EXECUTION_CORE`), otherwise `APPLY_INTERRUPTED`.
 
-Binding hash: sha256 of the canonical JSON of source id, post id, revision, post hash, action id,
-action, side, family and entry-terms hash, execution contract key, price reference, stop, target,
-waived (code, detail) list, published time and expiry. Expiry: `published_at` + the action's existing
-limit (anchored: the family's `max_signal_age_seconds`, 90 s for TLT; explicit: the policy's
-`max_signal_age_seconds`), unchanged; the gateway enforces it again at apply.
+**Clock- and date-dependent checks.** The mapping reads the date only for futures contract
+selection (named months, nearest month, front month, the roll margin; codes
+`CONTRACT_SELECTION_AMBIGUOUS`, `CONTRACT_MONTH_UNRECOGNISED`, `FRONT_MONTH_*`, all never-listed).
+The selected contract is in the hash and the apply step refuses another session date
+(`DATE_CHANGED`), so the selection is the one the same inputs give. Everything else that depends on
+time (source freshness, the anchor age, the session window, the roll window, quote ages) is in the
+gateway or the execution core and runs again at apply. TLT is a stock: no contract date at all.
 
-## 5. Latency (90 s budget, measured from publication)
+## Latency (90 s budget, from publication)
 
-| Step | Time |
-|---|---|
-| X exposes the post (G0, median / p95) | 12.4 s / 13.4 s |
-| Decision, offer, alert (end of the same cycle; macOS notification at once) | under 1 s |
-| Owner notices, opens the card, decides | the remainder |
-| Operator queue applied at the next cycle start (cycle = source poll interval: 5 s recommended, 1 s in the shadow example, longer under an X rate limit) | up to 5 s |
-| **Left for the owner** | **about 70 s** |
-
-The queue is fast enough; no new channel is needed. The real limit is the human: the feature is
-useful only when the owner is at the screen with notifications on. An anchored entry also needs, at
+X exposes a post in 12.4 s (median; p95 13.4 s, G0). Decision, offer and alert take under 1 s in
+the same cycle. The queue is applied at the next cycle start: up to one cycle (5 s recommended for
+X, 1 s in the shadow example). That leaves the owner about 70 s. An anchored entry also needs, at
 apply, a LIVE quote with each side at most 3 s old and the market within 0.3% adverse / 0.6%
-favourable of the stated level, so a slow confirmation often ends `HELD` with a move code. A longer
-window for confirmed signals is a trading-behaviour change for the owner: it would need a new
-per-family limit, raising the gateway ceiling `ANCHOR_MAX_SIGNAL_AGE_CEILING_SECONDS` (120 s), the
-policy's source freshness and the coordinator's intent age, and an evaluation of the stale-level risk.
-Not designed in.
+favourable of the stated level; a slow confirmation often ends HELD with a move code. A longer
+window for confirmed signals would be a trading-behaviour change for the owner: a new limit, a raised
+gateway ceiling (`ANCHOR_MAX_SIGNAL_AGE_CEILING_SECONDS`, 120 s), the policy's source freshness and
+the core's intent age. Not built.
 
-## 6. Failure modes
+## Journal and privacy
 
-| Failure | What happens |
+Events (`service_events`): `CONFIRMATION_OFFERED`, `CONFIRMATION_NOT_OFFERED` (holds carrying a
+table doubt; reason, detail, tier), `OPERATOR_CONFIRMED_SIGNAL`, `OPERATOR_DISMISSED_SIGNAL` (with
+the operator, request id and origin), `CONFIRMATION_EXPIRED`, `CONFIRMATION_INVALIDATED`,
+`CONFIRMATION_RESULT` (status, reasons, order ref), `CONFIRMATION_PRECHECK_FAILED` (exception
+type only; no offer). Identifiers, codes, numbers and times only: no post text is stored anywhere
+(test scans every table, the alerts file, the notification log and the card for an invented post's
+words).
+
+## Evaluation hook (pure)
+
+```python
+from tradingbot.runtime import confirmation as C, confirmation_table as T
+waived = mapping.apply_waived(parsed, action_id, waive=T.WAIVE_ALL, **same_kwargs_as_apply)
+out = C.offer_for(C.HeldDecision(..., production=decision, waived=waived, quote=..., now=...))
+gate = C.gate_confirmed(out, fresh_quote, policy, now=later)   # for an Offer (or out.would_be)
+```
+
+`offer_for` returns an `Offer` (CONFIRMABLE) or a `NoOffer(reason, detail, tier,
+confirmable_doubts, would_be)`. `gate_confirmed` is the gateway only (no execution-core caps).
+
+## Proof (tests)
+
+| Invariant | Test |
 |---|---|
-| Queue missing or unreadable | nothing applies (`OPERATOR_QUEUE_UNAVAILABLE`); offers expire |
-| Broker unreadable or reconnect pending | requests are not applied that cycle, or the coordinator refuses the OPEN; the offer ends `REJECTED` or expires |
-| Halt engaged | every open offer `INVALIDATED HALT`; the coordinator refuses anyway |
-| Service restart | offers persist; still valid only if not expired and the mapping and lexicon hashes match |
-| `tb_operator.py apply` with the service stopped | confirm refused `CONFIRM_NEEDS_RUNNING_SERVICE` (no live quote path) |
-| Stale card, double confirm (CLI and page) | `PROPOSAL_CHANGED`, `OFFER_NOT_OPEN` |
-| Crash during apply | the same order ref; the coordinator adopts or refuses the intent; never a second order |
-| Later post arrives after the confirm was applied | handled as for any open idea (the publisher's book already holds the idea), e.g. a CLOSE exits it |
-| Broker declares LIVE or nothing | refused at start (exit 2) and at apply |
+| Off equals main | `test_operator_confirmation_service`: no waived run, table, event or alert with the switch off; the mock scenarios and the shadow call trace replayed with the switch off match `main` (experiment, PR notes) |
+| No order package | `test_shadow_no_order_import_sdk`: the subprocess import blocker with the switch on, through a confirmed entry |
+| SIM or PAPER only | refused at start for LIVE and undeclared brokers, and at apply |
+| The chain still refuses | adverse move, a quote that stopped updating, exposure cap, stale ledger (reconnect pending), account check, halt, expiry, each with its own reason |
+| One-shot and binding | second press, stale hash, dismiss then confirm, revision, later instruction, mapping change on restart, switch off |
+| Restart in APPLYING | never evaluated again |
+| Closed table, safeguards | `test_operator_confirmation_core`: codes exist, never-list absent, unknown pair raises, keyword-only, no waiver in `resolve`/`apply`, `ensure_production`, later checks run behind a waived hold |
+| No tolerance | the approximation's anchor is the stated number; 0.31% away holds `ENTRY_ANCHOR_ADVERSE_MOVE` |
+| No post text | every row, event, alert, log line and card |
 
-## 7. Surface, journal, alerts
-
-Card per offer (Exceptions page): proposed action and side; source family, reference series,
-execution instrument; price reference (stated level or explicit entry), basis treatment, the latest
-quote with its age and quality, deviation from the level and whether the move limits pass now; stop;
-target; uncertainty in plain words, one sentence per waived code; the hold reasons; time left; the
-post's identity (post id, revision, published time). Never post text. Buttons Confirm and Dismiss
-queue `CONFIRM_SIGNAL` / `DISMISS_SIGNAL` with the offer id and hash; CLI `tb_operator.py offers`,
-`confirm <offer> <hash8>`, `dismiss <offer> <hash8>`. Journal events (`service_events`, identifiers,
-codes, times, operator): `CONFIRMATION_OFFERED`, `CONFIRMATION_NOT_OFFERED` (only for holds carrying
-at least one confirmable code), `OPERATOR_CONFIRMED_SIGNAL`, `OPERATOR_DISMISSED_SIGNAL`,
-`CONFIRMATION_EXPIRED`, `CONFIRMATION_INVALIDATED`, `CONFIRMATION_RESULT` (status, reasons, order ref).
-Alert `SIGNAL_CONFIRMABLE` (key `OFFER:<id>`) on the existing channels, resolved when the offer ends.
-
-AGENTS.md rule 1: the capability adds no order path (the action still comes only from a gateway
-approval through `ExecutionCoordinator`), but it is not "recording a broker fact" or "lifting a
-block" as those words were meant. Proposed: "Operator tools only record what a human established at
-the broker, lift a block, or, where `[operator_confirmation]` is enabled in a simulated or paper mode,
-confirm the reading of a held signal whose only hold reasons are on the closed list in
-docs/OPERATOR_CONFIRMATION.md; the confirmed action passes the gateway and the coordinator again,
-unchanged, and nothing an operator enters becomes an order value." OPERATIONS.md ("no operator action
-below sends an order") and the `operator_actions` docstring change to match. Rule 4 applies: the new
-replay attempt and the service's apply step are order-path changes and need independent review.
-
-Evaluation hook (pure, no I/O): `offer_for(HeldDecision) -> Offer | NoOffer(reason)` where
-`HeldDecision` holds the typed action, the production and waived mapping decisions, the outcome,
-the post-level facts and the dry gate; and `gate_confirmed(offer, quote, position, policy, now)`, the
-gateway on the rebuilt action (no coordinator caps), for counting how many would pass.
-
-## 8. Proof
-
-* Off = main: unit test that no waiver run, table, event or alert exists; the mock scenarios and the
-  shadow call trace replayed with the switch off give byte-identical journals and wire traces; the
-  subprocess import blocker for `tradingbot.ibkr_orders` still passes with the switch on.
-* SIM/PAPER gate: start refused for LIVE and undeclared brokers; apply refused if it changes.
-* Chain unchanged: for every gateway and coordinator refusal (collar, quote age, stop distance, caps,
-  age limit, halt, reconnect, account) a confirmed offer ends with that reason; a property test that
-  a confirmed action is approved only if `gate_action` approves the rebuilt action on the same inputs.
-* Closed table: every named code exists; the never-list is absent; an unknown code is refused; adding
-  a code to the mapping does not make it confirmable.
-* One proposal: posts with two actions, an ADD, an exit, two stops, or a confirmable plus a never
-  code yield "not confirmable" with the right reason; the waived run finds blockers behind a
-  confirmable first problem.
-* Binding: revision, later instruction, halt, expiry, mapping or lexicon change, feature off all end
-  the offer; wrong hash and second confirm refused; restart in `APPLYING` never re-runs.
-* Journal and text: every transition journaled with operator and codes; a scan that no offer row,
-  event, alert or card carries a word of an invented post.
-* Hook: `offer_for` gives the same answer as the service on the invented fixtures.
-
-## 9. Files and size (rough)
-
-New `runtime/confirmation.py` (table, pre-check, hash, hook, about 400 lines); `runtime/mapping.py`
-(waiver at the confirmable sites, about 80); `runtime/service.py` (offer, refresh, invalidate, apply,
-about 200); `runtime/store.py` (offers table, about 80); `event_replay.py` and `execution/replay.py`
-(the confirmed attempt, about 80); `operator_actions.py`, `operator_apply.py`, `execution/operator_catalog.py`,
-`scripts/tb_operator.py` (about 120); `runtime/config.py`, `notify.py`, `alerts.py` (about 50);
-`dashboard/pages/9_Exceptions.py` (card, about 200); docs (this file, RUNTIME, OPERATIONS, AGENTS);
-tests about 1,000 lines. About 1,300 lines of production code.
-
-## 10. Open questions for the owner
-
-1. **Cost basis** (`ENTRY_PRICE_IS_COST_BASIS`): confirmable? Recommend never in v1.
-2. **Entry or summary, and an unattributed instruction sentence**
-   (`HEADLINE_POSITION_LINE_WITHOUT_ENTRY_VERB`, `POSITION_STATEMENT_OR_ENTRY`,
-   `ENTRY_ANCHOR_POST_UNATTRIBUTED_ACTION`): confirmable? Recommend yes, only with one trading action.
-3. **The 90 s window**: keep it for the evaluation? Recommend yes; count unanswered expiries first.
-4. **One tap**: existing actions need a typed phrase and a note. Recommend a single press on the card
-   (the request carries the hash; note optional), and the typed `confirm <offer> <hash8>` on the CLI.
-5. **Text-dependent mapping checks**: run once at offer time and bound by hash (recommended), or keep
-   the post text in memory until expiry so the whole mapping re-runs at apply? Recommend the former:
-   no text is retained, and the checks depend only on the immutable revision, the mapping and the
-   lexicon, all of which are re-checked by hash at apply.
+AGENTS.md rule 1 is worded for this capability. The apply step and `process_confirmed` are order-path
+changes (rule 4): they need the independent review before merge.

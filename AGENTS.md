@@ -6,8 +6,11 @@ Canonical repository: https://github.com/tsaid1/tradingbot (**public**).
 
 1. **One gateway.** Every order comes from an action that the deterministic gateway
    (`validator.py`) approved, through `ExecutionCoordinator`. No other path may create or increase
-   exposure. Operator tools only record what a human established at the broker, or lift a block.
-   LLM or interpreter output never bypasses the gateway.
+   exposure. Operator tools only record what a human established at the broker, lift a block, or,
+   where `[operator_confirmation]` is enabled in a simulated or paper mode, confirm the reading of
+   a held signal whose only hold reasons are on the closed list in docs/OPERATOR_CONFIRMATION.md;
+   the confirmed action passes the gateway and the coordinator again, unchanged, and nothing an
+   operator enters becomes an order value. LLM or interpreter output never bypasses the gateway.
 2. **No paid source content and no credentials in this repo.** Do not commit post text,
    screenshots, subscriber material, tokens, account numbers or broker licences. Tests and
    fixtures use invented data only. Logs, journals and notifications carry identifiers and reason

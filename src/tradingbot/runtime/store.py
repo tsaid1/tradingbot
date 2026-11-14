@@ -104,6 +104,28 @@ CREATE TABLE IF NOT EXISTS kv (
 );
 """
 
+OFFERS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS confirmation_offers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    hash TEXT NOT NULL UNIQUE,
+    source_id TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    action_id TEXT NOT NULL,
+    idea_id TEXT NOT NULL,
+    family TEXT NOT NULL,
+    state TEXT NOT NULL,
+    state_reason TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    record TEXT NOT NULL,
+    quote_view TEXT,
+    result TEXT,
+    operator TEXT,
+    request_uid TEXT
+);
+"""
+
 
 def _iso(value: datetime | None) -> str | None:
     return value.isoformat() if value is not None else None
@@ -486,6 +508,70 @@ class RuntimeStore:
         with self.tx() as c:
             rows = c.execute("SELECT * FROM service_events ORDER BY seq").fetchall()
         return [{**dict(r), "detail": json.loads(r["detail"])} for r in rows]
+
+
+    # ------------------------------------------------------------------ operator confirmation
+    # Created only when [operator_confirmation] is enabled (ensure_offers): with the switch off
+    # the store's schema and content are exactly as before. Typed fields only, never post text.
+
+    def ensure_offers(self) -> None:
+        with self.tx() as c:
+            c.executescript(OFFERS_SCHEMA)
+
+    def has_offers(self) -> bool:
+        with self.tx() as c:
+            return c.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                             "AND name='confirmation_offers'").fetchone() is not None
+
+    def add_offer(self, record: dict, at: datetime) -> int | None:
+        """Store a new offer (state OFFERED); None when an offer with this hash exists."""
+        with self.tx() as c:
+            cur = c.execute(
+                """INSERT OR IGNORE INTO confirmation_offers (hash,source_id,revision,action_id,
+                idea_id,family,state,created_at,updated_at,expires_at,record)
+                VALUES (?,?,?,?,?,?,'OFFERED',?,?,?,?)""",
+                (record["hash"], record["source_id"], record["revision"], record["action_id"],
+                 record["idea_id"], record["family"], at.isoformat(), at.isoformat(),
+                 record["expires_at"], json.dumps(record, sort_keys=True, default=str)))
+            return int(cur.lastrowid) if cur.rowcount else None
+
+    def offers(self, *, states: tuple[str, ...] | None = None) -> list[dict]:
+        if not self.has_offers():
+            return []
+        with self.tx() as c:
+            rows = c.execute("SELECT * FROM confirmation_offers ORDER BY id").fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            if states is not None and d["state"] not in states:
+                continue
+            for k in ("record", "quote_view", "result"):
+                d[k] = json.loads(d[k]) if d.get(k) else None
+            out.append(d)
+        return out
+
+    def offer(self, offer_id: int) -> dict | None:
+        return next((o for o in self.offers() if o["id"] == offer_id), None)
+
+    def set_offer_state(self, offer_id: int, *, expect: tuple[str, ...], state: str,
+                        at: datetime, reason: str | None = None, result: dict | None = None,
+                        operator: str | None = None, request_uid: str | None = None) -> bool:
+        """Compare and set: moves the offer only from one of ``expect`` (one-shot)."""
+        with self.tx() as c:
+            cur = c.execute(
+                f"""UPDATE confirmation_offers SET state=?, updated_at=?,
+                state_reason=COALESCE(?, state_reason), result=COALESCE(?, result),
+                operator=COALESCE(?, operator), request_uid=COALESCE(?, request_uid)
+                WHERE id=? AND state IN ({",".join("?" * len(expect))})""",
+                (state, at.isoformat(), reason,
+                 json.dumps(result, sort_keys=True, default=str) if result is not None else None,
+                 operator, request_uid, offer_id, *expect))
+            return cur.rowcount == 1
+
+    def set_offer_quote(self, offer_id: int, view: dict, at: datetime) -> None:
+        with self.tx() as c:
+            c.execute("UPDATE confirmation_offers SET quote_view=? WHERE id=?",
+                      (json.dumps(view, sort_keys=True, default=str), offer_id))
 
 
 def write_json_atomic(path: Path, payload: dict) -> None:

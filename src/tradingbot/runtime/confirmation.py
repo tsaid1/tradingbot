@@ -21,6 +21,7 @@ from decimal import Decimal, InvalidOperation
 from zoneinfo import ZoneInfo
 
 from tradingbot.event_models import ReplaySource, Timing, TradeAction
+from tradingbot.event_replay import ConfirmationAuthority
 from tradingbot.models import Action, GateDecision, MappedQuote, MockPolicy, Position, Quote
 from tradingbot.runtime import confirmation_table as T
 from tradingbot.runtime.mapping import (
@@ -154,6 +155,7 @@ class Offer:
     uncertainty: tuple[str, ...]  # plain words, one per pair (from the closed table)
     hold_reasons: tuple[str, ...]
     published_at: datetime
+    received_at: datetime
     expires_at: datetime
     entry_terms_hash: str
     lexicon_hash: str
@@ -174,6 +176,7 @@ class Offer:
             "stop": self.stop, "target": self.target,
             "confirms": [list(p) for p in self.confirms], "tier": self.tier,
             "published_at": self.published_at.isoformat(),
+            "received_at": self.received_at.isoformat(),
             "expires_at": self.expires_at.isoformat(),
             "entry_terms_hash": self.entry_terms_hash, "lexicon_hash": self.lexicon_hash,
             "session_date": self.session_date,
@@ -208,6 +211,7 @@ class Offer:
             uncertainty=tuple(r.get("uncertainty", ())),
             hold_reasons=tuple(r.get("hold_reasons", ())),
             published_at=datetime.fromisoformat(r["published_at"]),
+            received_at=datetime.fromisoformat(r["received_at"]),
             expires_at=datetime.fromisoformat(r["expires_at"]),
             entry_terms_hash=r["entry_terms_hash"], lexicon_hash=r["lexicon_hash"],
             session_date=r["session_date"], gate_now_status=r.get("gate_now_status", ""),
@@ -322,7 +326,7 @@ def offer_for(held: HeldDecision) -> Offer | NoOffer:
         confirms_detail=tuple(p for _, _, p in w.waived) + tuple((x,) for x in own),
         uncertainty=tuple(T.TABLE[p] for p in pairs),
         hold_reasons=tuple(held.outcome_reasons), published_at=held.published_at,
-        expires_at=expires, entry_terms_hash=entry_terms_hash(entry),
+        received_at=held.received_at, expires_at=expires, entry_terms_hash=entry_terms_hash(entry),
         lexicon_hash=held.lexicon_hash,
         session_date=held.now.astimezone(ZoneInfo(tz)).date().isoformat(),
         gate_now_status="", gate_now_reasons=())
@@ -364,3 +368,25 @@ def gate_confirmed(offer: Offer, quote: Quote | None, policy: MockPolicy, *, now
         return GateDecision(status="HOLD", reasons=[CONFIRMATION_EXPIRED])
     return gate_action(offer.proposal, offer.published_at, anchored_quote(offer, quote), policy,
                        position, now=now)
+
+
+# ----------------------------------------------------------------------------- the apply step
+
+def source_of(offer: Offer) -> ReplaySource:
+    """The post revision the offer is bound to, as the replay records it (``offer_for`` offers
+    only a verified, complete, original post)."""
+    return ReplaySource(source_id=offer.source_id, revision=offer.revision,
+                        published_at=offer.published_at, received_at=offer.received_at,
+                        verified_author=True, complete_text=True, post_hash=offer.post_hash)
+
+
+def authorize(offer: Offer, *, state: str, now: datetime) -> ConfirmationAuthority:
+    """The one capability that lets the replay evaluate a confirmed action: only for an offer in
+    state APPLYING (confirmed by the operator), of the confirmable tier, intact (its record matches
+    its hash) and not expired."""
+    if state != "APPLYING" or offer.tier != T.CONFIRMABLE_TIER or offer_hash(offer) != offer.hash \
+            or now >= offer.expires_at:
+        raise PermissionError("no confirmed, unexpired, intact offer")
+    return ConfirmationAuthority(offer_hash=offer.hash, source_id=offer.source_id,
+                                 revision=offer.revision, post_hash=offer.post_hash,
+                                 action=offer.proposal, expires_at=offer.expires_at)

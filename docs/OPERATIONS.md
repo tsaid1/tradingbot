@@ -3,8 +3,9 @@
 Three processes: the **service** (`scripts/run_service.py`), the **watchdog**
 (`scripts/tb_watchdog.py`, every 60 s) and the **dashboard** (`streamlit run dashboard/app.py`, pages
 *Execution* and *Exceptions*). All read one runtime TOML (`TRADINGBOT_RUNTIME_CONFIG`, default
-`~/.config/tradingbot/runtime.toml`). Only the simulated broker exists; no operator action below
-sends an order.
+`~/.config/tradingbot/runtime.toml`). Only the simulated broker exists. No operator action below
+sends an order, except that a confirmed offer (operator confirmation, off by default, below)
+releases a held action into the unchanged gateway and execution core on the simulated broker.
 
 ## Start and stop
 
@@ -60,6 +61,7 @@ an alert.
 | `REVIEW_LOG_WRITE_FAILED` | The owner's private vocabulary review log (`[interpreter] review_log_path`) could not be appended: it became group- or world-readable, was replaced by something other than a regular file, or the disk refused the write. The alert carries the code and the exception type only. Trading, the journal and the heartbeat carry on; only review lines are lost. | Fix the file (`chmod 600`, restore a regular file, free space); the alert resolves on the next successful write. See `docs/RUNTIME.md`, "Vocabulary review". |
 | `PRIVATE_PATH_IN_SYNCED_FOLDER` | At start, with the review log on: the review log or the private lexicon lies in a cloud-synced folder (the message names the file kind and the path class, such as `CLOUD_STORAGE`, never the path or any content). Allowed by the owner's policy; the file is copied to that provider. | Nothing required. To avoid the copy, move the review log, proposals, candidates and backups to a non-synced private directory (mode 0700) and update the config. |
 | `PRIVATE_PATH_IN_OTHER_GIT_TREE` | At start, with the review log on: the review log or the private lexicon lies inside a git work tree that is not this program's repository (the message names the file kind and the class `OTHER_GIT_WORK_TREE`, never the path). Allowed by the Product Owner's decision; the file could be committed to that repository by mistake and the tool cannot prevent it. | Make sure that repository never commits the file (an ignore rule, or keep it outside the tracked folders), or move the private files to a private folder outside any git work tree (docs/RUNTIME.md, recommended layout). |
+| `SIGNAL_CONFIRMABLE` | Operator confirmation only (`[operator_confirmation] enabled`): a signal is held only because its meaning is in doubt, and it can be confirmed. The alert names the offer, its hash, the action, family, level, stop, the doubts and the seconds left (no post text). It closes when the offer ends. | Read the post on X yourself. If the card's doubts are wrong readings, press Confirm (or `tb_operator.py confirm`); otherwise Dismiss or let it expire. The price, quote, stop, size and age checks run again and can still refuse it. |
 | `HEARTBEAT_STALE` / `_RESTORED` | From the watchdog: the service has stopped, or is hung. | Check `launchctl list`, the service log and the lock holder. |
 | `HALT_ENGAGED` / `HALT_CLEARED` | The halt file appeared or went away. | Confirm that you meant it. |
 
@@ -126,6 +128,13 @@ of the queue; write what you checked, never a credential or a full account numbe
   identity read alone). With `[service] lockout_clear_requires_full_reconnect = true` (the
   default) the latter is refused with `FULL_RECONNECT_UNAVAILABLE`: such an adapter stays locked
   out until the service is restarted, after which the clear is accepted on the new session.
+* `offers`, `confirm <offer> <hash8> --confirm "CONFIRM <offer> <hash8>"`,
+  `dismiss <offer> <hash8> --confirm "DISMISS <offer> <hash8>"` (note optional): operator
+  confirmation of a held signal, only with `[operator_confirmation] enabled = true` (refused unless
+  the broker declares SIM or PAPER). On the *Exceptions* page it is one press on the offer's card.
+  Only the running service applies it (an offline `apply` refuses it,
+  `CONFIRM_NEEDS_RUNNING_SERVICE`), once, before the offer's expiry (the signal's own age limit,
+  90 s from publication for TLT). See docs/OPERATOR_CONFIRMATION.md.
 * Never operator-clearable, because only evidence resolves them: `UNPROTECTED_POSITION`,
   `PROTECTION_UNVERIFIED`, `ENTRY_REMAINDER_NOT_CANCELLED`, `BROKER_STATE_UNKNOWN`,
   `BROKER_RECONNECT_PENDING`, `OPERATOR_SETTLEMENT_UNVERIFIED`.

@@ -91,11 +91,13 @@ from tradingbot.runtime import notify as N
 from tradingbot.runtime import vocab_review
 from tradingbot.runtime.alerts import Alerter
 from tradingbot.runtime.config import ConfigError, RuntimeConfig
+from tradingbot.runtime.confirmation_desk import ConfirmationDesk, disable_open_offers
 from tradingbot.runtime.mapping import (
     AnchorLexicon,
     FamilyMapping,
     MappingDecision,
     MappingPolicy,
+    ensure_production,
 )
 from tradingbot.runtime.notify import Notifier
 from tradingbot.runtime.operator_actions import OperatorQueue, OperatorQueueUnavailable
@@ -397,6 +399,17 @@ class RuntimeService:
         except BaseException:
             self.coordinator.close()
             raise
+        # Operator confirmation (docs/OPERATOR_CONFIRMATION.md): off by default; with the switch
+        # off nothing of it runs (an offer an earlier run left open ends FEATURE_DISABLED).
+        self.confirmation: ConfirmationDesk | None = None
+        try:
+            if config.operator_confirmation.enabled:
+                self.confirmation = ConfirmationDesk(self)
+            else:
+                disable_open_offers(self.store, self.clock())
+        except BaseException:
+            self.coordinator.close()
+            raise
         saved = self.store.get("health", {}) or {}
         self.health = {c: Health(**saved.get(c, {})) for c in COMPONENTS}
         self.cycles = int(self.store.get("cycles", 0) or 0)
@@ -464,6 +477,8 @@ class RuntimeService:
             # operator clears the lockout against the expected account.
             report.skipped = "identity_lockout"
             self._apply_operator_requests(locked_out=True)
+            if self.confirmation is not None:
+                self.confirmation.tick(self.clock(), read_quotes=False)
             self._raise_alerts(self.clock(), report)
             self._heartbeat(report)
             return report
@@ -495,6 +510,8 @@ class RuntimeService:
         report.halted = self._check_halt(self.clock()) or report.halted
         self._settle_working_rows(self.clock())
         self._journal_shadow_fills()
+        if self.confirmation is not None:
+            self.confirmation.tick(self.clock(), read_quotes=broker_ok)
         self._raise_alerts(self.clock(), report)
         self._heartbeat(report)
         return report
@@ -773,6 +790,8 @@ class RuntimeService:
                 locked_out=locked_out,
                 require_full_reconnect=self.config.service.lockout_clear_requires_full_reconnect,
                 session_opened_at=self.started_at,
+                signal_handler=(self.confirmation.handle if self.confirmation is not None
+                                else None),
             )
         except (OperatorQueueUnavailable, sqlite3.DatabaseError, OSError):
             self._queue_unavailable("QUEUE_UNREADABLE")
@@ -870,18 +889,19 @@ class RuntimeService:
         interpreted = self.interpreter.interpret(post)
         interpreted_at = self.clock()
         recorded = self._recorded_mappings()
-        mapped, decisions = self.mapping.apply(
-            group_linked_actions(interpreted),
-            clauses={c.action_id: c.clause for c in interpreted.classifications},
-            now=decision_now,
-            held=self._held_contracts(),
-            recorded=recorded,
-            post_text=post.text,  # an option must be one leg across the whole post
+        linked = group_linked_actions(interpreted)
+        apply_kw = {
+            "clauses": {c.action_id: c.clause for c in interpreted.classifications},
+            "now": decision_now,
+            "held": self._held_contracts(),
+            "recorded": recorded,
+            "post_text": post.text,  # an option must be one leg across the whole post
             # The interpreter's price mentions per action, as (role, value): read only by an
             # entry with entry_rule = REFERENCE_AS_COLLAR, for its entry anchor.
-            levels={c.action_id: [(m.role.value, m.value) for m in c.prices]
-                    for c in interpreted.classifications},
-        )
+            "levels": {c.action_id: [(m.role.value, m.value) for m in c.prices]
+                       for c in interpreted.classifications},
+        }
+        mapped, decisions = self.mapping.apply(linked, **apply_kw)
         quotes = self._gate_quotes(mapped, decisions, decision_now, recorded)
         self.replay.gate_stamps = {}
         source = post.to_replay_source()
@@ -983,6 +1003,10 @@ class RuntimeService:
             self._journal_shadow_fills()
         if self.review_log is not None and not result.duplicate:
             self._write_review_log(post, result.outcomes, decision_by_id, decided_at)
+        if self.confirmation is not None:
+            # After the post is journaled: what it supersedes ends, what it holds may be offered.
+            self.confirmation.after_post(post, linked, apply_kw, mapped, decisions, result,
+                                         decision_now)
         return len(exceptions), result.duplicate
 
     def _journal_shadow_fills(self) -> None:
@@ -1123,6 +1147,7 @@ class RuntimeService:
         unusable quote is simply absent; the gateway then blocks with QUOTE_UNAVAILABLE. A mapped
         family gets a ``MappedQuote``: its terms and both legs (the gateway decides on them)."""
         now = now or self.clock()
+        ensure_production(decisions)  # a waived evaluation never reaches the gateway this way
         supported = {d.action_id: d for d in decisions if d.status == "SUPPORTED"}
         quotes: dict[str, Quote] = {}
         for a in parsed.actions:

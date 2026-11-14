@@ -73,3 +73,6 @@ confirm_wait_seconds = 0
 [mock]
 account = "SIM-PAPER-0001"
 quotes = { TLT = { bid = "88.40", ask = "88.42" } }
+
+[operator_confirmation]        # optional; docs/OPERATOR_CONFIRMATION.md
+enabled = false               # one-press owner confirmation of interpretation holds; paper only

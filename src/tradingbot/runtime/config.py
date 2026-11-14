@@ -144,6 +144,14 @@ class ShadowConfig(StrictModel):
     account: str = Field(default="SIM-SHADOW-0001", pattern=r"^SIM-[A-Z0-9-]{1,32}$")
 
 
+class OperatorConfirmationConfig(StrictModel):
+    """Optional operator confirmation of held signals (docs/OPERATOR_CONFIRMATION.md). OFF by
+    default; when on, refused unless the broker declares SIM or PAPER (mock and shadow only).
+    It never authorizes order submission to a real broker."""
+
+    enabled: bool = False
+
+
 class RuntimeConfig(StrictModel):
     mode: Literal["mock", "shadow"]
     paths: PathsConfig
@@ -155,6 +163,8 @@ class RuntimeConfig(StrictModel):
     execution: ExecutionSettings
     mock: MockConfig = Field(default_factory=MockConfig)
     shadow: ShadowConfig | None = None
+    operator_confirmation: OperatorConfirmationConfig = Field(
+        default_factory=OperatorConfirmationConfig)
 
     @property
     def simulated_account(self) -> str:

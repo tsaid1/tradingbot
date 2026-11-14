@@ -1,8 +1,10 @@
 """Exceptions: the register of everything that needs a human, and the operator actions.
 
-Read-only except for three things, each a request and never an order: the emergency halt (as on
-the Execution page), queueing an operator settlement of an intent of unknown outcome, and queueing
-a clear or acknowledgement of an exception. Every request needs a note and the exact confirmation
+Read-only except for these, each a request and never an order: the emergency halt (as on the
+Execution page), queueing an operator settlement of an intent of unknown outcome, queueing a clear
+or acknowledgement of an exception and, only with ``[operator_confirmation] enabled``, one press to
+confirm or dismiss an offer (the confirmed action then passes the gateway and the execution core
+again, unchanged; docs/OPERATOR_CONFIRMATION.md). Every request needs a note and the exact confirmation
 words, and is applied by the running service on its next cycle, which checks it against the
 broker first (``tradingbot.runtime.operator_actions``, ``docs/OPERATIONS.md``).
 
@@ -18,9 +20,12 @@ from pathlib import Path
 
 import streamlit as st
 
+from tradingbot.execution.operator_catalog import offer_phrase
 from tradingbot.runtime import operator_actions as Q
 from tradingbot.runtime.config import DEFAULT_CONFIG_PATH, ConfigError, load_config
+from tradingbot.runtime.confirmation_view import card, load_offers
 from tradingbot.runtime.register import load_register
+from tradingbot.runtime.store import RuntimeStore
 
 CONFIRM_WORD = "RESUME"
 BANNER = (
@@ -133,9 +138,36 @@ if reg["open"]:
 else:
     st.success("No open exception.")
 
+op_name = st.text_input("Your name", value=getpass.getuser(), key="op_name")
+
+# ------------------------------------------------------------------ operator confirmation
+if config.operator_confirmation.enabled:
+    st.subheader("Held signals you can confirm")
+    open_offers = load_offers(RuntimeStore(config.runtime_db), open_only=True)
+    if not open_offers:
+        st.info("No offer open.")
+    for row in open_offers:
+        c = card(row, datetime.now(UTC))
+        with st.container(border=True):
+            st.text(c["what a confirmation does"])  # plain text only, never Markdown
+            for label in ("offer", "proposed action", "instrument", "price reference",
+                          "current quote", "would pass now", "stop", "target",
+                          "reason for the hold", "time left", "post"):
+                st.text(f"{label}: {c[label]}")
+            st.text("uncertainty (what a confirmation resolves):")
+            for line in c["uncertainty"]:
+                st.text(f"  - {line}")
+            b1, b2 = st.columns(2)
+            for col, action, word in ((b1, Q.CONFIRM_SIGNAL, "Confirm"),
+                                      (b2, Q.DISMISS_SIGNAL, "Dismiss")):
+                if col.button(f"{word} {row['id']} ({row['hash'][:8]})",
+                              key=f"offer_{word}_{row['id']}_{row['hash'][:8]}"):
+                    queue_request(operator=op_name, action=action, target=str(row["id"]),
+                                  kind=row["hash"], note="",
+                                  confirmation=offer_phrase(action, row["id"], row["hash"]))
+
 # ------------------------------------------------------------------ settlement
 st.subheader("Intents of unknown outcome")
-op_name = st.text_input("Your name", value=getpass.getuser(), key="op_name")
 if reg["unresolved_intents"]:
     st.markdown(
         table(

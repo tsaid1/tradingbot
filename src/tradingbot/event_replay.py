@@ -14,12 +14,17 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 
 from tradingbot.event_models import (
-    ActionOutcome, PaperOrder, ParsedPost, ReplayResult, ReplaySource, TradeAction,
+    ActionOutcome,
+    PaperOrder,
+    ParsedPost,
+    ReplayResult,
+    ReplaySource,
+    TradeAction,
 )
 from tradingbot.models import Action, AssetClass, MockPolicy, Position, PositionSide, Quote
 from tradingbot.validator import ALL_ACTIONS, fill_quantity, gate_action, gate_source
@@ -78,6 +83,26 @@ class Idea:
                         stop_price=self.stop_price, target_price=self.target_price)
 
 
+@dataclass(frozen=True)
+class ConfirmationAuthority:
+    """Issued only by the apply step of a CONFIRMED, unexpired operator-confirmation offer
+    (``runtime.confirmation.authorize``) for one action of one post revision. ``process`` never
+    takes one; ``process_confirmed`` takes nothing else."""
+
+    offer_hash: str
+    source_id: str
+    revision: int
+    post_hash: str
+    action: TradeAction
+    expires_at: datetime
+
+    def permits(self, source: ReplaySource, action: TradeAction, now: datetime) -> bool:
+        return (len(self.offer_hash) == 64
+                and (source.source_id, source.revision, source.post_hash)
+                == (self.source_id, self.revision, self.post_hash)
+                and action == self.action and now < self.expires_at)
+
+
 class PaperEventReplay:
     def __init__(self, db_path: str | Path, policy: MockPolicy | None = None):
         self.db_path = Path(db_path)
@@ -117,6 +142,12 @@ class PaperEventReplay:
     def ideas(self) -> list[dict]:
         with self._connection() as c:
             return [dict(r) for r in c.execute("SELECT * FROM replay_ideas ORDER BY idea_id")]
+
+    def has_other_revision(self, source_id: str, revision: int) -> bool:
+        """Is another revision of this post on record (an edit)?"""
+        with self._connection() as c:
+            return c.execute("SELECT 1 FROM replay_posts WHERE source_id=? AND revision<>? "
+                             "LIMIT 1", (source_id, revision)).fetchone() is not None
 
     def outcomes(self, source_id: str, revision: int = 1) -> list[ActionOutcome]:
         with self._connection() as c:
@@ -182,7 +213,7 @@ class PaperEventReplay:
         `now` makes offline historic replay deterministic. The caller must not set it to bypass
         freshness rules for live trading; this engine has no live route.
         """
-        now = now or datetime.now(timezone.utc)
+        now = now or datetime.now(UTC)
         quotes = quotes or {}
         with self._transaction() as c:
             prior = c.execute(
@@ -262,6 +293,74 @@ class PaperEventReplay:
                 )
         return ReplayResult(source_id=source.source_id, revision=source.revision,
                             hydrated=hydrated, outcomes=outcomes)
+
+    def process_confirmed(
+        self,
+        source: ReplaySource,
+        action: TradeAction,
+        quotes: dict[str, Quote] | None = None,
+        *,
+        now: datetime,
+        authority,
+    ) -> ReplayResult:
+        """Operator confirmation (docs/OPERATOR_CONFIRMATION.md): evaluate ONE action of a post
+        revision already processed and held, once more, as a new evaluation pass (``attempt``)
+        of the same (source_id, revision). Everything ``process`` applies applies here unchanged:
+        ``gate_source`` (an edit or another revision on record holds it), the gateway, the
+        execution seam. ``authority`` must be the ``ConfirmationAuthority`` the apply step of a
+        CONFIRMED, unexpired offer issues for exactly this action, source and hash; anything else
+        is refused before any read. The other actions' recorded outcomes are carried into the
+        new pass unchanged, so a later duplicate delivery returns every action's outcome."""
+        if not isinstance(authority, ConfirmationAuthority) or not authority.permits(
+                source, action, now):
+            raise PermissionError("a confirmed evaluation needs the authority of its own "
+                                  "confirmed, unexpired offer")
+        quotes = quotes or {}
+        with self._transaction() as c:
+            prior = c.execute(
+                "SELECT post_hash FROM replay_posts WHERE source_id=? AND revision=?",
+                (source.source_id, source.revision),
+            ).fetchone()
+            if prior is None or prior["post_hash"] != source.post_hash:
+                return ReplayResult(source_id=source.source_id, revision=source.revision,
+                                    outcomes=[ActionOutcome(
+                                        action_id=action.action_id, status="BLOCK",
+                                        reasons=["CONFIRMED_POST_NOT_ON_RECORD"])])
+            previous = self._recorded(c, source.source_id, source.revision)
+            if not any(o.action_id == action.action_id for o in previous):
+                return ReplayResult(source_id=source.source_id, revision=source.revision,
+                                    outcomes=[ActionOutcome(
+                                        action_id=action.action_id, status="BLOCK",
+                                        reasons=["CONFIRMED_ACTION_NOT_ON_RECORD"])])
+            attempt = c.execute(
+                "SELECT COALESCE(MAX(attempt), 0) + 1 FROM replay_actions WHERE source_id=? "
+                "AND revision=?", (source.source_id, source.revision)).fetchone()[0]
+            is_edit = c.execute(
+                "SELECT 1 FROM replay_posts WHERE source_id=? AND revision<>? LIMIT 1",
+                (source.source_id, source.revision),
+            ).fetchone() is not None
+            block = gate_source(source, now, is_edit=is_edit)
+            committed = self._load_ideas(c)
+            if block is not None:
+                outcome = ActionOutcome(action_id=action.action_id, status=block.status,
+                                        reasons=list(block.reasons))
+            else:
+                staged = deepcopy(committed)
+                outcome = self._simulate(source, action, quotes, staged, now)
+                if outcome.status == "SIMULATED":
+                    [outcome] = self._execute_group(source, [action], [outcome], staged, now)
+                    committed = staged
+            self._save_ideas(c, committed)
+            outcomes = [outcome if o.action_id == action.action_id else o for o in previous]
+            for item in outcomes:
+                c.execute(
+                    "INSERT INTO replay_actions (source_id,revision,attempt,action_id,result_json)"
+                    " VALUES (?,?,?,?,?)",
+                    (source.source_id, source.revision, attempt, item.action_id,
+                     item.model_dump_json()),
+                )
+        return ReplayResult(source_id=source.source_id, revision=source.revision,
+                            outcomes=[outcome])
 
     def _execute_group(self, source: ReplaySource, group: list[TradeAction],
                        outcomes: list[ActionOutcome], ideas: dict[str, Idea],

@@ -48,7 +48,8 @@ resolve against the config file.
   `max_submit_attempts`, `settle_seconds`, `exit_no_trace_lookups` (at least 3),
   `max_intent_age_seconds`, `max_exit_intent_age_seconds`, `lookup_horizon_seconds`,
   `confirm_attempts`, `confirm_wait_seconds`.
-* Optional: `[interpreter] lexicon_path, review_log_path` (see "Vocabulary review"), `[notify] channels, macos, realert_seconds,
+* Optional: `[operator_confirmation] enabled` (default `false`; docs/OPERATOR_CONFIRMATION.md),
+  `[interpreter] lexicon_path, review_log_path` (see "Vocabulary review"), `[notify] channels, macos, realert_seconds,
   alerts_file`, `[service] source_stall_after_seconds, activity_window_utc,
   heartbeat_stale_after_seconds` (alerting only), `[service]
   lockout_clear_requires_full_reconnect` (default `true`, see `docs/OPERATIONS.md`), `[mock]
@@ -88,6 +89,11 @@ Every action whose outcome is `HOLD`, `BLOCK`, `REFUSED`, `HALTED`, `UNRESOLVED`
 codes: unsupported mapping, edits (`SOURCE_EDIT_REQUIRES_REVIEW`), unverified or truncated
 posts, stale sources or quotes, collar or exposure breaches, the halt, unknown broker outcomes.
 Commentary (`NO_TRADE`) and recaps (`RECONCILE`) are journaled, not held. Nothing held is traded.
+With `[operator_confirmation] enabled = true` (off by default; mock and shadow only, refused unless
+the broker declares SIM or PAPER), a held current OPEN whose only doubts are on a closed list of
+interpretation reasons is offered for a one-press owner confirmation; the confirmed action passes
+`gate_source`, the gateway and the execution core again, unchanged, on a fresh quote, before the
+signal's own age limit. See `docs/OPERATOR_CONFIRMATION.md`.
 
 ## Failures, halt, notifications
 

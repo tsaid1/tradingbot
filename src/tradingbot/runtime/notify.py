@@ -70,6 +70,8 @@ PRIVATE_PATH_IN_SYNCED_FOLDER = "PRIVATE_PATH_IN_SYNCED_FOLDER"
 # A private review file lies in a git work tree other than this program's (class only; allowed,
 # warned: it could be committed to that repository by mistake).
 PRIVATE_PATH_IN_OTHER_GIT_TREE = "PRIVATE_PATH_IN_OTHER_GIT_TREE"
+# Operator confirmation (optional): a held signal the owner may confirm (identifiers only).
+SIGNAL_CONFIRMABLE = "SIGNAL_CONFIRMABLE"
 
 
 @runtime_checkable

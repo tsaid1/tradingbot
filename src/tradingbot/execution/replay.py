@@ -102,6 +102,13 @@ class BrokerEventReplay(PaperEventReplay):
         self._plans = {}
         return super().process(source, parsed, quotes, now=now)
 
+    def process_confirmed(self, source, action, quotes=None, *, now, authority):
+        # The same preparation as ``process``: unknown outcomes settled and broker fills applied
+        # first, and no plan carried over from another pass.
+        self.coordinator.recover()
+        self._plans = {}
+        return super().process_confirmed(source, action, quotes, now=now, authority=authority)
+
     def _load_ideas(self, c):
         ideas = super()._load_ideas(c)
         for p in self.coordinator.ledger():
