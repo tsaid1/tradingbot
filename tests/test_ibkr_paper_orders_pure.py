@@ -67,7 +67,7 @@ def test_paper_test_1_caps_are_the_specified_constants():
     assert c.max_order_notional == Decimal(150)
     assert c.order_types == {"LMT", "STP"} and c.tifs == {"DAY"}
     assert c.long_only and not c.outside_rth_allowed
-    assert list(C.EXPERIMENTS) == ["paper-test-1"]
+    assert list(C.EXPERIMENTS) == ["paper-test-1", "paper-test-2"]  # paper-test-2: YOUR CALL 17
     with pytest.raises(TypeError):
         C.EXPERIMENTS["other"] = c  # type: ignore[index]
 
@@ -107,7 +107,7 @@ def test_no_orders_entry_means_no_order_mode(tmp_path):
         load_order_config(write_cfg(tmp_path, orders=None))
 
 
-@pytest.mark.parametrize("value", ["paper-test-2", "PAPER-TEST-1", "", "true", "1"])
+@pytest.mark.parametrize("value", ["paper-test-3", "PAPER-TEST-1", "", "true", "1"])
 def test_unknown_experiment_refused(tmp_path, value):
     with pytest.raises(UnknownExperiment):
         load_order_config(write_cfg(tmp_path, orders=value))

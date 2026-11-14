@@ -300,7 +300,7 @@ def test_no_orders_entry_no_state_dir_or_no_journal_means_no_order_capability(tm
     with pytest.raises(OrdersNotEnabled):  # the read-only keys alone
         load_order_config(write_cfg(tmp_path, orders=None, state_dir=None))
     with pytest.raises(UnknownExperiment):
-        load_order_config(write_cfg(tmp_path, orders="paper-test-2"))
+        load_order_config(write_cfg(tmp_path, orders="paper-test-3"))
     with pytest.raises(StateDirInvalid):
         load_order_config(write_cfg(tmp_path, state_dir=str(tmp_path / "absent")))
     cfg = load_order_config(write_cfg(tmp_path))  # all three written, but no journal yet

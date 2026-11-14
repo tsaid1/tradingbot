@@ -1311,7 +1311,8 @@ class PaperOrderSession(IbkrSession):
             adopted = not own and absent and self._is_own_without_client_id(oid, contract, order)
             if own or adopted:
                 self._event("openOrder", oid, status=state.status,
-                            **({"client_id": "ABSENT_ADOPTED"} if adopted else {}))
+                            client_id="ABSENT_ADOPTED" if adopted else int(order.clientId),
+                            lookup=self._open_lookup_pending())
                 t = self._tracks.get(oid)
                 if t is None:
                     t = self._tracks[oid] = _Track(order_id=oid, own=True)
@@ -1334,6 +1335,12 @@ class PaperOrderSession(IbkrSession):
                 if p.kind == "open_orders" and not p.done:
                     p.rows.append(row)
             self._cond.notify_all()
+
+    def _open_lookup_pending(self) -> bool:
+        """Caller holds the lock. True while an open-orders lookup of this session is unanswered:
+        a row then may be its reply rather than a message TWS sent of its own accord (evidence
+        only; conservative: an unsolicited message in that window is also marked)."""
+        return any(p.kind == "open_orders" and not p.done for p in self._pending.values())
 
     @staticmethod
     def _same_order(known: _Track, row: _Track) -> bool:
@@ -1382,7 +1389,13 @@ class PaperOrderSession(IbkrSession):
                        else None,
                        order_type=o.orderType if o is not None and o.HasField("orderType")
                        else None,
-                       warning=bool(st is not None and st.warningText))
+                       warning=bool(st is not None and st.warningText),
+                       # the order's own fields as the broker reports them (a stop's added
+                       # limit, the OCA group it assigned): values, never the account
+                       **({f: (str(getattr(o, f)) if f == "totalQuantity" else getattr(o, f))
+                           for f in ("lmtPrice", "auxPrice", "totalQuantity", "tif",
+                                     "ocaGroup", "ocaType", "parentPermId", "transmit")
+                           if o.HasField(f)} if o is not None else {}))
             if kind == "openOrder" and oid is not None:
                 with self._cond:
                     self._open_client_absent[int(oid)] = o is not None and not has_cid
@@ -1418,7 +1431,9 @@ class PaperOrderSession(IbkrSession):
                 self.ignored["status_other_client"] += 1
                 return
             self._event("orderStatus", int(order_id), status=status, filled=str(filled),
-                        remaining=str(remaining))
+                        remaining=str(remaining),
+                        client_id=None if client_id == UNSET_INTEGER else int(client_id),
+                        lookup=self._open_lookup_pending())
             t = self._tracks.get(int(order_id))
             if t is None:
                 self.ignored["status_before_track"] += 1

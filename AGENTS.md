@@ -14,9 +14,9 @@ Canonical repository: https://github.com/tsaid1/tradingbot (**public**).
    codes, never post text.
 3. **No order submission without the owner's explicit authorization of a specific experiment.**
    `main` runs the simulated broker only: `mode = "mock"` (invented market) or `mode = "shadow"` (simulated orders and fills at quotes from the read-only adapter `tradingbot.ibkr`, which cannot send orders). An order-capable module (`tradingbot.ibkr_orders`,
-   `scripts/ibkr_paper_*`) exists for one capped paper experiment (`paper-test-1`); it is
-   disabled by default and may be run only with the Product Owner's explicit authorization of
-   that experiment (docs/IBKR_PAPER_ORDERS.md).
+   `scripts/ibkr_paper_*`) defines two capped paper experiments, `paper-test-1` and
+   `paper-test-2`; each is disabled by default and may be run only with the Product Owner's
+   explicit authorization of that experiment (docs/IBKR_PAPER_ORDERS.md).
 4. **Independent review before any change to an order path.** That covers the coordinator, the
    broker protocol and adapters, reconciliation, settlement and the runtime service's broker
    handling. Protocol changes are additive.
