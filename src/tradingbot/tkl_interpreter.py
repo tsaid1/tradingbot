@@ -19,6 +19,7 @@ Rules
 """
 from __future__ import annotations
 
+import bisect
 import html
 import re
 from dataclasses import dataclass, field
@@ -33,7 +34,7 @@ from pydantic import Field
 from tradingbot.event_models import ParsedPost, PriceBasis, ReplayResult, Timing, TradeAction
 from tradingbot.event_replay import PaperEventReplay
 from tradingbot.models import Action, AssetClass, Instrument, PositionSide, Quote, StrictModel
-from tradingbot.price_roles import ClauseUnit, PriceReading, safe_read_price_roles
+from tradingbot.price_roles import ClauseUnit, PriceReading, note_fault, safe_read_price_roles
 from tradingbot.source_events import SourcePost
 from tradingbot.validator import gate_source
 
@@ -363,28 +364,42 @@ class TklInterpreter:
     def _price_readings(self, post: SourcePost, classifications: list[Classification],
                         actions: list[TradeAction]) -> list[PriceReading]:
         """The additive structured price readings. Reads the classifications, never changes them, and
-        can never raise (price_roles.safe_read_price_roles)."""
+        can never raise (price_roles.safe_read_price_roles). When the clauses cannot be rebuilt (a fault,
+        or a clause split that differs from ``_clauses``) the fault is counted and logged by its code
+        and every reading carries NO_CLAUSE_CONTEXT: no reading is then tied to an action."""
+        raw = post.text or ""
         try:
-            units = self._price_units(_normalise(post.text), classifications, actions)
-            raw = post.text or ""
-            return safe_read_price_roles(raw, units, lambda p: len(_normalise(raw[:p])))
+            try:
+                units, fault = self._price_units_checked(_normalise(raw), classifications, actions)
+                to_norm = _norm_offsets(raw)
+            except Exception:  # noqa: BLE001
+                units, fault, to_norm = [], "CLAUSE_CONTEXT_FAULT", None
+            if fault is None:
+                return safe_read_price_roles(raw, units, to_norm)
+            note_fault(fault)
+            return [r.model_copy(update={"reasons": [*r.reasons, "NO_CLAUSE_CONTEXT"]}) for r in safe_read_price_roles(raw)]
         except Exception:  # noqa: BLE001 - advisory output must never disturb the interpretation
-            return safe_read_price_roles(post.text)
+            return safe_read_price_roles(raw)
 
     def _price_units(self, text: str, classifications: list[Classification],
                      actions: list[TradeAction]) -> list[ClauseUnit]:
         """The clauses of ``_classify`` with their offsets and the classification each one produced
         (or, for a level line, its host), rebuilt in the same order without classifying again."""
+        return self._price_units_checked(text, classifications, actions)[0]
+
+    def _price_units_checked(self, text: str, classifications: list[Classification],
+                             actions: list[TradeAction]) -> tuple[list[ClauseUnit], str | None]:
+        """``_price_units`` and the public code of the reason it is empty, if that is a fault."""
         if not text.strip():
-            return []
+            return [], None
         spans = self._clause_spans(text)
         if [c.text for c, _ in spans] != [c.text for c in self._clauses(text)]:
-            return []
+            return [], "CLAUSE_SPLIT_MISMATCH"
         acts = {a.action_id: a for a in actions}
 
         def unit(c, start, end, kind):
             a = acts.get(c.action_id)
-            return ClauseUnit(start=start, end=end, action_id=c.action_id, kind=kind,
+            return ClauseUnit(start=start, end=end, action_id=c.action_id, kind=kind, asset=c.asset,
                               trading=a is not None and a.action != Action.NO_TRADE,
                               month_applicable=c.asset is None or c.asset in _SERIES_CODES,
                               past_execution=c.message_class in (MessageClass.RETROSPECTIVE, MessageClass.EXIT_ANNOUNCEMENT)
@@ -410,7 +425,7 @@ class TklInterpreter:
                 units.append(unit(c, start, end, "CLAUSE"))
             else:   # a descriptive line of a summary post
                 units.append(ClauseUnit(start=start, end=end, action_id=None, trading=False, kind="OTHER"))
-        return units
+        return units, None
 
     def _clause_spans(self, text: str) -> list[tuple[_Clause, int]]:
         """``_clauses`` with each clause's offset in ``text``."""
@@ -770,6 +785,17 @@ def _class_from_action(a: TradeAction) -> MessageClass:
 
 def _tense_from_timing(timing: Timing) -> Tense:
     return {Timing.HISTORICAL: Tense.PAST, Timing.CONDITIONAL: Tense.FUTURE}.get(timing, Tense.PRESENT)
+
+
+def _norm_offsets(raw: str):
+    """The map from a raw offset of ``raw`` to the length of ``_normalise`` of the text before it (the
+    price readings' clause positions), exact and linear: without an HTML entity ``_normalise`` maps
+    character by character except the em dash (one character to three); with an entity each query
+    normalises the prefix (the price reader asks at most price_roles.MAX_NUMBERS times)."""
+    if "&" in raw:
+        return lambda p: len(_normalise(raw[:p]))
+    dashes = [i for i, ch in enumerate(raw) if ch == "\u2014"]
+    return lambda p: p + 2 * bisect.bisect_left(dashes, p)
 
 
 def _normalise(text: str) -> str:
