@@ -19,6 +19,7 @@ Rules
 """
 from __future__ import annotations
 
+import bisect
 import html
 import re
 from dataclasses import dataclass, field
@@ -33,6 +34,7 @@ from pydantic import Field
 from tradingbot.event_models import ParsedPost, PriceBasis, ReplayResult, Timing, TradeAction
 from tradingbot.event_replay import PaperEventReplay
 from tradingbot.models import Action, AssetClass, Instrument, PositionSide, Quote, StrictModel
+from tradingbot.price_roles import ClauseUnit, PriceReading, note_fault, safe_note_fault, safe_read_price_roles
 from tradingbot.source_events import SourcePost
 from tradingbot.validator import gate_source
 
@@ -101,6 +103,12 @@ class InterpretedPost(StrictModel):
     parsed: ParsedPost
     classifications: list[Classification] = Field(default_factory=list)
     backend: Literal["deterministic", "ai"] = "deterministic"
+    # Additive and advisory (price_roles.py): what kind of number each price-like number of the post
+    # is, decided from its context. Nothing in the trading path (mapping, gateway, coordinator) reads it.
+    # INTENDED_ENTRY, CURRENT_MARKET and HISTORICAL_FILL are candidates for confirmation, never an
+    # authorization: no order, position, fill reconciliation or anchor price may be created, changed or
+    # released on the strength of these readings alone (the limits are in the price_roles docstring).
+    price_readings: list[PriceReading] = Field(default_factory=list)
 
 
 class StructuredBackend(Protocol):
@@ -353,7 +361,102 @@ class TklInterpreter:
         actions = [self._to_trade_action(c) for c in classifications]
         return InterpretedPost(source_id=post.source_id, post_id=post.post_id, revision=post.revision,
                                published_at=post.published_at, parsed=ParsedPost(actions=actions),
-                               classifications=classifications)
+                               classifications=classifications,
+                               price_readings=self._price_readings(post, classifications, actions))
+
+    def _price_readings(self, post: SourcePost, classifications: list[Classification],
+                        actions: list[TradeAction]) -> list[PriceReading]:
+        """The additive structured price readings. Reads the classifications, never changes them, and
+        can never raise (price_roles.safe_read_price_roles). When the clauses cannot be rebuilt (a fault,
+        or a clause split that differs from ``_clauses``) the fault is counted and logged by its code
+        and every reading carries NO_CLAUSE_CONTEXT: no reading is then tied to an action."""
+        raw = post.text or ""
+        try:
+            try:
+                units, fault = self._price_units_checked(_normalise(raw), classifications, actions)
+                to_norm = _norm_offsets(raw)
+            except Exception:  # noqa: BLE001
+                units, fault, to_norm = [], "CLAUSE_CONTEXT_FAULT", None
+            if fault is None:
+                return safe_read_price_roles(raw, units, to_norm)
+            note_fault(fault)
+            return [r.model_copy(update={"reasons": [*r.reasons, "NO_CLAUSE_CONTEXT"]}) for r in safe_read_price_roles(raw)]
+        except Exception:  # noqa: BLE001 - advisory output must never disturb the interpretation
+            # even when counting the fault failed: count it again on the safe path and mark the readings
+            safe_note_fault("CLAUSE_CONTEXT_FAULT")
+            try:
+                return [r.model_copy(update={"reasons": [*r.reasons, "NO_CLAUSE_CONTEXT"]})
+                        for r in safe_read_price_roles(raw)]
+            except Exception:  # noqa: BLE001
+                return []
+
+    def _price_units(self, text: str, classifications: list[Classification],
+                     actions: list[TradeAction]) -> list[ClauseUnit]:
+        """The clauses of ``_classify`` with their offsets and the classification each one produced
+        (or, for a level line, its host), rebuilt in the same order without classifying again."""
+        return self._price_units_checked(text, classifications, actions)[0]
+
+    def _price_units_checked(self, text: str, classifications: list[Classification],
+                             actions: list[TradeAction]) -> tuple[list[ClauseUnit], str | None]:
+        """``_price_units`` and the public code of the reason it is empty, if that is a fault."""
+        if not text.strip():
+            return [], None
+        spans = self._clause_spans(text)
+        if [c.text for c, _ in spans] != [c.text for c in self._clauses(text)]:
+            return [], "CLAUSE_SPLIT_MISMATCH"
+        acts = {a.action_id: a for a in actions}
+
+        def unit(c, start, end, kind):
+            a = acts.get(c.action_id)
+            return ClauseUnit(start=start, end=end, action_id=c.action_id, kind=kind, asset=c.asset,
+                              named_assets=_named_assets(text[start:end]),
+                              trading=a is not None and a.action != Action.NO_TRADE,
+                              month_applicable=c.asset is None or c.asset in _SERIES_CODES,
+                              past_execution=c.message_class in (MessageClass.RETROSPECTIVE, MessageClass.EXIT_ANNOUNCEMENT)
+                              and c.underlying in (Action.OPEN, Action.ADD, Action.CLOSE, Action.REDUCE))
+        summary_mode = self._is_summary(text)
+        units: list[ClauseUnit] = []
+        seen: list[Classification] = []
+        ci = 0
+        for clause, start in spans:
+            end = start + len(clause.text)
+            if summary_mode and _is_summary_clause(clause.text):
+                units.append(ClauseUnit(start=start, end=end, action_id=None, trading=False, kind="OTHER"))
+                continue
+            host = next((c for c in reversed(seen) if c.message_class in _LEVEL_HOSTS), None) \
+                if LEVEL_LINE_RE.match(clause.text) else None
+            if host is not None:
+                units.append(unit(host, start, end, "LEVEL_LINE"))
+                continue
+            c = classifications[ci] if ci < len(classifications) else None
+            if c is not None and c.clause == clause.text[:200] and c.sentence == clause.sentence:
+                ci += 1
+                seen.append(c)
+                units.append(unit(c, start, end, "CLAUSE"))
+            else:   # a descriptive line of a summary post
+                units.append(ClauseUnit(start=start, end=end, action_id=None, trading=False, kind="OTHER"))
+        return units, None
+
+    def _clause_spans(self, text: str) -> list[tuple[_Clause, int]]:
+        """``_clauses`` with each clause's offset in ``text``."""
+        out: list[tuple[_Clause, int]] = []
+        parts, pos = [], 0
+        for m in SENTENCE_SPLIT.finditer(text):
+            parts.append((text[pos:m.start()], pos))
+            pos = m.end()
+        parts.append((text[pos:], pos))
+        for s_index, (sentence, s_pos) in enumerate((p, q) for p, q in parts if p and p.strip()):
+            stripped = sentence.strip()
+            base = s_pos + (len(sentence) - len(sentence.lstrip()))
+            cursor = 0
+            for part in _split_conjunctions(stripped, self._verbs):
+                if part.strip():
+                    piece = part.strip()
+                    at = stripped.find(piece, cursor)
+                    at = cursor if at < 0 else at
+                    cursor = at + len(piece)
+                    out.append((_Clause(piece, s_index), base + at))
+        return out
 
     def is_source_eligible(self, post: SourcePost) -> bool:
         """The canonical provenance rule, reused from the gateway: a post that `gate_source` would
@@ -431,7 +534,7 @@ class TklInterpreter:
         ]
         return InterpretedPost(source_id=post.source_id, post_id=post.post_id, revision=post.revision,
                                published_at=post.published_at, parsed=parsed, classifications=classifications,
-                               backend="ai")
+                               backend="ai", price_readings=safe_read_price_roles(post.text))
 
     # ------------------------------------------------------------------ deterministic grammar
 
@@ -694,6 +797,29 @@ def _tense_from_timing(timing: Timing) -> Tense:
     return {Timing.HISTORICAL: Tense.PAST, Timing.CONDITIONAL: Tense.FUTURE}.get(timing, Tense.PRESENT)
 
 
+def _norm_offsets(raw: str):
+    """The map from a raw offset of ``raw`` to the length of ``_normalise`` of the text before it (the
+    price readings' clause positions), exact and linear: without an HTML entity ``_normalise`` maps
+    character by character except the em dash (one character to three); with an entity each query
+    normalises the prefix (the price reader asks at most price_roles.MAX_NUMBERS times)."""
+    if "&" in raw:
+        # _normalise is additive at a whitespace boundary (an entity never contains whitespace): each answer
+        # is the nearest known boundary's plus the normalised piece after it, and every boundary asked is
+        # kept, so the price reader's queries in text order cost one pass
+        anchors, values = [0], [0]
+
+        def entity_map(p: int) -> int:
+            k = bisect.bisect_right(anchors, p) - 1
+            v = values[k] + len(_normalise(raw[anchors[k]:p]))
+            if p > anchors[k] and raw[p - 1].isspace():
+                anchors.insert(k + 1, p)
+                values.insert(k + 1, v)
+            return v
+        return entity_map
+    dashes = [i for i, ch in enumerate(raw) if ch == "\u2014"]
+    return lambda p: p + 2 * bisect.bisect_left(dashes, p)
+
+
 def _normalise(text: str) -> str:
     text = html.unescape(text)   # API text may carry HTML entities
     return (text.replace("’", "'").replace("“", '"').replace("”", '"')
@@ -725,6 +851,13 @@ def _split_conjunctions(sentence: str, verbs=None) -> list[str]:
         return [sentence]
     head, tail = sentence[:cut.start()].strip(), sentence[cut.end():].strip()
     return [head, *_split_conjunctions(tail, verbs)] if head and tail else [sentence]
+
+
+def _named_assets(text: str) -> tuple[str, ...]:
+    """Every market a clause names in its own words (series codes and tickers), never a carried one."""
+    tickers = list(dict.fromkeys(TICKER_RE.findall(text)))
+    tickers += [t for t in dict.fromkeys(BARE_ETF_RE.findall(text)) if t not in tickers]
+    return tuple(tickers + list(dict.fromkeys(code for rx, code in SERIES_RES if rx.search(text))))
 
 
 def _asset(text: str) -> tuple[str | None, str | None, str | None]:

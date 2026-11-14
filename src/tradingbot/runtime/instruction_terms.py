@@ -244,6 +244,11 @@ _TOKEN_RE = re.compile(r"\S+")
 _EDGE = "()[]{}.,;:!?\"'\u2018\u2019"
 _NUMBER_RE = re.compile(r"^\$?(\d{1,3}(?:,\d{3})+|\d+)(\.\d+)?(%?)$")
 
+# Public names of the three number-reader patterns above (the same objects; read by price_roles).
+TOKEN_RE = _TOKEN_RE
+EDGE = _EDGE
+NUMBER_RE = _NUMBER_RE
+
 
 def leftover_tokens(terms: InstructionTerms, consumed: set[Decimal],
                     fractions: set[Decimal], roots: set[str]) -> list[str]:
