@@ -347,25 +347,26 @@ def g1_borrowing(c: _Ctx) -> tuple[GateResult, Decimal | None]:
     if c.stage == "GATEWAY":
         return (_result("G1", codes) if codes else _not_evaluated("G1")), None
     codes += c.money_problem() + c.portfolio_missing("G1")
-    if not short_stock:
-        codes += c.account_problem("G1", "total_cash")
+    codes += c.account_problem("G1", "total_cash")
     if c.cost is None:
         codes.append(f"{INPUT_MISSING}:G1:COST")
     if codes:
         return _result("G1", codes), None
-    if short_stock:
-        # The borrowed securities: this sale plus every short stock position and working short
-        # sale already on the account, at their marks.
-        borrowed = abs(c.cost) + sum(
+    # Borrowed cash: the purchase (if a long) plus working buy entries beyond total cash.
+    committed = sum((e.buy_cost for e in c.portfolio), Decimal(0))
+    loan = max(Decimal(0), (c.cost if c.long else Decimal(0)) + committed
+               - c.account.total_cash)
+    borrowed = loan
+    if rules.permitted:
+        # Plus the borrowed securities: this sale (if a short stock) and every short stock
+        # position and working short sale already on the account, at their marks. One total.
+        borrowed += (abs(c.cost) if short_stock else Decimal(0)) + sum(
             (abs(e.mark * e.units * e.multiplier) for e in c.portfolio
              if e.short and e.sec_type in ("STK", "CMDTY") and e.mark is not None), Decimal(0))
         if any(e.short and e.sec_type in ("STK", "CMDTY") and e.mark is None
                for e in c.portfolio):
             codes.append(f"{INPUT_MISSING}:G1:MARK")
-    else:
-        committed = sum((e.buy_cost for e in c.portfolio), Decimal(0))
-        borrowed = max(Decimal(0), c.cost + committed - c.account.total_cash)
-    if not codes and borrowed > 0 and not rules.permitted:
+    if not codes and loan > 0 and not rules.permitted:
         codes.append(BORROWING_NOT_PERMITTED)
     elif not codes and rules.permitted and borrowed > rules.max_borrowed:
         codes.append(BORROWING_LIMIT)

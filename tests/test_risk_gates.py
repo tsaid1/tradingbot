@@ -414,6 +414,30 @@ def test_s1_a_short_stock_sale_counts_against_max_borrowed():
                                                  no_borrowing), "G1").codes
 
 
+def test_new1_borrowed_cash_and_borrowed_stock_are_one_total():
+    p = short_table()  # max_borrowed 1000
+    short_900 = Exposure(sec_type="STK", units=9, mark=D(100), multiplier=D(1), entry=D(100),
+                         stop=D(102), short=True)
+    # A short held, then a purchase 900 beyond cash: 900 + 900 = 1800 borrowed.
+    r = run(etf(units=9), ETF, p, acct=account(total_cash=D(0)), portfolio=[short_900])
+    only(r, "G1", G.BORROWING_LIMIT)
+    assert gate(r, "G1").value == D(1800) and r.borrowing == D(1800)
+    # A purchase 900 beyond cash held (cash -900), then a 900 short sale.
+    r = run(etf(side="SHORT", stop=D(102), units=9), ETF, p, acct=account(total_cash=D(-900)))
+    only(r, "G1", G.BORROWING_LIMIT)
+    assert gate(r, "G1").value == D(1800) and r.borrowing == D(1800)
+    # Each alone under the limit passes.
+    assert run(etf(units=9), ETF, p, acct=account(total_cash=D(0))).passed
+    assert run(etf(side="SHORT", stop=D(102), units=9), ETF, p).passed
+    # Exactly at the limit passes (600 short + 400 loan); one unit over fails.
+    short_600 = Exposure(**{**short_900.__dict__, "units": 6})
+    r = run(etf(units=4), ETF, p, acct=account(total_cash=D(0)), portfolio=[short_600])
+    assert r.passed and r.borrowing == D(1000)
+    r = run(etf(units=4), ETF, p, acct=account(total_cash=D(-1)), portfolio=[short_600])
+    only(r, "G1", G.BORROWING_LIMIT)
+    assert r.borrowing == D(1001)
+
+
 def test_s2_writing_an_option_is_refused_whatever_the_table_says():
     t = deepcopy(TABLE)
     t["eligibility"]["options"] = True

@@ -158,7 +158,11 @@ def test_the_anchor_is_compared_in_its_own_series():
 
 
 def test_reference_trigger_anchor_keeps_protection_in_the_reference_series():
-    t = ref_terms("REFERENCE_TRIGGER")
+    # A loadable family: a reference trigger with an execution-priced backstop.
+    t = ref_terms("REFERENCE_TRIGGER", require_backstop=True)
+    bare = gate(act(entry=None, stop="4980", target="5070"),
+                q_with(ref_terms("REFERENCE_TRIGGER"), "5010", reference=leg()))
+    assert bare.reasons == ["RISK_GATES_FAILED", "RISK_STOP_UNKNOWN"]  # no backstop: refused
     g = gate(act(entry=None, stop="4980", target="5070"), q_with(t, "5010", reference=leg()))
     assert g.status == "APPROVE", g.reasons
     p = g.plan

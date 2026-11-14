@@ -65,9 +65,10 @@ family or from the global `[policy]` collar.
 * **Effective equity** = min(`allocated_equity`, broker net liquidation). Both are recorded. If
   net liquidation is unreadable or stale, the gates that need it refuse.
 * **Borrowing** (G1, securities only) = max(0, purchase cost + cash committed by working buy
-  entries - total cash). A short stock sale borrows the security: it needs
-  `short_sale_permitted` AND `permitted`, and its value (units x price x multiplier) plus every
-  short stock position and working short sale counts against `max_borrowed`. Writing an option is
+  entries - total cash) + the value of borrowed stock (the proposed short stock sale, units x
+  price x multiplier, plus every short stock position and working short sale at its mark),
+  compared as one total with `max_borrowed`. A short stock sale needs `short_sale_permitted` AND
+  `permitted`. Writing an option is
   refused in this build whatever the table says (`RISK_SHORT_OPTION_NOT_SUPPORTED`; no key enables
   it); a long, fully paid option is a cash purchase. Futures initial margin is not borrowing.
 * **Cash sufficiency is checked only under a `[risk]` table** (G1). The cash baseline does not

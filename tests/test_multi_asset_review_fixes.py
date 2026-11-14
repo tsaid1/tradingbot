@@ -389,7 +389,7 @@ def rt_open(reference, **kw):
 
 def test_f5_a_fresh_reference_quote_with_its_own_update_time_is_used():
     assert bs_open(ref_leg("1849.9", "1850.1", None)).status == "APPROVE"
-    assert rt_open(ref_leg()).status == "APPROVE"
+    assert rt_open(ref_leg(), require_backstop=True).status == "APPROVE"
 
 
 @pytest.mark.parametrize("treatment", ["BASIS_SHIFT", "REFERENCE_TRIGGER"])
@@ -590,7 +590,8 @@ def test_f9_direct_refuses_levels_marked_as_the_source_series(action):
 
 def test_f9_other_treatments_still_take_source_series_levels():
     a = act(basis=PriceBasis.SOURCE_SERIES, entry="5010", stop="4980", target="5070")
-    assert gate(a, mq(terms("REFERENCE_TRIGGER"), reference=leg())).status == "APPROVE"
+    assert gate(a, mq(terms("REFERENCE_TRIGGER", require_backstop=True),
+                      reference=leg())).status == "APPROVE"
 
 
 # ================================================================== F10 / F11: the loader
