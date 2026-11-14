@@ -203,6 +203,10 @@ end, a broken chain) is refused with a code, and it never removes or rewrites a 
 edit the head file by hand. Notes are stored and shown as one plain line: control,
 line-break and direction-override characters become spaces.
 
+**One limit of the repair.** A head file protects the last line only while the head file exists. If the head file AND the last line(s) are both gone, what remains is a valid, shorter
+chain, and situation (ii) accepts it. That is why the command prints the sequence number and item of the line it would treat as the last: compare it with the last save the page
+confirmed ("Saved ... as line n") before you pass `--yes`.
+
 ## Saving and resuming
 
 * A judgment is durable only when its **Save** button is clicked ("Save independent reading",
