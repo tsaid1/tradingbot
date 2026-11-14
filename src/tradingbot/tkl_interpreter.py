@@ -105,6 +105,9 @@ class InterpretedPost(StrictModel):
     backend: Literal["deterministic", "ai"] = "deterministic"
     # Additive and advisory (price_roles.py): what kind of number each price-like number of the post
     # is, decided from its context. Nothing in the trading path (mapping, gateway, coordinator) reads it.
+    # INTENDED_ENTRY, CURRENT_MARKET and HISTORICAL_FILL are candidates for confirmation, never an
+    # authorization: no order, position, fill reconciliation or anchor price may be created, changed or
+    # released on the strength of these readings alone (the limits are in the price_roles docstring).
     price_readings: list[PriceReading] = Field(default_factory=list)
 
 

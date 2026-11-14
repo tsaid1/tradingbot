@@ -6,6 +6,22 @@ CHART_LEVEL, OTHER_CONTRACT_MONTH, UNRESOLVED, and NOT_A_PRICE for indicator val
 sizes, periods and profits. NOTHING in the trading path reads them: the gateway, the mapping, the entry
 anchor rule and the coordinator keep reading the interpreter's existing fields only.
 
+LIMITS, to be read before anything is allowed to use these readings (independent review of PR #84):
+  1. INTENDED_ENTRY, CURRENT_MARKET and HISTORICAL_FILL are candidates for confirmation, never an
+     authorization: no order, position, fill reconciliation or anchor price may be created, changed or
+     released on the strength of these readings alone.
+  2. These roles are not certified. Independent review (PR #84, final confirmation at bc1922e) found 0
+     dangerous readings among 37 plain publisher statements, but 21 dangerous readings in 44
+     adversarial sentences written against the word lists: third-party subjects that are allowed
+     words, a market as the subject of an execution verb, and words before, after or around the
+     number that frame it as a joke, a model, an archive, a correction or a completed fill.
+  3. A consumer must treat every granted role as UNRESOLVED unless a separate, independently tested
+     confirmation step (an operator, or a check against the interpreter's own action and the live
+     market) agrees, and must hold the action when they disagree: a false trade authorization is
+     materially worse than an ambiguous instruction safely held.
+  4. Readings carrying NO_CLAUSE_CONTEXT, and every reading of the AI backend path, were decided
+     without the interpreter's clauses: they are never tied to an action and must not be used for one.
+
 How a role is decided. Context, never one phrase, and no default:
   * the numbers are those of the product's own number reader (``instruction_terms``: its token, edge
     and number patterns, outside an index's own name), in text order, so ``n`` is the same index as
