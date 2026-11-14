@@ -215,6 +215,8 @@ class FamilyRiskTerms:
     max_stop_distance: str | None = None  # the family's risk.max_stop_distance (G8)
     entry_collar: str | None = None
     multiplier: Decimal | None = None  # as stated in the family entry
+    # basis_shift.scale_ratio as the family states it: reference points per execution point.
+    reference_scale: Decimal | None = None
 
     @classmethod
     def of(cls, entry) -> FamilyRiskTerms:
@@ -230,7 +232,8 @@ class FamilyRiskTerms:
                    max_risk_per_idea=entry.risk.max_risk_per_idea if entry.risk else None,
                    margin=entry.margin,
                    max_stop_distance=entry.risk.max_stop_distance if entry.risk else None,
-                   entry_collar=entry.entry_collar, multiplier=stated_mult)
+                   entry_collar=entry.entry_collar, multiplier=stated_mult,
+                   reference_scale=entry.basis_shift.scale_ratio if entry.basis_shift else None)
 
     @classmethod
     def of_terms(cls, t) -> FamilyRiskTerms:
@@ -244,4 +247,4 @@ class FamilyRiskTerms:
         return cls(family=t.family, sec_type=SEC_TYPE_OF_ASSET.get(asset, asset),
                    funding=t.funding, max_risk_per_idea=t.max_risk_per_idea, margin=margin,
                    max_stop_distance=t.risk_max_stop_distance, entry_collar=t.entry_collar,
-                   multiplier=t.multiplier_stated)
+                   multiplier=t.multiplier_stated, reference_scale=t.reference_scale_ratio)

@@ -118,7 +118,7 @@ def test_g1_borrowing_limit_when_permitted():
 def test_g1_short_stock_sale_is_borrowing_class():
     only(run(etf(side="SHORT", stop=D(102)), ETF), "G1", G.SHORT_SALE_NOT_PERMITTED)
     t = deepcopy(TABLE)
-    t["borrowing"]["short_sale_permitted"] = True
+    t["borrowing"] = {"permitted": True, "short_sale_permitted": True, "max_borrowed": "1000"}
     assert run(etf(side="SHORT", stop=D(102)), ETF, RiskPolicy.from_table(t)).passed
 
 
@@ -389,3 +389,74 @@ def test_what_if_hook_returns_nine_results_and_is_pure():
     assert [g.gate for g in r.results] == [f"G{i}" for i in range(1, 10)] and r.passed
     r = what_if(TABLE, FUT, side="LONG", entry_reference=D(100), stop=D(90), units=20, now=NOW)
     assert {g.gate for g in r.failed} == {"G4", "G8"}
+
+
+# ----------------------------------------------------------------------------- review S1 to S5
+
+def short_table(**borrowing) -> RiskPolicy:
+    t = deepcopy(TABLE)
+    t["borrowing"] = {"permitted": True, "short_sale_permitted": True, "max_borrowed": "1000",
+                      **borrowing}
+    return RiskPolicy.from_table(t)
+
+
+def test_s1_a_short_stock_sale_counts_against_max_borrowed():
+    p = short_table()
+    r = run(etf(side="SHORT", stop=D(102)), ETF, p)  # 10 x 100 = 1000: at the limit
+    assert gate(r, "G1").status == "PASS" and gate(r, "G1").value == D(1000)
+    big = run(etf(side="SHORT", stop=D(102), units=1000), ETF, p)
+    assert G.BORROWING_LIMIT in gate(big, "G1").codes and gate(big, "G1").value == D(100000)
+    held = Exposure(sec_type="STK", units=1, mark=D("0.01"), multiplier=D(1), entry=D("0.01"),
+                    stop=D("0.02"), short=True)
+    only(run(etf(side="SHORT", stop=D(102)), ETF, p, portfolio=[held]), "G1", G.BORROWING_LIMIT)
+    no_borrowing = short_table(permitted=False, max_borrowed=None)
+    assert G.BORROWING_NOT_PERMITTED in gate(run(etf(side="SHORT", stop=D(102)), ETF,
+                                                 no_borrowing), "G1").codes
+
+
+def test_s2_writing_an_option_is_refused_whatever_the_table_says():
+    t = deepcopy(TABLE)
+    t["eligibility"]["options"] = True
+    t["borrowing"] = {"permitted": True, "short_sale_permitted": True, "max_borrowed": "1e9"}
+    opt = FamilyRiskTerms(family="QSTK.OPT", sec_type="OPT", funding="OPTION_PREMIUM",
+                          max_risk_per_idea=D(10 ** 9), max_stop_distance="100%",
+                          entry_collar="100%", multiplier=D(100))
+    short = Proposal(sec_type="OPT", side="SHORT", units=1, entry=D(4), stop=D(6),
+                     multiplier=D(100), touch=D(4))
+    only(run(short, opt, RiskPolicy.from_table(t)), "G1", G.SHORT_OPTION_NOT_SUPPORTED)
+    assert G.SHORT_OPTION_NOT_SUPPORTED in baseline(short, opt).reasons()
+    assert run(Proposal(**{**short.__dict__, "side": "LONG", "stop": D(2)}), opt,
+               RiskPolicy.from_table(t)).passed  # a long, fully paid option as designed
+
+
+def test_s3_reference_levels_need_the_stated_scale_and_cost_is_the_execution_price():
+    ref = Proposal(sec_type="FUT", side="LONG", units=1, entry=D(500), stop=D(495),
+                   multiplier=D(10), touch=D(500), exec_price=D(5000), reference_series=True)
+    for scale in (None, D(10)):
+        fam = FamilyRiskTerms(**{**FUT.__dict__, "reference_scale": scale})
+        r = run(ref, fam)
+        assert G.STOP_UNKNOWN in gate(r, "G4").codes and r.dollar_risk is None
+        assert G.STOP_UNKNOWN in gate(r, "G5").codes
+    r = run(ref, FamilyRiskTerms(**{**FUT.__dict__, "reference_scale": D(1)}))
+    assert r.passed and r.dollar_risk == D(50)
+    assert r.gross_notional == D(50000)  # 5000 x 10: the execution price, never the reference
+
+
+def test_s4_every_exposure_must_be_in_the_account_currency():
+    jpy = Exposure(sec_type="STK", units=1, mark=D(1), multiplier=D(1), entry=D(1),
+                   stop=D("0.9"), currency="JPY")
+    r = run(fut(), portfolio=[jpy])
+    assert {g.gate for g in r.failed} >= {"G3", "G5"} and G.CURRENCY_MISMATCH in r.reasons()
+
+
+@pytest.mark.parametrize("bad", [
+    {"entry": D("NaN")}, {"stop": D("Infinity")}, {"entry": 100.0}, {"multiplier": 10.0},
+    {"touch": D("sNaN")}, {"units": 1.5},
+])
+def test_s5_evaluate_refuses_and_never_raises_on_bad_numbers(bad):
+    r = run(fut(**bad))
+    assert [g.gate for g in r.failed] == [f"G{i}" for i in range(1, 10)]
+    assert r.reasons() == [G.FAILED, G.GATES_ERROR]
+    r = evaluate(POLICY, FUT, fut(), account=account(net_liquidation=D("NaN")), portfolio=[],
+                 environment="SIM", now=NOW)
+    assert r.reasons() == [G.FAILED, G.GATES_ERROR]

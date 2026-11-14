@@ -2,7 +2,8 @@
 
 `tradingbot.risk` adds nine independent, configurable risk gates to the order path. They grant no
 paper or funded trading authority. Leveraged execution is off by default: with no `[risk]`
-table, only a long cash stock or ETF can be traded, as before. No number here is a proposal: every
+table, only a long stock or ETF can be traded, as before, bounded by the existing absolute caps
+(the baseline does not compare its cost with cash; see below). No number here is a proposal: every
 limit is a field the owner fills, and the shipped configuration and examples carry none.
 
 ## The gates
@@ -25,7 +26,10 @@ pass through them: refusing an exit would increase risk.
 | G9 | Paper versus funded | `environments` (a subset of `SIM`, `PAPER`; `LIVE` is not a value) | `RISK_ENVIRONMENT_NOT_AUTHORIZED:<SIM\|PAPER\|LIVE\|UNDECLARED>` |
 
 Common codes: `RISK_INPUT_MISSING:<gate>:<input>`, `RISK_INPUT_STALE:<gate>:ACCOUNT_VALUES`,
-`RISK_CURRENCY_MISMATCH` (no FX conversion exists). A refusal reads `RISK_GATES_FAILED` followed
+`RISK_CURRENCY_MISMATCH` (the proposal, or any exposure counted with it, is not in the account
+currency; no FX conversion exists), `RISK_GATES_ERROR` (an input could not be read or a gate
+could not be computed: that entry is refused, every gate FAIL; a NaN, infinite or float input is
+refused the same way and never raises). A refusal reads `RISK_GATES_FAILED` followed
 by every failing gate's codes in gate order.
 
 The table also states `approved_by`, `approved_at`, `currency` (USD) and
@@ -45,7 +49,10 @@ family or from the global `[policy]` collar.
   the limit actually sent. Stop is the publisher's stop as read, in the execution series. A
   REFERENCE_TRIGGER idea is measured to its execution-priced backstop. With no backstop it is
   measured in the reference series, from the stated entry (or anchor) to the stop, at the
-  contract multiplier, taking one reference point as one execution point. The multiplier is the resolved contract's, and it must equal the
+  contract multiplier, only when the family states one reference point is one execution point
+  (`basis_shift.scale_ratio = 1`); otherwise `RISK_STOP_UNKNOWN`. An add to such an idea measures
+  its existing units from the add's own reference level. Cost and notional always use the
+  execution instrument's price (the limit), never the reference entry. The multiplier is the resolved contract's, and it must equal the
   multiplier the family entry states (a non-share family that does not state one refuses). An
   ADD counts the idea's existing units at their average price. A stop already beyond the entry in
   the favourable direction counts as 0. This is the distance to the stop, not the maximum loss:
@@ -58,8 +65,14 @@ family or from the global `[policy]` collar.
 * **Effective equity** = min(`allocated_equity`, broker net liquidation). Both are recorded. If
   net liquidation is unreadable or stale, the gates that need it refuse.
 * **Borrowing** (G1, securities only) = max(0, purchase cost + cash committed by working buy
-  entries - total cash). A short stock sale borrows the security and is G1's too. Futures
-  initial margin is not borrowing.
+  entries - total cash). A short stock sale borrows the security: it needs
+  `short_sale_permitted` AND `permitted`, and its value (units x price x multiplier) plus every
+  short stock position and working short sale counts against `max_borrowed`. Writing an option is
+  refused in this build whatever the table says (`RISK_SHORT_OPTION_NOT_SUPPORTED`; no key enables
+  it); a long, fully paid option is a cash purchase. Futures initial margin is not borrowing.
+* **Cash sufficiency is checked only under a `[risk]` table** (G1). The cash baseline does not
+  compare a long stock's cost with cash: "fully paid" is not verified there. As on main, only the
+  existing absolute notional and exposure caps bound a long stock.
 * **Margin utilisation** (G6) = (initial margin of open and working futures and CFDs, plus the
   proposal's) / effective equity. The account part is the larger of the owner's per-unit figures
   and the broker's reported initial margin, so a broker figure can only tighten it.
@@ -108,15 +121,17 @@ path gates on them today, since shadow gates on the simulated account.
 
 With no `[risk]` table (the shipped configuration):
 
-* G1 refuses a short stock sale and a `MARGIN_BORROWING` family.
+* G1 refuses a short stock sale, a written option and a `MARGIN_BORROWING` family. It does not
+  compare a long purchase with cash (no account is read).
 * G2 refuses anything but a stock or ETF.
 * G9 is today's rule: an anchored entry needs a broker that declares SIM or PAPER, and a broker
   declaring LIVE is refused for every entry. An undeclared broker may still take an explicit
   entry, as on main.
 * G3 to G8 record `RISK_BASELINE_CASH_ONLY`. The only exposure the baseline admits is a long
   cash stock or ETF, which the existing caps and family rules bound as before.
-* The simulated account keeps no values. The portfolio is not built and no extra quote is read,
-  so the shadow call trace is unchanged.
+* No account values are read, the portfolio is not built and no extra quote or position is read,
+  so the shadow call trace is unchanged. Economic leverage is recorded as unknown (no equity
+  figure); gross notional is recorded from the caps' own measure.
 
 A `[risk]` table switches every numeric gate on together. Leverage then still needs its own keys:
 `borrowing.permitted` with a limit, or `eligibility.futures` plus a family with
@@ -145,6 +160,17 @@ separately reviewed change.
 * The execution core reads the broker's environment declaration once more per entry (G9).
 * The read-only account summary (used by the `ibkr.check` tool and the paper-readiness checks;
   no runtime path) requests three more tags.
+* An entry refused by a cap (`NOTIONAL_LIMIT`, instrument or aggregate exposure) still runs the
+  gates: a `RISK_GATES` row and an environment read; under a table also a positions read, quote
+  reads and the gates' codes after the cap code. Early refusals (blocked instrument, unresolved
+  entry, quote, collar, stop rule) return before the gates and write no row.
+* Under a `[risk]` table, an unmapped stock with no family named by its symbol is refused
+  (funding, G4 and G8 terms missing).
+* `MarketTerms` gains optional risk fields and `MockPolicy` gains `risk`. The shadow policy
+  digest drops `risk` when it is None, and recorded `mapping_terms` leave unset risk fields out,
+  so no other serialised value changes.
+* A fault in an account read or in the gates refuses that entry (`RISK_GATES_ERROR`) and never
+  stops the cycle: sync, fills, protective upkeep and exits go on.
 
 Test fixtures changed for this, each with an INVENTED table (`tests/_risk_fixture.py`), no
 expectation relaxed:

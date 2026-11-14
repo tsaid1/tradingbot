@@ -296,3 +296,41 @@ def test_simulated_account_is_wired_only_under_a_table(tmp_path):
     finally:
         on.close()
         off.close()
+
+
+# ----------------------------------------------------------------------------- review S3, S5
+
+def test_s3_a_reference_trigger_without_backstop_on_another_scale_is_refused_at_the_gateway():
+    from test_multi_asset_gateway import NOW, act, gate, leg, mq, terms
+    for scale, held in ((D(10), True), (None, True), (D(1), False)):
+        t = terms("REFERENCE_TRIGGER", require_backstop=False, reference_scale_ratio=scale)
+        d = gate(act(entry="5010", stop="4980", target="5070"), mq(t, reference=leg()), now=NOW)
+        assert (d.status == "HOLD" and G.STOP_UNKNOWN in d.reasons) == held, (scale, d.reasons)
+
+
+def test_s5_a_faulting_gate_refuses_its_entry_and_the_cycle_goes_on(tmp_path):
+    h = Harness(tmp_path, risk_families=((SYMBOL, "STK", "1"),))
+    h.execute("p1", open_action())
+    ref = h.record_never_sent("p2", open_action())
+    calls = []
+
+    def boom(*_a, **_k):
+        calls.append(1)
+        raise RuntimeError("invented fault")
+
+    h.broker.account_values = boom  # an account read that raises: unreadable, refused
+    h.coord._risk_portfolio = boom  # a fault inside the gates' own work
+    h.coord.recover()  # never raises
+    assert G.GATES_ERROR in h.coord.intent(ref).reasons and calls
+    assert not h.broker.orders_with_ref(ref)  # the never-sent entry stays unsent
+    assert h.coord.sync()  # the cycle continues: sync, fills, protection
+    close = h.execute("p3", action("out", Action.CLOSE, idea="p1:open"))
+    assert close.replay_status == "EXECUTED"
+
+
+def test_s5_the_baseline_makes_no_account_read(tmp_path):
+    h = Harness(tmp_path)
+    reads = []
+    h.broker.account_values = lambda: reads.append(1)
+    assert h.execute("p1", open_action()).replay_status == "EXECUTED"
+    assert reads == []

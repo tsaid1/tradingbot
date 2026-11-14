@@ -235,6 +235,7 @@ class MarketTerms(StrictModel):
     margin_max_age_days: int | None = None
     entry_collar: str | None = None
     multiplier_stated: Decimal | None = None
+    reference_scale_ratio: Decimal | None = None  # basis_shift.scale_ratio, as stated
     # Problems found while building these terms (contract unresolved, specification differs).
     problems: list[str] = Field(default_factory=list)
 

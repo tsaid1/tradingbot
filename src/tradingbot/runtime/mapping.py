@@ -988,6 +988,7 @@ class FamilyMapping(StrictModel):
             margin_max_age_days=self.margin.max_age_days if self.margin else None,
             entry_collar=self.entry_collar,
             multiplier_stated=self.risk_terms().multiplier,
+            reference_scale_ratio=self.basis_shift.scale_ratio if self.basis_shift else None,
             problems=out,
         )
 

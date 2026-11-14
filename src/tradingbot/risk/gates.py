@@ -37,6 +37,8 @@ FAILED = "RISK_GATES_FAILED"
 BORROWING_NOT_PERMITTED = "RISK_BORROWING_NOT_PERMITTED"
 BORROWING_LIMIT = "RISK_BORROWING_LIMIT"
 SHORT_SALE_NOT_PERMITTED = "RISK_SHORT_SALE_NOT_PERMITTED"
+# Writing an option: refused in this build whatever the table says (no option-margin rule).
+SHORT_OPTION_NOT_SUPPORTED = "RISK_SHORT_OPTION_NOT_SUPPORTED"
 # G2
 NOT_ELIGIBLE = "RISK_INSTRUMENT_NOT_ELIGIBLE"
 FUNDING_MISSING = "RISK_FAMILY_FUNDING_MISSING"
@@ -63,6 +65,8 @@ ENVIRONMENT_NOT_AUTHORIZED = "RISK_ENVIRONMENT_NOT_AUTHORIZED"
 INPUT_MISSING = "RISK_INPUT_MISSING"
 INPUT_STALE = "RISK_INPUT_STALE"
 CURRENCY_MISMATCH = "RISK_CURRENCY_MISMATCH"
+# A fault while reading a gate input or computing a gate: that entry is refused.
+GATES_ERROR = "RISK_GATES_ERROR"
 
 GATES = (
     ("G1", "BORROWING"), ("G2", "ELIGIBILITY"), ("G3", "GROSS_NOTIONAL"),
@@ -93,6 +97,13 @@ class Proposal:
     anchored: bool = False  # entry_rule REFERENCE_AS_COLLAR (G9 baseline)
     action: Literal["OPEN", "ADD"] = "OPEN"
     held_risk: Decimal = Decimal(0)  # an ADD: the idea's existing dollar risk
+    # The execution instrument's own price of the order (the limit); cost and notional are always
+    # measured with it. None: ``entry`` is that price.
+    exec_price: Decimal | None = None
+    # ``entry`` and ``stop`` are reference-series levels (a reference-triggered idea with no
+    # execution-priced backstop): measured only when the family states one reference point is
+    # one execution point (basis_shift.scale_ratio = 1).
+    reference_series: bool = False
 
 
 @dataclass(frozen=True)
@@ -108,6 +119,7 @@ class Exposure:
     margin_initial: Decimal | None = None  # per unit, margin-funded only
     buy_cost: Decimal = Decimal(0)  # cash a working buy entry commits (G1)
     currency: str = "USD"
+    short: bool = False  # a short position or working sell entry (a short stock borrows, G1)
 
 
 @dataclass(frozen=True)
@@ -216,8 +228,10 @@ class _Ctx:
         self.now: datetime = now
         self.stage: Stage = stage
         self.long = proposal.side == "LONG"
-        self.cost = (proposal.entry * proposal.units * proposal.multiplier
-                     if proposal.entry is not None and proposal.multiplier is not None else None)
+        price = proposal.exec_price if proposal.exec_price is not None else (
+            None if proposal.reference_series else proposal.entry)
+        self.cost = (price * proposal.units * proposal.multiplier
+                     if price is not None and proposal.multiplier is not None else None)
 
     # -- shared reads
     def account_problem(self, gate: str, *fields: str) -> list[str]:
@@ -244,7 +258,12 @@ class _Ctx:
         return min(self.policy.allocated_equity, nl)
 
     def money_problem(self) -> list[str]:
-        if self.policy is not None and self.p.currency != self.policy.currency:
+        """The proposal, and every exposure counted with it, must be in the account currency;
+        nothing is converted."""
+        if self.policy is None:
+            return []
+        if self.p.currency != self.policy.currency or any(
+                e.currency != self.policy.currency for e in self.portfolio or ()):
             return [CURRENCY_MISMATCH]
         return []
 
@@ -311,28 +330,44 @@ def g1_borrowing(c: _Ctx) -> tuple[GateResult, Decimal | None]:
     p, fam = c.p, c.family
     codes: list[str] = []
     rules = c.policy.borrowing if c.policy else None
-    if not c.long and p.sec_type in ("STK", "OPT", "CMDTY") and not (
-            rules and rules.short_sale_permitted):
+    if not c.long and p.sec_type == "OPT":
+        codes.append(SHORT_OPTION_NOT_SUPPORTED)  # no key enables writing an option
+    short_stock = not c.long and p.sec_type in ("STK", "CMDTY")
+    if short_stock and not (rules and rules.short_sale_permitted):
         codes.append(SHORT_SALE_NOT_PERMITTED)
+    if short_stock and not (rules and rules.permitted):
+        codes.append(BORROWING_NOT_PERMITTED)  # the borrowed security counts as borrowing
     if fam.funding == "MARGIN_BORROWING" and not (rules and rules.permitted):
         codes.append(BORROWING_NOT_PERMITTED)
     if c.policy is None:
         return (_result("G1", codes) if codes else _baseline("G1")), None
-    if p.sec_type in ("FUT", "CFD") or not c.long:
-        # Performance margin is not borrowing (G6); a short sale is decided above.
+    if p.sec_type in ("FUT", "CFD") or (not c.long and not short_stock):
+        # Performance margin is not borrowing (G6); a written option is refused above.
         return _result("G1", codes, value=Decimal(0)), Decimal(0)
     if c.stage == "GATEWAY":
         return (_result("G1", codes) if codes else _not_evaluated("G1")), None
-    codes += c.money_problem() + c.portfolio_missing("G1") + c.account_problem("G1", "total_cash")
+    codes += c.money_problem() + c.portfolio_missing("G1")
+    if not short_stock:
+        codes += c.account_problem("G1", "total_cash")
     if c.cost is None:
         codes.append(f"{INPUT_MISSING}:G1:COST")
     if codes:
         return _result("G1", codes), None
-    committed = sum((e.buy_cost for e in c.portfolio), Decimal(0))
-    borrowed = max(Decimal(0), c.cost + committed - c.account.total_cash)
-    if borrowed > 0 and not rules.permitted:
+    if short_stock:
+        # The borrowed securities: this sale plus every short stock position and working short
+        # sale already on the account, at their marks.
+        borrowed = abs(c.cost) + sum(
+            (abs(e.mark * e.units * e.multiplier) for e in c.portfolio
+             if e.short and e.sec_type in ("STK", "CMDTY") and e.mark is not None), Decimal(0))
+        if any(e.short and e.sec_type in ("STK", "CMDTY") and e.mark is None
+               for e in c.portfolio):
+            codes.append(f"{INPUT_MISSING}:G1:MARK")
+    else:
+        committed = sum((e.buy_cost for e in c.portfolio), Decimal(0))
+        borrowed = max(Decimal(0), c.cost + committed - c.account.total_cash)
+    if not codes and borrowed > 0 and not rules.permitted:
         codes.append(BORROWING_NOT_PERMITTED)
-    elif rules.permitted and borrowed > rules.max_borrowed:
+    elif not codes and rules.permitted and borrowed > rules.max_borrowed:
         codes.append(BORROWING_LIMIT)
     return _result("G1", codes, value=borrowed, limit=rules.max_borrowed or Decimal(0)), borrowed
 
@@ -384,6 +419,9 @@ def _idea_risk(c: _Ctx) -> tuple[Decimal | None, list[str]]:
             c.family.multiplier is not None and p.multiplier != c.family.multiplier) or (
             c.family.multiplier is None and p.sec_type != "STK"):
         codes.append(MULTIPLIER_UNKNOWN)
+    if p.reference_series and c.family.reference_scale != Decimal(1):
+        # Reference levels at the execution multiplier are valid only on one stated scale.
+        codes.append(STOP_UNKNOWN)
     risk = dollar_risk(p.entry, p.stop, p.multiplier, p.units, c.long)
     if risk is None and not codes:
         codes.append(STOP_UNKNOWN)
@@ -521,6 +559,41 @@ def evaluate(policy: RiskPolicy | None, family: FamilyRiskTerms, proposal: Propo
              stage: Stage = "EXECUTION") -> RiskReport:
     """Run all nine gates. ``environment`` is the broker's declaration (SIM, PAPER, LIVE, None)."""
     now = now or datetime.now(UTC)
+    try:
+        if _invalid_inputs(proposal, account, portfolio):
+            raise ValueError("a risk-gate input is not a finite Decimal")
+        return _evaluate(policy, family, proposal, account, portfolio, environment, now, stage)
+    except Exception:  # noqa: BLE001 - a fault refuses this entry; it never passes or raises
+        return error_report(stage, policy is None)
+
+
+def error_report(stage: Stage, baseline: bool) -> RiskReport:
+    """Every gate FAIL with RISK_GATES_ERROR: an entry whose gates could not be computed."""
+    return RiskReport(stage=stage, baseline=baseline,
+                      results=tuple(_result(g, [GATES_ERROR]) for g, _ in GATES))
+
+
+def _bad_number(v) -> bool:
+    if v is None:
+        return False
+    return not isinstance(v, Decimal) or not v.is_finite()
+
+
+def _invalid_inputs(p: Proposal, account, portfolio) -> bool:
+    if any(_bad_number(v) for v in (p.entry, p.stop, p.multiplier, p.touch, p.held_risk,
+                                    p.exec_price)) or not isinstance(p.units, int):
+        return True
+    if account is not None and any(_bad_number(getattr(account, f)) for f in (
+            "net_liquidation", "total_cash", "excess_liquidity", "init_margin", "maint_margin")):
+        return True
+    for e in portfolio or ():
+        if any(_bad_number(v) for v in (e.mark, e.multiplier, e.entry, e.stop, e.margin_initial,
+                                        e.buy_cost)) or not isinstance(e.units, int):
+            return True
+    return False
+
+
+def _evaluate(policy, family, proposal, account, portfolio, environment, now, stage):
     c = _Ctx(policy, family, proposal, account, portfolio, environment, now, stage)
     r1, borrowed = g1_borrowing(c)
     r2 = g2_eligibility(c)

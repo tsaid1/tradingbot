@@ -152,7 +152,10 @@ def gate_action(
         # The unmapped stock path serves the fictional Sprint 1 journal and paper replay, which
         # never reach a broker; anything sent to a broker is gated by the execution core.
         return decision
-    report = gateway_risk(action, quote, policy, position, decision.plan, now)
+    try:
+        report = gateway_risk(action, quote, policy, position, decision.plan, now)
+    except Exception:  # noqa: BLE001 - a fault holds the action; it never approves or raises
+        return _gate("HOLD", "RISK_GATES_FAILED", "RISK_GATES_ERROR")
     if report.refused:
         return _gate("HOLD", *report.reasons())
     return decision
@@ -196,7 +199,9 @@ def gateway_risk(a: TradeAction, quote: MappedQuote, policy: MockPolicy,
                         units=plan.quantity if plan and plan.quantity else t.units_per_signal,
                         entry=entry, stop=stop, multiplier=t.multiplier, touch=touch,
                         anchored=plan is not None and plan.entry_limit is not None,
-                        action=a.action.value)
+                        action=a.action.value,
+                        exec_price=plan.execution_reference if plan else None,
+                        reference_series=in_reference)
     return evaluate_risk(policy.risk, family, proposal, now=now, stage="GATEWAY")
 
 

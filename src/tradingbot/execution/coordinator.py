@@ -78,6 +78,7 @@ from tradingbot.models import (
     StrictModel,
 )
 from tradingbot.risk.gates import Exposure, Proposal, dollar_risk
+from tradingbot.risk.gates import error_report as risk_error_report
 from tradingbot.risk.gates import evaluate as evaluate_risk
 from tradingbot.risk.policy import FamilyRiskTerms
 from tradingbot.validator import (
@@ -3230,19 +3231,44 @@ class ExecutionCoordinator:
         risk = self._risk_gates(contract, side, qty, entry, None if in_reference else price,
                                 idea_id, now, exclude_ref, stop=stop,
                                 family=risk_plan.family if risk_plan else None, action=action,
-                                anchored=fixed_limit is not None, gross=gross)
+                                anchored=fixed_limit is not None, gross=gross, exec_price=limit,
+                                reference_series=in_reference)
         if caps or risk:
             return None, caps + risk
         return limit, []
 
     def _risk_gates(self, contract: ContractRef, side: OrderSide, qty: int,
-                    limit: Decimal | None, touch: Decimal | None, idea_id: str, now: datetime, exclude_ref: str | None, *,
-                    stop: Decimal | None, family: str | None, action: Action, anchored: bool,
-                    gross: Decimal | None) -> list[str]:
+                    limit: Decimal | None, touch: Decimal | None, idea_id: str, now: datetime,
+                    exclude_ref: str | None, *, stop: Decimal | None, family: str | None,
+                    action: Action, anchored: bool, gross: Decimal | None,
+                    exec_price: Decimal | None = None,
+                    reference_series: bool = False) -> list[str]:
         """Evaluate the nine risk gates for one entry or add as it would be sent, journal the
         report (RISK_GATES: numbers and codes only) and return its refusal reasons ([] = pass).
-        Under the cash baseline (no [risk] table) nothing but the gates' own inputs is read: the
-        portfolio is built, and its quotes read, only under a table."""
+        Under the cash baseline (no [risk] table) nothing is read for them: no account values,
+        no portfolio, no quote. Any fault refuses this entry with RISK_GATES_ERROR and never
+        escapes, so the cycle (sync, fills, protection, exits) goes on."""
+        policy = self.policy.risk
+        try:
+            report = self._risk_report(contract, side, qty, limit, touch, idea_id, now,
+                                       exclude_ref, stop=stop, family=family, action=action,
+                                       anchored=anchored, exec_price=exec_price,
+                                       reference_series=reference_series)
+            if policy is None and gross is not None:
+                # The baseline records the exposure the caps measured; with no account read
+                # there is no equity figure, so economic leverage stays unknown.
+                report = dataclasses.replace(report, gross_notional=gross)
+        except Exception as exc:  # noqa: BLE001 - refuse this entry, never stop the cycle
+            report = risk_error_report("EXECUTION", policy is None)
+            with contextlib.suppress(Exception):
+                self.store.log(now, "RISK_GATES_ERROR", idea_id=idea_id,
+                               error=type(exc).__name__)
+        with contextlib.suppress(Exception):
+            self.store.log(now, "RISK_GATES", idea_id=idea_id, **report.record())
+        return report.reasons()
+
+    def _risk_report(self, contract, side, qty, limit, touch, idea_id, now, exclude_ref, *,
+                     stop, family, action, anchored, exec_price, reference_series):
         policy = self.policy.risk
         long = side == OrderSide.BUY
         # A mapped family's terms; without a plan, the family named by the contract's symbol and
@@ -3256,8 +3282,10 @@ class ExecutionCoordinator:
         held = Decimal(0)
         pos = self.store.position(idea_id)
         if action == Action.ADD and pos is not None and pos.quantity > 0:
-            held_risk = dollar_risk(_dec(pos.avg_price), stop, contract.multiplier, pos.quantity,
-                                    long)
+            # The idea's existing units, in the series its stop is in: from the average price,
+            # or (a reference-series stop) from this add's own reference level.
+            start = limit if reference_series else _dec(pos.avg_price)
+            held_risk = dollar_risk(start, stop, contract.multiplier, pos.quantity, long)
             held = held_risk if held_risk is not None else Decimal(0)
             if held_risk is None and policy is not None:
                 stop = None  # the idea's own risk is unknown: refuse (RISK_STOP_UNKNOWN)
@@ -3265,20 +3293,13 @@ class ExecutionCoordinator:
                             units=qty, entry=limit, stop=stop, multiplier=contract.multiplier,
                             currency=contract.currency, touch=limit if touch is None else touch,
                             anchored=anchored,
-                            action="ADD" if action == Action.ADD else "OPEN", held_risk=held)
+                            action="ADD" if action == Action.ADD else "OPEN", held_risk=held,
+                            exec_price=exec_price, reference_series=reference_series)
         env = broker_environment(self.broker)
-        snapshot = account_values(self.broker)
+        snapshot = account_values(self.broker) if policy is not None else None
         portfolio = self._risk_portfolio(exclude_ref, now) if policy is not None else None
-        report = evaluate_risk(policy, terms, proposal, account=snapshot, portfolio=portfolio,
-                               environment=env.value if env is not None else None, now=now)
-        if policy is None and gross is not None:
-            # The baseline records economic leverage from the exposure the caps measured.
-            equity = report.effective_equity
-            report = dataclasses.replace(
-                report, gross_notional=gross,
-                economic_leverage=gross / equity if equity and equity > 0 else None)
-        self.store.log(now, "RISK_GATES", idea_id=idea_id, **report.record())
-        return report.reasons()
+        return evaluate_risk(policy, terms, proposal, account=snapshot, portfolio=portfolio,
+                             environment=env.value if env is not None else None, now=now)
 
     def _risk_portfolio(self, exclude_ref: str | None, now: datetime) -> list[Exposure] | None:
         """Every open position (ledger and broker-only) and working entry, for the risk gates
@@ -3302,6 +3323,7 @@ class ExecutionCoordinator:
             stop = _dec(p.backstop_price if p.protection_series == "REFERENCE" else p.stop_price)
             out.append(Exposure(
                 sec_type=sec, units=p.quantity, mark=self._mark(contract, avg, now),
+                short=p.position_side == PositionSide.SHORT,
                 multiplier=mult, entry=avg, stop=stop,
                 protected=self._protection(p.idea_id) in ("CONFIRMED", "EXITING"),
                 margin_initial=self.risk_margin_by_symbol.get(p.symbol),
@@ -3310,7 +3332,7 @@ class ExecutionCoordinator:
             extra = abs(bp.quantity) - ledger.get(bp.contract.contract_key, 0)
             if extra > 0:  # a broker-only position: no known stop, unbounded risk
                 out.append(Exposure(
-                    sec_type=bp.contract.sec_type, units=extra,
+                    sec_type=bp.contract.sec_type, units=extra, short=bp.quantity < 0,
                     mark=self._mark(bp.contract, bp.avg_cost, now),
                     multiplier=bp.contract.multiplier, entry=bp.avg_cost, stop=None,
                     protected=False,
@@ -3337,6 +3359,7 @@ class ExecutionCoordinator:
             buy = intent.side == OrderSide.BUY.value
             out.append(Exposure(
                 sec_type=sec, units=left, mark=price, multiplier=mult, entry=price, stop=stop,
+                short=not buy,
                 margin_initial=self.risk_margin_by_symbol.get(intent.symbol),
                 buy_cost=price * left * mult if buy and sec not in ("FUT", "CFD") else Decimal(0),
                 currency=stored.currency if stored else "USD"))

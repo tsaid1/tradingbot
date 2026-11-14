@@ -371,7 +371,7 @@ def account_values(broker) -> AccountSnapshot | None:
         return None
     try:
         value = get()
-    except BrokerError:
+    except Exception:  # noqa: BLE001 - any failure is "unreadable"; the gates then refuse
         return None
     return value if isinstance(value, AccountSnapshot) else None
 

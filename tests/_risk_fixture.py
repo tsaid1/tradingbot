@@ -86,7 +86,9 @@ def market_terms_fields(asset_class, multiplier) -> dict:
     sec = SEC_OF_ASSET.get(getattr(asset_class, "value", asset_class), "STK")
     out = {"funding": FUNDING[sec], "max_risk_per_idea": Decimal(100000000),
            "risk_max_stop_distance": "100%", "entry_collar": "100%",
-           "multiplier_stated": Decimal(multiplier)}
+           "multiplier_stated": Decimal(multiplier),
+           # one reference point = one execution point, as a family states it (basis_shift)
+           "reference_scale_ratio": Decimal(1)}
     if sec in ("FUT", "CFD"):
         out.update({"margin_initial": Decimal(1), "margin_maintenance": Decimal(1),
                     "margin_verified_at": date(2026, 1, 1), "margin_max_age_days": 36500})
