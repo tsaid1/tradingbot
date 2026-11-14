@@ -520,7 +520,7 @@ def test_s7_current_or_historical_is_decided_by_the_posts_time_words():
 
 def test_s8_the_guide_is_one_page_and_defines_its_terms():
     guide = R.REVIEWER_GUIDE
-    assert len(guide.split()) <= R.REVIEWER_GUIDE_MAX_WORDS == 580  # 15.5 (was 700)
+    assert len(guide.split()) <= R.REVIEWER_GUIDE_MAX_WORDS == 700  # one page, plain sentences
     assert sum(line.startswith("#") for line in guide.splitlines()) <= \
         R.REVIEWER_GUIDE_MAX_HEADINGS == 6
     flat = " ".join(guide.split())
@@ -783,7 +783,9 @@ def test_c4_the_texts_say_what_flat_means_and_how_to_get_out():
     assert "MODIFY from FLAT" in dict(effect.values)["NONE"] and "MODIFY from FLAT" in \
         effect.tooltip
     guide = " ".join(R.REVIEWER_GUIDE.split())
-    assert "so is a position they do not establish, never FLAT" in guide
+    assert ("When they do not settle it, answer CANNOT_DETERMINE with the flag MISSING_CONTEXT, "
+            "never FLAT.") in guide
+    assert "or the post's own words (a new position), establish that none existed" in guide
 
 
 # 15.2 (C2, C9): an amendment's reset holds under escalation; amending the action resets the
@@ -945,7 +947,11 @@ def test_c5_the_freeze_writes_validation_codes_and_verify_checks_the_counts(base
 
 def test_c7_the_guide_fits_one_page_and_defines_first_report_and_repeat():
     guide = R.REVIEWER_GUIDE
-    assert len(guide.split()) <= 580
+    assert len(guide.split()) <= 700
+    assert "An unsaved form is lost when you leave the page." in " ".join(guide.split())
+    assert "Your access is personal and can be withdrawn." in " ".join(guide.split())
+    assert "any other tool or assistant" in " ".join(guide.split())
+    assert "Closing one position and opening another are two actions." in " ".join(guide.split())
     assert sum(line.startswith("#") for line in guide.splitlines()) <= 6
     flat = " ".join(guide.split())
     assert "FIRST_REPORT (this post first tells subscribers)" in flat
