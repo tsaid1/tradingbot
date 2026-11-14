@@ -724,10 +724,15 @@ def _workspace(base: Path, bundle: A.Bundle, session: A.Session) -> None:
     st.text(f"Scope: all {len(bundle.sequences)} ideas and the sampled posts" if covers_all
             else f"Scope: first {session.scope} ideas (of {len(bundle.sequences)})")
     prog = A.progress(bundle, records, session)
-    labels = {}
+    # ``names`` are the item selector's option texts and must never change while a session lasts:
+    # the browser holds the chosen option by its text, and a text that changed under it (a status
+    # in it, after a save) sends the page to the first item at the next interaction. The status
+    # is shown beside the selector instead (``labels``).
+    names, labels = {}, {}
     for sid, items in scoped:
         for n, i in enumerate(items, 1):
-            labels[i["item_id"]] = (f"{sid or 'no sequence'} {n}: {i['kind'].lower()}, "
+            names[i["item_id"]] = f"{sid or 'no sequence'} {n}: {i['kind'].lower()}"
+            labels[i["item_id"]] = (f"{names[i['item_id']]}, "
                                     f"{prog.status[i['item_id']].lower()}")
     with st.sidebar:
         st.metric("Sequences completed", f"{prog.sequences_done} of {prog.sequences}")
@@ -751,7 +756,10 @@ def _workspace(base: Path, bundle: A.Bundle, session: A.Session) -> None:
 
         st.button("Next item not yet adjudicated", on_click=_next, key="aw_next")
         pick = st.selectbox("Item (by sequence, in time order)", ids, key="aw_pick",
-                            format_func=labels.get)
+                            format_func=names.get)
+        st.caption(f"Status of this item: {prog.status[pick].lower()}")
+        with st.expander("Status of every item"):
+            st.text("\n".join(labels[i] for i in ids))
     item = bundle.items[pick]
     st.text(labels[pick])
     with st.container(border=True):

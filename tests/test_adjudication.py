@@ -721,6 +721,25 @@ def test_resuming_finds_the_next_open_item_from_the_log_alone(monkeypatch, local
     assert [m.value for m in at.metric if m.label == "Items done"] == [f"1 of {total}"]
 
 
+def test_the_item_selector_keeps_its_option_texts_when_a_status_changes(monkeypatch, local, base):
+    """The browser holds the chosen option by its TEXT. When the option texts carried the status,
+    a save changed the text under the browser and the next interaction sent the page to the
+    first item (seen in a real browser; AppTest sets values directly and cannot show it). So the
+    option texts must not depend on anything a save changes; the status is shown beside them."""
+    at = app(monkeypatch, base, "reviewer@example.invalid")
+    before = list(at.selectbox(key="aw_pick").options)
+    statuses = ("open", "saved", "awaiting", "done", "returned")
+    assert not any(word in option.split(": ", 1)[1] for option in before for word in statuses)
+    captions = [c.value for c in at.sidebar.caption]
+    assert "Status of this item: open" in captions
+    review(base, "i07")  # the selected (first) item is now reviewed: its status changes
+    at = app(monkeypatch, base, "reviewer@example.invalid")
+    assert list(at.selectbox(key="aw_pick").options) == before
+    captions = [c.value for c in at.sidebar.caption]
+    assert "Status of this item: open" not in captions
+    assert any(c.startswith("Status of this item: ") for c in captions)
+
+
 # ------------------------------------------------------------------ rubric-2 readings of the nine original items
 
 NS, NA = R.NOT_STATED, R.NOT_APPLICABLE
