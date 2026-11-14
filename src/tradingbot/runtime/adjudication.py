@@ -19,18 +19,23 @@ import hashlib
 import json
 import os
 import re
+import stat
 import tomllib
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
-from tradingbot.runtime.vocab_recommend import (
+from tradingbot.runtime.vocab_recommend import (  # noqa: F401 - re-exported for the app
+    LOCAL_IDENTITY_ENV,
+    PUBLISHED_HOST_ENV,
     RecommendationError,
     Verification,
     _read_private,
     append_chained,
-    identity_from_headers,
+    clean_text,
+    request_identity,
+    server_problem,
     verify_log,
 )
 from tradingbot.runtime.vocab_review import (  # noqa: F401 - PrivatePathError for the app
@@ -38,12 +43,13 @@ from tradingbot.runtime.vocab_review import (  # noqa: F401 - PrivatePathError f
     PrivateDir,
     PrivatePathError,
     check_private_path,
+    synced_folder_class,
 )
 
 BUNDLE_SCHEMA = "tradingbot.adjudication.bundle/1"
 ANNOTATION_SCHEMA = "tradingbot.adjudication.annotation/1"
 GROUND_TRUTH_SCHEMA = "tradingbot.adjudication.ground_truth/1"
-DIR_ENV, LOCAL_IDENTITY_ENV = "TRADINGBOT_ADJUDICATION_DIR", "TRADINGBOT_REVIEW_LOCAL_IDENTITY"
+DIR_ENV = "TRADINGBOT_ADJUDICATION_DIR"
 
 # Closed value sets (section 3 of the specification; the export must use exactly these).
 POST_LABELS = ("ACTIONABLE", "CONDITIONAL", "COMMENTARY", "RETROSPECTIVE", "UNRESOLVED")
@@ -68,6 +74,15 @@ HOLD_SCENARIOS, POSITION_STATES = ("SHIPPED", "FIVE_FAMILY"), ("OPEN", "FLAT")
 # Section 4 and 5.
 REVIEWER, APPROVER, FULL, RESTRICTED = "REVIEWER", "APPROVER", "FULL", "RESTRICTED"
 INDEPENDENT, AFTER_REVEAL, APPROVAL = "INDEPENDENT", "AFTER_REVEAL", "APPROVAL"
+# A marker, appended BEFORE the system's reading is served to a reviewer for an item: from then
+# on that login can no longer write an INDEPENDENT reading of it (durable blind-first).
+SYSTEM_SHOWN = "SYSTEM_SHOWN"
+NOT_READ = "NOT_READ"  # a number of the post the system typed no level for (its own state)
+# RESTRICTED: free-text system fields are shown only when symbol- or number-like.
+_SYMBOLIC = re.compile(r"^[A-Z0-9 ._:/-]{1,32}$")
+WITHHELD = "WITHHELD_NOT_A_SYMBOL"
+FREE_TEXT_FIELDS = ("instrument_as_read", "amendment_from", "amendment_to")
+FREE_TEXT_MAPPING = ("reference_series", "proposed_execution_instrument")
 YES_NO_UNSURE, YES_NO = ("YES", "NO", "UNSURE"), ("YES", "NO")
 FLAGS = ("MISSING_CONTEXT", "AMBIGUOUS_PRICE_SEMANTICS", "NEEDS_MORE_EVIDENCE", "CHART_NEEDED")
 CONFIDENCE = ("HIGH", "MEDIUM", "LOW")
@@ -98,8 +113,6 @@ _MEDIA = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,100}\.(png|jpg|jpeg|gif|webp)$
 _PRICE = re.compile(r"^\d{1,9}(\.\d{1,8})?$")
 _CTRL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
 _MAGIC = (b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"GIF87a", b"GIF89a")
-PROXY_MARKERS = ("X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto", "Forwarded",
-                 "Cf-Access-Jwt-Assertion", "Cf-Connecting-Ip")
 
 
 class AdjudicationError(ValueError):
@@ -354,6 +367,42 @@ def _post(raw: dict) -> dict:
             "quotes": _id(raw.get("quotes"), "quotes", optional=True)}
 
 
+def bundle_digest(root: str | Path) -> str:
+    """sha256 over one line per file other than ``manifest.json``, ordered by its POSIX path
+    relative to the bundle (as strings): ``<path>\\0<sha256 hex of the bytes>\\n``. Reads
+    every file (posts and media too): never called for a RESTRICTED session."""
+    root = Path(root)
+    names = []
+    for folder, dirs, files in os.walk(root, followlinks=False):
+        rel = Path(folder).relative_to(root)
+        names += [(rel / f).as_posix() for f in files]
+        dirs.sort()
+    lines = []
+    for name in sorted(n for n in names if n != "manifest.json"):
+        data = _read_private(root / name, "bundle file")
+        if data is None:
+            raise AdjudicationError("BUNDLE_FILE_VANISHED")
+        lines.append(f"{name}\0{hashlib.sha256(data).hexdigest()}\n")
+    return hashlib.sha256("".join(lines).encode("utf-8")).hexdigest()
+
+
+def check_folders(base: str | Path, *, media: bool) -> str | None:
+    """Refuse a private folder (the base, ``bundle/``, ``versions/`` and, with ``media``,
+    ``bundle/media/``) that others may read: mode 0700. Returns the synced-folder class (a
+    constant) when the base lies in a cloud-synced folder, else None."""
+    base = Path(base).expanduser()
+    folders = [base, base / "bundle", base / "versions"] + ([base / "bundle" / "media"]
+                                                            if media else [])
+    for folder in folders:
+        try:
+            st_ = os.stat(folder, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        if not stat.S_ISDIR(st_.st_mode) or stat.S_IMODE(st_.st_mode) & 0o077:
+            raise AdjudicationError("PRIVATE_FOLDER_NOT_0700")
+    return synced_folder_class(base / "annotations.jsonl")
+
+
 def load_bundle(path: str | Path, access: str) -> Bundle:
     """The bundle, validated. RESTRICTED reads ``manifest.json``, ``sequences.jsonl`` and
     ``items.jsonl`` only: ``posts.jsonl`` and ``media/`` are never opened."""
@@ -369,6 +418,8 @@ def load_bundle(path: str | Path, access: str) -> Bundle:
     bundle_id = manifest.get("bundle_id")
     if not (isinstance(bundle_id, str) and re.fullmatch(r"[0-9a-f]{64}", bundle_id)):
         raise AdjudicationError("BAD_BUNDLE_ID")
+    if access == FULL and bundle_digest(root) != bundle_id:
+        raise AdjudicationError("BUNDLE_ID_MISMATCH")
     families = manifest.get("families")
     if not (isinstance(families, list) and all(isinstance(f, str) and _FAMILY_RE.match(f)
                                                for f in families)):
@@ -410,6 +461,18 @@ def load_bundle(path: str | Path, access: str) -> Bundle:
                for i in items.values() for lv in i["levels"]):
             raise AdjudicationError("LEVEL_NOT_IN_NUMBERS")
         bundle.posts = posts
+    else:
+        for item in items.values():
+            withheld = [f for f in FREE_TEXT_FIELDS
+                        if item["ai"][f] and not _SYMBOLIC.match(item["ai"][f])]
+            withheld += [f"mapping.{f}" for f in FREE_TEXT_MAPPING
+                         if item["mapping"][f] and not _SYMBOLIC.match(item["mapping"][f])]
+            for f in withheld:
+                if f.startswith("mapping."):
+                    item["mapping"][f.removeprefix("mapping.")] = ""
+                else:
+                    item["ai"][f] = ""
+            item["withheld"] = withheld
     return bundle
 
 
@@ -512,8 +575,8 @@ def table_rows(bundle: Bundle, item: dict) -> list[tuple[str, str]]:
 
 
 def system_rows(bundle: Bundle, item: dict) -> dict[str, dict]:
-    """The system's answer per table row; a number the interpreter typed no level for is, in
-    its reading, not a price."""
+    """The system's answer per table row. A number the interpreter typed no level for was NOT
+    READ by it: ``{"not_read": True}``, never a claim that it is not a price."""
     out = {}
     for key, _label in table_rows(bundle, item):
         kind, k = key.split(":")
@@ -522,16 +585,20 @@ def system_rows(bundle: Bundle, item: dict) -> dict[str, dict]:
         else:
             lv = next((x for x in item["levels"] if x["n"] == int(k)), None)
         out[key] = ({f: lv[f] for f in LEVEL_KEYS} if lv else
-                    {"role": "NOT_A_PRICE", "exactness": "", "contract_month": ""})
+                    {"role": "", "exactness": "", "contract_month": "", "not_read": True})
     return out
 
 
 def prefill_row_verdicts(levels: list[dict], system: dict[str, dict]) -> dict[str, str]:
-    """Per row: CONFIRM when role, exactness and contract month equal the system's (two
+    """Per row: NOT_READ when the system read no level there (no verdict on a claim it never
+    made); else CONFIRM when role, exactness and contract month equal the system's (two
     NOT_A_PRICE rows agree whatever else), else CORRECT; an unanswered row is UNSURE."""
     out = {}
     for row in levels:
         sys_row = system.get(row["row"], {})
+        if sys_row.get("not_read"):
+            out[row["row"]] = NOT_READ
+            continue
         same = (row["role"] == sys_row.get("role") == "NOT_A_PRICE") or all(
             row[f] == sys_row.get(f, "") for f in LEVEL_KEYS)
         out[row["row"]] = "UNSURE" if not row["role"] else "CONFIRM" if same else "CORRECT"
@@ -617,8 +684,8 @@ def load_reviewers(path: str | Path) -> Reviewers:
 
         remote_full_context_authorized = false
         [[reviewer]]
-        login = "ria@example.com"
-        name = "Ria"
+        login = "reviewer@example.com"
+        name = "Reviewer Example"
         role = "REVIEWER"   # or APPROVER
         access = "FULL"     # or RESTRICTED
 
@@ -660,33 +727,21 @@ class Session:
 
 
 def resolve_session(headers, env, reviewers: Reviewers, port: int) -> Session:
-    """Who this session is and what it may see. Through the proxy (its login header present):
-    that login, and RESTRICTED whatever the entry says while ``remote_full_context_authorized``
-    is false. Without any proxy header and with a loopback Host: ``TRADINGBOT_REVIEW_LOCAL_IDENTITY``
-    (the owner working locally). Not listed, or anything else: refused."""
-    ident = identity_from_headers(headers, {k: v for k, v in env.items()
-                                            if k.startswith("TRADINGBOT_REVIEWER_")
-                                            and not k.endswith("ALLOWED_LOGINS")})
+    """Who this session is and what it may see, by the configured mode
+    (``vocab_recommend.request_identity``). PUBLISHED: the proxy's login, and the session is
+    proxied by configuration: RESTRICTED whatever the entry says while
+    ``remote_full_context_authorized`` is false. LOCAL: ``TRADINGBOT_REVIEW_LOCAL_IDENTITY``; any
+    proxy header refuses the request. Not listed, or anything else: refused."""
+    ident = request_identity(headers, {k: v for k, v in env.items()
+                                       if not k.endswith("ALLOWED_LOGINS")}, port)
     if ident.refused:
         raise AdjudicationError(ident.refused)
-    names = {k.casefold() for k in headers}
-    proxied = any(k.startswith("tailscale-") for k in names) or any(
-        m.casefold() in names for m in PROXY_MARKERS)
-    if ident.login:
-        login, via_proxy = ident.login, True
-    elif proxied:
-        raise AdjudicationError("PROXY_WITHOUT_IDENTITY")
-    else:
-        host = headers.get("Host", "")
-        if host not in (f"127.0.0.1:{port}", f"localhost:{port}"):
-            raise AdjudicationError("NOT_LOCAL")
-        login, via_proxy = env.get(LOCAL_IDENTITY_ENV, "").strip(), False
-    entry = reviewers.entries.get(login.casefold()) if login else None
+    entry = reviewers.entries.get(ident.login.casefold()) if ident.login else None
     if entry is None:
         raise AdjudicationError("NOT_LISTED")
-    access = entry.access if (not via_proxy or reviewers.remote_full_context_authorized) \
+    access = entry.access if (not ident.via_proxy or reviewers.remote_full_context_authorized) \
         else RESTRICTED
-    return Session(entry.login, entry.name, entry.role, access, via_proxy,
+    return Session(entry.login, entry.name, entry.role, access, ident.via_proxy,
                    reviewers.scope_sequences)
 
 
@@ -729,7 +784,10 @@ def append_annotation(base: str | Path, bundle: Bundle, session: Session, *, ite
     if not set(flags) <= set(FLAGS) or (confidence and confidence not in CONFIDENCE) or (
             phase != APPROVAL and not confidence):
         raise AdjudicationError("FLAGS_OR_CONFIDENCE")
-    if not isinstance(notes, str) or len(notes) > MAX_NOTES or _CTRL.search(notes):
+    if not isinstance(notes, str):
+        raise AdjudicationError("NOTES_TOO_LONG_OR_UNPRINTABLE")
+    notes = clean_text(notes)
+    if len(notes) > MAX_NOTES:
         raise AdjudicationError("NOTES_TOO_LONG_OR_UNPRINTABLE")
     verdicts = dict(field_verdicts or {})
     if phase == APPROVAL:
@@ -745,18 +803,22 @@ def append_annotation(base: str | Path, bundle: Bundle, session: Session, *, ite
         if phase == INDEPENDENT and (not blind or verdicts or refers_to is not None
                                      or outcome):
             raise AdjudicationError("INDEPENDENT_IS_BLIND_WITHOUT_VERDICTS")
-        rows = verdicts.get(LEVELS) if LEVELS in reading else None
+        rows = verdicts.get(LEVELS)
         flat = {f: v for f, v in verdicts.items() if f != LEVELS}
+        expected_rows = {k: NOT_READ if v.get("not_read") else None
+                         for k, v in system_rows(bundle, item).items()}
+        rows_ok = LEVELS not in reading and LEVELS not in verdicts or (
+            isinstance(rows, dict) and set(rows) == set(expected_rows) and all(
+                (rows[k] == NOT_READ) if want == NOT_READ else rows[k] in VERDICTS
+                for k, want in expected_rows.items()))
         if phase == AFTER_REVEAL and (set(flat) != compared or not set(flat.values()) <= set(
-                VERDICTS) or outcome or (LEVELS in reading and not (
-                    isinstance(rows, dict) and set(rows) == {r["row"] for r in reading[LEVELS]}
-                    and set(rows.values()) <= set(VERDICTS)))):
+                VERDICTS) or outcome or not rows_ok):
             raise AdjudicationError("VERDICT_FOR_EVERY_COMPARED_FIELD")
 
     def make(v: Verification) -> dict:
         recs, me = v.records, session.login
-        if phase == INDEPENDENT and _of(recs, item_id, bundle.bundle_id, AFTER_REVEAL, me):
-            raise AdjudicationError("SYSTEM_READING_ALREADY_SEEN")
+        if phase == INDEPENDENT and _of(recs, item_id, bundle.bundle_id, login=me):
+            raise AdjudicationError("SYSTEM_READING_ALREADY_SEEN")  # a marker or any reading
         if phase == AFTER_REVEAL:
             mine = {r["seq"] for r in _of(recs, item_id, bundle.bundle_id, INDEPENDENT, me)}
             if (refers_to in mine) != bool(blind) or (not blind and refers_to is not None):
@@ -785,6 +847,52 @@ def append_annotation(base: str | Path, bundle: Bundle, session: Session, *, ite
 # ------------------------------------------------------------------ ground truth
 
 
+def mark_system_shown(base: str | Path, bundle: Bundle, session: Session, item_id: str) -> None:
+    """Record, BEFORE the system's reading of ``item_id`` is served to a reviewer, that it was
+    (once per login and item). Raises when it cannot be recorded: the caller then does not show
+    it. Approvers write no reading, so they need no marker."""
+    if session.role != REVIEWER or item_id not in bundle.items:
+        return
+
+    def make(v: Verification) -> dict:
+        if _of(v.records, item_id, bundle.bundle_id, SYSTEM_SHOWN, session.login):
+            raise _AlreadyMarked
+        return {"at": datetime.now(UTC).isoformat(), "bundle_id": bundle.bundle_id,
+                "item_id": item_id,
+                "annotator": {"login": session.login, "name": session.name,
+                              "role": session.role, "access": session.access},
+                "phase": SYSTEM_SHOWN, "blind": False, "reading": {}, "field_verdicts": {},
+                "flags": [], "confidence": "", "notes": "", "refers_to": None,
+                "decision": None}
+
+    try:
+        append_chained(annotations_path(base), "annotation log", ANNOTATION_SCHEMA, make)
+    except _AlreadyMarked:
+        return
+    except RecommendationError as exc:
+        raise AdjudicationError(exc.code) from None
+
+
+class _AlreadyMarked(Exception):
+    pass
+
+
+def effective_approval(records: list[dict], item_id: str, bundle: Bundle) -> dict | None:
+    """The latest APPROVAL of the item, when it still refers to its reviewer's LATEST
+    AFTER_REVEAL of the item; a later revision by that reviewer returns it to PROVISIONAL."""
+    approvals = _of(records, item_id, bundle.bundle_id, APPROVAL)
+    if not approvals:
+        return None
+    last = approvals[-1]
+    after = {r["seq"]: r for r in _of(records, item_id, bundle.bundle_id, AFTER_REVEAL)}
+    reviewed = after.get(last["refers_to"])
+    if reviewed is None:
+        return None
+    by_same = [s for s, r in after.items()
+               if r["annotator"]["login"] == reviewed["annotator"]["login"]]
+    return last if max(by_same) == reviewed["seq"] else None
+
+
 def resolve(records: list[dict], bundle: Bundle) -> list[dict]:
     """Per item: the approver's accepted or amended reading; else the latest AFTER_REVEAL
     reading, PROVISIONAL; with the INDEPENDENT reading it followed (anchoring)."""
@@ -793,8 +901,7 @@ def resolve(records: list[dict], bundle: Bundle) -> list[dict]:
         after = {r["seq"]: r for r in _of(records, item_id, bundle.bundle_id, AFTER_REVEAL)}
         if not after:
             continue
-        approvals = _of(records, item_id, bundle.bundle_id, APPROVAL)
-        last = approvals[-1] if approvals else None
+        last = effective_approval(records, item_id, bundle)
         if last is not None and _outcome(last) in ("ACCEPT", "AMEND"):
             source, status = after[last["refers_to"]], ("APPROVED" if _outcome(last) ==
                                                           "ACCEPT" else "AMENDED")
@@ -840,7 +947,10 @@ def _sha(data: bytes) -> str:
 def freeze(base: str | Path, now: datetime | None = None) -> tuple[Path, dict]:
     """Write the next ``versions/ground_truth_v<N>.jsonl`` and its manifest (never overwrites)."""
     base = Path(base).expanduser()
+    check_folders(base, media=True)
     bundle = load_bundle(base / "bundle", RESTRICTED)
+    if bundle_digest(base / "bundle") != bundle.bundle_id:  # the owner's tool reads every file
+        raise AdjudicationError("BUNDLE_ID_MISMATCH")
     log = read_annotations(base)
     if not log.ok:
         raise AdjudicationError("ANNOTATION_LOG_FAILS_VERIFICATION")
@@ -898,10 +1008,10 @@ def progress(bundle: Bundle, records: list[dict], session: Session) -> Progress:
             s = "DONE" if AFTER_REVEAL in phases else "INDEPENDENT_SAVED" if (
                 INDEPENDENT in phases) else "OPEN"
         else:
-            appr = _of(records, item_id, bundle.bundle_id, APPROVAL)
+            appr = effective_approval(records, item_id, bundle)
             s = ("NOT_REVIEWED" if not _of(records, item_id, bundle.bundle_id, AFTER_REVEAL)
-                 else "AWAITING" if not appr else "RETURNED"
-                 if _outcome(appr[-1]) == "RETURN" else "DECIDED")
+                 else "AWAITING" if appr is None else "RETURNED"
+                 if _outcome(appr) == "RETURN" else "DECIDED")
         p.status[item_id] = s
         p.done += s in ("DONE", "DECIDED")
     scoped = [(sid, items) for sid, items in ordered(bundle, session.scope) if sid is not None]

@@ -9,9 +9,11 @@ page. No file browser, upload, download or path input; no lexicon, config, broke
 Every value from the export is shown as plain text (``st.text``), never Markdown or HTML, and no
 error shows a path or a traceback.
 
-Identity comes only from the proxy's request header (default ``Tailscale-User-Login``). Without
-one the page is a read-only preview; with ``TRADINGBOT_REVIEWER_ALLOWED_LOGINS`` set, any other
-login (or none) sees only "Not authorized".
+Identity by the configured mode (``vocab_recommend.request_identity``): PUBLISHED, only from
+the proxy's request header (default ``Tailscale-User-Login``); LOCAL, from
+``TRADINGBOT_REVIEW_LOCAL_IDENTITY`` and any proxy header is refused. Without an identity the page
+is a read-only preview; with ``TRADINGBOT_REVIEWER_ALLOWED_LOGINS`` set, any other login (or none)
+sees only "Not authorized".
 """
 
 from __future__ import annotations
@@ -26,11 +28,6 @@ from tradingbot.runtime import vocab_recommend as R
 VERDICT_LABELS = {"ACCEPT": "recommend accept", "REJECT": "recommend reject (not now)",
                   "KEEP_HOLDING": "recommend keep holding", R.NEEDS_CONTEXT: "needs context"}
 GROUP_LABELS = {g: R.GROUPS[g] for g in R.LIST_GROUPS}
-# Cross-origin and cross-site protection stay on (a page the reviewer visits must not drive this
-# one with the reviewer's proxy identity); no agent API and no static file serving.
-SAFE_OPTIONS = {"server.enableCORS": True, "server.enableXsrfProtection": True,
-                "server.enableAgentApi": False, "server.enableStaticServing": False}
-
 
 def _refuse(message: str) -> None:
     st.error(message)
@@ -81,16 +78,10 @@ def _proposal(n: int, row: dict, families: list[str], who: R.Identity, mine: dic
 
 def main() -> None:
     st.set_page_config(page_title="Vocabulary reviewer", layout="wide")
-    if st.get_option("server.address") != "127.0.0.1":
-        _refuse("Refusing to run: this server is not bound to 127.0.0.1. Start it with "
-                "--server.address 127.0.0.1 behind the identity-aware proxy.")
-    if st.get_option("browser.gatherUsageStats"):
-        _refuse("Refusing to run while Streamlit usage statistics are on. Start it with "
-                "--browser.gatherUsageStats false.")
-    for option, safe in SAFE_OPTIONS.items():
-        if st.get_option(option) != safe:
-            _refuse(f"Refusing to run with {option} = {not safe} (it must be {safe}).")
-    who = R.identity_from_headers(st.context.headers, os.environ)
+    problem = R.server_problem(st.get_option, os.environ)
+    if problem:
+        _refuse(f"Refusing to run: {problem}.")
+    who = R.request_identity(st.context.headers, os.environ, st.get_option("server.port"))
     if who.refused:
         _refuse("Not authorized.")
     st.title("Vocabulary reviewer")
@@ -112,10 +103,10 @@ def main() -> None:
                  "the owner checks it.")
         can_submit = False
     if who.login is None:
-        st.info("Preview only: no reviewer identity from the access proxy, so submissions are "
-                "disabled.")
+        st.info("Preview only: no reviewer identity, so submissions are disabled.")
     else:
-        st.text(f"Reviewer (from the access proxy): {who.login}"
+        st.text(f"Reviewer ({'from the access proxy' if who.via_proxy else 'local'}): "
+                f"{who.login}"
                 + (f" ({who.name})" if who.name else ""))
     st.info("You recommend a classification for each proposed word. Your recommendations are "
             "advice: they change nothing. The owner reviews them and decides the final batch.")

@@ -11,9 +11,11 @@ import subprocess
 import sys
 from pathlib import Path
 
+import _review_modes as modes
 import pytest
 import test_vocab_review_page as owner
-from streamlit.runtime.context import ContextProxy, StreamlitHeaders
+from _review_modes import published, with_headers
+from streamlit.runtime.context import StreamlitHeaders
 from streamlit.testing.v1 import AppTest
 from test_vocab_review_page import confirm, ids, page, plain, proposals, shown, words
 
@@ -22,8 +24,8 @@ from tradingbot.runtime import vocab_review as V
 
 REPO = Path(__file__).resolve().parents[1]
 APP = REPO / "dashboard" / "reviewer" / "reviewer_app.py"
-RIA = "ria@example.invalid"
-local, held = owner.local, owner.held  # the owner page's fixtures
+RIA = "reviewer@example.invalid"
+held, local = owner.held, modes.local  # fixtures
 SECRET_SENTENCE = "The zubrowka vexels glint near ninety-two"
 
 
@@ -46,15 +48,13 @@ def export(tmp_path) -> Path:
     return path
 
 
-def with_headers(monkeypatch, **headers):
-    monkeypatch.setattr(ContextProxy, "headers",
-                        property(lambda self: StreamlitHeaders(list(headers.items()))))
-
-
 def reviewer(monkeypatch, export: Path, **headers) -> AppTest:
+    """The page; with a proxy identity header, in PUBLISHED mode (LOCAL mode refuses one)."""
     monkeypatch.setenv(R.EXPORT_ENV, str(export))
     for k in (R.ALLOWED_ENV, R.IDENTITY_ENV, R.LOGIN_HEADER_ENV, R.NAME_HEADER_ENV):
         monkeypatch.delenv(k, raising=False)
+    if headers:
+        published(monkeypatch)
     with_headers(monkeypatch, **headers)
     at = AppTest.from_file(str(APP), default_timeout=60)
     at.run()
@@ -115,7 +115,11 @@ def test_the_reviewer_page_imports_no_service_mapping_execution_broker_or_storag
 import sys
 from streamlit import config as c
 from streamlit.testing.v1 import AppTest
+from streamlit.runtime.context import ContextProxy, StreamlitHeaders
 c.set_option("server.address", "127.0.0.1"); c.set_option("browser.gatherUsageStats", False)
+c.set_option("client.showErrorDetails", "none")
+port = c.get_option("server.port")
+ContextProxy.headers = property(lambda s: StreamlitHeaders([("Host", f"127.0.0.1:{{port}}")]))
 at = AppTest.from_file({str(APP)!r}, default_timeout=60); at.run()
 assert not at.exception and "plinkish" in "".join(str(t.value) for t in at.text)
 print(sorted(m for m in sys.modules if m.startswith({FORBIDDEN!r})))
@@ -151,6 +155,7 @@ def test_without_an_identity_header_it_is_a_read_only_preview(monkeypatch, local
 
 def test_a_login_outside_the_allow_list_sees_only_not_authorized(monkeypatch, local, export):
     monkeypatch.setenv(R.ALLOWED_ENV, RIA)
+    published(monkeypatch)
     for headers in ({"Tailscale-User-Login": "mallory@example.invalid"}, {}):
         with_headers(monkeypatch, **headers)
         at = AppTest.from_file(str(APP), default_timeout=60)
@@ -194,16 +199,16 @@ def test_a_submit_writes_exactly_one_chained_line_and_a_later_one_supersedes(
     pid = R.read_export(export)[0]["id"]
     before = tree(export.parent)
     at = reviewer(monkeypatch, export, **{"Tailscale-User-Login": RIA,
-                                          "Tailscale-User-Name": "Ria Invented"})
+                                          "Tailscale-User-Name": "Reviewer Example"})
     at = submit(at, pid, "ACCEPT", group=V.MARKET_NAME, family="TLT", note="looks like a nick")
     assert "Recorded as line 1" in shown(at)
     log = R.recommendations_path(export)
-    assert set(tree(export.parent)) == set(before) | {log.name}  # nothing else written
+    assert set(tree(export.parent)) == set(before) | {log.name, R.head_path(log).name}
     assert log.stat().st_mode & 0o777 == 0o600
     [line] = log.read_text().splitlines()
     rec = json.loads(line)
     assert rec["seq"] == 1 and rec["prev_sha256"] == R.GENESIS and rec["proposal_id"] == pid
-    assert rec["reviewer"] == {"login": RIA, "name": "Ria Invented"} and rec["token"] == "vexels"
+    assert rec["reviewer"] == {"login": RIA, "name": "Reviewer Example"} and rec["token"] == "vexels"
     assert rec["recommendation"] == {"verdict": "ACCEPT", "group": V.MARKET_NAME,
                                      "family": "TLT"} and rec["note"] == "looks like a nick"
     at = submit(at, pid, R.NEEDS_CONTEXT)
@@ -301,14 +306,14 @@ def test_the_owner_page_shows_the_latest_recommendation_and_records_it_on_apply(
     pid = ids(log, lex)
     rows = R.read_export(export)
     rlog = R.recommendations_path(export)
-    R.append_recommendation(rlog, rows, login=RIA, name="Ria", proposal=pid["alphaword"],
+    R.append_recommendation(rlog, rows, login=RIA, name="Reviewer Example", proposal=pid["alphaword"],
                             verdict="REJECT", note="first thought")
-    R.append_recommendation(rlog, rows, login=RIA, name="Ria", proposal=pid["alphaword"],
+    R.append_recommendation(rlog, rows, login=RIA, name="Reviewer Example", proposal=pid["alphaword"],
                             verdict="ACCEPT", group=V.NON_MARKET, note="a filler word")
     monkeypatch.setenv(R.EXPORT_ENV, str(export))
     at = page(monkeypatch, cfg)
     text = plain(at)
-    assert f"Reviewer {RIA} (Ria) recommends ACCEPT into" in text and "a filler word" in text
+    assert f"Reviewer {RIA} (Reviewer Example) recommends ACCEPT into" in text and "a filler word" in text
     assert "first thought" not in text and "a filler word" not in "".join(
         str(e.value) for e in at.markdown)
     assert all(r.value == V.PENDING for r in at.radio)  # never pre-selected
@@ -342,7 +347,7 @@ def test_the_reviewer_page_refuses_unsafe_server_options(monkeypatch, local, exp
         text = shown(reviewer(monkeypatch, export, **{"Tailscale-User-Login": RIA}))
     finally:
         st_config.set_option(option, saved)
-    assert f"Refusing to run with {option}" in text and "vexels" not in text
+    assert f"Refusing to run: {option}" in text and "vexels" not in text
 
 
 def test_the_export_command_writes_the_owner_pages_proposals_and_refuses_the_repo(
@@ -362,3 +367,34 @@ def test_the_export_command_writes_the_owner_pages_proposals_and_refuses_the_rep
     assert "alphaword" not in capsys.readouterr().out
     assert cli.main(["--out", str(REPO / "x-export.json"), "--config", str(cfg)]) == 2
     assert not (REPO / "x-export.json").exists()
+
+
+def test_the_vocabulary_page_follows_the_modes(monkeypatch, local, export):
+    monkeypatch.setenv(R.EXPORT_ENV, str(export))
+    with_headers(monkeypatch, **{"Tailscale-User-Login": RIA})  # LOCAL mode: refused outright
+    at = AppTest.from_file(str(APP), default_timeout=60)
+    at.run()
+    assert [e.value for e in at.error] == ["Not authorized."]
+    monkeypatch.setenv(R.LOCAL_IDENTITY_ENV, RIA)  # LOCAL mode: the owner's local identity
+    with_headers(monkeypatch)
+    at = AppTest.from_file(str(APP), default_timeout=60)
+    at.run()
+    assert f"Reviewer (local): {RIA}" in "".join(str(t.value) for t in at.text)
+    pid = R.read_export(export)[0]["id"]
+    at = submit(at, pid, "REJECT", note="first\nsecond \u202ethird")
+    [line] = R.recommendations_path(export).read_text().splitlines()
+    assert json.loads(line)["note"] == "first second third"
+    published(monkeypatch)  # PUBLISHED mode with a local identity: refuses to start
+    monkeypatch.setenv(R.LOCAL_IDENTITY_ENV, RIA)
+    at = AppTest.from_file(str(APP), default_timeout=60)
+    at.run()
+    assert R.LOCAL_IDENTITY_ENV in "".join(str(e.value) for e in at.error)
+
+
+def test_an_edit_of_the_last_recommendation_is_detected(export):
+    log, rows = R.recommendations_path(export), R.read_export(export)
+    for v in ("REJECT", "KEEP_HOLDING"):
+        R.append_recommendation(log, rows, login=RIA, name="", proposal=rows[1]["id"], verdict=v)
+    lines = log.read_bytes().splitlines(keepends=True)
+    log.write_bytes(lines[0] + lines[1].replace(b"KEEP_HOLDING", b"REJECT"))
+    assert R.verify_log(log).problem.startswith("HEAD_MISMATCH")

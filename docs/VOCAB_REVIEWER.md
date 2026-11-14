@@ -26,26 +26,37 @@ identity-aware proxy is **the owner's separate decision**.
   `ibkr`, `ibkr_orders`, storage or validator modules: tested in a subprocess). Errors show a
   constant, never a path or a traceback.
 * It refuses to run unless bound to `127.0.0.1`, with usage statistics off, CORS and XSRF
-  protection on, the Streamlit agent API off and static file serving off.
+  protection on, the Streamlit agent API off, static file serving off and
+  `client.showErrorDetails = "none"`, and no `*` in `server.allowedHosts` or
+  `server.corsAllowedOrigins`.
 
-## Identity
+## Modes and identity
 
-Only from the identity-aware proxy's request header (`st.context.headers`): login header
-`TRADINGBOT_REVIEWER_LOGIN_HEADER` (default `Tailscale-User-Login`), name header
-`TRADINGBOT_REVIEWER_NAME_HEADER` (default `Tailscale-User-Name`). A header sent twice is refused.
+The same two modes as the adjudication workspace
+([ADJUDICATION_WORKSPACE.md](ADJUDICATION_WORKSPACE.md), "Modes and identity"), configured, never
+guessed from headers:
 
-* No login header: a read-only preview ("submissions are disabled").
-* `TRADINGBOT_REVIEWER_ALLOWED_LOGINS=ria@example.com[,...]`: any other login, and a request
-  without a login, sees only "Not authorized". **Set it** when the page is published.
-* `TRADINGBOT_REVIEWER_IDENTITY` other than `tailscale` refuses everyone. It is the seam for a
-  Cloudflare Access variant, which would validate the signed `Cf-Access-Jwt-Assertion` token
-  (signature, audience, issuer, expiry) in `vocab_recommend.identity_from_headers`: not
-  implemented.
+* **LOCAL** (default): identity from `TRADINGBOT_REVIEW_LOCAL_IDENTITY` (none: a read-only
+  preview, "submissions are disabled"). A request with any forwarding, proxy or identity header
+  is refused outright; `Host` and `Origin` must be this server's own loopback address and port.
+* **PUBLISHED** (`TRADINGBOT_REVIEW_PUBLISHED_HOST=<host>`): identity only from the proxy's login
+  header `TRADINGBOT_REVIEWER_LOGIN_HEADER` (default `Tailscale-User-Login`; name header
+  `TRADINGBOT_REVIEWER_NAME_HEADER`, default `Tailscale-User-Name`); a request without it is not
+  authorized. `Host` and `Origin` must be exactly `<host>` and `https://<host>`. It refuses to
+  start with `TRADINGBOT_REVIEW_LOCAL_IDENTITY` set, or without `--server.allowedHosts <host>` and
+  `--server.corsAllowedOrigins https://<host>`.
 
-The header is trusted because only the proxy reaches the page. Anyone who can connect to
-`127.0.0.1:8502` directly (another account on this Mac, a local process) can send any header:
-run it on a machine (or account) only the owner uses. Use Tailscale **Serve** (tailnet only, sets
-the identity headers), never **Funnel** (public, no identity).
+A header sent twice is refused. `TRADINGBOT_REVIEWER_ALLOWED_LOGINS=reviewer@example.com[,...]`:
+any other login, and a request without a login, sees only "Not authorized"; **set it** when the
+page is published. `TRADINGBOT_REVIEWER_IDENTITY` other than `tailscale` refuses everyone: the
+seam for a Cloudflare Access variant, which would validate the signed `Cf-Access-Jwt-Assertion`
+token (signature, audience, issuer, expiry) in `vocab_recommend.identity_from_headers`, not
+implemented.
+
+The header is trusted because only the proxy reaches the page. Anyone who can connect to the port
+directly (another account on this Mac, a local process) can send any header: run it on a machine
+(or account) only the owner uses. Use Tailscale **Serve** (tailnet only, sets the identity
+headers), never **Funnel** (public, no identity).
 
 ## Commands (owner, locally)
 
@@ -56,10 +67,18 @@ export TRADINGBOT_VOCAB_REVIEWER_EXPORT="$HOME/tradingbot-reviewer/export.json" 
 # 1. Export the proposals the owner page shows (same runtime config and proposals file):
 python scripts/vocab_reviewer_export.py            # or --out PATH; prints counts and paths only
 
-# 2. Start the reviewer page (loopback only):
-TRADINGBOT_REVIEWER_ALLOWED_LOGINS="ria@example.com" \
+# 2. Start the reviewer page, LOCAL mode:
+TRADINGBOT_REVIEW_LOCAL_IDENTITY="reviewer@example.com" \
 streamlit run dashboard/reviewer/reviewer_app.py --server.address 127.0.0.1 \
-  --server.port 8502 --browser.gatherUsageStats false --server.headless true
+  --server.port 8502 --browser.gatherUsageStats false --server.headless true \
+  --client.showErrorDetails none
+#    or PUBLISHED mode (behind Tailscale Serve; the owner's separate decision):
+TRADINGBOT_REVIEW_PUBLISHED_HOST=reviewer.<tailnet>.ts.net \
+TRADINGBOT_REVIEWER_ALLOWED_LOGINS="reviewer@example.com" \
+streamlit run dashboard/reviewer/reviewer_app.py --server.address 127.0.0.1 \
+  --server.port 8502 --browser.gatherUsageStats false --server.headless true \
+  --client.showErrorDetails none --server.allowedHosts reviewer.<tailnet>.ts.net \
+  --server.corsAllowedOrigins https://reviewer.<tailnet>.ts.net
 
 # 3. Stop it: Ctrl-C in that terminal (or kill the process listening on 127.0.0.1:8502).
 
@@ -79,10 +98,13 @@ recommendation whose proposal id no longer matches is simply not shown on the ow
 per submit: `seq`, UTC `at`, `reviewer` (`login`, `name`), `proposal_id`, `token` (from the
 export, never from the request), `recommendation` (`verdict`, `group`, `family`), `note` and
 `prev_sha256` (the sha256 of the previous line's bytes; 64 zeros for the first). `verify_log`
-checks the schema, the sequence and the chain: an edited or removed line is reported (for example
-`CHAIN_BROKEN at line 2`). A log that fails verification blocks new submits and is not shown to
-the owner. Removing the LAST lines leaves a valid shorter chain; the owner's audit records the
-log's head (line count and last sha256) at each apply, which detects that afterwards. It is the
+checks the schema, the sequence and the chain (an edit of line n is reported at line n+1, for
+example `CHAIN_BROKEN at line 2`), and the head file `<log>.head` (line count and the last line's
+sha256, replaced atomically after every append), so an edit or removal of the LAST line is
+reported too (`HEAD_MISMATCH`). The chain has no key: whoever can write both files can rewrite
+them consistently. A log that fails verification blocks new submits and is not shown to the
+owner. Notes are stored and shown as one plain line (control, line-break and direction-override
+characters become spaces). It is the
 reviewer page's only write: with the log unwritable a submit fails closed and nothing else is
 written (tested).
 
@@ -105,11 +127,11 @@ The page is reached at, say, `https://reviewer.<tailnet>.ts.net` while Streamlit
   set (and strip any client-sent copy of) the identity headers on that WebSocket request: the page
   reads them from it.
 * Keep `server.enableCORS` and `server.enableXsrfProtection` **true** (the page refuses otherwise:
-  a page the reviewer visits must not drive this one with the reviewer's identity). When the
-  proxy's origin differs from the Host Streamlit sees, add it:
-  `--server.corsAllowedOrigins https://reviewer.<tailnet>.ts.net`.
-* Pin the host names: `--server.allowedHosts 127.0.0.1 --server.allowedHosts
-  reviewer.<tailnet>.ts.net` (DNS-rebinding protection).
+  a page the reviewer visits must not drive this one with the reviewer's identity). PUBLISHED
+  mode requires `--server.corsAllowedOrigins https://reviewer.<tailnet>.ts.net` and
+  `--server.allowedHosts reviewer.<tailnet>.ts.net` (DNS-rebinding protection), and the page
+  itself requires `Host` and `Origin` to be exactly that host: Streamlit alone would also accept
+  any `localhost` origin.
 
 Verified locally on 127.0.0.1 (Streamlit 1.67, no proxy): a WebSocket from a foreign origin is
 refused (403); with `server.corsAllowedOrigins` set, that origin is accepted and others still

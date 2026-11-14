@@ -20,7 +20,7 @@ import zlib
 from pathlib import Path
 
 from tradingbot.runtime import adjudication as A
-from tradingbot.runtime.vocab_review import PrivateDir
+from tradingbot.runtime.vocab_review import PrivateDir, PrivatePathError, check_private_path
 
 T0 = "2026-03-02T14:{:02d}:00+00:00"
 
@@ -169,8 +169,8 @@ def _jsonl(rows) -> bytes:
 
 
 def bundle_digest(files: dict[str, bytes]) -> str:
-    """sha256 over the sorted (relative name, sha256 of the file) of every file but the
-    manifest (the demo's reading of "sha256 over the other files")."""
+    """The specification's recipe (1.3), as ``adjudication.bundle_digest`` computes it from the
+    files: sha256 over ``<posix path>\\0<sha256 hex>\\n`` per file but the manifest, sorted."""
     lines = "".join(f"{n}\0{hashlib.sha256(d).hexdigest()}\n" for n, d in sorted(files.items()))
     return hashlib.sha256(lines.encode("utf-8")).hexdigest()
 
@@ -180,19 +180,19 @@ scope_sequences = 20
 
 [[reviewer]]
 login = "owner@example.invalid"
-name = "Owner (invented)"
+name = "Owner Example"
 role = "APPROVER"
 access = "FULL"
 
 [[reviewer]]
 login = "reviewer@example.invalid"
-name = "Ria Reviewer (invented)"
+name = "Reviewer Example"
 role = "REVIEWER"
 access = "FULL"
 
 [[reviewer]]
 login = "remote@example.invalid"
-name = "Remy Remote (invented)"
+name = "Remote Reviewer Example"
 role = "REVIEWER"
 access = "FULL"
 """
@@ -200,6 +200,11 @@ access = "FULL"
 
 def write_demo(out: str | Path) -> Path:
     out = Path(out).expanduser()
+    try:  # before anything is created: never inside this repository
+        check_private_path(out / "bundle" / "manifest.json", "demo bundle")
+        check_private_path(out / "reviewers.toml", "demo reviewers file")
+    except PrivatePathError:
+        raise SystemExit("refused: the directory lies inside this program's repository") from None
     if out.exists() and any(out.iterdir()):
         raise SystemExit("refused: the directory is not empty")
     out.mkdir(mode=0o700, parents=True, exist_ok=True)

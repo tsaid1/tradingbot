@@ -21,9 +21,8 @@ import streamlit as st
 from tradingbot.runtime import adjudication as A
 
 VOCAB_PAGE = Path(__file__).with_name("reviewer_app.py")
-SAFE_OPTIONS = {"server.enableCORS": True, "server.enableXsrfProtection": True,
-                "server.enableAgentApi": False, "server.enableStaticServing": False}
 NOT_STATED = "(not stated)"
+NOT_READ_TEXT = "not read by the system"
 
 
 def _refuse(message: str) -> None:
@@ -62,21 +61,30 @@ def _evidence(bundle: A.Bundle, item: dict) -> None:
             st.text(f"not shown ({_code(exc)})")
 
 
+def _shown(item: dict, f: str, v: str) -> str:
+    return f"(withheld: {A.WITHHELD})" if f in item.get("withheld", ()) else (v or NOT_STATED)
+
+
 def _system(bundle: A.Bundle, item: dict) -> None:
     reading = A.system_reading(bundle, item)
-    st.code("\n".join(f"{f}: {v or NOT_STATED}" for f, v in reading.items()
+    st.code("\n".join(f"{f}: {_shown(item, f, v)}" for f, v in reading.items()
                       if f not in A.NOT_COMPARED), language=None)
     if item["levels"]:
         st.code("\n".join(f"level {k} (number {'-' if lv['n'] is None else lv['n']}): "
                           f"{lv['price'] or '-'} " + " / ".join(lv[f] or "-" for f in A.LEVEL_KEYS)
                           for k, lv in enumerate(item["levels"])), language=None)
+    unread = [k for k, v in A.system_rows(bundle, item).items() if v.get("not_read")]
+    if unread:
+        st.text(f"{NOT_READ_TEXT}: " + ", ".join(f"number {k.split(':')[1]}" for k in unread))
     if item["holds"]:
         st.code("\n".join(f"holds {k}: {v['status']} {', '.join(v['reasons'])}"
                           for k, v in item["holds"].items()), language=None)
     m = item["mapping"]
     if any(v not in (None, "") for v in m.values()):
-        st.code("\n".join(f"mapping {k}: {'-' if v in (None, '') else v}" for k, v in m.items()),
-                language=None)
+        st.code("\n".join(f"mapping {k}: " + (f"(withheld: {A.WITHHELD})"
+                                               if f"mapping.{k}" in item.get("withheld", ())
+                                               else '-' if v in (None, '') else str(v))
+                          for k, v in m.items()), language=None)
 
 
 def _options(f: str, bundle: A.Bundle, item: dict) -> list[str] | None:
@@ -108,7 +116,7 @@ def _inputs(prefix: str, bundle: A.Bundle, item: dict, defaults: dict,
             reading[f] = cols[0].text_input(f"{f} (empty = not stated)", value=default,
                                             key=f"{prefix}_{f}", max_chars=A.MAX_TEXT)
         if system is not None and f not in A.NOT_COMPARED:
-            cols[1].text(f"system: {system.get(f) or NOT_STATED}")
+            cols[1].text(f"system: {_shown(item, f, system.get(f, ''))}")
             pre = A.prefill_verdicts({**system, f: reading[f]}, system, item["kind"])[f]
             tag = hashlib.sha256(reading[f].encode()).hexdigest()[:8]
             verdicts[f] = cols[2].radio(f"verdict on {f}", A.VERDICTS, horizontal=True,
@@ -146,6 +154,10 @@ def _price_table(prefix, bundle, item, rows, defaults, system) -> tuple[list, di
         levels.append(row)
         if system is not None:
             sr = sys_rows[key]
+            if sr.get("not_read"):
+                cols[4].text(f"system: {NOT_READ_TEXT}")
+                verdicts[key] = A.NOT_READ
+                continue
             cols[4].text("system: " + " / ".join(sr[f] or "-" for f in A.LEVEL_KEYS))
             pre = A.prefill_row_verdicts([row], sys_rows)[key]
             tag = hashlib.sha256("|".join(row[f] for f in A.LEVEL_KEYS).encode()).hexdigest()[:8]
@@ -193,10 +205,18 @@ def _reviewer(base, bundle, session, item, records, writable) -> None:
     blind = st.session_state.get("aw_blind", True)
     ind = _latest(records, iid, bundle, A.INDEPENDENT, me)
     after = _latest(records, iid, bundle, A.AFTER_REVEAL, me)
-    seen = st.session_state.setdefault("aw_seen_system", set())
-    revealed = ind is not None or after is not None or not blind
-    if revealed and ind is None:
-        seen.add(iid)  # the system's reading was shown before any independent reading
+    marked = _latest(records, iid, bundle, A.SYSTEM_SHOWN, me) is not None
+    revealed = ind is not None or after is not None or marked or not blind
+    if revealed and writable:
+        try:  # durable, BEFORE anything of the system's reading is served
+            A.mark_system_shown(base, bundle, session, iid)
+        except (A.AdjudicationError, OSError, A.PrivatePathError) as exc:
+            st.error(f"The system's reading cannot be shown ({_code(exc)}): the annotation log "
+                     "could not record that it was shown.")
+            revealed = False
+            writable = False
+    elif revealed:
+        revealed = False  # the log fails verification: nothing of the system is shown
     system = A.system_reading(bundle, item)
     with st.container(border=True):
         st.subheader("2. Your reading")
@@ -207,12 +227,9 @@ def _reviewer(base, bundle, session, item, records, writable) -> None:
             reading, _ = _inputs(prefix, bundle, item, {})
             flags, confidence, notes = _extras(prefix)
             if st.button("Save independent reading", key=f"{prefix}_save", type="primary"):
-                if iid in seen:
-                    st.error("Not saved: you have seen the system's reading of this item.")
-                else:
-                    _save(base, bundle, session, writable, item_id=iid, phase=A.INDEPENDENT,
-                          blind=True, reading=reading, flags=flags, confidence=confidence,
-                          notes=notes)
+                _save(base, bundle, session, writable, item_id=iid, phase=A.INDEPENDENT,
+                      blind=True, reading=reading, flags=flags, confidence=confidence,
+                      notes=notes)
         else:
             source = after or ind
             st.caption("Your reading beside the system's: correct any field on its own; each "
@@ -231,7 +248,8 @@ def _reviewer(base, bundle, session, item, records, writable) -> None:
         if revealed:
             _system(bundle, item)
         else:
-            st.caption("Hidden until you save an independent reading (blind-first).")
+            st.caption("Hidden until you save an independent reading (blind-first), or "
+                       "while the annotation log cannot record that it was shown.")
 
 
 def _describe(rec: dict) -> str:
@@ -245,7 +263,8 @@ def _describe(rec: dict) -> str:
     lines += [f"price {r['row']}: " + " / ".join(r[f] or "-" for f in A.LEVEL_KEYS)
               + (f"   [{row_verdicts[r['row']]}]" if r["row"] in row_verdicts else "")
               for r in rec["reading"].get(A.LEVELS, [])]
-    lines += [f"flags: {', '.join(rec['flags']) or '-'}", f"notes: {rec['notes'] or '-'}"]
+    lines += [f"flags: {', '.join(rec['flags']) or '-'}",
+              f"notes: {A.clean_text(str(rec['notes'] or '')) or '-'}"]
     return "\n".join(lines)
 
 
@@ -329,18 +348,23 @@ def _workspace(base: Path, bundle: A.Bundle, session: A.Session) -> None:
                       value=True, key="aw_blind")
         ids = [i["item_id"] for _, i in order]
 
-        def _next():
-            start = ids.index(st.session_state.get("aw_pick", ids[0]))
-            for iid in ids[start + 1:] + ids[:start + 1]:
-                if prog.status[iid] in ("OPEN", "INDEPENDENT_SAVED", "AWAITING", "RETURNED"):
-                    st.session_state["aw_pick"] = iid
-                    return
+        def _next():  # a callback runs outside the page's error handling: nothing may escape
+            try:
+                current = st.session_state.get("aw_pick")
+                start = ids.index(current) if current in ids else -1
+                for iid in ids[start + 1:] + ids[:start + 1]:
+                    if prog.status[iid] in ("OPEN", "INDEPENDENT_SAVED", "AWAITING",
+                                            "RETURNED"):
+                        st.session_state["aw_pick"] = iid
+                        return
+            except Exception:  # noqa: BLE001
+                st.session_state["aw_msg"] = "Could not move to the next item."
 
         st.button("Next item not yet adjudicated", on_click=_next, key="aw_next")
         pick = st.selectbox("Item (by sequence, in time order)", ids, key="aw_pick",
                             format_func=labels.get)
     item = bundle.items[pick]
-    st.subheader(labels[pick])
+    st.text(labels[pick])
     with st.container(border=True):
         st.subheader("1. Source evidence")
         _evidence(bundle, item)
@@ -350,17 +374,20 @@ def _workspace(base: Path, bundle: A.Bundle, session: A.Session) -> None:
 
 def main() -> None:
     st.set_page_config(page_title="Adjudication", layout="wide")
-    if st.get_option("server.address") != "127.0.0.1":
-        _refuse("Refusing to run: this server is not bound to 127.0.0.1.")
-    if st.get_option("browser.gatherUsageStats"):
-        _refuse("Refusing to run while Streamlit usage statistics are on.")
-    for option, safe in SAFE_OPTIONS.items():
-        if st.get_option(option) != safe:
-            _refuse(f"Refusing to run with {option} = {not safe} (it must be {safe}).")
+    problem = A.server_problem(st.get_option, os.environ)
+    if problem:
+        _refuse(f"Refusing to run: {problem}.")
     configured = os.environ.get(A.DIR_ENV)
     if not configured:
         _refuse("No adjudication material is configured.")
     base = Path(configured).expanduser()
+    published = bool(os.environ.get(A.PUBLISHED_HOST_ENV))
+    try:
+        synced = A.check_folders(base, media=False)
+    except (A.AdjudicationError, OSError) as exc:
+        _refuse(f"The adjudication folder is refused ({_code(exc)}).")
+    if synced and published:
+        _refuse(f"The adjudication folder is refused (PRIVATE_FOLDER_IN_SYNCED_FOLDER {synced}).")
     try:
         reviewers = A.load_reviewers(base / "reviewers.toml")
         session = A.resolve_session(st.context.headers, os.environ, reviewers,
@@ -368,9 +395,15 @@ def main() -> None:
     except (A.AdjudicationError, OSError, A.PrivatePathError):
         _refuse("Not authorized.")
     try:
+        if session.access == A.FULL:
+            A.check_folders(base, media=True)
         bundle = A.load_bundle(base / "bundle", session.access)
     except (A.AdjudicationError, OSError, A.PrivatePathError) as exc:
         _refuse(f"The adjudication bundle is refused ({_code(exc)}).")
+    if synced:
+        st.warning(f"PRIVATE_FOLDER_IN_SYNCED_FOLDER ({synced}): the bundle and the judgments "
+                   "are copied to that provider. Allowed locally by the owner's policy; refused "
+                   "in published mode.")
 
     def adjudication() -> None:
         _workspace(base, bundle, session)
