@@ -680,7 +680,8 @@ class FamilyMapping(StrictModel):
     # under an owner's [risk] table (with none, the cash baseline ignores them). No defaults.
     # funding: how a position in this family is paid for; must fit execution.sec_type (G1, G2).
     funding: FUNDING | None = None
-    # risk.max_risk_per_idea: the family's maximum dollar risk per idea, account currency (G4).
+    # risk = { max_risk_per_idea, max_stop_distance }: the family's maximum dollar risk per idea,
+    # account currency (G4), and the risk gate's own stop rule, "N%" (G8; see FamilyRisk).
     risk: FamilyRisk | None = None
     # margin: the owner's per-unit performance-margin figure, verified_at and max_age_days (G6).
     margin: MarginFigure | None = None
@@ -978,8 +979,28 @@ class FamilyMapping(StrictModel):
             max_stop_distance=self.max_stop_distance,
             anchor_max_quote_age_seconds=self.entry_anchor.max_quote_age_seconds
             if self.entry_anchor else None,
+            funding=self.funding,
+            max_risk_per_idea=self.risk.max_risk_per_idea if self.risk else None,
+            risk_max_stop_distance=self.risk.max_stop_distance if self.risk else None,
+            margin_initial=self.margin.initial if self.margin else None,
+            margin_maintenance=self.margin.maintenance if self.margin else None,
+            margin_verified_at=self.margin.verified_at if self.margin else None,
+            margin_max_age_days=self.margin.max_age_days if self.margin else None,
+            entry_collar=self.entry_collar,
+            multiplier_stated=self.risk_terms().multiplier,
             problems=out,
         )
+
+    def unset_risk_fields(self) -> set[str]:
+        """The risk-gate fields this entry does not state (left out of a recorded copy, so an
+        entry without them is recorded exactly as before they existed)."""
+        return {k for k in ("funding", "risk", "margin", "entry_collar")
+                if getattr(self, k) is None}
+
+    def risk_terms(self):
+        """The family's risk terms (tradingbot.risk.FamilyRiskTerms)."""
+        from tradingbot.risk.policy import FamilyRiskTerms
+        return FamilyRiskTerms.of(self)
 
     # ---------------------------------------------------------------- selection
 

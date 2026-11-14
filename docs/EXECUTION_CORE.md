@@ -195,6 +195,21 @@ produces conditional exits (`OrderIntent.condition`) and an optional backstop (r
 ref `<entry>.BKS`). A follow-up executes only in its idea's own contract. See
 `docs/MULTI_ASSET_MAPPING.md`.
 
+## Risk gates
+
+Every entry and add passes the nine independent risk gates of `tradingbot.risk`
+(`docs/RISK_GATES.md`) at the last check before it is sent (`_entry_checks`, also on a resend),
+with the limit actually sent, the stop held in the execution series, the resolved contract's
+multiplier, the ledger and broker positions, working entries, the broker's account values
+(`AccountValues.account_values()`, additive; the simulated broker computes its own account from
+its fills, positions, quotes and the owner's margin figures; the shadow broker returns the
+simulation's) and the broker's environment declaration. All nine always run; a refusal lists
+`RISK_GATES_FAILED` and every failing gate's codes, added to any cap refusal of the same check.
+Each evaluation is journalled as `RISK_GATES` (numbers and codes only, including economic
+leverage, borrowing and performance margin). Exits, reductions and protective amendments never
+pass through the risk gates. With no `[risk]` table the cash baseline applies: the portfolio is
+not built and no extra quote or position is read, so the call trace is unchanged.
+
 ## Exit netting
 
 The broker's reduce-only flag is never relied on. Before a REDUCE or CLOSE is sent:

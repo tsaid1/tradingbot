@@ -65,7 +65,8 @@ def test_a_stop_four_point_nine_percent_below_trades_under_the_default_collar():
 
 
 def test_a_sell_limit_is_never_below_the_stated_entry(tmp_path):
-    h = Harness(tmp_path)  # quote 49.98 / 50.02, 1 % collar
+    # A short sale needs an owner's [risk] table: an INVENTED one (docs/RISK_GATES.md).
+    h = Harness(tmp_path, risk_families=((SYMBOL, "STK", "1"),))  # 49.98 / 50.02, 1 % collar
     out = h.execute("p1", open_action(entry="50.01", stop="52", target="45",
                                       side=PositionSide.SHORT))
     [entry] = [o for o in h.broker.all_orders() if o.order_ref == out.order_ref]

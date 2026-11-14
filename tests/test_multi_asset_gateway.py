@@ -9,6 +9,7 @@ from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
 import pytest
+from _risk_fixture import INVENTED_RISK, market_terms_fields
 
 from tradingbot.event_models import PriceBasis, Timing, TradeAction
 from tradingbot.models import (
@@ -26,7 +27,8 @@ from tradingbot.models import (
 from tradingbot.validator import business_days_until, fill_quantity, gate_action
 
 NOW = datetime(2026, 6, 1, 14, 0, tzinfo=UTC)  # Monday
-POLICY = MockPolicy(max_notional_usd=Decimal(100000))
+# Futures need an owner's [risk] table (docs/RISK_GATES.md): an INVENTED, deliberately wide one.
+POLICY = MockPolicy(max_notional_usd=Decimal(100000), risk=INVENTED_RISK)
 FUT = Instrument(asset_class=AssetClass.FUTURE, symbol="QXF", exchange="SIMX",
                  futures_contract="202609")
 KEY = FUT.quote_key
@@ -49,6 +51,7 @@ def terms(basis="DIRECT", **kw) -> MarketTerms:
             "max_abs_basis": Decimal(40), "max_basis_age_seconds": 5,
         })
     base.update(kw)
+    base = {**market_terms_fields(base["asset_class"], base["multiplier"]), **base}
     return MarketTerms(**base)
 
 

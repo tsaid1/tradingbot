@@ -49,6 +49,8 @@ def harness(tmp_path, **policy) -> Harness:
             max_instrument_exposure_usd=Decimal(policy.get("instrument", 6000)),
             max_aggregate_exposure_usd=Decimal(policy.get("aggregate", 20000)),
         ),
+        # Futures and short sales need an owner's [risk] table: an INVENTED one (docs/RISK_GATES.md).
+        risk_families=((FUT, "FUT", "50"), ("ZZQ", "STK", "1"), (FUT, "STK", "1")),
     )
     for c in (MAR, JUN):
         h.broker.register_contract(c)

@@ -501,6 +501,8 @@ def g8_family_rules(c: _Ctx) -> GateResult:
 
 
 def g9_environment(c: _Ctx) -> GateResult:
+    if c.stage == "GATEWAY":
+        return _not_evaluated("G9")  # the broker's declaration is read by the execution core
     env = c.environment
     label = env or "UNDECLARED"
     if c.policy is None:

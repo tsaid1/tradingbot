@@ -15,6 +15,7 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
+from _risk_fixture import toml_fields
 from test_multi_asset_gateway import NOW, act, gate, leg, mq, position, terms
 
 from tradingbot.event_models import ParsedPost, PriceBasis, Timing, TradeAction
@@ -703,6 +704,7 @@ def service_mapping(*, rule=True, adverse="0.2%", front=True, oil_contracts=None
                     scope="SENTENCE_STRICT") -> str:
     anchor = RULE_TOML.format(adverse=adverse, scope=scope) if rule else ""
     oil = oil_contracts or 'contracts = [ { month = "202607", roll_date = 2026-07-06 } ]'
+    risk = toml_fields("FUT")  # INVENTED risk-gate fields (docs/RISK_GATES.md)
     return f"""
 version = 2
 
@@ -719,6 +721,7 @@ sizing = {{ units_per_signal = 2, max_units = 4, max_notional = "60000" }}
 roll = {{ business_days_before = 3, action = "FLATTEN" }}
 reference_trigger = {{ released_order_type = "MKT", reference_hours = ["13:30-20:00"], require_backstop = true }}
 basis_shift = {{ max_abs_basis = "40", max_age_seconds = 5, scale_ratio = "1" }}
+{risk}
 {anchor}
 
 [[mapping]]
@@ -730,6 +733,7 @@ execution = {{ sec_type = "FUT", symbol = "QOF", exchange = "SIMNRG", currency =
 contract_selection = {{ rule = "EXPLICIT_ONLY", min_business_days_to_roll = 6 }}
 {oil}
 sizing = {{ units_per_signal = 2, max_units = 4, max_notional = "5000" }}
+{risk}
 {SESSION}
 roll = {{ business_days_before = 3, action = "FLATTEN" }}
 {anchor}

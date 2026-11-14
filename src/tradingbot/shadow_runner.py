@@ -88,6 +88,8 @@ def policy_digest(policy: MockPolicy) -> str:
     """Digest of the mock policy. ``allowed_symbols`` is a frozenset, whose JSON order would follow
     the per-process hash seed, so it is sorted first."""
     data = policy.model_dump(mode="json")
+    if data.get("risk") is None:
+        data.pop("risk", None)  # the cash baseline: the digest is the one recorded before
     if data.get("allowed_symbols") is not None:
         data["allowed_symbols"] = sorted(data["allowed_symbols"])
     return canonical_digest(data)

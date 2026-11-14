@@ -14,6 +14,8 @@ from decimal import Decimal, InvalidOperation
 from typing import Literal
 
 from pydantic import (
+    BaseModel,
+    ConfigDict,
     Field,
     StrictBool,
     StrictFloat,
@@ -24,7 +26,16 @@ from pydantic import (
     model_validator,
 )
 
-from tradingbot.models import StrictModel
+
+class StrictModel(BaseModel):
+    """Unknown keys refuse (as tradingbot.models.StrictModel; defined here so models can import
+    this module without a cycle)."""
+    model_config = ConfigDict(extra="forbid")
+
+
+# Security type of a MarketTerms asset class (the gateway has the class, not the IBKR secType).
+SEC_TYPE_OF_ASSET = {"EQUITY": "STK", "ETF": "STK", "FUTURE": "FUT", "OPTION": "OPT",
+                     "CFD": "CFD", "COMMODITY": "CMDTY", "INDEX": "IND"}
 
 # "<decimal>" (account currency, or the instrument's own price units for a collar) or
 # "<decimal>%" (of effective equity, or of the entry).
@@ -143,8 +154,19 @@ class RiskPolicy(StrictModel):
 # ----------------------------------------------------------------------------- family fields
 
 class FamilyRisk(StrictModel):
-    """A family's own risk limits (G4)."""
+    """A family's own risk limits: G4, and G8's stop rule. ``max_stop_distance`` here is the risk
+    gate's own stop rule ("N%": the farthest the publisher's stop may be from the entry), stated
+    per family and never inherited. It is separate from the family-level ``max_stop_distance`` of
+    the entry rule (ceiling 10%, which also turns on the entry rule's strict text checks); when a
+    family states both, both apply."""
     max_risk_per_idea: Decimal = Field(**_POS)  # account currency, per idea
+    max_stop_distance: StrictStr = Field(pattern=r"^\d+(?:\.\d+)?%$")
+
+    @model_validator(mode="after")
+    def _pct(self):
+        if parse_amount_or_pct(self.max_stop_distance) is None:
+            raise ValueError("risk.max_stop_distance must be a percentage above 0 and at most 100")
+        return self
 
 
 class MarginFigure(StrictModel):
@@ -190,7 +212,7 @@ class FamilyRiskTerms:
     funding: str | None = None
     max_risk_per_idea: Decimal | None = None
     margin: MarginFigure | None = None
-    max_stop_distance: str | None = None
+    max_stop_distance: str | None = None  # the family's risk.max_stop_distance (G8)
     entry_collar: str | None = None
     multiplier: Decimal | None = None  # as stated in the family entry
 
@@ -206,5 +228,20 @@ class FamilyRiskTerms:
         return cls(family=entry.family, sec_type=x.sec_type if x else "UNKNOWN",
                    funding=entry.funding,
                    max_risk_per_idea=entry.risk.max_risk_per_idea if entry.risk else None,
-                   margin=entry.margin, max_stop_distance=entry.max_stop_distance,
+                   margin=entry.margin,
+                   max_stop_distance=entry.risk.max_stop_distance if entry.risk else None,
                    entry_collar=entry.entry_collar, multiplier=stated_mult)
+
+    @classmethod
+    def of_terms(cls, t) -> FamilyRiskTerms:
+        """From a gateway ``MarketTerms`` (the family's risk fields as frozen for one decision)."""
+        margin = None
+        if t.margin_initial is not None:
+            margin = MarginFigure.model_construct(
+                initial=t.margin_initial, maintenance=t.margin_maintenance, currency="USD",
+                verified_at=t.margin_verified_at, max_age_days=t.margin_max_age_days)
+        asset = getattr(t.asset_class, "value", t.asset_class)
+        return cls(family=t.family, sec_type=SEC_TYPE_OF_ASSET.get(asset, asset),
+                   funding=t.funding, max_risk_per_idea=t.max_risk_per_idea, margin=margin,
+                   max_stop_distance=t.risk_max_stop_distance, entry_collar=t.entry_collar,
+                   multiplier=t.multiplier_stated)

@@ -354,7 +354,10 @@ ETF_ENTRY = {
     {"funding": "CASH", "margin": {"initial": "1", "maintenance": "1", "currency": "USD",
                                    "verified_at": date(2026, 1, 1), "max_age_days": 1}},
     {"entry_collar": "0%"}, {"entry_collar": "-1"}, {"entry_collar": "x"},
-    {"risk": {"max_risk_per_idea": "0"}}, {"risk": {}}, {"funding": "LEVERAGE"},
+    {"risk": {"max_risk_per_idea": "0", "max_stop_distance": "5%"}}, {"risk": {}},
+    {"risk": {"max_risk_per_idea": "1"}}, {"risk": {"max_risk_per_idea": "1",
+                                                    "max_stop_distance": "0%"}},
+    {"risk": {"max_risk_per_idea": "1", "max_stop_distance": "101%"}}, {"funding": "LEVERAGE"},
 ])
 def test_family_risk_fields_refuse_when_inconsistent(extra):
     with pytest.raises(ValueError):
@@ -362,20 +365,20 @@ def test_family_risk_fields_refuse_when_inconsistent(extra):
 
 
 def test_family_fields_parse_and_terms_are_the_familys_own():
-    tlt = FamilyMapping.model_validate({**ETF_ENTRY, "family": "QETF", "max_stop_distance": "5%",
-                                        "funding": "CASH", "entry_collar": "0.3%",
-                                        "risk": {"max_risk_per_idea": "7"}})
+    tlt = FamilyMapping.model_validate({**ETF_ENTRY, "family": "QETF", "funding": "CASH",
+                                        "entry_collar": "0.3%", "max_stop_distance": "5%",
+                                        "risk": {"max_risk_per_idea": "7",
+                                                 "max_stop_distance": "5%"}})
     other = FamilyMapping.model_validate({
         **ETF_ENTRY, "family": "QOTH",
         "reference": {**ETF_ENTRY["reference"], "symbol": "QOTH"},
-        "execution": {**ETF_ENTRY["execution"], "symbol": "QOTH"}, "funding": "CASH",
-        "risk": {"max_risk_per_idea": "7"}})
+        "execution": {**ETF_ENTRY["execution"], "symbol": "QOTH"}, "funding": "CASH"})
     t1, t2 = FamilyRiskTerms.of(tlt), FamilyRiskTerms.of(other)
     assert (t1.max_stop_distance, t1.entry_collar) == ("5%", "0.3%")
     assert (t2.max_stop_distance, t2.entry_collar) == (None, None)  # never inherited
     r = evaluate(POLICY, t2, etf(units=1), account=account(), portfolio=[], environment="SIM",
                  now=NOW)
-    only(r, "G8", G.STOP_RULE_MISSING)
+    assert G.STOP_RULE_MISSING in gate(r, "G8").codes and G.PRICE_RULE_MISSING in gate(r, "G8").codes
     assert "5%" not in repr(r) and "0.3" not in repr(gate(r, "G8"))
 
 

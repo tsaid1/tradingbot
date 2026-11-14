@@ -21,6 +21,7 @@ from typing import Literal, Protocol, runtime_checkable
 from pydantic import ConfigDict, Field, model_validator
 
 from tradingbot.models import AssetClass, Instrument, StrictModel
+from tradingbot.risk.gates import AccountSnapshot
 
 
 class QuoteQuality(str, Enum):
@@ -353,6 +354,26 @@ def broker_environment(broker) -> BrokerEnvironment | None:
         return BrokerEnvironment(getattr(value, "value", value))
     except Exception:  # noqa: BLE001 - review S3: any failure to declare is "undeclared"
         return None
+
+
+class AccountValues(Protocol):
+    """Additive (tradingbot.risk): the account values the risk gates read. Kept out of ``Broker``
+    so an adapter without it still satisfies the protocol; such a broker has no readable account
+    values, and every gate that needs one refuses under a [risk] table."""
+
+    def account_values(self) -> AccountSnapshot: ...
+
+
+def account_values(broker) -> AccountSnapshot | None:
+    """The broker's account snapshot, or None when it offers none or the read fails."""
+    get = getattr(broker, "account_values", None)
+    if not callable(get):
+        return None
+    try:
+        value = get()
+    except BrokerError:
+        return None
+    return value if isinstance(value, AccountSnapshot) else None
 
 
 def supports_price_conditions(broker) -> bool:

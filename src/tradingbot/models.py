@@ -12,6 +12,8 @@ from typing import Literal
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
+from tradingbot.risk.policy import RiskPolicy
+
 
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -130,6 +132,9 @@ class MockPolicy(StrictModel):
     allowed_symbols: frozenset[str] | None = None
     paper_only: Literal[True] = True
     allow_stop_widening: Literal[False] = False
+    # The owner's [risk] table (tradingbot.risk; docs/RISK_GATES.md). None: the fixed cash
+    # baseline (long cash stock or ETF only; no borrowing, short sale, future, option or CFD).
+    risk: RiskPolicy | None = None
 
 
 # ----------------------------------------------------------------------------- multi-asset mapping
@@ -218,6 +223,18 @@ class MarketTerms(StrictModel):
     anchor_max_basis_age_seconds: float | None = None
     # The oldest each side (bid, ask) of the live streaming quote may be at an anchored decision.
     anchor_max_quote_age_seconds: float | None = None
+    # Risk gates (additive; tradingbot.risk): the family's own risk fields, read only under an
+    # owner's [risk] table. ``multiplier_stated`` is the multiplier the family entry states
+    # (None when it relies on the default and the instrument is not a share).
+    funding: str | None = None
+    max_risk_per_idea: Decimal | None = None
+    risk_max_stop_distance: str | None = None
+    margin_initial: Decimal | None = None
+    margin_maintenance: Decimal | None = None
+    margin_verified_at: date | None = None
+    margin_max_age_days: int | None = None
+    entry_collar: str | None = None
+    multiplier_stated: Decimal | None = None
     # Problems found while building these terms (contract unresolved, specification differs).
     problems: list[str] = Field(default_factory=list)
 
