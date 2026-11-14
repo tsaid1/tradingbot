@@ -379,6 +379,60 @@ def verify_log(path: str | Path, schema: str = REC_SCHEMA,
     return _with_head(verify_bytes(data, schema), _read_private(head_path(path), what + " head"))
 
 
+def repair_head(log_path: str | Path, schema: str, what: str, *, confirm: bool = False) -> dict:
+    """Repair the head file in exactly two situations, under the log's lock; anything else is
+    refused with a code. Never removes or rewrites a log line, never repairs a broken chain.
+
+    (i) ``CRASH_BETWEEN_LINE_AND_HEAD``: the head matches line n-1 and line n chains onto it.
+    (ii) ``NO_HEAD_FILE``: no head file, and the whole log verifies as a chain from line 1.
+
+    Returns ``{situation, seq, phase, item}`` of the last line (no content); writes the head
+    for it only with ``confirm``."""
+    with PrivateDir(log_path, what) as d:
+        try:
+            fd = d.open(d.name, os.O_RDONLY)
+        except FileNotFoundError:
+            raise RecommendationError("NO_LOG") from None
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            chunks = []
+            while chunk := os.read(fd, 1 << 16):
+                chunks.append(chunk)
+            data = b"".join(chunks)
+            v = verify_bytes(data, schema)
+            if not v.ok:
+                raise RecommendationError("CHAIN_BROKEN_NOT_REPAIRED")
+            if v.count == 0:
+                raise RecommendationError("NOTHING_TO_REPAIR")
+            head = _read_private(head_path(log_path), what + " head")
+            if head is None:
+                situation = "NO_HEAD_FILE"
+            else:
+                try:
+                    h = json.loads(head)
+                except ValueError:
+                    raise RecommendationError("HEAD_NOT_REPAIRABLE") from None
+                lines = data.split(b"\n")[:-1]
+                if not isinstance(h, dict):
+                    raise RecommendationError("HEAD_NOT_REPAIRABLE")
+                if h.get("count") == v.count and h.get("sha256") == v.head:
+                    raise RecommendationError("HEAD_ALREADY_MATCHES")
+                previous = GENESIS if v.count == 1 else _sha(lines[-2])
+                if h.get("count") != v.count - 1 or h.get("sha256") != previous:
+                    raise RecommendationError("HEAD_NOT_REPAIRABLE")
+                situation = "CRASH_BETWEEN_LINE_AND_HEAD"
+            last = v.records[-1]
+            out = {"situation": situation, "seq": last.get("seq"),
+                   "phase": last.get("phase", "RECOMMENDATION"),
+                   "item": last.get("item_id") or last.get("proposal_id")}
+            if confirm:
+                with PrivateDir(head_path(log_path), what + " head") as h_dir:
+                    h_dir.write_atomic(json.dumps({"count": v.count, "sha256": v.head}).encode())
+        finally:
+            os.close(fd)
+    return out
+
+
 def append_chained(log_path: str | Path, what: str, schema: str, make) -> dict:
     """Append ONE line to a chained log under an exclusive lock: ``make(verification)`` returns
     the record (without ``schema``, ``seq``, ``prev_sha256``) or raises to write nothing. Refused

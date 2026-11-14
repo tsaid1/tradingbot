@@ -558,16 +558,117 @@ def test_s5_both_apps_refuse_error_details(monkeypatch, local, base):
         assert "client.showErrorDetails must be none" in rendered(at)
 
 
-def test_s6_restricted_free_text_is_shown_only_when_symbolic(monkeypatch, local, base):
+def test_n13_restricted_free_text_only_a_number_a_family_or_an_instrument_word(
+        monkeypatch, local, base):
+    rewrite(base / "bundle" / "items.jsonl", lambda rs: [
+        {**r, "mapping": {**r["mapping"], "reference_series": "LONG ZED NEAR 412 STOP 420"}}
+        if r["item_id"] == "i01" else r for r in rs])
     b = bundle(base, A.RESTRICTED)
-    assert b.items["i07"]["ai"]["instrument_as_read"] == ""  # "Zed Metals": not a symbol
-    assert b.items["i07"]["withheld"] == ["instrument_as_read"]
-    assert b.items["i01"]["ai"]["instrument_as_read"] == "TLT"
-    assert b.items["i01"]["mapping"]["proposed_execution_instrument"] == "TLT ETF"
+    assert b.items["i07"]["withheld"] == ["instrument_as_read"]  # "Zed Metals"
+    assert b.items["i01"]["ai"]["instrument_as_read"] == "TLT"  # a manifest family
+    assert b.items["i01"]["ai"]["amendment_from"] == ""
+    assert b.items["i04"]["ai"]["amendment_from"] == "87.2"  # a number
+    assert set(b.items["i01"]["withheld"]) == {"mapping.reference_series",  # upper-case excerpt
+                                                "mapping.proposed_execution_instrument"}  # 2 words
     at = pick(app(monkeypatch, base, proxy="remote@example.invalid"), "i07")
     at.toggle(key="aw_blind").set_value(False).run()
     assert f"instrument_as_read: (withheld: {A.WITHHELD})" in plain(at)
     assert "Zed" not in rendered(at) + plain(at)
+    [radio] = [r for r in at.radio if r.key.startswith("aw_i07_after_0_verdict_instrument_as_read")]
+    assert radio.value is None  # a withheld field's verdict is never pre-filled
+    at.radio(key="aw_i07_after_0_confidence").set_value("LOW").run()
+    at.button(key="aw_i07_after_0_save").click().run()
+    [rec] = records(base)
+    assert "instrument_as_read" not in rec["field_verdicts"] and rec["field_verdicts"]["side"]
+
+
+def test_n15_a_finder_ds_store_is_ignored_and_no_other_dot_file_tolerated(base):
+    for folder in (base / "bundle", base / "bundle" / "media"):
+        (folder / ".DS_Store").write_bytes(b"\x00\x01finder")
+        (folder / ".DS_Store").chmod(0o644)
+    assert bundle(base, A.FULL).bundle_id == A.bundle_digest(base / "bundle")
+    (base / "bundle" / "media" / ".hidden").write_bytes(b"x")
+    with pytest.raises(A.AdjudicationError, match="DOT_FILE_IN_BUNDLE"):
+        bundle(base, A.FULL)
+
+
+def _repair_cli():
+    spec = importlib.util.spec_from_file_location("adjudication_freeze_r",
+                                                  REPO / "scripts" / "adjudication_freeze.py")
+    cli = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cli)
+    return cli
+
+
+def test_n14_repair_head_repairs_exactly_the_two_situations(base, capsys):
+    from tradingbot.runtime.vocab_recommend import _sha, head_path
+
+    cli = _repair_cli()
+    review(base, "i01")
+    log, head = A.annotations_path(base), head_path(A.annotations_path(base))
+    lines = log.read_bytes().splitlines()
+    # (i) a crash between line 2 and its head: the head still names line 1
+    head.write_text(json.dumps({"count": 1, "sha256": _sha(lines[0])}))
+    assert A.read_annotations(base).problem.startswith("HEAD_MISMATCH")
+    assert cli.main(["repair-head", "--dir", str(base)]) == 0  # without --yes: nothing written
+    assert not A.read_annotations(base).ok
+    assert cli.main(["repair-head", "--dir", str(base), "--yes"]) == 0
+    out = capsys.readouterr().out
+    assert "CRASH_BETWEEN_LINE_AND_HEAD: last line 2, phase AFTER_REVEAL, item i01" in out
+    assert A.read_annotations(base).ok
+    # (ii) no head file (a log from before head files, or a deleted head)
+    head.unlink()
+    assert cli.main(["repair-head", "--dir", str(base), "--yes"]) == 0
+    assert "NO_HEAD_FILE: last line 2" in capsys.readouterr().out and A.read_annotations(base).ok
+    good, good_head = log.read_bytes(), head.read_bytes()
+
+    def refused(data: bytes, head_bytes: bytes | None, code: str):
+        log.write_bytes(data)
+        if head_bytes is None:
+            head.unlink(missing_ok=True)
+        else:
+            head.write_bytes(head_bytes)
+            head.chmod(0o600)
+        assert cli.main(["repair-head", "--dir", str(base), "--yes"]) == 2
+        assert code in capsys.readouterr().err
+        assert log.read_bytes() == data  # never a line removed or rewritten
+
+    refused(lines[0] + b"\n", good_head, "HEAD_NOT_REPAIRABLE")  # truncated log
+    refused(lines[0] + b"\n" + lines[1].replace(b'"HIGH"', b'"LOW"') + b"\n", good_head,
+            "HEAD_NOT_REPAIRABLE")  # an edited last line
+    refused(lines[0].replace(b'"MEDIUM"', b'"LOW"') + b"\n" + lines[1] + b"\n", None,
+            "CHAIN_BROKEN_NOT_REPAIRED")  # an edited earlier line
+    refused(good, json.dumps({"count": 3, "sha256": "f" * 64}).encode(),
+            "HEAD_NOT_REPAIRABLE")  # a head pointing past the end
+
+
+def test_n14_repair_head_for_the_recommendations_log(tmp_path, monkeypatch, capsys):
+    from tradingbot.runtime import vocab_recommend as R
+
+    export = tmp_path / "rv" / "export.json"
+    R.write_export(export, [])
+    rows = [{"id": "0123456789abcdef", "token": "plinkish", "kind": None, "posts": 1,
+             "holds": 1, "families": [], "reasons": [], "market_warning": False,
+             "group": "NON_MARKET", "family": None}]
+    log = R.recommendations_path(export)
+    R.append_recommendation(log, rows, login="reviewer@example.invalid", name="",
+                            proposal=rows[0]["id"], verdict="REJECT")
+    R.head_path(log).unlink()
+    assert R.verify_log(log).problem == "HEAD_FILE_MISSING"
+    monkeypatch.setenv(R.EXPORT_ENV, str(export))
+    assert _repair_cli().main(["repair-head", "--recommendations", "--yes"]) == 0
+    assert "NO_HEAD_FILE: last line 1, phase RECOMMENDATION, item 0123456789abcdef" in \
+        capsys.readouterr().out
+    assert R.verify_log(log).ok
+
+
+def test_n17_the_app_names_the_repair_command_for_a_log_without_head(monkeypatch, local, base):
+    review(base, "i01")
+    from tradingbot.runtime.vocab_recommend import head_path
+
+    head_path(A.annotations_path(base)).unlink()
+    text = rendered(app(monkeypatch, base, "reviewer@example.invalid"))
+    assert "HEAD_FILE_MISSING" in text and "scripts/adjudication_freeze.py repair-head" in text
 
 
 def test_n1_an_edit_of_the_last_line_is_detected(base):

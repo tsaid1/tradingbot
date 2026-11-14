@@ -102,7 +102,9 @@ checks the schema, the sequence and the chain (an edit of line n is reported at 
 example `CHAIN_BROKEN at line 2`), and the head file `<log>.head` (line count and the last line's
 sha256, replaced atomically after every append), so an edit or removal of the LAST line is
 reported too (`HEAD_MISMATCH`). The chain has no key: whoever can write both files can rewrite
-them consistently. A log that fails verification blocks new submits and is not shown to the
+them consistently. A failed head write or a missing head file is repaired, in exactly
+the two safe situations, with `python scripts/adjudication_freeze.py repair-head --recommendations
+--yes` ([ADJUDICATION_WORKSPACE.md](ADJUDICATION_WORKSPACE.md), "Repairing the head file"). A log that fails verification blocks new submits and is not shown to the
 owner. Notes are stored and shown as one plain line (control, line-break and direction-override
 characters become spaces). It is the
 reviewer page's only write: with the log unwritable a submit fails closed and nothing else is

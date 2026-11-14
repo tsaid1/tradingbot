@@ -32,7 +32,10 @@ through a link, link count 1, mode 0600. The folders (the base, `bundle/`, `bund
 base inside a cloud-synced folder shows a constant warning in LOCAL mode (the owner's policy
 allows it) and is refused in PUBLISHED mode. The manifest's `bundle_id` is recomputed (sha256 over
 one line `<POSIX path>\0<sha256 hex>\n` per file other than `manifest.json`, sorted by path) by a
-FULL session and by the freeze, and a mismatch is refused (`BUNDLE_ID_MISMATCH`); a RESTRICTED
+FULL session and by the freeze, and a mismatch is refused (`BUNDLE_ID_MISMATCH`). A file named
+exactly `.DS_Store` (macOS Finder), in any folder of the bundle, is ignored by the loader, the
+media listing and this recipe; any other dot-file or dot-folder is refused (`DOT_FILE_IN_BUNDLE`).
+A RESTRICTED
 session cannot check it, because it never reads `posts.jsonl` or `media/`. A bundle with an unknown schema, a
 value outside a closed set (`post_label`, `action`, `side`, `effect`, price `role`,
 `exactness`, `contract_month`, `timing`, `holds.status`, families = `manifest.families` plus
@@ -68,8 +71,11 @@ access = "FULL"          # FULL or RESTRICTED
   files unreadable): areas (2) and (3) only, plus the sanitized vocabulary page.
 * **PUBLISHED mode** (through the proxy): every session is RESTRICTED, whatever its entry says,
   while `remote_full_context_authorized` is false. RESTRICTED shows the free-text system fields
-  (`instrument_as_read`, the amendment's from and to, the two mapping strings) only when they are
-  symbol- or number-like (`^[A-Z0-9 ._:/-]{1,32}$`); otherwise `(withheld: WITHHELD_NOT_A_SYMBOL)`.
+  (`instrument_as_read`, the amendment's from and to, the two mapping strings) only when each is a
+  number, or exactly one family name of `manifest.families`, or exactly one of the instrument
+  words FUT, FUTURE, ETF, INDEX, SPOT, CFD, OPT, OPTION, STOCK, FRONT, NEXT, DIRECT; anything else,
+  whatever its letter case, is shown as `(withheld: WITHHELD_NOT_A_SYMBOL)`. A withheld field's
+  verdict is never pre-filled: it stays unanswered and need not be given.
   In RESTRICTED blind mode the price-table rows are labelled with the system's typed prices (there
   is no text to show), so that reading is partly anchored by design.
 * **REVIEWER** writes INDEPENDENT and AFTER_REVEAL records. With *blind-first* on (the default,
@@ -177,9 +183,24 @@ previous line (an edit of line n is reported at line n+1, `CHAIN_BROKEN`), and a
 the head file is replaced atomically with the line count and the last line's sha256, so an edit
 or removal of the LAST line is reported too (`HEAD_MISMATCH`). A failing log disables saving,
 revealing and freezing. The chain has no key: whoever can write both files can rewrite them
-consistently; each frozen version's manifest records the head, for comparison later. A crash
-between the line and the head write leaves `HEAD_MISMATCH`: the owner checks the last line and
-then writes the head file again by hand. Notes are stored and shown as one plain line: control,
+consistently; each frozen version's manifest records the head, for comparison later.
+
+**Repairing the head file.** A failed head write (a crash between the line and the head, a full
+disk, a permission change) leaves `HEAD_MISMATCH`, and a log without a head file (written before
+head files existed, or the head deleted) gives `HEAD_FILE_MISSING`; both lock saving, revealing
+and freezing, and the page names this command:
+
+```bash
+python scripts/adjudication_freeze.py repair-head                  # annotation log: shows, writes nothing
+python scripts/adjudication_freeze.py repair-head --yes            # writes the head
+python scripts/adjudication_freeze.py repair-head --recommendations --yes   # the vocabulary log
+```
+
+It repairs only (i) a head that matches line n-1 with line n chaining onto it, and (ii) no head
+file with the whole log a valid chain from line 1; it prints the last line's sequence, phase and
+item id (never content). Anything else (a truncated log, an edited line, a head pointing past the
+end, a broken chain) is refused with a code, and it never removes or rewrites a log line. Do not
+edit the head file by hand. Notes are stored and shown as one plain line: control,
 line-break and direction-override characters become spaces.
 
 ## Saving and resuming

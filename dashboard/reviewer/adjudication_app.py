@@ -119,9 +119,12 @@ def _inputs(prefix: str, bundle: A.Bundle, item: dict, defaults: dict,
             cols[1].text(f"system: {_shown(item, f, system.get(f, ''))}")
             pre = A.prefill_verdicts({**system, f: reading[f]}, system, item["kind"])[f]
             tag = hashlib.sha256(reading[f].encode()).hexdigest()[:8]
-            verdicts[f] = cols[2].radio(f"verdict on {f}", A.VERDICTS, horizontal=True,
-                                        index=A.VERDICTS.index(pre),
-                                        key=f"{prefix}_verdict_{f}_{tag}")
+            withheld = f in item.get("withheld", ())  # never pre-filled: left unanswered
+            verdict = cols[2].radio(f"verdict on {f}", A.VERDICTS, horizontal=True,
+                                    index=None if withheld else A.VERDICTS.index(pre),
+                                    key=f"{prefix}_verdict_{f}_{tag}")
+            if verdict is not None:
+                verdicts[f] = verdict
     rows = A.table_rows(bundle, item)
     if rows:
         reading[A.LEVELS], row_verdicts = _price_table(prefix, bundle, item, rows, defaults,
@@ -325,7 +328,11 @@ def _workspace(base: Path, bundle: A.Bundle, session: A.Session) -> None:
         st.info("Restricted access: the source posts, images and context are not loaded.")
     log = A.read_annotations(base)
     if not log.ok:
-        st.error("The annotation log fails verification: saving is disabled.")
+        st.error(f"The annotation log fails verification ({log.problem}): saving is "
+                 "disabled." + (" If it is only the head file (a log without one, or a crash "
+                                "between a line and its head), the owner runs: python "
+                                "scripts/adjudication_freeze.py repair-head (then --yes)."
+                                if str(log.problem).startswith("HEAD_") else ""))
     records = log.records if log.ok else []
     if msg := st.session_state.pop("aw_msg", None):
         st.success(msg)

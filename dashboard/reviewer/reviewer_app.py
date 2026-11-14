@@ -99,6 +99,10 @@ def main() -> None:
         _refuse(f"The review material could not be read ({type(exc).__name__}).")
     can_submit = who.login is not None
     if checked is not None and not checked.ok:
+        if str(checked.problem).startswith("HEAD_"):
+            st.error("The recommendations log's head file does not match: the owner runs "
+                     "python scripts/adjudication_freeze.py repair-head --recommendations "
+                     "(then --yes).")
         st.error("The recommendations log fails verification: submissions are disabled until "
                  "the owner checks it.")
         can_submit = False

@@ -78,9 +78,13 @@ INDEPENDENT, AFTER_REVEAL, APPROVAL = "INDEPENDENT", "AFTER_REVEAL", "APPROVAL"
 # on that login can no longer write an INDEPENDENT reading of it (durable blind-first).
 SYSTEM_SHOWN = "SYSTEM_SHOWN"
 NOT_READ = "NOT_READ"  # a number of the post the system typed no level for (its own state)
-# RESTRICTED: free-text system fields are shown only when symbol- or number-like.
-_SYMBOLIC = re.compile(r"^[A-Z0-9 ._:/-]{1,32}$")
+# RESTRICTED: a free-text system field is shown only when it is a number, or exactly one family
+# name of the manifest or one of these instrument words; anything else is withheld.
+INSTRUMENT_WORDS = ("FUT", "FUTURE", "ETF", "INDEX", "SPOT", "CFD", "OPT", "OPTION", "STOCK",
+                    "FRONT", "NEXT", "DIRECT")
+_NUMBER = re.compile(r"^\d{1,9}(\.\d{1,8})?$")
 WITHHELD = "WITHHELD_NOT_A_SYMBOL"
+IGNORED_FILE = ".DS_Store"  # macOS Finder: ignored by the loader and by the bundle_id recipe
 FREE_TEXT_FIELDS = ("instrument_as_read", "amendment_from", "amendment_to")
 FREE_TEXT_MAPPING = ("reference_series", "proposed_execution_instrument")
 YES_NO_UNSURE, YES_NO = ("YES", "NO", "UNSURE"), ("YES", "NO")
@@ -375,7 +379,10 @@ def bundle_digest(root: str | Path) -> str:
     names = []
     for folder, dirs, files in os.walk(root, followlinks=False):
         rel = Path(folder).relative_to(root)
-        names += [(rel / f).as_posix() for f in files]
+        if any(n.startswith(".") for n in dirs) or any(
+                f.startswith(".") and f != IGNORED_FILE for f in files):
+            raise AdjudicationError("DOT_FILE_IN_BUNDLE")
+        names += [(rel / f).as_posix() for f in files if f != IGNORED_FILE]
         dirs.sort()
     lines = []
     for name in sorted(n for n in names if n != "manifest.json"):
@@ -462,11 +469,15 @@ def load_bundle(path: str | Path, access: str) -> Bundle:
             raise AdjudicationError("LEVEL_NOT_IN_NUMBERS")
         bundle.posts = posts
     else:
+        allowed = set(families) | set(INSTRUMENT_WORDS)
+
+        def shown(v: str) -> bool:
+            return bool(_NUMBER.match(v)) or v in allowed
+
         for item in items.values():
-            withheld = [f for f in FREE_TEXT_FIELDS
-                        if item["ai"][f] and not _SYMBOLIC.match(item["ai"][f])]
+            withheld = [f for f in FREE_TEXT_FIELDS if item["ai"][f] and not shown(item["ai"][f])]
             withheld += [f"mapping.{f}" for f in FREE_TEXT_MAPPING
-                         if item["mapping"][f] and not _SYMBOLIC.match(item["mapping"][f])]
+                         if item["mapping"][f] and not shown(item["mapping"][f])]
             for f in withheld:
                 if f.startswith("mapping."):
                     item["mapping"][f.removeprefix("mapping.")] = ""
@@ -811,8 +822,9 @@ def append_annotation(base: str | Path, bundle: Bundle, session: Session, *, ite
             isinstance(rows, dict) and set(rows) == set(expected_rows) and all(
                 (rows[k] == NOT_READ) if want == NOT_READ else rows[k] in VERDICTS
                 for k, want in expected_rows.items()))
-        if phase == AFTER_REVEAL and (set(flat) != compared or not set(flat.values()) <= set(
-                VERDICTS) or outcome or not rows_ok):
+        required = compared - set(item.get("withheld", ()))  # a withheld field: no verdict due
+        if phase == AFTER_REVEAL and (not required <= set(flat) <= compared or not set(
+                flat.values()) <= set(VERDICTS) or outcome or not rows_ok):
             raise AdjudicationError("VERDICT_FOR_EVERY_COMPARED_FIELD")
 
     def make(v: Verification) -> dict:
