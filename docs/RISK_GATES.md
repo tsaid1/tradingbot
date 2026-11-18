@@ -74,9 +74,17 @@ family or from the global `[policy]` collar.
   not taken out. The execution core marks each exposure: ledger and broker-only positions are
   filled, working entries are `working` (an exposure that does not say so counts as filled, the
   larger loan). The proceeds are taken at the position's entry (the price credited; a partial
-  cover leaves the realised gain or loss in own cash). A filled short with no known entry refuses
-  (`RISK_INPUT_MISSING:G1:ENTRY`). This assumes total cash and the positions are read from one
-  consistent account state, as the simulated account gives them. Under a table with `permitted`
+  cover leaves the realised gain or loss in own cash). A broker-only remainder of a contract the
+  ledger also holds short is taken at the broker's average over the whole position. This can
+  under-count G1 when that remainder was sold above the ledger's price. G5 refuses every entry
+  while a broker-only position exists (`RISK_PORTFOLIO_UNBOUNDED`). A filled short with no known
+  entry refuses (`RISK_INPUT_MISSING:G1:ENTRY`). Total cash is read before the positions. In the
+  simulated and shadow accounts, the positions read can settle a fill in between, which can only
+  over-count. **Enable both `permitted` and `short_sale_permitted` only with the simulated or
+  shadow account (today the only brokers that supply account values; any other broker refuses G1
+  for missing account values). Before a broker adapter that reads a real account's values is
+  gated, G1's short-proceeds term must be reviewed again for cash and positions read at different
+  moments.** Under a table with `permitted`
   false, a purchase that only short proceeds would pay for is refused
   (`RISK_BORROWING_NOT_PERMITTED`). A short stock sale needs `short_sale_permitted` AND
   `permitted`. Writing an option is
