@@ -6,18 +6,23 @@ is then confirmed at the broker (fully filled), so the CLOSE is resized to the w
 position in the same cycle. With an outcome that is not confirmed the exit is refused, nothing is
 sent and the exception stays open: final, exactly as on main (no deferred retry).
 
-Invented ticker (the harness's), toy prices. No network, no broker port.
+Invented ticker (the harness's), toy prices. No network, no broker port. The last test runs the
+same race through the whole mock service, on invented posts.
 """
 
 from __future__ import annotations
 
+import tempfile
 from decimal import Decimal
+from pathlib import Path
 
 from execution_harness import Harness, action, open_action
+from runtime_harness import Runtime, post
 
 from tradingbot.execution.coordinator import EXIT_NOT_NETTED
 from tradingbot.execution.store import IntentState
 from tradingbot.models import Action, MockPolicy
+from tradingbot.runtime import notify as N
 
 
 def sized(tmp_path, size: int) -> Harness:
@@ -229,3 +234,39 @@ def test_a_second_netting_failure_after_the_resize_is_refused_with_nothing_sent(
     assert h.coord.store.position("p1:open").quantity == 1
     assert {"EXIT_NOT_NETTED", "UNPROTECTED_POSITION"} <= set(open_kinds(h))
     h.coord.close()
+
+
+# ----------------------------------------------------------------- through the mock service
+
+# Invented posts: the mock ask is 88.42, so a buy limited at 88.30 rests. The service-mechanics
+# mapping sizes the entry at 2 shares.
+RESTING = "We are now long $TLT at 88.30. Stop 86.00."
+CLOSE = "Closing our $TLT long at 88.40."
+
+
+def test_through_the_service_the_close_reads_executed_and_the_follower_ends_flat():
+    """The scenario of review note N7, end to end: 1 of 2 filled, the publisher closes, the cancel
+    of the remainder loses the race. On the earlier code the CLOSE row read REFUSED, the follower
+    held 2 and the EXIT_REFUSED alert was sent."""
+    rt = Runtime(Path(tempfile.mkdtemp()), [post("1", 0, RESTING), post("2", 20, CLOSE)])
+    rt.broker.script_next_submit("PARTIAL", quantity=1)
+    rt.run(2)
+    coord = rt.service.coordinator
+    [opened] = [a for a in rt.actions() if a["action"] == "OPEN"]
+    entry = coord.intent(opened["order_ref"])
+    assert opened["status"] == "WORKING" and entry.quantity == 2
+    assert coord.store.filled_quantity(entry.order_ref) == 1
+    rt.broker.script_next_cancel("FILL_FIRST")  # the remainder fills before its cancel lands
+    rt.run(5)  # the close arrives
+    rt.run(6)  # nothing more is sent afterwards
+    rows = {a["action"]: a for a in rt.actions()}
+    assert rows["OPEN"]["status"] == "EXECUTED" and rows["CLOSE"]["status"] == "EXECUTED", rows
+    assert EXIT_NOT_NETTED not in rows["CLOSE"]["reasons"]
+    fills = rt.broker.executions()
+    assert sum(f.quantity for f in fills if f.side.value == "BUY") == 2
+    assert sum(f.quantity for f in fills if f.side.value == "SELL") == 2
+    assert sum(p.quantity for p in rt.broker.positions()) == 0
+    assert rt.broker.open_orders() == [] and rt.refs_placed_more_than_once() == {}
+    assert coord.store.exceptions(open_only=True) == []
+    assert N.EXIT_REFUSED not in rt.notifier.kinds()
+    rt.service.close()
