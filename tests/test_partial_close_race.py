@@ -2,8 +2,9 @@
 
 The entry for 2 has 1 filled and is still working when the publisher's CLOSE arrives. The netting
 cancels the remainder; the cancel loses the race and the remainder fills first. The entry's outcome
-is then confirmed at the broker (fully filled), so the CLOSE exits the whole confirmed position,
-once. With an outcome that is not confirmed nothing is sent and an exception stays open.
+is then confirmed at the broker (fully filled), so the CLOSE is resized to the whole confirmed
+position in the same cycle. With an outcome that is not confirmed the exit is refused, nothing is
+sent and the exception stays open: final, exactly as on main (no deferred retry).
 
 Invented ticker (the harness's), toy prices. No network, no broker port.
 """
@@ -62,13 +63,12 @@ def test_a_close_whose_entry_cancel_loses_the_race_exits_the_whole_confirmed_pos
 
 # ----------------------------------------------------------------- bounded enumeration (N7)
 
-CONFIRMED = {"normal": True, "FILL_FIRST": True, "LOST_ACK_APPLIED": True,
-             "LOST_ACK_NOT_APPLIED": False, "REJECT": False}
+CANCELS = ("normal", "FILL_FIRST", "LOST_ACK_APPLIED", "LOST_ACK_NOT_APPLIED", "REJECT")
 CASES = [
     (size, filled, cancel, exit_)
     for size in (2, 3, 4)
     for filled in range(1, size)
-    for cancel in CONFIRMED
+    for cancel in CANCELS
     for exit_ in ("CLOSE", "REDUCE")
 ]
 
@@ -103,109 +103,129 @@ def check_sends(sent: list[tuple[int, int, int]]) -> None:
         assert qty + committed <= holding, (qty, committed, holding)
 
 
+def exit_action(exit_: str):
+    if exit_ == "CLOSE":
+        return action("close", Action.CLOSE, idea="p1:open")
+    return action("trim", Action.REDUCE, idea="p1:open", fraction="0.5")
+
+
 def test_n7_bounded_enumeration(tmp_path):
+    branches: dict[str, int] = {}
     for n, (size, filled, cancel, exit_) in enumerate(CASES):
         case = (size, filled, cancel, exit_)
         h = sized(tmp_path / str(n), size)
-        partly_filled(h, filled)
+        opened = partly_filled(h, filled)
         sent = watch_exit_sends(h)
-        final = size if cancel == "FILL_FIRST" else filled
         if cancel != "normal":
             h.broker.script_next_cancel(cancel)
-        if exit_ == "CLOSE":
-            act = action("close", Action.CLOSE, idea="p1:open")
-        else:
-            act = action("trim", Action.REDUCE, idea="p1:open", fraction="0.5")
-        out = h.execute("p2", act)
+        out = h.execute("p2", exit_action(exit_))
         check_sends(sent)
         assert held(h) >= 0 and traded(h, "SELL") <= traded(h, "BUY"), case
+        events = h.events(out.order_ref)
         if exit_ == "REDUCE" and filled % 2:
-            # 0.5 of an odd holding is not a whole unit: refused before any netting, as before.
+            # 0.5 of an odd holding is not a whole unit: refused before any netting, as on main.
+            branch = "refused before netting"
             assert out.state == IntentState.REFUSED and not sent, (case, out)
-            h.coord.close()
-            continue
-        expected = final if exit_ == "CLOSE" else final * (filled // 2) // filled
-        if CONFIRMED[cancel]:
+        elif cancel in ("normal", "FILL_FIRST"):
+            # The entry is confirmed over: cancelled with its fill known, or filled in the race.
+            branch = "resized in the same cycle" if cancel == "FILL_FIRST" else "sent unchanged"
+            assert ("EXIT_RESIZED_TO_CONFIRMED_ENTRY" in events) == (cancel == "FILL_FIRST")
+            final = size if cancel == "FILL_FIRST" else filled
+            expected = final if exit_ == "CLOSE" else final * (filled // 2) // filled
             assert out.state == IntentState.FILLED and out.filled_quantity == expected, (case, out)
-            assert EXIT_NOT_NETTED not in open_kinds(h), case
+            assert len(sent) == 1 and EXIT_NOT_NETTED not in open_kinds(h), case
+            left = final - expected
+            assert held(h) == left == h.coord.store.position("p1:open").quantity, case
+            stops = [o.remaining for o in h.broker.open_orders() if o.order_ref.endswith(".STP")]
+            if left == 0:
+                assert h.broker.open_orders() == [], case  # no orphaned stop
+            else:
+                assert stops == [left], case
         else:
-            # Unknown outcome: nothing sent, the exception open, the entry still working.
+            # The cancel is not confirmed (refused, or its acknowledgement lost): refused, final.
+            branch = "refused as before"
             assert out.state == IntentState.REFUSED and EXIT_NOT_NETTED in out.reasons, (case, out)
+            assert "EXIT_RESIZED_TO_CONFIRMED_ENTRY" not in events, case
             assert not sent and EXIT_NOT_NETTED in open_kinds(h), case
-            assert held(h) == filled
-            # A following cycle: the entry's cancel is now confirmed, so the exit is sent once
-            # for the confirmed position.
-            h.clock.advance(1)
-            h.coord.recover()
+            if opened.order_ref in h.working():
+                h.broker.fill(opened.order_ref)  # the remainder fills in between
+            for _ in range(3):
+                h.clock.advance(5)
+                h.coord.sync()
             check_sends(sent)
-            assert len(sent) == 1, (case, sent)
-            assert h.coord.intent(out.order_ref).state == IntentState.FILLED, case
-            assert EXIT_NOT_NETTED not in open_kinds(h), case
-        assert traded(h, "SELL") == expected, case
-        left = final - expected
-        assert held(h) == left and h.coord.store.position("p1:open").quantity == left, case
-        stops = [o for o in h.broker.open_orders() if o.order_ref.endswith(".STP")]
-        if left == 0:
-            assert h.broker.open_orders() == [], case  # nothing left behind, no orphaned stop
-        else:
-            assert [s.remaining for s in stops] == [left], case
-        for _ in range(2):  # exactly once: later cycles send nothing more
-            h.clock.advance(5)
-            h.coord.recover()
-        assert traded(h, "SELL") == expected and held(h) == left, case
-        assert h.coord.reconcile().clean, case
+            assert not sent and traded(h, "SELL") == 0, case
+            assert h.coord.intent(out.order_ref).state == IntentState.REFUSED, case
+        branches[branch] = branches.get(branch, 0) + 1
         h.coord.close()
+    assert branches == {
+        "refused before netting": 20,
+        "sent unchanged": 8,
+        "resized in the same cycle": 8,
+        "refused as before": 24,
+    }, branches
 
 
-def test_an_awaiting_close_whose_entry_then_fills_is_sent_once_for_all_of_it(tmp_path):
+# ----------------------------------------------------------------- pinned limits and races
+
+
+def test_a_close_refused_for_an_unconfirmed_entry_cancel_stays_refused(tmp_path):
+    """The documented limit, as on main: the refusal is final and the follower keeps holding."""
     h = sized(tmp_path, 3)
     opened = partly_filled(h, 1)
+    sent = watch_exit_sends(h)
     h.broker.script_next_cancel("REJECT")
     close = h.execute("p2", action("close", Action.CLOSE, idea="p1:open"))
     assert close.state == IntentState.REFUSED and EXIT_NOT_NETTED in open_kinds(h)
-    h.broker.fill(opened.order_ref)  # the remainder fills before the next cycle
-    assert held(h) == 3
-    h.clock.advance(1)
-    h.coord.recover()
-    i = h.coord.intent(close.order_ref)
-    assert i.state == IntentState.FILLED and i.quantity == 3, i
-    assert held(h) == 0 and traded(h, "SELL") == 3 and h.broker.open_orders() == []
-    assert EXIT_NOT_NETTED not in open_kinds(h)
-    h.clock.advance(5)
-    h.coord.recover()
-    assert traded(h, "SELL") == 3 and h.coord.reconcile().clean
+    h.broker.fill(opened.order_ref)  # the remainder fills after the refusal
+    for _ in range(3):
+        h.clock.advance(5)
+        h.coord.sync()
+    assert h.coord.intent(close.order_ref).state == IntentState.REFUSED
+    assert not sent and traded(h, "SELL") == 0 and held(h) == 3
+    [stop] = [o for o in h.broker.open_orders() if o.order_ref.endswith(".STP")]
+    assert stop.remaining == 3  # protected, and the alert stays open
+    assert EXIT_NOT_NETTED in open_kinds(h)
     h.coord.close()
 
 
-def test_an_awaiting_close_sends_nothing_under_the_halt(tmp_path):
+def test_a_reduce_then_a_close_with_the_fill_first_race_sells_exactly_what_is_held(tmp_path):
+    for n, close_cancel in enumerate(("normal", "FILL_FIRST")):
+        h = sized(tmp_path / str(n), 4)
+        partly_filled(h, 2)
+        sent = watch_exit_sends(h)
+        h.broker.script_next_cancel("FILL_FIRST")  # the entry fills during the reduce's netting
+        h.broker.script_next_submit("REST")  # the reduction rests
+        trim = h.execute("p2", action("trim", Action.REDUCE, idea="p1:open", fraction="0.5"))
+        assert trim.state == IntentState.WORKING and h.coord.intent(trim.order_ref).quantity == 2
+        if close_cancel != "normal":
+            h.broker.script_next_cancel(close_cancel)  # the reduction fills before its cancel
+        close = h.execute("p3", action("close", Action.CLOSE, idea="p1:open"))
+        check_sends(sent)
+        assert held(h) >= 0 and traded(h, "SELL") + held(h) == traded(h, "BUY") == 4
+        if close_cancel == "normal":
+            assert close.state == IntentState.FILLED and close.filled_quantity == 4, close
+            assert held(h) == 0 and traded(h, "SELL") == 4 and h.broker.open_orders() == []
+        else:
+            # The position shrank during the close's netting: refused as on main, nothing sent.
+            assert close.state == IntentState.REFUSED and EXIT_NOT_NETTED in close.reasons
+            assert len(sent) == 1 and held(h) == 2 and traded(h, "SELL") == 2
+        h.coord.close()
+
+
+def test_a_second_netting_failure_after_the_resize_is_refused_with_nothing_sent(tmp_path):
     h = sized(tmp_path, 2)
     partly_filled(h, 1)
-    h.broker.script_next_cancel("REJECT")
+    sent = watch_exit_sends(h)
+    h.broker.script_next_cancel("FILL_FIRST")  # the entry fills during the first netting
+    h.broker.script_next_cancel("FILL_FIRST")  # the stop fills before its cancel, in the second
     close = h.execute("p2", action("close", Action.CLOSE, idea="p1:open"))
-    assert close.state == IntentState.REFUSED
-    h.halt()
-    h.clock.advance(1)
-    h.coord.sync()
-    assert traded(h, "SELL") == 0 and EXIT_NOT_NETTED in open_kinds(h)
-    h.unhalt()
-    h.clock.advance(1)
-    h.coord.recover()
-    assert h.coord.intent(close.order_ref).state == IntentState.FILLED
-    assert held(h) == 0 and traded(h, "SELL") == traded(h, "BUY")
-    h.coord.close()
-
-
-def test_an_awaiting_reduce_applies_its_fraction_to_the_confirmed_final_quantity(tmp_path):
-    h = sized(tmp_path, 4)
-    opened = partly_filled(h, 2)
-    h.broker.script_next_cancel("REJECT")
-    trim = h.execute("p2", action("trim", Action.REDUCE, idea="p1:open", fraction="0.5"))
-    assert trim.state == IntentState.REFUSED and traded(h, "SELL") == 0
-    h.broker.fill(opened.order_ref)
-    h.clock.advance(1)
-    h.coord.recover()
-    assert h.coord.intent(trim.order_ref).state == IntentState.FILLED
-    assert traded(h, "SELL") == 2 and held(h) == 2  # half of the confirmed 4, not of the 2
-    [stop] = [o for o in h.broker.open_orders() if o.order_ref.endswith(".STP")]
-    assert stop.remaining == 2 and EXIT_NOT_NETTED not in open_kinds(h)
+    assert "EXIT_RESIZED_TO_CONFIRMED_ENTRY" in h.events(close.order_ref)
+    assert close.state == IntentState.REFUSED and EXIT_NOT_NETTED in close.reasons, close
+    assert any(r.startswith("EXIT_NETTING_POSITION_CHANGED") for r in close.reasons)
+    # Reachable: the stop (sized to 1 beside the 1 the close then covered) filled in the race.
+    assert not sent and held(h) == 1 and traded(h, "SELL") == 1  # never short through a close
+    # As on main when a stop sized beside a working exit fills in the netting race: the unit
+    # left is reported unprotected, with both alerts open.
+    assert h.coord.store.position("p1:open").quantity == 1
+    assert {"EXIT_NOT_NETTED", "UNPROTECTED_POSITION"} <= set(open_kinds(h))
     h.coord.close()

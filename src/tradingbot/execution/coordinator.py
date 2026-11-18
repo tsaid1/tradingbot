@@ -118,10 +118,6 @@ UNRESOLVED_ENTRY_IN_INSTRUMENT = "UNRESOLVED_ENTRY_IN_INSTRUMENT"
 # An exit was not sent because the working entries, earlier exits or protective children could not
 # be cancelled or resized first, with the result confirmed at the broker (review R1 / R6).
 EXIT_NOT_NETTED = "EXIT_NOT_NETTED"
-# Review N7: an exit not netted because the idea's own entry or add moved or could not be confirmed
-# over. It stays REFUSED with nothing sent and EXIT_NOT_NETTED open, and is netted again on later
-# syncs; once the entry's outcome is confirmed at the broker it is sent for the confirmed position.
-EXIT_AWAITS_ENTRY_OUTCOME = "EXIT_AWAITS_ENTRY_OUTCOME"
 # An exit was not sent because the broker quote was not usable to price its limit (review S2); the
 # broker-side protective stop remains the protection.
 EXIT_WITHOUT_QUOTE = "EXIT_WITHOUT_QUOTE"
@@ -474,8 +470,6 @@ class ExecutionCoordinator:
         # Review N1: per contract, the consecutive successful position reads that differ from the
         # ledger, as (time, net). In memory: a restart, a failed read or agreement restarts it.
         self._position_runs: dict[str, list[tuple[datetime, int]]] = {}
-        # Exit nettings in progress: a sync inside one never retries an awaiting exit (review N7).
-        self._exit_depth = 0
         # Risk gates (tradingbot.risk): each mapped family's risk terms, and the owner's per-unit
         # initial margin by execution symbol, set by the runtime from the mapping. Read only
         # under a [risk] table (``policy.risk``).
@@ -719,8 +713,6 @@ class ExecutionCoordinator:
             touched | {i for i, p in positions.items() if p.status in ("OPEN", "PENDING")}
         ):
             self._maintain_protection(idea_id)
-        if _rerun:
-            self._retry_awaiting_exits()
         return True
 
     def _cancel_stopped_out_entries(self, open_orders: list[BrokerOrder]) -> bool:
@@ -1857,26 +1849,22 @@ class ExecutionCoordinator:
         confirmed at the broker means nothing is sent and EXIT_NOT_NETTED is opened."""
         if self._halt_blocks(intent):
             return
-        self._exit_depth += 1
-        try:
-            for attempt in range(2):
-                pos = self.store.position(intent.idea_id)
-                basis = pos.quantity if pos is not None else 0
-                problems = self._net_exit(intent)
-                if not problems:
-                    break
-                moved = self._exit_after_entry_moved(intent, order, basis, problems, attempt)
-                if not isinstance(moved, OrderIntent):
-                    self._exit_not_netted(intent, problems, awaiting=moved, basis=basis)
-                    return
-                intent, order = self.store.intent(intent.order_ref), moved
-        finally:
-            self._exit_depth -= 1
-        if self.store.resolve_exceptions(self.clock(), EXIT_NOT_NETTED, idea_id=intent.idea_id,
-                                         order_ref=intent.order_ref):
-            self.store.log(self.clock(), "EXIT_NETTED_AFTER_ENTRY_SETTLED",
-                           order_ref=intent.order_ref, idea_id=intent.idea_id,
-                           quantity=intent.quantity)
+        pos = self.store.position(intent.idea_id)
+        basis = pos.quantity if pos is not None else 0
+        problems = self._net_exit(intent)
+        if problems:
+            resized = self._exit_for_confirmed_entry(intent, order, basis)
+            if resized is None:
+                self._exit_not_netted(intent, problems)
+                return
+            intent, order = self.store.intent(intent.order_ref), resized
+            # Netted once more, never a third time. A second failure needs the position to move
+            # again between two nettings; with every entry over that is a protective fill, and it
+            # is refused exactly as on main.
+            problems = self._net_exit(intent)
+            if problems:
+                self._exit_not_netted(intent, problems)
+                return
         if self.config.exit_price_policy == "TOUCH":
             order = self._price_after_netting(intent, order)
             if order is None:
@@ -1923,28 +1911,25 @@ class ExecutionCoordinator:
                        rule="touch exit: the limit sent is the bid read after the stop was cancelled")
         return order.model_copy(update={"limit_price": limit})
 
-    def _exit_after_entry_moved(
-        self, intent: Intent, order: OrderIntent, basis: int, problems: list[str], attempt: int
-    ) -> OrderIntent | bool:
+    def _exit_for_confirmed_entry(
+        self, intent: Intent, order: OrderIntent, basis: int
+    ) -> OrderIntent | None:
         """Review N7: the netting failed. When the idea's own entry or add grew the position while
-        it was cancelled (the cancel lost the race) and every entry and add of the idea is now
-        confirmed over at the broker, the exit is resized to the confirmed position (a CLOSE to all
-        of it, a REDUCE to the same fraction, rounded down) and netted once more: the new order is
-        returned. Otherwise False (refused as before) or True (refused, nothing sent, and netted
-        again on a later sync: the entry moved or its cancel is unconfirmed)."""
+        it was being cancelled (the cancel lost the race to a fill) and every entry and add of the
+        idea is now confirmed over at the broker, the exit is resized to the confirmed position (a
+        CLOSE to all of it, a REDUCE to the same fraction, rounded down) and the resized order is
+        returned, to be netted once more. Otherwise None: refused exactly as before."""
         pos = self.store.position(intent.idea_id)
-        grew = pos is not None and pos.quantity > basis
-        if not grew and not any(p.startswith("ENTRY_CANCEL_UNCONFIRMED") for p in problems):
-            return False
-        if not grew or attempt or not self._entries_confirmed_over(intent.idea_id):
-            return not attempt
+        if pos is None or basis < 1 or pos.quantity <= basis:
+            return None
+        if not self._entries_confirmed_over(intent.idea_id):
+            return None
         qty = pos.quantity if intent.action == Action.CLOSE else (
             pos.quantity * intent.quantity // basis
         )
-        contract = order.contract
         committed = self.store.committed_exit_quantity(intent.idea_id, exclude_ref=intent.order_ref)
-        if qty < 1 or qty + committed > pos.quantity or _rule_problems(contract, qty):
-            return False
+        if qty < 1 or qty + committed > pos.quantity or _rule_problems(order.contract, qty):
+            return None
         now = self.clock()
         self.store.set_intent_quantity(intent.order_ref, qty, now)
         row = self.store.order(intent.order_ref)
@@ -1952,7 +1937,7 @@ class ExecutionCoordinator:
         self.store.log(
             now, "EXIT_RESIZED_TO_CONFIRMED_ENTRY", order_ref=intent.order_ref,
             idea_id=intent.idea_id, before=intent.quantity, after=qty, position_before=basis,
-            position=pos.quantity, problems=problems,
+            position=pos.quantity,
             rule="the entry's outcome is confirmed at the broker: the exit is sized to it",
         )
         return order.model_copy(update={"quantity": qty})
@@ -1989,52 +1974,6 @@ class ExecutionCoordinator:
             elif row.status not in TERMINAL_STATUSES or row.filled_quantity != filled:
                 return False
         return True
-
-    def _retry_awaiting_exits(self) -> None:
-        """Review N7: an exit refused while the idea's entry was moving or its cancel unconfirmed is
-        netted again, exactly as a new exit would be (re-priced from a fresh quote, sized to the
-        position held now). It ends when it is sent, when the idea holds nothing, or when a later
-        REDUCE / CLOSE of the idea supersedes it."""
-        if self._exit_depth or self.halted():
-            return
-        intents = self.store.intents()
-        for intent in intents:
-            if intent.state != IntentState.REFUSED or EXIT_AWAITS_ENTRY_OUTCOME not in intent.reasons:
-                continue
-            now = self.clock()
-            pos = self._open_position(intent.idea_id)
-            later = any(
-                j.idea_id == intent.idea_id and j.action in (Action.REDUCE, Action.CLOSE)
-                and j.created_at > intent.created_at for j in intents
-            )
-            if pos is None or later:
-                self.store.set_state(
-                    intent.order_ref, IntentState.REFUSED, now,
-                    reasons=[r for r in intent.reasons if r != EXIT_AWAITS_ENTRY_OUTCOME],
-                )
-                self.store.log(now, "EXIT_RETRY_ENDED", order_ref=intent.order_ref,
-                               idea_id=intent.idea_id,
-                               why="superseded by a later exit" if later else "nothing held")
-                continue
-            first = next(e for e in self.store.journal(intent.order_ref)
-                         if e.event == EXIT_AWAITS_ENTRY_OUTCOME)
-            qty = pos.quantity if intent.action == Action.CLOSE else (
-                pos.quantity * int(first.detail["quantity"]) // int(first.detail["basis"])
-            )
-            if qty < 1:
-                continue
-            self.store.set_intent_quantity(intent.order_ref, qty, now)
-            self.store.set_state(intent.order_ref, IntentState.RECORDED, now, reasons=[])
-            for row in self.store.orders(intent.order_ref):
-                self.store.update_order(row.order_ref, now, status="Recorded", quantity=qty)
-            self.store.log(now, "EXIT_RETRY", order_ref=intent.order_ref,
-                           idea_id=intent.idea_id, quantity=qty, position=pos.quantity)
-            intent = self.store.intent(intent.order_ref)
-            if not self._reprice_exit(intent, now):
-                continue
-            intent = self.store.intent(intent.order_ref)
-            entry, _children = self._rebuild(intent, self.store.orders(intent.order_ref))
-            self._submit_exit(intent, entry)
 
     def _net_exit(self, intent: Intent) -> list[str]:
         idea = intent.idea_id
@@ -2150,8 +2089,6 @@ class ExecutionCoordinator:
             self.broker.cancel(ref)
         except OrderNotFound:
             pass  # no longer working: confirmed below
-        except AckLost as exc:  # outcome unknown: decided below from the broker's own view only
-            self.store.log(now, "CANCEL_ACK_LOST", order_ref=ref, idea_id=idea_id, error=str(exc))
         except BrokerError as exc:
             self.store.log(now, "CANCEL_FAILED", order_ref=ref, idea_id=idea_id, error=str(exc))
             return False
@@ -2191,24 +2128,11 @@ class ExecutionCoordinator:
                        idea_id=idea_id, wanted=left)
         return False
 
-    def _exit_not_netted(
-        self, intent: Intent, problems: list[str], awaiting: bool = False, basis: int = 0
-    ) -> None:
+    def _exit_not_netted(self, intent: Intent, problems: list[str]) -> None:
         now = self.clock()
-        marker = [EXIT_AWAITS_ENTRY_OUTCOME] if awaiting else []
         self.store.set_state(
-            intent.order_ref, IntentState.REFUSED, now,
-            reasons=[EXIT_NOT_NETTED, *marker, *problems],
+            intent.order_ref, IntentState.REFUSED, now, reasons=[EXIT_NOT_NETTED, *problems]
         )
-        if awaiting and not any(e.event == EXIT_AWAITS_ENTRY_OUTCOME
-                                for e in self.store.journal(intent.order_ref)):
-            # The exit's quantity and the position it was sized from: a REDUCE keeps its fraction.
-            self.store.log(
-                now, EXIT_AWAITS_ENTRY_OUTCOME, order_ref=intent.order_ref,
-                idea_id=intent.idea_id, quantity=intent.quantity, basis=max(basis, 1),
-                rule="the idea's entry moved or its cancel is unconfirmed: nothing sent; netted "
-                "again on later syncs and sent once the entry's outcome is confirmed",
-            )
         for row in self.store.orders(intent.order_ref):
             self.store.update_order(row.order_ref, now, status="NotSubmitted")
         detail = f"{intent.action.value} {intent.quantity} not sent: {problems}"

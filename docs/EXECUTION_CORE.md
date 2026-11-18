@@ -237,35 +237,31 @@ working exit quantity therefore never exceeds the position.
 
 The exit is sized from the position held when it is recorded. If the idea's own entry or add is
 still working, step 1 cancels it, and that cancel can lose the race: the remainder fills first and
-the position grows. The coordinator then treats the entry's outcome as confirmed only when every
-entry and add of the idea has left `open_orders()` and either filled completely (by its own
-executions) or has a terminal row in `completed_orders()` whose filled quantity equals the fills
-in the ledger. A lost acknowledgement of the cancel request is not a failure in itself: the
-cancel is still judged only from those broker reads.
+the position grows, so step 3 fails.
 
-* Confirmed in the same cycle: the exit is resized before anything is sent. A CLOSE takes the whole
-  confirmed position. A REDUCE keeps its fraction of the confirmed position, rounded down to whole
-  units. The netting then runs once more from step 1. If it fails again, the exit is refused as
-  before.
-* Not confirmed (the cancel was refused or never arrived, or the position grew but the entry's
-  final state is not yet visible): nothing is sent, the intent ends `REFUSED` with
-  `EXIT_NOT_NETTED` and `EXIT_AWAITS_ENTRY_OUTCOME`, and the `EXIT_NOT_NETTED` exception is open,
-  as before. Each later full `sync()` (not under the halt, and not from inside another netting)
-  nets that exit again exactly as a new one: it is sized to the position held then, re-priced from
-  a fresh quote, and the entry's cancel is asked again. Once the netting succeeds it is sent once
-  and the exception is resolved (`EXIT_NETTED_AFTER_ENTRY_SETTLED`).
-* The retry ends without sending when the idea holds nothing any more, or when a later REDUCE or
-  CLOSE of the idea was recorded (that one is handled on its own). A retry that finds no usable
-  quote ends as `EXIT_WITHOUT_QUOTE`, as any other stale exit.
+In that one case the exit is resized in the same cycle, before anything is sent, if every entry
+and add of the idea is confirmed over at the broker. Confirmed over means: none is recorded, of
+unknown outcome or working; none is still in `open_orders()`; and each one that reached the broker
+either filled completely by its own executions or has a terminal row in `completed_orders()` whose
+filled quantity equals the fills in the ledger. A CLOSE then takes the whole confirmed position. A
+REDUCE keeps its fraction of the confirmed position, rounded down to whole units. The netting then
+runs once more from step 1. If that second netting fails too (for example a protective stop fills
+in the race of its own cancel), the exit is refused with `EXIT_NOT_NETTED` exactly as before, and
+nothing is sent. The resize never raises an exit above the confirmed position, and the account
+check of step 6 still runs against the broker position, so the position cannot cross zero.
 
-Limits. The resize only ever lowers the exit relative to the confirmed position: no exit is sent
-for more than the confirmed held quantity, and the account check of step 6 still runs against the
-broker position, so the position cannot cross zero. While the entry's outcome stays unknown (for
-example an entry cancel that the broker keeps refusing, or an entry of unknown acknowledgement)
-the follower keeps holding after the publisher's exit, behind its protective stop and the open
-exception, until a human settles it or the cancel is confirmed. The reported outcome of the
-publisher's action is the one returned when it arrived (`REFUSED`); a later send shows in the
-intent, the journal and the ledger, not in that first answer.
+Everything else is unchanged. If the entry's outcome is not confirmed (its cancel was refused, the
+cancel's acknowledgement was lost, the cancel was not seen to complete, or the position grew but
+the entry's final state is not visible yet), the exit is refused with `EXIT_NOT_NETTED`, nothing is
+sent and the exception is open for the operator. That refusal is final, as before: no later cycle
+sends the exit, also when the remainder fills afterwards. The follower then still holds after the
+publisher's exit, behind its protective stop, until the operator acts.
+
+A deferred retry of such a refused exit is not built. Before any real broker, one would need at
+least: no re-entry and a fresh read of each exit before acting on it; its state and journal written
+in one transaction; the service's action row and alert following a later send; an operator way to
+end it; refused later exits not superseding it; a later OPEN or ADD of the idea ending it; and a
+bound with an expiry.
 
 ## Halt
 
@@ -310,7 +306,6 @@ While the halt file exists:
  APPLIED: a MODIFY whose new prices were seen at the broker
  RECORDED --halt file--> HALTED, for every action
  RECORDED exit --netting not confirmed--> REFUSED (EXIT_NOT_NETTED), nothing sent
- REFUSED exit + EXIT_AWAITS_ENTRY_OUTCOME --later sync, netted--> RECORDED --> sent once
  WORKING --left open orders, no completed row, not fully filled--> UNRESOLVED + ENTRY_STATE_UNKNOWN
 ```
 
