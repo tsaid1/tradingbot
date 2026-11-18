@@ -218,7 +218,8 @@ The broker's reduce-only flag is never relied on. Before a REDUCE or CLOSE is se
    has left `open_orders()` and appears terminal in `completed_orders()`. Otherwise a later fill
    could reopen the position unprotected.
 2. A CLOSE also cancels, and confirms, every earlier resting REDUCE / CLOSE of the idea.
-3. `sync()` applies anything that filled meanwhile. If the position changed, nothing is sent.
+3. `sync()` applies anything that filled meanwhile. If the position changed, nothing is sent,
+   except as described under "An exit that meets a working entry" below.
 4. The protective children are resized to `position − other working exits − this exit`, or
    cancelled when that is zero. Each change is confirmed at the broker.
 5. `sync()` runs again. A cancel or resize that lost the race with a fill changes the position, and
@@ -229,8 +230,44 @@ The broker's reduce-only flag is never relied on. Before a REDUCE or CLOSE is se
 
 Any step that cannot be confirmed within `ExecutionConfig.confirm_attempts` broker reads ends the
 intent `REFUSED` with `EXIT_NOT_NETTED` and an open exception. Nothing is sent, and the children
-are sized back to the position. The same netting runs before a recovery resend of an exit. The
-working exit quantity therefore never exceeds the position.
+are sized back to the position. One exception: a protective stop that filled in the race of its own
+cancel is not placed again. The units left are then without a stop, `UNPROTECTED_POSITION` is open
+beside `EXIT_NOT_NETTED`, and no later `sync()` places a new stop: the operator must act. The same
+netting runs before a recovery resend of an exit. The working exit quantity therefore never exceeds
+the position.
+
+### An exit that meets a working entry (review N7)
+
+The exit is sized from the position held when it is recorded. If the idea's own entry or add is
+still working, step 1 cancels it, and that cancel can lose the race: the remainder fills first and
+the position grows, so step 3 fails.
+
+In that one case the exit is resized in the same cycle, before anything is sent, if every entry
+and add of the idea is confirmed over at the broker. Confirmed over means: none is recorded, of
+unknown outcome or working; none is still in `open_orders()`; and each one that reached the broker
+either filled completely by its own executions or has a terminal row in `completed_orders()` whose
+filled quantity equals the fills in the ledger. A CLOSE then takes the whole confirmed position. A
+REDUCE keeps its fraction of the confirmed position, rounded down to whole units. The netting then
+runs once more from step 1. If that second netting fails too (for example a protective stop fills
+in the race of its own cancel), the exit is refused with `EXIT_NOT_NETTED` exactly as before, and
+nothing is sent. In that stop race the units the stop did not cover are left without a stop, with
+`UNPROTECTED_POSITION` open as well, and no later `sync()` places a new one; a stop that fills in
+its own cancel race ended the same way before this change. The resize never raises an exit above
+the confirmed position, and the account check of step 6 still runs against the broker position, so
+the position cannot cross zero.
+
+Everything else is unchanged. If the entry's outcome is not confirmed (its cancel was refused, the
+cancel's acknowledgement was lost, the cancel was not seen to complete, or the position grew but
+the entry's final state is not visible yet), the exit is refused with `EXIT_NOT_NETTED`, nothing is
+sent and the exception is open for the operator. That refusal is final, as before: no later cycle
+sends the exit, also when the remainder fills afterwards. The follower then still holds after the
+publisher's exit, behind its protective stop, until the operator acts.
+
+A deferred retry of such a refused exit is not built. Before any real broker, one would need at
+least: no re-entry and a fresh read of each exit before acting on it; its state and journal written
+in one transaction; the service's action row and alert following a later send; an operator way to
+end it; refused later exits not superseding it; a later OPEN or ADD of the idea ending it; and a
+bound with an expiry.
 
 ## Halt
 

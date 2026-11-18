@@ -369,6 +369,14 @@ class ExecutionStore:
             total += max(i.quantity - self.filled_quantity(i.order_ref), 0)
         return total
 
+    def set_intent_quantity(self, order_ref: str, quantity: int, at: datetime) -> None:
+        """Resize an exit that was never sent to the confirmed position (review N7)."""
+        with self.tx() as c:
+            c.execute(
+                "UPDATE exec_intents SET quantity=?, updated_at=? WHERE order_ref=?",
+                (quantity, at.isoformat(), order_ref),
+            )
+
     def set_intent_limit(self, order_ref: str, limit_price: str, at: datetime) -> None:
         """Re-price an exit that was never sent (review F8); nothing else changes a limit."""
         with self.tx() as c:

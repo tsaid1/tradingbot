@@ -37,6 +37,7 @@ from pydantic import Field, model_validator
 from tradingbot.event_models import ReplaySource, TradeAction
 from tradingbot.execution.broker import (
     ANCHOR_ENVIRONMENTS,
+    TERMINAL_STATUSES,
     WORKING_STATUSES,
     AckLost,
     Broker,
@@ -1848,10 +1849,22 @@ class ExecutionCoordinator:
         confirmed at the broker means nothing is sent and EXIT_NOT_NETTED is opened."""
         if self._halt_blocks(intent):
             return
+        pos = self.store.position(intent.idea_id)
+        basis = pos.quantity if pos is not None else 0
         problems = self._net_exit(intent)
         if problems:
-            self._exit_not_netted(intent, problems)
-            return
+            resized = self._exit_for_confirmed_entry(intent, order, basis)
+            if resized is None:
+                self._exit_not_netted(intent, problems)
+                return
+            intent, order = self.store.intent(intent.order_ref), resized
+            # Netted once more, never a third time. A second failure needs the position to move
+            # again between two nettings; with every entry over that is a protective fill, and it
+            # is refused exactly as on main.
+            problems = self._net_exit(intent)
+            if problems:
+                self._exit_not_netted(intent, problems)
+                return
         if self.config.exit_price_policy == "TOUCH":
             order = self._price_after_netting(intent, order)
             if order is None:
@@ -1897,6 +1910,70 @@ class ExecutionCoordinator:
                        idea_id=intent.idea_id, before_netting=before, sent=str(limit), reads=reads,
                        rule="touch exit: the limit sent is the bid read after the stop was cancelled")
         return order.model_copy(update={"limit_price": limit})
+
+    def _exit_for_confirmed_entry(
+        self, intent: Intent, order: OrderIntent, basis: int
+    ) -> OrderIntent | None:
+        """Review N7: the netting failed. When the idea's own entry or add grew the position while
+        it was being cancelled (the cancel lost the race to a fill) and every entry and add of the
+        idea is now confirmed over at the broker, the exit is resized to the confirmed position (a
+        CLOSE to all of it, a REDUCE to the same fraction, rounded down) and the resized order is
+        returned, to be netted once more. Otherwise None: refused exactly as before."""
+        pos = self.store.position(intent.idea_id)
+        if pos is None or basis < 1 or pos.quantity <= basis:
+            return None
+        if not self._entries_confirmed_over(intent.idea_id):
+            return None
+        qty = pos.quantity if intent.action == Action.CLOSE else (
+            pos.quantity * intent.quantity // basis
+        )
+        committed = self.store.committed_exit_quantity(intent.idea_id, exclude_ref=intent.order_ref)
+        if qty < 1 or qty + committed > pos.quantity or _rule_problems(order.contract, qty):
+            return None
+        now = self.clock()
+        self.store.set_intent_quantity(intent.order_ref, qty, now)
+        row = self.store.order(intent.order_ref)
+        self.store.update_order(intent.order_ref, now, status=row.status, quantity=qty)
+        self.store.log(
+            now, "EXIT_RESIZED_TO_CONFIRMED_ENTRY", order_ref=intent.order_ref,
+            idea_id=intent.idea_id, before=intent.quantity, after=qty, position_before=basis,
+            position=pos.quantity,
+            rule="the entry's outcome is confirmed at the broker: the exit is sized to it",
+        )
+        return order.model_copy(update={"quantity": qty})
+
+    def _entries_confirmed_over(self, idea_id: str) -> bool:
+        """Every entry and add of the idea is over at the broker and its fills are applied: none is
+        recorded, of unknown outcome or working, none is still in open orders, and each one that
+        reached the broker either filled completely (its own executions) or has a terminal row in
+        completed orders whose filled quantity equals the fills in the ledger."""
+        intents = [i for i in self.store.intents()
+                   if i.idea_id == idea_id and i.action in (Action.OPEN, Action.ADD)]
+        if not intents:
+            return False
+        since = min(i.created_at for i in intents) - COMPLETED_LOOKBACK
+        try:
+            working = {o.order_ref for o in self.broker.open_orders()}
+            done = {o.order_ref: o for o in self.broker.completed_orders(since=since)}
+        except BrokerError:
+            return False
+        for i in intents:
+            if i.state in (IntentState.REFUSED, IntentState.HALTED) and i.attempts == 0:
+                continue  # never sent
+            if i.state not in (IntentState.FILLED, IntentState.CANCELLED, IntentState.REJECTED):
+                return False
+            if i.order_ref in working:
+                return False
+            filled = self.store.filled_quantity(i.order_ref)
+            row = done.get(i.order_ref)
+            if row is None:
+                if i.state == IntentState.CANCELLED or (
+                    filled < i.quantity if i.state == IntentState.FILLED else filled
+                ):
+                    return False
+            elif row.status not in TERMINAL_STATUSES or row.filled_quantity != filled:
+                return False
+        return True
 
     def _net_exit(self, intent: Intent) -> list[str]:
         idea = intent.idea_id
