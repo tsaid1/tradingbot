@@ -3359,7 +3359,7 @@ class ExecutionCoordinator:
             buy = intent.side == OrderSide.BUY.value
             out.append(Exposure(
                 sec_type=sec, units=left, mark=price, multiplier=mult, entry=price, stop=stop,
-                short=not buy,
+                short=not buy, working=True,
                 margin_initial=self.risk_margin_by_symbol.get(intent.symbol),
                 buy_cost=price * left * mult if buy and sec not in ("FUT", "CFD") else Decimal(0),
                 currency=stored.currency if stored else "USD"))

@@ -104,6 +104,63 @@ def test_under_a_table_a_stock_entry_beyond_cash_is_borrowing(tmp_path):
     assert G.BORROWING_NOT_PERMITTED in h.coord.intent(out.order_ref).reasons
 
 
+def test_under_a_table_a_purchase_paid_from_filled_short_proceeds_is_borrowing(tmp_path):
+    """The coordinator marks a filled short as filled and a working short sale as working, and a
+    purchase that only the filled short's proceeds pay for is a loan (docs/RISK_GATES.md, G1)."""
+    other, third = "QZQZ", "QZQY"  # invented stocks
+    h = Harness(tmp_path, risk_families=((SYMBOL, "STK", "1"), (other, "STK", "1"),
+                                         (third, "STK", "1")))
+    for sym in (other, third):
+        h.broker.set_quote(sym, "49.98", "50.02")
+    h.broker.account_cash = D(150)  # invented: own cash below a 4 x 50.02 purchase
+    short = h.execute("p1", open_action(side=PositionSide.SHORT, entry="49.98", stop="52",
+                                        target="45"))
+    assert short.replay_status == "EXECUTED"  # 4 x 49.98 = 199.92 credited to cash
+    sell = h.execute("p2", open_action("o2", symbol=other, side=PositionSide.SHORT,
+                                       entry="50.02", stop="52", target="45"))
+    assert sell.replay_status == "WORKING"  # above the bid: a working short sale
+    flags = sorted((e.working, e.entry) for e in h.coord._risk_portfolio(None, h.clock.now())
+                   if e.short)
+    assert flags == [(False, D("49.98")), (True, D("50.02"))]
+    assert h.broker.account_values().total_cash >= 4 * D("50.02")  # the proceeds would pay
+    t = deepcopy(INVENTED_RISK_TABLE)
+    t["borrowing"] = {"permitted": False, "short_sale_permitted": False}
+    h.coord.policy = h.coord.policy.model_copy(update={"risk": RiskPolicy.from_table(t)})
+    buy = h.execute("p3", open_action("o3", symbol=third))
+    assert G.BORROWING_NOT_PERMITTED in h.coord.intent(buy.order_ref).reasons
+    assert h.broker.submit_calls == 2  # the short and the working sale only
+
+
+def test_under_a_table_a_foreign_short_beside_a_ledger_short_is_stopped_by_portfolio_risk(tmp_path):
+    """G1 takes a broker-only remainder at the broker's average over the whole position. When that
+    remainder was sold above the ledger's price the proceeds taken out are too small and G1 can
+    under-count. The entry is refused all the same, because a broker-only position makes portfolio
+    risk unbounded (G5). This pins that dependency (docs/RISK_GATES.md, G1)."""
+    other, third = "QZQZ", "QZQY"  # invented stocks
+    h = Harness(tmp_path, risk_families=((SYMBOL, "STK", "1"), (other, "STK", "1"),
+                                         (third, "STK", "1")))
+    for sym in (other, third):
+        h.broker.set_quote(sym, "49.98", "50.02")
+    h.broker.account_cash = D(1000)
+    short = h.execute("p1", open_action("o1", symbol=other, side=PositionSide.SHORT,
+                                        entry="49.98", stop="60", target="40"))
+    assert short.replay_status == "EXECUTED"  # the ledger's short: 4 at 49.98
+    h.broker.set_quote(other, "55.00", "55.04")  # invented: a sale the ledger does not know, higher
+    h.broker.submit(OrderIntent(order_ref="FOREIGN", contract=h.broker.resolve(
+        open_action(symbol=other).instrument), side=OrderSide.SELL, quantity=2,
+        order_type=OrderType.MKT))
+    h.coord.sync()
+    h.broker.set_quote(other, "49.98", "50.02")
+    remainder = [e for e in h.coord._risk_portfolio(None, h.clock.now())
+                 if e.short and e.stop is None]
+    assert [e.units for e in remainder] == [2]
+    assert D("49.98") < remainder[0].entry < D("55.00")  # the average, not the price it sold at
+    sent = h.broker.submit_calls
+    buy = h.execute("p3", open_action("o3", symbol=third))
+    assert G.PORTFOLIO_UNBOUNDED in h.coord.intent(buy.order_ref).reasons
+    assert h.broker.submit_calls == sent  # the purchase never reached the broker
+
+
 # ----------------------------------------------------------------------------- the gateway
 
 def test_the_unmapped_stock_path_is_gated_by_the_execution_core_not_the_gateway():

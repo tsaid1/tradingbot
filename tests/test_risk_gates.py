@@ -5,6 +5,7 @@ is a proposal, an owner's value or a contract specification.
 """
 from __future__ import annotations
 
+import itertools
 from copy import deepcopy
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal as D
@@ -418,8 +419,9 @@ def test_new1_borrowed_cash_and_borrowed_stock_are_one_total():
     p = short_table()  # max_borrowed 1000
     short_900 = Exposure(sec_type="STK", units=9, mark=D(100), multiplier=D(1), entry=D(100),
                          stop=D(102), short=True)
-    # A short held, then a purchase 900 beyond cash: 900 + 900 = 1800 borrowed.
-    r = run(etf(units=9), ETF, p, acct=account(total_cash=D(0)), portfolio=[short_900])
+    # A short held, then a purchase 900 beyond cash: 900 + 900 = 1800 borrowed. The account's
+    # own cash is 0; total cash holds the short's 900 proceeds.
+    r = run(etf(units=9), ETF, p, acct=account(total_cash=D(900)), portfolio=[short_900])
     only(r, "G1", G.BORROWING_LIMIT)
     assert gate(r, "G1").value == D(1800) and r.borrowing == D(1800)
     # A purchase 900 beyond cash held (cash -900), then a 900 short sale.
@@ -431,12 +433,71 @@ def test_new1_borrowed_cash_and_borrowed_stock_are_one_total():
     assert run(etf(side="SHORT", stop=D(102), units=9), ETF, p).passed
     # Exactly at the limit passes (600 short + 400 loan); one unit over fails.
     short_600 = Exposure(**{**short_900.__dict__, "units": 6})
-    r = run(etf(units=4), ETF, p, acct=account(total_cash=D(0)), portfolio=[short_600])
+    r = run(etf(units=4), ETF, p, acct=account(total_cash=D(600)), portfolio=[short_600])
     assert r.passed and r.borrowing == D(1000)
-    r = run(etf(units=4), ETF, p, acct=account(total_cash=D(-1)), portfolio=[short_600])
+    r = run(etf(units=4), ETF, p, acct=account(total_cash=D(599)), portfolio=[short_600])
     only(r, "G1", G.BORROWING_LIMIT)
     assert r.borrowing == D(1001)
 
+
+
+def test_g1_a_purchase_paid_from_filled_short_proceeds_is_a_loan():
+    """The documented under-count: own cash 0, a filled 900 short (total cash rises to 900), then
+    a 900 purchase paid from those proceeds borrows 900 cash plus the 900 of borrowed stock."""
+    p = short_table()  # max_borrowed 1000
+    filled = Exposure(sec_type="STK", units=9, mark=D(100), multiplier=D(1), entry=D(100),
+                      stop=D(102), short=True)
+    r = run(etf(units=9), ETF, p, acct=account(total_cash=D(900)), portfolio=[filled])
+    only(r, "G1", G.BORROWING_LIMIT)
+    assert r.borrowing == D(1800)
+    # After such a purchase (total cash 0, the 900 long held), a further 100 short: 1900.
+    long_900 = Exposure(sec_type="STK", units=9, mark=D(100), multiplier=D(1), entry=D(100),
+                        stop=D(98))
+    r = run(etf(side="SHORT", stop=D(102), units=1), ETF, p, acct=account(total_cash=D(0)),
+            portfolio=[filled, long_900])
+    only(r, "G1", G.BORROWING_LIMIT)
+    assert r.borrowing == D(1900)
+    # A working short sale has credited nothing yet: the 900 in cash is the account's own.
+    working = Exposure(**{**filled.__dict__, "working": True})
+    r = run(etf(units=9), ETF, p, acct=account(total_cash=D(900)), portfolio=[working])
+    assert r.passed and r.borrowing == D(900)
+    # Without borrowing permitted, spending a held short's proceeds is refused as a loan.
+    no_loans = short_table(permitted=False, max_borrowed=None)
+    only(run(etf(units=9), ETF, no_loans, acct=account(total_cash=D(900)), portfolio=[filled]),
+         "G1", G.BORROWING_NOT_PERMITTED)
+    # A filled short whose sale price is unknown refuses (its proceeds cannot be taken out).
+    unknown = Exposure(**{**filled.__dict__, "entry": None})
+    g1 = gate(run(etf(units=9), ETF, p, acct=account(total_cash=D(900)), portfolio=[unknown]),
+              "G1")
+    assert g1.status == "FAIL" and g1.codes == (f"{G.INPUT_MISSING}:G1:ENTRY",)
+
+
+def test_g1_borrowing_is_never_below_an_independent_reference():
+    """Every combination of: own cash 0 or 1000, a filled long, a filled short (marked below or
+    above its sale price), a working buy, a working short sale, and a long or short proposal of 9
+    at 100. The reference keeps the account's own money and the short proceeds apart."""
+    p = short_table(max_borrowed="1000000")
+    one = {"sec_type": "STK", "multiplier": D(1), "entry": D(100)}
+    for own_cash, longs, shorts, short_mark, buys, sells, side in itertools.product(
+            (D(0), D(1000)), (0, 5), (0, 9), (D(80), D(120)), (0, 3), (0, 4), ("LONG", "SHORT")):
+        own = own_cash - longs * 100  # filled purchases were paid from own money
+        total_cash = own + shorts * 100  # filled short sales credited 100 a unit
+        demand = (900 if side == "LONG" else 0) + buys * 100
+        reference = max(D(0), demand - own) + shorts * short_mark + sells * 100 \
+            + (900 if side == "SHORT" else 0)
+        portfolio = [e for n, e in (
+            (longs, Exposure(**one, units=longs, mark=D(100), stop=D(98))),
+            (shorts, Exposure(**one, units=shorts, mark=short_mark, stop=D(130), short=True)),
+            (buys, Exposure(**one, units=buys, mark=D(100), stop=D(98), working=True,
+                            buy_cost=D(buys * 100))),
+            (sells, Exposure(**one, units=sells, mark=D(100), stop=D(102), short=True,
+                             working=True)),
+        ) if n]
+        r = run(etf(side=side, units=9, stop=D(98) if side == "LONG" else D(102)), ETF, p,
+                acct=account(total_cash=total_cash), portfolio=portfolio)
+        case = (own_cash, longs, shorts, short_mark, buys, sells, side)
+        assert r.borrowing is not None and r.borrowing >= reference, case
+        assert r.borrowing == reference, case  # and nothing is counted twice
 
 def test_s2_writing_an_option_is_refused_whatever_the_table_says():
     t = deepcopy(TABLE)
