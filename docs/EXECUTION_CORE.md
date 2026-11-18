@@ -230,8 +230,11 @@ The broker's reduce-only flag is never relied on. Before a REDUCE or CLOSE is se
 
 Any step that cannot be confirmed within `ExecutionConfig.confirm_attempts` broker reads ends the
 intent `REFUSED` with `EXIT_NOT_NETTED` and an open exception. Nothing is sent, and the children
-are sized back to the position. The same netting runs before a recovery resend of an exit. The
-working exit quantity therefore never exceeds the position.
+are sized back to the position. One exception: a protective stop that filled in the race of its own
+cancel is not placed again. The units left are then without a stop, `UNPROTECTED_POSITION` is open
+beside `EXIT_NOT_NETTED`, and no later `sync()` places a new stop: the operator must act. The same
+netting runs before a recovery resend of an exit. The working exit quantity therefore never exceeds
+the position.
 
 ### An exit that meets a working entry (review N7)
 
@@ -247,8 +250,11 @@ filled quantity equals the fills in the ledger. A CLOSE then takes the whole con
 REDUCE keeps its fraction of the confirmed position, rounded down to whole units. The netting then
 runs once more from step 1. If that second netting fails too (for example a protective stop fills
 in the race of its own cancel), the exit is refused with `EXIT_NOT_NETTED` exactly as before, and
-nothing is sent. The resize never raises an exit above the confirmed position, and the account
-check of step 6 still runs against the broker position, so the position cannot cross zero.
+nothing is sent. In that stop race the units the stop did not cover are left without a stop, with
+`UNPROTECTED_POSITION` open as well, and no later `sync()` places a new one; a stop that fills in
+its own cancel race ended the same way before this change. The resize never raises an exit above
+the confirmed position, and the account check of step 6 still runs against the broker position, so
+the position cannot cross zero.
 
 Everything else is unchanged. If the entry's outcome is not confirmed (its cancel was refused, the
 cancel's acknowledgement was lost, the cancel was not seen to complete, or the position grew but
