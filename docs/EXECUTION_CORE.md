@@ -218,7 +218,8 @@ The broker's reduce-only flag is never relied on. Before a REDUCE or CLOSE is se
    has left `open_orders()` and appears terminal in `completed_orders()`. Otherwise a later fill
    could reopen the position unprotected.
 2. A CLOSE also cancels, and confirms, every earlier resting REDUCE / CLOSE of the idea.
-3. `sync()` applies anything that filled meanwhile. If the position changed, nothing is sent.
+3. `sync()` applies anything that filled meanwhile. If the position changed, nothing is sent,
+   except as described under "An exit that meets a working entry" below.
 4. The protective children are resized to `position − other working exits − this exit`, or
    cancelled when that is zero. Each change is confirmed at the broker.
 5. `sync()` runs again. A cancel or resize that lost the race with a fill changes the position, and
@@ -231,6 +232,40 @@ Any step that cannot be confirmed within `ExecutionConfig.confirm_attempts` brok
 intent `REFUSED` with `EXIT_NOT_NETTED` and an open exception. Nothing is sent, and the children
 are sized back to the position. The same netting runs before a recovery resend of an exit. The
 working exit quantity therefore never exceeds the position.
+
+### An exit that meets a working entry (review N7)
+
+The exit is sized from the position held when it is recorded. If the idea's own entry or add is
+still working, step 1 cancels it, and that cancel can lose the race: the remainder fills first and
+the position grows. The coordinator then treats the entry's outcome as confirmed only when every
+entry and add of the idea has left `open_orders()` and either filled completely (by its own
+executions) or has a terminal row in `completed_orders()` whose filled quantity equals the fills
+in the ledger. A lost acknowledgement of the cancel request is not a failure in itself: the
+cancel is still judged only from those broker reads.
+
+* Confirmed in the same cycle: the exit is resized before anything is sent. A CLOSE takes the whole
+  confirmed position. A REDUCE keeps its fraction of the confirmed position, rounded down to whole
+  units. The netting then runs once more from step 1. If it fails again, the exit is refused as
+  before.
+* Not confirmed (the cancel was refused or never arrived, or the position grew but the entry's
+  final state is not yet visible): nothing is sent, the intent ends `REFUSED` with
+  `EXIT_NOT_NETTED` and `EXIT_AWAITS_ENTRY_OUTCOME`, and the `EXIT_NOT_NETTED` exception is open,
+  as before. Each later full `sync()` (not under the halt, and not from inside another netting)
+  nets that exit again exactly as a new one: it is sized to the position held then, re-priced from
+  a fresh quote, and the entry's cancel is asked again. Once the netting succeeds it is sent once
+  and the exception is resolved (`EXIT_NETTED_AFTER_ENTRY_SETTLED`).
+* The retry ends without sending when the idea holds nothing any more, or when a later REDUCE or
+  CLOSE of the idea was recorded (that one is handled on its own). A retry that finds no usable
+  quote ends as `EXIT_WITHOUT_QUOTE`, as any other stale exit.
+
+Limits. The resize only ever lowers the exit relative to the confirmed position: no exit is sent
+for more than the confirmed held quantity, and the account check of step 6 still runs against the
+broker position, so the position cannot cross zero. While the entry's outcome stays unknown (for
+example an entry cancel that the broker keeps refusing, or an entry of unknown acknowledgement)
+the follower keeps holding after the publisher's exit, behind its protective stop and the open
+exception, until a human settles it or the cancel is confirmed. The reported outcome of the
+publisher's action is the one returned when it arrived (`REFUSED`); a later send shows in the
+intent, the journal and the ledger, not in that first answer.
 
 ## Halt
 
@@ -275,6 +310,7 @@ While the halt file exists:
  APPLIED: a MODIFY whose new prices were seen at the broker
  RECORDED --halt file--> HALTED, for every action
  RECORDED exit --netting not confirmed--> REFUSED (EXIT_NOT_NETTED), nothing sent
+ REFUSED exit + EXIT_AWAITS_ENTRY_OUTCOME --later sync, netted--> RECORDED --> sent once
  WORKING --left open orders, no completed row, not fully filled--> UNRESOLVED + ENTRY_STATE_UNKNOWN
 ```
 

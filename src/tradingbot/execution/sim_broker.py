@@ -391,7 +391,9 @@ class SimBroker:
 
     def script_next_cancel(self, behaviour: str) -> None:
         """``FILL_FIRST`` (strict: the order fills its remaining quantity before the cancel takes
-        effect, so the cancel loses the race) | ``REJECT`` (the cancel request fails)"""
+        effect, so the cancel loses the race) | ``REJECT`` (the cancel request fails) |
+        ``LOST_ACK_APPLIED`` (the cancel is applied, its acknowledgement lost) |
+        ``LOST_ACK_NOT_APPLIED`` (the request never arrived, its acknowledgement lost)"""
         self._cancel_script.append(behaviour)
 
     def set_quote(
@@ -862,6 +864,12 @@ class SimBroker:
     def cancel(self, order_ref: str) -> BrokerOrder:
         self._check_session()
         behaviour = self._cancel_script.popleft() if self._cancel_script else "APPLY"
+        if behaviour == "LOST_ACK_NOT_APPLIED":
+            raise AckLost("simulated: cancel lost before reaching the broker")
+        if behaviour == "LOST_ACK_APPLIED":
+            self._cancel_script.appendleft("APPLY")  # applied exactly as a normal cancel
+            self.cancel(order_ref)
+            raise AckLost("simulated: cancel accepted, acknowledgement lost")
         with self._tx() as c:
             self._settle(c)
             row = self._working_row(c, order_ref)
