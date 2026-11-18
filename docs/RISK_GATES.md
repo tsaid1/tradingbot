@@ -65,19 +65,23 @@ family or from the global `[policy]` collar.
 * **Effective equity** = min(`allocated_equity`, broker net liquidation). Both are recorded. If
   net liquidation is unreadable or stale, the gates that need it refuse.
 * **Borrowing** (G1, securities only) = max(0, purchase cost + cash committed by working buy
-  entries - total cash) + the value of borrowed stock (the proposed short stock sale, units x
+  entries - own cash) + the value of borrowed stock (the proposed short stock sale, units x
   price x multiplier, plus every short stock position and working short sale at its mark),
-  compared as one total with `max_borrowed`. A short stock sale needs `short_sale_permitted` AND
+  compared as one total with `max_borrowed`. **Own cash** = total cash - the proceeds of every
+  filled short (units x entry x multiplier, any short that is not a future or CFD): a filled
+  short sale credits its proceeds to total cash, but that cash is held against the borrowed
+  stock, so a purchase paid from it is a loan. A working short sale has credited nothing and is
+  not taken out. The execution core marks each exposure: ledger and broker-only positions are
+  filled, working entries are `working` (an exposure that does not say so counts as filled, the
+  larger loan). The proceeds are taken at the position's entry (the price credited; a partial
+  cover leaves the realised gain or loss in own cash). A filled short with no known entry refuses
+  (`RISK_INPUT_MISSING:G1:ENTRY`). This assumes total cash and the positions are read from one
+  consistent account state, as the simulated account gives them. Under a table with `permitted`
+  false, a purchase that only short proceeds would pay for is refused
+  (`RISK_BORROWING_NOT_PERMITTED`). A short stock sale needs `short_sale_permitted` AND
   `permitted`. Writing an option is
   refused in this build whatever the table says (`RISK_SHORT_OPTION_NOT_SUPPORTED`; no key enables
   it); a long, fully paid option is a cash purchase. Futures initial margin is not borrowing.
-  **Known limit (open; independent review, final check at `30b3873`):** the proceeds of a filled
-  short sale are not taken out of total cash, so a purchase paid from those proceeds is not
-  counted as a loan. The borrowed stock is still counted, so the true borrowing can exceed the
-  reported total by at most the short value, never past twice `max_borrowed`. It cannot occur in
-  the cash baseline and needs BOTH `permitted` and `short_sale_permitted`. **Do not enable both
-  keys in a risk table until this is fixed** (mark filled positions in the portfolio view and take
-  filled short value out of total cash in the loan term).
 * **Cash sufficiency is checked only under a `[risk]` table** (G1). The cash baseline does not
   compare a long stock's cost with cash: "fully paid" is not verified there. As on main, only the
   existing absolute notional and exposure caps bound a long stock.
@@ -199,9 +203,13 @@ second PAPER answer covers the extra G9 read before the last-step check.
 * `tests/test_risk_gates.py`: each gate's boundary (passes at the limit, fails just past it,
   reports only its own code), all nine failing at once, the baseline, config refusals, staleness,
   family isolation (TLT's 5% and 0.3% / 0.6% never appear in another family's decision), the
-  what-if hook.
+  what-if hook. G1's borrowed total equals an independently written reference (own money and
+  short proceeds kept apart) over every combination of cash, a filled long, a filled short marked
+  below or above its sale price, a working buy, a working short sale and a long or short
+  proposal.
 * `tests/test_risk_gates_wiring.py`: the coordinator (baseline unchanged and recorded, short
-  refused, LIVE refused, exits exempt with every gate failing), the gateway, the simulated
+  refused, LIVE refused, exits exempt with every gate failing, a purchase paid from filled
+  short proceeds refused as a loan), the gateway, the simulated
   account, shadow reading nothing real, config, the policy digest, the shipped configs, the pinned
   allow-lists, and the multi-asset scenarios with and without the table.
 * Off-equals-main: the shipped cash TLT path is identical on main and on this branch with no

@@ -120,6 +120,9 @@ class Exposure:
     buy_cost: Decimal = Decimal(0)  # cash a working buy entry commits (G1)
     currency: str = "USD"
     short: bool = False  # a short position or working sell entry (a short stock borrows, G1)
+    # A working entry, not yet filled. False (the default) is a filled position: a filled short's
+    # proceeds are in total cash and G1 takes them out of it; a working short sale has none yet.
+    working: bool = False
 
 
 @dataclass(frozen=True)
@@ -350,12 +353,21 @@ def g1_borrowing(c: _Ctx) -> tuple[GateResult, Decimal | None]:
     codes += c.account_problem("G1", "total_cash")
     if c.cost is None:
         codes.append(f"{INPUT_MISSING}:G1:COST")
+    # Filled short sales (stock, or any short that is not performance-margined) credited their
+    # proceeds to total cash. That cash is the lender's collateral, not the account's own: it is
+    # taken out, at the price it was credited (the position's entry), before the loan is measured.
+    filled_shorts = [e for e in c.portfolio or () if e.short and not e.working
+                     and e.sec_type not in ("FUT", "CFD")]
+    if any(e.entry is None for e in filled_shorts):
+        codes.append(f"{INPUT_MISSING}:G1:ENTRY")
     if codes:
         return _result("G1", codes), None
-    # Borrowed cash: the purchase (if a long) plus working buy entries beyond total cash.
+    proceeds = sum((e.entry * e.units * e.multiplier for e in filled_shorts), Decimal(0))
+    # Borrowed cash: the purchase (if a long) plus working buy entries beyond the account's own
+    # cash (total cash less filled short proceeds).
     committed = sum((e.buy_cost for e in c.portfolio), Decimal(0))
     loan = max(Decimal(0), (c.cost if c.long else Decimal(0)) + committed
-               - c.account.total_cash)
+               - (c.account.total_cash - proceeds))
     borrowed = loan
     if rules.permitted:
         # Plus the borrowed securities: this sale (if a short stock) and every short stock
