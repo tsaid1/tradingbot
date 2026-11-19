@@ -6,8 +6,9 @@ recommendations page (``reviewer_app.py``) as its restricted vocabulary mode.
 Per item, three areas kept apart: (1) SOURCE EVIDENCE (FULL access only), (2) THE READER'S READING,
 (3) THE SYSTEM'S READING, hidden under blind-first until an INDEPENDENT reading is saved on
 every form of the post. The form follows the rubric (``runtime/adjudication_rubric.py``, version
-2.2); two static pages show the reviewer guide and the field reference. A choice control shows
-codes only; the complete meaning of every option is plain text beside it (``_choices``). Every
+2.2); two static pages show the reviewer guide and the field reference. A select control (a list
+or a multiple choice) shows codes only; the complete meaning of every option is plain text
+beside it or above its rows (``_choices``). Every
 publisher or bundle string is plain text (``st.text`` / ``st.code``); images only from the
 bundle's ``media/`` by a name the post lists. The only write is the annotation log. No broker,
 order, mapping, lexicon or policy code; no upload, download, file browser or path input.
@@ -31,14 +32,18 @@ NOT_STATED = "(not stated)"
 NOT_READ_TEXT = "not read by the system"
 # A select control draws every option, and the option chosen, on ONE line that never wraps, in a
 # list exactly as wide as the control: a meaning inside an option text is cut off wherever the
-# control is narrow. So an option's text is its code alone (``_short``), a choice control has a
-# fixed width that fits its longest code at any window width or zoom, and the complete meaning of
-# every option is plain, wrapping text beside the control (``_choices``), under it where the
-# window is narrow. Widths are CSS pixels.
-CONTROL_PX = 320  # a choice control: fits "SEQUENCE:<id>" and the longest code
+# control is narrow. So an option's text is its code alone (``_short``); a select control has a
+# width of its own, which no neighbour narrows and which fits its longest option (``_fit``) in
+# any window at least that wide (a narrower window narrows the control to its own width); and
+# the complete meaning of every option is plain, wrapping text beside the control
+# (``_choices``), under it where the window is narrow. A radio keeps its meanings in its option
+# texts: those wrap. Widths are CSS pixels, measured in Chrome at the default text size.
+CONTROL_PX = 320  # a select control of the form: fits the rubric's longest code
 MEANINGS_PX = 440  # the meanings beside it: both fit a 1280-pixel window with the sidebar open
 ROW_PX = {"role": 250, "exactness": 165, "contract_month": 165, "month_named": 140}
 FURTHER_PX = {"timing": 170, "action": 200, "family": 170, "side": 200}
+CHROME_PX = 50  # of a select control's width: its padding and its arrow
+LETTER_PX = 8  # a capital letter, a digit or an underscore of a code takes up to about this
 REPEAT_TABLE_CHOICES_FROM = 4  # rows: from here the table's meanings are offered again below it
 
 
@@ -143,6 +148,13 @@ def _short(code) -> str:
     return "(unanswered)" if code == "" else str(code)
 
 
+def _fit(px: int, options) -> int:
+    """The width of a select control: ``px``, or more when its longest option text needs more
+    (an idea identifier may have 64 characters; the rubric's longest code has 25). In a window
+    narrower than that the control is as wide as the window and a longer option is cut."""
+    return max(px, CHROME_PX + LETTER_PX * max((len(_short(o)) for o in options), default=0))
+
+
 def _choices(f: str, options) -> str:
     """The complete meaning of every option a control offers, one option per line, for the plain
     text beside the control. The bundle's markets share one meaning and take one line, and so do
@@ -215,8 +227,8 @@ def _collect(prefix: str, item: dict, defaults: dict, details: list[dict]) -> di
 
 
 def _widget(prefix: str, f: str, bundle: A.Bundle, item: dict, defaults: dict, col) -> None:
-    """One answered field: a closed choice (codes in the control, every option's complete meaning
-    beside it), or a value with its answer state."""
+    """One answered field: a closed choice (a select control lists codes, with every option's
+    complete meaning beside it), or a value with its answer state."""
     current = _peek(prefix, f, defaults)
     if f == "component":
         col.radio(_label(f), R.COMPONENTS, key=_key(prefix, f), help=_help(f),
@@ -245,7 +257,7 @@ def _widget(prefix: str, f: str, bundle: A.Bundle, item: dict, defaults: dict, c
         row = col.container(horizontal=True)
         row.selectbox(_label(f), options, key=_key(prefix, f), help=_help(f),
                       index=options.index(current) if current in options else 0,
-                      format_func=_short, width=CONTROL_PX)
+                      format_func=_short, width=_fit(CONTROL_PX, options))
         row.text(_choices(f, options), width=MEANINGS_PX)
 
 
@@ -268,7 +280,8 @@ def _additional(prefix: str, bundle: A.Bundle, defaults: dict, col) -> None:
             options = ("", *allowed[k])
             row.selectbox(f"further action {j + 1}: {k}", options, key=f"{prefix}_aa_{j}_{k}",
                           index=options.index(value) if value in options else 0,
-                          help=R.ADDITIONAL_HELP[k], format_func=_short, width=FURTHER_PX[k])
+                          help=R.ADDITIONAL_HELP[k], format_func=_short,
+                          width=_fit(FURTHER_PX[k], options))
 
 
 def _verdict(prefix: str, f: str, value, system: dict, item: dict, col, verdicts: dict) -> None:
@@ -291,10 +304,10 @@ def _verdict(prefix: str, f: str, value, system: dict, item: dict, col, verdicts
 def _inputs(prefix: str, bundle: A.Bundle, item: dict, defaults: dict, ctx,
             system: dict | None = None, compared=()) -> tuple[dict, dict]:
     """The reading form, field groups A to I: plain-English labels with the field name in
-    brackets, a tooltip on every field, the complete meaning of every option beside its control,
-    fields that do not apply greyed with the reason, derived values read-only. With ``system``
-    (after the reveal): the system's value under each field and a verdict on it, pre-filled from
-    the comparison. Nothing of the system's reading fills an answer, in any mode."""
+    brackets, a tooltip on every field, the complete meaning of every option beside its control
+    (above the rows of the price table and of the further actions), fields that do not apply
+    greyed with the reason, derived values read-only. With ``system`` (after the reveal): the
+    system's value under each field and a verdict on it, pre-filled from the comparison. Nothing of the system's reading fills an answer, in any mode."""
     details = A.table_row_details(bundle, item)
     status = R.applicability(R.complete(_collect(prefix, item, defaults, details), ctx), ctx)
     verdicts: dict = {}
@@ -411,7 +424,7 @@ def _price_table(prefix, bundle, item, details, defaults, status, system) -> dic
                 options = ("", *allowed[c])
                 line.selectbox(label, options, key=f"{prefix}_lv_{d['key']}_{c}", help=_help(c),
                                index=options.index(row[c]) if row[c] in options else 0,
-                               format_func=_short, width=ROW_PX[c])
+                               format_func=_short, width=_fit(ROW_PX[c], options))
         chosen = [f"{c} {_meaning(c, row[c])}" for c in allowed
                   if row_status[c].state == R.ASK and row[c] in allowed[c]]
         if chosen:  # the complete meaning of what this row holds, where the row is
