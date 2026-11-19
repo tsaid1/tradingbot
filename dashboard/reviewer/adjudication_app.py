@@ -456,7 +456,11 @@ def _table_choices(title: str, allowed: dict, *, expanded: bool) -> None:
             st.text(f"{R.BY_NAME[c].question} [{c}]\n" + _choices(c, options))
 
 
-def _extras(prefix: str, *, approval: bool = False) -> tuple[list, str, str]:
+def _extras(prefix: str, *, approval: bool = False,
+            notice: str | None = None) -> tuple[list, str, str]:
+    """Flags, confidence and notes. ``notice`` (what the log already holds of this form) stands
+    directly above the confidence: after a save that is where the reviewer looks, and the
+    confidence under it is empty again."""
     flags = []
     if not approval:
         row = st.container(horizontal=True)
@@ -464,6 +468,8 @@ def _extras(prefix: str, *, approval: bool = False) -> tuple[list, str, str]:
                                 help=_help("flags"), format_func=_short, width=CONTROL_PX,
                                 wrap=True)
         row.text(_choices("flags", A.FLAGS), width=MEANINGS_PX)
+    if notice:
+        st.success(notice)
     confidence = "" if approval else st.radio(
         _label("confidence"), A.CONFIDENCE, index=None, horizontal=True,
         key=f"{prefix}_confidence", help=_help("confidence"),
@@ -473,14 +479,20 @@ def _extras(prefix: str, *, approval: bool = False) -> tuple[list, str, str]:
     return flags, confidence or "", notes
 
 
-def _issues(prefix: str, checks: R.Checks) -> tuple[bool, list[str]]:
+def _issues(prefix: str, checks: R.Checks, *, saved: bool = False) -> tuple[bool, list[str]]:
     """Above Save: the required fields still unanswered, the blocking codes and the warnings
-    with the "I have checked these" tick. Returns (may save, acknowledged warnings)."""
+    with the "I have checked these" tick. Returns (may save, acknowledged warnings). With
+    ``saved`` (a reading of this form is already in the log) the same codes are listed as what
+    the NEXT save needs, not as a refusal: nothing the reviewer saved was refused. The checks
+    and what Save requires are the same either way."""
     if checks.unanswered:
         st.text("Required, unanswered: " + ", ".join(checks.unanswered))
     for code, f in checks.blocking:
-        st.error(f"Save refuses {code}" + (f" ({f})" if f else "") + ": "
-                 + R.BLOCKING_CODES.get(code, ""))
+        what = code + (f" ({f})" if f else "") + ": " + R.BLOCKING_CODES.get(code, "")
+        if saved:
+            st.info(f"The next save needs {what}")
+        else:
+            st.error(f"Save refuses {what}")
     ack: list[str] = []
     if checks.warnings:
         st.warning("Please check: " + "; ".join(f"{c}: {R.WARNING_CODES[c]}"
@@ -547,8 +559,30 @@ def _overall(records, bundle, item, login) -> None:
         st.text(f"Label of the whole post (from your saved readings): {label or '-'}")
 
 
+def _saved_notice(ind: dict | None, after: dict | None) -> str | None:
+    """What the log holds of this reviewer's readings of this form, in words, shown directly
+    above the confidence. After a save the form is built again under a new key (the key holds
+    the saved line's number), so its flags, confidence and notes are empty by construction: they
+    belong to the next save, and a confidence is never carried from one save to the next."""
+    if after is not None:
+        return (f"SAVED. Your reading of this form after the reveal is line {after['seq']} of the "
+                f"log, saved at {after['at'][11:16]} UTC with confidence {after['confidence']}. "
+                "This form is done: go on with \"Next item not yet adjudicated\" in the sidebar. "
+                "Save again only to CHANGE the reading: correct the answers above, choose a "
+                "confidence for the changed reading and save; the newest line counts. The "
+                "confidence below is empty because it belongs to such a new save.")
+    if ind is not None:
+        return (f"SAVED. Your independent reading of this form is line {ind['seq']} of the log, "
+                f"saved at {ind['at'][11:16]} UTC with confidence {ind['confidence']}. Second "
+                "step, on this same form: compare with the system's reading, check each verdict, "
+                "answer the questions of group H, choose a confidence for the reading after the "
+                "reveal, and save it. The confidence below is empty because it belongs to that "
+                "second save.")
+    return None
+
+
 def _form(prefix, base, bundle, session, item, records, writable, *, defaults, revealed,
-          system=None, phase, blind, refers_to=None) -> None:
+          system=None, phase, blind, refers_to=None, notice=None) -> None:
     earlier = A.earlier_positions(records, bundle, item, session.login)
     ctx = A.form_context(bundle, item, revealed=revealed, earlier_positions=earlier)
     compared = ()
@@ -558,7 +592,7 @@ def _form(prefix, base, bundle, session, item, records, writable, *, defaults, r
         compared = A.compared_fields(bundle, item, guess, earlier)
     reading, verdicts = _inputs(prefix, bundle, item, defaults, ctx, system, compared)
     _positions(reading, ctx)
-    flags, confidence, notes = _extras(prefix)
+    flags, confidence, notes = _extras(prefix, notice=notice)
     try:
         clean = A.clean_reading(reading, item, bundle)
     except A.AdjudicationError as exc:
@@ -567,7 +601,7 @@ def _form(prefix, base, bundle, session, item, records, writable, *, defaults, r
     _done, checks, _ctx = A.check_reading(bundle, item, clean, revealed=revealed,
                                           records=records, login=session.login, flags=flags,
                                           confidence=confidence, notes=notes)
-    ok, ack = _issues(prefix, checks)
+    ok, ack = _issues(prefix, checks, saved=bool(notice))
     title = "Save independent reading" if phase == A.INDEPENDENT else \
         "Save reading after reveal"
     if st.button(title, key=f"{prefix}_save", type="primary", disabled=not ok):
@@ -622,7 +656,8 @@ def _reviewer(base, bundle, session, item, records, writable) -> None:
             _form(f"aw_{iid}_after_{source['seq'] if source else 0}", base, bundle, session,
                   item, records, writable, defaults=source["reading"] if source else {},
                   revealed=True, system=A.system_reading(bundle, item), phase=A.AFTER_REVEAL,
-                  blind=ind is not None, refers_to=ind["seq"] if ind else None)
+                  blind=ind is not None, refers_to=ind["seq"] if ind else None,
+                  notice=_saved_notice(ind, after))
     with st.container(border=True):
         st.subheader("3. The system's reading")
         if revealed:
@@ -848,6 +883,39 @@ def _workspace(base: Path, bundle: A.Bundle, session: A.Session) -> None:
                                                               records, log.ok)
 
 
+def _bundle_stamp(root: Path) -> str:
+    """The state of the bundle's files without opening one: every file's path, size,
+    modification time and inode."""
+    rows = []
+    for folder, dirs, files in os.walk(root, followlinks=False):
+        dirs.sort()
+        for name in sorted(files):
+            info = os.stat(Path(folder) / name, follow_symlinks=False)
+            rows.append(f"{(Path(folder) / name).relative_to(root).as_posix()}\0{info.st_size}"
+                        f"\0{info.st_mtime_ns}\0{info.st_ino}")
+    return hashlib.sha256("\n".join(rows).encode()).hexdigest()
+
+
+def _load(base: Path, access: str) -> A.Bundle:
+    """The validated bundle of this session. The page runs again at every choice, and a FULL
+    load reads and hashes every file of the bundle (posts and images: seconds on a real bundle,
+    during which the page still shows the state before the choice). So a FULL session validates
+    the bundle when it starts, and again whenever a file of the bundle is added, removed or
+    changed (``_bundle_stamp``) or its access changes, and keeps it in its OWN session state in
+    between: never shared with another session. A RESTRICTED session loads at every run, as
+    before: it opens neither posts nor media, and holds nothing."""
+    if access != A.FULL:
+        st.session_state.pop("aw_bundle", None)
+        return A.load_bundle(base / "bundle", access)
+    stamp = _bundle_stamp(base / "bundle")
+    held = st.session_state.get("aw_bundle")
+    if held is None or held[0] != stamp:
+        st.session_state.pop("aw_bundle", None)  # a refused bundle is never kept
+        held = (stamp, A.load_bundle(base / "bundle", access))
+        st.session_state["aw_bundle"] = held
+    return held[1]
+
+
 def main() -> None:
     st.set_page_config(page_title="Adjudication", layout="wide")
     problem = A.server_problem(st.get_option, os.environ)
@@ -869,11 +937,12 @@ def main() -> None:
         session = A.resolve_session(st.context.headers, os.environ, reviewers,
                                     st.get_option("server.port"))
     except (A.AdjudicationError, OSError, A.PrivatePathError):
+        st.session_state.pop("aw_bundle", None)  # nothing is held for a session that is refused
         _refuse("Not authorized.")
     try:
         if session.access == A.FULL:
             A.check_folders(base, media=True)
-        bundle = A.load_bundle(base / "bundle", session.access)
+        bundle = _load(base, session.access)
     except (A.AdjudicationError, OSError, A.PrivatePathError) as exc:
         _refuse(f"The adjudication bundle is refused ({_code(exc)}).")
     if synced:

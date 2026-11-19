@@ -43,7 +43,14 @@ through a link, link count 1, mode 0600. The folders (the base, `bundle/`, `bund
 base inside a cloud-synced folder shows a constant warning in LOCAL mode (the owner's policy
 allows it) and is refused in PUBLISHED mode. The manifest's `bundle_id` is recomputed (sha256 over
 one line `<POSIX path>\0<sha256 hex>\n` per file other than `manifest.json`, sorted by path) by a
-FULL session and by the freeze, and a mismatch is refused (`BUNDLE_ID_MISMATCH`). A file named
+FULL session and by the freeze, and a mismatch is refused (`BUNDLE_ID_MISMATCH`). A FULL session
+recomputes it when it starts and again whenever a file of the bundle is added, removed or changed
+(path, size, modification time or inode, looked at on every run of the page without opening a
+file), not at every run: the page runs again at every choice, and hashing a real bundle takes
+seconds, during which the page would still show the state before the choice. The validated bundle
+is kept in that session's own state in between, never shared with another session, and dropped
+when the session is refused or becomes RESTRICTED. A change that keeps a file's size,
+modification time and inode is not seen until the session starts again. A file named
 exactly `.DS_Store` (macOS Finder), in any folder of the bundle, is ignored by the loader, the
 media listing and this recipe; any other dot-file or dot-folder is refused (`DOT_FILE_IN_BUNDLE`).
 A RESTRICTED
@@ -363,7 +370,13 @@ confirmed ("Saved ... as line n") before you pass `--yes`.
 
 * A judgment is durable only when its **Save** button is clicked ("Save independent reading",
   "Save reading after reveal", "Save decision"): that click appends one line to
-  `annotations.jsonl` (fsynced) and replaces the head file, and the page says "Saved ... as line n".
+  `annotations.jsonl` (fsynced) and replaces the head file, and the page says "Saved ... as line n"
+  at its top. A reviewer's form is then built again (its key holds the saved line's number): the
+  answers are those just saved, while flags, confidence and notes are EMPTY, because they belong
+  to the next save and a confidence is never carried from one save to the next. Directly above
+  the confidence the form therefore says what the log holds ("SAVED. Your reading ... is line n
+  ... with confidence X") and, above Save, lists what a further save would need as "The next save needs ...", not as
+  "Save refuses ...": nothing that was saved was refused. The checks are the same in both wordings.
   Nothing is saved while you choose values.
 * Revealing the system's reading also writes one line (the SYSTEM_SHOWN marker), before it is shown.
 * If the browser, the tab or the app closes mid-item, every value chosen since the last Save is
