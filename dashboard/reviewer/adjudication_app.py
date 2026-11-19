@@ -6,7 +6,8 @@ recommendations page (``reviewer_app.py``) as its restricted vocabulary mode.
 Per item, three areas kept apart: (1) SOURCE EVIDENCE (FULL access only), (2) THE READER'S READING,
 (3) THE SYSTEM'S READING, hidden under blind-first until an INDEPENDENT reading is saved on
 every form of the post. The form follows the rubric (``runtime/adjudication_rubric.py``, version
-2.2); two static pages show the reviewer guide and the field reference. Every
+2.2); two static pages show the reviewer guide and the field reference. A choice control shows
+codes only; the complete meaning of every option is plain text beside it (``_choices``). Every
 publisher or bundle string is plain text (``st.text`` / ``st.code``); images only from the
 bundle's ``media/`` by a name the post lists. The only write is the annotation log. No broker,
 order, mapping, lexicon or policy code; no upload, download, file browser or path input.
@@ -28,6 +29,17 @@ GUIDE_PAGE = Path(__file__).with_name("adjudication_guide.py")
 FIELDS_PAGE = Path(__file__).with_name("adjudication_fields.py")
 NOT_STATED = "(not stated)"
 NOT_READ_TEXT = "not read by the system"
+# A select control draws every option, and the option chosen, on ONE line that never wraps, in a
+# list exactly as wide as the control: a meaning inside an option text is cut off wherever the
+# control is narrow. So an option's text is its code alone (``_short``), a choice control has a
+# fixed width that fits its longest code at any window width or zoom, and the complete meaning of
+# every option is plain, wrapping text beside the control (``_choices``), under it where the
+# window is narrow. Widths are CSS pixels.
+CONTROL_PX = 320  # a choice control: fits "SEQUENCE:<id>" and the longest code
+MEANINGS_PX = 440  # the meanings beside it: both fit a 1280-pixel window with the sidebar open
+ROW_PX = {"role": 250, "exactness": 165, "contract_month": 165, "month_named": 140}
+FURTHER_PX = {"timing": 170, "action": 200, "family": 170, "side": 200}
+REPEAT_TABLE_CHOICES_FROM = 4  # rows: from here the table's meanings are offered again below it
 
 
 def _refuse(message: str) -> None:
@@ -124,6 +136,33 @@ def _meaning(f: str, code: str) -> str:
     return f"{code}: {meanings[code]}" if code in meanings else code
 
 
+def _short(code) -> str:
+    """An option's text inside a select control: its code alone (see ``CONTROL_PX``). The texts
+    of a control never change while a session lasts: the browser holds the chosen option by its
+    text."""
+    return "(unanswered)" if code == "" else str(code)
+
+
+def _choices(f: str, options) -> str:
+    """The complete meaning of every option a control offers, one option per line, for the plain
+    text beside the control. The bundle's markets share one meaning and take one line, and so do
+    the other listed ideas."""
+    markets = [c for c in options if f == "family" and c and c not in _FAMILY_MEANING]
+    ideas = [c for c in options if f == "idea" and c.startswith("SEQUENCE:")]
+    lines = []
+    for code in options:
+        if code == "" or code in markets[1:] or code in ideas[1:]:
+            continue
+        meaning = _meaning(f, code)
+        if code in markets[:1]:
+            lines.append(", ".join(markets) + meaning[len(code):])
+        elif code in ideas[:1]:
+            lines.append(f"SEQUENCE:<idea> ({len(ideas)} in the list)" + meaning[len(code):])
+        else:
+            lines.append(meaning)
+    return "\n".join(lines)
+
+
 def _options(f: str, bundle: A.Bundle, item: dict) -> tuple[str, ...]:
     sequences = [s["sequence_id"] for s in bundle.sequences
                  if s["sequence_id"] != item["sequence_id"]]
@@ -176,7 +215,8 @@ def _collect(prefix: str, item: dict, defaults: dict, details: list[dict]) -> di
 
 
 def _widget(prefix: str, f: str, bundle: A.Bundle, item: dict, defaults: dict, col) -> None:
-    """One answered field: a closed choice with meanings, or a value with its answer state."""
+    """One answered field: a closed choice (codes in the control, every option's complete meaning
+    beside it), or a value with its answer state."""
     current = _peek(prefix, f, defaults)
     if f == "component":
         col.radio(_label(f), R.COMPONENTS, key=_key(prefix, f), help=_help(f),
@@ -193,16 +233,20 @@ def _widget(prefix: str, f: str, bundle: A.Bundle, item: dict, defaults: dict, c
                            value=current if current not in R.VALUE_SENTINELS[f] else "",
                            max_chars=A.MAX_TEXT)
     elif f == "ambiguities":
-        col.multiselect(_label(f), R.AMBIGUITIES, key=_key(prefix, f), help=_help(f),
+        row = col.container(horizontal=True)
+        row.multiselect(_label(f), R.AMBIGUITIES, key=_key(prefix, f), help=_help(f),
                         default=[c for c in current if c in R.AMBIGUITIES],
-                        format_func=lambda v: _meaning(f, v))
+                        format_func=_short, width=CONTROL_PX, wrap=True)
+        row.text(_choices(f, R.AMBIGUITIES), width=MEANINGS_PX)
     elif f == "additional_actions":
         _additional(prefix, bundle, defaults, col)
     else:
         options = ("", *_options(f, bundle, item))
-        col.selectbox(_label(f), options, key=_key(prefix, f), help=_help(f),
+        row = col.container(horizontal=True)
+        row.selectbox(_label(f), options, key=_key(prefix, f), help=_help(f),
                       index=options.index(current) if current in options else 0,
-                      format_func=lambda v: _meaning(f, v))
+                      format_func=_short, width=CONTROL_PX)
+        row.text(_choices(f, options), width=MEANINGS_PX)
 
 
 def _additional(prefix: str, bundle: A.Bundle, defaults: dict, col) -> None:
@@ -213,16 +257,18 @@ def _additional(prefix: str, bundle: A.Bundle, defaults: dict, col) -> None:
                       format_func=lambda v: f"{v} further action(s)")
     allowed = {"timing": R.ADDITIONAL_TIMINGS, "action": R.ADDITIONAL_ACTIONS,
                "family": tuple(bundle.families), "side": R.SIDES}
-    meaning_of = {"timing": "timing", "action": "action", "family": "family", "side": "side"}
+    if n:
+        with col.expander("What the further-action choices mean, in full", expanded=True):
+            for k in R.ADDITIONAL_KEYS:
+                st.text(f"{k}\n" + _choices(k, allowed[k]))
     for j in range(n or 0):
-        cols = col.columns(4)
-        for c, k in zip(cols, R.ADDITIONAL_KEYS, strict=True):
+        row = col.container(horizontal=True, vertical_alignment="bottom")
+        for k in R.ADDITIONAL_KEYS:
             value = current[j][k] if j < len(current) else ""
             options = ("", *allowed[k])
-            c.selectbox(f"further action {j + 1}: {k}", options, key=f"{prefix}_aa_{j}_{k}",
-                        index=options.index(value) if value in options else 0,
-                        help=R.ADDITIONAL_HELP[k],
-                        format_func=lambda v, k=k: _meaning(meaning_of[k], v))
+            row.selectbox(f"further action {j + 1}: {k}", options, key=f"{prefix}_aa_{j}_{k}",
+                          index=options.index(value) if value in options else 0,
+                          help=R.ADDITIONAL_HELP[k], format_func=_short, width=FURTHER_PX[k])
 
 
 def _verdict(prefix: str, f: str, value, system: dict, item: dict, col, verdicts: dict) -> None:
@@ -245,10 +291,10 @@ def _verdict(prefix: str, f: str, value, system: dict, item: dict, col, verdicts
 def _inputs(prefix: str, bundle: A.Bundle, item: dict, defaults: dict, ctx,
             system: dict | None = None, compared=()) -> tuple[dict, dict]:
     """The reading form, field groups A to I: plain-English labels with the field name in
-    brackets, a tooltip on every field, option texts with their meanings, fields that do not
-    apply greyed with the reason, derived values read-only. With ``system`` (after the
-    reveal): the system's value beside each field and a verdict on it, pre-filled from the
-    comparison. Nothing of the system's reading fills an answer, in any mode."""
+    brackets, a tooltip on every field, the complete meaning of every option beside its control,
+    fields that do not apply greyed with the reason, derived values read-only. With ``system``
+    (after the reveal): the system's value under each field and a verdict on it, pre-filled from
+    the comparison. Nothing of the system's reading fills an answer, in any mode."""
     details = A.table_row_details(bundle, item)
     status = R.applicability(R.complete(_collect(prefix, item, defaults, details), ctx), ctx)
     verdicts: dict = {}
@@ -278,26 +324,26 @@ def _inputs(prefix: str, bundle: A.Bundle, item: dict, defaults: dict, ctx,
                                              system))
             continue
         for f, s in zip(mine, states, strict=True):
-            cols = st.columns([3, 2, 3]) if system is not None else [st.container()]
+            box = st.container()  # the form's width: a control never narrows beside a verdict
             if s.state == R.ASK:
-                _widget(prefix, f, bundle, item, defaults, cols[0])
+                _widget(prefix, f, bundle, item, defaults, box)
             elif s.state == R.DERIVED:
                 shown = s.value if s.value not in ("", None) else "(unanswered)"
-                cols[0].text(f"{_label(f)}: {shown} (set by the form)")
+                box.text(f"{_label(f)}: {shown} (set by the form)")
                 if f == "follower_implication":
                     inferred = _peek(prefix, "explicit", defaults) == "NO"
-                    cols[0].caption(R.FOLLOWER_SENTENCE + (f" ({R.INFERRED_NOTE}.)"
-                                                           if inferred else ""))
+                    box.caption(R.FOLLOWER_SENTENCE + (f" ({R.INFERRED_NOTE}.)"
+                                                       if inferred else ""))
             elif s.state == R.PENDING:
-                cols[0].caption(f"{_label(f)}: {s.reason}.")
+                box.caption(f"{_label(f)}: {s.reason}.")
             else:
-                cols[0].caption(f"{_label(f)}: does not apply ({s.reason}).")
+                box.caption(f"{_label(f)}: does not apply ({s.reason}).")
             if system is not None and f in compared:
                 value = R.NOT_APPLICABLE if s.state == R.NA else (
                     s.value if s.state == R.DERIVED else _peek(prefix, f, defaults))
-                _verdict(prefix, f, value, system, item, _Two(cols[1], cols[2]), verdicts)
+                _verdict(prefix, f, value, system, item, _Two(*st.columns([2, 3])), verdicts)
             elif system is not None and f in A.SYSTEM_FIELDS:
-                cols[1].text(f"system (not compared): {_shown(item, f, system.get(f, ''))}")
+                st.text(f"system (not compared): {_shown(item, f, system.get(f, ''))}")
         if g == "G" and details:
             verdicts.update(_price_table(prefix, bundle, item, details, defaults, status, system))
     reading = _collect(prefix, item, defaults, details)
@@ -345,46 +391,66 @@ def _price_table(prefix, bundle, item, details, defaults, status, system) -> dic
     verdicts = {}
     allowed = {"role": R.TABLE_ROLES, "exactness": R.ROW_EXACTNESS,
                "contract_month": R.ROW_MONTHS}
+    _table_choices("What the price-table choices mean, in full", allowed, expanded=True)
     for n, (d, row) in enumerate(zip(details, rows, strict=True), 1):
         where = f"  ({d['k']} of {d['m']})" if d["m"] > 1 else ""
         st.text(f"row {n}: {d['label']}{where}" + (f"   ... {d['context']} ..."
                                                     if d["context"] else ""))
-        cols = st.columns([2, 2, 2, 1] + ([2, 3] if system is not None else []))
+        line = st.container(horizontal=True, vertical_alignment="bottom")
         row_status = R.row_applicability(row, reading)
-        for col, c in zip(cols[:4], R.ROW_KEYS, strict=True):
+        for c in R.ROW_KEYS:
             s = row_status[c]
             label = f"{R.BY_NAME[c].question} [{c}], row {n}"
             if s.state != R.ASK:
-                col.caption(f"{c}: " + ("not applicable" if s.state == R.NA else s.reason))
+                line.caption(f"{c}: " + ("not applicable" if s.state == R.NA else s.reason),
+                             width=ROW_PX[c])
             elif c == "month_named":
-                col.text_input(label, key=f"{prefix}_lv_{d['key']}_{c}", max_chars=12,
-                               help=_help(c), value=row[c])
+                line.text_input(label, key=f"{prefix}_lv_{d['key']}_{c}", max_chars=12,
+                                help=_help(c), value=row[c], width=ROW_PX[c])
             else:
                 options = ("", *allowed[c])
-                col.selectbox(label, options, key=f"{prefix}_lv_{d['key']}_{c}", help=_help(c),
-                              index=options.index(row[c]) if row[c] in options else 0,
-                              format_func=lambda v, c=c: _meaning(c, v))
+                line.selectbox(label, options, key=f"{prefix}_lv_{d['key']}_{c}", help=_help(c),
+                               index=options.index(row[c]) if row[c] in options else 0,
+                               format_func=_short, width=ROW_PX[c])
+        chosen = [f"{c} {_meaning(c, row[c])}" for c in allowed
+                  if row_status[c].state == R.ASK and row[c] in allowed[c]]
+        if chosen:  # the complete meaning of what this row holds, where the row is
+            st.text("\n".join(chosen))
         if system is not None:
             sr = sys_rows[d["key"]]
+            left, right = st.columns([2, 3])
             if sr.get("not_read"):
-                cols[4].text(f"system: {NOT_READ_TEXT}")
+                left.text(f"system: {NOT_READ_TEXT}")
                 verdicts[d["key"]] = A.NOT_READ
                 continue
-            cols[4].text("system: " + " / ".join(sr[c] or "-" for c in A.LEVEL_KEYS))
+            left.text("system: " + " / ".join(sr[c] or "-" for c in A.LEVEL_KEYS))
             pre = R.prefill_row_verdict(reading[A.LEVELS][n - 1], sr)  # the completed row
             tag = hashlib.sha256("|".join(row[c] for c in R.ROW_KEYS).encode()).hexdigest()[:8]
-            verdicts[d["key"]] = cols[5].radio(f"verdict, row {n}", A.VERDICTS, horizontal=True,
-                                               index=A.VERDICTS.index(pre),
-                                               key=f"{prefix}_lvv_{d['key']}_{tag}",
-                                               help=R.VERDICT_HELP,
-                                               format_func=R.VERDICT_TEXT.get)
+            verdicts[d["key"]] = right.radio(f"verdict, row {n}", A.VERDICTS, horizontal=True,
+                                             index=A.VERDICTS.index(pre),
+                                             key=f"{prefix}_lvv_{d['key']}_{tag}",
+                                             help=R.VERDICT_HELP,
+                                             format_func=R.VERDICT_TEXT.get)
+    if len(details) >= REPEAT_TABLE_CHOICES_FROM:
+        _table_choices("The price-table choices again, in full", allowed, expanded=False)
     return {"__rows__": verdicts} if system is not None else {}
 
 
+def _table_choices(title: str, allowed: dict, *, expanded: bool) -> None:
+    """The complete meaning of every option of the table's three choices, once for all rows."""
+    with st.expander(title, expanded=expanded):
+        for c, options in allowed.items():
+            st.text(f"{R.BY_NAME[c].question} [{c}]\n" + _choices(c, options))
+
+
 def _extras(prefix: str, *, approval: bool = False) -> tuple[list, str, str]:
-    flags = [] if approval else st.multiselect(
-        _label("flags"), A.FLAGS, key=f"{prefix}_flags", help=_help("flags"),
-        format_func=lambda v: _meaning("flags", v))
+    flags = []
+    if not approval:
+        row = st.container(horizontal=True)
+        flags = row.multiselect(_label("flags"), A.FLAGS, key=f"{prefix}_flags",
+                                help=_help("flags"), format_func=_short, width=CONTROL_PX,
+                                wrap=True)
+        row.text(_choices("flags", A.FLAGS), width=MEANINGS_PX)
     confidence = "" if approval else st.radio(
         _label("confidence"), A.CONFIDENCE, index=None, horizontal=True,
         key=f"{prefix}_confidence", help=_help("confidence"),

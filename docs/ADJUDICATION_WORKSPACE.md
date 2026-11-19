@@ -96,7 +96,8 @@ access = "FULL"          # FULL or RESTRICTED
   read the post as an instruction at all); and, in RESTRICTED access, the system's levels as the
   table's rows. Two bundle strings appear as option texts: market names (the `family` choice) and
   idea identifiers (`SEQUENCE:<id>` in `idea`); both are strictly pattern-checked at load and
-  option texts are not rendered as Markdown. Revealing one form marks every form of its post
+  option texts are not rendered as Markdown. The market names appear once more in the meanings
+  beside the `family` control, which are plain text (`st.text`). Revealing one form marks every form of its post
   within the scope; a form of the same post outside the scope (in another sequence) is marked
   too, so it can no longer be read blind once the scope is later raised.
 * **REVIEWER** writes INDEPENDENT and AFTER_REVEAL records. With *blind-first* on (the default,
@@ -116,8 +117,14 @@ access = "FULL"          # FULL or RESTRICTED
   answer, in any mode) and only AFTER_REVEAL is written (`blind: false`).
 * **The form** (rubric 2.3): "Form k of m for this post" (m = the post's instruction items), a
   "How to review" expander, then field groups A to I, each field labelled with a plain-English
-  question and its name in brackets, with a tooltip and option texts that give each value's
-  meaning. A field that does not apply to the reviewer's own timing and action is greyed with the
+  question and its name in brackets, with a tooltip. A choice control lists the option CODES
+  only, at a fixed width that fits the longest code, and the complete meaning of every option is
+  plain text beside the control (under it in a narrow window): a select control draws an option
+  on one line and cuts a long text off instead of wrapping it, so no meaning is ever inside a
+  list. The price table and the further actions give the meanings of their options once, above
+  their rows (the table again below a long table), and each price row shows the complete meaning
+  of what it holds. After the reveal the system's value and the verdict follow under each answer.
+  A field that does not apply to the reviewer's own timing and action is greyed with the
   reason (and stored NOT_APPLICABLE); values the form derives (the label of the action from its
   timing, the announcement FIRST_REPORT for CURRENT and CANNOT_DETERMINE for UNCERTAIN,
   `follower_implication` (with "inferred from context: not counted as executable" when `explicit`
