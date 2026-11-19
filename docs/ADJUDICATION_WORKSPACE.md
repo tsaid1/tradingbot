@@ -43,14 +43,22 @@ through a link, link count 1, mode 0600. The folders (the base, `bundle/`, `bund
 base inside a cloud-synced folder shows a constant warning in LOCAL mode (the owner's policy
 allows it) and is refused in PUBLISHED mode. The manifest's `bundle_id` is recomputed (sha256 over
 one line `<POSIX path>\0<sha256 hex>\n` per file other than `manifest.json`, sorted by path) by a
-FULL session and by the freeze, and a mismatch is refused (`BUNDLE_ID_MISMATCH`). A FULL session
-recomputes it when it starts and again whenever a file of the bundle is added, removed or changed
-(path, size, modification time or inode, looked at on every run of the page without opening a
-file), not at every run: the page runs again at every choice, and hashing a real bundle takes
-seconds, during which the page would still show the state before the choice. The validated bundle
-is kept in that session's own state in between, never shared with another session, and dropped
-when the session is refused or becomes RESTRICTED. A change that keeps a file's size,
-modification time and inode is not seen until the session starts again. A file named
+FULL session and by the freeze, and a mismatch is refused (`BUNDLE_ID_MISMATCH`). The freeze
+recomputes it at every run, from the files. A FULL session recomputes it (and runs every other
+check of the loader) when it starts and again whenever anything in the bundle folder changes, not
+at every run: the page runs again at every choice, and hashing a real bundle takes seconds,
+during which the page would still show the state before the choice. What "changes" means: at
+every run the page looks at every folder, file and link of the bundle without opening one (path,
+kind and mode, link count, size, modification time, change time, inode). The system moves the
+change time at every write, chmod, link or rename and a program cannot set it back, so a mode
+other than 0600, a second link, a dot entry and an edit (even one that keeps the size and puts
+the modification time back) are all refused at the next run, as before. What is no longer caught
+during a session is a change that the file system itself does not record (writing to the disk
+underneath it, or a system clock set back); the freeze still catches it. A change that only moves
+the change time (a tool writing an extended attribute) costs one more validation. The validated
+bundle is kept in that session's own state in between, never shared with another session, and
+dropped whenever the page refuses the session or the session becomes RESTRICTED; a click on Save
+after a change that fails validation writes nothing. A file named
 exactly `.DS_Store` (macOS Finder), in any folder of the bundle, is ignored by the loader, the
 media listing and this recipe; any other dot-file or dot-folder is refused (`DOT_FILE_IN_BUNDLE`).
 A RESTRICTED
@@ -375,8 +383,12 @@ confirmed ("Saved ... as line n") before you pass `--yes`.
   answers are those just saved, while flags, confidence and notes are EMPTY, because they belong
   to the next save and a confidence is never carried from one save to the next. Directly above
   the confidence the form therefore says what the log holds ("SAVED. Your reading ... is line n
-  ... with confidence X") and, above Save, lists what a further save would need as "The next save needs ...", not as
-  "Save refuses ...": nothing that was saved was refused. The checks are the same in both wordings.
+  of the log, saved <date> at <time> UTC with confidence X"), and what comes next: the second step
+  after an independent reading; nothing more after the reading after the reveal; or that the
+  approver RETURNED that reading. Above Save, the two codes that only say the rebuilt form is not
+  answered yet (CONFIDENCE, REQUIRED_UNANSWERED) are worded "The next save needs ...", not "Save
+  refuses ...": nothing that was saved was refused. A contradiction between answers stays "Save
+  refuses ...". What Save requires is the same in both wordings.
   Nothing is saved while you choose values.
 * Revealing the system's reading also writes one line (the SYSTEM_SHOWN marker), before it is shown.
 * If the browser, the tab or the app closes mid-item, every value chosen since the last Save is
