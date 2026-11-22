@@ -38,6 +38,13 @@ NOT_READ_TEXT = "not read by the system"
 # the complete meaning of every option is plain, wrapping text beside the control
 # (``_choices``), under it where the window is narrow. A radio keeps its meanings in its option
 # texts: those wrap. Widths are CSS pixels, measured in Chrome at the default text size.
+# The page is read by its headings: the title, the three steps of an item (``st.header``) and the
+# field groups of the form (``st.subheader``); their sizes are in ``.streamlit/config.toml``
+# beside this file. A typed value and the count of further actions have the control width, like
+# the lists; a typed value too long for it widens its box at the next run, as a long option
+# widens a list (``_fit``). The price table and the further actions keep their own narrower
+# controls, and the notes the form's width. After the reveal the system's value is one line and
+# the verdict follows under it at the form's width, so that its three choices share a line.
 CONTROL_PX = 320  # a select control of the form: fits the rubric's longest code
 MEANINGS_PX = 440  # the meanings beside it: both fit a 1280-pixel window with the sidebar open
 ROW_PX = {"role": 250, "exactness": 165, "contract_month": 165, "month_named": 140}
@@ -242,9 +249,10 @@ def _widget(prefix: str, f: str, bundle: A.Bundle, item: dict, defaults: dict, c
                            help=_help(f), index=states.index(state) if state else None,
                            format_func=_STATE_TEXT.get)
         if chosen == VALUE:
+            typed = current if current not in R.VALUE_SENTINELS[f] else ""
             col.text_input(f"{_label(f)}: the value", key=_key(prefix, f), help=_help(f),
-                           value=current if current not in R.VALUE_SENTINELS[f] else "",
-                           max_chars=A.MAX_TEXT)
+                           value=typed, max_chars=A.MAX_TEXT,
+                           width=_fit(CONTROL_PX, [typed]))  # a long value is not cut
     elif f == "ambiguities":
         row = col.container(horizontal=True)
         row.multiselect(_label(f), R.AMBIGUITIES, key=_key(prefix, f), help=_help(f),
@@ -267,7 +275,7 @@ def _additional(prefix: str, bundle: A.Bundle, defaults: dict, col) -> None:
     n = col.selectbox(_label("additional_actions"), range(R.MAX_ADDITIONAL + 1),
                       key=f"{prefix}_aa_n", help=_help("additional_actions"),
                       index=min(len(current), R.MAX_ADDITIONAL),
-                      format_func=lambda v: f"{v} further action(s)")
+                      format_func=lambda v: f"{v} further action(s)", width=CONTROL_PX)
     allowed = {"timing": R.ADDITIONAL_TIMINGS, "action": R.ADDITIONAL_ACTIONS,
                "family": tuple(bundle.families), "side": R.SIDES}
     if n:
@@ -320,7 +328,7 @@ def _inputs(prefix: str, bundle: A.Bundle, item: dict, defaults: dict, ctx,
             mine = [f for f in mine if f in ("ambiguities", "additional_actions")]
         if not mine:
             continue
-        st.caption(f"{g}. {title}")
+        st.subheader(f"{g}. {title}", anchor=False)
         states = [status.get(f, R.Status(R.NA)) for f in mine]
         if len({s.state for s in states}) == 1 and states[0].state in (R.NA, R.PENDING) and len(
                 {s.reason for s in states}) == 1:
@@ -338,7 +346,7 @@ def _inputs(prefix: str, bundle: A.Bundle, item: dict, defaults: dict, ctx,
                                              system))
             continue
         for f, s in zip(mine, states, strict=True):
-            box = st.container()  # the form's width: a control never narrows beside a verdict
+            box = st.container()  # the form's width: the control, then the verdict under it
             if s.state == R.ASK:
                 _widget(prefix, f, bundle, item, defaults, box)
             elif s.state == R.DERIVED:
@@ -355,7 +363,7 @@ def _inputs(prefix: str, bundle: A.Bundle, item: dict, defaults: dict, ctx,
             if system is not None and f in compared:
                 value = R.NOT_APPLICABLE if s.state == R.NA else (
                     s.value if s.state == R.DERIVED else _peek(prefix, f, defaults))
-                _verdict(prefix, f, value, system, item, _Two(*st.columns([2, 3])), verdicts)
+                _verdict(prefix, f, value, system, item, box, verdicts)
             elif system is not None and f in A.SYSTEM_FIELDS:
                 st.text(f"system (not compared): {_shown(item, f, system.get(f, ''))}")
         if g == "G" and details:
@@ -367,26 +375,13 @@ def _inputs(prefix: str, bundle: A.Bundle, item: dict, defaults: dict, ctx,
     return reading, verdicts
 
 
-class _Two:
-    """The system's value in one column, the verdict in the next."""
-
-    def __init__(self, left, right):
-        self.left, self.right = left, right
-
-    def text(self, body):
-        self.left.text(body)
-
-    def radio(self, *a, **k):
-        return self.right.radio(*a, **k)
-
-
 def _price_table(prefix, bundle, item, details, defaults, status, system) -> dict:
     """One row per number of the post (FULL) or per typed level (RESTRICTED): the number as
     written, "k of m" for a repeated number and, FULL only, a few words around it (plain text);
     then role, exactness, contract month and month named as the rubric asks them."""
-    st.caption("T. The price table: " + (
+    st.subheader("T. The price table: " + (
         "one row per number of the post, in text order" if bundle.posts is not None else
-        "one row per level the system typed (restricted: no text)"))
+        "one row per level the system typed (restricted: no text)"), anchor=False)
     table = status.get(A.LEVELS, R.Status(R.NA))
     if table.state != R.ASK:
         for n, d in enumerate(details, 1):
@@ -432,19 +427,18 @@ def _price_table(prefix, bundle, item, details, defaults, status, system) -> dic
             st.text("\n".join(chosen))
         if system is not None:
             sr = sys_rows[d["key"]]
-            left, right = st.columns([2, 3])
             if sr.get("not_read"):
-                left.text(f"system: {NOT_READ_TEXT}")
+                st.text(f"system: {NOT_READ_TEXT}")
                 verdicts[d["key"]] = A.NOT_READ
                 continue
-            left.text("system: " + " / ".join(sr[c] or "-" for c in A.LEVEL_KEYS))
+            st.text("system: " + " / ".join(sr[c] or "-" for c in A.LEVEL_KEYS))
             pre = R.prefill_row_verdict(reading[A.LEVELS][n - 1], sr)  # the completed row
             tag = hashlib.sha256("|".join(row[c] for c in R.ROW_KEYS).encode()).hexdigest()[:8]
-            verdicts[d["key"]] = right.radio(f"verdict, row {n}", A.VERDICTS, horizontal=True,
-                                             index=A.VERDICTS.index(pre),
-                                             key=f"{prefix}_lvv_{d['key']}_{tag}",
-                                             help=R.VERDICT_HELP,
-                                             format_func=R.VERDICT_TEXT.get)
+            verdicts[d["key"]] = st.radio(f"verdict, row {n}", A.VERDICTS, horizontal=True,
+                                          index=A.VERDICTS.index(pre),
+                                          key=f"{prefix}_lvv_{d['key']}_{tag}",
+                                          help=R.VERDICT_HELP,
+                                          format_func=R.VERDICT_TEXT.get)
     if len(details) >= REPEAT_TABLE_CHOICES_FROM:
         _table_choices("The price-table choices again, in full", allowed, expanded=False)
     return {"__rows__": verdicts} if system is not None else {}
@@ -648,7 +642,7 @@ def _reviewer(base, bundle, session, item, records, writable) -> None:
     elif revealed:
         revealed = False  # the log fails verification: nothing of the system is shown
     with st.container(border=True):
-        st.subheader("2. Your reading")
+        st.header("2. Your reading", anchor=False)
         _form_header(bundle, item)
         _how_to_review()
         _overall(records, bundle, item, me)
@@ -675,7 +669,7 @@ def _reviewer(base, bundle, session, item, records, writable) -> None:
                   blind=ind is not None, refers_to=ind["seq"] if ind else None,
                   notice=_saved_notice(ind, after, returned))
     with st.container(border=True):
-        st.subheader("3. The system's reading")
+        st.header("3. The system's reading", anchor=False)
         if revealed:
             _system(bundle, item)
         else:
@@ -759,7 +753,7 @@ def _amend_defaults(source: dict, amended: dict, ctx, item: dict, bundle: A.Bund
 def _approver(base, bundle, session, item, records, writable) -> None:
     iid = item["item_id"]
     with st.container(border=True):
-        st.subheader("2. The reviewers' readings")
+        st.header("2. The reviewers' readings", anchor=False)
         _form_header(bundle, item)
         afters = [r for r in A._of(records, iid, bundle.bundle_id, A.AFTER_REVEAL)
                   if r.get("rubric") == A.RUBRIC]
@@ -828,12 +822,12 @@ def _approver(base, bundle, session, item, records, writable) -> None:
                       blind=False, reading=amended, notes=notes, refers_to=chosen,
                       outcome=decision, acknowledged_warnings=ack)
     with st.container(border=True):
-        st.subheader("3. The system's reading")
+        st.header("3. The system's reading", anchor=False)
         _system(bundle, item)
 
 
 def _workspace(base: Path, bundle: A.Bundle, session: A.Session) -> None:
-    st.title("Trading signal adjudication")
+    st.title("Trading signal adjudication", anchor=False)
     st.text(f"{session.login} ({session.name}): {session.role}, {session.access} access, "
             + ("through the access proxy" if session.via_proxy else "local"))
     if session.access == A.RESTRICTED:
@@ -893,7 +887,7 @@ def _workspace(base: Path, bundle: A.Bundle, session: A.Session) -> None:
     item = bundle.items[pick]
     st.text(labels[pick])
     with st.container(border=True):
-        st.subheader("1. Source evidence")
+        st.header("1. Source evidence", anchor=False)
         _evidence(bundle, item)
     (_reviewer if session.role == A.REVIEWER else _approver)(base, bundle, session, item,
                                                               records, log.ok)
