@@ -140,7 +140,14 @@ access = "FULL"          # FULL or RESTRICTED
   texts, which wrap. The price table and the further actions give the meanings of their options
   once, above their rows (the table again below a table of four rows or more), and each price
   row shows the complete meaning of what it holds. Typing in a list narrows it by code. After the
-  reveal the system's value and the verdict follow under each answer.
+  reveal the system's value and the verdict follow under each answer: the value on one line, the
+  verdict under it at the form's width, its three choices on one line in a window of ordinary
+  width. The page is read by three levels of heading: its title, the three steps of an item
+  (source evidence, the reading, the system's reading) and the field groups A to I with the
+  price table; their sizes are in `dashboard/reviewer/.streamlit/config.toml`, which Streamlit
+  reads for every instance of the page and which may hold the heading sizes and nothing else.
+  Every control of the form has the control width, whatever it holds: a list, a typed value, the
+  count of further actions.
   A field that does not apply to the reviewer's own timing and action is greyed with the
   reason (and stored NOT_APPLICABLE); values the form derives (the label of the action from its
   timing, the announcement FIRST_REPORT for CURRENT and CANNOT_DETERMINE for UNCERTAIN,

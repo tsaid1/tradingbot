@@ -1,0 +1,9 @@
+# The heading scale of the reviewer pages. The adjudication page has three levels of heading: the
+# title, the three steps of an item, and the field groups of the form. Streamlit's own sizes
+# (2.75, 2.25 and 1.75 rem) are made for presentation pages; in a dense form a group title of that
+# size would outweigh the questions under it. Streamlit reads this file for every instance whose
+# main script is in this folder, wherever it is started from. Presentation only: no server
+# option belongs here (the launcher sets those, and the app checks them).
+[theme]
+headingFontSizes = ["1.6rem", "1.3rem", "1.125rem"]
+headingFontWeights = [650, 600, 600]
