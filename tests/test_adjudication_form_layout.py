@@ -9,6 +9,7 @@ import tomllib
 
 import _review_modes as modes
 import pytest
+import streamlit
 from streamlit.delta_generator import DeltaGenerator
 from test_adjudication import fill, save
 from test_adjudication_option_texts import app_code
@@ -24,6 +25,7 @@ from test_adjudication_rubric import (
     pick,
     records,
 )
+from test_adjudication_save_feedback import in_order
 
 from tradingbot.runtime import adjudication as A
 from tradingbot.runtime import adjudication_rubric as R
@@ -59,6 +61,25 @@ def widths(monkeypatch) -> dict:
     return seen
 
 
+@pytest.fixture
+def containers(monkeypatch) -> list[dict]:
+    """The keyword arguments of every container the page asks for (from the page or inside one)."""
+    seen: list[dict] = []
+    in_block, at_top = DeltaGenerator.container, streamlit.container
+
+    def inside(self, *args, **kwargs):
+        seen.append(kwargs)
+        return in_block(self, *args, **kwargs)
+
+    def top(*args, **kwargs):
+        seen.append(kwargs)
+        return at_top(*args, **kwargs)
+
+    monkeypatch.setattr(DeltaGenerator, "container", inside)
+    monkeypatch.setattr(streamlit, "container", top)
+    return seen
+
+
 def answered(monkeypatch, base):
     b = bundle(base)
     at = pick(app(monkeypatch, base, REVIEWER.login), ITEM)
@@ -78,6 +99,7 @@ def test_the_page_is_read_by_three_levels_of_heading(monkeypatch, local, base):
     assert headings(at) == (["Trading signal adjudication"], STEPS, GROUPS)
     assert not any(str(c.value).startswith(tuple(f"{g}. " for g, _ in R.GROUPS))
                    for c in at.caption)
+    assert all(h.proto.hide_anchor for h in (*at.title, *at.header, *at.subheader))  # no link icon
     at = save(at, IND)  # the reveal: the same headings, in the same order
     assert headings(at) == (["Trading signal adjudication"], STEPS, GROUPS)
     assert not any(str(c.value).startswith(tuple(f"{g}. " for g, _ in R.GROUPS))
@@ -113,18 +135,32 @@ def test_a_typed_value_and_the_count_of_further_actions_have_the_control_width(
     assert widths[f"{IND}_aa_n"] == code["CONTROL_PX"]
     assert widths[f"{IND}_timing"] == code["CONTROL_PX"]  # as the lists beside it
     assert widths[f"{IND}_lv_n:0_role"] == code["ROW_PX"]["role"]
+    # A value too long for the control width is not cut: its box widens at the next run, as a
+    # list widens for a long option (80 characters is the limit of a typed value).
+    longest = "Zed Metals " + "x" * (A.MAX_TEXT - 11)
+    assert A.MAX_TEXT == 80
+    at.text_input(key=f"{IND}_instrument_as_read").set_value(longest).run()
+    assert at.text_input(key=f"{IND}_instrument_as_read").value == longest
+    assert widths[f"{IND}_instrument_as_read"] == 50 + 8 * 80 > code["CONTROL_PX"]
+    assert widths[f"{IND}_entry_price"] == code["CONTROL_PX"]  # a short value keeps the width
 
 
-def test_after_the_reveal_a_verdict_follows_under_the_systems_value(monkeypatch, local, base):
-    """The system's value is one line and the verdict follows under it at the form's width: no
-    narrow column beside the form breaks its three choices over two lines."""
+def test_after_the_reveal_a_verdict_follows_under_the_systems_value(
+        monkeypatch, local, base, containers):
+    """The system's value is one line and the verdict follows directly under it at the form's
+    width: no narrow column or box breaks its three choices over two lines."""
     at = save(answered(monkeypatch, base), IND)
     verdicts = [r for r in at.radio if "_verdict_" in (r.key or "") or "_lvv_" in (r.key or "")]
     assert len(verdicts) > 10 and len(at.columns) == 0
     assert all(r.proto.horizontal and list(r.options) == [R.VERDICT_TEXT[v] for v in A.VERDICTS]
                for r in verdicts)
-    systems = [str(t.value) for t in at.text if str(t.value).startswith("system: ")]
-    assert len(systems) >= len(verdicts)
+    drawn = [e for e in in_order(at.main) if not hasattr(e, "children")]  # elements, page order
+    keys = {r.key for r in verdicts}
+    before = [drawn[n - 1] for n, e in enumerate(drawn) if getattr(e, "key", None) in keys]
+    assert len(before) == len(verdicts)
+    assert all(type(e).__name__ == "Text" and str(e.value).startswith("system: ") for e in before)
+    # The form's boxes are as wide as the form: none is given a width of its own.
+    assert len(containers) > 20 and not [k for k in containers if "width" in k]
     assert "st.columns" not in APP.read_text()
 
 
@@ -135,5 +171,5 @@ def test_the_heading_scale_beside_the_page_holds_sizes_only():
     assert set(scale) == {"theme"}
     assert set(scale["theme"]) == {"headingFontSizes", "headingFontWeights"}
     sizes = [float(s.removesuffix("rem")) for s in scale["theme"]["headingFontSizes"]]
-    assert len(sizes) == 3 and sizes == sorted(sizes, reverse=True) and 1 < sizes[2] < sizes[0] < 2
+    assert len(sizes) == 3 and 2 > sizes[0] > sizes[1] > sizes[2] > 1  # three distinct levels
     assert all(isinstance(w, int) and 500 <= w <= 700 for w in scale["theme"]["headingFontWeights"])

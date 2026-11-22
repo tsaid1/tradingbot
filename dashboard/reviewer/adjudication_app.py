@@ -40,9 +40,11 @@ NOT_READ_TEXT = "not read by the system"
 # texts: those wrap. Widths are CSS pixels, measured in Chrome at the default text size.
 # The page is read by its headings: the title, the three steps of an item (``st.header``) and the
 # field groups of the form (``st.subheader``); their sizes are in ``.streamlit/config.toml``
-# beside this file. Every control of the form has the control width, whatever it holds (a list,
-# a typed value, the count of further actions). After the reveal the system's value is one line
-# and the verdict follows under it at the form's width, so that its three choices share a line.
+# beside this file. A typed value and the count of further actions have the control width, like
+# the lists; a typed value too long for it widens its box at the next run, as a long option
+# widens a list (``_fit``). The price table and the further actions keep their own narrower
+# controls, and the notes the form's width. After the reveal the system's value is one line and
+# the verdict follows under it at the form's width, so that its three choices share a line.
 CONTROL_PX = 320  # a select control of the form: fits the rubric's longest code
 MEANINGS_PX = 440  # the meanings beside it: both fit a 1280-pixel window with the sidebar open
 ROW_PX = {"role": 250, "exactness": 165, "contract_month": 165, "month_named": 140}
@@ -247,9 +249,10 @@ def _widget(prefix: str, f: str, bundle: A.Bundle, item: dict, defaults: dict, c
                            help=_help(f), index=states.index(state) if state else None,
                            format_func=_STATE_TEXT.get)
         if chosen == VALUE:
+            typed = current if current not in R.VALUE_SENTINELS[f] else ""
             col.text_input(f"{_label(f)}: the value", key=_key(prefix, f), help=_help(f),
-                           value=current if current not in R.VALUE_SENTINELS[f] else "",
-                           max_chars=A.MAX_TEXT, width=CONTROL_PX)
+                           value=typed, max_chars=A.MAX_TEXT,
+                           width=_fit(CONTROL_PX, [typed]))  # a long value is not cut
     elif f == "ambiguities":
         row = col.container(horizontal=True)
         row.multiselect(_label(f), R.AMBIGUITIES, key=_key(prefix, f), help=_help(f),

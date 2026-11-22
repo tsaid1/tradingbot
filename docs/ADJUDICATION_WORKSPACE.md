@@ -145,9 +145,13 @@ access = "FULL"          # FULL or RESTRICTED
   width. The page is read by three levels of heading: its title, the three steps of an item
   (source evidence, the reading, the system's reading) and the field groups A to I with the
   price table; their sizes are in `dashboard/reviewer/.streamlit/config.toml`, which Streamlit
-  reads for every instance of the page and which may hold the heading sizes and nothing else.
-  Every control of the form has the control width, whatever it holds: a list, a typed value, the
-  count of further actions.
+  reads for every instance whose main script is in that folder (this page with its guide and
+  field reference, and the vocabulary page), which takes precedence over a profile in the folder
+  an instance is started from, and which may hold the heading sizes and nothing else.
+  A typed value and the count of further actions have the control width, like the lists; a typed
+  value too long for it (the limit is 80 characters) widens its box at the next run. The price
+  table and the further actions keep their own narrower controls, and the notes the form's
+  width.
   A field that does not apply to the reviewer's own timing and action is greyed with the
   reason (and stored NOT_APPLICABLE); values the form derives (the label of the action from its
   timing, the announcement FIRST_REPORT for CURRENT and CANNOT_DETERMINE for UNCERTAIN,
