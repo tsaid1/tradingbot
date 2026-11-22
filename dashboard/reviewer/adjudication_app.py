@@ -630,7 +630,7 @@ def _reviewer(base, bundle, session, item, records, writable) -> None:
     blind = st.session_state.get("aw_blind", True)
     ind = _latest(records, iid, bundle, A.INDEPENDENT, me)
     after = _latest(records, iid, bundle, A.AFTER_REVEAL, me)
-    siblings = A.post_siblings(bundle, item, session.scope)
+    siblings = A.post_siblings(bundle, item, session.scope, session.additional_items)
     new = A.rubric2(records)
     every_form_saved = all(A._of(new, s, bid, A.INDEPENDENT, me) for s in siblings)
     seen = _latest(records, iid, bundle, A.SYSTEM_SHOWN, me) is not None or any(
@@ -849,7 +849,9 @@ def _workspace(base: Path, bundle: A.Bundle, session: A.Session) -> None:
     if msg := st.session_state.pop("aw_msg", None):
         st.success(msg)
     scoped = A.ordered(bundle, session.scope)
-    order = [(sid, i) for sid, items in scoped for i in items]
+    extra = A.additional_forms(bundle, session.scope, session.additional_items)
+    order = [(sid, i) for sid, items in scoped for i in items] + [
+        (i["sequence_id"], i) for i in extra]
     covers_all = session.scope is None or session.scope >= len(bundle.sequences)
     st.text(f"Scope: all {len(bundle.sequences)} ideas and the sampled posts" if covers_all
             else f"Scope: first {session.scope} ideas (of {len(bundle.sequences)})")
@@ -864,9 +866,19 @@ def _workspace(base: Path, bundle: A.Bundle, session: A.Session) -> None:
             names[i["item_id"]] = f"{sid or 'no sequence'} {n}: {i['kind'].lower()}"
             labels[i["item_id"]] = (f"{names[i['item_id']]}, "
                                     f"{prog.status[i['item_id']].lower()}")
+    if extra:  # an additional form is named as in its own sequence: by its place there
+        place = {i["item_id"]: (sid, n) for sid, items in A.ordered(bundle)
+                 for n, i in enumerate(items, 1)}
+        for i in extra:
+            sid, n = place[i["item_id"]]
+            names[i["item_id"]] = f"{sid or 'no sequence'} {n}: {i['kind'].lower()}"
+            labels[i["item_id"]] = (f"{names[i['item_id']]}, "
+                                    f"{prog.status[i['item_id']].lower()}")
     with st.sidebar:
         st.metric("Sequences completed", f"{prog.sequences_done} of {prog.sequences}")
         st.metric("Items done", f"{prog.done} of {prog.total}")
+        if extra:
+            st.metric("Additional forms", f"{prog.additional_done} of {prog.additional_total}")
         if session.role == A.REVIEWER:
             st.toggle("Blind-first (hide the system's reading until you save yours)",
                       value=True, key="aw_blind")
@@ -889,7 +901,9 @@ def _workspace(base: Path, bundle: A.Bundle, session: A.Session) -> None:
                             format_func=names.get)
         st.caption(f"Status of this item: {prog.status[pick].lower()}")
         with st.expander("Status of every item"):
-            st.text("\n".join(labels[i] for i in ids))
+            st.text("\n".join(labels[i] for i in ids[:len(ids) - len(extra)]))
+            if extra:  # after the scope's ideas: one neutral group
+                st.text("Additional forms\n" + "\n".join(labels[i["item_id"]] for i in extra))
     item = bundle.items[pick]
     st.text(labels[pick])
     with st.container(border=True):
@@ -965,6 +979,10 @@ def main() -> None:
         bundle = _load(base, session.access)
     except (A.AdjudicationError, OSError, A.PrivatePathError) as exc:
         _refuse(f"The adjudication bundle is refused ({_code(exc)}).")
+    try:  # every additional item must be in this bundle, before any form is offered
+        A.additional_forms(bundle, session.scope, session.additional_items)
+    except A.AdjudicationError as exc:
+        _refuse(f"The reviewers file is refused ({_code(exc)}).")
     if synced:
         st.warning(f"PRIVATE_FOLDER_IN_SYNCED_FOLDER ({synced}): the bundle and the judgments "
                    "are copied to that provider. Allowed locally by the owner's policy; refused "

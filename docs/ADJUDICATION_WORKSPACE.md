@@ -184,6 +184,16 @@ access = "FULL"          # FULL or RESTRICTED
   label-only posts come once the scope covers all sequences. Progress ("sequences completed",
   "items done") counts within the scope; "Next item not yet adjudicated". A record for an item
   outside the scope is refused.
+* **Additional forms** (optional; the owner's to edit, in `reviewers.toml`):
+  `additional_items = ["<item id>", ...]`, at most 50 distinct item ids, offers those forms as
+  well, beyond the first `scope_sequences` ideas, as ordinary forms listed after the scope under
+  "Additional forms" with their own count; nothing on the page says why they were added. An id
+  already in the scope is not offered twice. Saving, blind-first per post (within the scope and
+  the list together), the reveal marker and "Next item not yet adjudicated" treat them as in
+  scope; "sequences completed" and "items done" still count the first-N scope only. A malformed
+  list makes the file unreadable (`REVIEWERS_FILE_UNREADABLE`); an id that is not in the bundle
+  refuses the session before any form is offered (`ADDITIONAL_ITEM_UNKNOWN`). Absent or empty:
+  nothing changes.
 * The sidebar also offers the vocabulary recommendations page ([VOCAB_REVIEWER.md](VOCAB_REVIEWER.md)),
   which keeps its own checks and sanitized export.
 * **What a remote reviewer cannot do**, by construction (the app has no such code and imports
