@@ -108,6 +108,7 @@ LEVELS = R.LEVELS  # the price table: reading[LEVELS] = [{row, role, exactness, 
 #                                                         month_named}]
 fields_for = R.fields_for
 DEFAULT_SCOPE = 20
+MAX_ADDITIONAL_ITEMS = 50  # the reviewers file's ``additional_items``
 
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")
 _CODE = re.compile(r"^[A-Z][A-Z0-9_:.]{0,63}$")
@@ -563,9 +564,41 @@ def post_forms(bundle: Bundle, item: dict) -> list[dict]:
                                         order.index(i["item_id"])))
 
 
-def post_siblings(bundle: Bundle, item: dict, scope: int | None) -> list[str]:
-    """Every item of ``item``'s post within the scope (blind-first holds per POST)."""
+def additional_forms(bundle: Bundle, scope: int | None, additional=()) -> list[dict]:
+    """The reviewers file's ``additional_items`` that are not already within the first
+    ``scope`` sequences, in review order (as ``ordered`` lists the whole bundle). Fails closed,
+    refusing the session: ``ADDITIONAL_ITEM_UNKNOWN`` for an id that is not in the bundle, and
+    ``ADDITIONAL_ITEM_PARTIAL_POST`` for a listed item OUTSIDE the scope whose post has another
+    item (any kind, any sequence or none) that is not listed, or that lies inside the scope:
+    blind-first holds per post, so such an item brings its whole post in the list, and a form
+    of a post that is partly inside the scope cannot be added (the list is never expanded
+    silently). A listed id inside the scope is not doubled and triggers nothing by itself."""
+    if any(i not in bundle.items for i in additional):
+        raise AdjudicationError("ADDITIONAL_ITEM_UNKNOWN")
+    if not additional:
+        return []
     scoped = {i["item_id"] for _, items in ordered(bundle, scope) for i in items}
+    wanted = set(additional) - scoped
+    posts = {bundle.items[i]["post_ref"] for i in wanted}
+    if any(x["post_ref"] in posts and (i in scoped or i not in wanted)
+           for i, x in bundle.items.items()):
+        raise AdjudicationError("ADDITIONAL_ITEM_PARTIAL_POST")
+    return [i for _, items in ordered(bundle) for i in items if i["item_id"] in wanted]
+
+
+def scope_ids(bundle: Bundle, scope: int | None, additional=()) -> set[str]:
+    """Every item offered to a session: the first ``scope`` sequences and the additional
+    items (``ADDITIONAL_ITEM_UNKNOWN`` for an id not in the bundle)."""
+    extra = additional_forms(bundle, scope, additional)
+    return {i["item_id"] for _, items in ordered(bundle, scope) for i in items} | {
+        i["item_id"] for i in extra}
+
+
+def post_siblings(bundle: Bundle, item: dict, scope: int | None,
+                  additional=()) -> list[str]:
+    """Every item of ``item``'s post within the scope and the additional items (blind-first
+    holds per POST)."""
+    scoped = scope_ids(bundle, scope, additional)
     return [i for i, x in bundle.items.items() if x["post_ref"] == item["post_ref"]
             and (i in scoped or i == item["item_id"])]
 
@@ -865,6 +898,7 @@ class Reviewers:
     entries: dict[str, Reviewer]  # casefolded login -> entry
     remote_full_context_authorized: bool = False
     scope_sequences: int = DEFAULT_SCOPE
+    additional_items: tuple[str, ...] = ()  # forms offered beyond the first-N scope
 
 
 def load_reviewers(path: str | Path) -> Reviewers:
@@ -878,7 +912,15 @@ def load_reviewers(path: str | Path) -> Reviewers:
         access = "FULL"     # or RESTRICTED
 
     plus ``scope_sequences = 20`` (default): only the first that many sequences in review order
-    are offered (the sampled label-only posts once it covers all).
+    are offered (the sampled label-only posts once it covers all); and, optionally,
+    ``additional_items = ["<item id>", ...]``: at most 50 distinct item ids offered as well,
+    beyond that scope (absent or empty: none). The line goes at the top of the file, above the
+    first ``[[reviewer]]`` (below it TOML makes it a key of that entry, which is refused:
+    ``REVIEWERS_FILE_ENTRY``). Each must have the bundle's item-id shape; once the bundle is
+    loaded, an id that is not in it (``ADDITIONAL_ITEM_UNKNOWN``) or a listed item outside the
+    scope whose post has another item that is not listed or lies inside the scope
+    (``ADDITIONAL_ITEM_PARTIAL_POST``: a form of a post that is partly inside the scope cannot
+    be added) refuses the session. The first-N counts of ``progress`` do not include them.
     """
     data = _read_private(path, "reviewers file")
     if data is None:
@@ -889,19 +931,27 @@ def load_reviewers(path: str | Path) -> Reviewers:
         raise AdjudicationError("REVIEWERS_FILE_UNREADABLE") from None
     switch = raw.get("remote_full_context_authorized", False)
     scope = raw.get("scope_sequences", DEFAULT_SCOPE)
+    additional = raw.get("additional_items", [])
     if not isinstance(switch, bool) or not set(raw) <= {
-            "remote_full_context_authorized", "reviewer", "scope_sequences"} or isinstance(
+            "remote_full_context_authorized", "reviewer", "scope_sequences",
+            "additional_items"} or isinstance(
             scope, bool) or not isinstance(scope, int) or scope < 1:
+        raise AdjudicationError("REVIEWERS_FILE_UNREADABLE")
+    if not isinstance(additional, list) or len(additional) > MAX_ADDITIONAL_ITEMS or not all(
+            isinstance(i, str) and _ID.fullmatch(i) for i in additional) or len(
+            set(additional)) != len(additional):
         raise AdjudicationError("REVIEWERS_FILE_UNREADABLE")
     entries = {}
     for r in raw.get("reviewer") or []:
         login, name = r.get("login"), r.get("name", "")
+        if "additional_items" in r:  # written below a [[reviewer]]: refused, never ignored
+            raise AdjudicationError("REVIEWERS_FILE_ENTRY")
         if not (isinstance(login, str) and login.strip() and isinstance(name, str)) \
                 or r.get("role") not in (REVIEWER, APPROVER) \
                 or r.get("access") not in (FULL, RESTRICTED) or login.casefold() in entries:
             raise AdjudicationError("REVIEWERS_FILE_ENTRY")
         entries[login.casefold()] = Reviewer(login, name, r["role"], r["access"])
-    return Reviewers(entries, switch, scope)
+    return Reviewers(entries, switch, scope, tuple(additional))
 
 
 @dataclass(frozen=True)
@@ -912,6 +962,7 @@ class Session:
     access: str  # the EFFECTIVE access of this session
     via_proxy: bool
     scope: int | None = None  # sequences offered (reviewers file); None: all (tools, tests)
+    additional_items: tuple[str, ...] = ()  # items offered beyond the scope (reviewers file)
 
 
 def resolve_session(headers, env, reviewers: Reviewers, port: int) -> Session:
@@ -930,7 +981,7 @@ def resolve_session(headers, env, reviewers: Reviewers, port: int) -> Session:
     access = entry.access if (not ident.via_proxy or reviewers.remote_full_context_authorized) \
         else RESTRICTED
     return Session(entry.login, entry.name, entry.role, access, ident.via_proxy,
-                   reviewers.scope_sequences)
+                   reviewers.scope_sequences, tuple(reviewers.additional_items))
 
 
 # ------------------------------------------------------------------ the annotation log
@@ -1007,8 +1058,8 @@ def append_annotation(base: str | Path, bundle: Bundle, session: Session, *, ite
     item = bundle.items.get(item_id)
     if item is None:
         raise AdjudicationError("UNKNOWN_ITEM")
-    if session.scope is not None and item_id not in {
-            i["item_id"] for _, items in ordered(bundle, session.scope) for i in items}:
+    offered = scope_ids(bundle, session.scope, session.additional_items)
+    if session.scope is not None and item_id not in offered:
         raise AdjudicationError("OUTSIDE_SCOPE")
     if phase not in (INDEPENDENT, AFTER_REVEAL, APPROVAL):
         raise AdjudicationError("UNKNOWN_PHASE")
@@ -1046,7 +1097,7 @@ def append_annotation(base: str | Path, bundle: Bundle, session: Session, *, ite
         recs, me = v.records, session.login
         new = rubric2(recs)
         stored = reading
-        siblings = post_siblings(bundle, item, session.scope)
+        siblings = post_siblings(bundle, item, session.scope, session.additional_items)
         if phase == INDEPENDENT and (_of(recs, item_id, bundle.bundle_id, login=me) or any(
                 _of(recs, s, bundle.bundle_id, SYSTEM_SHOWN, me) for s in siblings)):
             raise AdjudicationError("SYSTEM_READING_ALREADY_SEEN")  # a marker or a reading
@@ -1113,7 +1164,8 @@ def mark_system_shown(base: str | Path, bundle: Bundle, session: Session, item_i
     Approvers write no reading, so they need no marker."""
     if session.role != REVIEWER or item_id not in bundle.items:
         return
-    for sid in post_siblings(bundle, bundle.items[item_id], session.scope):
+    for sid in post_siblings(bundle, bundle.items[item_id], session.scope,
+                             session.additional_items):
         def make(v: Verification, sid=sid) -> dict:
             if _of(v.records, sid, bundle.bundle_id, SYSTEM_SHOWN, session.login):
                 raise _AlreadyMarked
@@ -1365,16 +1417,22 @@ class Progress:
     total: int = 0
     sequences_done: int = 0
     sequences: int = 0
-    status: dict[str, str] = field(default_factory=dict)  # item_id -> status
+    status: dict[str, str] = field(default_factory=dict)  # item_id -> status (additional too)
+    additional_done: int = 0  # the additional items (not counted in done, total, sequences)
+    additional_total: int = 0
 
 
 def progress(bundle: Bundle, records: list[dict], session: Session) -> Progress:
     """Per item for this session, under rubric 2 (rubric-1 records do not count): a reviewer's
-    OPEN / INDEPENDENT_SAVED / DONE; an approver's NOT_REVIEWED / AWAITING / RETURNED / DECIDED."""
+    OPEN / INDEPENDENT_SAVED / DONE; an approver's NOT_REVIEWED / AWAITING / RETURNED / DECIDED.
+    ``done``, ``total`` and the sequences count the first-N scope only; the additional items
+    are counted apart (``additional_done`` of ``additional_total``)."""
     records = rubric2(records)
     in_scope = [i["item_id"] for _, items in ordered(bundle, session.scope) for i in items]
-    p = Progress(total=len(in_scope))
-    for item_id in in_scope:
+    extra = [i["item_id"] for i in additional_forms(bundle, session.scope,
+                                                     session.additional_items)]
+    p = Progress(total=len(in_scope), additional_total=len(extra))
+    for item_id in in_scope + extra:
         if session.role == REVIEWER:
             phases = {r["phase"] for r in _of(records, item_id, bundle.bundle_id,
                                               login=session.login)}
@@ -1386,7 +1444,10 @@ def progress(bundle: Bundle, records: list[dict], session: Session) -> Progress:
                  else "AWAITING" if appr is None else "RETURNED"
                  if _outcome(appr) == "RETURN" else "DECIDED")
         p.status[item_id] = s
-        p.done += s in ("DONE", "DECIDED")
+        if item_id in extra:
+            p.additional_done += s in ("DONE", "DECIDED")
+        else:
+            p.done += s in ("DONE", "DECIDED")
     scoped = [(sid, items) for sid, items in ordered(bundle, session.scope) if sid is not None]
     p.sequences = len(scoped)
     p.sequences_done = sum(all(p.status[i["item_id"]] in ("DONE", "DECIDED") for i in items)
