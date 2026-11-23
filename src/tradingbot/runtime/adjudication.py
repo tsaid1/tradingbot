@@ -566,13 +566,20 @@ def post_forms(bundle: Bundle, item: dict) -> list[dict]:
 
 def additional_forms(bundle: Bundle, scope: int | None, additional=()) -> list[dict]:
     """The reviewers file's ``additional_items`` that are not already within the first
-    ``scope`` sequences, in review order (as ``ordered`` lists the whole bundle). An id that is
-    not in the bundle refuses the session: ``ADDITIONAL_ITEM_UNKNOWN`` (fails closed)."""
+    ``scope`` sequences, in review order (as ``ordered`` lists the whole bundle). Fails closed,
+    refusing the session: ``ADDITIONAL_ITEM_UNKNOWN`` for an id that is not in the bundle, and
+    ``ADDITIONAL_ITEM_PARTIAL_POST`` for a listed item whose post has an item (any kind, any
+    sequence) that is neither in the scope nor in the list: blind-first holds per post, so a
+    listed item brings its whole post (the list is never expanded silently)."""
     if any(i not in bundle.items for i in additional):
         raise AdjudicationError("ADDITIONAL_ITEM_UNKNOWN")
     if not additional:
         return []
     scoped = {i["item_id"] for _, items in ordered(bundle, scope) for i in items}
+    offered = scoped | set(additional)
+    posts = {bundle.items[i]["post_ref"] for i in additional}
+    if any(x["post_ref"] in posts and i not in offered for i, x in bundle.items.items()):
+        raise AdjudicationError("ADDITIONAL_ITEM_PARTIAL_POST")
     wanted = set(additional) - scoped
     return [i for _, items in ordered(bundle) for i in items if i["item_id"] in wanted]
 
@@ -905,9 +912,12 @@ def load_reviewers(path: str | Path) -> Reviewers:
     plus ``scope_sequences = 20`` (default): only the first that many sequences in review order
     are offered (the sampled label-only posts once it covers all); and, optionally,
     ``additional_items = ["<item id>", ...]``: at most 50 distinct item ids offered as well,
-    beyond that scope (absent or empty: none). Each must have the bundle's item-id shape; one
-    that is not in the bundle refuses the session once the bundle is loaded
-    (``ADDITIONAL_ITEM_UNKNOWN``). The first-N counts of ``progress`` do not include them.
+    beyond that scope (absent or empty: none). The line goes at the top of the file, above the
+    first ``[[reviewer]]`` (below it TOML makes it a key of that entry, which is refused:
+    ``REVIEWERS_FILE_ENTRY``). Each must have the bundle's item-id shape; once the bundle is
+    loaded, an id that is not in it (``ADDITIONAL_ITEM_UNKNOWN``) or a listed item whose post
+    has an item neither in the scope nor in the list (``ADDITIONAL_ITEM_PARTIAL_POST``) refuses
+    the session. The first-N counts of ``progress`` do not include them.
     """
     data = _read_private(path, "reviewers file")
     if data is None:
@@ -925,12 +935,14 @@ def load_reviewers(path: str | Path) -> Reviewers:
             scope, bool) or not isinstance(scope, int) or scope < 1:
         raise AdjudicationError("REVIEWERS_FILE_UNREADABLE")
     if not isinstance(additional, list) or len(additional) > MAX_ADDITIONAL_ITEMS or not all(
-            isinstance(i, str) and _ID.match(i) for i in additional) or len(
+            isinstance(i, str) and _ID.fullmatch(i) for i in additional) or len(
             set(additional)) != len(additional):
         raise AdjudicationError("REVIEWERS_FILE_UNREADABLE")
     entries = {}
     for r in raw.get("reviewer") or []:
         login, name = r.get("login"), r.get("name", "")
+        if "additional_items" in r:  # written below a [[reviewer]]: refused, never ignored
+            raise AdjudicationError("REVIEWERS_FILE_ENTRY")
         if not (isinstance(login, str) and login.strip() and isinstance(name, str)) \
                 or r.get("role") not in (REVIEWER, APPROVER) \
                 or r.get("access") not in (FULL, RESTRICTED) or login.casefold() in entries:

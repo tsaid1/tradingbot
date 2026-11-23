@@ -185,10 +185,13 @@ access = "FULL"          # FULL or RESTRICTED
   "items done") counts within the scope; "Next item not yet adjudicated". A record for an item
   outside the scope is refused.
 * **Additional forms** (optional; the owner's to edit, in `reviewers.toml`):
-  `additional_items = ["<item id>", ...]`, at most 50 distinct item ids, offers those forms as
-  well, beyond the first `scope_sequences` ideas, as ordinary forms listed after the scope under
-  "Additional forms" with their own count; nothing on the page says why they were added. An id
-  already in the scope is not offered twice. Saving, blind-first per post (within the scope and
+  `additional_items = ["<item id>", ...]`, at most 50 distinct item ids, on a line at the top
+  of the file above the first `[[reviewer]]` (below one it belongs to that entry and the file is
+  refused, `REVIEWERS_FILE_ENTRY`), offers those forms as well, beyond the first
+  `scope_sequences` ideas, as ordinary forms listed after the scope under "Additional forms"
+  with their own count; nothing on the page says why they were added. An id already in the
+  scope is not offered twice. A listed form brings its whole post: every item of its post must
+  be in the scope or in the list, else the session is refused (`ADDITIONAL_ITEM_PARTIAL_POST`). Saving, blind-first per post (within the scope and
   the list together), the reveal marker and "Next item not yet adjudicated" treat them as in
   scope; "sequences completed" and "items done" still count the first-N scope only. A malformed
   list makes the file unreadable (`REVIEWERS_FILE_UNREADABLE`); an id that is not in the bundle

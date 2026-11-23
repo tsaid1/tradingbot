@@ -9,13 +9,12 @@ import re
 import _review_modes as modes
 import pytest
 from streamlit.testing.v1 import AppTest
-from test_adjudication import fill, review, save, valid
+from test_adjudication import VALID, fill, review, rewrite, save, valid
 from test_adjudication_rubric import (
     APP,
     APPROVER,
     DEMO,
     REVIEWER,
-    after_reading,
     answers_of,
     bundle,
     save_after,
@@ -44,6 +43,7 @@ def configure(base, *, scope: int | None = None, additional=None, raw: str | Non
         text = text.replace("scope_sequences = 40", f"scope_sequences = {scope}")
     if additional is not None or raw is not None:
         value = raw if raw is not None else "[" + ", ".join(f'"{i}"' for i in additional) + "]"
+        text = re.sub(r"additional_items = .*\n", "", text)  # a list changed: replaced
         text = text.replace("\n[[reviewer]]", f"additional_items = {value}\n\n[[reviewer]]", 1)
     path.write_text(text)
     return path
@@ -147,6 +147,7 @@ def test_the_key_is_optional_and_carried(base, raw, expected):
     '[""]',
     '["bad id"]',
     '["-s14a"]',
+    '["s14a\\n"]',  # a trailing newline: the whole string must have the shape
     '["' + "x" * 65 + '"]',
     '[["s14a"]]',
     "[" + ", ".join(f'"x{k}"' for k in range(51)) + "]",  # more than 50
@@ -411,28 +412,177 @@ def test_next_reaches_the_list_after_the_scope_and_never_leaves_the_union(
     assert metric(at, HEADING) == ["2 of 2"] and metric(at, "Items done") == ["2 of 2"]
 
 
-def test_a_later_form_whose_earlier_form_is_not_offered(monkeypatch, local, base):
-    """``s14b`` listed alone: its earlier form ``s14a`` is neither in the scope nor in the list.
-    The page shows its own evidence and context; no earlier position is assumed (there is
-    none), its reveal follows its own independent reading, and only ``s14b`` is marked, as for
-    a form whose sibling lies outside the scope."""
-    configure(base, scope=1, additional=["s14b"])
+PARTIAL = "The reviewers file is refused (ADDITIONAL_ITEM_PARTIAL_POST)."
+
+
+def refused(at, message=PARTIAL) -> None:
+    assert [str(e.value) for e in at.error] == [message]
+    assert not at.selectbox and not at.button and not at.radio and not at.text_input
+    assert "aw_bundle" not in at.session_state
+
+
+def test_b1_one_form_of_a_two_form_post_refuses_the_session(monkeypatch, local, base):
+    """The review's B1 start: ``["s14a"]`` alone (``s14b`` neither in the scope nor listed)."""
+    configure(base, scope=1, additional=["s14a"])
+    for login in (REVIEWER.login, APPROVER.login):
+        refused(run(monkeypatch, base, login))
     b = bundle(base)
-    assert A.earlier_positions([], b, b.items["s14b"], REVIEWER.login) == []
+    half = session(additional=("s14a",))
+    for call in (lambda: A.additional_forms(b, 1, ("s14a",)),
+                 lambda: A.progress(b, [], half),
+                 lambda: A.mark_system_shown(base, b, half, "s14a"),
+                 lambda: A.append_annotation(
+                     base, b, half, item_id="s14a", phase=A.INDEPENDENT, blind=True,
+                     reading=answers_of(b, b.items["s14a"], S14["forms"][0]),
+                     confidence="HIGH")):
+        with pytest.raises(A.AdjudicationError, match="^ADDITIONAL_ITEM_PARTIAL_POST$"):
+            call()
+    assert stored(base) == []
+    # Path A and B of the review: the owner then lists both. Nothing was revealed: both forms
+    # start blind, and neither is shown before both independent readings are saved.
+    configure(base, additional=["s14a", "s14b"])
+    at = run(monkeypatch, base, REVIEWER.login)
+    for iid in ("s14a", "s14b"):
+        at = pick(at, iid)
+        assert at.radio(key=f"aw_{iid}_ind_component").value is None
+        assert not any(t.startswith("holds SHIPPED") for t in texts(at))
+    assert markers(base) == []
+
+
+def test_b1_a_list_changed_mid_review_refuses_and_writes_nothing(monkeypatch, local, base):
+    """The variant: both listed, ``s14a`` saved, then the owner shrinks the list to
+    ``["s14a"]`` between two requests: the next request is refused and nothing more of the
+    post is written (no marker, no reading); the same through the proxy path."""
+    configure(base, scope=1, additional=["s14a", "s14b"])
+    b = bundle(base)
+    at = _scenario_through_page(run(monkeypatch, base, REVIEWER.login), base, b, 0)
+    before = stored(base)
+    assert [r["phase"] for r in before] == [A.INDEPENDENT] and markers(base) == []
+    configure(base, additional=["s14a"])
+    at.run()
+    refused(at)
+    at = run(monkeypatch, base, REVIEWER.login)
+    refused(at)
+    shrunk = session(additional=("s14a",))
+    with pytest.raises(A.AdjudicationError, match="^ADDITIONAL_ITEM_PARTIAL_POST$"):
+        A.mark_system_shown(base, b, shrunk, "s14a")
+    with pytest.raises(A.AdjudicationError, match="^ADDITIONAL_ITEM_PARTIAL_POST$"):
+        save_after(base, b, {**S14, "forms": S14["forms"][:1]}, [before[0]], session=shrunk)
+    assert stored(base) == before
+    configure(base, additional=["s14b"])  # the other half: refused too
+    refused(run(monkeypatch, base, REVIEWER.login))
+    modes.published(monkeypatch)  # PUBLISHED mode: the proxy's login
+    monkeypatch.delenv(A.LOCAL_IDENTITY_ENV, raising=False)
+    modes.with_headers(monkeypatch, **{"Tailscale-User-Login": REVIEWER.login})
+    at = AppTest.from_file(str(APP), default_timeout=120)
+    at.run()
+    refused(at)
+    assert stored(base) == before
+
+
+def test_a_listed_form_whose_sibling_is_in_the_scope_is_accepted(monkeypatch, local, base):
+    """An invented bundle edit puts ``s14b`` in the next sequence: with ``s14a`` in the scope,
+    listing ``s14b`` offers the whole post. Blind-first holds over both."""
+    rewrite(base / "bundle" / "items.jsonl", lambda rows: [
+        {**r, "sequence_id": "scs15"} if r["item_id"] == "s14b" else r for r in rows])
+    b = bundle(base)
+    order = [sid for sid, _ in A.ordered(b)]
+    scope = order.index("scs14") + 1
+    assert order[scope] == "scs15"
+    assert [i["item_id"] for i in A.additional_forms(b, scope, ("s14b",))] == ["s14b"]
+    assert sorted(A.post_siblings(b, b.items["s14a"], scope, ("s14b",))) == ["s14a", "s14b"]
+    assert A.earlier_positions([], b, b.items["s14b"], REVIEWER.login) == []  # none saved
+    configure(base, scope=scope, additional=["s14b"])
     at = pick(run(monkeypatch, base, REVIEWER.login), "s14b")
+    assert not [e for e in at.error if "refused" in str(e.value)]  # offered, not refused
     assert "Form 2 of 2 for this post" in texts(at)
-    s01 = next(s for s in SC.SCENARIOS if s["n"] == 1)
-    assert any(s01["text"] in t for t in texts(at)) and any(S14["text"] in t for t in texts(at))
     assert not any(t.startswith("Position after your reading of the previous action")
                    for t in texts(at))
     at = _scenario_through_page(at, base, b, 1)
-    assert any(t.startswith("holds SHIPPED: NOT_DECIDED ") for t in texts(at))
-    assert markers(base) == ["s14b"]
-    assert not any(t.startswith("Label of the whole post") for t in texts(at))
-    ind = A.read_annotations(base).records[0]
-    _done, checks, ctx = A.check_reading(
-        b, b.items["s14b"], A.clean_reading(after_reading(b, b.items["s14b"], ind["reading"]),
-                                            b.items["s14b"], b),
-        revealed=True, records=A.read_annotations(base).records, login=REVIEWER.login,
-        confidence="HIGH")
-    assert ctx.earlier_positions == () and "POSITION_CHAIN" not in checks.warnings
+    assert not any(t.startswith("holds SHIPPED") for t in texts(at)) and markers(base) == []
+    at = _scenario_through_page(at, base, b, 0)
+    assert any(t.startswith("holds SHIPPED") for t in texts(at))
+    assert sorted(markers(base)) == ["s14a", "s14b"]
+
+
+def _forge_marker(base, b, item_id) -> None:
+    """A SYSTEM_SHOWN marker for ONE form, as a log written while only that form of the post
+    was offered would hold it (the state B1 left behind)."""
+    def make(_v):
+        return {"at": "2026-11-20T10:00:00+00:00", "bundle_id": b.bundle_id, "item_id": item_id,
+                "annotator": {"login": REVIEWER.login, "name": REVIEWER.name,
+                              "role": A.REVIEWER, "access": A.FULL},
+                "phase": A.SYSTEM_SHOWN, "blind": False, "reading": {}, "field_verdicts": {},
+                "flags": [], "confidence": "", "notes": "", "refers_to": None,
+                "decision": None, "rubric": A.RUBRIC, "acknowledged_warnings": []}
+    A.append_chained(A.annotations_path(base), "annotation log", A.ANNOTATION_SCHEMA, make)
+
+
+def test_the_save_check_holds_blind_first_over_listed_siblings(base):
+    """Through ``append_annotation`` directly, with both forms of ``s14`` listed: no reading
+    after the reveal of one form before the other's independent reading, and no
+    "independent" reading of a form whose listed sibling's system reading was shown."""
+    b = bundle(base)
+    both = session(additional=("s14a", "s14b"))
+    [ind] = save_independent(base, b, {**S14, "forms": S14["forms"][:1]}, session=both,
+                             variants=False)
+    with pytest.raises(A.AdjudicationError, match="^BLIND_FIRST_PER_POST$"):
+        save_after(base, b, {**S14, "forms": S14["forms"][:1]}, [ind], session=both)
+    _forge_marker(base, b, "s14a")
+    f = S14["forms"][1]
+    with pytest.raises(A.AdjudicationError, match="^SYSTEM_READING_ALREADY_SEEN$"):
+        A.append_annotation(base, b, both, item_id="s14b", phase=A.INDEPENDENT, blind=True,
+                            reading=answers_of(b, b.items["s14b"], f), flags=f["flags"],
+                            notes=f["notes"], confidence=f["confidence"])
+    assert [r["phase"] for r in stored(base)] == [A.INDEPENDENT, A.SYSTEM_SHOWN]
+
+
+def test_a_held_selector_text_keeps_its_form_when_the_list_grows(monkeypatch, local, base):
+    """An additional form is named by its place in its own sequence, never by its place in
+    the list: ``i03`` is "seqA 3", alone or after ``i01`` joins the list before it."""
+    configure(base, scope=1, additional=["i03"])
+    at = pick(run(monkeypatch, base, REVIEWER.login), "i03")
+    box = at.selectbox(key="aw_pick")
+    assert list(box.options) == ["seqB 1: instruction", "seqB 2: instruction",
+                                 "seqA 3: instruction"]
+    configure(base, additional=["i03", "i01"])
+    at.run()
+    box = at.selectbox(key="aw_pick")
+    assert list(box.options) == ["seqB 1: instruction", "seqB 2: instruction",
+                                 "seqA 1: instruction", "seqA 3: instruction"]
+    assert box.value == "i03" and box.options[box.index] == "seqA 3: instruction"
+    assert "seqA 3: instruction, open" in texts(at)
+
+
+def test_a_label_only_additional_form(monkeypatch, local, base):
+    configure(base, scope=1, additional=["i02"])
+    b = bundle(base)
+    at = run(monkeypatch, base, REVIEWER.login)
+    assert "seqA 2: label_only" in list(at.selectbox(key="aw_pick").options)
+    assert f"{HEADING}\nseqA 2: label_only, open" in texts(at)
+    assert metric(at, HEADING) == ["0 of 1"]
+    at = pick(at, "i02")
+    assert "Label-only form: the label of the whole post" in texts(at)
+    fill(at, "aw_i02_ind", valid(b, "i02"))
+    save(at, "aw_i02_ind", "MEDIUM")
+    [ind] = [r for r in stored(base) if r["phase"] == A.INDEPENDENT]
+    assert ind["item_id"] == "i02"
+    p = A.progress(b, A.read_annotations(base).records, session(additional=("i02",)))
+    assert (p.additional_done, p.additional_total, p.status["i02"]) == (
+        0, 1, "INDEPENDENT_SAVED")
+    save(at, f"aw_i02_after_{ind['seq']}")
+    assert [r["phase"] for r in stored(base) if r["item_id"] == "i02"][-1] == A.AFTER_REVEAL
+    assert metric(at, HEADING) == ["1 of 1"] and metric(at, "Items done") == ["0 of 2"]
+    assert f"{HEADING}\nseqA 2: label_only, done" in texts(at)
+    assert VALID["i02"]["post_label"] == "COMMENTARY"
+
+
+def test_the_key_below_a_reviewer_entry_is_refused_not_ignored(base):
+    path = base / "reviewers.toml"
+    text = path.read_text()
+    for value in ('["s14a"]', '["zz99"]', "[]"):
+        path.write_text(text + f"additional_items = {value}\n")
+        with pytest.raises(A.AdjudicationError, match="^REVIEWERS_FILE_ENTRY$"):
+            A.load_reviewers(path)
+    path.write_text(text + "scope_sequences = 3\n")  # any other key: loaded exactly as before
+    assert A.load_reviewers(path).scope_sequences == 40
