@@ -190,8 +190,10 @@ access = "FULL"          # FULL or RESTRICTED
   refused, `REVIEWERS_FILE_ENTRY`), offers those forms as well, beyond the first
   `scope_sequences` ideas, as ordinary forms listed after the scope under "Additional forms"
   with their own count; nothing on the page says why they were added. An id already in the
-  scope is not offered twice. A listed form brings its whole post: every item of its post must
-  be in the scope or in the list, else the session is refused (`ADDITIONAL_ITEM_PARTIAL_POST`). Saving, blind-first per post (within the scope and
+  scope is not offered twice. A listed form outside the scope brings its whole post: every other
+  item of its post (any kind, any sequence or none) must be listed too, else the session is
+  refused (`ADDITIONAL_ITEM_PARTIAL_POST`); a form of a post that is partly inside the scope
+  cannot be added. Saving, blind-first per post (within the scope and
   the list together), the reveal marker and "Next item not yet adjudicated" treat them as in
   scope; "sequences completed" and "items done" still count the first-N scope only. A malformed
   list makes the file unreadable (`REVIEWERS_FILE_UNREADABLE`); an id that is not in the bundle

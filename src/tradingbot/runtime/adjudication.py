@@ -568,19 +568,21 @@ def additional_forms(bundle: Bundle, scope: int | None, additional=()) -> list[d
     """The reviewers file's ``additional_items`` that are not already within the first
     ``scope`` sequences, in review order (as ``ordered`` lists the whole bundle). Fails closed,
     refusing the session: ``ADDITIONAL_ITEM_UNKNOWN`` for an id that is not in the bundle, and
-    ``ADDITIONAL_ITEM_PARTIAL_POST`` for a listed item whose post has an item (any kind, any
-    sequence) that is neither in the scope nor in the list: blind-first holds per post, so a
-    listed item brings its whole post (the list is never expanded silently)."""
+    ``ADDITIONAL_ITEM_PARTIAL_POST`` for a listed item OUTSIDE the scope whose post has another
+    item (any kind, any sequence or none) that is not listed, or that lies inside the scope:
+    blind-first holds per post, so such an item brings its whole post in the list, and a form
+    of a post that is partly inside the scope cannot be added (the list is never expanded
+    silently). A listed id inside the scope is not doubled and triggers nothing by itself."""
     if any(i not in bundle.items for i in additional):
         raise AdjudicationError("ADDITIONAL_ITEM_UNKNOWN")
     if not additional:
         return []
     scoped = {i["item_id"] for _, items in ordered(bundle, scope) for i in items}
-    offered = scoped | set(additional)
-    posts = {bundle.items[i]["post_ref"] for i in additional}
-    if any(x["post_ref"] in posts and i not in offered for i, x in bundle.items.items()):
-        raise AdjudicationError("ADDITIONAL_ITEM_PARTIAL_POST")
     wanted = set(additional) - scoped
+    posts = {bundle.items[i]["post_ref"] for i in wanted}
+    if any(x["post_ref"] in posts and (i in scoped or i not in wanted)
+           for i, x in bundle.items.items()):
+        raise AdjudicationError("ADDITIONAL_ITEM_PARTIAL_POST")
     return [i for _, items in ordered(bundle) for i in items if i["item_id"] in wanted]
 
 
@@ -915,9 +917,10 @@ def load_reviewers(path: str | Path) -> Reviewers:
     beyond that scope (absent or empty: none). The line goes at the top of the file, above the
     first ``[[reviewer]]`` (below it TOML makes it a key of that entry, which is refused:
     ``REVIEWERS_FILE_ENTRY``). Each must have the bundle's item-id shape; once the bundle is
-    loaded, an id that is not in it (``ADDITIONAL_ITEM_UNKNOWN``) or a listed item whose post
-    has an item neither in the scope nor in the list (``ADDITIONAL_ITEM_PARTIAL_POST``) refuses
-    the session. The first-N counts of ``progress`` do not include them.
+    loaded, an id that is not in it (``ADDITIONAL_ITEM_UNKNOWN``) or a listed item outside the
+    scope whose post has another item that is not listed or lies inside the scope
+    (``ADDITIONAL_ITEM_PARTIAL_POST``: a form of a post that is partly inside the scope cannot
+    be added) refuses the session. The first-N counts of ``progress`` do not include them.
     """
     data = _read_private(path, "reviewers file")
     if data is None:

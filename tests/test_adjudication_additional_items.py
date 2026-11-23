@@ -480,29 +480,88 @@ def test_b1_a_list_changed_mid_review_refuses_and_writes_nothing(monkeypatch, lo
     assert stored(base) == before
 
 
-def test_a_listed_form_whose_sibling_is_in_the_scope_is_accepted(monkeypatch, local, base):
-    """An invented bundle edit puts ``s14b`` in the next sequence: with ``s14a`` in the scope,
-    listing ``s14b`` offers the whole post. Blind-first holds over both."""
+def _move(base, item_id, **fields) -> A.Bundle:
+    """An invented variant of the demo bundle: one item's fields changed, resealed."""
     rewrite(base / "bundle" / "items.jsonl", lambda rows: [
-        {**r, "sequence_id": "scs15"} if r["item_id"] == "s14b" else r for r in rows])
-    b = bundle(base)
+        {**r, **fields} if r["item_id"] == item_id else r for r in rows])
+    return bundle(base)
+
+
+def partial(b, scope, additional) -> bool:
+    try:
+        A.additional_forms(b, scope, additional)
+    except A.AdjudicationError as exc:
+        assert exc.code == "ADDITIONAL_ITEM_PARTIAL_POST"
+        return True
+    return False
+
+
+def test_a_form_of_a_post_partly_inside_the_scope_cannot_be_added(monkeypatch, local, base):
+    """An invented bundle edit puts ``s14b`` in the next sequence: with ``s14a`` in the scope,
+    listing ``s14b`` (alone or with ``s14a``) is refused; the in-scope ``s14a`` alone is a
+    harmless entry."""
+    b = _move(base, "s14b", sequence_id="scs15")
     order = [sid for sid, _ in A.ordered(b)]
     scope = order.index("scs14") + 1
     assert order[scope] == "scs15"
-    assert [i["item_id"] for i in A.additional_forms(b, scope, ("s14b",))] == ["s14b"]
-    assert sorted(A.post_siblings(b, b.items["s14a"], scope, ("s14b",))) == ["s14a", "s14b"]
-    assert A.earlier_positions([], b, b.items["s14b"], REVIEWER.login) == []  # none saved
+    assert partial(b, scope, ("s14b",)) and partial(b, scope, ("s14a", "s14b"))
+    assert not partial(b, scope, ("s14a",)) and A.additional_forms(b, scope, ("s14a",)) == []
+    assert not partial(b, scope - 1, ("s14a", "s14b"))  # both outside: the whole post listed
     configure(base, scope=scope, additional=["s14b"])
-    at = pick(run(monkeypatch, base, REVIEWER.login), "s14b")
-    assert not [e for e in at.error if "refused" in str(e.value)]  # offered, not refused
-    assert "Form 2 of 2 for this post" in texts(at)
-    assert not any(t.startswith("Position after your reading of the previous action")
-                   for t in texts(at))
-    at = _scenario_through_page(at, base, b, 1)
-    assert not any(t.startswith("holds SHIPPED") for t in texts(at)) and markers(base) == []
-    at = _scenario_through_page(at, base, b, 0)
-    assert any(t.startswith("holds SHIPPED") for t in texts(at))
-    assert sorted(markers(base)) == ["s14a", "s14b"]
+    refused(run(monkeypatch, base, REVIEWER.login))
+    assert stored(base) == []
+
+
+def test_sf1_a_sibling_outside_the_scope_of_a_revealed_form_cannot_be_added(
+        monkeypatch, local, base):
+    """The second review's SF1: the label-only ``i09`` (no sequence) moved onto ``i07``'s
+    post ``p07``. ``i07`` is read and revealed at once (base behaviour: ``i09`` is not
+    offered); the owner then lists ``i09``: refused, and nothing more is written."""
+    b = _move(base, "i09", post_ref="p07")
+    assert A.post_forms(b, b.items["i09"]) == [b.items["i09"]]
+    configure(base, scope=1)
+    at = pick(run(monkeypatch, base, REVIEWER.login), "i07")
+    fill(at, "aw_i07_ind", valid(b, "i07"))
+    save(at, "aw_i07_ind", "MEDIUM")
+    assert markers(base) == ["i07"]  # revealed at once, as at the base
+    before = stored(base)
+    configure(base, additional=["i09"])
+    at.run()
+    refused(at)
+    refused(run(monkeypatch, base, REVIEWER.login))
+    listed = session(additional=("i09",))
+    for call in (lambda: A.mark_system_shown(base, b, listed, "i07"),
+                 lambda: A.append_annotation(base, b, listed, item_id="i09",
+                                             phase=A.INDEPENDENT, blind=True,
+                                             reading=valid(b, "i09"), confidence="LOW")):
+        with pytest.raises(A.AdjudicationError, match="^ADDITIONAL_ITEM_PARTIAL_POST$"):
+            call()
+    assert stored(base) == before and "i09" not in markers(base)
+    configure(base, additional=["i07"])  # an in-scope id alone: harmless, not doubled
+    at = run(monkeypatch, base, REVIEWER.login)
+    assert not at.error and metric(at, HEADING) == []
+
+
+def test_the_rule_covers_every_kind_every_listed_id_and_every_scope(base):
+    """The label-only ``i09`` (no sequence) moved onto post ``s14``: the post is ``s14a``,
+    ``s14b`` and ``i09``. Every one must be listed, whatever its kind or sequence, whichever
+    listed id is the partial one, at any scope that leaves the post outside."""
+    b = _move(base, "i09", post_ref="s14")
+    whole = ("s14a", "s14b", "i09")
+    for scope in (1, 2, 5, 16):
+        assert not partial(b, scope, whole)
+        assert [i["item_id"] for i in A.additional_forms(b, scope, whole)] == [
+            "s14a", "s14b", "i09"]
+        assert partial(b, scope, ("s14a", "s14b"))  # the label-only, no-sequence one missing
+        assert partial(b, scope, ("i09",))  # a label-only listed id: its post missing
+        assert partial(b, scope, ("s22a", "s22b", "s14a", "s14b"))  # not the first listed id
+        assert partial(b, scope, ("s22a", "s22b", "i09", "s01a"))
+        assert not partial(b, scope, ("s22a", "s22b", *whole))
+    plain = bundle(DEMO.write_demo(base.parent / "plain"))
+    for scope in (2, 5, 16):  # the demo as written: two-form posts at scopes other than 1
+        assert partial(plain, scope, ("s14a",)) and partial(plain, scope, ("s30b",))
+        assert partial(plain, scope, ("s22a", "s22b", "s14b"))
+        assert not partial(plain, scope, ("s14a", "s14b", "s22a", "s22b"))
 
 
 def _forge_marker(base, b, item_id) -> None:
