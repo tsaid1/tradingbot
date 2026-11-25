@@ -1318,8 +1318,8 @@ def test_local_lines_spelled_otherwise_are_refused_and_parity_fails(cli, run, st
     local_save(base, ONE, "i08", A.INDEPENDENT)  # the file's spelling, beside the other
     assert "REMOTE-2: 2 spelling(s) of its sign-in" in run("import-log", code=2)
     out = run("parity", code=1)
-    assert ("local lines of remote reviewers that NO row holds under that spelling: 3, of 1 "
-            "sign-in spelling(s)") in out and out.splitlines()[-1].endswith("FAIL, 2 reviewer(s)")
+    assert ("local lines of reviewers that no row holds: 3, of 1 sign-in spelling(s)") in out \
+        and out.splitlines()[-1].endswith("FAIL, 2 reviewer(s)")
     # Whoever asks: no line is stored under a row spelled otherwise.
     row = store.reviewer_by_login(ONE.login)
     with pytest.raises(A.AdjudicationError, match="^LINE_NOT_SPELLED_AS_ITS_ROW$"):
@@ -2157,3 +2157,27 @@ def test_make_site_role_works_for_an_operator_who_is_not_a_superuser(
     assert run("make-site-role", "--role", "nobody_here", "--grants-only", code=2) == \
         "refused: NO_SITE_ROLE\n"
     assert run("make-site-role", "--role", role, code=2) == "refused: OUT_FILE_NEEDED\n"
+
+
+def test_local_lines_of_a_reviewer_without_a_row_are_accepted_only_by_their_count(
+        cli, run, store, base):
+    """Re-check R5 (probe ``test_r15::test_a_reviewer_of_the_local_log_without_a_row...``): a
+    former remote reviewer's line in the local log, nobody of that address in the file, made
+    ``parity`` fail for good, while the cutover needs PASS. Now ``import-log`` and ``parity``
+    print the count (no address), and ``parity`` accepts exactly the number the operator names
+    with ``--accept-unlisted-lines``; any other number fails."""
+    b = A.load_bundle(base / "bundle", A.FULL)
+    former = A.Session("former@example.invalid", "Former Example", A.REVIEWER, A.FULL, True, 40)
+    A.append_annotation(base, b, former, **reading_kw(b, "i07", [], former, phase=A.INDEPENDENT))
+    run("init-db")
+    run("publish-bundle", "--demo", base)
+    run("sync-reviewers", "--demo")
+    assert "local lines of reviewers that no row holds: 1, of 1 sign-in spelling(s): give them " \
+        "a row, or accept exactly that many with --accept-unlisted-lines 1" in run("import-log")
+    assert run("parity", code=1).splitlines()[-1].endswith("FAIL, 2 reviewer(s)")
+    for wrong in ("0", "2"):
+        out = run("parity", "--accept-unlisted-lines", wrong, code=1)
+        assert f"NOT the {wrong} named" in out
+    out = run("parity", "--accept-unlisted-lines", "1")
+    assert "1, of 1 sign-in spelling(s): accepted as named (--accept-unlisted-lines 1)" in out
+    assert out.splitlines()[-1].endswith("PASS, 2 reviewer(s)")

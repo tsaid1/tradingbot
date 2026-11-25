@@ -653,6 +653,7 @@ def cmd_import_log(args) -> int:
           + (f"FIXED, the reviewers' hosted lines continue it (the local log has {log.count} "
              "line(s) now)" if hosted else "moved to the log's present head"))
     print(f"imported {len(new)} new line(s); {len(legacy)} already imported")
+    print(_unlisted_line(unlisted(log.records, rows.values()), args.accept_unlisted_lines)[0])
     for row in rows.values():
         mine = [json.loads(e["line"]) for e in events
                 if e["alias"] == row.alias and e["origin"] != RETURN]
@@ -672,6 +673,30 @@ def _bodies(records: list[dict]) -> list[dict]:
     place = {r["seq"]: n for n, r in enumerate(records)}
     return [{**{k: v for k, v in r.items() if k not in (*ENVELOPE, "hosted")},
              "refers_to": place.get(r.get("refers_to"), r.get("refers_to"))} for r in records]
+
+
+def unlisted(records: list[dict], rows) -> list[str]:
+    """The spelling of every local line of a reviewer (role REVIEWER) that no reviewer row holds
+    under that exact spelling: a former reviewer no longer in the file, a sign-in spelled
+    otherwise, or the owner's reviewer identity before its row is written. Counted, never
+    printed."""
+    held = {row.login_shown for row in rows if not row.is_test}
+    return [_spelled(r) for r in records
+            if (r.get("annotator") or {}).get("role") == A.REVIEWER and _spelled(r) not in held]
+
+
+def _unlisted_line(found: list[str], accepted: int | None) -> tuple[str, bool]:
+    """(the line that says how many local reviewer lines no row holds, whether that fails)."""
+    n, who = len(found), len(set(found))
+    if accepted is not None and accepted == n:
+        return (f"local lines of reviewers that no row holds: {n}, of {who} sign-in "
+                f"spelling(s): accepted as named (--accept-unlisted-lines {accepted})"), False
+    if accepted is not None:
+        return (f"local lines of reviewers that no row holds: {n}, of {who} sign-in "
+                f"spelling(s): NOT the {accepted} named"), True
+    return (f"local lines of reviewers that no row holds: {n}, of {who} sign-in spelling(s)"
+            + (": give them a row, or accept exactly that many with --accept-unlisted-lines "
+               f"{n}" if n else "")), bool(n)
 
 
 def _web_steps():
@@ -697,13 +722,13 @@ def cmd_parity(args) -> int:
     if steps is None:  # the web app's resume rule is part of what must agree
         print("NEXT_STEP_FUNCTION_MISSING: reviewer_web.forms gives no next_step and step_state")
     print(f"local bundle {local.bundle_id[:12]}")
-    held_as = {row.login_shown for row, _served, _stored in theirs.values()}
-    strays = [_spelled(r) for r in log.records if "@" in _spelled(r) and (
-        r.get("annotator") or {}).get("role") == A.REVIEWER and _spelled(r) not in held_as]
-    if strays:  # a remote reviewer without a row, or lines under another spelling of a sign-in
-        print(f"local lines of remote reviewers that NO row holds under that spelling: "
-              f"{len(strays)}, of {len(set(strays))} sign-in spelling(s)")
-        failed = True
+    # A reviewer without a row, lines under another spelling of a sign-in: only a count the
+    # operator names explicitly is accepted (re-check R5).
+    strays = unlisted(log.records, [row for row, _served, _stored in theirs.values()])
+    if strays or args.accept_unlisted_lines is not None:
+        line, fails = _unlisted_line(strays, args.accept_unlisted_lines)
+        print(line)
+        failed = failed or fails
     summary = []
     for alias, (row, served, stored) in theirs.items():
         session = row.session()
@@ -1301,6 +1326,9 @@ def main(argv: list[str] | None = None) -> int:
         p.set_defaults(run=run)
         return p
 
+    accept = {"type": int, "metavar": "N", "dest": "accept_unlisted_lines",
+              "help": "accept exactly N local reviewer lines that no row holds (the number a "
+                      "run without it printed); any other number fails"}
     command("init-db", cmd_init_db, "apply schema.sql (can be run again)")
     p = command("sync-reviewers", cmd_sync_reviewers,
                 "the reviewers file's remote reviewers as REMOTE-<n> rows on the real bundle")
@@ -1332,10 +1360,12 @@ def main(argv: list[str] | None = None) -> int:
                 "publish the part of the local bundle the scope needs, after a parity check")
     p.add_argument("--check-only", action="store_true", help="cut and check; upload nothing")
     p.add_argument("--demo", metavar="DIR", help="publish the invented demo folder DIR instead")
-    command("import-log", cmd_import_log,
-            "snapshot the local log and import the remote reviewers' lines").add_argument(
-        "--snapshots", metavar="DIR", help=f"snapshot root (default: <dir>/{SNAPSHOTS})")
-    command("parity", cmd_parity, "compare the local log's state with the hosted store's")
+    p = command("import-log", cmd_import_log,
+                "snapshot the local log and import the remote reviewers' lines")
+    p.add_argument("--snapshots", metavar="DIR", help=f"snapshot root (default: <dir>/{SNAPSHOTS})")
+    p.add_argument("--accept-unlisted-lines", **accept)
+    command("parity", cmd_parity, "compare the local log's state with the hosted store's"
+            ).add_argument("--accept-unlisted-lines", **accept)
     command("export", cmd_export, "every event as JSONL").add_argument(
         "--out", required=True, metavar="FILE")
     command("restore", cmd_restore, "load an export into an EMPTY database").add_argument(
