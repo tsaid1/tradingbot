@@ -269,3 +269,19 @@ def test_q4_import_log_refuses_hosted_lines_of_rows_not_in_the_file_and_an_empty
     del EventLine
 
 
+
+
+# ------------------------------------------------------------------ Q3, M1
+
+
+def test_q3_the_owner_entry_is_never_a_remote_reviewer_s(run, store, base, tmp_path):  # noqa: F811
+    """Q3 (probe ``test_owner_entry_may_name_a_remote_reviewer_s_entry``): ``--owner-entry 1``
+    made the first remote reviewer's entry the owner's identity."""
+    run("init-db")
+    run("publish-bundle", "--demo", base)
+    secret = address_file(tmp_path / "keys")
+    assert run("sync-reviewers", "--demo", "--owner-entry", "1", "--owner-address-file", secret,
+               code=2) == "refused: OWNER_ENTRY_IS_A_REMOTE_REVIEWER_S\n"
+    assert store.reviewers() == []
+    out = run("sync-reviewers", "--demo", "--owner-entry", "3", "--owner-address-file", secret)
+    assert "OWNER-REVIEWER: id " in out and "REMOTE-2: id " in out

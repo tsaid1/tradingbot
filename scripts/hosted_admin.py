@@ -373,6 +373,8 @@ def owner_entry(reviewers: A.Reviewers, place: int | None):
     if place is not None:
         if not 1 <= place <= len(listed):
             raise refused("NO_SUCH_REVIEWER_ENTRY")
+        if "@" in listed[place - 1].login:  # a remote reviewer's entry: their REMOTE-n
+            raise refused("OWNER_ENTRY_IS_A_REMOTE_REVIEWER_S")
         return listed[place - 1]
     local = [e for e in listed if "@" not in e.login]
     if len(local) > 1:
