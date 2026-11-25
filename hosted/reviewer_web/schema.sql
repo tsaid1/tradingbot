@@ -74,6 +74,10 @@ END
 $$;
 CREATE OR REPLACE TRIGGER reviewer_address_by_default BEFORE INSERT ON reviewer
     FOR EACH ROW EXECUTE FUNCTION reviewer_address_defaults();
+-- When an import-log of the local log last considered this row: until then a reviewer row (not
+-- a test identity) is closed for saving, whenever it was written, so that its local history is
+-- on the site before anything continues it.
+ALTER TABLE reviewer ADD COLUMN IF NOT EXISTS imported_at TIMESTAMPTZ;
 CREATE UNIQUE INDEX IF NOT EXISTS reviewer_one_of_each_kind_per_sign_in
     ON reviewer (sign_in, is_test);
 
@@ -164,6 +168,21 @@ CREATE TABLE IF NOT EXISTS chain_anchor (
     imported_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Who wrote the anchor: IMPORT (import-log of the local log whose first lines hash to
+-- snapshot_file_sha256), RESTORE (restore of an export), SEED (the acceptance seed of a
+-- preview); NULL for an anchor written by an earlier version. import-log, pull-to-local and
+-- push-returns continue only an anchor of IMPORT or RESTORE.
+ALTER TABLE chain_anchor ADD COLUMN IF NOT EXISTS written_by TEXT
+    CHECK (written_by IN ('IMPORT', 'RESTORE', 'SEED'));
+
+-- A database initialised as a PREVIEW (init-db --preview): only there may the acceptance seed
+-- write. Production is initialised without it.
+CREATE TABLE IF NOT EXISTS database_kind (
+    id        INT PRIMARY KEY CHECK (id = 1),
+    kind      TEXT NOT NULL CHECK (kind = 'PREVIEW'),
+    marked_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 -- ---------------------------------------------------------------------------------------------
 -- WEB's section (sign-in codes, sessions, rate limits, queued mail) starts below this line.
 -- ---------------------------------------------------------------------------------------------
@@ -214,7 +233,8 @@ CREATE TABLE IF NOT EXISTS draft (
 );
 
 -- After a right code for an address with two identities: the choice of the identity to open,
--- bound to that verified code. Single use, five minutes, held by its browser in a cookie of its
+-- made only when a right code was entered (it holds the address's key row and its times, not the
+-- code). Single use, five minutes, held by its browser in a cookie of its
 -- own; only the token's SHA-256 is stored. ``sign_in_key``: the address's key row (the lowest id
 -- of the rows of that address), under which its codes and counters are kept.
 CREATE TABLE IF NOT EXISTS sign_in_choice (

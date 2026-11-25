@@ -69,6 +69,7 @@ PUBLIC = ("healthz", "robots", "favicon", "static")  # no session, no database
 SIGN_IN = ("sign_in", "sign_in_code", "sign_in_verify", "choose_identity", "chosen_identity")
 CHOICE_SECONDS = int(auth.CHOICE_VALID.total_seconds())
 UI_PREFIX = "ui."  # posted interface state: kept in a draft, never validated, never an event
+MAX_UI_FIELDS = 64  # of one draft
 # The phase whose draft a form in this state may hold.
 CURRENT_PHASE = {"INDEPENDENT_DUE": "INDEPENDENT", "AFTER_REVEAL_DUE": "AFTER_REVEAL",
                  "RETURNED": "AFTER_REVEAL"}
@@ -171,6 +172,19 @@ def _cause(exc: Exception) -> str:
     quote an address or a code). ``mail.Unreachable`` carries the class name of what failed."""
     named = str(exc) if isinstance(exc, mail.Unreachable) else type(exc).__name__
     return named if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,60}", named) else type(exc).__name__
+
+
+def draft_names(bundle: A.Bundle, item: dict) -> frozenset[str]:
+    """Every control name the form of ``item`` can post, in either phase: what a draft may keep
+    (the page's own ``_phase`` and ``_on`` included)."""
+    fields = R.fields_for(item["kind"])
+    rows = [d["key"] for d in A.table_row_details(bundle, item)]
+    out = {"_phase", "_on", "flags", "confidence", "notes", "ack", "aa.n"}
+    out |= set(fields) | {f"{p}.{f}" for f in fields for p in ("s", "v", "vt")}
+    out |= {f"aa.{j}.{k}" for j in range(R.MAX_ADDITIONAL) for k in R.ADDITIONAL_KEYS}
+    out |= {f"lv.{r}.{c}" for r in rows for c in R.ROW_KEYS}
+    out |= {f"{p}.row.{r}" for r in rows for p in ("v", "vt")}
+    return frozenset(out)
 
 
 def create_app(store, mailer, config: dict) -> Flask:
@@ -299,11 +313,13 @@ def create_app(store, mailer, config: dict) -> Flask:
             return refuse(503)  # no bundle is assigned to this reviewer: nothing is served
         if demo_env and not (demo and store.bundle_is_demo()):
             return refuse(503)  # a preview serves nobody whose bundle is not invented
-        if not store.is_open(reviewer):
+        if not store.is_open(reviewer) and request.endpoint != "sign_out":
             # Before the first import nothing of a reviewer's may be stored (it would continue no
             # local log): every page says so calmly, and nothing is lost, as nothing was saved.
-            return render_template("message.html", message=NOT_OPEN, status=503, who=None,
-                                   csrf="", demo=demo), 503
+            # Signing out stays possible from that page (the session ends at once).
+            return render_template("message.html", message=NOT_OPEN, status=503,
+                                   who=Who(reviewer, reviewer.session(), token, demo),
+                                   csrf=auth.csrf_token(secret, token), demo=demo), 503
         g.who = Who(reviewer, reviewer.session(), token, demo)
         return None
 
@@ -687,17 +703,29 @@ def create_app(store, mailer, config: dict) -> Flask:
                      if str(r.get("seq")) == seq
                      and r["phase"] in (A.INDEPENDENT, A.AFTER_REVEAL)), None)
 
-    def kept(form_data) -> list[tuple[str, str]]:
-        """What a draft keeps of a posted form: every field (the ``ui.*`` interface state too),
-        never the session's token or the page's key."""
-        return [(k, v) for k, v in form_data.items(multi=True) if k not in ("_csrf", "_key")]
+    def kept(bundle, item, form_data) -> list[tuple[str, str]]:
+        """What a draft keeps of a posted form: the names this form can have (its fields, their
+        state, the price table's cells, the further actions, the verdicts, flags, confidence,
+        notes, the tick) and a bounded ``ui.*`` interface state; never the session's token, the
+        page's key, or a name the form does not have."""
+        names = draft_names(bundle, item)
+        out, ui = [], 0
+        for k, v in form_data.items(multi=True):
+            if k.startswith(UI_PREFIX):
+                ui += 1
+                if ui <= MAX_UI_FIELDS and len(k) <= 64 and len(v) <= 256:
+                    out.append((k, v))
+            elif k in names:
+                out.append((k, v))
+        return out
 
-    def keep(item_id, phase, form_data) -> dict | None:
+    def keep(bundle, item, phase, form_data) -> dict | None:
         """Keep the draft of the form the page holds now (only for the phase it shows)."""
         if phase is None or form_data.get("_phase") != phase:
             return None
         now = clock()
-        store.keep_draft(g.who.reviewer, item_id, phase, kept(form_data), now)
+        store.keep_draft(g.who.reviewer, item["item_id"], phase, kept(bundle, item, form_data),
+                         now)
         return {"saved_at": now}
 
     @app.get("/form/<item_id>")
@@ -723,7 +751,7 @@ def create_app(store, mailer, config: dict) -> Flask:
         bundle, item = item_of(item_id)
         records, gate, problem = reveal(bundle, item)
         phase = phase_of(bundle, item, records, gate)
-        draft = keep(item_id, phase, request.form)  # every round trip keeps the draft
+        draft = keep(bundle, item, phase, request.form)  # every round trip keeps it
 
         def marked(response):
             """The script cannot see the draft in a fragment: the answer says it was kept, and
@@ -794,7 +822,7 @@ def create_app(store, mailer, config: dict) -> Flask:
             app.logger.info("SAVE_REFUSED code=%s", exc.code.split(":")[0])
             records, gate, problem = reveal(bundle, item)
             code = exc.code
-            draft = keep(item_id, phase_of(bundle, item, records, gate), request.form)
+            draft = keep(bundle, item, phase_of(bundle, item, records, gate), request.form)
             return lambda: page(bundle, item, records, gate, problem, posted=request.form,
                                 refusal=code, status=422, draft=draft)
         return lambda: redirect(f"/form/{item_id}?saved={done.records[0]['seq']}", 303)

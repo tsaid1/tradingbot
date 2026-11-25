@@ -388,24 +388,30 @@ def test_sync_reviewers_reads_the_owner_s_file_and_never_deletes(run, store, bas
     out = run("sync-reviewers", "--demo")
     assert out.splitlines() == [f"REMOTE-2: id 1, REVIEWER, FULL, scope 40, {bundle}",
                                 f"REMOTE-3: id 2, REVIEWER, FULL, scope 40, {bundle}",
-                                "2 reviewer row(s) written; none deleted"]
+                                "2 reviewer row(s) written; none deleted",
+                                ("REMOTE-2: closed until import-log runs (no save is accepted "
+                                 "before)"),
+                                ("REMOTE-3: closed until import-log runs (no save is accepted "
+                                 "before)")]
     assert store.reviewer_by_login(ONE.login).session() == ONE
     assert "TEST_ALIAS_IS_TEST_N" in run("sync-reviewers", "--test-identity", "REMOTE-9", TESTER,
                                          code=2)
     out = run("sync-reviewers", "--test-identity", "TEST-1", TESTER)
     assert out.splitlines() == [
         f"TEST-1: id 3, REVIEWER, FULL, scope 40, {bundle}, test identity",
-        "1 reviewer row(s) written; none deleted"]
+        "1 reviewer row(s) written; none deleted",
+        "REMOTE-2: closed until import-log runs (no save is accepted before)",
+        "REMOTE-3: closed until import-log runs (no save is accepted before)"]
     assert store.reviewer_by_login(TESTER).is_test is True
     # An entry that left the file keeps its row (revoke it); the file itself is only read.
     file.write_text(file.read_text().split("[[reviewer]]\nlogin = \"remote@")[0])
-    assert run("sync-reviewers", "--demo").splitlines()[-1] == \
-        "1 reviewer row(s) written; none deleted"
+    assert "1 reviewer row(s) written; none deleted" in run("sync-reviewers", "--demo")
     assert [r.alias for r in store.reviewers()] == ["REMOTE-2", "REMOTE-3", "TEST-1"]
     file.write_bytes(before[0])
     os.utime(file, ns=(before[1], before[1]))
     for command in (["sync-reviewers", "--demo"], ["publish-bundle", "--demo", base],
-                    ["import-log"], ["parity"], ["status"], ["push-returns"]):
+                    ["import-log", "--allow-empty-log"], ["parity"], ["status"],
+                    ["push-returns"]):
         run(*command)
     assert (file.read_bytes(), file.stat().st_mtime_ns) == before
 
@@ -652,6 +658,10 @@ def test_hosted_saves_come_home_into_a_log_the_local_code_accepts(run, store, ba
     # resume (a local reading after the reveal that refers to a pulled independent one).
     A.append_annotation(base, b, OWNER, item_id="i08", phase=A.APPROVAL, blind=False,
                         reading={}, refers_to=10, outcome="ACCEPT")
+    # A reviewer who saved on the site is refused locally until the rollback removes the mark.
+    with pytest.raises(A.AdjudicationError, match="^REVIEWS_ON_THE_SITE$"):
+        local_save(base, TWO, "i08", A.AFTER_REVEAL)
+    (base / A.REVIEWS_ON_THE_SITE_FILE).unlink()
     later = local_save(base, TWO, "i08", A.AFTER_REVEAL)
     assert (later["seq"], later["refers_to"], later["blind"]) == (17, 14, True)
     assert FREEZE.main(["verify", "--dir", str(base)]) == 0
@@ -2182,8 +2192,13 @@ def test_local_lines_of_a_reviewer_without_a_row_are_accepted_only_by_their_coun
     run("init-db")
     run("publish-bundle", "--demo", base)
     run("sync-reviewers", "--demo")
+    out = run("import-log", code=2)  # nothing imported until the count is named (round 2, M2)
     assert "local lines of reviewers that no row holds: 1, of 1 sign-in spelling(s): give them " \
-        "a row, or accept exactly that many with --accept-unlisted-lines 1" in run("import-log")
+        "a row, or accept exactly that many with --accept-unlisted-lines 1" in out
+    assert out.endswith("refused: UNLISTED_LOCAL_LINES\n") and store.anchor() is None
+    assert run("import-log", "--accept-unlisted-lines", "2", code=2).endswith(
+        "refused: UNLISTED_LOCAL_LINES\n")
+    assert "accepted as named" in run("import-log", "--accept-unlisted-lines", "1")
     assert run("parity", code=1).splitlines()[-1].endswith("FAIL, 2 reviewer(s)")
     for wrong in ("0", "2"):
         out = run("parity", "--accept-unlisted-lines", wrong, code=1)

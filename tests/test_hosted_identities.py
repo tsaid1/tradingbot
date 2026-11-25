@@ -88,6 +88,7 @@ class Two:
         self.owner = admin.upsert_reviewer("OWNER-REVIEWER", LOCAL_ID, name="Owner Reviewer "
                                            "Example", scope_sequences=40, bundle_id=real.bundle_id,
                                            address=ADDRESS)
+        admin.stamp_imported([self.owner.id])  # its local history is imported (none)
         self.test = admin.upsert_reviewer("TEST-1", ADDRESS, name="TEST-1", scope_sequences=40,
                                           is_test=True, bundle_id=site.bundle.bundle_id)
         self.real = real
@@ -272,8 +273,9 @@ def test_sync_reviewers_writes_the_owner_s_reviewer_identity_from_the_private_ad
         run, store, base, tmp_path, monkeypatch, cli):  # noqa: F811
     run("init-db")
     run("publish-bundle", "--demo", base)
-    out = run("sync-reviewers", "--demo")
+    out = run("sync-reviewers", "--demo", code=2)
     assert "OWNER-REVIEWER: not written: no sign-in address file" in out
+    assert out.endswith("refused: NO_OWNER_ADDRESS_FILE\n")
     assert "OWNER-REVIEWER" not in {r.alias for r in store.reviewers()}
     secret = address_file(tmp_path / "keys")
     out = run("sync-reviewers", "--demo", "--owner-address-file", secret)
@@ -288,7 +290,7 @@ def test_sync_reviewers_writes_the_owner_s_reviewer_identity_from_the_private_ad
     assert (test.login_shown, test.sign_in, test.is_test) == (ADDRESS, ADDRESS.casefold(), True)
     # Without the file the row stays as it is (its address is kept); it is never deleted.
     monkeypatch.delenv(cli.OWNER_ADDRESS_ENV)
-    run("sync-reviewers", "--demo")
+    run("sync-reviewers", "--demo")  # the row exists: it keeps its address
     assert {r.alias: r for r in store.reviewers()}["OWNER-REVIEWER"].address == ADDRESS
     # The approver never gets a row: no REVIEWER entry of the file is an approver's.
     assert {r.role for r in store.reviewers()} == {A.REVIEWER}
@@ -398,7 +400,7 @@ def test_a_local_reviewer_save_of_the_owner_after_hosted_saves_is_refused(
     hosted_reveal(store, owner, "i08")  # a hosted line of the owner's, not pulled yet
     local_save(base, OWNER_R, "i01", A.INDEPENDENT)  # and a local save by habit
     assert run("import-log", code=2).endswith("refused: LOCAL_SAVE_AFTER_HOSTED_SAVES\n")
-    assert run("pull-to-local", code=2) == "refused: LOCAL_SAVE_AFTER_HOSTED_SAVES\n"
+    assert "OWNER-REVIEWER: NOT pulled: 1 hosted line(s)" in run("pull-to-local", code=1)
     assert len(A.read_annotations(base).records) == 14  # nothing appended
 
 

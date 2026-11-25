@@ -1136,6 +1136,36 @@ def build_annotation(records: list[dict], bundle: Bundle, session: Session, *, i
                        confidence, notes, refers_to, outcome, acknowledged_warnings, now)(records)
 
 
+# Written by the hosted site's operator tool (``hosted_admin.py import-log`` and
+# ``pull-to-local``) into the adjudication folder: the logins, as the log spells them, that
+# review on the hosted site. Their REVIEWER saves here would start a second history of the same
+# reviewer, so they are refused (REVIEWS_ON_THE_SITE). A folder without it: as before.
+REVIEWS_ON_THE_SITE_FILE = "reviews_on_the_site.json"
+REVIEWS_ON_THE_SITE_SCHEMA = "tradingbot.hosted.reviews-on-the-site/1"
+
+
+def reviews_on_the_site(base: str | Path) -> frozenset[str]:
+    """The logins (exact spelling) that review on the hosted site; empty without the file."""
+    data = _read_private(Path(base).expanduser() / REVIEWS_ON_THE_SITE_FILE,
+                         "reviews-on-the-site marker")
+    if data is None:
+        return frozenset()
+    try:
+        raw = json.loads(data)
+        logins = raw["logins"]
+        if raw.get("schema") != REVIEWS_ON_THE_SITE_SCHEMA or not all(
+                isinstance(x, str) for x in logins):
+            raise ValueError
+    except (ValueError, KeyError, TypeError):
+        raise AdjudicationError("REVIEWS_ON_THE_SITE_MARKER_UNREADABLE") from None
+    return frozenset(logins)
+
+
+def _not_on_the_site(base: str | Path, session: Session) -> None:
+    if session.role == REVIEWER and session.login in reviews_on_the_site(base):
+        raise AdjudicationError("REVIEWS_ON_THE_SITE")
+
+
 def append_annotation(base: str | Path, bundle: Bundle, session: Session, *, item_id: str,
                       phase: str, blind: bool, reading: dict, field_verdicts: dict | None = None,
                       flags=(), confidence: str = "", notes: str = "",
@@ -1146,6 +1176,7 @@ def append_annotation(base: str | Path, bundle: Bundle, session: Session, *, ite
     the log is opened."""
     make = _annotation(bundle, session, item_id, phase, blind, reading, field_verdicts, flags,
                        confidence, notes, refers_to, outcome, acknowledged_warnings, now)
+    _not_on_the_site(base, session)  # a reviewer who reviews on the hosted site: not here
     try:
         return append_chained(annotations_path(base), "annotation log", ANNOTATION_SCHEMA,
                               lambda v: make(v.records))
@@ -1189,6 +1220,7 @@ def mark_system_shown(base: str | Path, bundle: Bundle, session: Session, item_i
 
     if session.role != REVIEWER or item_id not in bundle.items:
         return
+    _not_on_the_site(base, session)
     while True:
         try:
             append_chained(annotations_path(base), "annotation log", ANNOTATION_SCHEMA, make)

@@ -14,8 +14,9 @@
 * One address may open TWO identities (the owner's real reviewer identity and a test identity).
   Its codes and its counters belong to the ADDRESS (kept under its key row: the lowest id of
   its rows), so the wrong-code lock, the hourly quota and ``unlock`` act on the address. After a
-  right code such an address chooses which identity to open (``choices``, ``choose``): the
-  choice is bound to that verified code, single use, five minutes, held by the browser in a
+  right code such an address chooses which identity to open (``choices``, ``choose``): a
+  choice is made only by a right code and holds the address's key row and its times (not the
+  code), single use, five minutes, held by the browser in a
   cookie of its own. A session belongs to exactly one identity.
 * Limits per hour: codes per address, codes per network address, tries per network address.
   Every request counts against its network address before anything else is looked at, and an
@@ -262,7 +263,7 @@ def verify_code(store, secret: bytes, address: str, code: str, network: str,
         cur.execute("UPDATE login_code SET used_at = %s WHERE reviewer_id = %s "
                     "AND used_at IS NULL", (now, key.id))  # using one ends both
         token = secrets.token_urlsafe(32)  # 256 bits
-        if len(found.open) > 1:  # which identity to open: chosen next, bound to this code
+        if len(found.open) > 1:  # which identity to open: chosen next (only after this right code)
             cur.execute("DELETE FROM sign_in_choice WHERE expires_at < %s", (now - DAY,))
             cur.execute("INSERT INTO sign_in_choice (token_sha256, sign_in_key, created_at,"
                         " expires_at) VALUES (%s, %s, %s, %s)",
