@@ -175,7 +175,10 @@ def create_app(store, mailer, config: dict) -> Flask:
                 request.form.get("_csrf", "").encode("utf-8"),
                 auth.csrf_token(secret, token).encode("utf-8")):
             return refuse(403)
-        demo = store.is_demo(reviewer)
+        try:
+            demo = store.is_demo(reviewer)
+        except A.AdjudicationError:
+            return refuse(503)  # no bundle is assigned to this reviewer: nothing is served
         if demo_env and not (demo and store.bundle_is_demo()):
             return refuse(503)  # a preview serves nobody whose bundle is not invented
         g.who = Who(reviewer, reviewer.session(), token, demo)

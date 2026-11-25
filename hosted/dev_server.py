@@ -61,7 +61,7 @@ def seed(store, reviewer, item_id: str) -> None:
     from tradingbot.runtime import adjudication as A
     from tradingbot.runtime import adjudication_scenarios as SC
 
-    bundle, session = store.active_bundle(), reviewer.session()
+    bundle, session = store.bundle_for(reviewer), reviewer.session()
     form = next((sc["forms"][k] for sc in SC.SCENARIOS for k in range(len(sc["forms"]))
                  if SC.item_id(sc, k) == item_id), None)
     if form is None:
