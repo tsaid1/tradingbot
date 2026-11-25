@@ -10,6 +10,7 @@
     python scripts/hosted_admin.py export --out FILE
     python scripts/hosted_admin.py restore --in FILE
     python scripts/hosted_admin.py pull-to-local
+    python scripts/hosted_admin.py push-returns
     python scripts/hosted_admin.py status
     python scripts/hosted_admin.py verify [--snapshots DIR]
 
@@ -40,13 +41,15 @@ from tradingbot.runtime.vocab_review import PrivateDir, PrivatePathError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "hosted"))
 S = importlib.import_module("reviewer_web.store")  # the deployed layout: a top-level package
-HOSTED, LEGACY, HOSTED_BASE, sha256 = S.HOSTED, S.LEGACY, S.HOSTED_BASE, S.sha256
+HOSTED, LEGACY, RETURN, sha256 = S.HOSTED, S.LEGACY, S.RETURN, S.sha256
+HOSTED_BASE, RETURN_BASE = S.HOSTED_BASE, S.RETURN_BASE
 
 URL_ENV, UNPOOLED_ENV = "HOSTED_DATABASE_URL", "HOSTED_DATABASE_URL_UNPOOLED"
 EXPORT_SCHEMA = "tradingbot.hosted.export/1"
 SNAPSHOTS, LOG, WHAT = "hosted_snapshots", "annotations.jsonl", "annotation log"
 BUNDLE_FILES = ("manifest.json", "sequences.jsonl", "items.jsonl", "posts.jsonl")
 TEST_ALIAS = re.compile(r"^TEST-[0-9]{1,3}$")
+APPROVER_SHOWN = "approver"  # all a reviewer learns of who returned a reading
 ENVELOPE = ("schema", "seq", "prev_sha256")
 EVENT_KEYS = ("alias", "origin", "seq", "prev_sha256", "sha256", "line", "idempotency_key",
               "batch", "created_at")
@@ -400,7 +403,8 @@ def cmd_import_log(args) -> int:
           else "anchor: none (the hosted lines continue an empty log)")
     print(f"imported {len(new)} new line(s); {len(legacy)} already imported")
     for row in rows.values():
-        mine = [json.loads(e["line"]) for e in events if e["alias"] == row.alias]
+        mine = [json.loads(e["line"]) for e in events
+                if e["alias"] == row.alias and e["origin"] != RETURN]
         _print_states(row.alias, f"lines {len(mine)} ({sum(e.reviewer_id == row.id for e in new)}"
                       " new)", states(local, [r for r in mine if r["bundle_id"]
                                               == local.bundle_id], row.session()))
@@ -479,17 +483,23 @@ def cmd_status(_args) -> int:
     return 0
 
 
+def _record(line: bytes) -> dict:
+    try:
+        rec = json.loads(line)
+    except ValueError:
+        return {}
+    return rec if isinstance(rec, dict) else {}
+
+
 def chain_problems(events: list[dict], anchor: dict | None) -> list[str]:
     """Constant codes, each with a line's seq: every line against its row (hash, seq, previous
-    hash, schema), and the HOSTED lines as ONE chain that starts on the anchor's head and counts
-    1000001, 1000002, ..."""
+    hash, schema); the HOSTED lines as ONE chain that starts on the anchor's head and counts
+    1000001, 1000002, ...; and every RETURN as the return of a reading after the reveal that
+    the same reviewer has in the store (its seq, and its sha256 as the RETURN's previous hash)."""
     out = []
+    rows = {e["seq"]: (e, _record(e["line"])) for e in events}
     prev, due = anchor["head"] if anchor else V.GENESIS, HOSTED_BASE + 1
-    for e in events:
-        try:
-            rec = json.loads(e["line"])
-        except ValueError:
-            rec = {}
+    for e, rec in rows.values():
         if sha256(e["line"]) != e["sha256"] or (rec.get("seq"), rec.get("prev_sha256"), rec.get(
                 "schema")) != (e["seq"], e["prev_sha256"], A.ANNOTATION_SCHEMA):
             out.append(f"LINE_DIFFERS_FROM_ITS_ROW at {e['seq']}")
@@ -497,6 +507,14 @@ def chain_problems(events: list[dict], anchor: dict | None) -> list[str]:
             if (e["seq"], e["prev_sha256"]) != (due, prev):
                 out.append(f"HOSTED_CHAIN_BROKEN at {e['seq']}")
             prev, due = e["sha256"], e["seq"] + 1
+        elif e["origin"] == RETURN:
+            local = rec.get("local") if isinstance(rec.get("local"), dict) else {}
+            reviewed, reading = rows.get(rec.get("refers_to"), ({}, {}))
+            if (e["seq"] - RETURN_BASE, rec.get("phase"), rec.get("decision")) != (
+                    local.get("seq"), A.APPROVAL, "RETURN") or (
+                    reviewed.get("alias"), reviewed.get("sha256"), reading.get("phase")) != (
+                    e["alias"], e["prev_sha256"], A.AFTER_REVEAL):
+                out.append(f"RETURN_DOES_NOT_NAME_ITS_READING at {e['seq']}")
     return out
 
 
@@ -634,6 +652,95 @@ def cmd_pull_to_local(args) -> int:
     return 0 if after.ok else 1
 
 
+# ------------------------------------------------------------------ the approver's returns
+
+
+def return_record(approval: dict, line_sha256: str, reviewed: dict) -> dict:
+    """The record the hosted store keeps of a local RETURN, for the reviewer whose reading it
+    returns: an APPROVAL record of the log's shape, so that ``A.effective_approval`` and
+    ``A._outcome`` read it as they read the local one. ``reviewed``: the hosted event of the
+    returned reading. It carries the decision, the approver's notes and time, the hosted ``seq``
+    of the returned reading (``refers_to``) and that reading's sha256 (``prev_sha256``: it is
+    outside the hosted chain); of the approver only the role; and the local line it was made
+    from (``local``)."""
+    return {"schema": A.ANNOTATION_SCHEMA, "seq": RETURN_BASE + approval["seq"],
+            "prev_sha256": reviewed["sha256"], "at": approval["at"],
+            "bundle_id": approval["bundle_id"], "item_id": approval["item_id"],
+            "annotator": {"login": APPROVER_SHOWN, "name": APPROVER_SHOWN.capitalize(),
+                          "role": A.APPROVER, "access": A.FULL},
+            "phase": A.APPROVAL, "blind": False, "reading": {}, "field_verdicts": {},
+            "flags": [], "confidence": "", "notes": approval.get("notes") or "",
+            "refers_to": reviewed["seq"], "decision": "RETURN", "rubric": A.RUBRIC,
+            "acknowledged_warnings": [],
+            "local": {"seq": approval["seq"], "sha256": line_sha256}}
+
+
+def cmd_push_returns(args) -> int:
+    base, store = _base(args), _store()
+    data, _head, log = read_log(base)
+    lines = _lines(data)
+    local = A.load_bundle(base / "bundle", A.RESTRICTED)
+    new = A.rubric2(log.records)
+    standing = [a for a in (A.effective_approval(new, i, local) for i in local.items)
+                if a is not None and A._outcome(a) == "RETURN"]
+    with store.exclusive():
+        events, anchor, published = store.events(), store.anchor(), store.published()
+        if not continues(lines, anchor):
+            raise refused("LOCAL_LOG_IS_NOT_THE_ANCHORED_LOG")
+        if chain_problems(events, anchor):
+            raise refused("HOSTED_STORE_FAILS_VERIFICATION")
+        if published is None or published["bundle_id"] != local.bundle_id:
+            raise refused("HOSTED_BUNDLE_IS_NOT_THE_LOCAL_ONE")
+        rows = {r.login: r for r in store.reviewers() if not r.is_test}
+        by_seq = {e["seq"]: e for e in events}
+        by_sha = {e["sha256"]: e for e in events}
+        pushed, known, skipped, elsewhere = [], 0, 0, 0
+        for approval in standing:
+            source = log.records[approval["refers_to"] - 1]  # the reading it returns
+            row = rows.get(_login(source))
+            if row is None:
+                elsewhere += 1  # a local reviewer's reading: nothing to push
+                continue
+            # The same reading in the store: the pulled copy's hosted line, else the imported one.
+            reviewed = by_sha.get(_pulled(source) or sha256(lines[source["seq"] - 1]))
+            if reviewed is None or reviewed["alias"] != row.alias or reviewed["origin"] not in (
+                    LEGACY, HOSTED):
+                skipped += 1
+                continue
+            line = V.encode_line(return_record(approval, sha256(lines[approval["seq"] - 1]),
+                                               reviewed))
+            held = by_seq.get(RETURN_BASE + approval["seq"])
+            if held is not None and held["sha256"] != sha256(line):
+                raise refused("PUSHED_RETURN_DIFFERS")
+            if held is not None:
+                known += 1
+                continue
+            store.insert_events([S.EventLine(row.id, RETURN, line)])
+            pushed.append((row.alias, approval["item_id"], RETURN_BASE + approval["seq"],
+                           reviewed["seq"]))
+        events = store.events()
+    print(f"returns that stand in the local log: {len(standing)}; {elsewhere} of a reading that "
+          "was not made by a hosted reviewer")
+    print(f"pushed {len(pushed)} new return(s): {_counts(p[0] for p in pushed)}; {known} already "
+          f"stored; {skipped} skipped (the returned reading is not in the hosted store)")
+    for alias, item_id, seq, reviewed_seq in pushed:
+        print(f"  {alias} {item_id}: return {seq} of the reading {reviewed_seq}")
+    # A pushed return that no longer stands locally (the approver decided again) but still shows
+    # on the site: no line of the store can be taken back; the reviewer's next save clears it.
+    stands = {a["seq"] for a in standing}
+    for e in events:
+        if e["origin"] != RETURN:
+            continue
+        rec = json.loads(e["line"])
+        theirs = [json.loads(x["line"]) for x in events if x["alias"] == e["alias"]
+                  and json.loads(x["line"])["bundle_id"] == rec["bundle_id"]]
+        shown = A.effective_approval(A.rubric2(theirs), rec["item_id"], local)
+        if rec["local"]["seq"] not in stands and shown is not None and shown["seq"] == e["seq"]:
+            print(f"  NO_LONGER_STANDS_LOCALLY {e['alias']} {rec['item_id']}: return {e['seq']} "
+                  "still shows on the site until that reviewer saves again")
+    return 0
+
+
 # ------------------------------------------------------------------ the command line
 
 
@@ -671,6 +778,8 @@ def main(argv: list[str] | None = None) -> int:
         "--in", dest="infile", required=True, metavar="FILE")
     command("pull-to-local", cmd_pull_to_local,
             "append the hosted saves the local log does not hold yet")
+    command("push-returns", cmd_push_returns,
+            "store the approver's standing local returns for the reviewers they concern")
     command("status", cmd_status, "per alias: times, counts by phase, revoked")
     command("verify", cmd_verify,
             "the hosted chain, and the imported lines against the snapshot").add_argument(

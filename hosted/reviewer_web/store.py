@@ -20,8 +20,15 @@ connection and commits with the block (one connection per request).
 #   GENESIS, the head of an empty local log.
 # * ``bundle.scope_sequences`` (an added column): how many sequences the published files carry
 #   content for, so the operator tool can refuse a reviewer scope beyond it.
-# * ``event.origin`` allows a third value, RETURN (seq above 2000000, outside the hosted chain):
-#   an approver's local return of a reading, stored for its reviewer by the operator tool only.
+# * ``event.origin`` has a third value, RETURN: an approver's LOCAL decision to return a reading,
+#   stored by the operator tool (``push-returns``) under the reviewer whose reading it returns,
+#   so ``records_of`` serves it to that reviewer only. It is an APPROVAL record of the log's
+#   shape (decision RETURN, the approver's notes; of the approver only the role), ``refers_to``
+#   the seq the returned reading has HERE, so ``A.effective_approval`` / ``A._outcome`` give the
+#   site what they give the local workspace, and the reviewer's next reading after the reveal
+#   supersedes it. It is outside the hosted chain: seq 2000000 + its local line's seq (after
+#   every record of the reviewer's own), ``prev_sha256`` the sha256 of the returned reading. The
+#   site never writes one; ``pull-to-local`` never copies one back.
 # * The parsed bundle is cached by (bundle_id, published_at), not bundle_id alone: a larger scope
 #   of the same local bundle is published under the same bundle_id and must replace the cache.
 # * ``append`` also refuses a record whose annotator is not the reviewer or whose bundle is not
@@ -47,7 +54,8 @@ from tradingbot.runtime.vocab_recommend import GENESIS, encode_line
 SCHEMA_SQL = Path(__file__).with_name("schema.sql")
 LOCK_KEY = 7_203_001  # pg_advisory_xact_lock: one writer of ``event`` at a time
 HOSTED_BASE = 1_000_000  # a HOSTED line's seq is HOSTED_BASE + n (n = 1, 2, ...)
-LEGACY, HOSTED = "LEGACY", "HOSTED"
+RETURN_BASE = 2_000_000  # a RETURN line's seq is RETURN_BASE + the seq of its local line
+LEGACY, HOSTED, RETURN = "LEGACY", "HOSTED", "RETURN"
 MAX_MEDIA_BYTES = 4 * 1024 * 1024
 _IMAGE_TYPES = dict(zip(A._MAGIC, ("image/png", "image/jpeg", "image/gif", "image/gif"),
                         strict=True))
@@ -188,8 +196,9 @@ class Store:
     # -------------------------------------------------------------- one reviewer's records
 
     def records_of(self, reviewer: ReviewerRow) -> list[dict]:
-        """ONLY this reviewer's records of the active bundle, in order (the imported local lines,
-        then the hosted ones), as the log's dicts."""
+        """ONLY this reviewer's records of the active bundle, as the log's dicts, in order: the
+        imported local lines, the hosted ones, then the approver's returns of this reviewer's
+        readings (APPROVAL records with decision RETURN; see the head of this file)."""
         with self.connection() as conn:
             rows = conn.execute(
                 "SELECT e.line FROM event e JOIN bundle b ON b.bundle_id = e.bundle_id AND b.active"

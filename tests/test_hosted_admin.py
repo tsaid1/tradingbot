@@ -36,7 +36,8 @@ OWNER = A.Session("owner@example.invalid", "Owner Example", A.APPROVER, A.FULL, 
 TESTER = "tester@example.invalid"
 # Nothing the tool prints may hold a sign-in, a name, or a word of a post or of a reading.
 FORBIDDEN = ("@", "example.invalid", "Reviewer Example", "Owner Example", "Zed Metals", "TLT",
-             "starter long", "bond crowd", "crude", "postgresql", "COMMENTARY", "LONG")
+             "starter long", "bond crowd", "crude", "postgresql", "COMMENTARY", "NOT_STATED",
+             "CURRENT_MARKET", "Approver")
 HOSTED_1 = 1_000_001
 
 
@@ -327,8 +328,10 @@ def test_the_published_scope_and_the_reviewers_scope_stay_consistent(run, store,
 def test_sync_reviewers_reads_the_owner_s_file_and_never_deletes(run, store, base):
     file = base / "reviewers.toml"
     before = (file.read_bytes(), file.stat().st_mtime_ns)
-    out = run("init-db")
-    assert out.startswith("schema applied: 5 table(s): bundle, chain_anchor, event, media, ")
+    out = run("init-db")  # the web app's sign-in tables live in the same schema file
+    assert re.fullmatch(r"schema applied: \d+ table\(s\): [a-z_, ]+\n", out)
+    assert {"bundle", "chain_anchor", "event", "media", "reviewer"} <= set(
+        out.strip().split(": ")[2].split(", "))
     out = run("sync-reviewers")
     assert out.splitlines() == ["REMOTE-2: id 1, REVIEWER, FULL, scope 40",
                                 "REMOTE-3: id 2, REVIEWER, FULL, scope 40",
@@ -351,17 +354,28 @@ def test_sync_reviewers_reads_the_owner_s_file_and_never_deletes(run, store, bas
     assert (file.read_bytes(), file.stat().st_mtime_ns) == before
 
 
+def web_sessions(store, *sessions: tuple[str, int]) -> None:
+    """Rows (token letter, reviewer id) in the web app's ``web_session`` table: made here as the
+    web app's part of ``schema.sql`` defines it when this tree does not hold that part yet."""
+    with store.connection() as conn:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS web_session (token_sha256 TEXT PRIMARY KEY,"
+            " reviewer_id BIGINT NOT NULL REFERENCES reviewer (id) ON DELETE CASCADE,"
+            " created_at TIMESTAMPTZ NOT NULL, last_seen_at TIMESTAMPTZ NOT NULL,"
+            " expires_at TIMESTAMPTZ NOT NULL)")
+        for letter, reviewer_id in sessions:
+            conn.execute("INSERT INTO web_session VALUES (%s, %s, now(), now(), now())",
+                         (letter * 64, reviewer_id))
+
+
 def test_revoke_stops_access_at_once_and_restore_access_lifts_it(run, store, base):
     run("sync-reviewers")
-    with store.connection() as conn:  # the web app's table, as its part of the schema names it
-        conn.execute("CREATE TABLE web_session (token_sha256 TEXT PRIMARY KEY,"
-                     " reviewer_id BIGINT NOT NULL REFERENCES reviewer (id))")
-        conn.execute("INSERT INTO web_session VALUES ('a', 1), ('b', 1), ('c', 2)")
+    web_sessions(store, ("a", 1), ("b", 1), ("c", 2))
     assert run("revoke", "REMOTE-2") == "REMOTE-2: REVOKED; 2 web session(s) deleted\n"
     assert store.reviewer_by_login(ONE.login).revoked is True
     assert "REMOTE-2: id 1, REVIEWER, FULL, scope 40, REVOKED" in run("sync-reviewers")
     with store.connection() as conn:
-        assert conn.execute("SELECT token_sha256 FROM web_session").fetchall() == [("c",)]
+        assert conn.execute("SELECT token_sha256 FROM web_session").fetchall() == [("c" * 64,)]
     assert "revoked 2" in run("status").replace("revoked -", "")
     assert run("restore-access", "REMOTE-2") == \
         "REMOTE-2: access restored; 0 web session(s) deleted\n"
@@ -699,3 +713,185 @@ def test_status_gives_times_and_counts_by_phase_per_alias(run, store, base):
     assert out[6:8] == ["  LEGACY: INDEPENDENT 1", "  HOSTED: INDEPENDENT 1"]
     assert out[8].startswith("TEST-1 (test identity): scope 40,")
     assert out[9:] == ["  HOSTED: INDEPENDENT 1"]
+
+
+# ------------------------------------------------------------------ the approver's returns
+
+RETURN_1 = 2_000_001
+NOTE = "The stop was raised in the post before this one."
+NEUTRAL = {"login": "approver", "name": "Approver", "role": A.APPROVER, "access": A.FULL}
+
+
+def standing_return(records: list[dict], bundle: A.Bundle, login: str, item_id: str):
+    """The approver's RETURN of this reviewer's latest reading of the item, when it stands: what
+    the local workspace computes from the log for its "returned" notice (``_reviewer``), here
+    from any list of records."""
+    new = A.rubric2(records)
+    own = A._of(new, item_id, bundle.bundle_id, A.AFTER_REVEAL, login)
+    appr = A.effective_approval(new, item_id, bundle) if own else None
+    return appr if appr is not None and A._outcome(appr) == "RETURN" and appr[
+        "refers_to"] == own[-1]["seq"] else None
+
+
+def hosted_return(store, row, item_id: str):
+    return standing_return(store.records_of(row), store.active_bundle(), row.login_shown,
+                           item_id)
+
+
+def decide(base: Path, item_id: str, refers_to: int, outcome: str, notes: str = "") -> dict:
+    return A.append_annotation(base, A.load_bundle(base / "bundle", A.FULL), OWNER,
+                               item_id=item_id, phase=A.APPROVAL, blind=False, reading={},
+                               refers_to=refers_to, outcome=outcome, notes=notes)
+
+
+def test_a_local_return_reaches_its_reviewer_and_a_corrected_save_supersedes_it(
+        run, store, base):
+    rows = cutover(run, store, base)
+    one, two = rows["REMOTE-2"], rows["REMOTE-3"]
+    bundle = store.active_bundle()
+    # The reviewer works on the site, the saves come home, the approver returns two readings
+    # with a note: one made on the site, one imported from the local log.
+    hosted_save(store, one, "i03", A.INDEPENDENT)  # 1000001
+    hosted_reveal(store, one, "i03")  # 1000002
+    hosted_save(store, one, "i03", A.AFTER_REVEAL)  # 1000003; local line 11 after the pull
+    run("pull-to-local")
+    before = {alias: store.records_of(row) for alias, row in rows.items()}
+    assert "pushed 0 new return(s): -; 0 already stored; 0 skipped" in run("push-returns")
+    local = decide(base, "i03", 11, "RETURN", NOTE)  # line 12
+    decide(base, "i07", 3, "RETURN", "Look at the entry again.")  # line 13, of the local line 3
+    out = run("push-returns")
+    assert NOTE not in out and out.splitlines() == [
+        ("returns that stand in the local log: 2; 0 of a reading that was not made by a hosted "
+         "reviewer"),
+        ("pushed 2 new return(s): REMOTE-2 2; 0 already stored; 0 skipped (the returned reading "
+         "is not in the hosted store)"),
+        f"  REMOTE-2 i03: return {RETURN_1 + 11} of the reading {HOSTED_1 + 2}",
+        f"  REMOTE-2 i07: return {RETURN_1 + 12} of the reading 3"]
+    # The site computes "returned" with the workspace's own functions, as the local log does.
+    got = hosted_return(store, one, "i03")
+    assert got == {**local, "seq": RETURN_1 + 11, "refers_to": HOSTED_1 + 2, "annotator": NEUTRAL,
+                   "prev_sha256": got["prev_sha256"], "local": got["local"]}
+    assert (got["decision"], got["notes"], got["at"]) == ("RETURN", NOTE, local["at"])
+    log = A.read_annotations(base).records
+    at_home = standing_return(log, bundle, ONE.login, "i03")
+    assert (at_home["seq"], at_home["refers_to"], at_home["notes"]) == (12, 11, NOTE)
+    assert hosted_return(store, one, "i07")["refers_to"] == 3
+    # Only that reviewer gets it, nothing of anyone's own records changed, and no line of the
+    # store names the approver.
+    mine = store.records_of(one)
+    assert [r for r in mine if r["phase"] != A.APPROVAL] == before["REMOTE-2"]
+    assert [r["seq"] for r in mine][-2:] == [RETURN_1 + 11, RETURN_1 + 12]
+    assert store.records_of(two) == before["REMOTE-3"]
+    assert store.records_of(rows["TEST-1"]) == before["TEST-1"] == []
+    returns = [e for e in store.events() if e["origin"] == "RETURN"]
+    assert [(e["seq"], e["alias"], e["phase"]) for e in returns] == [
+        (RETURN_1 + 11, "REMOTE-2", A.APPROVAL), (RETURN_1 + 12, "REMOTE-2", A.APPROVAL)]
+    assert not any(word.encode() in e["line"] for e in returns
+                   for word in (OWNER.login, OWNER.name, "owner"))
+    assert got["prev_sha256"] == V._sha(V.encode_line(mine[-3]))  # the reading it returns
+    assert got["local"] == {"seq": 12, "sha256": V._sha(log_lines(base)[11])}
+    assert A.progress(bundle, mine, one.session()).status["i03"] == "DONE"
+    # Again: nothing new. The store verifies, parity ignores the returns, status counts them.
+    events = store.events()
+    assert "pushed 0 new return(s): -; 2 already stored; 0 skipped" in run("push-returns")
+    assert store.events() == events
+    assert "events: LEGACY 7, HOSTED 3, RETURN 2" in run("verify")
+    assert "PASS" in run("parity") and "  RETURN: APPROVAL 2" in run("status")
+    # The reviewer saves a corrected reading on the site: it chains on normally, and the return
+    # no longer stands (the other one still does).
+    [fixed] = hosted_save(store, one, "i03", A.AFTER_REVEAL, confidence="MEDIUM").records
+    assert (fixed["seq"], fixed["prev_sha256"], fixed["refers_to"]) == (
+        HOSTED_1 + 3, events[9]["sha256"], HOSTED_1)
+    assert hosted_return(store, one, "i03") is None
+    assert hosted_return(store, one, "i07") is not None
+    # Home again: only the corrected reading is pulled, never a return; the approver decides.
+    assert "pulled 1 hosted line(s) into the local log: REMOTE-2 1; 3 already held" in run(
+        "pull-to-local")
+    log = A.read_annotations(base)
+    assert log.ok and log.count == 14 and "approver" not in A.annotations_path(base).read_text()
+    assert FREEZE.main(["verify", "--dir", str(base)]) == 0
+    b = A.load_bundle(base / "bundle", A.FULL)
+    assert standing_return(log.records, b, ONE.login, "i03") is None
+    assert A.progress(b, log.records, OWNER).status["i03"] == "AWAITING"
+    decide(base, "i03", 14, "ACCEPT")
+    assert A.progress(b, A.read_annotations(base).records, OWNER).status["i03"] == "DECIDED"
+    out = run("push-returns")  # an ACCEPT is never pushed
+    assert "returns that stand in the local log: 1;" in out
+    assert "pushed 0 new return(s): -; 1 already stored; 0 skipped" in out
+    assert "PASS" in run("verify") and "PASS" in run("parity")
+
+
+def test_a_return_of_a_reading_the_store_does_not_hold_is_counted_and_skipped(run, store, base):
+    rows = cutover(run, store, base)
+    # The legacy site still serves the second reviewer, who has no save on the hosted site.
+    local_save(base, TWO, "i07", A.AFTER_REVEAL)  # line 9: not imported yet
+    decide(base, "i07", 9, "RETURN", NOTE)  # line 10
+    out = run("push-returns")
+    assert "returns that stand in the local log: 1;" in out
+    assert "pushed 0 new return(s): -; 0 already stored; 1 skipped" in out
+    assert [e["origin"] for e in store.events()] == ["LEGACY"] * 7
+    assert "imported 1 new line(s)" in run("import-log")
+    out = run("push-returns")
+    assert f"  REMOTE-3 i07: return {RETURN_1 + 9} of the reading 9" in out
+    assert hosted_return(store, rows["REMOTE-3"], "i07")["notes"] == NOTE
+    assert hosted_return(store, rows["REMOTE-2"], "i07") is None  # the other reviewer's reading
+    assert [r["phase"] for r in store.records_of(rows["REMOTE-2"])].count(A.APPROVAL) == 0
+
+
+def test_a_pushed_return_that_the_approver_took_back_is_reported(run, store, base):
+    rows = cutover(run, store, base)
+    one = rows["REMOTE-2"]
+    decide(base, "i07", 3, "RETURN", NOTE)  # line 9
+    assert "pushed 1 new return(s): REMOTE-2 1" in run("push-returns")
+    decide(base, "i07", 3, "ACCEPT")  # line 10: decided again, without a new reading
+    assert standing_return(A.read_annotations(base).records, store.active_bundle(), ONE.login,
+                           "i07") is None
+    out = run("push-returns")  # no line of the store can be taken back: the operator is told
+    assert "returns that stand in the local log: 0;" in out
+    assert out.splitlines()[-1] == (f"  NO_LONGER_STANDS_LOCALLY REMOTE-2 i07: return "
+                                    f"{RETURN_1 + 8} still shows on the site until that reviewer "
+                                    "saves again")
+    assert hosted_return(store, one, "i07") is not None
+    hosted_reveal(store, one, "i07")
+    hosted_save(store, one, "i07", A.AFTER_REVEAL)  # the reviewer's next save clears it
+    assert hosted_return(store, one, "i07") is None
+    assert "NO_LONGER_STANDS_LOCALLY" not in run("push-returns")
+
+
+def test_returns_survive_export_and_restore_and_verify_checks_what_they_name(
+        cli, run, store, base, monkeypatch, tmp_path):
+    rows = cutover(run, store, base)
+    one = rows["REMOTE-2"]
+    decide(base, "i07", 3, "RETURN", NOTE)
+    run("push-returns")
+    run("export", "--out", tmp_path / "x" / "events.jsonl")
+    events = store.events()
+    original = monkeypatch.setenv(cli.URL_ENV, hosted_pg.fresh_database())
+    assert original is None
+    run("init-db")
+    run("sync-reviewers", "--test-identity", "TEST-1", TESTER)
+    assert "restored 8 event(s): LEGACY 7, RETURN 1" in run(
+        "restore", "--in", tmp_path / "x" / "events.jsonl")
+    restored = cli.S.AdminStore(os.environ[cli.URL_ENV])
+    assert restored.events() == events
+    run("publish-bundle", "--demo", base)
+    assert hosted_return(restored, restored.reviewer_by_login(ONE.login), "i07")["notes"] == NOTE
+    assert "verify: PASS" in run("verify")
+    # A return that names a reading of another reviewer, or no reading after the reveal.
+    record = json.loads(events[-1]["line"])
+    for n, (refers_to, prev) in enumerate(((5, events[4]["sha256"]), (1, events[0]["sha256"]),
+                                           (3, "0" * 64)), 1):
+        stray = V.encode_line({**record, "seq": record["seq"] + n, "refers_to": refers_to,
+                               "prev_sha256": prev,
+                               "local": {**record["local"], "seq": record["local"]["seq"] + n}})
+        restored.insert_events([cli.S.EventLine(one.id, "RETURN", stray)])
+    out = run("verify", code=1)
+    assert [x for x in out.splitlines() if x.startswith("  ")] == [
+        f"  RETURN_DOES_NOT_NAME_ITS_READING at {record['seq'] + n}" for n in (1, 2, 3)]
+    # The site never writes a return, and a return is never in the hosted chain.
+    assert restored.records_of(one)[-1]["seq"] == record["seq"] + 3
+    [nxt] = hosted_reveal(restored, restored.reviewer_by_login(ONE.login), "i08").records
+    assert (nxt["seq"], nxt["prev_sha256"]) == (HOSTED_1, restored.anchor()["head"])
+    # Another folder's log is not the log this store continues.
+    assert run("push-returns", "--dir", write_demo(tmp_path / "other"), code=2) == \
+        "refused: LOCAL_LOG_IS_NOT_THE_ANCHORED_LOG\n"

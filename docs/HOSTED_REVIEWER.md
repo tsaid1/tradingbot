@@ -43,6 +43,7 @@ python scripts/hosted_admin.py status
 | `export --out FILE` | Every event as JSONL (mode 0600, never over an existing file, never inside the repository): a header with the anchor, then per event its alias, origin, `seq`, hashes and exact line. |
 | `restore --in FILE` | Loads an export into an EMPTY database and verifies every hash and the hosted chain. |
 | `pull-to-local` | Appends the hosted saves the local log does not hold yet to the local log. |
+| `push-returns` | Stores the approver's standing local RETURN decisions for the reviewers whose readings they return. |
 | `status` | The published bundle and the anchor; per alias: scope, invited, first sign-in, first hosted save, revoked, and the lines by origin and phase. |
 | `verify` | The hosted chain (every line against its hash, 1000001, 1000002, ... from the anchor) and the imported lines against the newest snapshot, in both directions. |
 
@@ -90,6 +91,8 @@ of it: a later line supersedes, as in the local log.
 * **HOSTED**: written by the site. `seq` 1000001, 1000002, ...; each line carries the sha256 of
   the previous hosted line, and the first one the head of the local log at the cutover
   (`chain_anchor`). A line hashes the same as a local one (`vocab_recommend.encode_line`).
+* **RETURN**: the approver's local decision to return a reading, stored by `push-returns` for
+  the reviewer it concerns (below). Outside the hosted chain; the site never writes one.
 
 ### Cutover
 
@@ -146,6 +149,54 @@ record it means, and `hosted = {"seq", "sha256"}` naming the hosted line. It can
 refuses a folder whose log is not the one the site continues
 (`LOCAL_LOG_IS_NOT_THE_ANCHORED_LOG`) and a store that fails verification. Between pulls `parity`
 says FAIL with `hosted lines not pulled: n`; after a pull it must PASS.
+
+### Returned readings
+
+The approver decides locally. A RETURN reaches the reviewer through the operator:
+
+```bash
+python scripts/hosted_admin.py pull-to-local
+# ... the approver returns readings in the local workspace ...
+python scripts/hosted_admin.py push-returns
+```
+
+`push-returns` takes each RETURN that stands in the local log (the item's latest approval, still
+referring to its reviewer's latest reading after the reveal: `effective_approval`), finds the
+returned reading in the store (an imported line by its bytes, a pulled copy by its `hosted`
+field) and stores one RETURN event under that reviewer:
+
+* an APPROVAL record of the log's shape with `decision: "RETURN"`, the approver's notes and
+  time, and `refers_to` the `seq` the returned reading has in the store; of the approver only
+  the role (`annotator` is `approver` / `Approver`, never a sign-in or a name);
+* `seq` 2000000 + the seq of the local approval line (so the same decision is stored once),
+  `prev_sha256` the sha256 of the returned reading, `local = {"seq", "sha256"}` naming the local
+  line.
+
+The site serves it to that reviewer only, after the reviewer's own records, and computes
+"returned" with the workspace's own functions (`effective_approval`, `_outcome`), so the form
+reopens after the reveal with the reviewer's latest answers and the approver's notes. Nothing of
+the reviewer's records changes. The reviewer's next reading after the reveal chains on as any
+other save and supersedes the return, exactly as locally; the next `pull-to-local` brings that
+reading home (a RETURN event is never written back into the local log) and the approver decides
+again.
+
+```text
+returns that stand in the local log: 2; 0 of a reading that was not made by a hosted reviewer
+pushed 1 new return(s): REMOTE-1 1; 1 already stored; 0 skipped (the returned reading is not in the hosted store)
+  REMOTE-1 i03: return 2000012 of the reading 1000003
+```
+
+It can be run again (nothing is stored twice). A RETURN of a reading the store does not hold
+(saved locally and not imported) is counted as skipped. ACCEPT and AMEND are never pushed.
+`verify` checks that every RETURN names a reading after the reveal of the same reviewer by its
+seq and sha256; `export` and `restore` carry RETURN events like the others; `parity` compares the
+reviewers' own records only.
+
+One limit: no event can be taken back. If the approver decides again on the same reading
+(ACCEPT or AMEND after a RETURN) before the reviewer has answered, the site still shows the
+return until that reviewer saves again; `push-returns` then prints
+`NO_LONGER_STANDS_LOCALLY <alias> <item>`. The same holds for the return of one reviewer's
+reading once the approver's latest decision on that item concerns another reviewer's reading.
 
 ### Backup: export and restore
 
