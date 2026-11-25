@@ -136,7 +136,8 @@ def test_an_image_is_served_only_to_a_reviewer_whose_form_shows_its_post(site): 
 
 
 ROUTES = ("/", "/guide", "/fields", "/form/i07", "/form/nothing", "/continue", "/sign-in",
-          "/healthz", "/robots.txt", "/static/app.css", "/static/app.js", "/static/nothing.css",
+          "/healthz", "/robots.txt", "/favicon.ico", "/static/app.css", "/static/app.js",
+          "/static/nothing.css",
           "/nothing", "/media/x/y/z")
 
 
@@ -201,7 +202,7 @@ def test_the_health_page_and_the_static_files_touch_neither_the_store_nor_a_sess
     b = site.browser()
     health = b.get("/healthz")
     assert health.status_code == 200 and health.get_data() == b"ok\n"
-    assert b.get("/robots.txt").status_code == 200
+    assert b.get("/robots.txt").status_code == 200 and b.get("/favicon.ico").status_code == 204
     assert b.get("/static/app.css").status_code == 200
     assert b.get("/healthz", headers={"Cookie": "__Host-session=anything"}).status_code == 200
 

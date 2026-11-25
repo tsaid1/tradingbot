@@ -48,7 +48,7 @@ from . import forms as F
 STATIC = Path(__file__).resolve().parent.parent / "public" / "static"
 SITE_ENVS = ("production", "preview", "test")
 DEMO_ENVS = ("preview", "test")  # these show invented data only
-PUBLIC = ("healthz", "robots", "static")  # no session, no database
+PUBLIC = ("healthz", "robots", "favicon", "static")  # no session, no database
 SIGN_IN = ("sign_in", "sign_in_code", "sign_in_verify")
 IMAGE_TYPES = ("image/png", "image/jpeg", "image/gif", "image/webp")
 MAX_IMAGE_BYTES = 4 * 1024 * 1024  # the platform caps a response at 4.5 MB
@@ -240,6 +240,10 @@ def create_app(store, mailer, config: dict) -> Flask:
     @app.get("/robots.txt")
     def robots():
         return Response("User-agent: *\nDisallow: /\n", mimetype="text/plain")
+
+    @app.get("/favicon.ico")
+    def favicon():
+        return Response(status=204)  # browsers ask; the site has no image of its own
 
     # ------------------------------------------------------------- sign-in and sign-out
 
