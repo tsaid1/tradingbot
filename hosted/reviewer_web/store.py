@@ -94,7 +94,10 @@ _IMAGE_TYPES = dict(zip(A._MAGIC, ("image/png", "image/jpeg", "image/gif", "imag
                         strict=True))
 
 _REVIEWER = ("SELECT id, alias, login, login_shown, name, role, access, scope_sequences, is_test,"
-             " revoked_at IS NOT NULL, bundle_id FROM reviewer")
+             " revoked_at IS NOT NULL, bundle_id, sign_in, address FROM reviewer")
+OWNER_REVIEWER = "OWNER-REVIEWER"  # the alias of the owner's own reviewer identity
+# The phases the site writes: never an approval (approval, return and freeze stay local).
+SITE_PHASES = (A.INDEPENDENT, A.AFTER_REVEAL, A.SYSTEM_SHOWN)
 # One bundle row; its four files travel only when this process does not hold that publication.
 _BUNDLE = ("SELECT b.bundle_id, b.published_at, b.is_demo, f.manifest, f.sequences, f.items,"
            " f.posts FROM bundle b LEFT JOIN bundle f ON f.bundle_id = b.bundle_id"
@@ -122,6 +125,8 @@ class ReviewerRow:
     is_test: bool
     revoked: bool
     bundle_id: str | None = None  # the bundle this reviewer works on (None: not assigned yet)
+    sign_in: str | None = None  # casefolded: the address whose codes open this identity
+    address: str | None = None  # as given: where this identity's codes and invitations go
 
     def session(self) -> A.Session:
         return A.Session(self.login_shown, self.name, self.role, self.access, True,
@@ -202,6 +207,14 @@ class Store:
         with self.connection() as conn:
             row = conn.execute(_REVIEWER + " WHERE login = %s", (login.casefold(),)).fetchone()
         return ReviewerRow(*row) if row else None
+
+    def identities_at(self, sign_in: str) -> list[ReviewerRow]:
+        """Every identity whose codes go to this address (casefolded match), revoked ones too:
+        the real one first, then the test identity. At most one of each kind."""
+        with self.connection() as conn:
+            rows = conn.execute(_REVIEWER + " WHERE sign_in = %s ORDER BY is_test, id",
+                                (sign_in.casefold(),)).fetchall()
+        return [ReviewerRow(*row) for row in rows]
 
     def reviewer_by_id(self, reviewer_id: int) -> ReviewerRow | None:
         with self.connection() as conn:
@@ -284,7 +297,7 @@ class Store:
                 " WHERE id = (SELECT q.id FROM mail_queue q JOIN reviewer r"
                 " ON r.id = q.reviewer_id WHERE " + _MAIL_DUE + " AND " + _MAIL_FOR
                 + " AND NOT q.id = ANY(%s) ORDER BY q.id LIMIT 1 FOR UPDATE OF q SKIP LOCKED)"
-                " RETURNING id, kind, (SELECT login_shown FROM reviewer"
+                " RETURNING id, kind, (SELECT address FROM reviewer"
                 " WHERE id = mail_queue.reviewer_id)", (list(skip),)).fetchone()
         return tuple(row) if row else None
 
@@ -363,6 +376,9 @@ class Store:
                 if (body.get("annotator") or {}).get("login") != reviewer.login_shown \
                         or body.get("bundle_id") != bundle_id:
                     raise A.AdjudicationError("RECORD_NOT_OF_THIS_REVIEWER_AND_BUNDLE")
+                if body.get("phase") not in SITE_PHASES or (body.get("annotator") or {}).get(
+                        "role") != A.REVIEWER:
+                    raise A.AdjudicationError("PHASE_NOT_WRITTEN_BY_THE_SITE")
                 seq += 1
                 rec = {**body, "schema": A.ANNOTATION_SCHEMA, "seq": seq, "prev_sha256": prev}
                 line = encode_line(rec)
@@ -403,7 +419,7 @@ class AdminStore(Store):
     def upsert_reviewer(self, alias: str, login: str, *, name: str = "",
                         role: str = A.REVIEWER, access: str = A.FULL,
                         scope_sequences: int = A.DEFAULT_SCOPE, is_test: bool = False,
-                        bundle_id: str | None = None) -> ReviewerRow:
+                        bundle_id: str | None = None, address: str | None = None) -> ReviewerRow:
         """Insert the reviewer, or update the name, role, access, scope and bundle of the row
         that holds this alias AND this sign-in; its spelling too, but only while the row has no
         event (its records are found by that exact spelling). Anything else is refused: a row
@@ -413,8 +429,14 @@ class AdminStore(Store):
         only (TEST_IDENTITY_NEEDS_A_DEMO_BUNDLE). None keeps the row's bundle; for a new row it
         is the invented active bundle (test identity), or the real active one, else the invented
         one (a preview or test database); with nothing published the row stays unassigned and is
-        served nothing."""
+        served nothing.
+
+        ``address``: where this identity's codes go, when it is not the login itself (the
+        owner's reviewer identity, whose login is the local identity string). An address holds
+        at most one identity of each kind, a real one and a test identity
+        (ADDRESS_HELD_BY_ANOTHER_IDENTITY)."""
         key = login.casefold()
+        address = (address if address is not None else login).strip()
         with self.connection() as conn:
             held = conn.execute(
                 "SELECT alias, login, is_test, login_shown <> %s AND EXISTS (SELECT 1 FROM event e"
@@ -424,6 +446,9 @@ class AdminStore(Store):
                 raise A.AdjudicationError("ALIAS_OR_LOGIN_HELD_BY_ANOTHER_ROW")
             if held and held[0][3]:
                 raise A.AdjudicationError("LOGIN_SPELLING_HAS_RECORDS")
+            if conn.execute("SELECT 1 FROM reviewer WHERE sign_in = %s AND is_test = %s"
+                            " AND alias <> %s", (address.casefold(), is_test, alias)).fetchone():
+                raise A.AdjudicationError("ADDRESS_HELD_BY_ANOTHER_IDENTITY")
             if bundle_id is None and not held:
                 found = conn.execute(
                     "SELECT bundle_id FROM bundle WHERE active AND (is_demo OR NOT %s)"
@@ -439,29 +464,34 @@ class AdminStore(Store):
             if held:
                 conn.execute(
                     "UPDATE reviewer SET login_shown = %s, name = %s, role = %s, access = %s,"
-                    " scope_sequences = %s, bundle_id = COALESCE(%s, bundle_id) WHERE alias = %s",
-                    (login, name, role, access, scope_sequences, bundle_id, alias))
+                    " scope_sequences = %s, bundle_id = COALESCE(%s, bundle_id), sign_in = %s,"
+                    " address = %s WHERE alias = %s",
+                    (login, name, role, access, scope_sequences, bundle_id, address.casefold(),
+                     address, alias))
             else:
                 conn.execute(
                     "INSERT INTO reviewer (alias, login, login_shown, name, role, access,"
-                    " scope_sequences, is_test, bundle_id)"
-                    " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
-                    (alias, key, login, name, role, access, scope_sequences, is_test, bundle_id))
+                    " scope_sequences, is_test, bundle_id, sign_in, address)"
+                    " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                    (alias, key, login, name, role, access, scope_sequences, is_test, bundle_id,
+                     address.casefold(), address))
             return self.reviewer_by_login(login)
 
     def sync_reviewers(self, reviewers: A.Reviewers, *,
-                       bundle_id: str | None = None) -> list[ReviewerRow]:
+                       bundle_id: str | None = None,
+                       skip: str | None = None) -> list[ReviewerRow]:
         """The remote reviewers of the owner's reviewers file. An entry whose login contains
         ``@`` is REMOTE-<n>, n its place among those entries in file order (the alias the
         owner's other tools print); the REVIEWER ones are stored, with the file's scope, the
         access a remote session has by that file (RESTRICTED unless
         ``remote_full_context_authorized``) and ``bundle_id`` (as ``upsert_reviewer`` reads it).
-        Never deletes."""
+        Never deletes. ``skip``: the login of the owner's own reviewer entry (its row is
+        OWNER-REVIEWER, written by the operator tool with the owner's address)."""
         out, n = [], 0
         with self.connection():
             for entry in reviewers.entries.values():
                 n += "@" in entry.login
-                if "@" in entry.login and entry.role == A.REVIEWER:
+                if "@" in entry.login and entry.role == A.REVIEWER and entry.login != skip:
                     out.append(self.upsert_reviewer(
                         f"REMOTE-{n}", entry.login, name=entry.name, role=entry.role,
                         access=entry.access if reviewers.remote_full_context_authorized
@@ -498,7 +528,14 @@ class AdminStore(Store):
                 " END WHERE alias = %s RETURNING id", (revoked, alias)).fetchone()
             if row is None:
                 raise A.AdjudicationError("UNKNOWN_ALIAS")
-            conn.execute("DELETE FROM login_code WHERE reviewer_id = %s AND used_at IS NULL", row)
+            # The codes and open choices of the ADDRESS end (they are kept under its key row);
+            # the other identity of that address simply asks for a new code. Sessions end for
+            # this identity only.
+            same = ("(SELECT o.id FROM reviewer o JOIN reviewer r ON r.sign_in = o.sign_in"
+                    " WHERE r.id = %s)")
+            conn.execute("DELETE FROM login_code WHERE used_at IS NULL AND reviewer_id IN "
+                         + same, row)
+            conn.execute("DELETE FROM sign_in_choice WHERE sign_in_key IN " + same, row)
             return conn.execute("DELETE FROM web_session WHERE reviewer_id = %s", row).rowcount
 
     # -------------------------------------------------------------- queued mail

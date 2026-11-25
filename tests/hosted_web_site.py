@@ -451,7 +451,8 @@ class Site:
         """Change a reviewer's row (role, access, scope_sequences), as the operator tool does."""
         row = self.reviewers[alias]
         kw = {"name": row.name, "role": row.role, "access": row.access,
-              "scope_sequences": row.scope_sequences, "is_test": row.is_test, **changes}
+              "scope_sequences": row.scope_sequences, "is_test": row.is_test,
+              "address": row.address, **changes}
         self.admin.upsert_reviewer(alias, row.login_shown, **kw)
 
     def sql(self, statement: str, *values) -> list:

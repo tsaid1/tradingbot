@@ -54,6 +54,29 @@ $$;
 CREATE OR REPLACE TRIGGER reviewer_bundle_stays_assigned BEFORE UPDATE ON reviewer
     FOR EACH ROW EXECUTE FUNCTION reviewer_keeps_a_bundle();
 
+-- The address a sign-in code is mailed to is not the identity whose lines are written. ``login``
+-- (casefolded ``login_shown``) is the identity: what its records carry. ``sign_in`` (casefolded)
+-- and ``address`` (as given) are where its codes go. One address may have TWO identities, one of
+-- each kind: the owner's real reviewer identity and a test identity. A database made by an
+-- earlier version of this file gets its rows' own login as their address.
+ALTER TABLE reviewer ADD COLUMN IF NOT EXISTS sign_in TEXT;
+ALTER TABLE reviewer ADD COLUMN IF NOT EXISTS address TEXT;
+UPDATE reviewer SET sign_in = login, address = login_shown WHERE sign_in IS NULL OR address IS NULL;
+ALTER TABLE reviewer ALTER COLUMN sign_in SET NOT NULL;
+ALTER TABLE reviewer ALTER COLUMN address SET NOT NULL;
+-- A row written without an address (an older operator tool) has its login as its address.
+CREATE OR REPLACE FUNCTION reviewer_address_defaults() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    NEW.address := COALESCE(NEW.address, NEW.login_shown);
+    NEW.sign_in := COALESCE(NEW.sign_in, NEW.login);
+    RETURN NEW;
+END
+$$;
+CREATE OR REPLACE TRIGGER reviewer_address_by_default BEFORE INSERT ON reviewer
+    FOR EACH ROW EXECUTE FUNCTION reviewer_address_defaults();
+CREATE UNIQUE INDEX IF NOT EXISTS reviewer_one_of_each_kind_per_sign_in
+    ON reviewer (sign_in, is_test);
+
 CREATE TABLE IF NOT EXISTS media (
     bundle_id    TEXT NOT NULL REFERENCES bundle (bundle_id) ON DELETE CASCADE,
     name         TEXT NOT NULL,
@@ -169,6 +192,18 @@ CREATE TABLE IF NOT EXISTS rate_limit (
     at     TIMESTAMPTZ NOT NULL
 );
 CREATE INDEX IF NOT EXISTS rate_limit_by_bucket ON rate_limit (bucket, at);
+
+-- After a right code for an address with two identities: the choice of the identity to open,
+-- bound to that verified code. Single use, five minutes, held by its browser in a cookie of its
+-- own; only the token's SHA-256 is stored. ``sign_in_key``: the address's key row (the lowest id
+-- of the rows of that address), under which its codes and counters are kept.
+CREATE TABLE IF NOT EXISTS sign_in_choice (
+    token_sha256 TEXT PRIMARY KEY CHECK (token_sha256 ~ '^[0-9a-f]{64}$'),
+    sign_in_key  BIGINT NOT NULL REFERENCES reviewer (id) ON DELETE CASCADE,
+    created_at   TIMESTAMPTZ NOT NULL,
+    expires_at   TIMESTAMPTZ NOT NULL,
+    used_at      TIMESTAMPTZ
+);
 
 -- Mail the operator asks the site to send (the mail password exists only where the site runs):
 -- one invitation per row. No address and no text is stored: the reviewer's row gives the address

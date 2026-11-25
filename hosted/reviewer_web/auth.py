@@ -11,6 +11,12 @@
   after its last use (the cookie is sent again whenever the stored expiry moves), and at most
   ninety days after the sign-in: then a new code is needed. It is checked against the reviewer
   row on every request: a revoked reviewer's sessions stop working at once.
+* One address may open TWO identities (the owner's real reviewer identity and a test identity).
+  Its codes and its counters belong to the ADDRESS (kept under its key row: the lowest id of
+  its rows), so the wrong-code lock, the hourly quota and ``unlock`` act on the address. After a
+  right code such an address chooses which identity to open (``choices``, ``choose``): the
+  choice is bound to that verified code, single use, five minutes, held by the browser in a
+  cookie of its own. A session belongs to exactly one identity.
 * Limits per hour: codes per address, codes per network address, tries per network address.
   Every request counts against its network address before anything else is looked at, and an
   address that is not shaped like one is never looked up and never reaches the mail server.
@@ -38,6 +44,9 @@ from tradingbot.runtime import adjudication as A
 from .mail import SITE_NAME
 
 COOKIE = "__Host-session"
+CHOICE_COOKIE = "__Host-choice"
+CHOICE_VALID = timedelta(minutes=5)
+REAL, TEST = "review", "test"  # what a choice names: the address's real identity, or its test one
 CODE_VALID = timedelta(minutes=10)
 CODE_TRIES = 5
 LIVE_CODES = 2  # the newest codes of a reviewer that are valid at once
@@ -67,6 +76,7 @@ class Asked(NamedTuple):
     reviewer: object = None
     code: str | None = None
     code_id: int | None = None
+    identities: tuple = ()  # every identity of the address that may sign in
 
 
 class Verified(NamedTuple):
@@ -75,6 +85,7 @@ class Verified(NamedTuple):
 
     token: str | None = None
     exhausted: str | None = None
+    choice: str | None = None  # the token of the choice between two identities, instead
 
 
 def plausible(address: str) -> str | None:
@@ -100,6 +111,30 @@ def eligible(reviewer) -> bool:
     """A reviewer row that may use the site."""
     return reviewer is not None and not reviewer.revoked and reviewer.role == A.REVIEWER \
         and reviewer.access == A.FULL
+
+
+class Address(NamedTuple):
+    """The identities an address opens: ``key`` is the row its codes and counters are kept
+    under (None: no row has this address), ``open`` the identities that may sign in now."""
+
+    key: object = None
+    open: tuple = ()
+
+
+def address_of(store, login: str | None) -> Address:
+    rows = store.identities_at(login) if login is not None else []
+    if not rows:
+        return Address()
+    return Address(min(rows, key=lambda r: r.id), tuple(r for r in rows if eligible(r)))
+
+
+def key_of(store, reviewer) -> int:
+    """The key row of a reviewer's address: where its codes and counters are kept."""
+    return min(r.id for r in store.identities_at(reviewer.sign_in or reviewer.login))
+
+
+def kind(reviewer) -> str:
+    return TEST if reviewer.is_test else REAL
 
 
 def csrf_token(secret: bytes, token: str) -> str:
@@ -162,24 +197,24 @@ def request_code(store, secret: bytes, address: str, network: str, now: datetime
         allowed = _allow(cur, "net:" + _mac(secret, "net", network), CODES_PER_NETWORK, now)
         if login is None:
             return Asked(False)  # not an address: nothing is looked up, no mail server is asked
-        reviewer = store.reviewer_by_login(login)
-        # A listed address is counted under its row (the operator can clear it by alias), any
-        # other under a keyed hash.
-        bucket = f"to:r{reviewer.id}" if reviewer is not None else "to:" + _mac(secret, "to", login)
+        found = address_of(store, login)
+        key = found.key
+        # A listed address is counted under its key row (the operator can clear it by alias),
+        # any other under a keyed hash.
+        bucket = f"to:r{key.id}" if key is not None else "to:" + _mac(secret, "to", login)
         allowed = _allow(cur, bucket, CODES_PER_ADDRESS, now) and allowed
-        if not allowed or not eligible(reviewer) or len(_wrong_codes(
-                cur, reviewer.id, now)) >= WRONG_CODES_PER_DAY:
+        if not allowed or not found.open or len(_wrong_codes(
+                cur, key.id, now)) >= WRONG_CODES_PER_DAY:
             return Asked(allowed)
         code = f"{secrets.randbelow(10 ** 6):06d}"
         # The code delivered last stays valid beside the new one; older ones end.
         cur.execute("UPDATE login_code SET used_at = %s WHERE reviewer_id = %s AND used_at IS NULL"
                     " AND id NOT IN (SELECT id FROM login_code WHERE reviewer_id = %s"
-                    " ORDER BY id DESC LIMIT %s)", (now, reviewer.id, reviewer.id, LIVE_CODES - 1))
+                    " ORDER BY id DESC LIMIT %s)", (now, key.id, key.id, LIVE_CODES - 1))
         cur.execute("INSERT INTO login_code (reviewer_id, code_hmac, created_at, expires_at) "
                     "VALUES (%s, %s, %s, %s) RETURNING id",
-                    (reviewer.id, _mac(secret, "code", str(reviewer.id), code), now,
-                     now + CODE_VALID))
-        return Asked(True, reviewer, code, cur.fetchone()[0])
+                    (key.id, _mac(secret, "code", str(key.id), code), now, now + CODE_VALID))
+        return Asked(True, found.open[0], code, cur.fetchone()[0], found.open)
 
 
 def cancel_code(store, code_id: int, now: datetime) -> None:
@@ -202,35 +237,89 @@ def verify_code(store, secret: bytes, address: str, code: str, network: str,
     with store.connection() as conn:
         cur = conn.cursor(row_factory=tuple_row)
         allowed = _allow(cur, "try:" + _mac(secret, "net", network), TRIES_PER_NETWORK, now)
-        reviewer = store.reviewer_by_login(login) if login is not None else None
-        if not allowed or not digits or not eligible(reviewer) or len(_wrong_codes(
-                cur, reviewer.id, now)) >= WRONG_CODES_PER_DAY:
+        found = address_of(store, login)
+        key = found.key
+        if not allowed or not digits or not found.open or len(_wrong_codes(
+                cur, key.id, now)) >= WRONG_CODES_PER_DAY:
             hmac.compare_digest(_mac(secret, "code", "0", code[:16]), "0" * 64)
             return Verified()
-        # Every try counts on each valid code, right or wrong: the newest two of the reviewer.
+        # Every try counts on each valid code, right or wrong: the newest two of the address.
         cur.execute(
             "UPDATE login_code SET attempts = attempts + 1 WHERE id IN (SELECT id FROM login_code"
             " WHERE reviewer_id = %s ORDER BY id DESC LIMIT %s) AND used_at IS NULL"
             " AND expires_at > %s AND attempts < %s RETURNING id, code_hmac",
-            (reviewer.id, LIVE_CODES, now, CODE_TRIES))
+            (key.id, LIVE_CODES, now, CODE_TRIES))
         valid = cur.fetchall()
-        entered = _mac(secret, "code", str(reviewer.id), code)
+        entered = _mac(secret, "code", str(key.id), code)
         right = [hmac.compare_digest(stored, entered) for _id, stored in valid]  # each one
         if not any(right):
             if not valid:
                 return Verified()  # nothing it could have been: not a guess at a code
             cur.execute("INSERT INTO rate_limit (bucket, at) VALUES (%s, %s)",
-                        (f"wrong:r{reviewer.id}", now))
-            exhausted = len(_wrong_codes(cur, reviewer.id, now)) == WRONG_CODES_PER_DAY
-            return Verified(None, reviewer.alias if exhausted else None)
+                        (f"wrong:r{key.id}", now))
+            exhausted = len(_wrong_codes(cur, key.id, now)) == WRONG_CODES_PER_DAY
+            return Verified(None, "+".join(r.alias for r in found.open) if exhausted else None)
         cur.execute("UPDATE login_code SET used_at = %s WHERE reviewer_id = %s "
-                    "AND used_at IS NULL", (now, reviewer.id))  # using one ends both
+                    "AND used_at IS NULL", (now, key.id))  # using one ends both
         token = secrets.token_urlsafe(32)  # 256 bits
-        cur.execute("INSERT INTO web_session (token_sha256, reviewer_id, created_at, "
-                    "last_seen_at, expires_at) VALUES (%s, %s, %s, %s, %s)",
-                    (_sha(token), reviewer.id, now, now, now + SESSION_VALID))
-        store.note_first_sign_in(reviewer.id)  # in the same transaction as the session
+        if len(found.open) > 1:  # which identity to open: chosen next, bound to this code
+            cur.execute("DELETE FROM sign_in_choice WHERE expires_at < %s", (now - DAY,))
+            cur.execute("INSERT INTO sign_in_choice (token_sha256, sign_in_key, created_at,"
+                        " expires_at) VALUES (%s, %s, %s, %s)",
+                        (_sha(token), key.id, now, now + CHOICE_VALID))
+            return Verified(choice=token)
+        _open_session(cur, store, token, found.open[0].id, now)
     return Verified(token)
+
+
+def _open_session(cur, store, token: str, reviewer_id: int, now: datetime) -> None:
+    cur.execute("INSERT INTO web_session (token_sha256, reviewer_id, created_at, "
+                "last_seen_at, expires_at) VALUES (%s, %s, %s, %s, %s)",
+                (_sha(token), reviewer_id, now, now, now + SESSION_VALID))
+    store.note_first_sign_in(reviewer_id)  # in the same transaction as the session
+
+
+def _choice_key(cur, token: str, now: datetime) -> int | None:
+    if not token or len(token) > 128:
+        return None
+    cur.execute("SELECT sign_in_key FROM sign_in_choice WHERE token_sha256 = %s"
+                " AND used_at IS NULL AND expires_at > %s", (_sha(token), now))
+    row = cur.fetchone()
+    return row[0] if row else None
+
+
+def choices(store, token: str, now: datetime) -> tuple | None:
+    """The identities a pending choice may open, in order (the real one first), or None: no such
+    choice, used, expired, or fewer than two identities left that may sign in."""
+    with store.connection() as conn:
+        key = _choice_key(conn.cursor(row_factory=tuple_row), token, now)
+        if key is None:
+            return None
+        row = store.reviewer_by_id(key)
+        found = address_of(store, row.sign_in) if row is not None else Address()
+    return found.open if len(found.open) > 1 else None
+
+
+def choose(store, token: str, which: str, now: datetime) -> str | None:
+    """Open the identity ``which`` (REAL or TEST) of a pending choice: a new session's token, or
+    None. The choice is used up whatever happens; it names an identity of ITS address only."""
+    with store.connection() as conn:
+        cur = conn.cursor(row_factory=tuple_row)
+        if not token or len(token) > 128:
+            return None
+        cur.execute("UPDATE sign_in_choice SET used_at = %s WHERE token_sha256 = %s"
+                    " AND used_at IS NULL AND expires_at > %s RETURNING sign_in_key",
+                    (now, _sha(token), now))
+        row = cur.fetchone()
+        if row is None:
+            return None
+        key = store.reviewer_by_id(row[0])
+        chosen = [r for r in address_of(store, key.sign_in).open if kind(r) == which]
+        if len(chosen) != 1:
+            return None
+        session = secrets.token_urlsafe(32)
+        _open_session(cur, store, session, chosen[0].id, now)
+    return session
 
 
 class Signed(NamedTuple):

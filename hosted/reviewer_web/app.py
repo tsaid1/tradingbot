@@ -54,7 +54,9 @@ STATIC = Path(__file__).resolve().parent.parent / "public" / "static"
 SITE_ENVS = ("production", "preview", "test")
 DEMO_ENVS = ("preview", "test")  # these show invented data only
 PUBLIC = ("healthz", "robots", "favicon", "static")  # no session, no database
-SIGN_IN = ("sign_in", "sign_in_code", "sign_in_verify")
+SIGN_IN = ("sign_in", "sign_in_code", "sign_in_verify", "choose_identity", "chosen_identity")
+CHOICE_SECONDS = int(auth.CHOICE_VALID.total_seconds())
+IDENTITY_TEXT = {auth.REAL: "Your review", auth.TEST: "Test forms (invented data)"}
 OPERATOR = ("send_queued",)  # the one route without a session: its own token, or it is a 404
 SENDER = "/internal/send-queued"
 MIN_OPERATOR_TOKEN = 32
@@ -393,14 +395,15 @@ def create_app(store, mailer, config: dict) -> Flask:
         if synthetic and not store.bundle_is_demo():
             return refuse(503)  # a code is shown on a page only beside invented data
         asked = auth.request_code(store, secret, address, network(), clock())
-        if synthetic and asked.code is not None and not reads_demo(asked.reviewer):
+        if synthetic and asked.code is not None and not all(
+                reads_demo(r) for r in asked.identities):
             auth.cancel_code(store, asked.code_id, clock())  # never for a real bundle's reader
             asked = auth.Asked(True)
         unsent = False
         if not synthetic:
             try:
                 if asked.code is not None:
-                    mailer(asked.reviewer.login_shown, auth.SUBJECT, auth.mail_text(asked.code))
+                    mailer(asked.reviewer.address, auth.SUBJECT, auth.mail_text(asked.code))
                 elif asked.allowed and hasattr(mailer, "probe"):
                     mailer.probe()
             except mail.Unreachable as exc:
@@ -421,15 +424,47 @@ def create_app(store, mailer, config: dict) -> Flask:
         """One refusal for every reason, after the same least time as a request for a code."""
         started = time.monotonic()
         address = typed_address()
-        token, exhausted = auth.verify_code(
+        token, exhausted, choice = auth.verify_code(
             store, secret, address, request.form.get("code", "")[:32], network(), clock())
-        if exhausted:  # the tenth wrong code of the day for this reviewer: the operator sees it
+        if exhausted:  # the tenth wrong code of the day for this address: the operator sees it
             app.logger.warning("SIGN_IN_TRIES_EXHAUSTED alias=%s", exhausted)
         time.sleep(max(0.0, floor - (time.monotonic() - started)))
+        if choice is not None:  # an address with two identities: which one to open
+            response = redirect("/sign-in/choose", 303)
+            response.set_cookie(auth.CHOICE_COOKIE, choice, max_age=CHOICE_SECONDS, secure=True,
+                                httponly=True, samesite="Lax", path="/")
+            return response
         if token is None:
             return render_template("sign_in_code.html", address=address, failed=True,
                                    unsent=False, shown_code=None), 401
         response = redirect("/", 303)
+        session_cookie(response, token, SESSION_SECONDS)
+        return response
+
+    def end_choice(response):
+        response.delete_cookie(auth.CHOICE_COOKIE, secure=True, httponly=True, samesite="Lax",
+                               path="/")
+        return response
+
+    @app.get("/sign-in/choose")
+    def choose_identity():
+        """After a right code for an address with two identities: which one to open. Only the
+        browser that entered the code holds the choice (its own cookie), for five minutes."""
+        found = auth.choices(store, request.cookies.get(auth.CHOICE_COOKIE, ""), clock())
+        if found is None:
+            return end_choice(redirect("/sign-in", 303))
+        return render_template("choose_identity.html", options=[
+            (auth.kind(r), IDENTITY_TEXT[auth.kind(r)]) for r in found])
+
+    @app.post("/sign-in/choose")
+    def chosen_identity():
+        """The choice is used once, whatever is chosen; the session belongs to that identity
+        alone. Switching means signing out and choosing again after a new code."""
+        token = auth.choose(store, request.cookies.get(auth.CHOICE_COOKIE, ""),
+                            request.form.get("identity", "")[:16], clock())
+        if token is None:
+            return end_choice(redirect("/sign-in", 303))
+        response = end_choice(redirect("/", 303))
         session_cookie(response, token, SESSION_SECONDS)
         return response
 

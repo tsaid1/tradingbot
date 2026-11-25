@@ -201,7 +201,8 @@ def test_reviewers_are_found_by_casefolded_login_and_a_revoked_one_says_so(store
         "id": row.id, "alias": "REMOTE-2", "login": "reviewer@example.invalid",
         "login_shown": "reviewer@example.invalid", "name": "Reviewer Example",
         "role": A.REVIEWER, "access": A.FULL, "scope_sequences": 40, "is_test": False,
-        "revoked": False, "bundle_id": bundle.bundle_id}
+        "revoked": False, "bundle_id": bundle.bundle_id,
+        "sign_in": "reviewer@example.invalid", "address": "reviewer@example.invalid"}
     assert row.session() == A.Session("reviewer@example.invalid", "Reviewer Example", A.REVIEWER,
                                       A.FULL, True, 40)
     assert store.reviewer_by_login("mallory@example.invalid") is None
@@ -211,7 +212,8 @@ def test_reviewers_are_found_by_casefolded_login_and_a_revoked_one_says_so(store
     assert store.reviewer_by_id(row.id).revoked is True
     store.set_revoked("REMOTE-2", False)
     assert store.reviewer_by_id(row.id) == row
-    assert type(row)(*dataclasses.astuple(row)[:10]) == dataclasses.replace(row, bundle_id=None)
+    assert type(row)(*dataclasses.astuple(row)[:10]) == dataclasses.replace(
+        row, bundle_id=None, sign_in=None, address=None)
     with refused("UNKNOWN_ALIAS"):
         store.set_revoked("REMOTE-9", True)
 

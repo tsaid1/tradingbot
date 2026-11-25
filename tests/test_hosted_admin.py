@@ -527,11 +527,15 @@ def test_parity_compares_records_states_and_the_site_s_next_step(run, store, bas
         (f"REMOTE-2: bundle {bundle}; records local 6, hosted 6: the same; forms 45: 45 equal, "
          "0 different; hosted lines not pulled: 0"),
         "  next step: local i08 AFTER_REVEAL_DUE, hosted i08 AFTER_REVEAL_DUE: the same",
+        "  reveal history: local 2, hosted 2 marker(s): the same",
         "  the site's state of each form: 45 equal, 0 different",
         (f"REMOTE-3: bundle {bundle}; records local 1, hosted 1: the same; forms 45: 45 equal, "
          "0 different; hosted lines not pulled: 0"),
         "  next step: local i07 AFTER_REVEAL_DUE, hosted i07 AFTER_REVEAL_DUE: the same",
+        "  reveal history: local 0, hosted 0 marker(s): the same",
         "  the site's state of each form: 45 equal, 0 different",
+        "REMOTE-2: completed 1 of 45; next i08 AFTER_REVEAL_DUE",
+        "REMOTE-3: completed 0 of 45; next i07 AFTER_REVEAL_DUE",
         "parity of the local log and the hosted store: PASS, 2 reviewer(s)"]  # no test identity
     # The next step is the web app's own function: without it there is no parity.
     with monkeypatch.context() as without:
