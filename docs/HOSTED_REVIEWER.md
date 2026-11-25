@@ -20,8 +20,9 @@ device for thirty days after your last visit; "Sign out" ends it. On another dev
 again. If your access is withdrawn, the site stops answering you at once.
 
 **The workspace.** It shows how many ideas and forms of your scope are done, and every form in
-review order with its status: open, independent reading saved, done, or "Returned to you".
-"Continue" opens the next unfinished step (the rule is below). You may open any form of the list.
+review order with its status: open, independent reading saved (another form of the same post is
+still open), reading after the reveal due, done, or "Returned to you". "Continue" opens the next
+unfinished step (the rule is below). You may open any form of the list.
 
 **A form** has three parts: 1. the source evidence (the post, its images, and the earlier posts
 shown with it, oldest first), 2. your reading, 3. the system's reading.
@@ -71,6 +72,11 @@ is:
 4. a form whose independent reading is saved and whose post is revealed opens in the state after
    the reveal, with your independent answers in it.
 
+The rule is one pure function, `forms.next_step(bundle, session, records)`, and the state a
+form's page shows is another, `forms.step_state(bundle, session, records, item_id)`
+(`INDEPENDENT_DUE`, `REVEAL_PENDING`, `AFTER_REVEAL_DUE`, `RETURNED`, `DONE`): the operator tool
+can check a reviewer's resume point with them, without signing in as that reviewer.
+
 **A returned reading.** When the approver returns your reading of a form, the workspace marks it
 "Returned to you" and the form opens again with your latest answers. The notice above the
 confidence says "RETURNED by the approver" and gives the approver's note. Correct the answers,
@@ -93,11 +99,19 @@ these tables, written to a log, or put into a URL.
 
 **Every request.** A POST must come from a page of the site (`Origin` and `Sec-Fetch-Site`; at
 least one must be sent and every one sent must agree) and, once signed in, carry the session's
-CSRF token. A route behind sign-in first establishes the reviewer, then the item: a form or an
-image is found only inside that reviewer's scope (`ordered(bundle, scope)`); every id from a URL
-is looked up, never used. Anything else is a 404 that is the same page for every reason. The
-store has no call that returns another reviewer's records, so no page can show them; beside a
-reviewer's own records it hands over only the approver's RETURN of that reviewer's readings.
+CSRF token. A route behind sign-in first establishes the reviewer, then that reviewer's own
+bundle (`Store.bundle_for`), then the item: a form or an image is found only inside that
+reviewer's scope of that bundle (`ordered(bundle, scope)`); every id from a URL is looked up,
+never used. Anything else is a 404 that is the same page for every reason. The store has no call
+that returns another reviewer's records, so no page can show them; beside a reviewer's own
+records it hands over only the approver's RETURN of that reviewer's readings.
+
+**A test identity beside the real reviewers.** A reviewer row flagged as a test identity reads a
+bundle of invented forms in the same database, while the real reviewers read the real one. Every
+route asks the store for the signed-in reviewer's bundle and never for "the" bundle, so a form,
+an image or a record of one bundle is a 404 for a session of the other. Whoever reads a bundle
+flagged as demonstration data sees the "Demonstration data" band on every page, in production
+too.
 
 **Blind-first.** Before the reveal a response holds nothing of the system: not its reading of any
 field, not its price rows or levels, not the holds, not the mapping (reference series, proposed
@@ -117,8 +131,8 @@ under the store's lock, against the reviewer's current records); the browser dec
 save carries a key made for that rendering of the form: the same key again stores nothing and
 shows the saved state.
 
-**Images** are served only for the post of a form in the reviewer's scope, of the active bundle,
-by a name that post lists, as PNG, JPEG, GIF or WEBP of at most 4 MB.
+**Images** are served only for the post of a form in the reviewer's scope, of the reviewer's
+bundle, by a name that post lists, as PNG, JPEG, GIF or WEBP of at most 4 MB.
 
 **Responses.** `Cache-Control: private, no-store` on everything but the stylesheet and the
 script; a Content-Security-Policy of `default-src 'self'` (no inline script or style, no other
@@ -130,15 +144,23 @@ holds nothing else) and nothing from anywhere else. Publisher text is always ren
 line carries a constant code, the route's name and an exception's class, never post text, a
 reading, an address or a code.
 
-**Environments** (`SITE_ENV`). `production` needs the five mail variables (`SMTP_HOST`,
-`SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `MAIL_FROM`) or does not start; port 465 is TLS from
-the first byte, any other port STARTTLS. The message holds the site's name, the code and its
-validity, and no link. `preview` and `test` serve only a bundle flagged as demonstration data
-(they do not start on any other, and stop answering if one is published) and show a
-"Demonstration data" band on every page. With none of the mail variables set they use synthetic
-mail: no message leaves, and the code-entry page shows the code in that band. Synthetic mail is
-therefore only for a preview that sits behind the platform's own login: whoever reaches it can
-sign in as a listed address, and the page shows a code only for a listed one.
+**Mail.** `production` needs the five mail variables (`SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`,
+`SMTP_PASSWORD`, `MAIL_FROM`) or does not start; port 465 is TLS from the first byte, any other
+port STARTTLS. The message holds the site's name, the code and its validity, and no link. A
+production page never carries a code, whatever the bundle and whoever signs in. When the mail
+server cannot be reached, or does not let the site in, the page says "The code could not be
+sent. Try again in a minute." for every address alike: an address that gets no code makes the
+same connection and sends nothing. When the server refuses or loses the one message (which no
+unlisted address could meet), the page stays the neutral one and `MAIL_FAILED` is logged:
+saying so would tell that the address is listed. In both cases the undelivered code is ended.
+
+**Environments** (`SITE_ENV`). `preview` and `test` serve only bundles flagged as demonstration
+data: they do not start on any other, stop answering if one is published, and refuse a reviewer
+whose bundle is not flagged. With none of the mail variables set they use synthetic mail: no
+message leaves, and the code-entry page shows the code in the demonstration band. Synthetic mail
+is therefore only for a preview that sits behind the platform's own login: whoever reaches it
+can sign in as a listed address, and the page shows a code only for a listed one. Production
+never uses it.
 
 **Known limits.** The time a code request takes is padded to a floor, and an address that gets no
 code makes the same connection to the mail server as one that does (so a mail failure reads the

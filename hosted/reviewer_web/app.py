@@ -7,7 +7,9 @@ stored records, and every rule is the rubric's (``forms``).
 
 Enforced on every route, before anything is read: a session (sign-in by an emailed one-time
 code), a reviewer who is not revoked, role REVIEWER, access FULL, and an item inside that
-reviewer's scope. Anything else gets the sign-in page or a 404 without detail. The system's
+reviewer's scope of that reviewer's OWN bundle (``store.bundle_for``: a test identity reads
+invented forms beside the real reviewers, and neither ever gets a form, an image or a record of
+the other's bundle). Anything else gets the sign-in page or a 404 without detail. The system's
 reading, its mapping proposals, holds and price rows are put into a response only after the
 SYSTEM_SHOWN markers are stored and read back. Logs carry constant codes and exception class
 names: never post text, a reading, an address or a code.
@@ -84,6 +86,7 @@ class Who:
     reviewer: object  # the store's ReviewerRow
     session: A.Session
     token: str
+    demo: bool  # this reviewer's bundle is demonstration data: every page says so
 
 
 def _code(exc: Exception) -> str:
@@ -103,13 +106,13 @@ def create_app(store, mailer, config: dict) -> Flask:
         raise RuntimeError("SESSION_SECRET_TOO_SHORT")
     if site_env not in SITE_ENVS:
         raise RuntimeError("UNKNOWN_SITE_ENV")
-    demo = site_env in DEMO_ENVS
-    if demo and not store.bundle_is_demo():
+    demo_env = site_env in DEMO_ENVS  # preview and test serve invented data only
+    if demo_env and not store.bundle_is_demo():
         raise RuntimeError("NOT_A_DEMO_BUNDLE")  # a preview never shows anything but invented data
     # No mailer: "synthetic mail". Nothing is sent and the code-entry page shows the code in the
-    # demonstration band. Only where nothing but invented data is served; never in production.
+    # demonstration band. Only in preview and test; production never uses it, whoever signs in.
     synthetic = mailer is None
-    if synthetic and not demo:
+    if synthetic and not demo_env:
         raise RuntimeError("MAIL_NOT_CONFIGURED")
     clock = config.get("CLOCK") or (lambda: datetime.now(UTC))
     floor = float(config.get("SIGN_IN_FLOOR_SECONDS", 2.0))
@@ -126,7 +129,7 @@ def create_app(store, mailer, config: dict) -> Flask:
     def refuse(status: int):
         """The one page of a refusal: the same for everybody, whoever asks and whatever for."""
         return render_template("message.html", message=MESSAGES[status], status=status,
-                               who=None, csrf=""), status
+                               who=None, csrf="", demo=demo_env), status
 
     def same_origin() -> bool:
         """A POST must come from a page of this site: ``Sec-Fetch-Site`` and ``Origin`` (one of
@@ -172,9 +175,10 @@ def create_app(store, mailer, config: dict) -> Flask:
                 request.form.get("_csrf", "").encode("utf-8"),
                 auth.csrf_token(secret, token).encode("utf-8")):
             return refuse(403)
-        if demo and not store.bundle_is_demo():
-            return refuse(503)
-        g.who = Who(reviewer, reviewer.session(), token)
+        demo = store.is_demo(reviewer)
+        if demo_env and not (demo and store.bundle_is_demo()):
+            return refuse(503)  # a preview serves nobody whose bundle is not invented
+        g.who = Who(reviewer, reviewer.session(), token, demo)
         return None
 
     def reviewer_route(view):
@@ -204,7 +208,8 @@ def create_app(store, mailer, config: dict) -> Flask:
     @app.context_processor
     def common():
         who = g.get("who")
-        return {"demo": demo, "who": who, "site_name": mail.SITE_NAME, "synthetic": synthetic,
+        return {"demo": who.demo if who else demo_env, "who": who,
+                "site_name": mail.SITE_NAME, "synthetic": synthetic,
                 "csrf": auth.csrf_token(secret, who.token) if who else ""}
 
     for status in (400, 403, 404, 405, 413):
@@ -252,6 +257,9 @@ def create_app(store, mailer, config: dict) -> Flask:
         if synthetic and not store.bundle_is_demo():
             return refuse(503)  # a code is shown on a page only beside invented data
         asked = auth.request_code(store, secret, address, network(), clock())
+        if synthetic and asked.code is not None and not store.is_demo(asked.reviewer):
+            auth.cancel_codes(store, asked.reviewer, clock())  # never for a real bundle's reader
+            asked = auth.Asked(True)
         unsent = False
         if not synthetic:
             try:
@@ -298,7 +306,7 @@ def create_app(store, mailer, config: dict) -> Flask:
     @app.get("/")
     @reviewer_route
     def workspace():
-        bundle = store.active_bundle()
+        bundle = store.bundle_for(g.who.reviewer)
         records = store.records_of(g.who.reviewer)
         return lambda: render_template("workspace.html",
                                        **F.workspace(bundle, g.who.session, records))
@@ -306,7 +314,7 @@ def create_app(store, mailer, config: dict) -> Flask:
     @app.get("/continue")
     @reviewer_route
     def resume():
-        bundle = store.active_bundle()
+        bundle = store.bundle_for(g.who.reviewer)
         step = F.next_step(bundle, g.who.session, store.records_of(g.who.reviewer))
         return redirect(f"/form/{step}" if step else "/", 303)
 
@@ -324,8 +332,8 @@ def create_app(store, mailer, config: dict) -> Flask:
     # ------------------------------------------------------------- one form
 
     def item_of(item_id: str):
-        """The bundle and the item, only when the item is in this reviewer's scope."""
-        bundle = store.active_bundle()
+        """This reviewer's bundle and the item, only when the item is in their scope of it."""
+        bundle = store.bundle_for(g.who.reviewer)
         item = F.scoped(bundle, g.who.session).get(item_id)
         if item is None:
             abort(404)
@@ -486,16 +494,16 @@ def create_app(store, mailer, config: dict) -> Flask:
     @app.get("/media/<bundle_id>/<post_ref>/<name>")
     @reviewer_route
     def media(bundle_id, post_ref, name):
-        """An image of the active bundle, only for a post one of this reviewer's forms shows and
-        only by a name that post lists. Anything else: 404, no detail."""
+        """An image of this reviewer's bundle, only for a post one of their forms shows and only
+        by a name that post lists. Anything else (another bundle's image too): 404, no detail."""
         if not _BUNDLE.fullmatch(bundle_id):
             abort(404)
-        bundle = store.active_bundle()
+        bundle = store.bundle_for(g.who.reviewer)
         post = bundle.posts.get(post_ref) if bundle_id == bundle.bundle_id else None
         if post is None or post_ref not in F.media_posts(bundle, g.who.session) \
                 or name not in post["media"]:
             abort(404)
-        found = store.media(post_ref, name)
+        found = store.media(g.who.reviewer, post_ref, name)
         if found is None or found[1] not in IMAGE_TYPES or len(found[0]) > MAX_IMAGE_BYTES:
             abort(404)
         response = Response(found[0], mimetype=found[1])

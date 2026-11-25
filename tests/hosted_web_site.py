@@ -33,6 +33,17 @@ from tradingbot.runtime.vocab_recommend import encode_line
 
 REPO = Path(__file__).resolve().parents[1]
 
+# INTERIM, to be deleted when the foundation branch has the per-reviewer bundle
+# (Store.bundle_for, Store.is_demo, Store.media(reviewer, post_ref, name)): the same three calls
+# over the one active bundle, so that the web app's tests run meanwhile.
+from reviewer_web import store as _store  # noqa: E402
+
+if not hasattr(_store.Store, "bundle_for"):
+    _media = _store.Store.media
+    _store.Store.bundle_for = lambda self, _reviewer: self.active_bundle()
+    _store.Store.is_demo = lambda self, _reviewer: self.bundle_is_demo()
+    _store.Store.media = lambda self, *args: _media(self, *args[-2:])
+
 ORIGIN = "https://reviewer.example.invalid"
 SECRET = "an-invented-secret-for-tests-only-0123456789"
 FIRST, SECOND = "REMOTE-2", "REMOTE-3"  # the demo file's two remote reviewers, by alias
