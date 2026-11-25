@@ -175,6 +175,7 @@ def seed(admin, base: Path, alias: str, login: str = LOGIN) -> dict:
             raise A.AdjudicationError("ALREADY_SEEDED")
         if admin.anchor() is None:  # an empty local log, imported: reviewers may save
             admin.set_anchor(0, GENESIS, sha256(b""))
+        admin.stamp_imported([row.id])
     _save(admin, row, RETURNED, after=False)
     admin.append(row, lambda records: A.build_system_shown(records, bundle, row.session(),
                                                            RETURNED))

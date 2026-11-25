@@ -116,7 +116,9 @@ def demo_reviewers(store, base: Path) -> dict[str, object]:
     approver has an ``@`` login too and takes REMOTE-1 by the alias rule, without a row). They
     work on the real active bundle when there is one, else on the demonstration bundle; publish
     first."""
-    return {r.alias: r for r in store.sync_reviewers(A.load_reviewers(base / "reviewers.toml"))}
+    rows = store.sync_reviewers(A.load_reviewers(base / "reviewers.toml"))
+    store.stamp_imported(r.id for r in rows)  # as an import-log of an empty log would
+    return {r.alias: r for r in store.reviewers() if r.alias in {x.alias for x in rows}}
 
 
 def reading_kw(bundle: A.Bundle, item_id: str, records: list[dict], session: A.Session, *,

@@ -74,6 +74,10 @@ END
 $$;
 CREATE OR REPLACE TRIGGER reviewer_address_by_default BEFORE INSERT ON reviewer
     FOR EACH ROW EXECUTE FUNCTION reviewer_address_defaults();
+-- When an import-log of the local log last considered this row: until then a reviewer row (not
+-- a test identity) is closed for saving, whenever it was written, so that its local history is
+-- on the site before anything continues it.
+ALTER TABLE reviewer ADD COLUMN IF NOT EXISTS imported_at TIMESTAMPTZ;
 CREATE UNIQUE INDEX IF NOT EXISTS reviewer_one_of_each_kind_per_sign_in
     ON reviewer (sign_in, is_test);
 

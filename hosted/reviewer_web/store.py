@@ -225,13 +225,17 @@ class Store:
         return bool(row and row[0])
 
     def is_open(self, reviewer: ReviewerRow) -> bool:
-        """Whether this identity may work here: a test identity always; a reviewer once the
-        local log is imported (the anchor exists), so that every hosted line continues it."""
+        """Whether this identity may work here: a test identity always; a reviewer once an
+        ``import-log`` has considered THAT row (``imported_at``) and the anchor exists, so that
+        its local history is on the site before any hosted line continues it. A row written
+        after an import is closed until the next one."""
         if reviewer.is_test:
             return True
         with self.connection() as conn:
-            return conn.execute("SELECT EXISTS (SELECT 1 FROM chain_anchor WHERE id = 1)"
-                                ).fetchone()[0]
+            return conn.execute(
+                "SELECT EXISTS (SELECT 1 FROM chain_anchor WHERE id = 1) AND EXISTS (SELECT 1"
+                " FROM reviewer WHERE id = %s AND imported_at IS NOT NULL)",
+                (reviewer.id,)).fetchone()[0]
 
     def reviewer_by_id(self, reviewer_id: int) -> ReviewerRow | None:
         with self.connection() as conn:
@@ -400,13 +404,14 @@ class Store:
         (READ COMMITTED: each statement sees what earlier writers committed)."""
         with self.connection() as conn:
             conn.execute("SELECT pg_advisory_xact_lock(%s)", (LOCK_KEY,))
-            allowed, test, bundle_id, anchor, last_seq, last_sha = conn.execute(
+            allowed, test, bundle_id, anchor, last_seq, last_sha, imported = conn.execute(
                 "SELECT r.revoked_at IS NULL, r.is_test, " + _THEIRS + ","
-                " (SELECT snapshot_head_sha256 FROM chain_anchor WHERE id = 1), t.seq, t.sha256"
+                " (SELECT snapshot_head_sha256 FROM chain_anchor WHERE id = 1), t.seq, t.sha256,"
+                " r.imported_at IS NOT NULL"
                 " FROM reviewer r LEFT JOIN LATERAL (SELECT e.seq, e.sha256 FROM event e"
                 " WHERE e.origin = CASE WHEN r.is_test THEN 'TEST' ELSE 'HOSTED' END"
                 " ORDER BY e.seq DESC LIMIT 1) t ON TRUE WHERE r.id = %s",
-                (reviewer.id, reviewer.id)).fetchone() or (None,) * 6
+                (reviewer.id, reviewer.id)).fetchone() or (None,) * 7
             if not allowed:
                 raise A.AdjudicationError("REVOKED")
             if bundle_id is None:
@@ -415,6 +420,9 @@ class Store:
                 # Nothing is imported yet: a reviewer's line now would continue no local log, and
                 # no command could bring it home. A test identity's stream needs no anchor.
                 raise A.AdjudicationError("NO_ANCHOR")
+            if not test and not imported:
+                # Written after the last import: its local lines may not be on the site yet.
+                raise A.AdjudicationError("NOT_IMPORTED")
             mine = conn.execute(
                 "SELECT line, bundle_id, idempotency_key, batch, seq FROM event"
                 " WHERE reviewer_id = %s ORDER BY seq", (reviewer.id,)).fetchall()
@@ -561,6 +569,20 @@ class AdminStore(Store):
                         else A.RESTRICTED, scope_sequences=reviewers.scope_sequences,
                         bundle_id=bundle_id))
         return out
+
+    def stamp_imported(self, ids) -> None:
+        """``import-log`` considered these rows: from now on they are open for saving."""
+        with self.connection() as conn:
+            conn.execute("UPDATE reviewer SET imported_at = COALESCE(imported_at, now())"
+                         " WHERE id = ANY(%s) AND NOT is_test", (list(ids),))
+
+    def closed_rows(self) -> list[str]:
+        """The aliases of the reviewer rows (not test identities) that no import has
+        considered: closed for saving until ``import-log`` runs."""
+        with self.connection() as conn:
+            return [a for (a,) in conn.execute(
+                "SELECT alias FROM reviewer WHERE NOT is_test AND imported_at IS NULL"
+                " ORDER BY id").fetchall()]
 
     def reviewers(self) -> list[ReviewerRow]:
         with self.connection() as conn:

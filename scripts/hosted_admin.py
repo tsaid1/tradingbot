@@ -457,9 +457,14 @@ def cmd_sync_reviewers(args) -> int:
                     access=owner.access if reviewers.remote_full_context_authorized
                     else A.RESTRICTED, scope_sequences=reviewers.scope_sequences,
                     bundle_id=bundle["bundle_id"], address=address or held.address))
-            elif owner is not None:
+            elif owner is not None and not args.without_owner:
                 print(f"{OWNER_REVIEWER}: not written: no sign-in address file (--owner-address-"
-                      f"file FILE or {OWNER_ADDRESS_ENV})")
+                      f"file FILE or {OWNER_ADDRESS_ENV}); --without-owner leaves it out on "
+                      "purpose")
+                raise refused("NO_OWNER_ADDRESS_FILE")
+            elif owner is not None:
+                print(f"{OWNER_REVIEWER}: left out on purpose (--without-owner): its local lines "
+                      "stay unlisted until it is written and import-log runs")
     shared = {}
     for r in store.reviewers():
         shared[r.sign_in] = shared.get(r.sign_in, 0) + 1
@@ -470,6 +475,8 @@ def cmd_sync_reviewers(args) -> int:
               + (f"; its sign-in address opens {shared[r.sign_in]} identities"
                  if shared.get(r.sign_in, 0) > 1 else ""))
     print(f"{len(rows)} reviewer row(s) written; none deleted")
+    for alias in store.closed_rows():
+        print(f"{alias}: closed until import-log runs (no save is accepted before)")
     return 0
 
 
@@ -633,8 +640,9 @@ def cmd_import_log(args) -> int:
             row = rows.get(_login(rec))
             if row is None or n in legacy or _pulled(rec) in hosted:
                 continue  # not a remote reviewer's, already imported, or a hosted save pulled back
-            if n > (anchor["count"] if anchor else 0) and row.alias in writers:
-                raise refused("LOCAL_SAVE_AFTER_HOSTED_SAVES")  # two histories of one reviewer
+            if row.alias in writers:  # a row that saved on the site: nothing goes behind it
+                raise refused("LOCAL_SAVE_AFTER_HOSTED_SAVES" if n > (
+                    anchor["count"] if anchor else 0) else "LEGACY_AFTER_HOSTED_LINES")
             try:
                 line.decode("utf-8")
             except UnicodeDecodeError:
@@ -643,6 +651,7 @@ def cmd_import_log(args) -> int:
         folder = snapshot(Path(args.snapshots).expanduser() if args.snapshots
                           else base / SNAPSHOTS, data, head, log.count)
         store.insert_events(new)
+        store.stamp_imported(row.id for row in rows.values())  # open from now on
         if not hosted:  # until a reviewer has saved on the site, the anchor follows the log
             store.set_anchor(log.count, log.head, sha256(data))
         anchor, events = store.anchor(), store.events()
@@ -981,8 +990,13 @@ def cmd_export(args) -> int:
     store = _store()
     with store.connection():
         events, anchor = store.events(), store.anchor()
+        closed = set(store.closed_rows())
+        # Which rows an import has considered (open for saving), by a hash of their spelling:
+        # a restore opens the same rows, and no address is written into the header.
+        imported = sorted(sha256(r.login_shown.encode("utf-8")) for r in store.reviewers()
+                          if not r.is_test and r.alias not in closed)
     header = {"schema": EXPORT_SCHEMA, "exported_at": _time(datetime.now(UTC)),
-              "events": len(events),
+              "events": len(events), "imported": imported,
               "anchor": anchor and {**anchor, "imported_at": anchor["imported_at"].isoformat()}}
     rows = [{**{k: e[k] for k in EVENT_KEYS}, "line": e["line"].decode("utf-8"),
              "created_at": e["created_at"].isoformat()} for e in events]
@@ -1032,6 +1046,9 @@ def cmd_restore(args) -> int:
         store.insert_events([S.EventLine(owner[e["seq"]].id, e["origin"], e["line"],
                                          e["idempotency_key"], e["batch"], e["created_at"])
                              for e in events])
+        opened = set(header.get("imported") or ())
+        store.stamp_imported(r.id for r in store.reviewers()
+                             if sha256(r.login_shown.encode("utf-8")) in opened)
         keys = [k for k in EVENT_KEYS if k != "alias"]
         if [{k: e[k] for k in keys} for e in store.events()] != [
                 {k: e[k] for k in keys} for e in events] or store.anchor() != anchor:
@@ -1376,6 +1393,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--owner-address-file", metavar="FILE",
                    help=f"the private file (0600) holding the owner's sign-in address (default: "
                         f"{OWNER_ADDRESS_ENV})")
+    p.add_argument("--without-owner", action="store_true",
+                   help="leave the owner's reviewer identity out on purpose (no address file)")
     p.add_argument("--owner-entry", type=int, metavar="N",
                    help="the owner's reviewer entry is the N-th REVIEWER entry of the file "
                         "(default: the one REVIEWER entry without '@')")

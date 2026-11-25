@@ -388,19 +388,24 @@ def test_sync_reviewers_reads_the_owner_s_file_and_never_deletes(run, store, bas
     out = run("sync-reviewers", "--demo")
     assert out.splitlines() == [f"REMOTE-2: id 1, REVIEWER, FULL, scope 40, {bundle}",
                                 f"REMOTE-3: id 2, REVIEWER, FULL, scope 40, {bundle}",
-                                "2 reviewer row(s) written; none deleted"]
+                                "2 reviewer row(s) written; none deleted",
+                                "REMOTE-2: closed until import-log runs (no save is accepted "
+                                "before)",
+                                "REMOTE-3: closed until import-log runs (no save is accepted "
+                                "before)"]
     assert store.reviewer_by_login(ONE.login).session() == ONE
     assert "TEST_ALIAS_IS_TEST_N" in run("sync-reviewers", "--test-identity", "REMOTE-9", TESTER,
                                          code=2)
     out = run("sync-reviewers", "--test-identity", "TEST-1", TESTER)
     assert out.splitlines() == [
         f"TEST-1: id 3, REVIEWER, FULL, scope 40, {bundle}, test identity",
-        "1 reviewer row(s) written; none deleted"]
+        "1 reviewer row(s) written; none deleted",
+        "REMOTE-2: closed until import-log runs (no save is accepted before)",
+        "REMOTE-3: closed until import-log runs (no save is accepted before)"]
     assert store.reviewer_by_login(TESTER).is_test is True
     # An entry that left the file keeps its row (revoke it); the file itself is only read.
     file.write_text(file.read_text().split("[[reviewer]]\nlogin = \"remote@")[0])
-    assert run("sync-reviewers", "--demo").splitlines()[-1] == \
-        "1 reviewer row(s) written; none deleted"
+    assert "1 reviewer row(s) written; none deleted" in run("sync-reviewers", "--demo")
     assert [r.alias for r in store.reviewers()] == ["REMOTE-2", "REMOTE-3", "TEST-1"]
     file.write_bytes(before[0])
     os.utime(file, ns=(before[1], before[1]))
