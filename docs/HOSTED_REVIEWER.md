@@ -120,6 +120,19 @@ asks. A session is a
 valid thirty days after the last use (the cookie is sent again whenever the stored expiry
 moves, so the browser's copy slides with it) and at most ninety days after the sign-in.
 
+**Pressing "Sign in" twice.** A browser drops the answer to a request when it sends the next
+one, and the first answer carried the session. So the answer to a code request sets a cookie
+`__Host-signin` (a random value, Secure, HttpOnly, SameSite=Lax, Path=/, eleven minutes; only
+its SHA-256 is stored, beside the code it was answered with). A verify with the RIGHT code that
+signed in at most 60 seconds ago, carrying the cookie of THAT code request, is answered like the
+first: signed in again (for an address with two identities, the choice is offered again), and
+the session or choice the first answer made, which never arrived, is ended, so one live session
+results; the first sign-in's time stays and nothing is counted. The code stays single-use for
+everyone else: without that cookie, with another request's, after 60 seconds, after a newer code
+was asked for, or for a revoked, locked or not yet opened row, the answer is the same refusal as
+before. A browser that already holds a session, or the choice of its identity, is sent on by a
+verify (nothing counted). The cookie ends at sign-in and on "Use another address".
+
 **What is stored for sign-in** (`login_code`, `web_session`, `rate_limit` in `schema.sql`): a
 code only as HMAC-SHA256 under `SESSION_SECRET`, a session token only as SHA-256, a limit counter
 under a keyed hash of the address or the network address. No address, code or token is stored in

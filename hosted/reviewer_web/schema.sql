@@ -200,6 +200,13 @@ CREATE TABLE IF NOT EXISTS login_code (
     used_at     TIMESTAMPTZ                    -- set by the sign-in, or by a newer code
 );
 CREATE INDEX IF NOT EXISTS login_code_by_reviewer ON login_code (reviewer_id, id);
+-- The same browser may repeat its own successful sign-in for a minute (a second press of "Sign in"
+-- whose first answer the browser dropped): the SHA-256 of the cookie its code request was
+-- answered with, when this code signed in, and the SHA-256 of the session (or choice) token that
+-- sign-in created, which a repeat replaces so that one live session results.
+ALTER TABLE login_code ADD COLUMN IF NOT EXISTS browser_sha256 TEXT;
+ALTER TABLE login_code ADD COLUMN IF NOT EXISTS signed_in_at TIMESTAMPTZ;
+ALTER TABLE login_code ADD COLUMN IF NOT EXISTS delivered_sha256 TEXT;
 
 CREATE TABLE IF NOT EXISTS web_session (
     token_sha256 TEXT PRIMARY KEY CHECK (token_sha256 ~ '^[0-9a-f]{64}$'),
