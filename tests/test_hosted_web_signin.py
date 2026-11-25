@@ -410,6 +410,67 @@ def test_a_session_slides_for_thirty_days_and_sign_out_ends_it(site):  # noqa: F
     assert not signed_in(thief)
 
 
+def test_the_cookie_slides_with_the_session_and_ninety_days_end_it(site):  # noqa: F811
+    """The review's finding 10: the cookie was set once, so the browser signed the reviewer out
+    thirty days after the sign-in whatever they did; and a session used monthly never ended."""
+    b = site.browser().sign_in(FIRST)
+    token = b.client.get_cookie(COOKIE, domain="reviewer.example.invalid").value
+
+    def cookie(response):
+        sent = response.headers.get("Set-Cookie")
+        if sent is None:
+            return None
+        assert sent.startswith(f"{COOKIE}={token};")  # the same session, never a new token
+        for part in ("Secure", "HttpOnly", "Path=/", "SameSite=Lax"):
+            assert part in sent
+        return int(re.search(r"Max-Age=(\d+)", sent).group(1))
+
+    day = 24 * 3600
+    assert cookie(b.get("/")) is None  # just signed in: nothing has moved
+    site.clock.forward(minutes=59)
+    assert cookie(b.get("/")) is None
+    site.clock.forward(minutes=2)  # the stored expiry is moved once an hour at most,
+    assert cookie(b.get("/")) == 30 * day  # and the browser's copy with it
+    assert cookie(b.get("/guide")) is None
+    # Any page behind sign-in carries it, a refusal and a form's round trip too.
+    csrf = b.csrf()
+    for send in (lambda: b.get("/form/i07"), lambda: b.get("/form/nothing"),
+                 lambda: b.post("/form/i07/state", {"_csrf": csrf}),
+                 lambda: b.get("/sign-in")):
+        site.clock.forward(hours=2)
+        assert cookie(send()) == 30 * day
+    # Used every 29 days it lasts, but only ninety days from the sign-in.
+    start = site.sql("SELECT created_at FROM web_session")[0][0]
+    site.clock.now = start + auth_days(29)
+    assert cookie(b.get("/")) == 30 * day
+    site.clock.now = start + auth_days(58)
+    assert cookie(b.get("/")) == 30 * day
+    site.clock.now = start + auth_days(87)
+    assert cookie(b.get("/")) == 3 * day  # no longer than the session itself
+    assert site.sql("SELECT expires_at - created_at FROM web_session") == [(auth_days(90),)]
+    site.clock.now = start + auth_days(89, hours=23)
+    assert signed_in(b)
+    site.clock.now = start + auth_days(90, seconds=1)
+    answer = b.get("/")
+    assert answer.status_code == 303 and answer.headers["Location"] == "/sign-in"
+    assert "Set-Cookie" not in answer.headers
+    # A new code starts a new session with a new token.
+    b.sign_in(FIRST)
+    assert b.client.get_cookie(COOKIE, domain="reviewer.example.invalid").value != token
+    # Signing out takes the cookie away and does not send it again.
+    site.clock.forward(hours=2)
+    out = b.post("/sign-out", {"_csrf": b.csrf()})
+    assert out.headers.getlist("Set-Cookie") == [h for h in out.headers.getlist("Set-Cookie")
+                                                 if h.startswith(f"{COOKIE}=;")]
+    assert len(out.headers.getlist("Set-Cookie")) == 1 and not signed_in(b)
+
+
+def auth_days(days, **more):
+    from datetime import timedelta
+
+    return timedelta(days=days, **more)
+
+
 def test_a_post_needs_the_sessions_csrf_token_and_the_sites_own_origin(site):  # noqa: F811
     b = site.browser().sign_in(FIRST)
     csrf = b.csrf()

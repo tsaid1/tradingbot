@@ -135,7 +135,8 @@ CREATE TABLE IF NOT EXISTS web_session (
     reviewer_id  BIGINT NOT NULL REFERENCES reviewer (id) ON DELETE CASCADE,
     created_at   TIMESTAMPTZ NOT NULL,
     last_seen_at TIMESTAMPTZ NOT NULL,
-    expires_at   TIMESTAMPTZ NOT NULL          -- thirty days after last_seen_at (sliding)
+    expires_at   TIMESTAMPTZ NOT NULL          -- thirty days after last_seen_at (sliding),
+                                               -- never later than ninety days after created_at
 );
 CREATE INDEX IF NOT EXISTS web_session_by_reviewer ON web_session (reviewer_id);
 

@@ -7,9 +7,10 @@
   by somebody else does not end the code just delivered); using one ends both.
 * Ten wrong codes for an address within 24 hours lock its sign-in: no code is accepted or sent
   until the window has passed or the operator unlocks it (``hosted_admin.py unlock``).
-* A session is a 256-bit random token in a cookie; only its SHA-256 is stored. Thirty days,
-  sliding. It is checked against the reviewer row on every request: a revoked reviewer's sessions
-  stop working at once.
+* A session is a 256-bit random token in a cookie; only its SHA-256 is stored. Thirty days
+  after its last use (the cookie is sent again whenever the stored expiry moves), and at most
+  ninety days after the sign-in: then a new code is needed. It is checked against the reviewer
+  row on every request: a revoked reviewer's sessions stop working at once.
 * Limits per hour: codes per address, codes per network address, tries per network address.
   Every request counts against its network address before anything else is looked at, and an
   address that is not shaped like one is never looked up and never reaches the mail server.
@@ -45,7 +46,8 @@ DAY = timedelta(hours=24)
 CODES_PER_ADDRESS = 5  # per hour
 CODES_PER_NETWORK = 20  # per hour, per network address
 TRIES_PER_NETWORK = 30  # per hour, per network address
-SESSION_VALID = timedelta(days=30)
+SESSION_VALID = timedelta(days=30)  # after the last use
+SESSION_LIMIT = timedelta(days=90)  # after the sign-in, however it is used
 SESSION_REFRESH = timedelta(hours=1)  # the sliding expiry is written at most this often
 HOUR = timedelta(hours=1)
 LIMIT_LOCK = 7203  # pg_advisory_xact_lock(LIMIT_LOCK, <bucket>): one counter at a time
@@ -231,26 +233,38 @@ def verify_code(store, secret: bytes, address: str, code: str, network: str,
     return Verified(token)
 
 
-def session_reviewer(store, token: str, now: datetime):
-    """The reviewer of a session cookie, or None: no such session, expired, or a reviewer who may
-    no longer use the site (their session is deleted)."""
+class Signed(NamedTuple):
+    """A session that stands: its reviewer, and, when its stored expiry was just moved, the
+    seconds its cookie should now live (the browser's copy slides with the stored one)."""
+
+    reviewer: object
+    cookie_seconds: int | None = None
+
+
+def session_reviewer(store, token: str, now: datetime) -> Signed | None:
+    """The reviewer of a session cookie, or None: no such session, not used for thirty days,
+    older than ninety days, or a reviewer who may no longer use the site (their session is
+    deleted)."""
     if not token or len(token) > 128:
         return None
+    seconds = None
     with store.connection() as conn:
         cur = conn.cursor(row_factory=tuple_row)
-        cur.execute("SELECT reviewer_id, last_seen_at, expires_at FROM web_session "
+        cur.execute("SELECT reviewer_id, last_seen_at, expires_at, created_at FROM web_session "
                     "WHERE token_sha256 = %s", (_sha(token),))
         row = cur.fetchone()
-        if row is None or row[2] <= now:
+        if row is None or row[2] <= now or row[3] + SESSION_LIMIT <= now:
             return None
         if now - row[1] >= SESSION_REFRESH:
+            expires = min(now + SESSION_VALID, row[3] + SESSION_LIMIT)
             cur.execute("UPDATE web_session SET last_seen_at = %s, expires_at = %s "
-                        "WHERE token_sha256 = %s", (now, now + SESSION_VALID, _sha(token)))
+                        "WHERE token_sha256 = %s", (now, expires, _sha(token)))
+            seconds = int((expires - now).total_seconds())
     reviewer = store.reviewer_by_id(row[0])
     if not eligible(reviewer):
         end_session(store, token)
         return None
-    return reviewer
+    return Signed(reviewer, seconds)
 
 
 def end_session(store, token: str) -> None:

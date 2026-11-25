@@ -214,9 +214,13 @@ def create_app(store, mailer, config: dict) -> Flask:
             return None
         if request.method == "POST" and not same_origin():
             return refuse(403)
-        if request.endpoint in SIGN_IN and auth.session_reviewer(
-                store, request.cookies.get(auth.COOKIE, ""), clock()) is not None:
-            return redirect("/", 303)
+        if request.endpoint in SIGN_IN:
+            token = request.cookies.get(auth.COOKIE, "")
+            signed = auth.session_reviewer(store, token, clock())
+            if signed is not None:
+                if signed.cookie_seconds:
+                    g.cookie = (token, signed.cookie_seconds)
+                return redirect("/", 303)
         return None
 
     def reads_demo(reviewer) -> bool | None:
@@ -229,11 +233,14 @@ def create_app(store, mailer, config: dict) -> Flask:
     def admit():
         """Who is asking, or the refusal. Runs first in every reviewer route."""
         token = request.cookies.get(auth.COOKIE, "")
-        reviewer = auth.session_reviewer(store, token, clock())
-        if reviewer is None:
+        signed = auth.session_reviewer(store, token, clock())
+        if signed is None:
             if request.endpoint == "media":
                 abort(404)
             return redirect("/sign-in", 303)
+        reviewer = signed.reviewer
+        if signed.cookie_seconds:  # the stored expiry moved: the browser's copy moves with it
+            g.cookie = (token, signed.cookie_seconds)
         if request.method == "POST" and not hmac.compare_digest(
                 request.form.get("_csrf", "").encode("utf-8"),
                 auth.csrf_token(secret, token).encode("utf-8")):
@@ -268,7 +275,13 @@ def create_app(store, mailer, config: dict) -> Flask:
         response.headers["Cache-Control"] = "no-cache" if served else "private, no-store"
         if scheme() == "https":
             response.headers["Strict-Transport-Security"] = "max-age=63072000"
+        if g.get("cookie"):
+            session_cookie(response, *g.cookie)
         return response
+
+    def session_cookie(response, token: str, seconds: int) -> None:
+        response.set_cookie(auth.COOKIE, token, max_age=seconds, secure=True, httponly=True,
+                            samesite="Lax", path="/")
 
     @app.context_processor
     def common():
@@ -412,14 +425,14 @@ def create_app(store, mailer, config: dict) -> Flask:
             return render_template("sign_in_code.html", address=address, failed=True,
                                    unsent=False, shown_code=None), 401
         response = redirect("/", 303)
-        response.set_cookie(auth.COOKIE, token, max_age=SESSION_SECONDS, secure=True,
-                            httponly=True, samesite="Lax", path="/")
+        session_cookie(response, token, SESSION_SECONDS)
         return response
 
     @app.post("/sign-out")
     @reviewer_route
     def sign_out():
         auth.end_session(store, g.who.token)
+        g.cookie = None  # the cookie is taken away, not sent again
         response = redirect("/sign-in", 303)
         response.delete_cookie(auth.COOKIE, secure=True, httponly=True, samesite="Lax", path="/")
         return response

@@ -16,9 +16,10 @@ the field reference are pages of the site ("Reviewer guide", "Field reference").
 six-digit code: it is valid for 10 minutes, works once and allows five tries; at most five codes
 are sent to an address in an hour. If you ask twice, the two newest codes both work. After ten
 wrong codes within 24 hours the sign-in of that address is locked for the rest of those 24
-hours: tell the person who invited you, who can unlock it. The page answers the same for every address, so it never says
-whether an address is invited. Signing in sets one cookie, which keeps you signed in on that
-device for thirty days after your last visit; "Sign out" ends it. On another device you sign in
+hours: tell the person who invited you, who can unlock it. The page answers the same for every
+address, so it never says whether an address is invited. Signing in sets one cookie, which keeps
+you signed in on that device for thirty days after your last visit, and for at most ninety days
+after signing in (then a new code is needed); "Sign out" ends it. On another device you sign in
 again. If your access is withdrawn, the site stops answering you at once.
 
 **The workspace.** It shows how many ideas and forms of your scope are done, and every form in
@@ -101,7 +102,8 @@ one (empty, too long, a control character) is never looked up and never makes th
 the mail server; entering a code takes the same least time and one database connection, whoever
 asks. A session is a
 256-bit random token in the cookie `__Host-session` (Secure, HttpOnly, SameSite=Lax, Path=/),
-valid thirty days after the last use.
+valid thirty days after the last use (the cookie is sent again whenever the stored expiry
+moves, so the browser's copy slides with it) and at most ninety days after the sign-in.
 
 **What is stored for sign-in** (`login_code`, `web_session`, `rate_limit` in `schema.sql`): a
 code only as HMAC-SHA256 under `SESSION_SECRET`, a session token only as SHA-256, a limit counter
