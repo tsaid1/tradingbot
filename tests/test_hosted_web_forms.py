@@ -590,22 +590,41 @@ def test_two_reviewers_saving_at_the_same_moment_both_succeed_as_themselves(site
 
 
 def test_resuming_in_a_new_session_lands_on_the_next_unfinished_step(site14):
+    from reviewer_web import forms as F
+
     site = site14  # noqa: F811
+    session = site.reviewers[FIRST].session()
 
     def resume() -> str:
+        """Where "Continue" leads in a new session: exactly what the pure function says."""
         answer = site.browser().sign_in(FIRST).get("/continue")
         assert answer.status_code == 303
+        step = F.next_step(site.bundle, session, site.records(FIRST))
+        assert answer.headers["Location"] == f"/form/{step}"
         return answer.headers["Location"]
 
+    def state(item_id: str) -> str:
+        """The form's state by the pure function, checked against what its page shows."""
+        named = F.step_state(site.bundle, session, site.records(FIRST), item_id)
+        shown = site.browser().sign_in(FIRST).open(item_id)
+        assert shown.value("_phase") == {
+            F.INDEPENDENT_DUE: A.INDEPENDENT, F.REVEAL_PENDING: None}.get(named, A.AFTER_REVEAL)
+        return named
+
     assert resume() == "/form/s14a"  # nothing saved: the first form in review order
+    assert (state("s14a"), state("s14b")) == (F.INDEPENDENT_DUE, F.INDEPENDENT_DUE)
     b = site.browser().sign_in(FIRST)
     b.review("s14a", after=False)
     assert "Next step:" in b.shown.text and "continue with s14b" in b.shown.visible()
     # Form 1 is saved, the post is not revealed: the step is the sibling without a reading.
+    assert (state("s14a"), state("s14b")) == (F.REVEAL_PENDING, F.INDEPENDENT_DUE)
     assert resume() == "/form/s14b"
-    assert "next step" in site.browser().sign_in(FIRST).get("/").get_data(as_text=True)
+    home = site.browser().sign_in(FIRST).get("/").get_data(as_text=True)
+    assert "next step" in home and "independent reading saved" in home
     b.review("s14b", after=False)
     assert "Next step: on this same form, below." in b.shown.visible()
+    assert (state("s14a"), state("s14b")) == (F.AFTER_REVEAL_DUE, F.AFTER_REVEAL_DUE)
+    assert "reading after the reveal due" in b.get("/").get_data(as_text=True)
     # Both saved and revealed: the first form that is not done, in the state after the reveal,
     # with the independent answers intact.
     assert resume() == "/form/s14a"
@@ -618,6 +637,7 @@ def test_resuming_in_a_new_session_lands_on_the_next_unfinished_step(site14):
     assert shown.value("confidence") == "" and SYSTEM_MARKS["s14a"]["reference"] in shown.text
     fresh.set({"reference_series_right": "YES", "execution_instrument_right": "YES"})
     assert "continue with s14b" in fresh.save().visible()
+    assert (state("s14a"), state("s14b")) == (F.DONE, F.AFTER_REVEAL_DUE)
     assert resume() == "/form/s14b"
     fresh.open("s14b")
     fresh.set({"reference_series_right": "YES", "execution_instrument_right": "YES"})
@@ -659,6 +679,12 @@ def test_a_reading_the_approver_returned_is_shown_to_its_reviewer_only(site):  #
         assert "RETURNED" not in text and "Returned to you" not in text and note not in text
     assert b.get("/continue").headers["Location"] == "/form/i07"
     assert returned not in site.records(SECOND) and returned in site.records(FIRST)
+    from reviewer_web import forms as F
+
+    for alias, expected in ((FIRST, F.RETURNED), (SECOND, F.DONE)):
+        session = site.reviewers[alias].session()
+        assert F.step_state(site.bundle, session, site.records(alias), "i08") == expected
+    assert F.next_step(site.bundle, site.reviewers[FIRST].session(), site.records(FIRST)) == "i08"
     # The approver's record is never taken for the reviewer's own.
     assert "Saved." not in a.get(f"/form/i08?saved={returned['seq']}").get_data(as_text=True)
     # The corrected reading is saved: the return no longer stands.

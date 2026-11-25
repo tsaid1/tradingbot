@@ -237,17 +237,26 @@ def test_a_post_needs_the_sessions_csrf_token_and_the_sites_own_origin(site):  #
         assert b.post("/form/i07/save", data).status_code == 403
         assert b.post("/form/i07/state", data).status_code == 403
     good = {"_csrf": csrf}
+
+    def sign_out(origin=None, fetch_site=None):
+        headers = {k: v for k, v in (("Origin", origin), ("Sec-Fetch-Site", fetch_site)) if v}
+        return b.post("/sign-out", good, origin=None, headers=headers).status_code
+
     refused = [
-        b.post("/sign-out", good, origin="https://elsewhere.example.invalid"),
-        b.post("/sign-out", good, origin=ORIGIN.replace("https", "http")),
-        b.post("/sign-out", good, origin=ORIGIN + ".example.invalid"),
-        b.post("/sign-out", good, origin=None),  # neither Origin nor Sec-Fetch-Site
-        b.post("/sign-out", good, origin=None, headers={"Sec-Fetch-Site": "cross-site"}),
-        b.post("/sign-out", good, origin=None, headers={"Sec-Fetch-Site": "same-site"}),
-        b.post("/sign-out", good, headers={"Sec-Fetch-Site": "cross-site"}),
-        b.post("/sign-out", good, origin="null"),
+        sign_out(),  # neither header
+        sign_out("https://elsewhere.example.invalid", "same-origin"),  # the two disagree
+        sign_out("https://elsewhere.example.invalid", "cross-site"),
+        sign_out("https://elsewhere.example.invalid"),
+        sign_out(ORIGIN.replace("https", "http"), "same-origin"),
+        sign_out(ORIGIN + ".example.invalid", "same-origin"),
+        sign_out(fetch_site="cross-site"),
+        sign_out(fetch_site="same-site"),
+        sign_out(fetch_site="none"),
+        sign_out("null", "cross-site"),  # a sandboxed frame elsewhere
+        sign_out(ORIGIN, "cross-site"),
+        sign_out("null"),  # an old browser: "null" proves nothing
     ]
-    assert [r.status_code for r in refused] == [403] * len(refused)
+    assert refused == [403] * len(refused)
     assert signed_in(b) and not site.records(FIRST)
     # The sign-in forms have no session yet: the origin check alone guards them.
     sent = len(site.outbox.sent)
@@ -257,9 +266,15 @@ def test_a_post_needs_the_sessions_csrf_token_and_the_sites_own_origin(site):  #
     assert ask(stranger, login_of(site), origin=None).status_code == 403
     assert enter(stranger, login_of(site), "123456", origin=None).status_code == 403
     assert len(site.outbox.sent) == sent
-    # With only one of the two headers, a same-origin POST passes.
-    assert b.post("/sign-out", good, origin=None,
-                  headers={"Sec-Fetch-Site": "same-origin"}).status_code == 303
+    # What browsers do send from a page of the site passes: a form (under no-referrer the
+    # Origin is "null"), the form's script, a browser without Origin, an old one without
+    # Sec-Fetch-Site.
+    for origin, fetch_site in (("null", "same-origin"), (ORIGIN, "same-origin"),
+                               (None, "same-origin"), (ORIGIN, None)):
+        if not signed_in(b):
+            b.sign_in(FIRST)
+            good["_csrf"] = b.csrf()
+        assert sign_out(origin, fetch_site) == 303
 
 
 def test_no_response_and_no_log_line_carries_a_code_or_an_address(site, caplog):  # noqa: F811
@@ -274,33 +289,20 @@ def test_no_response_and_no_log_line_carries_a_code_or_an_address(site, caplog):
                                       "/healthz", "/robots.txt", "/static/app.js")]
     seen.append(b.post("/sign-out", {"_csrf": b.csrf()}))
 
-    class Down:
-        """A mail server that cannot be reached, for a message and for the probe alike."""
+    def failing(_to, _subject, text):
+        raise RuntimeError(f"the server said no to {text}")  # an error may quote anything
 
-        def __call__(self, _to, _subject, text):
-            raise RuntimeError(f"the server said no to {text}")  # an error may quote anything
-
-        def probe(self):
-            raise OSError("no route to the mail server")
-
-    broken = web.create_app(site.store, Down(), site.config).test_client()
-
-    def ask_broken(address):
-        return broken.post("/sign-in", data={"address": address}, base_url=ORIGIN,
-                           headers={"Origin": ORIGIN})
-
-    listed, unlisted = ask_broken(login), ask_broken(NOBODY)
-    # The page says so calmly, and the same for a listed and an unlisted address.
-    assert listed.status_code == unlisted.status_code == 200
-    assert "The code could not be sent. Try again in a minute." in listed.get_data(as_text=True)
-    assert listed.get_data(as_text=True).replace(login, NOBODY) == unlisted.get_data(as_text=True)
-    assert "could not be sent" not in seen[0].get_data(as_text=True)
-    seen += [listed, unlisted]
+    broken = web.create_app(site.store, failing, site.config).test_client()
+    same = broken.post("/sign-in", data={"address": login}, base_url=ORIGIN,
+                       headers={"Origin": ORIGIN})
+    assert same.status_code == 200 and same.get_data(as_text=True) == seen[0].get_data(
+        as_text=True)  # a message that failed answers like one that went out
+    seen.append(same)
     [(newest,)] = site.sql("SELECT code_hmac FROM login_code ORDER BY id DESC LIMIT 1")
     logged = "\n".join(r.getMessage() for r in caplog.records)
-    assert "MAIL_FAILED error=RuntimeError" in logged and "MAIL_FAILED error=OSError" in logged
+    assert "MAIL_FAILED error=RuntimeError" in logged
     assert code not in logged and login.casefold() not in logged.casefold()
-    assert newest not in logged and "sign-in code is" not in logged and "no route" not in logged
+    assert newest not in logged and "sign-in code is" not in logged
     for response in seen:
         assert code not in response.get_data(as_text=True)
         assert code not in repr(sorted(response.headers.items()))
@@ -309,6 +311,94 @@ def test_no_response_and_no_log_line_carries_a_code_or_an_address(site, caplog):
     probes, sent = site.outbox.probes, len(site.outbox.sent)
     ask(site.browser(), NOBODY)
     assert site.outbox.probes == probes + 1 and len(site.outbox.sent) == sent
+
+
+def test_production_never_shows_its_own_code_whatever_happens_to_the_mail(
+        tmp_path, store, dsn, monkeypatch, caplog):  # noqa: F811
+    import smtplib
+
+    from reviewer_web import app as web
+    from reviewer_web import auth, mail
+
+    caplog.set_level(logging.DEBUG)
+    site = Site(tmp_path, store, dsn)  # noqa: F811
+    login, made = login_of(site), []
+    real = auth.secrets.randbelow
+
+    def recorded(n):
+        made.append(f"{real(n):06d}")
+        return int(made[-1])
+
+    monkeypatch.setattr(auth.secrets, "randbelow", recorded)
+
+    class Mailer:
+        """A mail server in one of its states: fine, unreachable, or failing this message."""
+
+        def __init__(self, at_connect=None, at_send=None):
+            self.at_connect, self.at_send, self.sent = at_connect, at_send, []
+
+        def __call__(self, to, _subject, text):
+            if self.at_connect:
+                raise mail.Unreachable(type(self.at_connect).__name__)
+            if self.at_send:
+                raise self.at_send
+            self.sent.append((to, text))
+
+        def probe(self):
+            if self.at_connect:
+                raise mail.Unreachable(type(self.at_connect).__name__)
+
+    def production(mailer):
+        return web.create_app(site.store, mailer, {**site.config, "SITE_ENV": "production"})
+
+    def ask_live(app, address):
+        site.sql("DELETE FROM rate_limit")
+        return app.test_client().post("/sign-in", data={"address": address}, base_url=ORIGIN,
+                                      headers={"Origin": ORIGIN})
+
+    def whole(response) -> str:
+        return response.get_data(as_text=True) + repr(sorted(response.headers.items()))
+
+    fine = production(Mailer())
+    neutral = ask_live(fine, NOBODY).get_data(as_text=True)
+    assert "a message with a six-digit code is on its way" in " ".join(neutral.split())
+    cases = [(Mailer(at_connect=TimeoutError("timed out")), True),
+             (Mailer(at_connect=ConnectionRefusedError()), True),
+             (Mailer(at_send=smtplib.SMTPDataError(451, b"try later 123456")), False),
+             (Mailer(at_send=TimeoutError("timed out")), False),
+             (Mailer(at_send=smtplib.SMTPRecipientsRefused({})), False),
+             (Mailer(), False)]
+    for mailer, says_so in cases:
+        app, before = production(mailer), len(made)
+        listed, unlisted = ask_live(app, login), ask_live(app, NOBODY)
+        assert len(made) == before + 1  # one code, for the listed address only
+        code = made[-1]
+        for response in (listed, unlisted):
+            assert response.status_code == 200
+            assert code not in whole(response)  # body and every header
+            assert "Set-Cookie" not in response.headers and "Location" not in response.headers
+            assert "Demonstration" not in response.get_data(as_text=True)
+            assert ("The code could not be sent. Try again in a minute." in response.get_data(
+                as_text=True)) is says_so
+        # The same page for a listed and an unlisted address, whatever happened to the mail;
+        assert listed.get_data(as_text=True).replace(login, NOBODY) == unlisted.get_data(
+            as_text=True)
+        # and without the sentence it is the page of a message that went out.
+        if not says_so:
+            assert unlisted.get_data(as_text=True) == neutral
+        # A code that was not delivered is ended: it cannot be tried afterwards.
+        delivered = bool(mailer.sent)
+        answer = app.test_client().post(
+            "/sign-in/verify", data={"address": login, "code": code}, base_url=ORIGIN,
+            headers={"Origin": ORIGIN})
+        assert answer.status_code == (303 if delivered else 401)
+        assert code not in whole(answer)
+        assert site.sql("SELECT count(*) FROM login_code WHERE used_at IS NULL") == [(0,)]
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert "MAIL_UNREACHABLE error=TimeoutError" in logged
+    assert "MAIL_FAILED error=SMTPDataError" in logged
+    assert not [code for code in made if code in logged] and login not in logged
+    assert "try later" not in logged
 
 
 def test_mail_goes_out_over_tls_by_the_port_and_carries_the_code_and_nothing_else(monkeypatch):
@@ -375,9 +465,18 @@ def test_mail_goes_out_over_tls_by_the_port_and_carries_the_code_and_nothing_els
 
     monkeypatch.setattr(smtplib, "SMTP", NoTls)
     calls.clear()
-    with pytest.raises(smtplib.SMTPNotSupportedError):
+    with pytest.raises(mail.Unreachable, match="^SMTPNotSupportedError$"):
         mail.send("reviewer@example.invalid", "s", "t", {**env, "SMTP_PORT": "587"})
     assert [c[0] for c in calls] == ["connect", "close"]  # no sign-in, no message in the clear
+
+    class Refused(Server):
+        def __init__(self, *a, **k):
+            raise ConnectionRefusedError("an-invented-key must not travel with the error")
+
+    monkeypatch.setattr(smtplib, "SMTP_SSL", Refused)
+    with pytest.raises(mail.Unreachable) as failure:
+        mail.Smtp(env).probe()
+    assert failure.value.args == ("ConnectionRefusedError",) and failure.value.__cause__ is None
     assert mail.configured(env) is True and mail.configured({}) is False
     assert mail.configured({**env, "SMTP_PASSWORD": ""}) is None
 

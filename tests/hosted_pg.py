@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import importlib.util
 import itertools
+import json
 import sys
 import tempfile
 from functools import cache
@@ -92,15 +93,29 @@ def bundle_bytes(base: Path) -> tuple[list[bytes], dict[str, bytes]]:
 
 
 def publish_demo(store, base: Path) -> A.Bundle:
-    """Publish the WHOLE demo bundle, flagged as demonstration data, and make it active."""
+    """Publish the WHOLE demo bundle, flagged as demonstration data, and make it the active
+    demonstration bundle."""
     files, media = bundle_bytes(base)
     return store.publish_bundle(*files, media, is_demo=True,
                                 source_sequences=len(files[1].splitlines()))
 
 
+def publish_as_real(store, base: Path, bundle_id: str = "ab" * 32) -> A.Bundle:
+    """Publish an invented stand-in for the REAL bundle beside the demonstration one: the demo
+    folder's content under another ``bundle_id``, without its last item and with another image
+    under the same name (so a mix-up of the two bundles shows)."""
+    files, media = bundle_bytes(base)
+    files[0] = json.dumps({**json.loads(files[0]), "bundle_id": bundle_id}).encode()
+    files[2] = b"".join(files[2].splitlines(keepends=True)[:-1])
+    return store.publish_bundle(*files, {name: data + b"real" for name, data in media.items()},
+                                is_demo=False, source_sequences=len(files[1].splitlines()))
+
+
 def demo_reviewers(store, base: Path) -> dict[str, object]:
     """The demo file's remote reviewers as rows, by alias (REMOTE-2 and REMOTE-3: the demo's
-    approver has an ``@`` login too and takes REMOTE-1 by the alias rule, without a row)."""
+    approver has an ``@`` login too and takes REMOTE-1 by the alias rule, without a row). They
+    work on the real active bundle when there is one, else on the demonstration bundle; publish
+    first."""
     return {r.alias: r for r in store.sync_reviewers(A.load_reviewers(base / "reviewers.toml"))}
 
 
@@ -138,7 +153,7 @@ def reading_kw(bundle: A.Bundle, item_id: str, records: list[dict], session: A.S
 def hosted_save(store, reviewer, item_id: str, phase: str, *, key: str | None = None, **kw):
     """One reading saved through the store as the web app saves it: validated by
     ``A.build_annotation`` under the store's lock. Returns the ``Appended``."""
-    bundle, session = store.active_bundle(), reviewer.session()
+    bundle, session = store.bundle_for(reviewer), reviewer.session()
     if phase == A.AFTER_REVEAL and "refers_to" not in kw:
         kw["refers_to"] = A.latest_own_reading(
             [r for r in store.records_of(reviewer) if r["phase"] == A.INDEPENDENT], item_id,
@@ -150,6 +165,6 @@ def hosted_save(store, reviewer, item_id: str, phase: str, *, key: str | None = 
 
 def hosted_reveal(store, reviewer, item_id: str):
     """The SYSTEM_SHOWN markers of the item's post, stored before the system's reading is shown."""
-    bundle, session = store.active_bundle(), reviewer.session()
+    bundle, session = store.bundle_for(reviewer), reviewer.session()
     return store.append(reviewer, lambda records: A.build_system_shown(
         records, bundle, session, item_id))

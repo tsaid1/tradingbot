@@ -1,7 +1,9 @@
 """The hosted reviewer site's store: Postgres only, psycopg 3, synchronous.
 
-``Store`` is all the web app may call: who a reviewer is, the active bundle and its images, ONE
-reviewer's own records, and the single append. No call returns another reviewer's records.
+``Store`` is all the web app may call: who a reviewer is, THAT reviewer's bundle and its images,
+that reviewer's own records, and the single append. No call returns another reviewer's records,
+and none serves a reviewer anything of a bundle that is not theirs: the reviewers work on the
+real bundle, a test identity on an invented one, in the same database.
 ``AdminStore`` adds the writes of the operator tool (``scripts/hosted_admin.py``) and of the test
 fixtures; the web app never constructs it. Every refusal is ``AdjudicationError`` with a constant
 code; every statement passes its values as parameters.
@@ -20,13 +22,27 @@ connection and commits with the block (one connection per request).
 #   GENESIS, the head of an empty local log.
 # * ``bundle.scope_sequences`` (an added column): how many sequences the published files carry
 #   content for, so the operator tool can refuse a reviewer scope beyond it.
-# * ``event.origin`` allows a third value, RETURN (seq above 2000000, outside the hosted chain):
-#   an approver's local return of a reading, stored for its reviewer by the operator tool only.
-# * The parsed bundle is cached by (bundle_id, published_at), not bundle_id alone: a larger scope
+# * ``event.origin`` has a third value, RETURN: an approver's LOCAL decision to return a reading,
+#   stored by the operator tool (``push-returns``) under the reviewer whose reading it returns,
+#   so ``records_of`` serves it to that reviewer only. It is an APPROVAL record of the log's
+#   shape (decision RETURN, the approver's notes; of the approver only the role), ``refers_to``
+#   the seq the returned reading has HERE, so ``A.effective_approval`` / ``A._outcome`` give the
+#   site what they give the local workspace, and the reviewer's next reading after the reveal
+#   supersedes it. It is outside the hosted chain: seq 2000000 + its local line's seq (after
+#   every record of the reviewer's own), ``prev_sha256`` the sha256 of the returned reading. The
+#   site never writes one; ``pull-to-local`` never copies one back.
+# * A parsed bundle is cached by (bundle_id, published_at), not bundle_id alone: a larger scope
 #   of the same local bundle is published under the same bundle_id and must replace the cache.
 # * ``append`` also refuses a record whose annotator is not the reviewer or whose bundle is not
-#   the active one (RECORD_NOT_OF_THIS_REVIEWER_AND_BUNDLE): ``records_of`` relies on both.
+#   the reviewer's (RECORD_NOT_OF_THIS_REVIEWER_AND_BUNDLE): ``records_of`` relies on both.
 # * A reviewer row is one person: ``upsert_reviewer`` refuses an alias that another sign-in holds.
+# * ``reviewer.bundle_id``: the one bundle a reviewer is served (``bundle_for``, ``is_demo``,
+#   ``media(reviewer, ...)``, ``records_of``, ``append``). A test identity is served a bundle
+#   only while that bundle is flagged ``is_demo`` (checked in every query, not only when it is
+#   assigned). ``ReviewerRow.bundle_id`` (an added field, last, with a default) says which.
+#   The names of the first contract remain: ``active_bundle()`` is the real active bundle, else
+#   the invented one; ``bundle_is_demo()`` is True only while no real bundle is active;
+#   ``media(post_ref, name)`` reads ``active_bundle()``.
 
 from __future__ import annotations
 
@@ -47,13 +63,22 @@ from tradingbot.runtime.vocab_recommend import GENESIS, encode_line
 SCHEMA_SQL = Path(__file__).with_name("schema.sql")
 LOCK_KEY = 7_203_001  # pg_advisory_xact_lock: one writer of ``event`` at a time
 HOSTED_BASE = 1_000_000  # a HOSTED line's seq is HOSTED_BASE + n (n = 1, 2, ...)
-LEGACY, HOSTED = "LEGACY", "HOSTED"
+RETURN_BASE = 2_000_000  # a RETURN line's seq is RETURN_BASE + the seq of its local line
+LEGACY, HOSTED, RETURN = "LEGACY", "HOSTED", "RETURN"
 MAX_MEDIA_BYTES = 4 * 1024 * 1024
 _IMAGE_TYPES = dict(zip(A._MAGIC, ("image/png", "image/jpeg", "image/gif", "image/gif"),
                         strict=True))
 
 _REVIEWER = ("SELECT id, alias, login, login_shown, name, role, access, scope_sequences, is_test,"
-             " revoked_at IS NOT NULL FROM reviewer")
+             " revoked_at IS NOT NULL, bundle_id FROM reviewer")
+# One bundle row; its four files travel only when this process does not hold that publication.
+_BUNDLE = ("SELECT b.bundle_id, b.published_at, b.is_demo, f.manifest, f.sequences, f.items,"
+           " f.posts FROM bundle b LEFT JOIN bundle f ON f.bundle_id = b.bundle_id"
+           " AND (f.bundle_id, f.published_at) NOT IN"
+           " (SELECT * FROM unnest(%s::text[], %s::timestamptz[]))")
+# The bundle a reviewer is served: the assigned one; for a test identity only an invented one.
+_THEIRS = ("(SELECT r.bundle_id FROM reviewer r JOIN bundle b ON b.bundle_id = r.bundle_id"
+           " AND (b.is_demo OR NOT r.is_test) WHERE r.id = %s)")
 _INSERT_EVENT = (
     "INSERT INTO event (seq, prev_sha256, sha256, line, reviewer_id, bundle_id, item_id, phase,"
     " at, origin, idempotency_key, batch, created_at)"
@@ -72,6 +97,7 @@ class ReviewerRow:
     scope_sequences: int
     is_test: bool
     revoked: bool
+    bundle_id: str | None = None  # the bundle this reviewer works on (None: not assigned yet)
 
     def session(self) -> A.Session:
         return A.Session(self.login_shown, self.name, self.role, self.access, True,
@@ -118,7 +144,7 @@ class Store:
     def __init__(self, dsn: str):
         self._dsn = dsn
         self._open = threading.local()
-        self._cached: tuple[tuple, A.Bundle] | None = None  # ((bundle_id, published_at), bundle)
+        self._parsed: dict[str, tuple[datetime, A.Bundle]] = {}  # bundle_id: (published_at, it)
 
     @contextmanager
     def connection(self):
@@ -149,35 +175,53 @@ class Store:
             row = conn.execute(_REVIEWER + " WHERE id = %s", (reviewer_id,)).fetchone()
         return ReviewerRow(*row) if row else None
 
-    # -------------------------------------------------------------- the active bundle
+    # -------------------------------------------------------------- a reviewer's bundle
 
-    def _active(self) -> tuple[A.Bundle, bool]:
-        """(bundle, is_demo) in one query: the four files travel only when the cache is stale."""
-        cached = self._cached
+    def _bundle(self, reviewer: ReviewerRow | None) -> tuple[A.Bundle, bool]:
+        """(bundle, is_demo) in one query: the reviewer's bundle; without a reviewer, the real
+        active bundle, else the invented one."""
+        held = dict(self._parsed)
+        known = [list(held), [published for published, _bundle in held.values()]]
         with self.connection() as conn:
-            row = conn.execute(
-                "SELECT b.bundle_id, b.published_at, b.is_demo, f.manifest, f.sequences, f.items,"
-                " f.posts FROM bundle b LEFT JOIN bundle f ON f.bundle_id = b.bundle_id"
-                " AND NOT (f.bundle_id = %s AND f.published_at = %s) WHERE b.active",
-                cached[0] if cached else ("", None)).fetchone()
+            if reviewer is None:
+                row = conn.execute(_BUNDLE + " WHERE b.active ORDER BY b.is_demo LIMIT 1",
+                                   known).fetchone()
+            else:
+                row = conn.execute(_BUNDLE + " WHERE b.bundle_id = " + _THEIRS,
+                                   [*known, reviewer.id]).fetchone()
         if row is None:
-            raise A.AdjudicationError("NO_ACTIVE_BUNDLE")
+            raise A.AdjudicationError("NO_ACTIVE_BUNDLE" if reviewer is None
+                                      else "NO_BUNDLE_ASSIGNED")
         if row[3] is not None:
-            cached = self._cached = (
-                row[:2], A.bundle_from_bytes(*map(bytes, row[3:]), access=A.FULL))
-        return cached[1], row[2]
+            held[row[0]] = self._parsed[row[0]] = (
+                row[1], A.bundle_from_bytes(*map(bytes, row[3:]), access=A.FULL))
+        return held[row[0]][1], row[2]
+
+    def bundle_for(self, reviewer: ReviewerRow) -> A.Bundle:
+        """The bundle this reviewer works on, validated like a FULL local one (``root`` is
+        None), parsed once per process and publication."""
+        return self._bundle(reviewer)[0]
+
+    def is_demo(self, reviewer: ReviewerRow) -> bool:
+        """Whether this reviewer's bundle is invented demonstration data."""
+        return self._bundle(reviewer)[1]
 
     def active_bundle(self) -> A.Bundle:
-        """The published bundle, validated like a FULL local one (``root`` is None)."""
-        return self._active()[0]
+        """The real active bundle, else the invented one (the first contract's name; a page
+        served to a reviewer uses ``bundle_for``)."""
+        return self._bundle(None)[0]
 
     def bundle_is_demo(self) -> bool:
-        return self._active()[1]
+        """True only while no real bundle is active (a preview or test database)."""
+        return self._bundle(None)[1]
 
-    def media(self, post_ref: str, name: str) -> tuple[bytes, str] | None:
-        """(bytes, content type) of an image, only when that post of the ACTIVE bundle lists it."""
+    def media(self, *args) -> tuple[bytes, str] | None:
+        """``media(reviewer, post_ref, name)``: (bytes, content type) of an image, only when
+        that post of THAT REVIEWER'S bundle lists it. The first contract's
+        ``media(post_ref, name)`` reads ``active_bundle()``."""
+        reviewer, post_ref, name = args if len(args) == 3 else (None, *args)
         with self.connection() as conn:
-            bundle = self.active_bundle()
+            bundle = self._bundle(reviewer)[0]
             post = bundle.posts.get(post_ref)
             if post is None or name not in post["media"]:
                 return None
@@ -188,18 +232,19 @@ class Store:
     # -------------------------------------------------------------- one reviewer's records
 
     def records_of(self, reviewer: ReviewerRow) -> list[dict]:
-        """ONLY this reviewer's records of the active bundle, in order (the imported local lines,
-        then the hosted ones), as the log's dicts."""
+        """ONLY this reviewer's records of this reviewer's bundle, as the log's dicts, in order:
+        the imported local lines, the hosted ones, then the approver's returns of this reviewer's
+        readings (APPROVAL records with decision RETURN; see the head of this file)."""
         with self.connection() as conn:
             rows = conn.execute(
-                "SELECT e.line FROM event e JOIN bundle b ON b.bundle_id = e.bundle_id AND b.active"
-                " WHERE e.reviewer_id = %s ORDER BY e.seq", (reviewer.id,)).fetchall()
+                "SELECT e.line FROM event e WHERE e.reviewer_id = %s AND e.bundle_id = " + _THEIRS
+                + " ORDER BY e.seq", (reviewer.id, reviewer.id)).fetchall()
         return [json.loads(bytes(line)) for (line,) in rows]
 
     def append(self, reviewer: ReviewerRow, make, *,
                idempotency_key: str | None = None) -> Appended:
         """The site's only write of a reading. ``make(records)`` gets the reviewer's CURRENT
-        records of the active bundle and returns one record body, a list of them, or None / []
+        records of the reviewer's bundle and returns one record body, a list of them, or None / []
         (nothing written), each WITHOUT schema, seq and prev_sha256; an exception from it writes
         nothing and propagates. A known ``idempotency_key`` returns what that save stored, with
         ``duplicate=True``, and does not call ``make``. A revoked reviewer: REVOKED.
@@ -209,16 +254,15 @@ class Store:
         with self.connection() as conn:
             conn.execute("SELECT pg_advisory_xact_lock(%s)", (LOCK_KEY,))
             allowed, bundle_id, anchor, last_seq, last_sha = conn.execute(
-                "SELECT (SELECT revoked_at IS NULL FROM reviewer WHERE id = %s),"
-                " (SELECT bundle_id FROM bundle WHERE active),"
+                "SELECT (SELECT revoked_at IS NULL FROM reviewer WHERE id = %s), " + _THEIRS + ","
                 " (SELECT snapshot_head_sha256 FROM chain_anchor WHERE id = 1),"
                 " (SELECT max(seq) FROM event WHERE origin = 'HOSTED'),"
                 " (SELECT sha256 FROM event WHERE origin = 'HOSTED' ORDER BY seq DESC LIMIT 1)",
-                (reviewer.id,)).fetchone()
+                (reviewer.id, reviewer.id)).fetchone()
             if not allowed:
                 raise A.AdjudicationError("REVOKED")
             if bundle_id is None:
-                raise A.AdjudicationError("NO_ACTIVE_BUNDLE")
+                raise A.AdjudicationError("NO_BUNDLE_ASSIGNED")
             mine = conn.execute(
                 "SELECT line, bundle_id, idempotency_key, batch, seq FROM event"
                 " WHERE reviewer_id = %s ORDER BY seq", (reviewer.id,)).fetchall()
@@ -273,35 +317,56 @@ class AdminStore(Store):
 
     def upsert_reviewer(self, alias: str, login: str, *, name: str = "",
                         role: str = A.REVIEWER, access: str = A.FULL,
-                        scope_sequences: int = A.DEFAULT_SCOPE,
-                        is_test: bool = False) -> ReviewerRow:
-        """Insert the reviewer, or update the spelling, name, role, access and scope of the row
-        that holds this alias AND this sign-in. Anything else is refused: a row is one person,
-        and its events stay theirs. Never deletes."""
+                        scope_sequences: int = A.DEFAULT_SCOPE, is_test: bool = False,
+                        bundle_id: str | None = None) -> ReviewerRow:
+        """Insert the reviewer, or update the spelling, name, role, access, scope and bundle of
+        the row that holds this alias AND this sign-in. Anything else is refused: a row is one
+        person, and its events stay theirs. Never deletes.
+
+        ``bundle_id``: the bundle the reviewer works on; a test identity takes an invented one
+        only (TEST_IDENTITY_NEEDS_A_DEMO_BUNDLE). None keeps the row's bundle; for a new row it
+        is the invented active bundle (test identity), or the real active one, else the invented
+        one (a preview or test database); with nothing published the row stays unassigned and is
+        served nothing."""
         key = login.casefold()
         with self.connection() as conn:
             held = conn.execute("SELECT alias, login, is_test FROM reviewer WHERE alias = %s"
                                 " OR login = %s", (alias, key)).fetchall()
             if held and held != [(alias, key, is_test)]:
                 raise A.AdjudicationError("ALIAS_OR_LOGIN_HELD_BY_ANOTHER_ROW")
+            if bundle_id is None and not held:
+                found = conn.execute(
+                    "SELECT bundle_id FROM bundle WHERE active AND (is_demo OR NOT %s)"
+                    " ORDER BY is_demo LIMIT 1", (is_test,)).fetchone()
+                bundle_id = found and found[0]
+            elif bundle_id is not None:
+                demo = conn.execute("SELECT is_demo FROM bundle WHERE bundle_id = %s",
+                                    (bundle_id,)).fetchone()
+                if demo is None:
+                    raise A.AdjudicationError("UNKNOWN_BUNDLE")
+                if is_test and not demo[0]:
+                    raise A.AdjudicationError("TEST_IDENTITY_NEEDS_A_DEMO_BUNDLE")
             if held:
                 conn.execute(
                     "UPDATE reviewer SET login_shown = %s, name = %s, role = %s, access = %s,"
-                    " scope_sequences = %s WHERE alias = %s",
-                    (login, name, role, access, scope_sequences, alias))
+                    " scope_sequences = %s, bundle_id = COALESCE(%s, bundle_id) WHERE alias = %s",
+                    (login, name, role, access, scope_sequences, bundle_id, alias))
             else:
                 conn.execute(
                     "INSERT INTO reviewer (alias, login, login_shown, name, role, access,"
-                    " scope_sequences, is_test) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
-                    (alias, key, login, name, role, access, scope_sequences, is_test))
+                    " scope_sequences, is_test, bundle_id)"
+                    " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                    (alias, key, login, name, role, access, scope_sequences, is_test, bundle_id))
             return self.reviewer_by_login(login)
 
-    def sync_reviewers(self, reviewers: A.Reviewers) -> list[ReviewerRow]:
+    def sync_reviewers(self, reviewers: A.Reviewers, *,
+                       bundle_id: str | None = None) -> list[ReviewerRow]:
         """The remote reviewers of the owner's reviewers file. An entry whose login contains
         ``@`` is REMOTE-<n>, n its place among those entries in file order (the alias the
-        owner's other tools print); the REVIEWER ones are stored, with the file's scope and the
+        owner's other tools print); the REVIEWER ones are stored, with the file's scope, the
         access a remote session has by that file (RESTRICTED unless
-        ``remote_full_context_authorized``). Never deletes."""
+        ``remote_full_context_authorized``) and ``bundle_id`` (as ``upsert_reviewer`` reads it).
+        Never deletes."""
         out, n = [], 0
         with self.connection():
             for entry in reviewers.entries.values():
@@ -310,7 +375,8 @@ class AdminStore(Store):
                     out.append(self.upsert_reviewer(
                         f"REMOTE-{n}", entry.login, name=entry.name, role=entry.role,
                         access=entry.access if reviewers.remote_full_context_authorized
-                        else A.RESTRICTED, scope_sequences=reviewers.scope_sequences))
+                        else A.RESTRICTED, scope_sequences=reviewers.scope_sequences,
+                        bundle_id=bundle_id))
         return out
 
     def reviewers(self) -> list[ReviewerRow]:
@@ -319,29 +385,31 @@ class AdminStore(Store):
                     for row in conn.execute(_REVIEWER + " ORDER BY id").fetchall()]
 
     def status(self) -> list[dict]:
-        """Per reviewer row: alias, scope and the times the operator's ``status`` prints."""
-        keys = ("alias", "is_test", "scope_sequences", "invited_at", "first_sign_in_at",
-                "revoked_at", "first_hosted_at")
+        """Per reviewer row: alias, scope, bundle, the times the operator's ``status`` prints
+        and the number of web sessions (the web app's ``web_session``)."""
+        keys = ("alias", "is_test", "scope_sequences", "bundle_id", "invited_at",
+                "first_sign_in_at", "revoked_at", "first_hosted_at", "sessions")
         with self.connection() as conn:
             rows = conn.execute(
-                "SELECT r.alias, r.is_test, r.scope_sequences, r.invited_at, r.first_sign_in_at,"
-                " r.revoked_at, (SELECT min(e.at) FROM event e WHERE e.reviewer_id = r.id"
-                " AND e.origin = 'HOSTED') FROM reviewer r ORDER BY r.id").fetchall()
+                "SELECT r.alias, r.is_test, r.scope_sequences, r.bundle_id, r.invited_at,"
+                " r.first_sign_in_at, r.revoked_at, (SELECT min(e.at) FROM event e"
+                " WHERE e.reviewer_id = r.id AND e.origin = 'HOSTED'), (SELECT count(*)"
+                " FROM web_session w WHERE w.reviewer_id = r.id) FROM reviewer r ORDER BY r.id"
+            ).fetchall()
         return [dict(zip(keys, row, strict=True)) for row in rows]
 
     def set_revoked(self, alias: str, revoked: bool) -> int:
-        """Set or clear ``revoked_at`` and delete that reviewer's web sessions (WEB's table
-        ``web_session``, by ``reviewer_id``, once it exists). Returns the sessions deleted."""
+        """Set or clear ``revoked_at`` and delete that reviewer's web sessions and sign-in codes
+        not yet used (the web app's ``web_session`` and ``login_code``). Returns the sessions
+        deleted."""
         with self.connection() as conn:
             row = conn.execute(
                 "UPDATE reviewer SET revoked_at = CASE WHEN %s THEN COALESCE(revoked_at, now())"
                 " END WHERE alias = %s RETURNING id", (revoked, alias)).fetchone()
             if row is None:
                 raise A.AdjudicationError("UNKNOWN_ALIAS")
-            if conn.execute("SELECT to_regclass('web_session')").fetchone()[0] is None:
-                return 0
-            return conn.execute("DELETE FROM web_session WHERE reviewer_id = %s",
-                                (row[0],)).rowcount
+            conn.execute("DELETE FROM login_code WHERE reviewer_id = %s AND used_at IS NULL", row)
+            return conn.execute("DELETE FROM web_session WHERE reviewer_id = %s", row).rowcount
 
     # -------------------------------------------------------------- content
 
@@ -350,10 +418,12 @@ class AdminStore(Store):
                        scope_sequences: int | None = None) -> A.Bundle:
         """Validate the four files as the site will load them, store them with exactly the
         images their posts list (``media``: name -> bytes) and mark the bundle active, in one
-        transaction. ``source_sequences``: the sequences of the local bundle; ``scope_sequences``:
-        how many of them, in review order, these files carry content for (default: all). A
-        bundle already stored under this id is replaced (a larger scope of the same local bundle
-        keeps its bundle_id)."""
+        transaction. It becomes THE active bundle of its kind (real, or invented with
+        ``is_demo``); the active bundle of the other kind stays. ``source_sequences``: the
+        sequences of the local bundle; ``scope_sequences``: how many of them, in review order,
+        these files carry content for (default: all). A bundle already stored under this id is
+        replaced (a larger scope of the same local bundle keeps its bundle_id), but never as a
+        real bundle while a test identity works on it."""
         bundle = A.bundle_from_bytes(manifest, sequences, items, posts, access=A.FULL)
         listed: dict[str, str] = {}
         for ref, post in bundle.posts.items():
@@ -370,7 +440,12 @@ class AdminStore(Store):
                 raise A.AdjudicationError("MEDIA_NOT_AN_IMAGE")
             rows.append((bundle.bundle_id, name, ref, kind, media[name], sha256(media[name])))
         with self.connection() as conn:
-            conn.execute("UPDATE bundle SET active = FALSE WHERE active")
+            if not is_demo and conn.execute(
+                    "SELECT 1 FROM reviewer WHERE is_test AND bundle_id = %s LIMIT 1",
+                    (bundle.bundle_id,)).fetchone():
+                raise A.AdjudicationError("TEST_IDENTITIES_WORK_ON_THIS_BUNDLE")
+            conn.execute("UPDATE bundle SET active = FALSE WHERE active AND is_demo = %s"
+                         " AND bundle_id <> %s", (is_demo, bundle.bundle_id))
             conn.execute(
                 "INSERT INTO bundle (bundle_id, manifest, sequences, items, posts, is_demo,"
                 " source_sequences, scope_sequences, published_at, active)"
@@ -389,8 +464,9 @@ class AdminStore(Store):
                     " VALUES (%s, %s, %s, %s, %s, %s)", rows)
         return bundle
 
-    def published(self) -> dict | None:
-        """The active bundle's row without its content: id, flags, scope and sizes."""
+    def published(self, *, demo: bool) -> dict | None:
+        """The active real bundle's row, or with ``demo`` the active invented one's, without
+        its content: id, flags, scope and sizes."""
         keys = ("bundle_id", "is_demo", "published_at", "source_sequences", "scope_sequences",
                 "bytes", "images", "image_bytes")
         with self.connection() as conn:
@@ -400,7 +476,7 @@ class AdminStore(Store):
                 " + octet_length(b.items) + octet_length(b.posts), count(m.name),"
                 " COALESCE(sum(octet_length(m.bytes)), 0)::bigint FROM bundle b"
                 " LEFT JOIN media m ON m.bundle_id = b.bundle_id WHERE b.active"
-                " GROUP BY b.bundle_id").fetchone()
+                " AND b.is_demo = %s GROUP BY b.bundle_id", (demo,)).fetchone()
         return row and dict(zip(keys, row, strict=True))
 
     # -------------------------------------------------------------- events, verbatim

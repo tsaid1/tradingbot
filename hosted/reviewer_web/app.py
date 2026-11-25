@@ -7,7 +7,9 @@ stored records, and every rule is the rubric's (``forms``).
 
 Enforced on every route, before anything is read: a session (sign-in by an emailed one-time
 code), a reviewer who is not revoked, role REVIEWER, access FULL, and an item inside that
-reviewer's scope. Anything else gets the sign-in page or a 404 without detail. The system's
+reviewer's scope of that reviewer's OWN bundle (``store.bundle_for``: a test identity reads
+invented forms beside the real reviewers, and neither ever gets a form, an image or a record of
+the other's bundle). Anything else gets the sign-in page or a 404 without detail. The system's
 reading, its mapping proposals, holds and price rows are put into a response only after the
 SYSTEM_SHOWN markers are stored and read back. Logs carry constant codes and exception class
 names: never post text, a reading, an address or a code.
@@ -46,7 +48,7 @@ from . import forms as F
 STATIC = Path(__file__).resolve().parent.parent / "public" / "static"
 SITE_ENVS = ("production", "preview", "test")
 DEMO_ENVS = ("preview", "test")  # these show invented data only
-PUBLIC = ("healthz", "robots", "static")  # no session, no database
+PUBLIC = ("healthz", "robots", "favicon", "static")  # no session, no database
 SIGN_IN = ("sign_in", "sign_in_code", "sign_in_verify")
 IMAGE_TYPES = ("image/png", "image/jpeg", "image/gif", "image/webp")
 MAX_IMAGE_BYTES = 4 * 1024 * 1024  # the platform caps a response at 4.5 MB
@@ -84,6 +86,7 @@ class Who:
     reviewer: object  # the store's ReviewerRow
     session: A.Session
     token: str
+    demo: bool  # this reviewer's bundle is demonstration data: every page says so
 
 
 def _code(exc: Exception) -> str:
@@ -103,16 +106,16 @@ def create_app(store, mailer, config: dict) -> Flask:
         raise RuntimeError("SESSION_SECRET_TOO_SHORT")
     if site_env not in SITE_ENVS:
         raise RuntimeError("UNKNOWN_SITE_ENV")
-    demo = site_env in DEMO_ENVS
-    if demo and not store.bundle_is_demo():
+    demo_env = site_env in DEMO_ENVS  # preview and test serve invented data only
+    if demo_env and not store.bundle_is_demo():
         raise RuntimeError("NOT_A_DEMO_BUNDLE")  # a preview never shows anything but invented data
     # No mailer: "synthetic mail". Nothing is sent and the code-entry page shows the code in the
-    # demonstration band. Only where nothing but invented data is served; never in production.
+    # demonstration band. Only in preview and test; production never uses it, whoever signs in.
     synthetic = mailer is None
-    if synthetic and not demo:
+    if synthetic and not demo_env:
         raise RuntimeError("MAIL_NOT_CONFIGURED")
     clock = config.get("CLOCK") or (lambda: datetime.now(UTC))
-    floor = float(config.get("SIGN_IN_FLOOR_SECONDS", 1.5))
+    floor = float(config.get("SIGN_IN_FLOOR_SECONDS", 2.0))
     schemes = ("https", "http") if config.get("ALLOW_HTTP") else ("https",)
 
     app = Flask(__name__, static_folder=str(STATIC), static_url_path="/static")
@@ -126,20 +129,22 @@ def create_app(store, mailer, config: dict) -> Flask:
     def refuse(status: int):
         """The one page of a refusal: the same for everybody, whoever asks and whatever for."""
         return render_template("message.html", message=MESSAGES[status], status=status,
-                               who=None, csrf=""), status
+                               who=None, csrf="", demo=demo_env), status
 
     def same_origin() -> bool:
-        """A POST must come from a page of this site: ``Sec-Fetch-Site`` and ``Origin`` (one of
-        them at least; every one that is sent must agree)."""
+        """A POST must come from a page of this site. ``Sec-Fetch-Site`` (which a page cannot
+        set) must say ``same-origin``; an ``Origin`` sent with it must be this site's, or
+        ``null``: under ``Referrer-Policy: no-referrer`` a browser sends ``Origin: null`` with a
+        form it submits to its own site. A browser too old to send ``Sec-Fetch-Site`` is
+        believed only on an ``Origin`` that is this site's."""
         site, origin = request.headers.get("Sec-Fetch-Site"), request.headers.get("Origin")
-        if site is None and origin is None:
-            return False
-        if site is not None and site != "same-origin":
-            return False
-        if origin is not None:
+        ours = False
+        if origin not in (None, "null"):
             parts = urlsplit(origin)
-            return parts.scheme in schemes and parts.netloc == request.host
-        return True
+            ours = parts.scheme in schemes and parts.netloc == request.host
+        if site is None:
+            return ours
+        return site == "same-origin" and (ours or origin in (None, "null"))
 
     def network() -> str:
         """The caller's network address, for the limits only (the platform sets these headers)."""
@@ -160,6 +165,13 @@ def create_app(store, mailer, config: dict) -> Flask:
             return redirect("/", 303)
         return None
 
+    def reads_demo(reviewer) -> bool | None:
+        """Whether the reviewer's bundle is invented data; None: no bundle is assigned to them."""
+        try:
+            return store.is_demo(reviewer)
+        except A.AdjudicationError:
+            return None
+
     def admit():
         """Who is asking, or the refusal. Runs first in every reviewer route."""
         token = request.cookies.get(auth.COOKIE, "")
@@ -172,9 +184,12 @@ def create_app(store, mailer, config: dict) -> Flask:
                 request.form.get("_csrf", "").encode("utf-8"),
                 auth.csrf_token(secret, token).encode("utf-8")):
             return refuse(403)
-        if demo and not store.bundle_is_demo():
-            return refuse(503)
-        g.who = Who(reviewer, reviewer.session(), token)
+        demo = reads_demo(reviewer)
+        if demo is None:
+            return refuse(503)  # no bundle is assigned to this reviewer: nothing is served
+        if demo_env and not (demo and store.bundle_is_demo()):
+            return refuse(503)  # a preview serves nobody whose bundle is not invented
+        g.who = Who(reviewer, reviewer.session(), token, demo)
         return None
 
     def reviewer_route(view):
@@ -204,7 +219,8 @@ def create_app(store, mailer, config: dict) -> Flask:
     @app.context_processor
     def common():
         who = g.get("who")
-        return {"demo": demo, "who": who, "site_name": mail.SITE_NAME, "synthetic": synthetic,
+        return {"demo": who.demo if who else demo_env, "who": who,
+                "site_name": mail.SITE_NAME, "synthetic": synthetic,
                 "csrf": auth.csrf_token(secret, who.token) if who else ""}
 
     for status in (400, 403, 404, 405, 413):
@@ -231,6 +247,10 @@ def create_app(store, mailer, config: dict) -> Flask:
     def robots():
         return Response("User-agent: *\nDisallow: /\n", mimetype="text/plain")
 
+    @app.get("/favicon.ico")
+    def favicon():
+        return Response(status=204)  # browsers ask; the site has no image of its own
+
     # ------------------------------------------------------------- sign-in and sign-out
 
     @app.get("/sign-in")
@@ -239,14 +259,22 @@ def create_app(store, mailer, config: dict) -> Flask:
 
     @app.post("/sign-in")
     def sign_in_code():
-        """Answers the same for every address, listed or not, and takes about as long. When
-        the mail server cannot be reached the page says so, for every address alike: an address
-        that gets no code asks the server too (``probe``), and sends nothing."""
+        """Answers the same for every address, listed or not, and takes about as long.
+
+        The page never carries the code (synthetic mail apart, which production never uses).
+        When the mail server cannot be reached the page says the code could not be sent, for
+        every address alike: an address that gets no code asks the server too (``probe``) and
+        sends nothing. A failure of the one message (which no unlisted address could meet) is
+        logged and not shown: showing it would say that the address is listed. Either way the
+        code that was not delivered is ended."""
         started = time.monotonic()
         address = request.form.get("address", "")[:auth.MAX_ADDRESS]
         if synthetic and not store.bundle_is_demo():
             return refuse(503)  # a code is shown on a page only beside invented data
         asked = auth.request_code(store, secret, address, network(), clock())
+        if synthetic and asked.code is not None and not reads_demo(asked.reviewer):
+            auth.cancel_codes(store, asked.reviewer, clock())  # never for a real bundle's reader
+            asked = auth.Asked(True)
         unsent = False
         if not synthetic:
             try:
@@ -254,9 +282,15 @@ def create_app(store, mailer, config: dict) -> Flask:
                     mailer(asked.reviewer.login_shown, auth.SUBJECT, auth.mail_text(asked.code))
                 elif asked.allowed and hasattr(mailer, "probe"):
                     mailer.probe()
+            except mail.Unreachable as exc:
+                app.logger.error("MAIL_UNREACHABLE error=%s", str(exc)[:60])  # a class name
+                unsent = True
             except Exception as exc:  # noqa: BLE001 - whatever failed: a constant code, no detail
                 app.logger.error("MAIL_FAILED error=%s", type(exc).__name__)
-                unsent = True
+            else:
+                asked = asked._replace(code=None)  # delivered, or none was made: nothing to end
+            if asked.code is not None:
+                auth.cancel_codes(store, asked.reviewer, clock())
         time.sleep(max(0.0, floor - (time.monotonic() - started)))
         return render_template("sign_in_code.html", address=address, failed=False, unsent=unsent,
                                shown_code=asked.code if synthetic else None)
@@ -287,7 +321,7 @@ def create_app(store, mailer, config: dict) -> Flask:
     @app.get("/")
     @reviewer_route
     def workspace():
-        bundle = store.active_bundle()
+        bundle = store.bundle_for(g.who.reviewer)
         records = store.records_of(g.who.reviewer)
         return lambda: render_template("workspace.html",
                                        **F.workspace(bundle, g.who.session, records))
@@ -295,7 +329,7 @@ def create_app(store, mailer, config: dict) -> Flask:
     @app.get("/continue")
     @reviewer_route
     def resume():
-        bundle = store.active_bundle()
+        bundle = store.bundle_for(g.who.reviewer)
         step = F.next_step(bundle, g.who.session, store.records_of(g.who.reviewer))
         return redirect(f"/form/{step}" if step else "/", 303)
 
@@ -313,8 +347,8 @@ def create_app(store, mailer, config: dict) -> Flask:
     # ------------------------------------------------------------- one form
 
     def item_of(item_id: str):
-        """The bundle and the item, only when the item is in this reviewer's scope."""
-        bundle = store.active_bundle()
+        """This reviewer's bundle and the item, only when the item is in their scope of it."""
+        bundle = store.bundle_for(g.who.reviewer)
         item = F.scoped(bundle, g.who.session).get(item_id)
         if item is None:
             abort(404)
@@ -359,21 +393,30 @@ def create_app(store, mailer, config: dict) -> Flask:
                        notice=F.saved_notice(gate.ind, gate.after, gate.returned)
                        if after else None)
 
+    def phase_of(bundle, item, records, gate) -> str | None:
+        """The form the page of ``item`` shows, by ``forms.step_state`` (the one function that
+        says where a form stands): the independent form, no form while the post waits for
+        another form's reading, else the form after the reveal. That one needs the markers:
+        without them (they could not be stored) no form is shown."""
+        state = F.step_state(bundle, g.who.session, records, item["item_id"])
+        if state == F.INDEPENDENT_DUE:
+            return A.INDEPENDENT
+        return A.AFTER_REVEAL if state != F.REVEAL_PENDING and gate.marked else None
+
     def page(bundle, item, records, gate, problem, *, posted=None, refusal=None, saved=None,
              status=200):
         """The form page as it stands now. ``posted`` is used only when it belongs to the form
         the page shows (the same phase)."""
         who, item_id = g.who, item["item_id"]
-        revealed = gate.open and gate.marked
-        phase = A.AFTER_REVEAL if revealed else A.INDEPENDENT if (
-            gate.ind is None and not gate.open) else None
+        phase = phase_of(bundle, item, records, gate)
+        revealed = phase == A.AFTER_REVEAL
         if posted is not None and posted.get("_phase") != phase:
             posted = None
         step = F.step_from(bundle, who.session, records, item)
         return render_template(
             "form.html", item_id=item_id, bundle_id=bundle.bundle_id,
             names=F.names(bundle, who.session),
-            status=F.STATUS_TEXT[F.statuses(bundle, who.session, records)[item_id]],
+            status=F.STATUS_TEXT[gate.state],
             returned=gate.returned is not None and revealed,
             evidence=F.evidence(bundle, item), header=F.form_header(bundle, item),
             how=R.HOW_TO_REVIEW, verdict_help=R.VERDICT_HELP,
@@ -408,9 +451,7 @@ def create_app(store, mailer, config: dict) -> Flask:
         Saves nothing. A script asks for the form's body only; without one the whole page."""
         bundle, item = item_of(item_id)
         records, gate, problem = reveal(bundle, item)
-        revealed = gate.open and gate.marked
-        phase = A.AFTER_REVEAL if revealed else A.INDEPENDENT if (
-            gate.ind is None and not gate.open) else None
+        phase = phase_of(bundle, item, records, gate)
         if request.headers.get("X-Fragment") != "form":
             return lambda: page(bundle, item, records, gate, problem, posted=request.form)
         if phase is None or request.form.get("_phase") != phase:
@@ -438,7 +479,7 @@ def create_app(store, mailer, config: dict) -> Flask:
         def make(current):
             """Under the store's lock, with the reviewer's current records."""
             gate = F.gate(bundle, who.session, item, current)
-            if phase == A.AFTER_REVEAL and not (gate.open and gate.marked):
+            if phase == A.AFTER_REVEAL and phase_of(bundle, item, current, gate) != phase:
                 raise A.AdjudicationError("NOT_REVEALED")
             filled = build(bundle, item, current, gate, phase, request.form)
             if filled.invalid:
@@ -468,16 +509,16 @@ def create_app(store, mailer, config: dict) -> Flask:
     @app.get("/media/<bundle_id>/<post_ref>/<name>")
     @reviewer_route
     def media(bundle_id, post_ref, name):
-        """An image of the active bundle, only for a post one of this reviewer's forms shows and
-        only by a name that post lists. Anything else: 404, no detail."""
+        """An image of this reviewer's bundle, only for a post one of their forms shows and only
+        by a name that post lists. Anything else (another bundle's image too): 404, no detail."""
         if not _BUNDLE.fullmatch(bundle_id):
             abort(404)
-        bundle = store.active_bundle()
+        bundle = store.bundle_for(g.who.reviewer)
         post = bundle.posts.get(post_ref) if bundle_id == bundle.bundle_id else None
         if post is None or post_ref not in F.media_posts(bundle, g.who.session) \
                 or name not in post["media"]:
             abort(404)
-        found = store.media(post_ref, name)
+        found = store.media(g.who.reviewer, post_ref, name)
         if found is None or found[1] not in IMAGE_TYPES or len(found[0]) > MAX_IMAGE_BYTES:
             abort(404)
         response = Response(found[0], mimetype=found[1])

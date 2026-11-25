@@ -117,6 +117,13 @@ def request_code(store, secret: bytes, address: str, network: str, now: datetime
     return Asked(True, reviewer, code)
 
 
+def cancel_codes(store, reviewer, now: datetime) -> None:
+    """End every unused code of the reviewer: a code that was never delivered cannot be tried."""
+    with store.connection() as conn:
+        conn.cursor().execute("UPDATE login_code SET used_at = %s WHERE reviewer_id = %s "
+                              "AND used_at IS NULL", (now, reviewer.id))
+
+
 def verify_code(store, secret: bytes, address: str, code: str, network: str,
                 now: datetime) -> str | None:
     """The token of a new session, or None. One refusal for every reason: not listed, revoked,

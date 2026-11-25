@@ -136,7 +136,8 @@ def test_an_image_is_served_only_to_a_reviewer_whose_form_shows_its_post(site): 
 
 
 ROUTES = ("/", "/guide", "/fields", "/form/i07", "/form/nothing", "/continue", "/sign-in",
-          "/healthz", "/robots.txt", "/static/app.css", "/static/app.js", "/static/nothing.css",
+          "/healthz", "/robots.txt", "/favicon.ico", "/static/app.css", "/static/app.js",
+          "/static/nothing.css",
           "/nothing", "/media/x/y/z")
 
 
@@ -201,7 +202,7 @@ def test_the_health_page_and_the_static_files_touch_neither_the_store_nor_a_sess
     b = site.browser()
     health = b.get("/healthz")
     assert health.status_code == 200 and health.get_data() == b"ok\n"
-    assert b.get("/robots.txt").status_code == 200
+    assert b.get("/robots.txt").status_code == 200 and b.get("/favicon.ico").status_code == 204
     assert b.get("/static/app.css").status_code == 200
     assert b.get("/healthz", headers={"Cookie": "__Host-session=anything"}).status_code == 200
 
@@ -239,7 +240,7 @@ def test_preview_and_test_show_invented_data_only_and_say_so(tmp_path, store, ds
     assert "Demonstration data" in site.browser().get("/sign-in").get_data(as_text=True)
     # The same content published WITHOUT the flag: the site answers no content route any more,
     # and an application for preview or test refuses to start on it.
-    files, media = bundle_bytes(write_demo(tmp_path / "again"))
+    files, media = bundle_bytes(tmp_path / "demo")  # the site's own bundle: its reviewers' bundle
     store.publish_bundle(*files, media, is_demo=False, source_sequences=1)
     for path in ("/", "/form/i07", "/guide", f"/media/{site.bundle.bundle_id}/p01/chart-p01.png"):
         answer = b.get(path)
@@ -247,13 +248,17 @@ def test_preview_and_test_show_invented_data_only_and_say_so(tmp_path, store, ds
     for env in ("preview", "test"):
         with pytest.raises(RuntimeError, match="NOT_A_DEMO_BUNDLE"):
             web.create_app(Store(dsn), mail.Outbox(), {**site.config, "SITE_ENV": env})
-    # Production serves it, without the band.
-    live = web.create_app(Store(dsn), site.outbox, {**site.config, "SITE_ENV": "production"})
-    client = live.test_client()
+    # Production serves the reviewer that bundle, which is theirs, and without the band: the
+    # band follows the reader's bundle, not the environment (a real reviewer beside a test
+    # identity: the next test).
+    client = site.production().test_client()
     token = b.client.get_cookie("__Host-session", domain="reviewer.example.invalid").value
     client.set_cookie("__Host-session", token, domain="reviewer.example.invalid", secure=True)
     page = client.get("/form/i07", base_url=ORIGIN)
     assert page.status_code == 200 and b"Demonstration data" not in page.get_data()
+    store.publish_bundle(*files, media, is_demo=True, source_sequences=1)
+    assert b"Demonstration data" in client.get("/form/i07", base_url=ORIGIN).get_data()
+    store.publish_bundle(*files, media, is_demo=False, source_sequences=1)
     # The configuration itself.
     for config, code in (({"SESSION_SECRET": "short"}, "SESSION_SECRET_TOO_SHORT"),
                          ({"SESSION_SECRET": ""}, "SESSION_SECRET_TOO_SHORT"),
@@ -270,3 +275,116 @@ def test_preview_and_test_show_invented_data_only_and_say_so(tmp_path, store, ds
         web.from_environment({"SESSION_SECRET": SECRET, "SITE_ENV": "preview"})  # no database
     with pytest.raises(RuntimeError, match="MAIL_NOT_CONFIGURED"):
         web.from_environment({"DATABASE_URL": dsn, "SESSION_SECRET": SECRET})  # production
+
+
+def test_a_test_identity_reads_invented_forms_beside_a_real_reviewer_in_production(
+        tmp_path, store, dsn):  # noqa: F811
+    """One database, production: the reviewer works on the real bundle (here an invented
+    stand-in for it), the owner's test identity on the demonstration bundle. Neither ever gets
+    a form, an image or a record of the other's."""
+    from hosted_web_site import SYSTEM_MARKS
+
+    site = Site(tmp_path, store, dsn)  # noqa: F811 - the demonstration bundle, with its marks
+    demo = site.bundle
+    real = site.publish_real(write_demo(tmp_path / "real"))
+    assert real.bundle_id != demo.bundle_id and not set(real.items) & set(demo.items)
+    site.set_reviewer(FIRST, bundle_id=real.bundle_id)  # the reviewer: the real bundle
+    store.upsert_reviewer("TEST-1", "tester@example.invalid", name="Test Identity",
+                          scope_sequences=40, is_test=True)  # takes the invented bundle
+    assert site.reviewers["TEST-1"].bundle_id == demo.bundle_id
+    live = site.production()
+    assert b"Demonstration data" not in site.browser(live).get("/sign-in").get_data()
+    # The test identity signs in by mail like everybody: production never shows a code.
+    tester = site.browser(live)
+    asked = tester.post("/sign-in", {"address": "tester@example.invalid"})
+    code = site.code()
+    whole = asked.get_data(as_text=True) + repr(sorted(asked.headers.items()))
+    assert site.outbox.sent[-1][0] == "tester@example.invalid" and code not in whole
+    assert "your code is" not in whole and "Demonstration" not in whole
+    assert tester.post("/sign-in/verify", {"address": "tester@example.invalid",
+                                           "code": code}).status_code == 303
+    reviewer = site.browser(live).sign_in(FIRST)
+
+    def forms(browser) -> list[str]:
+        return re.findall(r'href="/form/([^"]+)"', browser.get("/").get_data(as_text=True))
+
+    assert forms(tester) == list(F_scoped(demo)) and forms(reviewer) == list(F_scoped(real))
+    assert forms(reviewer)[0] == "ri07" and forms(tester)[0] == "i07"
+    # The band: wherever the reader's bundle is invented, and only there.
+    for path in ("/", "/form/i07", "/guide", "/fields"):
+        assert b"Demonstration data" in tester.get(path).get_data(), path
+    for path in ("/", "/form/ri07", "/guide", "/fields"):
+        assert b"Demonstration data" not in reviewer.get(path).get_data(), path
+    # A form of the other bundle does not exist, to read or to write.
+    for browser, theirs, other in ((reviewer, "ri07", "i07"), (tester, "i07", "ri07")):
+        data = {"_csrf": browser.csrf(), "_phase": A.INDEPENDENT, "_key": "k" * 24}
+        assert browser.get(f"/form/{theirs}").status_code == 200
+        assert browser.get(f"/form/{other}").status_code == 404
+        assert browser.post(f"/form/{other}/state", data).status_code == 404
+        assert browser.post(f"/form/{other}/save", data).status_code == 404
+    # An image of the other bundle is not served, by any of its names.
+    real_image = f"/media/{real.bundle_id}/qp01/real-chart-p01.png"
+    demo_image = f"/media/{demo.bundle_id}/p01/chart-p01.png"
+    assert reviewer.get(real_image).get_data().startswith(PNG)
+    assert tester.get(demo_image).get_data().startswith(PNG)
+    refused = [reviewer.get(demo_image), tester.get(real_image),
+               reviewer.get(f"/media/{real.bundle_id}/p01/chart-p01.png"),
+               reviewer.get(f"/media/{real.bundle_id}/qp01/chart-p01.png"),
+               reviewer.get(f"/media/{demo.bundle_id}/qp01/real-chart-p01.png"),
+               tester.get(f"/media/{demo.bundle_id}/qp01/real-chart-p01.png"),
+               tester.get(f"/media/{demo.bundle_id}/p01/real-chart-p01.png"),
+               tester.get(f"/media/{real.bundle_id}/p01/chart-p01.png")]
+    assert [r.status_code for r in refused] == [404] * 8
+    assert not [r for r in refused if PNG in r.get_data()]
+    # Each one's records are of their own bundle, and stay their own.
+    tester.site.bundle = demo
+    tester.open("i07")
+    tester.review("s14a", after=False)
+    tester.review("s14b", after=False)  # the invented system's reading is revealed to the tester
+    assert SYSTEM_MARKS["s14b"]["reference"] in tester.shown.text
+    reviewer.review("ri07", like="i07")
+    assert {r["bundle_id"] for r in site.records("TEST-1")} == {demo.bundle_id}
+    assert {r["bundle_id"] for r in site.records(FIRST)} == {real.bundle_id}
+    assert {r["item_id"] for r in site.records(FIRST)} == {"ri07"}
+    pages = [reviewer.get("/"), reviewer.get("/form/rs14a"), reviewer.get("/form/rs14b"),
+             reviewer.get("/form/ri07")]
+    for page in pages:
+        assert b"ZQSYS" not in page.get_data() and b"Demonstration" not in page.get_data()
+    assert "1 of 45" in pages[0].get_data(as_text=True)
+    assert "0 of 45" in tester.get("/").get_data(as_text=True)
+    assert reviewer.get("/continue").headers["Location"] == "/form/ri08"
+    assert tester.get("/continue").headers["Location"] == "/form/i07"
+    # A test identity is served an invented bundle or nothing.
+    with pytest.raises(A.AdjudicationError, match="TEST_IDENTITY_NEEDS_A_DEMO_BUNDLE"):
+        site.set_reviewer("TEST-1", bundle_id=real.bundle_id)
+    site.sql("UPDATE bundle SET is_demo = FALSE, active = FALSE WHERE bundle_id = %s",
+             demo.bundle_id)  # no longer flagged as invented
+    assert tester.get("/").status_code == 503 and tester.get(demo_image).status_code == 503
+    assert reviewer.get("/").status_code == 200
+
+
+def F_scoped(bundle) -> dict:
+    from reviewer_web import forms as F
+
+    return F.scoped(bundle, A.Session("x", "x", A.REVIEWER, A.FULL, True, 40))
+
+
+def test_a_reviewer_without_a_bundle_is_served_nothing(store, dsn):  # noqa: F811
+    from reviewer_web import app as web
+    from reviewer_web import mail
+    from reviewer_web.store import Store
+
+    row = store.upsert_reviewer("REMOTE-1", "early@example.invalid", name="Early Example")
+    assert row.bundle_id is None  # listed before anything was published
+    outbox = mail.Outbox()
+    app = web.create_app(Store(dsn), outbox, {"SESSION_SECRET": SECRET, "SITE_ENV": "production",
+                                              "SIGN_IN_FLOOR_SECONDS": 0})
+    client = app.test_client()
+    kw = {"base_url": ORIGIN, "headers": {"Origin": ORIGIN}}
+    client.post("/sign-in", data={"address": row.login}, **kw)
+    code = re.search(r"\b\d{6}\b", outbox.sent[-1][2]).group(0)
+    assert client.post("/sign-in/verify", data={"address": row.login, "code": code},
+                       **kw).status_code == 303
+    for path in ("/", "/continue", "/form/i07", "/guide", "/media/" + "0" * 64 + "/p01/x.png"):
+        answer = client.get(path, base_url=ORIGIN)
+        assert answer.status_code == 503 and b"The site is not available." in answer.get_data()

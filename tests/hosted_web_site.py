@@ -23,7 +23,14 @@ from html.parser import HTMLParser
 from pathlib import Path
 
 import pytest
-from hosted_pg import demo_reviewers, dsn, publish_demo, store, write_demo  # noqa: F401
+from hosted_pg import (  # noqa: F401 - fixtures
+    bundle_bytes,
+    demo_reviewers,
+    dsn,
+    publish_demo,
+    store,
+    write_demo,
+)
 from werkzeug.datastructures import MultiDict
 
 from tradingbot.runtime import adjudication as A
@@ -227,9 +234,9 @@ def scenario_reading(bundle: A.Bundle, item_id: str) -> tuple[dict, dict]:
 class Browser:
     """A browser on the site: one cookie jar, ``Origin`` on every POST."""
 
-    def __init__(self, site):
+    def __init__(self, site, app=None):
         self.site = site
-        self.client = site.app.test_client()
+        self.client = (app or site.app).test_client()
         self.shown: Shown | None = None
 
     # -- plain requests
@@ -237,10 +244,14 @@ class Browser:
     def get(self, path: str, **kw):
         return self.client.get(path, base_url=ORIGIN, **kw)
 
-    def post(self, path: str, data=None, *, origin: str | None = ORIGIN, headers=None, **kw):
+    def post(self, path: str, data=None, *, origin: str | None = "null", headers=None, **kw):
+        """A form submitted from a page of the site, with the headers a browser sends: under
+        the site's ``Referrer-Policy: no-referrer`` that is ``Origin: null`` and
+        ``Sec-Fetch-Site: same-origin`` (the form's script sends the site's own origin).
+        ``origin=None``: neither header."""
         headers = dict(headers or {})
         if origin is not None:
-            headers.setdefault("Origin", origin)
+            headers.setdefault("Origin", ORIGIN if "X-Fragment" in headers else origin)
             headers.setdefault("Sec-Fetch-Site", "same-origin")
         return self.client.post(path, data=MultiDict(data or {}), base_url=ORIGIN,
                                 headers=headers, **kw)
@@ -313,10 +324,11 @@ class Browser:
             self.shown = shown = Shown(self.get(shown.response.headers["Location"]))
         return shown
 
-    def review(self, item_id: str, *, after: bool = True) -> None:
-        """The scenario's reading of ``item_id``: independent, and (when the system's reading is
-        revealed) after the reveal with the two mapping questions answered YES."""
-        reading, form = scenario_reading(self.site.bundle, item_id)
+    def review(self, item_id: str, *, after: bool = True, like: str | None = None) -> None:
+        """The scenario's reading of ``item_id`` (or of the demo item ``like`` it is a copy of):
+        independent, and (when the system's reading is revealed) after the reveal with the two
+        mapping questions answered YES."""
+        reading, form = scenario_reading(self.site.bundle, like or item_id)
         self.open(item_id)
         self.fill(reading)
         saved = self.save(confidence=form["confidence"], flags=form["flags"],
@@ -362,8 +374,51 @@ class Site:
     def reviewers(self) -> dict:
         return {r.alias: r for r in self.admin.reviewers()}
 
-    def browser(self) -> Browser:
-        return Browser(self)
+    def browser(self, app=None) -> Browser:
+        """A new browser on the site's application, or on another one over the same database."""
+        return Browser(self, app)
+
+    def production(self):
+        """The same database served as production (mail goes to the same outbox)."""
+        from reviewer_web import app as web
+        from reviewer_web.store import Store
+
+        return web.create_app(Store(self.dsn), self.outbox,
+                              {**self.config, "SITE_ENV": "production"})
+
+    def publish_real(self, base: Path):
+        """Publish an invented stand-in for the REAL bundle beside the demonstration one: the
+        demo's content with every form, post and image under another name (``r``, ``q``,
+        ``real-``), so that nothing of one bundle can be asked for by a name of the other."""
+        root = base / "bundle"
+
+        def rows(name):
+            return [json.loads(line) for line in (root / name).read_text().splitlines()]
+
+        def write(name, data):
+            (root / name).write_text("".join(json.dumps(r, sort_keys=True) + "\n" for r in data))
+
+        items, posts, sequences = rows("items.jsonl"), rows("posts.jsonl"), rows("sequences.jsonl")
+        ids = {r["item_id"] for r in items}
+        for r in posts:
+            r["post_ref"] = "q" + r["post_ref"]
+            r["media"] = ["real-" + m for m in r["media"]]
+        for r in sequences:
+            r["post_refs"] = ["q" + ref for ref in r["post_refs"]]
+        for r in items:
+            r["item_id"], r["post_ref"] = "r" + r["item_id"], "q" + r["post_ref"]
+            r["context_refs"] = ["q" + ref for ref in r["context_refs"]]
+            if r["ai"].get("idea_ref") in ids:
+                r["ai"]["idea_ref"] = "r" + r["ai"]["idea_ref"]
+        write("items.jsonl", items), write("posts.jsonl", posts), write("sequences.jsonl", sequences)
+        for image in list((root / "media").iterdir()):
+            image.rename(image.with_name("real-" + image.name))
+        manifest = json.loads((root / "manifest.json").read_text())
+        manifest["bundle_id"] = A.bundle_digest(root)
+        (root / "manifest.json").write_text(json.dumps(manifest, indent=1) + "\n")
+        files, media = bundle_bytes(base)
+        return self.admin.publish_bundle(*files, media, is_demo=False,
+                                         source_sequences=len(sequences))
 
     def code(self) -> str:
         """The code of the newest message in the outbox."""
@@ -377,7 +432,7 @@ class Site:
         """Change a reviewer's row (role, access, scope_sequences), as the operator tool does."""
         row = self.reviewers[alias]
         kw = {"name": row.name, "role": row.role, "access": row.access,
-              "scope_sequences": row.scope_sequences, **changes}
+              "scope_sequences": row.scope_sequences, "is_test": row.is_test, **changes}
         self.admin.upsert_reviewer(alias, row.login_shown, **kw)
 
     def sql(self, statement: str, *values) -> list:
