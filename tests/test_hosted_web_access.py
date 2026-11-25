@@ -10,7 +10,7 @@ import re
 from pathlib import Path
 
 import pytest
-from hosted_pg import bundle_bytes
+from hosted_pg import bundle_bytes, write_demo
 from hosted_web_site import (  # noqa: F401 - fixtures
     FIRST,
     ORIGIN,
@@ -248,14 +248,17 @@ def test_preview_and_test_show_invented_data_only_and_say_so(tmp_path, store, ds
     for env in ("preview", "test"):
         with pytest.raises(RuntimeError, match="NOT_A_DEMO_BUNDLE"):
             web.create_app(Store(dsn), mail.Outbox(), {**site.config, "SITE_ENV": env})
-    # Production serves the reviewer the bundle that is theirs: still the invented one, and
-    # the band says so there too (a real reviewer beside a test identity: the next test).
+    # Production serves the reviewer that bundle, which is theirs, and without the band: the
+    # band follows the reader's bundle, not the environment (a real reviewer beside a test
+    # identity: the next test).
     client = site.production().test_client()
     token = b.client.get_cookie("__Host-session", domain="reviewer.example.invalid").value
     client.set_cookie("__Host-session", token, domain="reviewer.example.invalid", secure=True)
     page = client.get("/form/i07", base_url=ORIGIN)
-    assert page.status_code == 200 and b"Demonstration data" in page.get_data()
-    assert b"Demonstration data" not in client.get("/healthz", base_url=ORIGIN).get_data()
+    assert page.status_code == 200 and b"Demonstration data" not in page.get_data()
+    store.publish_bundle(*files, media, is_demo=True, source_sequences=1)
+    assert b"Demonstration data" in client.get("/form/i07", base_url=ORIGIN).get_data()
+    store.publish_bundle(*files, media, is_demo=False, source_sequences=1)
     # The configuration itself.
     for config, code in (({"SESSION_SECRET": "short"}, "SESSION_SECRET_TOO_SHORT"),
                          ({"SESSION_SECRET": ""}, "SESSION_SECRET_TOO_SHORT"),
