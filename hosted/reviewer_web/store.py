@@ -664,6 +664,17 @@ class AdminStore(Store):
                 " AND b.is_demo = %s GROUP BY b.bundle_id", (demo,)).fetchone()
         return row and dict(zip(keys, row, strict=True))
 
+    def published_files(self, bundle_id: str) -> tuple[list[str], dict[str, str]]:
+        """(the sha256 of the four stored files, {image name: sha256 of its stored bytes}) of a
+        stored bundle: what ``verify`` compares with a fresh cut of the local bundle."""
+        with self.connection() as conn:
+            row = conn.execute("SELECT manifest, sequences, items, posts FROM bundle"
+                               " WHERE bundle_id = %s", (bundle_id,)).fetchone()
+            images = conn.execute("SELECT name, bytes FROM media WHERE bundle_id = %s",
+                                  (bundle_id,)).fetchall()
+        return ([sha256(bytes(x)) for x in row] if row else [],
+                {name: sha256(bytes(data)) for name, data in images})
+
     # -------------------------------------------------------------- events, verbatim
 
     def insert_events(self, lines: list[EventLine]) -> None:

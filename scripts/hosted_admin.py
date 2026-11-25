@@ -903,6 +903,35 @@ def chain_problems(events: list[dict], anchor: dict | None) -> list[str]:
     return out
 
 
+def published_problems(store, base: Path) -> list[str]:
+    """Re-check R6: what is stored of the published part, compared again with a fresh cut of the
+    local bundle at the stored scope: the sha256 of the four files and of every image, both
+    ways. The active bundle of this folder (real, else the demonstration one) is compared; a
+    real bundle of another folder is a problem. Counts only."""
+    local_id = A.load_bundle(base / "bundle", A.RESTRICTED).bundle_id
+    real, demo = store.published(demo=False), store.published(demo=True)
+    mine = next((p for p in (real, demo) if p and p["bundle_id"] == local_id), None)
+    if mine is None:
+        if real is not None:
+            print("published files: the active real bundle is not this folder's: NOT compared")
+            return ["PUBLISHED_BUNDLE_IS_NOT_THIS_FOLDER_S"]
+        print("published files: no active bundle is this folder's: not compared")
+        return []
+    _full, files, media = subset(base, mine["scope_sequences"])
+    stored_files, stored_media = store.published_files(local_id)
+    files_differ = sum(a != b for a, b in zip([sha256(f) for f in files], stored_files,
+                                              strict=False)) + abs(len(files) - len(stored_files))
+    names = set(media) | set(stored_media)
+    images_differ = sum(sha256(media[n]) != stored_media.get(n) if n in media else True
+                        for n in names)
+    print(f"published files of bundle {local_id[:12]} against a fresh cut of the local bundle: "
+          f"files {len(files) - files_differ} of {len(files)} equal, images "
+          f"{len(names) - images_differ} of {len(names)} equal: "
+          f"{'PASS' if not files_differ and not images_differ else 'FAIL'}")
+    return ["PUBLISHED_FILE_DIFFERS"] * bool(files_differ) + \
+        ["PUBLISHED_IMAGE_DIFFERS"] * bool(images_differ)
+
+
 def cmd_verify(args) -> int:
     store = _store()
     with store.connection():
@@ -938,6 +967,7 @@ def cmd_verify(args) -> int:
                          and _pulled(rec) not in hosted]
         print(f"snapshot {folders[-1].name}: {len(lines)} line(s); {len(legacy)} LEGACY line(s) "
               "compared with it")
+    problems += published_problems(store, _base(args))
     for problem in problems[:40]:
         print(f"  {problem}")
     print(f"verify: {'FAIL' if problems else 'PASS'}, {len(problems)} problem(s)")

@@ -1957,7 +1957,9 @@ def test_a_test_identity_s_saves_through_the_site_are_a_stream_of_their_own(
     out = run("verify", code=1)  # both chains hold; all it misses is an imported log
     assert out.startswith("events: HOSTED 6, TEST 3; hosted chain on ") and \
         "CHAIN_BROKEN" not in out
-    assert out.splitlines()[1:] == ["  NO_SNAPSHOT", "verify: FAIL, 1 problem(s)"]
+    assert out.splitlines()[1:] == [
+        "published files: no active bundle is this folder's: not compared", "  NO_SNAPSHOT",
+        "verify: FAIL, 1 problem(s)"]
     out = run("status")
     assert "TEST-1" not in out and out.splitlines()[-1] == \
         "test identities: 1 (see test-report ALIAS)"
@@ -2181,3 +2183,25 @@ def test_local_lines_of_a_reviewer_without_a_row_are_accepted_only_by_their_coun
     out = run("parity", "--accept-unlisted-lines", "1")
     assert "1, of 1 sign-in spelling(s): accepted as named (--accept-unlisted-lines 1)" in out
     assert out.splitlines()[-1].endswith("PASS, 2 reviewer(s)")
+
+
+def test_verify_compares_the_published_files_with_a_fresh_cut_of_the_local_bundle(
+        run, store, base, dsn):
+    """Re-check R6 (probe ``test_r15::test_nothing_compares_the_published_files...``): the stored
+    posts and images were changed with the owning role, and ``verify`` still said PASS."""
+    import psycopg
+
+    cutover(run, store, base)
+    out = run("verify")
+    assert "files 4 of 4 equal, images 1 of 1 equal: PASS" in out and "verify: PASS" in out
+    with psycopg.connect(dsn) as conn:  # the owning role, or anyone holding its address
+        conn.execute("UPDATE media SET bytes = bytes || 'x'")
+    out = run("verify", code=1)
+    assert "images 0 of 1 equal: FAIL" in out and "PUBLISHED_IMAGE_DIFFERS" in out
+    with psycopg.connect(dsn) as conn:
+        conn.execute("UPDATE bundle SET posts = convert_to(replace(convert_from(posts, 'UTF8'),"
+                     " 'a', 'e'), 'UTF8')")
+    out = run("verify", code=1)
+    assert "files 3 of 4 equal" in out and "PUBLISHED_FILE_DIFFERS" in out
+    run("publish-bundle", "--demo", base)  # published again: equal again
+    assert "verify: PASS" in run("verify")
