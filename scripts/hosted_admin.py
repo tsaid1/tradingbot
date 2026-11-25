@@ -1234,10 +1234,11 @@ def _site_url(url: str, role: str, password: str) -> str:
 
 
 def scram_verifier(password: str, salt: bytes | None = None, iterations: int = 4096) -> str:
-    """The SCRAM-SHA-256 verifier PostgreSQL stores for ``password`` (RFC 5802, 7677), computed
-    HERE: the statement that sets the password carries this verifier, never the password, so a
-    server that logs statements keeps nothing that signs in. (The password is URL-safe ASCII,
-    which SASLprep leaves as it is.)"""
+    """The SCRAM-SHA-256 verifier PostgreSQL stores for ``password`` with ``salt`` (RFC 5802,
+    7677). NOT sent to the server: the hosting provider accepts a password in plain text only
+    ("Hashed passwords are not supported"; a statement carrying a verifier fails there when the
+    transaction ends). Kept to prove that the verifier a server stored belongs to the password
+    in the address file. (The password is URL-safe ASCII, which SASLprep leaves as it is.)"""
     import base64
     import hashlib
     import hmac
@@ -1269,9 +1270,11 @@ def cmd_make_site_role(args) -> int:
     """Create the login role the SITE connects as, give it a new password, or (``--grants-only``)
     give an existing one exactly the present rights again without touching its password: the
     rights the site's code uses and no other, no ownership. A new address goes to a file (mode
-    0600); nothing secret is printed, and the password never travels to the server (only its
-    SCRAM-SHA-256 verifier). It works for an operator that has CREATEROLE and is not a superuser
-    (the hosting provider's), and after the schema was dropped and made again."""
+    0600), written only once the database has accepted the change; nothing secret is printed.
+    The statement carries the password itself, over the direct TLS connection: the hosting
+    provider takes no hashed password (seen there: a verifier is refused when the transaction
+    ends). It works for an operator that has CREATEROLE and is not a superuser (the hosting
+    provider's), and after the schema was dropped and made again."""
     url = os.environ.get(URL_ENV)
     if not SITE_ROLE.match(args.role):
         raise refused("BAD_ROLE_NAME")
@@ -1289,13 +1292,13 @@ def cmd_make_site_role(args) -> int:
         password = None
         if not args.grants_only:
             password = secrets.token_urlsafe(32)
-            verifier = sql.Literal(scram_verifier(password))
+            secret = sql.Literal(password)
             if found:  # only the password: what an operator without superuser may alter
-                conn.execute(sql.SQL("ALTER ROLE {} PASSWORD {}").format(role, verifier))
+                conn.execute(sql.SQL("ALTER ROLE {} PASSWORD {}").format(role, secret))
             else:
                 conn.execute(sql.SQL(
                     "CREATE ROLE {} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT"
-                    " NOREPLICATION NOBYPASSRLS PASSWORD {}").format(role, verifier))
+                    " NOREPLICATION NOBYPASSRLS PASSWORD {}").format(role, secret))
         schema, database = (sql.Identifier(x) for x in conn.execute(
             "SELECT current_schema(), current_database()").fetchone())
         for statement in ("REVOKE ALL ON ALL TABLES IN SCHEMA {s} FROM {r}",
@@ -1326,9 +1329,9 @@ def cmd_make_site_role(args) -> int:
             grant("UPDATE, DELETE", table)
         for table, columns in SITE_SETS.items():
             grant("UPDATE", table, columns)
-        if password is not None:
-            with PrivateDir(args.out, "site database address", create=True) as d:
-                d.create(d.name, (_site_url(url, args.role, password) + "\n").encode("utf-8"))
+    if password is not None:  # only now: the database has accepted the role and its password
+        with PrivateDir(args.out, "site database address", create=True) as d:
+            d.create(d.name, (_site_url(url, args.role, password) + "\n").encode("utf-8"))
     done = "rights given again, password unchanged" if args.grants_only else (
         "password changed" if found else "created")
     print(f"site role {args.role}: {done}; it owns "

@@ -487,8 +487,11 @@ Give the content of that file to the site as its `SITE_DATABASE_URL` (with the h
 pooled address, if the site should use the pool), and keep `HOSTED_DATABASE_URL` (the owner's
 role) on the Mac only; the platform may keep managing `DATABASE_URL`, which the site then does
 not use. Run it again with another `--out` to change the password, and with `--grants-only`
-after an `init-db` that added a table (the password stays). The password never travels to the
-server: the statement carries its SCRAM-SHA-256 verifier, computed on the Mac. It works for an
+after an `init-db` that added a table (the password stays). The statement carries the
+password itself, over the direct TLS connection: the hosting provider takes a password in plain
+text only (a statement carrying a SCRAM verifier is refused there when the transaction ends),
+and stores its own verifier. The address file is written only after the database accepted the
+change, so a refused run leaves no file. It works for an
 operator that has CREATEROLE and is not a superuser (a second run alters only the password),
 and after the schema was dropped and made again. It runs after `init-db` (the tables must
 exist), over the direct connection when `HOSTED_DATABASE_URL_UNPOOLED` is set. It refuses a

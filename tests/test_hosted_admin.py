@@ -2120,7 +2120,10 @@ def test_make_site_role_works_for_an_operator_who_is_not_a_superuser(
     for path, verifier in ((tmp_path / "k" / "a1", first), (tmp_path / "k" / "a2", second)):
         salt = __import__("base64").b64decode(verifier.split("$")[1].split(":")[1])
         assert cli.scram_verifier(password_of(path), salt) == verifier  # its own password's
-        assert not [q for q in sent if password_of(path) in q]  # never sent to the server
+        # The hosting provider takes a password in plain text only ("Hashed passwords are not
+        # supported"): it travels in the ONE statement that sets it, and in no other.
+        assert [q.split()[:2] for q in sent if password_of(path) in q] in (
+            [["CREATE", "ROLE"]], [["ALTER", "ROLE"]])
     out = run("make-site-role", "--role", role, "--grants-only")
     assert "rights given again, password unchanged" in out and stored_verifier() == second
     assert not (tmp_path / "k" / "a3").exists()
