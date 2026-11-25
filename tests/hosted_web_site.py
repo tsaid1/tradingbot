@@ -244,10 +244,14 @@ class Browser:
     def get(self, path: str, **kw):
         return self.client.get(path, base_url=ORIGIN, **kw)
 
-    def post(self, path: str, data=None, *, origin: str | None = ORIGIN, headers=None, **kw):
+    def post(self, path: str, data=None, *, origin: str | None = "null", headers=None, **kw):
+        """A form submitted from a page of the site, with the headers a browser sends: under
+        the site's ``Referrer-Policy: no-referrer`` that is ``Origin: null`` and
+        ``Sec-Fetch-Site: same-origin`` (the form's script sends the site's own origin).
+        ``origin=None``: neither header."""
         headers = dict(headers or {})
         if origin is not None:
-            headers.setdefault("Origin", origin)
+            headers.setdefault("Origin", ORIGIN if "X-Fragment" in headers else origin)
             headers.setdefault("Sec-Fetch-Site", "same-origin")
         return self.client.post(path, data=MultiDict(data or {}), base_url=ORIGIN,
                                 headers=headers, **kw)

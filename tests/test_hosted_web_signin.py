@@ -237,17 +237,26 @@ def test_a_post_needs_the_sessions_csrf_token_and_the_sites_own_origin(site):  #
         assert b.post("/form/i07/save", data).status_code == 403
         assert b.post("/form/i07/state", data).status_code == 403
     good = {"_csrf": csrf}
+
+    def sign_out(origin=None, fetch_site=None):
+        headers = {k: v for k, v in (("Origin", origin), ("Sec-Fetch-Site", fetch_site)) if v}
+        return b.post("/sign-out", good, origin=None, headers=headers).status_code
+
     refused = [
-        b.post("/sign-out", good, origin="https://elsewhere.example.invalid"),
-        b.post("/sign-out", good, origin=ORIGIN.replace("https", "http")),
-        b.post("/sign-out", good, origin=ORIGIN + ".example.invalid"),
-        b.post("/sign-out", good, origin=None),  # neither Origin nor Sec-Fetch-Site
-        b.post("/sign-out", good, origin=None, headers={"Sec-Fetch-Site": "cross-site"}),
-        b.post("/sign-out", good, origin=None, headers={"Sec-Fetch-Site": "same-site"}),
-        b.post("/sign-out", good, headers={"Sec-Fetch-Site": "cross-site"}),
-        b.post("/sign-out", good, origin="null"),
+        sign_out(),  # neither header
+        sign_out("https://elsewhere.example.invalid", "same-origin"),  # the two disagree
+        sign_out("https://elsewhere.example.invalid", "cross-site"),
+        sign_out("https://elsewhere.example.invalid"),
+        sign_out(ORIGIN.replace("https", "http"), "same-origin"),
+        sign_out(ORIGIN + ".example.invalid", "same-origin"),
+        sign_out(fetch_site="cross-site"),
+        sign_out(fetch_site="same-site"),
+        sign_out(fetch_site="none"),
+        sign_out("null", "cross-site"),  # a sandboxed frame elsewhere
+        sign_out(ORIGIN, "cross-site"),
+        sign_out("null"),  # an old browser: "null" proves nothing
     ]
-    assert [r.status_code for r in refused] == [403] * len(refused)
+    assert refused == [403] * len(refused)
     assert signed_in(b) and not site.records(FIRST)
     # The sign-in forms have no session yet: the origin check alone guards them.
     sent = len(site.outbox.sent)
@@ -257,9 +266,15 @@ def test_a_post_needs_the_sessions_csrf_token_and_the_sites_own_origin(site):  #
     assert ask(stranger, login_of(site), origin=None).status_code == 403
     assert enter(stranger, login_of(site), "123456", origin=None).status_code == 403
     assert len(site.outbox.sent) == sent
-    # With only one of the two headers, a same-origin POST passes.
-    assert b.post("/sign-out", good, origin=None,
-                  headers={"Sec-Fetch-Site": "same-origin"}).status_code == 303
+    # What browsers do send from a page of the site passes: a form (under no-referrer the
+    # Origin is "null"), the form's script, a browser without Origin, an old one without
+    # Sec-Fetch-Site.
+    for origin, fetch_site in (("null", "same-origin"), (ORIGIN, "same-origin"),
+                               (None, "same-origin"), (ORIGIN, None)):
+        if not signed_in(b):
+            b.sign_in(FIRST)
+            good["_csrf"] = b.csrf()
+        assert sign_out(origin, fetch_site) == 303
 
 
 def test_no_response_and_no_log_line_carries_a_code_or_an_address(site, caplog):  # noqa: F811

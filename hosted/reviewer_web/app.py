@@ -132,17 +132,19 @@ def create_app(store, mailer, config: dict) -> Flask:
                                who=None, csrf="", demo=demo_env), status
 
     def same_origin() -> bool:
-        """A POST must come from a page of this site: ``Sec-Fetch-Site`` and ``Origin`` (one of
-        them at least; every one that is sent must agree)."""
+        """A POST must come from a page of this site. ``Sec-Fetch-Site`` (which a page cannot
+        set) must say ``same-origin``; an ``Origin`` sent with it must be this site's, or
+        ``null``: under ``Referrer-Policy: no-referrer`` a browser sends ``Origin: null`` with a
+        form it submits to its own site. A browser too old to send ``Sec-Fetch-Site`` is
+        believed only on an ``Origin`` that is this site's."""
         site, origin = request.headers.get("Sec-Fetch-Site"), request.headers.get("Origin")
-        if site is None and origin is None:
-            return False
-        if site is not None and site != "same-origin":
-            return False
-        if origin is not None:
+        ours = False
+        if origin not in (None, "null"):
             parts = urlsplit(origin)
-            return parts.scheme in schemes and parts.netloc == request.host
-        return True
+            ours = parts.scheme in schemes and parts.netloc == request.host
+        if site is None:
+            return ours
+        return site == "same-origin" and (ours or origin in (None, "null"))
 
     def network() -> str:
         """The caller's network address, for the limits only (the platform sets these headers)."""
