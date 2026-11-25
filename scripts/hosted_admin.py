@@ -455,6 +455,13 @@ def cmd_sync_reviewers(args) -> int:
             rows = store.sync_reviewers(reviewers, bundle_id=bundle["bundle_id"],
                                         skip=owner.login if owner else None)
             held = next((r for r in store.reviewers() if r.alias == OWNER_REVIEWER), None)
+            if held is not None and address and held.address.casefold() != address.casefold():
+                # The owner's codes would go elsewhere: said (never the address), and with
+                # lines only on purpose.
+                print(f"{OWNER_REVIEWER}: sign-in address CHANGED")
+                if any(e["alias"] == OWNER_REVIEWER for e in store.events()) \
+                        and not args.address_changed:
+                    raise refused("ADDRESS_CHANGED_NEEDS_THE_FLAG")
             if owner is not None and (address or held):
                 # The owner's REAL reviewer identity: its lines carry the local identity string
                 # exactly as the reviewers file spells it; its codes go to the private address.
@@ -1472,6 +1479,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--owner-address-file", metavar="FILE",
                    help=f"the private file (0600) holding the owner's sign-in address (default: "
                         f"{OWNER_ADDRESS_ENV})")
+    p.add_argument("--address-changed", action="store_true",
+                   help="the owner's address file names another address on purpose")
     p.add_argument("--without-owner", action="store_true",
                    help="leave the owner's reviewer identity out on purpose (no address file)")
     p.add_argument("--owner-entry", type=int, metavar="N",

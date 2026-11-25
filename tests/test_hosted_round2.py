@@ -285,3 +285,20 @@ def test_q3_the_owner_entry_is_never_a_remote_reviewer_s(run, store, base, tmp_p
     assert store.reviewers() == []
     out = run("sync-reviewers", "--demo", "--owner-entry", "3", "--owner-address-file", secret)
     assert "OWNER-REVIEWER: id " in out and "REMOTE-2: id " in out
+
+
+def test_m1_a_changed_sign_in_address_of_a_row_with_lines_needs_the_flag(
+        run, store, base, tmp_path):  # noqa: F811
+    from test_hosted_identities import owner_cutover
+
+    owner_cutover(run, store, base, tmp_path)
+    other = address_file(tmp_path / "other", "Owner.Other@example.invalid")
+    out = run("sync-reviewers", "--demo", "--owner-address-file", other, code=2)
+    assert "OWNER-REVIEWER: sign-in address CHANGED" in out
+    assert out.endswith("refused: ADDRESS_CHANGED_NEEDS_THE_FLAG\n")
+    owner = {r.alias: r for r in store.reviewers()}["OWNER-REVIEWER"]
+    assert owner.address != "Owner.Other@example.invalid"
+    out = run("sync-reviewers", "--demo", "--owner-address-file", other, "--address-changed")
+    assert "OWNER-REVIEWER: sign-in address CHANGED" in out
+    owner = {r.alias: r for r in store.reviewers()}["OWNER-REVIEWER"]
+    assert owner.address == "Owner.Other@example.invalid"
