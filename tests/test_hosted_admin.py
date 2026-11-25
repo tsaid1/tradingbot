@@ -410,7 +410,8 @@ def test_sync_reviewers_reads_the_owner_s_file_and_never_deletes(run, store, bas
     file.write_bytes(before[0])
     os.utime(file, ns=(before[1], before[1]))
     for command in (["sync-reviewers", "--demo"], ["publish-bundle", "--demo", base],
-                    ["import-log"], ["parity"], ["status"], ["push-returns"]):
+                    ["import-log", "--allow-empty-log"], ["parity"], ["status"],
+                    ["push-returns"]):
         run(*command)
     assert (file.read_bytes(), file.stat().st_mtime_ns) == before
 

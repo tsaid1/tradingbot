@@ -781,8 +781,30 @@ class AdminStore(Store):
         return row and dict(zip(("count", "head", "file_sha256", "imported_at"), row,
                                 strict=True))
 
+    def anchor_writer(self) -> str | None:
+        """Who wrote the anchor (IMPORT, RESTORE, SEED), None when no anchor or not recorded."""
+        with self.connection() as conn:
+            row = conn.execute("SELECT written_by FROM chain_anchor WHERE id = 1").fetchone()
+        return row[0] if row else None
+
+    def mark_preview(self) -> None:
+        """``init-db --preview``: this database is a preview. Refused on a database that holds a
+        bundle that is not invented, or an anchor of a real import."""
+        with self.exclusive() as conn:
+            if conn.execute("SELECT 1 FROM bundle WHERE NOT is_demo LIMIT 1").fetchone() or \
+                    conn.execute("SELECT 1 FROM chain_anchor WHERE written_by IN"
+                                 " ('IMPORT', 'RESTORE') AND snapshot_count > 0").fetchone():
+                raise A.AdjudicationError("NOT_A_PREVIEW_DATABASE")
+            conn.execute("INSERT INTO database_kind (id, kind) VALUES (1, 'PREVIEW')"
+                         " ON CONFLICT (id) DO NOTHING")
+
+    def is_preview(self) -> bool:
+        with self.connection() as conn:
+            return conn.execute("SELECT EXISTS (SELECT 1 FROM database_kind WHERE id = 1"
+                                " AND kind = 'PREVIEW')").fetchone()[0]
+
     def set_anchor(self, count: int, head: str, file_sha256: str,
-                   imported_at: datetime | None = None) -> None:
+                   imported_at: datetime | None = None, *, writer: str | None = None) -> None:
         """Record the local log's state the hosted chain continues. Once a HOSTED line exists
         its head is fixed (the first HOSTED line names it): a different head is refused."""
         with self.exclusive() as conn:
@@ -793,8 +815,10 @@ class AdminStore(Store):
                 raise A.AdjudicationError("ANCHOR_FIXED_BY_HOSTED_LINES")
             conn.execute(
                 "INSERT INTO chain_anchor (id, snapshot_count, snapshot_head_sha256,"
-                " snapshot_file_sha256, imported_at) VALUES (1, %s, %s, %s, COALESCE(%s, now()))"
+                " snapshot_file_sha256, imported_at, written_by)"
+                " VALUES (1, %s, %s, %s, COALESCE(%s, now()), %s)"
                 " ON CONFLICT (id) DO UPDATE SET snapshot_count = EXCLUDED.snapshot_count,"
                 " snapshot_head_sha256 = EXCLUDED.snapshot_head_sha256,"
                 " snapshot_file_sha256 = EXCLUDED.snapshot_file_sha256,"
-                " imported_at = EXCLUDED.imported_at", (count, head, file_sha256, imported_at))
+                " imported_at = EXCLUDED.imported_at, written_by = EXCLUDED.written_by",
+                (count, head, file_sha256, imported_at, writer))

@@ -26,6 +26,7 @@ import argparse
 import importlib.util
 import json
 import os
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -159,9 +160,19 @@ def seed(admin, base: Path, alias: str, login: str = LOGIN) -> dict:
     from tradingbot.runtime import adjudication as A
     from tradingbot.runtime.vocab_recommend import GENESIS, encode_line
 
+    if not re.fullmatch(r"ACCEPT-[0-9]{1,3}", alias):
+        raise A.AdjudicationError("SEED_ALIAS_IS_ACCEPT_N")
     with admin.connection() as conn:
+        # Only on a database initialised as a preview (init-db --preview), of invented bundles
+        # only, before any real import, holding no reviewer row but the seed's own.
+        if not admin.is_preview():
+            raise A.AdjudicationError("NOT_A_PREVIEW_DATABASE")
         if conn.execute("SELECT 1 FROM bundle WHERE NOT is_demo LIMIT 1").fetchone():
             raise A.AdjudicationError("NOT_A_DEMO_DATABASE")
+        if admin.anchor() is not None and admin.anchor_writer() != "SEED":
+            raise A.AdjudicationError("ANCHOR_EXISTS")
+        if [r.alias for r in admin.reviewers() if not re.fullmatch(r"ACCEPT-[0-9]{1,3}", r.alias)]:
+            raise A.AdjudicationError("OTHER_REVIEWER_ROWS")
     root = base / "bundle"
     files = [(root / n).read_bytes()
              for n in ("manifest.json", "sequences.jsonl", "items.jsonl", "posts.jsonl")]
@@ -174,7 +185,7 @@ def seed(admin, base: Path, alias: str, login: str = LOGIN) -> dict:
         if any(e["alias"] == alias for e in admin.events()):
             raise A.AdjudicationError("ALREADY_SEEDED")
         if admin.anchor() is None:  # an empty local log, imported: reviewers may save
-            admin.set_anchor(0, GENESIS, sha256(b""))
+            admin.set_anchor(0, GENESIS, sha256(b""), writer="SEED")
         admin.stamp_imported([row.id])
     _save(admin, row, RETURNED, after=False)
     admin.append(row, lambda records: A.build_system_shown(records, bundle, row.session(),

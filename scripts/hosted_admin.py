@@ -349,9 +349,13 @@ def cmd_publish_bundle(args) -> int:
 # ------------------------------------------------------------------ reviewers
 
 
-def cmd_init_db(_args) -> int:
+def cmd_init_db(args) -> int:
     store = _store(unpooled=True)
     store.init_schema()
+    if args.preview:
+        store.mark_preview()
+        print("marked as a PREVIEW database (the acceptance seed may write here; never "
+              "production)")
     with store.connection() as conn:
         tables = [name for (name,) in conn.execute(
             "SELECT tablename FROM pg_tables WHERE schemaname = current_schema()"
@@ -539,6 +543,25 @@ def continues(lines: list[bytes], anchor: dict | None) -> bool:
     return count <= len(lines) and (sha256(lines[count - 1]) if count else V.GENESIS) == head
 
 
+def own_anchor(store, lines: list[bytes], anchor: dict | None) -> None:
+    """Refuse an anchor that no import (or restore) of THIS log wrote: one of the acceptance
+    seed, of an earlier version, or of another folder's log, whose first ``count`` lines do not
+    hash to the anchor's snapshot sha256 (ANCHOR_NOT_OF_THIS_LOG)."""
+    if anchor is None:
+        return
+    prefix = b"".join(line + b"\n" for line in lines[:anchor["count"]])
+    if store.anchor_writer() not in ("IMPORT", "RESTORE") or len(lines) < anchor["count"] \
+            or sha256(prefix) != anchor["file_sha256"]:
+        raise refused("ANCHOR_NOT_OF_THIS_LOG")
+
+
+def strangers(events: list[dict], rows, listed) -> int:
+    """HOSTED lines of reviewer rows that are not entries of the reviewers file (an invented
+    tester of a preview, a row of another folder): such a database is not this cutover's."""
+    logins = {r.alias for r in rows if not r.is_test and r.login not in listed}
+    return sum(e["origin"] == HOSTED and e["alias"] in logins for e in events)
+
+
 def anchored(lines: list[bytes], anchor: dict | None) -> None:
     """Refuse a folder whose log is not the log the hosted chain continues: it must hold the
     anchored head at the anchored line count. Without an anchor (nothing imported yet) only a
@@ -612,8 +635,12 @@ def cmd_import_log(args) -> int:
         raise refused("LOCAL_LOG_TOO_LONG")
     local = A.load_bundle(base / "bundle", A.RESTRICTED)
     listed = A.load_reviewers(base / "reviewers.toml").entries
+    if not lines and not args.allow_empty_log:
+        raise refused("EMPTY_LOCAL_LOG")  # a preview only: --allow-empty-log
     with store.exclusive():
         events, anchor = store.events(), store.anchor()
+        if strangers(events, store.reviewers(), listed):
+            raise refused("HOSTED_LINES_OF_ROWS_NOT_IN_THE_FILE")
         legacy = {e["seq"]: e["line"] for e in events if e["origin"] == LEGACY}
         # The reviewers' hosted lines (a test identity's are a stream of their own: TEST).
         hosted = {e["sha256"] for e in events if e["origin"] == HOSTED}
@@ -622,6 +649,7 @@ def cmd_import_log(args) -> int:
         if not continues(lines, anchor) or any(
                 seq > len(lines) or lines[seq - 1] != line for seq, line in legacy.items()):
             raise refused("IMPORTED_PREFIX_DIFFERS")
+        own_anchor(store, lines, anchor)
         rows = {r.login: r for r in store.reviewers() if not r.is_test}
         # One spelling per reviewer: the log's, the row's and the file's. The site finds a
         # reviewer's history by the exact spelling, so a line spelled otherwise would be lost.
@@ -653,7 +681,7 @@ def cmd_import_log(args) -> int:
         store.insert_events(new)
         store.stamp_imported(row.id for row in rows.values())  # open from now on
         if not hosted:  # until a reviewer has saved on the site, the anchor follows the log
-            store.set_anchor(log.count, log.head, sha256(data))
+            store.set_anchor(log.count, log.head, sha256(data), writer="IMPORT")
         anchor, events = store.anchor(), store.events()
         on_site = write_reviews_on_the_site(base, events, store.reviewers(),
                                             set(store.closed_rows()), cutover=args.cutover)
@@ -1046,7 +1074,7 @@ def cmd_restore(args) -> int:
             owner[e["seq"]] = row
         if anchor:
             store.set_anchor(anchor["count"], anchor["head"], anchor["file_sha256"],
-                             anchor["imported_at"])
+                             anchor["imported_at"], writer="RESTORE")
         store.insert_events([S.EventLine(owner[e["seq"]].id, e["origin"], e["line"],
                                          e["idempotency_key"], e["batch"], e["created_at"])
                              for e in events])
@@ -1101,6 +1129,11 @@ def cmd_pull_to_local(args) -> int:
     anchored(_lines(data), anchor)
     if chain_problems(events, anchor):
         raise refused("HOSTED_STORE_FAILS_VERIFICATION")
+    own_anchor(store, _lines(data), anchor)
+    listed = A.load_reviewers(base / "reviewers.toml").entries
+    with store.connection():
+        if strangers(events, store.reviewers(), listed):
+            raise refused("HOSTED_LINES_OF_ROWS_NOT_IN_THE_FILE")
     hosted = [e for e in events if e["origin"] == HOSTED]  # never a TEST or RETURN line
     known = {e["sha256"] for e in hosted}
     held_here = {_pulled(r) for r in log.records}
@@ -1204,6 +1237,7 @@ def cmd_push_returns(args) -> int:
         anchored(lines, anchor)
         if chain_problems(events, anchor):
             raise refused("HOSTED_STORE_FAILS_VERIFICATION")
+        own_anchor(store, lines, anchor)
         rows = {r.login: r for r in store.reviewers()
                 if not r.is_test and r.bundle_id == local.bundle_id}  # who is served that bundle
         ids = {r.alias: r.id for r in rows.values()}
@@ -1420,7 +1454,9 @@ def main(argv: list[str] | None = None) -> int:
     accept = {"type": int, "metavar": "N", "dest": "accept_unlisted_lines",
               "help": "accept exactly N local reviewer lines that no row holds (the number a "
                       "run without it printed); any other number fails"}
-    command("init-db", cmd_init_db, "apply schema.sql (can be run again)")
+    command("init-db", cmd_init_db, "apply schema.sql (can be run again)").add_argument(
+        "--preview", action="store_true",
+        help="mark this database as a preview (never production): the acceptance seed's")
     p = command("sync-reviewers", cmd_sync_reviewers,
                 "the reviewers file's remote reviewers as REMOTE-<n> rows on the real bundle")
     p.add_argument("--demo", action="store_true",
@@ -1457,6 +1493,8 @@ def main(argv: list[str] | None = None) -> int:
                 "snapshot the local log and import the remote reviewers' lines")
     p.add_argument("--snapshots", metavar="DIR", help=f"snapshot root (default: <dir>/{SNAPSHOTS})")
     p.add_argument("--accept-unlisted-lines", **accept)
+    p.add_argument("--allow-empty-log", action="store_true",
+                   help="import an EMPTY local log (a preview only)")
     p.add_argument("--cutover", action="store_true",
                    help="the final import: from now on every imported reviewer reviews on the "
                         "site, and the local workspace refuses their reviewer saves")

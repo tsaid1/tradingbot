@@ -168,6 +168,21 @@ CREATE TABLE IF NOT EXISTS chain_anchor (
     imported_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Who wrote the anchor: IMPORT (import-log of the local log whose first lines hash to
+-- snapshot_file_sha256), RESTORE (restore of an export), SEED (the acceptance seed of a
+-- preview); NULL for an anchor written by an earlier version. import-log, pull-to-local and
+-- push-returns continue only an anchor of IMPORT or RESTORE.
+ALTER TABLE chain_anchor ADD COLUMN IF NOT EXISTS written_by TEXT
+    CHECK (written_by IN ('IMPORT', 'RESTORE', 'SEED'));
+
+-- A database initialised as a PREVIEW (init-db --preview): only there may the acceptance seed
+-- write. Production is initialised without it.
+CREATE TABLE IF NOT EXISTS database_kind (
+    id        INT PRIMARY KEY CHECK (id = 1),
+    kind      TEXT NOT NULL CHECK (kind = 'PREVIEW'),
+    marked_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 -- ---------------------------------------------------------------------------------------------
 -- WEB's section (sign-in codes, sessions, rate limits, queued mail) starts below this line.
 -- ---------------------------------------------------------------------------------------------

@@ -48,6 +48,7 @@ def test_seed_puts_the_named_reviewer_into_the_acceptance_state(seeding, store, 
     from reviewer_web import progress as P
     from reviewer_web.store import Store
 
+    store.mark_preview()  # init-db --preview
     found = seeding.seed(store, seeding.write(tmp_path / "a"), "ACCEPT-1")
     assert found["returned"] == "s01a" and found["forms"][0] == "s01a"
     row = {r.alias: r for r in store.reviewers()}["ACCEPT-1"]
@@ -82,6 +83,7 @@ def test_seed_puts_the_named_reviewer_into_the_acceptance_state(seeding, store, 
 
 def test_seed_refuses_a_database_that_holds_a_real_bundle(seeding, store, tmp_path):  # noqa: F811
     base = hosted_pg.write_demo(tmp_path / "demo")
+    store.mark_preview()
     hosted_pg.publish_as_real(store, base)
     before = (store.events(), [r.alias for r in store.reviewers()], store.anchor())
     with pytest.raises(A.AdjudicationError, match="^NOT_A_DEMO_DATABASE$"):
@@ -94,6 +96,7 @@ def test_the_command_prints_ids_and_counts_only(seeding, dsn, monkeypatch, capsy
     from reviewer_web.store import AdminStore
 
     AdminStore(dsn).init_schema()
+    AdminStore(dsn).mark_preview()
     monkeypatch.setenv("HOSTED_DATABASE_URL", dsn)
     assert seeding.main(["seed", "--alias", "ACCEPT-2"]) == 0
     out = capsys.readouterr().out

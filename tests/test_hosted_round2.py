@@ -177,3 +177,95 @@ def test_q2_a_folder_without_the_marker_behaves_as_before(base):  # noqa: F811
     (base / A.REVIEWS_ON_THE_SITE_FILE).chmod(0o600)
     with pytest.raises(A.AdjudicationError, match="^REVIEWS_ON_THE_SITE_MARKER_UNREADABLE$"):
         local_save(base, ONE, "i08", A.INDEPENDENT)
+
+
+# ------------------------------------------------------------------ Q4
+
+
+def _seed_module():
+    import importlib.util
+
+    from hosted_pg import REPO
+
+    spec = importlib.util.spec_from_file_location("seed_round2",
+                                                  REPO / "scripts" / "hosted_acceptance_seed.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_q4_the_acceptance_seed_writes_only_on_a_preview_database_before_any_import(
+        run, store, base, tmp_path):  # noqa: F811
+    """Q4 (probe ``test_acceptance_seed_on_a_database_before_its_real_import``): the seed ran on
+    any database of invented bundles (production before the cutover), wrote an anchor of an
+    empty log and HOSTED lines of a row that is no test identity; the real import then kept that
+    anchor and pull-to-local brought the invented tester's lines into the real local log."""
+    seed = _seed_module()
+    half_way(base)
+    run("init-db")  # production: no preview mark
+    with pytest.raises(A.AdjudicationError, match="^NOT_A_PREVIEW_DATABASE$"):
+        seed.seed(store, seed.write(tmp_path / "a"), "ACCEPT-1")
+    assert store.events() == [] and store.anchor() is None and store.reviewers() == []
+    assert "marked as a PREVIEW" in run("init-db", "--preview")
+    run("publish-bundle", "--demo", base)
+    run("sync-reviewers", "--demo", "--without-owner")
+    with pytest.raises(A.AdjudicationError, match="^OTHER_REVIEWER_ROWS$"):
+        seed.seed(store, seed.write(tmp_path / "b"), "ACCEPT-1")
+    assert store.anchor() is None
+
+
+def test_q4_import_log_refuses_a_database_a_seed_or_another_folder_wrote_into(
+        run, store, base, tmp_path):  # noqa: F811
+    seed = _seed_module()
+    half_way(base)
+    run("init-db", "--preview")
+    seed.seed(store, seed.write(tmp_path / "a"), "ACCEPT-1")
+    run("publish-bundle", "--demo", base)
+    run("sync-reviewers", "--demo", "--without-owner")
+    lines = len(A.read_annotations(base).records)
+    assert run("import-log", code=2).endswith("refused: HOSTED_LINES_OF_ROWS_NOT_IN_THE_FILE\n")
+    for command in ("pull-to-local", "push-returns"):
+        assert run(command, code=2).endswith("refused: ANCHOR_NOT_OF_THIS_LOG\n")
+    assert len(A.read_annotations(base).records) == lines  # nothing of the tester came home
+    assert not [e for e in store.events() if e["origin"] == "LEGACY"]
+
+
+def test_q4_an_anchor_no_import_of_this_log_wrote_is_continued_by_nothing(
+        run, store, base):  # noqa: F811
+    """With an anchor of 0 lines, ``anchored`` accepted any folder's log. An anchor the seed
+    wrote, or one of another folder's log, is now refused by import-log, pull and push."""
+    from reviewer_web.store import sha256
+
+    half_way(base)
+    run("init-db")
+    run("publish-bundle", "--demo", base)
+    run("sync-reviewers", "--demo", "--without-owner")
+    store.set_anchor(0, V.GENESIS, sha256(b""), writer="SEED")
+    for command in ("import-log", "pull-to-local", "push-returns"):
+        assert run(command, code=2).endswith("refused: ANCHOR_NOT_OF_THIS_LOG\n"), command
+    lines = A.annotations_path(base).read_bytes().splitlines(keepends=True)
+    store.set_anchor(3, store.anchor()["head"], sha256(b"".join(lines[:3])), writer="IMPORT")
+    assert run("import-log", code=2).endswith("refused: IMPORTED_PREFIX_DIFFERS\n")
+
+
+def test_q4_import_log_refuses_hosted_lines_of_rows_not_in_the_file_and_an_empty_log(
+        run, store, base, tmp_path):  # noqa: F811
+    from reviewer_web.store import EventLine
+
+    run("init-db")
+    run("publish-bundle", "--demo", base)
+    run("sync-reviewers", "--demo", "--without-owner")
+    assert run("import-log", code=2) == "refused: EMPTY_LOCAL_LOG\n"
+    run("import-log", "--allow-empty-log")
+    stranger = store.upsert_reviewer("REMOTE-9", "stranger@example.invalid",
+                                     scope_sequences=40)
+    store.stamp_imported([stranger.id])
+    hosted_save(store, stranger, "i07", A.INDEPENDENT)
+    half_way(base)
+    assert run("import-log", code=2).endswith(
+        "refused: HOSTED_LINES_OF_ROWS_NOT_IN_THE_FILE\n")
+    assert run("pull-to-local", code=2).endswith(
+        "refused: HOSTED_LINES_OF_ROWS_NOT_IN_THE_FILE\n")
+    del EventLine
+
+
