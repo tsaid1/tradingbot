@@ -1,7 +1,7 @@
 """Operator, locally: the hosted reviewer site's database (docs/HOSTED_REVIEWER.md, "Operations").
 
     python scripts/hosted_admin.py init-db
-    python scripts/hosted_admin.py sync-reviewers [--demo | --test-identity ALIAS LOGIN]
+    python scripts/hosted_admin.py sync-reviewers [--demo [--force] | --test-identity ALIAS LOGIN]
     python scripts/hosted_admin.py revoke ALIAS
     python scripts/hosted_admin.py restore-access ALIAS
     python scripts/hosted_admin.py invite ALIAS --kind continue|start
@@ -20,7 +20,9 @@ The database is ``HOSTED_DATABASE_URL`` (``init-db`` prefers ``HOSTED_DATABASE_U
 the adjudication folder is ``--dir`` or ``TRADINGBOT_ADJUDICATION_DIR``. Never deployed. It
 prints counts, ids, aliases, times, sizes and fingerprints only: never a sign-in address, a name,
 or a word of a post or a reading; every refusal is a constant code. The owner's reviewers file is
-only read. Exit 0 when all is well, 1 when a check fails (parity, verify), 2 when refused.
+only read. Exit 0 when all is well, 1 when a check fails (parity, verify), 2 when refused: a
+refusal changes nothing, except that a ``pull-to-local`` which fails midway has appended the
+lines before the failure (run it again: it appends the rest).
 """
 from __future__ import annotations
 
@@ -357,6 +359,9 @@ def cmd_sync_reviewers(args) -> int:
             if bundle is None:  # publish-bundle first
                 raise refused("NO_DEMO_BUNDLE_PUBLISHED" if args.demo
                               else "NO_REAL_BUNDLE_PUBLISHED")
+            if args.demo and not args.force and store.published(demo=False) is not None:
+                # It would move the reviewers from the real forms to the invented ones.
+                raise refused("REAL_BUNDLE_IS_PUBLISHED")
             if not _scope_fits(bundle, reviewers.scope_sequences):
                 raise refused("SCOPE_NOT_PUBLISHED")  # publish-bundle first
             # A row with lines keeps its spelling: the site finds a reviewer's history by it.
@@ -622,6 +627,19 @@ def cmd_parity(args) -> int:
         print(f"  next step: local {' '.join(resume[0])}, hosted {' '.join(resume[1])}: "
               f"{'the same' if resume[0] == resume[1] else 'DIFFERENT'}")
         failed = failed or resume[0] != resume[1]
+        if served.bundle_id != local.bundle_id:
+            continue
+        # Where EVERY form stands as the site says it, on both sides: a return that is missing
+        # or stale on a form that is not the next step shows here.
+        sides = [{i: steps[1](bundle, session, records, i) for i in b}
+                 for bundle, records in ((local, at_home), (served, stored))]
+        apart = [i for i in b if sides[0][i] != sides[1][i]]
+        print(f"  the site's state of each form: {len(b) - len(apart)} equal, {len(apart)} "
+              "different")
+        for item_id in apart:
+            print(f"  {item_id}: site state local {sides[0][item_id]}, hosted "
+                  f"{sides[1][item_id]}")
+        failed = failed or bool(apart)
     print(f"parity of the local log and the hosted store: {'FAIL' if failed else 'PASS'}, "
           f"{len(theirs)} reviewer(s)")
     return int(failed)
@@ -1028,6 +1046,8 @@ def main(argv: list[str] | None = None) -> int:
                 "the reviewers file's remote reviewers as REMOTE-<n> rows on the real bundle")
     p.add_argument("--demo", action="store_true",
                    help="bind them to the demonstration bundle instead (a preview database)")
+    p.add_argument("--force", action="store_true",
+                   help="with --demo: although a real bundle is published in this database")
     p.add_argument("--test-identity", nargs=2, metavar=("ALIAS", "LOGIN"),
                    help="instead: write the test row TEST-<n> for this sign-in, bound to the "
                         "demonstration bundle")

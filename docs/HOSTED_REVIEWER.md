@@ -209,7 +209,9 @@ python scripts/hosted_admin.py status
 * It prints counts, ids, aliases, times, sizes and fingerprints only: never a sign-in address, a
   name, or a word of a post or a reading. A refusal is one constant code (`refused: CODE`), a
   database error only its class (`refused: DATABASE_OperationalError`). Exit 0: all is well;
-  1: a check failed (parity, verify); 2: refused, nothing changed.
+  1: a check failed (parity, verify); 2: refused. A refusal changes nothing, with one exception:
+  a `pull-to-local` that fails midway has already appended the lines before the failure (run it
+  again: it appends the rest).
 * A reviewer is named by **alias**: an entry of `reviewers.toml` whose login contains `@` is
   `REMOTE-<n>`, n its place among those entries in file order (the alias the owner's other tools
   print). Only the REVIEWER entries get a row. The reviewers file is only ever read.
@@ -219,7 +221,7 @@ python scripts/hosted_admin.py status
 | command | what it does |
 | --- | --- |
 | `init-db` | Applies `hosted/reviewer_web/schema.sql`. Every statement can be run again. |
-| `sync-reviewers` | Writes the remote reviewers of `reviewers.toml` as rows, bound to the active REAL bundle: login, name, role, scope, and the access a remote session has by that file (FULL only while `remote_full_context_authorized = true`, else RESTRICTED, which the site does not serve). Never deletes: an entry that left the file keeps its row, so revoke it. Refused while no real bundle is published (`NO_REAL_BUNDLE_PUBLISHED`), when an alias would pass to another sign-in (`ALIAS_OR_LOGIN_HELD_BY_ANOTHER_ROW`), when the file spells differently (capitals included) a sign-in whose row already has lines (`LOGIN_SPELLING_HAS_RECORDS`, with the alias: put the earlier spelling back), or when the file's scope is larger than the published one (`SCOPE_NOT_PUBLISHED`: publish first). `--demo` binds them to the demonstration bundle instead (a preview database, tests). |
+| `sync-reviewers` | Writes the remote reviewers of `reviewers.toml` as rows, bound to the active REAL bundle: login, name, role, scope, and the access a remote session has by that file (FULL only while `remote_full_context_authorized = true`, else RESTRICTED, which the site does not serve). Never deletes: an entry that left the file keeps its row, so revoke it. Refused while no real bundle is published (`NO_REAL_BUNDLE_PUBLISHED`), when an alias would pass to another sign-in (`ALIAS_OR_LOGIN_HELD_BY_ANOTHER_ROW`), when the file spells differently (capitals included) a sign-in whose row already has lines (`LOGIN_SPELLING_HAS_RECORDS`, with the alias: put the earlier spelling back), or when the file's scope is larger than the published one (`SCOPE_NOT_PUBLISHED`: publish first). `--demo` binds them to the demonstration bundle instead (a preview database, tests); on a database that holds a real bundle that would move the reviewers from the real forms to the invented ones, so it is refused there (`REAL_BUNDLE_IS_PUBLISHED`) unless `--force` is given (run `sync-reviewers` without `--demo` to move them back). |
 | `sync-reviewers --test-identity TEST-1 LOGIN` | Instead: writes (or updates) the test identity `TEST-<n>` for that sign-in, bound to the active DEMONSTRATION bundle with that bundle's scope (`NO_DEMO_BUNDLE_PUBLISHED` while there is none). The reviewers file is not read. |
 | `revoke ALIAS` | Sets `revoked_at` and deletes that reviewer's web sessions and sign-in codes not yet used. From that moment sign-in, every page and every save are refused; the records stay. |
 | `restore-access ALIAS` | Clears the revocation (the reviewer signs in again). |
@@ -374,8 +376,10 @@ the anchor).
    since the rehearsal, and moves the anchor to the log's present head (it prints
    `anchor: <lines> line(s), head <...>: moved to the log's present head`; if it prints FIXED
    instead, a reviewer has already saved on the site: stop and decide with the owner).
-7. **Parity**: `parity` PASS, `verify` PASS. Compare the per-alias lines and form states that
-   `import-log` printed, and each reviewer's next step, with what you expect.
+7. **Returns and parity**: `push-returns` (a return the approver decided before the cutover
+   and that still stands reaches its reviewer only by this command; until it is run, `parity`
+   fails on that form), then `parity` PASS and `verify` PASS. Compare the per-alias lines and
+   form states that `import-log` printed, and each reviewer's next step, with what you expect.
 8. Open the hosted site to the reviewers.
 
 ```text
@@ -401,7 +405,8 @@ chain continues no log; start from an empty database).
 
 ### Day to day: hosted saves in the local log
 
-Approval, freeze and scoring read the local log. Before them:
+Approval, freeze and scoring read the local log, and nothing in them knows of the site: a
+freeze taken without a pull simply lacks the hosted saves. Before them, always:
 
 ```bash
 python scripts/hosted_admin.py pull-to-local
@@ -428,6 +433,11 @@ REMOTE-1: bundle 5bee31e4acb2; records local 6, hosted 8: DIFFERENT; forms 45: 4
   next step: local i08 AFTER_REVEAL_DUE, hosted i01 AFTER_REVEAL_DUE: DIFFERENT
 parity of the local log and the hosted store: FAIL, 1 reviewer(s)
 ```
+
+`parity` also compares the site's state of EVERY form on both sides (a return that is missing
+or stale on a form that is not the next step shows there), and fails when the local log holds
+lines of a remote reviewer that no row holds; compare the number of reviewers it prints with
+the reviewers file.
 
 The next step is the form the site's "Continue" opens and where it stands (INDEPENDENT_DUE,
 REVEAL_PENDING, AFTER_REVEAL_DUE, RETURNED). On the local side it is computed over the

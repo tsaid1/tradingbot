@@ -527,9 +527,11 @@ def test_parity_compares_records_states_and_the_site_s_next_step(run, store, bas
         (f"REMOTE-2: bundle {bundle}; records local 6, hosted 6: the same; forms 45: 45 equal, "
          "0 different; hosted lines not pulled: 0"),
         "  next step: local i08 AFTER_REVEAL_DUE, hosted i08 AFTER_REVEAL_DUE: the same",
+        "  the site's state of each form: 45 equal, 0 different",
         (f"REMOTE-3: bundle {bundle}; records local 1, hosted 1: the same; forms 45: 45 equal, "
          "0 different; hosted lines not pulled: 0"),
         "  next step: local i07 AFTER_REVEAL_DUE, hosted i07 AFTER_REVEAL_DUE: the same",
+        "  the site's state of each form: 45 equal, 0 different",
         "parity of the local log and the hosted store: PASS, 2 reviewer(s)"]  # no test identity
     # The next step is the web app's own function: without it there is no parity.
     with monkeypatch.context() as without:
@@ -1518,3 +1520,51 @@ def test_the_published_part_holds_nothing_that_no_page_shows(cli, run, store, ba
             "local file; no other image is published") in out
     with store.connection() as conn:
         assert conn.execute("SELECT name FROM media").fetchall() == [("chart-p01.png",)]
+
+
+# ------------------------------------------------------------------ what parity did not say
+# (The independent review's finding 13.)
+
+
+def test_parity_compares_the_site_s_state_of_every_form_not_only_the_next_step(run, store,
+                                                                              base):
+    rows = cutover(run, store, base)
+    one = rows["REMOTE-2"]
+    hosted_save(store, one, "i03", A.INDEPENDENT)
+    hosted_reveal(store, one, "i03")
+    hosted_save(store, one, "i03", A.AFTER_REVEAL)  # the local line 11 after the pull
+    run("pull-to-local")
+    decide(base, "i07", 3, "RETURN", NOTE)
+    run("push-returns")
+    assert "PASS" in run("parity")
+    decide(base, "i03", 11, "RETURN", NOTE)  # a second return, not pushed yet
+    out = run("parity", code=1)  # the next step is the same on both sides: the first return
+    assert "  next step: local i07 RETURNED, hosted i07 RETURNED: the same" in out
+    assert "  the site's state of each form: 44 equal, 1 different" in out
+    assert "  i03: site state local RETURNED, hosted DONE" in out
+    run("push-returns")
+    assert "  the site's state of each form: 45 equal, 0 different" in run("parity")
+    decide(base, "i03", 11, "ACCEPT")  # taken back locally: stale on the site until the push
+    out = run("parity", code=1)
+    assert "  i03: site state local DONE, hosted RETURNED" in out
+    run("push-returns")
+    assert "PASS" in run("parity")
+
+
+def test_sync_reviewers_demo_is_refused_beside_a_real_bundle_unless_forced(run, store, base,
+                                                                         tmp_path):
+    demo = write_demo(tmp_path / "demo")
+    edit(base / "bundle" / "posts.jsonl",
+         lambda rows: rows["p09"].update(text="Back on Wednesday, after the holiday."))
+    reseal(base, product_commit="abc1234")  # ``base`` stands in for the real folder
+    real_id, demo_id = (A.bundle_digest(d / "bundle") for d in (base, demo))
+    run("publish-bundle")
+    run("publish-bundle", "--demo", demo)
+    run("sync-reviewers")
+    # It would silently move the reviewers from the real forms to the invented ones.
+    assert run("sync-reviewers", "--demo", code=2) == "refused: REAL_BUNDLE_IS_PUBLISHED\n"
+    assert {r.bundle_id for r in store.reviewers()} == {real_id}
+    assert "(demonstration data)" in run("sync-reviewers", "--demo", "--force")
+    assert {r.bundle_id for r in store.reviewers()} == {demo_id}
+    run("sync-reviewers")  # and back
+    assert {r.bundle_id for r in store.reviewers()} == {real_id}
