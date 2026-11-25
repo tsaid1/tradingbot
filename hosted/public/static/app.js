@@ -19,6 +19,21 @@
   var dock = document.getElementById("view-post");
   var post = document.getElementById("post-under-review");
   var remembered = "";   /* the id of the control the reviewer was at when they left for the post */
+  var wide = window.matchMedia ? window.matchMedia("(min-width: 80rem)") : null;
+  var panel = document.getElementById("nav-panel");
+
+  /* The panel of sequences: open next to the page on a wide screen, one line above it on a narrow one. */
+  function fitPanel() {
+    if (panel && wide) { panel.open = wide.matches; }
+  }
+  fitPanel();
+  if (wide && wide.addEventListener) { wide.addEventListener("change", fitPanel); }
+
+  /* The region that scrolls: the page's own one when a bottom bar is shown, else the window. */
+  function scroller() {
+    var region = document.getElementById("page-scroll");
+    return region && region.scrollHeight > region.clientHeight ? region : window;
+  }
 
   function moveTo(el, where) {
     if (!el) { return; }
@@ -86,6 +101,8 @@
     if (label) { label.textContent = back ? dock.getAttribute("data-back-text") : dock.getAttribute("data-view"); }
     dock.classList.toggle("is-back", back);
     dock.setAttribute("data-mode", back ? "back" : "view");
+    var inPost = post ? post.querySelector(".post-back") : null;
+    if (inPost) { inPost.classList.toggle("is-shown", back); }
   }
 
   /* Where "Back to my question" goes: the remembered control, else the question last
@@ -117,11 +134,11 @@
   function viewPost() {
     var active = document.activeElement;
     if (body && active && body.contains(active) && active.id) { remembered = active.id; }
+    setDock(true);
     moveTo(post, "start");
     /* The focus waits in the post's own "Back to my question": one key press returns. */
     var stay = post ? post.querySelector("[data-back]") : null;
     if (stay) { stay.focus({ preventScroll: true }); } else if (post) { post.focus({ preventScroll: true }); }
-    setDock(true);
   }
 
   document.addEventListener("click", function (event) {
@@ -183,8 +200,19 @@
     return el && (el.tagName === "TEXTAREA" || (el.tagName === "INPUT" && el.type === "text"));
   }
 
+  /* A draft the server kept (it says when, in a header): "Draft kept at HH:MM, not submitted". */
+  function kept(at) {
+    if (!saveState || !at) { return; }
+    var time = at.slice(11, 16);
+    var words = saveState.querySelector("span");
+    if (words) { words.textContent = saveState.getAttribute("data-draft").replace("{time}", time); }
+    saveState.classList.remove("is-editing");
+    saveState.classList.add("save-state--draft");
+  }
+
   function edited() {
     if (!saveState || saveState.classList.contains("is-editing")) { return; }
+    saveState.classList.remove("save-state--draft");
     saveState.classList.add("is-editing");
     var words = saveState.querySelector("span");
     if (words) { words.textContent = saveState.getAttribute("data-editing"); }
@@ -204,6 +232,7 @@
         window.location.reload();   /* the form moved on, or the session ended */
         return null;
       }
+      if (reply.ok && mine === changes) { kept(reply.headers.get("X-Draft-Kept")); }
       return reply.ok ? reply.text() : Promise.reject(new Error("refused"));
     }).then(function (html) {
       if (html === null || mine !== changes) { return; }
@@ -217,7 +246,7 @@
       if (again) {
         again.focus({ preventScroll: true });
         if (typed(again) && from !== null) { again.setSelectionRange(from, to); }
-        window.scrollBy(0, again.getBoundingClientRect().top - top);
+        scroller().scrollBy(0, again.getBoundingClientRect().top - top);
         markCurrent(questionOf(again));
       }
       busy("");

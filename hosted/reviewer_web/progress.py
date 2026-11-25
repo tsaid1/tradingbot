@@ -15,8 +15,10 @@ it is ``sequence_next``.
 from __future__ import annotations
 
 from tradingbot.runtime import adjudication as A
+from tradingbot.runtime import adjudication_rubric as R
 
 from . import forms as F
+from . import wording as W
 
 NOT_STARTED = "NOT_STARTED"
 IN_PROGRESS = "IN_PROGRESS"
@@ -33,23 +35,18 @@ NEXT_FORM = "NEXT_FORM"
 ALL_DONE = "ALL_DONE"
 NO_SEQUENCE = "-"  # the id of the group of the forms of no sequence (in a URL too)
 
-# The owner's phrases (DECIDED 40); INTERFACE has the last word on every text a reviewer reads.
+# The owner's phrases (DECIDED 40), in the words of ``wording`` (one source for every text).
 TEXT = {
-    NOT_STARTED: "Not started",
-    IN_PROGRESS: "In progress",
-    AWAITING_ASSESSMENT: "Awaiting your assessment",
-    COMPLETE: "Complete",
-    RETURNED: "Returned for changes",
-    SAVE_YOUR_READING: "Save your own reading of this form.",
-    COMPLETE_OTHER_FORM: ("Your reading is saved. Another form of this post must be completed "
-                          "before the system's answers are shown: form {k} of {n}."),
-    ASSESS_SYSTEM_ANSWERS: "Your reading is saved. Review the system's answers.",
-    CORRECT_RETURNED: "This reading was returned for changes. Correct it and save it again.",
-    NEXT_FORM: "Review complete. Continue to the next form.",
-    ALL_DONE: "Review complete. Every form assigned to you is done.",
+    **W.STATUS,
+    SAVE_YOUR_READING: W.STEP_TEXT[SAVE_YOUR_READING],
+    COMPLETE_OTHER_FORM: W.STEP_TEXT[COMPLETE_OTHER_FORM],
+    ASSESS_SYSTEM_ANSWERS: W.STEP_TEXT[ASSESS_SYSTEM_ANSWERS],
+    CORRECT_RETURNED: W.STEP_TEXT[CORRECT_RETURNED],
+    NEXT_FORM: W.STEP_TEXT[NEXT_FORM],
+    ALL_DONE: W.STEP_TEXT[ALL_DONE],
     "START": "Start",
     "CONTINUE": "Continue",
-    "NO_SEQUENCE": "Posts of no sequence",
+    "NO_SEQUENCE": W.NO_SEQUENCE,
 }
 _BY_STATE = {F.INDEPENDENT_DUE: NOT_STARTED, F.REVEAL_PENDING: IN_PROGRESS,
              F.AFTER_REVEAL_DUE: AWAITING_ASSESSMENT, F.DONE: COMPLETE, F.RETURNED: RETURNED}
@@ -128,9 +125,24 @@ def form_status(bundle: A.Bundle, session: A.Session, records: list[dict], item_
             "step": remaining_step(bundle, session, records, item_id, _view=view)["code"]}
 
 
+def _read_markets(view: _View, ids: list[str]) -> str:
+    """The markets THIS reviewer read in these forms: the ``family`` answers of their own stored
+    independent readings, in words ("TLT", "TLT, GOLD"); "" before they have saved one. Nothing
+    of the system's reading: the dashboard stays the same whatever the system read."""
+    found: list[str] = []
+    for i in ids:
+        rec = F._latest(view.records, i, view.bundle, A.INDEPENDENT, view.session.login)
+        family = (rec or {}).get("reading", {}).get("family", "")
+        if family and family != R.NOT_APPLICABLE and family not in found:
+            found.append(family)
+    return ", ".join(W.option("family", f) for f in found)
+
+
 def _rows(view: _View, current: str | None) -> list[dict]:
     out = []
+    number = 0
     for sid, items in A.ordered(view.bundle, view.session.scope):
+        number += 1 if sid else 0
         ids = [i["item_id"] for i in items]
         codes = [view.code(i) for i in ids]
         done = codes.count(COMPLETE)
@@ -140,8 +152,13 @@ def _rows(view: _View, current: str | None) -> list[dict]:
         for i in ids:
             posts.setdefault(view.items[i]["post_ref"], []).append(i)
         nxt = view.next_in(ids)
+        ordered_posts = sorted(posts.items(), key=lambda p: (
+            view.bundle.posts[p[0]]["published_at"], p[0]))
         out.append({
             "id": sid or NO_SEQUENCE, "label": sid or TEXT["NO_SEQUENCE"], "status": status,
+            "number": number if sid else None,
+            "title": W.SEQUENCE.format(n=number) if sid else TEXT["NO_SEQUENCE"],
+            "read": _read_markets(view, ids),
             "status_text": TEXT[status], "done": done, "total": len(ids),
             "remaining": len(ids) - done, "returned": codes.count(RETURNED),
             "attention": codes.count(AWAITING_ASSESSMENT), "next_item": nxt,
@@ -150,13 +167,26 @@ def _rows(view: _View, current: str | None) -> list[dict]:
                                                          else "CONTINUE"],
             "active": current in ids,
             "posts": [{"post_ref": ref, "when": view.bundle.posts[ref]["published_at"],
+                       "number": p, "when_text": W.post_time(view.bundle.posts[ref][
+                           "published_at"]),
                        "forms": [{"item_id": i, **dict(zip(("k", "n"), _place(view.bundle, i))),
                                   "status": view.code(i), "status_text": TEXT[view.code(i)],
-                                  "draft": i in view.drafts, "current": i == current}
+                                  "draft": i in view.drafts, "current": i == current,
+                                  "label": W.form_label(p, *_place(view.bundle, i))}
                                  for i in forms]}
-                      for ref, forms in sorted(posts.items(), key=lambda p: (
-                          view.bundle.posts[p[0]]["published_at"], p[0]))]})
+                      for p, (ref, forms) in enumerate(ordered_posts, 1)]})
     return out
+
+
+def _named(rows: list[dict], item_id: str | None) -> dict:
+    """Where a form stands in the rows, in words: "Sequence 3, post 2, form 1 of 2"."""
+    for row in rows:
+        for post in row["posts"]:
+            for f in post["forms"]:
+                if f["item_id"] == item_id:
+                    return {"place": W.place(row["title"], post["number"], f["k"], f["n"]),
+                            "code": f["status"]}
+    return {"place": "", "code": ""}
 
 
 def dashboard(bundle: A.Bundle, session: A.Session, records: list[dict], drafts=()) -> dict:
@@ -168,7 +198,11 @@ def dashboard(bundle: A.Bundle, session: A.Session, records: list[dict], drafts=
     view = _View(bundle, session, records, drafts)
     rows = _rows(view, None)
     codes = [view.code(i) for i in view.items]
-    return {"sequences": rows, "next": F.next_step(bundle, session, records), "totals": {
+    nxt = F.next_step(bundle, session, records)
+    named = _named(rows, nxt)
+    return {"sequences": rows, "next": nxt, "next_place": named["place"],
+            "next_text": W.next_button(named["code"], named["place"]) if nxt else "",
+            "totals": {
         "done": codes.count(COMPLETE), "total": len(codes),
         "remaining": len(codes) - codes.count(COMPLETE), "returned": codes.count(RETURNED),
         "attention": codes.count(AWAITING_ASSESSMENT),
@@ -189,7 +223,8 @@ def sidebar(bundle: A.Bundle, session: A.Session, records: list[dict], item_id: 
                 for form in post["forms"]:
                     form["current"] = False
     active = next((r["id"] for r in rows if r["active"]), None)
-    return {"sequences": rows, "active": active, "current": current}
+    return {"sequences": rows, "active": active, "current": current,
+            "place": _named(rows, current)["place"] if current else ""}
 
 
 def sequence_next(bundle: A.Bundle, session: A.Session, records: list[dict],
