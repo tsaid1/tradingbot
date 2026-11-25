@@ -15,3 +15,6 @@ __pycache__/
 *.egg-info/
 build/
 dist/
+
+# Screenshots of the hosted site on invented data (hosted/dev_server.py)
+hosted/dev_screenshots/

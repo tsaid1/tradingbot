@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block title %}Sign in{% endblock %}
+{% block main %}
+<section class="narrow">
+  <h1>Sign in</h1>
+  <p>This site is for invited reviewers. Enter the address you were invited with and a one-time
+  code is sent to it.</p>
+  <form method="post" action="/sign-in" class="stack">
+    <label for="address">Your address</label>
+    <input type="email" id="address" name="address" autocomplete="email" inputmode="email"
+           maxlength="320" required autofocus>
+    <button type="submit" class="primary">Send me a code</button>
+  </form>
+  <p class="quiet-text">The page answers the same for every address, and codes are limited per
+  hour. Signing in sets one cookie that keeps you signed in on this device; nothing else is
+  stored in your browser.</p>
+</section>
+{% endblock %}

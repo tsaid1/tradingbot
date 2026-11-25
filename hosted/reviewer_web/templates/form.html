@@ -1,0 +1,133 @@
+{% extends "base.html" %}
+{% block title %}{{ item_id }}{% endblock %}
+{% block main_class %} class="wide"{% endblock %}
+{% block main %}
+<p class="crumbs"><a href="/">Workspace</a> <span aria-hidden="true">/</span>
+  <strong>{{ item_id }}</strong> <span class="status">{{ status }}</span></p>
+
+{% if saved %}
+<div class="banner success" role="status" id="saved">
+  <p><strong>Saved.</strong> Your {{ "independent reading" if saved.phase == "INDEPENDENT" else "reading after the reveal" }}
+  of this form is stored as record {{ saved.seq }} ({{ saved.at[:10] }} at {{ saved.at[11:16] }} UTC).</p>
+  {% if next_step == item_id %}
+  <p>Next step: on this same form, below.</p>
+  {% elif next_step %}
+  <p>Next step: <a href="/form/{{ next_step }}">continue with {{ next_step }}</a>.</p>
+  {% else %}
+  <p>Every form in your scope is done. <a href="/">Back to the workspace</a>.</p>
+  {% endif %}
+</div>
+{% endif %}
+{% if refusal %}
+<div class="banner error" role="alert" id="refused">
+  <p><strong>Not saved ({{ refusal }}).</strong> {{ refusal_text }}</p>
+  {% if form %}<p>Nothing was stored. What Save still needs is listed above the Save button.</p>{% endif %}
+</div>
+{% endif %}
+
+<div class="work">
+  <section class="evidence" aria-labelledby="h-evidence">
+    <h2 id="h-evidence">1. Source evidence</h2>
+    {% if evidence.context %}
+    <p class="caption">Earlier posts of the idea and recent context, oldest first:</p>
+    {% for p in evidence.context %}
+    <article class="post context">
+      <p class="post-meta">{{ p.at }} <span class="ref">[{{ p.ref }}]</span></p>
+      <p class="post-text">{{ p.text }}</p>
+    </article>
+    {% endfor %}
+    {% endif %}
+    <p class="caption">The post:</p>
+    <article class="post">
+      <p class="post-meta">{{ evidence.post.at }} <span class="ref">[{{ evidence.post.ref }}]</span>
+        revision {{ evidence.post.revision }}{% for kind, ref in evidence.post.links %} · {{ kind }} {{ ref }}{% endfor %}</p>
+      <p class="post-text">{{ evidence.post.text }}</p>
+      {% for name in evidence.post.media %}
+      <figure>
+        <img src="/media/{{ bundle_id }}/{{ evidence.post.ref }}/{{ name }}" alt="Image of the post: {{ name }}" loading="lazy">
+        <figcaption>image: {{ name }}</figcaption>
+      </figure>
+      {% endfor %}
+    </article>
+  </section>
+
+  <div class="answers">
+    <section class="reading" aria-labelledby="h-reading">
+      <h2 id="h-reading">2. Your reading</h2>
+      <p class="form-header">{{ header }}</p>
+      <details class="how">
+        <summary>How to review</summary>
+        {% for line in how %}<p>{{ line }}</p>{% endfor %}
+      </details>
+      {% if overall %}<p class="plain">{{ overall }}</p>{% endif %}
+
+      {% if problem %}
+      <p class="banner error" role="alert">The system's reading cannot be shown ({{ problem }}): it could
+      not be recorded that it was shown. Nothing of it is on this page. Reload the page to try again.</p>
+      {% endif %}
+
+      {% if returned %}
+      <p class="banner warning" role="status">The approver returned this reading. The approver's note
+      and what to do stand <a href="#notice">directly above the confidence</a>: correct the answers
+      and save again.</p>
+      {% endif %}
+      {% if form %}
+      {% if form.phase == "INDEPENDENT" %}
+      <p class="caption">Blind-first: record your own reading; the system's reading is revealed after
+      you save it on every form of this post.</p>
+      {% else %}
+      <p class="caption">Your reading beside the system's: correct an answer only when the system's
+      reading points to evidence you missed; each verdict is on the system's value, pre-filled from
+      the comparison and editable.</p>
+      <details class="how"><summary>What a verdict means</summary><p>{{ verdict_help }}</p></details>
+      {% endif %}
+      <form id="reading-form" method="post" action="/form/{{ item_id }}/save"
+            data-state="/form/{{ item_id }}/state" autocomplete="off" novalidate>
+        <input type="hidden" name="_csrf" value="{{ csrf }}">
+        <input type="hidden" name="_phase" value="{{ form.phase }}">
+        <button type="submit" class="visually-hidden" tabindex="-1" formaction="/form/{{ item_id }}/state">Refresh the form</button>
+        <div id="form-body">
+{% include "_form_body.html" %}
+        </div>
+      </form>
+      {% elif described %}
+      <p class="caption">Your independent reading of this form is saved. The system's reading appears
+      once every form of this post has an independent reading.</p>
+      {% if waiting %}
+      <p class="banner info">Still without an independent reading:
+        {% for other in waiting %}<a href="/form/{{ other }}">{{ other }}</a>{{ ", " if not loop.last else "" }}{% endfor %}.</p>
+      {% endif %}
+      <p class="plain">{{ described.head }}</p>
+      <dl class="meanings saved-reading">
+        {% for name, value in described.rows %}<div><dt>{{ name }}</dt><dd>{{ value }}</dd></div>{% endfor %}
+      </dl>
+      {% endif %}
+    </section>
+
+    <section class="system" aria-labelledby="h-system">
+      <h2 id="h-system">3. The system's reading</h2>
+      {% if system %}
+      <dl class="meanings system-reading">
+        {% for name, value in system.fields %}<div><dt>{{ name }}</dt><dd>{{ value }}</dd></div>{% endfor %}
+      </dl>
+      {% if system.levels %}<pre class="plain">{{ system.levels | join("\n") }}</pre>{% endif %}
+      {% if system.unread %}<p class="plain">not read by the system: {% for n in system.unread %}number {{ n }}{{ ", " if not loop.last else "" }}{% endfor %}</p>{% endif %}
+      {% if system.holds %}<pre class="plain">{{ system.holds | join("\n") }}</pre>{% endif %}
+      {% if system.mapping %}
+      <dl class="meanings system-reading">
+        {% for name, value in system.mapping %}<div><dt>mapping {{ name }}</dt><dd>{{ value }}</dd></div>{% endfor %}
+      </dl>
+      {% endif %}
+      {% else %}
+      <p class="caption">Hidden until you save an independent reading on every form of this post
+      (blind-first), or while it cannot be recorded that it was shown.</p>
+      {% endif %}
+    </section>
+
+    <p class="after">
+      {% if next_step and next_step != item_id %}<a class="button" href="/form/{{ next_step }}">Continue: {{ next_step }}</a>{% endif %}
+      <a href="/">Back to the workspace</a>
+    </p>
+  </div>
+</div>
+{% endblock %}

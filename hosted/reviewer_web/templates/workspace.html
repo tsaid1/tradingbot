@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block title %}Workspace{% endblock %}
+{% block main %}
+<section class="page">
+  <h1>Workspace</h1>
+  <p class="quiet-text">Signed in as {{ who.session.name or "reviewer" }}. Your scope: {{ ideas }}
+  idea{{ "" if ideas == 1 else "s" }}, {{ forms }} form{{ "" if forms == 1 else "s" }}, in review
+  order.</p>
+  <div class="progress">
+    <p class="metric"><span class="metric-value">{{ progress.sequences_done }} of {{ progress.sequences }}</span>
+      <span class="metric-label">ideas completed</span></p>
+    <p class="metric"><span class="metric-value">{{ progress.done }} of {{ progress.total }}</span>
+      <span class="metric-label">forms done</span></p>
+    {% if next %}
+    <p class="metric-action"><a class="button primary" href="/continue">Continue</a>
+      <span class="quiet-text">the next unfinished step: {{ next }}</span></p>
+    {% else %}
+    <p class="banner success" role="status">Every form in your scope is done.</p>
+    {% endif %}
+  </div>
+  {% if returned %}
+  <p class="banner warning" role="status">The approver returned {{ returned }}
+  reading{{ "" if returned == 1 else "s" }} to you. "Continue" opens {{ "it" if returned == 1 else "the first" }}:
+  correct the reading and save it again.</p>
+  {% endif %}
+  <h2>Forms</h2>
+  <ol class="forms">
+    {% for group in groups %}
+    {% for row in group.rows %}
+    <li class="{{ 'first' if loop.first else '' }} {{ 'next' if row.item_id == next else '' }}">
+      <a href="/form/{{ row.item_id }}">{{ group.sequence }} {{ row.n }}: {{ row.kind }}</a>
+      {% if row.form %}<span class="quiet-text">{{ row.form }}</span>{% endif %}
+      <span class="status status-{{ row.status | lower }}">{{ row.status_text }}</span>
+      {% if row.item_id == next %}<span class="status status-next">next step</span>{% endif %}
+    </li>
+    {% endfor %}
+    {% endfor %}
+  </ol>
+</section>
+{% endblock %}

@@ -1,0 +1,299 @@
+{#- The body of the reading form: everything the applicability round trip renders again. -#}
+{%- macro select(c, id) -%}
+<select name="{{ c.name }}" id="{{ id }}"{% if c.label %} aria-label="{{ c.label }}"{% endif %}>
+  {%- for value, text, chosen in c.options %}
+  <option value="{{ value }}"{% if chosen %} selected{% endif %}>{{ text }}</option>
+  {%- endfor %}
+</select>
+{%- endmacro -%}
+
+{%- macro meanings(rows) -%}
+<dl class="meanings">
+  {%- for m in rows %}
+  <div{% if m.chosen %} class="chosen"{% endif %}><dt>{{ m.code }}</dt><dd>{{ m.meaning }}</dd></div>
+  {%- endfor %}
+</dl>
+{%- endmacro -%}
+
+{%- macro question(e) -%}
+<span class="q">{{ e.question }}</span> <code class="fname">[{{ e.name }}]</code>
+{%- endmacro -%}
+
+{%- macro help(text) -%}
+<details class="help"><summary>About this field</summary><p>{{ text }}</p></details>
+{%- endmacro -%}
+
+{%- macro verdict(v, legend) -%}
+<fieldset class="verdict-choice">
+  <legend>{{ legend }}</legend>
+  <input type="hidden" name="{{ v.tag_name }}" value="{{ v.tag }}">
+  {%- for code, text, chosen in v.options %}
+  <label><input type="radio" name="{{ v.name }}" id="{{ (v.name ~ '-' ~ code) | ident }}" value="{{ code }}"{% if chosen %} checked{% endif %}> {{ text }}</label>
+  {%- endfor %}
+</fieldset>
+{%- endmacro -%}
+
+{%- macro control(e) -%}
+{%- set c = e.control -%}
+<input type="hidden" name="_on" value="{{ e.name }}">
+{%- if c.type == "select" %}
+<div class="field" id="field-{{ e.name }}">
+  <label class="field-label" for="{{ c.name | ident }}">{{ question(e) }}</label>
+  {{ help(e.help) }}
+  <div class="answer">
+    {{ select(c, c.name | ident) }}
+    {{ meanings(c.meanings) }}
+  </div>
+  {{ caller() }}
+</div>
+{%- elif c.type == "radio" %}
+<fieldset class="field" id="field-{{ e.name }}">
+  <legend class="field-label">{{ question(e) }}</legend>
+  {{ help(e.help) }}
+  <div class="options">
+    {%- for value, text, chosen in c.options %}
+    <label><input type="radio" name="{{ c.name }}" id="{{ (c.name ~ '-' ~ value) | ident }}" value="{{ value }}"{% if chosen %} checked{% endif %}> {{ text }}</label>
+    {%- endfor %}
+  </div>
+  {{ caller() }}
+</fieldset>
+{%- elif c.type == "value" %}
+<fieldset class="field" id="field-{{ e.name }}">
+  <legend class="field-label">{{ question(e) }}</legend>
+  {{ help(e.help) }}
+  <div class="options inline">
+    {%- for value, text, chosen in c.options %}
+    <label><input type="radio" name="{{ c.state_name }}" id="{{ (c.state_name ~ '-' ~ value) | ident }}" value="{{ value }}"{% if chosen %} checked{% endif %}> {{ text }}</label>
+    {%- endfor %}
+  </div>
+  {%- if c.typed %}
+  <label class="typed" for="{{ c.name | ident }}">the value
+    <input type="text" name="{{ c.name }}" id="{{ c.name | ident }}" value="{{ c.value }}" maxlength="{{ c.maxlength }}" autocomplete="off" autocapitalize="off" spellcheck="false"></label>
+  {%- endif %}
+  {{ caller() }}
+</fieldset>
+{%- elif c.type == "checks" %}
+<fieldset class="field" id="field-{{ e.name }}">
+  <legend class="field-label">{{ question(e) }}</legend>
+  {{ help(e.help) }}
+  <div class="checks">
+    {%- for o in c.options %}
+    <label><input type="checkbox" name="{{ c.name }}" id="{{ (c.name ~ '-' ~ o.code) | ident }}" value="{{ o.code }}"{% if o.checked %} checked{% endif %}> <span class="code">{{ o.code }}</span> <span class="meaning">{{ o.meaning }}</span></label>
+    {%- endfor %}
+  </div>
+  {{ caller() }}
+</fieldset>
+{%- elif c.type == "additional" %}
+<fieldset class="field" id="field-{{ e.name }}">
+  <legend class="field-label">{{ question(e) }}</legend>
+  {{ help(e.help) }}
+  <div class="answer">
+    <select name="aa.n" id="aa-n" aria-label="How many further actions">
+      {%- for n, text, chosen in c.counts %}
+      <option value="{{ n }}"{% if chosen %} selected{% endif %}>{{ text }}</option>
+      {%- endfor %}
+    </select>
+  </div>
+  {%- if c.rows %}
+  <details class="how" open>
+    <summary>What the further-action choices mean, in full</summary>
+    {%- for key, rows in c.meanings %}
+    <p class="fname">{{ key }}</p>
+    {{ meanings(rows) }}
+    {%- endfor %}
+  </details>
+  {%- for row in c.rows %}
+  <div class="cells further">
+    {%- for cell in row %}
+    <div class="cell"><label for="{{ cell.name | ident }}">{{ cell.label }}</label>{{ select(cell, cell.name | ident) }}</div>
+    {%- endfor %}
+  </div>
+  {%- endfor %}
+  {%- endif %}
+  {{ caller() }}
+</fieldset>
+{%- endif %}
+{%- endmacro -%}
+
+{%- macro system_and_verdict(e) -%}
+{%- if e.system is defined %}
+<div class="verdict">
+  <p class="system-value"><span class="who">system{{ " (not compared)" if e.not_compared else "" }}</span> <span class="mono">{{ e.system }}</span></p>
+  {%- if e.verdict_fixed %}
+  <p class="note">verdict: {{ e.verdict_fixed }}</p>
+  {%- elif e.verdict %}
+  {{ verdict(e.verdict, "verdict on the system's " ~ e.name) }}
+  {%- endif %}
+</div>
+{%- endif %}
+{%- endmacro -%}
+
+<input type="hidden" name="_key" value="{{ key }}">
+{% for block in form.blocks %}
+{% if block.kind == "group" %}
+<section class="group{{ ' proposals' if block.proposals else '' }}" aria-labelledby="g-{{ block.code }}">
+  <h3 id="g-{{ block.code }}">{{ block.code }}. {{ block.title }}</h3>
+  {% if block.proposals %}
+  {% for p in block.proposals %}
+  <div class="proposal" id="field-{{ p.name }}">
+    <div class="proposal-text">
+      <p class="proposal-title">{{ p.title }}: <strong class="proposal-value">{{ p.value or "none proposed" }}</strong></p>
+      <p class="proposal-question" id="q-{{ p.name }}">{{ p.question }}</p>
+    </div>
+    {% if p.asked %}
+    <div class="proposal-answer" role="radiogroup" aria-labelledby="q-{{ p.name }}">
+      <input type="hidden" name="_on" value="{{ p.name }}">
+      {% for code, text, chosen in p.options %}
+      <input type="radio" class="seg" name="{{ p.name }}" id="{{ (p.name ~ '-' ~ code) | ident }}" value="{{ code }}"{% if chosen %} checked{% endif %}><label for="{{ (p.name ~ '-' ~ code) | ident }}">{{ text }}</label>
+      {% endfor %}
+      {% if not p.answered %}<span class="unanswered">not answered yet</span>{% endif %}
+    </div>
+    {% else %}
+    <p class="proposal-why">{{ p.why }}</p>
+    {% endif %}
+    <p class="proposal-foot"><code class="fname">[{{ p.name }}]</code> {{ help(p.help) }}</p>
+  </div>
+  {% endfor %}
+  {% elif block.collapsed %}
+  <p class="note">{{ block.collapsed }}</p>
+  {% if block.system %}<p class="system-value"><span class="who">system</span> <span class="mono">{{ block.system }}</span></p>{% endif %}
+  {% else %}
+  {% for e in block.fields %}
+  {% if e.state == "ASK" %}
+  {% call control(e) %}{{ system_and_verdict(e) }}{% endcall %}
+  {% else %}
+  <div class="field settled" id="field-{{ e.name }}">
+    <p class="field-label">{{ question(e) }}</p>
+    {% if e.state == "DERIVED" %}
+    <p class="derived"><span class="mono">{{ e.derived }}</span> <span class="note">(set by the form)</span></p>
+    {% if e.sentence %}<p class="note">{{ e.sentence }}</p>{% endif %}
+    {% else %}
+    <p class="note">{{ e.note }}</p>
+    {% endif %}
+    {{ system_and_verdict(e) }}
+  </div>
+  {% endif %}
+  {% endfor %}
+  {% endif %}
+</section>
+{% else %}
+<section class="group table" aria-labelledby="g-T">
+  <h3 id="g-T">T. The price table: {{ block.caption }}</h3>
+  {% if not block.asked %}
+  <ul class="rows-plain">
+    {% for row in block.rows %}
+    <li><span class="rown">row {{ row.n }}</span> <strong class="mono">{{ row.label }}</strong> {{ row.where }}{% if row.context %} <span class="context">… {{ row.context }} …</span>{% endif %}</li>
+    {% endfor %}
+  </ul>
+  <p class="note">{{ block.note }}</p>
+  {% else %}
+  <details class="how" open>
+    <summary>What the price-table choices mean, in full</summary>
+    {% for column, asks, rows in block.meanings %}
+    <p class="fname">{{ asks }} [{{ column }}]</p>
+    {{ meanings(rows) }}
+    {% endfor %}
+  </details>
+  {% for row in block.rows %}
+  <div class="price-row" id="row-{{ row.key | ident }}">
+    <p class="price-head"><span class="rown">row {{ row.n }}</span> <strong class="mono">{{ row.label }}</strong> {{ row.where }}{% if row.context %} <span class="context">… {{ row.context }} …</span>{% endif %}</p>
+    <div class="cells">
+      {% for cell in row.cells %}
+      <div class="cell">
+        {% if cell.note is defined %}
+        <span class="cell-label">{{ cell.column }}</span><span class="note">{{ cell.note }}</span>
+        {% elif cell.type == "text" %}
+        <label for="{{ cell.name | ident }}" title="{{ cell.label }}">{{ cell.column }}</label>
+        <input type="text" name="{{ cell.name }}" id="{{ cell.name | ident }}" value="{{ cell.value }}" maxlength="{{ cell.maxlength }}" aria-label="{{ cell.label }}" autocomplete="off" autocapitalize="characters" spellcheck="false">
+        {% else %}
+        <label for="{{ cell.name | ident }}" title="{{ cell.label }}">{{ cell.column }}</label>
+        {{ select(cell, cell.name | ident) }}
+        {% endif %}
+      </div>
+      {% endfor %}
+    </div>
+    {% if row.chosen %}
+    <dl class="meanings chosen-row">
+      {% for column, code, meaning in row.chosen %}<div><dt>{{ column }} {{ code }}</dt><dd>{{ meaning }}</dd></div>{% endfor %}
+    </dl>
+    {% endif %}
+    {% if row.system is defined %}
+    <div class="verdict">
+      <p class="system-value"><span class="who">system</span> <span class="mono">{{ row.system }}</span></p>
+      {% if row.verdict %}{{ verdict(row.verdict, "verdict, row " ~ row.n) }}{% endif %}
+    </div>
+    {% endif %}
+  </div>
+  {% endfor %}
+  {% if block.repeat %}
+  <details class="how">
+    <summary>The price-table choices again, in full</summary>
+    {% for column, asks, rows in block.meanings %}
+    <p class="fname">{{ asks }} [{{ column }}]</p>
+    {{ meanings(rows) }}
+    {% endfor %}
+  </details>
+  {% endif %}
+  {% endif %}
+</section>
+{% endif %}
+{% endfor %}
+
+{% if form.positions %}
+<section class="group positions" aria-label="Positions">
+  {% for line in form.positions %}<p class="plain">{{ line }}</p>{% endfor %}
+</section>
+{% endif %}
+
+<section class="group extras" aria-label="Flags, confidence and notes">
+  <fieldset class="field" id="field-flags">
+    <legend class="field-label"><span class="q">What does the REVIEW need?</span> <code class="fname">[flags]</code></legend>
+    <div class="checks">
+      {% for o in form.flag_options %}
+      <label><input type="checkbox" name="flags" id="flags-{{ o.code | ident }}" value="{{ o.code }}"{% if o.checked %} checked{% endif %}> <span class="code">{{ o.code }}</span> <span class="meaning">{{ o.meaning }}</span></label>
+      {% endfor %}
+    </div>
+  </fieldset>
+  {% if form.notice %}
+  <p class="banner {{ form.notice[0] }}" id="notice">{{ form.notice[1] }}</p>
+  {% endif %}
+  <fieldset class="field" id="field-confidence">
+    <legend class="field-label"><span class="q">How confident are you in this whole form?</span> <code class="fname">[confidence]</code></legend>
+    <div class="options">
+      {% for code, text, chosen in form.confidence_options %}
+      <label><input type="radio" name="confidence" id="confidence-{{ code }}" value="{{ code }}"{% if chosen %} checked{% endif %}> {{ text }}</label>
+      {% endfor %}
+    </div>
+  </fieldset>
+  <div class="field" id="field-notes">
+    <label class="field-label" for="notes"><span class="q">Notes</span> <code class="fname">[notes]</code> <span class="note">(at most 2000 characters)</span></label>
+    <textarea name="notes" id="notes" rows="4" maxlength="2000">{{ form.notes }}</textarea>
+  </div>
+</section>
+
+<section class="issues" id="issues" aria-live="polite" aria-label="What Save needs">
+  {% if form.invalid %}
+  <p class="issue refuses">Not a valid value ({{ form.invalid }}).</p>
+  {% endif %}
+  {% if form.unanswered %}
+  <p class="plain">Required, unanswered: {{ form.unanswered | join(", ") }}</p>
+  {% endif %}
+  {% for kind, text in form.blocking %}
+  <p class="issue {{ kind }}">{{ text }}</p>
+  {% endfor %}
+  {% if form.warnings %}
+  <div class="issue warns">
+    <p>Please check: {% for code, meaning in form.warnings %}{{ code }}: {{ meaning }}{{ "; " if not loop.last else "" }}{% endfor %}</p>
+    <label><input type="checkbox" name="ack" id="ack" value="{{ form.ack_value }}"{% if form.ack %} checked{% endif %}> I have checked these</label>
+  </div>
+  {% endif %}
+</section>
+
+<div class="actions">
+  <button type="submit" class="primary" id="save"{% if not form.may_save %} disabled{% endif %}>{{ form.save_title }}</button>
+  <button type="submit" class="secondary no-script" formaction="/form/{{ item_id }}/state">Refresh the form</button>
+  <span class="busy" id="busy" role="status"></span>
+</div>
+{% if not form.may_save %}
+<p class="note">Save is available once everything listed above is answered.<span class="no-script"> Press "Refresh the form" after changing an answer.</span></p>
+{% endif %}
