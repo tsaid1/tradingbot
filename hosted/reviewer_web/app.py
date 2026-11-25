@@ -18,7 +18,7 @@ read. So a marker or a save is durable before any page says so.
 
 ``create_app(store, mailer, config)`` builds the application; ``app`` (module level, built on
 first use) is the one the platform serves, configured by the environment: ``DATABASE_URL``,
-``SESSION_SECRET``, ``SITE_ENV`` and the SMTP variables of ``mail``.
+``SESSION_SECRET``, ``SITE_ENV`` and the five SMTP variables of ``mail`` (``from_environment``).
 """
 
 from __future__ import annotations
@@ -91,7 +91,8 @@ def _code(exc: Exception) -> str:
 
 
 def create_app(store, mailer, config: dict) -> Flask:
-    """``store``: the contract's ``Store``. ``mailer(to, subject, text)``. ``config``:
+    """``store``: the contract's ``Store``. ``mailer(to, subject, text)``, or None for synthetic
+    mail (preview and test only: the code is shown on the page). ``config``:
     ``SESSION_SECRET`` (at least 32 characters), ``SITE_ENV`` (production | preview | test), and
     for tests and the development server ``CLOCK`` (a function returning the time),
     ``SIGN_IN_FLOOR_SECONDS`` and ``ALLOW_HTTP`` (accept an ``http`` origin on loopback)."""
@@ -105,6 +106,11 @@ def create_app(store, mailer, config: dict) -> Flask:
     demo = site_env in DEMO_ENVS
     if demo and not store.bundle_is_demo():
         raise RuntimeError("NOT_A_DEMO_BUNDLE")  # a preview never shows anything but invented data
+    # No mailer: "synthetic mail". Nothing is sent and the code-entry page shows the code in the
+    # demonstration band. Only where nothing but invented data is served; never in production.
+    synthetic = mailer is None
+    if synthetic and not demo:
+        raise RuntimeError("MAIL_NOT_CONFIGURED")
     clock = config.get("CLOCK") or (lambda: datetime.now(UTC))
     floor = float(config.get("SIGN_IN_FLOOR_SECONDS", 1.5))
     schemes = ("https", "http") if config.get("ALLOW_HTTP") else ("https",)
@@ -198,7 +204,7 @@ def create_app(store, mailer, config: dict) -> Flask:
     @app.context_processor
     def common():
         who = g.get("who")
-        return {"demo": demo, "who": who,
+        return {"demo": demo, "who": who, "site_name": mail.SITE_NAME, "synthetic": synthetic,
                 "csrf": auth.csrf_token(secret, who.token) if who else ""}
 
     for status in (400, 403, 404, 405, 413):
@@ -233,19 +239,27 @@ def create_app(store, mailer, config: dict) -> Flask:
 
     @app.post("/sign-in")
     def sign_in_code():
-        """Answers the same for every address, listed or not, and takes about as long."""
+        """Answers the same for every address, listed or not, and takes about as long. When
+        the mail server cannot be reached the page says so, for every address alike: an address
+        that gets no code asks the server too (``probe``), and sends nothing."""
         started = time.monotonic()
         address = request.form.get("address", "")[:auth.MAX_ADDRESS]
-        issued = auth.request_code(store, secret, address, network(), clock())
-        if issued is not None:
-            reviewer, code = issued
+        if synthetic and not store.bundle_is_demo():
+            return refuse(503)  # a code is shown on a page only beside invented data
+        asked = auth.request_code(store, secret, address, network(), clock())
+        unsent = False
+        if not synthetic:
             try:
-                mailer(reviewer.login_shown, auth.SUBJECT, auth.mail_text(code))
-            except Exception as exc:  # noqa: BLE001 - the answer must not depend on the mail
+                if asked.code is not None:
+                    mailer(asked.reviewer.login_shown, auth.SUBJECT, auth.mail_text(asked.code))
+                elif asked.allowed and hasattr(mailer, "probe"):
+                    mailer.probe()
+            except Exception as exc:  # noqa: BLE001 - whatever failed: a constant code, no detail
                 app.logger.error("MAIL_FAILED error=%s", type(exc).__name__)
-            del code, issued
+                unsent = True
         time.sleep(max(0.0, floor - (time.monotonic() - started)))
-        return render_template("sign_in_code.html", address=address, failed=False)
+        return render_template("sign_in_code.html", address=address, failed=False, unsent=unsent,
+                               shown_code=asked.code if synthetic else None)
 
     @app.post("/sign-in/verify")
     def sign_in_verify():
@@ -253,7 +267,8 @@ def create_app(store, mailer, config: dict) -> Flask:
         token = auth.verify_code(store, secret, address, request.form.get("code", "")[:32],
                                  network(), clock())
         if token is None:
-            return render_template("sign_in_code.html", address=address, failed=True), 401
+            return render_template("sign_in_code.html", address=address, failed=True,
+                                   unsent=False, shown_code=None), 401
         response = redirect("/", 303)
         response.set_cookie(auth.COOKIE, token, max_age=SESSION_SECONDS, secure=True,
                             httponly=True, samesite="Lax", path="/")
@@ -472,13 +487,17 @@ def create_app(store, mailer, config: dict) -> Flask:
 
 
 def from_environment(env=os.environ) -> Flask:
-    """The application the platform serves."""
+    """The application the platform serves. Mail: all five SMTP variables, or none of them.
+    With none, ``preview`` and ``test`` show the code on the page beside the demonstration data
+    (no mail leaves); ``production`` refuses to start."""
     from .store import Store
 
-    return create_app(Store(env["DATABASE_URL"]),
-                      lambda to, subject, text: mail.send(to, subject, text, env),
-                      {"SESSION_SECRET": env.get("SESSION_SECRET", ""),
-                       "SITE_ENV": env.get("SITE_ENV", "production")})
+    site_env = env.get("SITE_ENV") or "production"
+    with_mail = mail.configured(env)
+    if with_mail is None or (not with_mail and site_env not in DEMO_ENVS):
+        raise RuntimeError("MAIL_NOT_CONFIGURED")
+    return create_app(Store(env["DATABASE_URL"]), mail.Smtp(env) if with_mail else None,
+                      {"SESSION_SECRET": env.get("SESSION_SECRET", ""), "SITE_ENV": site_env})
 
 
 def __getattr__(name: str):

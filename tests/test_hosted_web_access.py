@@ -267,4 +267,6 @@ def test_preview_and_test_show_invented_data_only_and_say_so(tmp_path, store, ds
     assert served.get("/healthz", base_url=ORIGIN).status_code == 200
     assert served.get("/", base_url=ORIGIN).headers["Location"] == "/sign-in"
     with pytest.raises(KeyError):
-        web.from_environment({"SESSION_SECRET": SECRET})
+        web.from_environment({"SESSION_SECRET": SECRET, "SITE_ENV": "preview"})  # no database
+    with pytest.raises(RuntimeError, match="MAIL_NOT_CONFIGURED"):
+        web.from_environment({"DATABASE_URL": dsn, "SESSION_SECRET": SECRET})  # production

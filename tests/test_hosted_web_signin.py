@@ -8,7 +8,17 @@ import hashlib
 import logging
 import re
 
-from hosted_web_site import FIRST, ORIGIN, SECOND, dsn, site, store  # noqa: F401 - fixtures
+import pytest
+from hosted_web_site import (  # noqa: F401 - fixtures
+    FIRST,
+    ORIGIN,
+    SECOND,
+    SECRET,
+    Site,
+    dsn,
+    site,
+    store,
+)
 
 NOBODY = "nobody@example.invalid"
 COOKIE = "__Host-session"
@@ -41,8 +51,10 @@ def test_a_mailed_code_signs_in_and_only_hashes_are_stored(site):  # noqa: F811
     assert page.status_code == 200
     [(to, subject, text)] = site.outbox.sent
     code = site.code()
-    assert to == login and subject == "Your sign-in code" and code in text
-    assert code not in page.get_data(as_text=True)
+    assert to == login and subject == "Trade review: your sign-in code"
+    # The message: the site's name, the code, its validity. No link, nothing else.
+    assert text == f"Trade review\n\nYour sign-in code is {code}. It is valid for 10 minutes.\n"
+    assert code not in page.get_data(as_text=True) and code not in subject
     answer = enter(b, login, code)
     assert answer.status_code == 303 and answer.headers["Location"] == "/"
     cookie = answer.headers["Set-Cookie"]
@@ -262,20 +274,167 @@ def test_no_response_and_no_log_line_carries_a_code_or_an_address(site, caplog):
                                       "/healthz", "/robots.txt", "/static/app.js")]
     seen.append(b.post("/sign-out", {"_csrf": b.csrf()}))
 
-    def failing(_to, _subject, _text):
-        raise RuntimeError(f"the server said no to {code}")  # a mailer's error may quote anything
+    class Down:
+        """A mail server that cannot be reached, for a message and for the probe alike."""
 
-    broken = web.create_app(site.store, failing, site.config).test_client()
-    same = broken.post("/sign-in", data={"address": login}, base_url=ORIGIN,
-                       headers={"Origin": ORIGIN})
-    assert same.status_code == 200 and same.get_data(as_text=True) == seen[0].get_data(
-        as_text=True)  # a failed mail answers the same
-    seen.append(same)
+        def __call__(self, _to, _subject, text):
+            raise RuntimeError(f"the server said no to {text}")  # an error may quote anything
+
+        def probe(self):
+            raise OSError("no route to the mail server")
+
+    broken = web.create_app(site.store, Down(), site.config).test_client()
+
+    def ask_broken(address):
+        return broken.post("/sign-in", data={"address": address}, base_url=ORIGIN,
+                           headers={"Origin": ORIGIN})
+
+    listed, unlisted = ask_broken(login), ask_broken(NOBODY)
+    # The page says so calmly, and the same for a listed and an unlisted address.
+    assert listed.status_code == unlisted.status_code == 200
+    assert "The code could not be sent. Try again in a minute." in listed.get_data(as_text=True)
+    assert listed.get_data(as_text=True).replace(login, NOBODY) == unlisted.get_data(as_text=True)
+    assert "could not be sent" not in seen[0].get_data(as_text=True)
+    seen += [listed, unlisted]
     [(newest,)] = site.sql("SELECT code_hmac FROM login_code ORDER BY id DESC LIMIT 1")
     logged = "\n".join(r.getMessage() for r in caplog.records)
-    assert "MAIL_FAILED error=RuntimeError" in logged
+    assert "MAIL_FAILED error=RuntimeError" in logged and "MAIL_FAILED error=OSError" in logged
     assert code not in logged and login.casefold() not in logged.casefold()
-    assert newest not in logged
+    assert newest not in logged and "sign-in code is" not in logged and "no route" not in logged
     for response in seen:
         assert code not in response.get_data(as_text=True)
         assert code not in repr(sorted(response.headers.items()))
+        assert not re.search(r"code is\s*(<[^>]+>)?\d{6}", response.get_data(as_text=True))
+    # A healthy mail server is asked for an unlisted address too, and nothing is sent to it.
+    probes, sent = site.outbox.probes, len(site.outbox.sent)
+    ask(site.browser(), NOBODY)
+    assert site.outbox.probes == probes + 1 and len(site.outbox.sent) == sent
+
+
+def test_mail_goes_out_over_tls_by_the_port_and_carries_the_code_and_nothing_else(monkeypatch):
+    import smtplib
+
+    from reviewer_web import auth, mail
+
+    calls = []
+
+    class Server:
+        def __init__(self, host, port, timeout=None, context=None):
+            calls.append(("connect", type(self).__name__, host, port, timeout, context is not None))
+
+        def starttls(self, context=None):
+            calls.append(("starttls", context is not None))
+
+        def login(self, user, password):
+            calls.append(("login", user, password))
+
+        def send_message(self, message):
+            calls.append(("send", message))
+
+        def noop(self):
+            calls.append(("noop",))
+
+        def close(self):
+            calls.append(("close",))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            calls.append(("quit",))
+
+    class Tls(Server):
+        pass
+
+    monkeypatch.setattr(smtplib, "SMTP", Server)
+    monkeypatch.setattr(smtplib, "SMTP_SSL", Tls)
+    env = {"SMTP_HOST": "mail.example.invalid", "SMTP_PORT": "465", "SMTP_USER": "sender",
+           "SMTP_PASSWORD": "an-invented-key", "MAIL_FROM": "review@example.invalid"}
+    mail.Smtp(env)("reviewer@example.invalid", auth.SUBJECT, auth.mail_text("123456"))
+    assert calls[0] == ("connect", "Tls", "mail.example.invalid", 465, 15, True)  # implicit TLS
+    assert calls[1] == ("login", "sender", "an-invented-key") and calls[-1] == ("quit",)
+    message = calls[2][1]
+    assert message["From"] == "Trade review <review@example.invalid>"
+    assert message["To"] == "reviewer@example.invalid"
+    assert message["Subject"] == "Trade review: your sign-in code"
+    assert message["Date"].endswith("+0000") and re.fullmatch(
+        r"<[^@<>\s]+@example\.invalid>", message["Message-ID"])
+    assert message.get_content_type() == "text/plain" and not message.is_multipart()
+    body = message.get_content()
+    assert body == "Trade review\n\nYour sign-in code is 123456. It is valid for 10 minutes.\n"
+    assert "http" not in body and "://" not in body and "example.invalid" not in body
+    # Any other port: STARTTLS before the sign-in, or nothing is sent.
+    calls.clear()
+    mail.Smtp({**env, "SMTP_PORT": "587"}).probe()
+    assert [c[0] for c in calls] == ["connect", "starttls", "login", "noop", "quit"]
+    assert calls[0][1] == "Server" and calls[0][3] == 587
+
+    class NoTls(Server):
+        def starttls(self, context=None):
+            raise smtplib.SMTPNotSupportedError("STARTTLS extension not supported by server.")
+
+    monkeypatch.setattr(smtplib, "SMTP", NoTls)
+    calls.clear()
+    with pytest.raises(smtplib.SMTPNotSupportedError):
+        mail.send("reviewer@example.invalid", "s", "t", {**env, "SMTP_PORT": "587"})
+    assert [c[0] for c in calls] == ["connect", "close"]  # no sign-in, no message in the clear
+    assert mail.configured(env) is True and mail.configured({}) is False
+    assert mail.configured({**env, "SMTP_PASSWORD": ""}) is None
+
+
+def test_synthetic_mail_shows_the_code_only_in_a_preview_of_invented_data(tmp_path, store, dsn):  # noqa: F811
+    from hosted_pg import bundle_bytes, write_demo
+    from reviewer_web import app as web
+    from reviewer_web.store import Store
+
+    site = Site(tmp_path, store, dsn)  # noqa: F811
+    login = login_of(site)
+    env = {"DATABASE_URL": dsn, "SESSION_SECRET": SECRET}
+    smtp = {"SMTP_HOST": "mail.example.invalid", "SMTP_PORT": "465", "SMTP_USER": "sender",
+            "SMTP_PASSWORD": "an-invented-key", "MAIL_FROM": "review@example.invalid"}
+
+    def post(app, path, data):
+        return app.test_client().post(path, data=data, base_url=ORIGIN, headers={"Origin": ORIGIN})
+
+    # Preview (and test) without any mail variable: no mail leaves, the code stands in the band.
+    for site_env in ("preview", "test"):
+        app = web.from_environment({**env, "SITE_ENV": site_env})
+        page = post(app, "/sign-in", {"address": login}).get_data(as_text=True)
+        shown = re.search(r'<div class="demo-band".*?Demonstration: your code is <strong>(\d{6})'
+                          r"</strong>; no email was sent\..*?</div>", page, re.DOTALL)
+        assert shown, page[:900]
+        client = app.test_client()
+        answer = client.post("/sign-in/verify", data={"address": login, "code": shown.group(1)},
+                             base_url=ORIGIN, headers={"Origin": ORIGIN})
+        assert answer.status_code == 303
+        assert client.get("/", base_url=ORIGIN).status_code == 200
+        other = post(app, "/sign-in", {"address": NOBODY}).get_data(as_text=True)
+        assert "your code is" not in other and not re.search(r"\b\d{6}\b", other)
+        assert "Demonstration: no email is sent from this site." in other
+    assert not site.outbox.sent
+    # Production never shows a code: without the five variables it does not start,
+    for missing in (*smtp, None):
+        given = {k: v for k, v in smtp.items() if k != missing} if missing else {}
+        with pytest.raises(RuntimeError, match="MAIL_NOT_CONFIGURED"):
+            web.from_environment({**env, **given, "SITE_ENV": "production"})
+    with pytest.raises(RuntimeError, match="MAIL_NOT_CONFIGURED"):
+        web.create_app(Store(dsn), None, {**site.config, "SITE_ENV": "production"})
+    with pytest.raises(RuntimeError, match="MAIL_NOT_CONFIGURED"):
+        web.from_environment({**env, "SMTP_HOST": "mail.example.invalid", "SITE_ENV": "preview"})
+    # and with them it mails, and its pages carry no code and no band.
+    live = web.create_app(Store(dsn), site.outbox, {**site.config, "SITE_ENV": "production"})
+    page = post(live, "/sign-in", {"address": login}).get_data(as_text=True)
+    assert len(site.outbox.sent) == 1 and site.code() not in page
+    assert "Demonstration" not in page and "your code is" not in page
+    assert isinstance(web.from_environment({**env, **smtp, "SITE_ENV": "production"}), web.Flask)
+    # A preview whose bundle is not flagged as demonstration data: no code is made or shown,
+    # and such a preview does not start.
+    app = web.from_environment({**env, "SITE_ENV": "preview"})
+    files, media = bundle_bytes(write_demo(tmp_path / "again"))
+    store.publish_bundle(*files, media, is_demo=False, source_sequences=1)
+    codes = site.sql("SELECT count(*) FROM login_code")
+    refused = post(app, "/sign-in", {"address": login})
+    assert refused.status_code == 503 and not re.search(rb"\b\d{6}\b", refused.get_data())
+    assert site.sql("SELECT count(*) FROM login_code") == codes
+    with pytest.raises(RuntimeError, match="NOT_A_DEMO_BUNDLE"):
+        web.from_environment({**env, "SITE_ENV": "preview"})

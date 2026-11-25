@@ -5,14 +5,19 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
 <meta name="referrer" content="no-referrer">
-<title>{% block title %}Adjudication{% endblock %}</title>
+<title>{% block title %}Sign in{% endblock %} · {{ site_name }}</title>
 <link rel="stylesheet" href="/static/app.css">
 <script src="/static/app.js" defer></script>
 </head>
 <body>
-{% if demo %}<p class="demo-band" role="note">Demonstration data: every post, price and reading on this site is invented.</p>{% endif %}
+{% if demo %}
+<div class="demo-band" role="note">
+  <p>Demonstration data: every post, price and reading on this site is invented.</p>
+  {% block band %}{% endblock %}
+</div>
+{% endif %}
 <header class="site">
-  <a class="brand" href="/">Trading signal adjudication</a>
+  <a class="brand" href="/">{{ site_name }}</a>
   {% if who %}
   <nav aria-label="Site">
     <a href="/">Workspace</a>

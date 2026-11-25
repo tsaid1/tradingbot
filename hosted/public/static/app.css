@@ -91,6 +91,9 @@ code, .mono, .fname, pre { font-family: var(--mono); font-size: 0.92em; }
   background: var(--warn-bg); color: var(--warn); border-bottom: 2px solid var(--warn);
   font-weight: 600; text-align: center;
 }
+.demo-band p { margin: 0; }
+.demo-band .demo-code { margin-top: 0.2rem; color: var(--text); font-size: 1.1rem; }
+.demo-band .demo-code strong { font-family: var(--mono); font-size: 1.3em; letter-spacing: 0.15em; }
 
 header.site {
   display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between;
@@ -280,7 +283,7 @@ label.typed input { color: var(--text); font-size: 1rem; }
 .system-value .who { color: var(--system); font-weight: 700; font-size: 0.82rem;
   text-transform: uppercase; letter-spacing: 0.04em; margin-right: 0.5rem; }
 .verdict-choice { border: 0; margin: 0.35rem 0 0; padding: 0; display: flex; flex-wrap: wrap;
-  gap: 0.2rem 1.4rem; min-width: 0; }
+  gap: 0.2rem 1.1rem; min-width: 0; font-size: 0.95rem; }
 .verdict-choice legend { padding: 0; font-size: 0.85rem; color: var(--muted); }
 .verdict .note { margin: 0.3rem 0 0; }
 
@@ -322,6 +325,9 @@ label.typed input { color: var(--text); font-size: 1rem; }
 .context { color: var(--muted); }
 .cells { display: grid; gap: 0.5rem 0.75rem;
   grid-template-columns: repeat(auto-fit, minmax(min(100%, 10.5rem), 1fr)); min-width: 0; }
+@media (min-width: 46rem) {
+  .price-row .cells { grid-template-columns: minmax(15.5rem, 3fr) repeat(3, minmax(8rem, 2fr)); }
+}
 .cells.further { margin: 0.5rem 0; }
 .cell { display: grid; gap: 0.15rem; align-content: start; min-width: 0; }
 .cell label, .cell-label { font-family: var(--mono); font-size: 0.82rem; color: var(--muted);

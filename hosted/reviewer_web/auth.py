@@ -21,10 +21,13 @@ import hashlib
 import hmac
 import secrets
 from datetime import datetime, timedelta
+from typing import NamedTuple
 
 from psycopg.rows import tuple_row
 
 from tradingbot.runtime import adjudication as A
+
+from .mail import SITE_NAME
 
 COOKIE = "__Host-session"
 CODE_VALID = timedelta(minutes=10)
@@ -37,7 +40,16 @@ SESSION_REFRESH = timedelta(hours=1)  # the sliding expiry is written at most th
 HOUR = timedelta(hours=1)
 LIMIT_LOCK = 7203  # pg_advisory_xact_lock(LIMIT_LOCK, <bucket>): one counter at a time
 MAX_ADDRESS = 320
-SUBJECT = "Your sign-in code"
+SUBJECT = f"{SITE_NAME}: your sign-in code"
+
+
+class Asked(NamedTuple):
+    """What a request for a code came to. ``allowed``: within the hourly limits. ``reviewer``
+    and ``code``: set only when a code was stored for a reviewer who may sign in."""
+
+    allowed: bool
+    reviewer: object = None
+    code: str | None = None
 
 
 def _mac(secret: bytes, *parts: str) -> str:
@@ -60,9 +72,8 @@ def csrf_token(secret: bytes, token: str) -> str:
 
 
 def mail_text(code: str) -> str:
-    return (f"Your one-time sign-in code is {code}\n\n"
-            "It is valid for ten minutes and can be used once. If you did not ask for it, "
-            "ignore this message: nobody can sign in without the code.\n")
+    """The whole message: the site's name, the code, how long it is valid. No link."""
+    return f"{SITE_NAME}\n\nYour sign-in code is {code}. It is valid for 10 minutes.\n"
 
 
 def _allow(cur, bucket: str, limit: int, now: datetime) -> bool:
@@ -76,13 +87,13 @@ def _allow(cur, bucket: str, limit: int, now: datetime) -> bool:
     return True
 
 
-def request_code(store, secret: bytes, address: str, network: str, now: datetime):
-    """``(reviewer, code)`` when a code was stored for a reviewer who may sign in; None for
-    everything else (not listed, revoked, another role, over a limit). The caller answers the
-    same either way."""
+def request_code(store, secret: bytes, address: str, network: str, now: datetime) -> Asked:
+    """A code is stored only for a reviewer who may sign in, within the limits; for everything
+    else (not listed, revoked, another role, over a limit) there is none. The caller answers
+    the same either way."""
     login = address.strip().casefold()
     if not login or len(login) > MAX_ADDRESS:
-        return None
+        return Asked(True)
     with store.connection() as conn:
         cur = conn.cursor(row_factory=tuple_row)
         cur.execute("DELETE FROM rate_limit WHERE at < %s", (now - 2 * HOUR,))
@@ -93,7 +104,7 @@ def request_code(store, secret: bytes, address: str, network: str, now: datetime
             and allowed
     reviewer = store.reviewer_by_login(login)
     if not allowed or not eligible(reviewer):
-        return None
+        return Asked(allowed)
     code = f"{secrets.randbelow(10 ** 6):06d}"
     with store.connection() as conn:
         cur = conn.cursor(row_factory=tuple_row)
@@ -103,7 +114,7 @@ def request_code(store, secret: bytes, address: str, network: str, now: datetime
                     "VALUES (%s, %s, %s, %s)",
                     (reviewer.id, _mac(secret, "code", str(reviewer.id), code), now,
                      now + CODE_VALID))
-    return reviewer, code
+    return Asked(True, reviewer, code)
 
 
 def verify_code(store, secret: bytes, address: str, code: str, network: str,
