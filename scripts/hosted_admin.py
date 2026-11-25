@@ -50,12 +50,28 @@ URL_ENV, UNPOOLED_ENV = "HOSTED_DATABASE_URL", "HOSTED_DATABASE_URL_UNPOOLED"
 EXPORT_SCHEMA = "tradingbot.hosted.export/1"
 SNAPSHOTS, LOG, WHAT = "hosted_snapshots", "annotations.jsonl", "annotation log"
 BUNDLE_FILES = ("manifest.json", "sequences.jsonl", "items.jsonl", "posts.jsonl")
-# The keys of an item line and of a post line that the workspace reads: no other key of a line is
-# published (``parity_problems`` fails if one that matters is ever missing here).
-ITEM_KEYS = ("item_id", "kind", "sequence_id", "set", "post_ref", "slot", "order_in_sequence",
-             "context_refs", "ai", "holds", "mapping")
+# What is published of a line: the keys the loader reads (``adjudication._item``, ``_ai``,
+# ``_levels``, ``_holds``, ``_mapping``, ``_post``) and a page or a check of the site uses.
+# Nothing else of a line leaves the Mac; ``parity_problems`` compares the loaded result with the
+# full bundle's, so a key that matters and is missing here fails the publication.
+ITEM_KEYS = ("item_id", "kind", "sequence_id", "post_ref", "slot", "order_in_sequence",
+             "context_refs", "ai", "holds", "mapping")  # not ``set``: no page shows it
+STUB_KEYS = ("item_id", "kind", "post_ref", "slot", "order_in_sequence")  # form numbering
+AI_KEYS = ("post_label", "action", "family", "instrument_as_read", "side", "effect", "timing",
+           "explicit", "ambiguities", "idea_ref")
+AI_PARTS = {"entry": ("price", "role", "exactness"), "stop": ("price",),
+            "amendment": ("field", "from", "to"),
+            "position_context": ("state", "side", "last_stop")}
+AI_LISTS = {"targets": ("price",),
+            "levels": ("n", "price", "role", "exactness", "contract_month")}
+HOLD_KEYS = ("status", "reasons")
+MAPPING_KEYS = ("reference_series", "proposed_execution_instrument", "basis_treatment",
+                "approved")
 POST_KEYS = ("post_ref", "published_at", "text", "media", "revision", "numbers", "reply_to",
-             "quotes")
+             "quotes")  # a form's own post
+CONTEXT_KEYS = ("post_ref", "published_at", "text")  # a post shown as context: its text only
+MANIFEST_KEYS = ("schema", "bundle_id", "families")
+STUB_TIME = "1970-01-01T00:00:00+00:00"  # of a post that is named by its id only
 TEST_ALIAS = re.compile(r"^TEST-[0-9]{1,3}$")
 APPROVER_SHOWN = "approver"  # all a reviewer learns of who returned a reading
 ENVELOPE = ("schema", "seq", "prev_sha256")
@@ -109,90 +125,132 @@ def _dump(row: dict) -> str:
     return json.dumps(row, ensure_ascii=False, sort_keys=True)
 
 
+def _keep(raw, keys):
+    return {k: raw[k] for k in keys if k in raw} if isinstance(raw, dict) else raw
+
+
+def _read_keys(row: dict) -> dict:
+    """An item line with the keys the loader reads, at every level."""
+    out = _keep(row, ITEM_KEYS)
+    ai = out.get("ai")
+    if isinstance(ai, dict):
+        out["ai"] = {
+            **_keep(ai, AI_KEYS),
+            **{k: _keep(ai[k], keys) for k, keys in AI_PARTS.items() if k in ai},
+            **{k: [_keep(x, keys) for x in ai[k]] if isinstance(ai[k], list) else ai[k]
+               for k, keys in AI_LISTS.items() if k in ai}}
+    if isinstance(out.get("holds"), dict):
+        out["holds"] = {k: _keep(v, HOLD_KEYS) for k, v in out["holds"].items()}
+    if "mapping" in out:
+        out["mapping"] = _keep(out["mapping"], MAPPING_KEYS)
+    return out
+
+
 def subset(base: Path, scope: int) -> tuple[A.Bundle, list[bytes], dict[str, bytes]]:
     """(the verified local bundle, the four files of its published part, that part's images).
 
-    The part holds what a reviewer of the first ``scope`` sequences is shown, and nothing that
-    reviewer is not shown:
+    The part holds what a page of a reviewer of the first ``scope`` sequences shows or a check
+    of the site reads, and nothing else:
 
     * the items ``ordered(bundle, scope)`` offers (those of no sequence only when the scope
-      covers every sequence);
-    * the posts those items, their context and their reply and quote chains need, and only the
-      images those posts list; of an item's and a post's line only the keys the workspace reads
-      (``ITEM_KEYS``, ``POST_KEYS``);
+      covers every sequence), with the keys the loader reads (``ITEM_KEYS`` and below);
+    * the OWN post of each such item whole (text, numbers, links) and its images: the only
+      images a page shows; a post shown as context with its time and text only; a post that is
+      only named (the target of an own post's reply or quote) as a stub without text;
     * EVERY sequence id with its place in the review order (the ``idea`` choices and the scope
-      rule read them); a sequence outside the scope keeps no post;
+      rule read them), nothing else of a sequence outside the scope;
     * an instruction item outside the scope that shares its post with an item inside it, as a
-      stub (its place among the post's forms and its market; no context, no system reading): the
-      form number of that post ("form k of m") counts it;
+      stub: its place among the post's forms ("form k of m" counts it), and its market only when
+      it comes before a form in scope (``position_compared`` reads the earlier forms' markets);
     * a system reading that refers (``ai.idea_ref``) to an item left out refers to that item's
-      sequence instead, which reads as the same idea association.
+      sequence instead, which reads as the same idea association;
+    * of the manifest: schema, the ORIGINAL ``bundle_id`` (the records carry it), the families.
 
-    The manifest is the local one, so the ORIGINAL ``bundle_id`` stays (the records carry it).
     ``parity_problems`` proves that none of this changes what the reviewer sees."""
     root = base / "bundle"
     full = A.load_bundle(root, A.FULL)
     raw = [A._read(root, name) for name in BUNDLE_FILES]
     if A.bundle_from_bytes(*raw, access=A.FULL) != dataclasses.replace(full, root=None):
         raise refused("BUNDLE_CHANGED_WHILE_READ")
-    shown = {i["item_id"] for _sid, items in A.ordered(full, scope) for i in items}
-    forms = {full.items[i]["post_ref"] for i in shown if full.items[i]["kind"] == "INSTRUCTION"}
-    numbered = {i for i, x in full.items.items() if i not in shown
+    shown = [i for _sid, items in A.ordered(full, scope) for i in items]
+    ids = {i["item_id"] for i in shown}
+    own = {i["post_ref"] for i in shown}
+    context = {r for i in shown for r in i["context_refs"]} - own
+    named = {full.posts[r][k] for r in own for k in ("reply_to", "quotes")
+             if full.posts[r][k]} - own - context
+    forms = {i["post_ref"] for i in shown if i["kind"] == "INSTRUCTION"}
+    numbered = {i for i, x in full.items.items() if i not in ids
                 and x["kind"] == "INSTRUCTION" and x["post_ref"] in forms}
-    needed: set[str] = set()
-    todo = [r for i in shown for r in (full.items[i]["post_ref"], *full.items[i]["context_refs"])]
-    while todo:
-        ref = todo.pop()
-        if ref not in needed:
-            needed.add(ref)
-            todo += [full.posts[ref][k] for k in ("reply_to", "quotes") if full.posts[ref][k]]
+    before = set()  # stubs that come before a form in scope: their market is read
+    for item in shown:
+        for form in A.post_forms(full, item):
+            if form["item_id"] == item["item_id"]:
+                break
+            before.add(form["item_id"])
     in_scope = {s["sequence_id"] for s in full.sequences[:scope]}
-    sequences = [_dump({**s, "post_refs": [r for r in s["post_refs"] if r in needed]
+    sequences = [_dump({"sequence_id": s["sequence_id"], "review_order": s["review_order"],
+                        "post_refs": [r for r in s["post_refs"] if r in own]
                         if s["sequence_id"] in in_scope else []}) for s in full.sequences]
     items = []
     for _line, row in _json_lines(raw[2]):
-        row = {k: row[k] for k in ITEM_KEYS if k in row}
-        if row["item_id"] in shown:
+        if row["item_id"] in ids:
+            row = _read_keys(row)
             ref = (row.get("ai") or {}).get("idea_ref")
-            gone = ref in full.items and ref not in shown | numbered
+            gone = ref in full.items and ref not in ids | numbered
             if gone and full.items[ref]["sequence_id"] is not None:
                 row["ai"] = {**row["ai"], "idea_ref": full.items[ref]["sequence_id"]}
             items.append(_dump(row))
         elif row["item_id"] in numbered:
-            items.append(_dump({**row, "context_refs": [], "holds": {}, "mapping": {},
-                                "ai": {"family": (row.get("ai") or {}).get("family")}}))
-    posts = [_dump({k: row[k] for k in POST_KEYS if k in row})
-             for _line, row in _json_lines(raw[3]) if row.get("post_ref") in needed]
+            market = {"ai": {"family": (row.get("ai") or {}).get("family")}} \
+                if row["item_id"] in before else {}
+            items.append(_dump({**_keep(row, STUB_KEYS), **market}))
+    posts = []
+    for _line, row in _json_lines(raw[3]):
+        ref = row.get("post_ref")
+        if ref in own:
+            posts.append(_dump(_keep(row, POST_KEYS)))
+        elif ref in context:
+            posts.append(_dump(_keep(row, CONTEXT_KEYS)))
+        elif ref in named:
+            posts.append(_dump({"post_ref": ref, "published_at": STUB_TIME, "text": ""}))
     media = {name: A.read_media(full, ref, name)
-             for ref in sorted(needed) for name in full.posts[ref]["media"]}
-    return full, [raw[0], _jsonl(sequences), _jsonl(items), _jsonl(posts)], media
+             for ref in sorted(own) for name in full.posts[ref]["media"]}
+    manifest = json.dumps(_keep(full.manifest, MANIFEST_KEYS), sort_keys=True).encode("utf-8")
+    return full, [manifest, _jsonl(sequences), _jsonl(items), _jsonl(posts)], media
 
 
 def _shown(bundle: A.Bundle, item: dict, scope: int, image) -> dict:
-    """What the workspace shows a reviewer of this scope for one item, per check, computed by
-    the functions the workspace itself uses."""
-    posts = [bundle.posts[r] for r in sorted({item["post_ref"], *item["context_refs"]})]
+    """What the site shows a reviewer of this scope for one item, or reads to check a save, per
+    check, computed by the functions the workspace itself uses. ``image(post, name)``: the bytes
+    of an image, or None."""
+    post = bundle.posts[item["post_ref"]]
+    forms = A.post_forms(bundle, item)
+    place = next(n for n, f in enumerate(forms) if f["item_id"] == item["item_id"])
     others = [s["sequence_id"] for s in bundle.sequences
               if s["sequence_id"] != item["sequence_id"]]
     return {
-        "item": {**item, "ai": {k: v for k, v in item["ai"].items() if k != "idea_ref"}},
+        "item": {**{k: v for k, v in item.items() if k != "set"},
+                 "ai": {k: v for k, v in item["ai"].items() if k != "idea_ref"}},
         "system_reading": A.system_reading(bundle, item),
-        "post_forms": [(f["item_id"], f["kind"], f["slot"], f["order_in_sequence"],
-                        f["ai"]["family"]) for f in A.post_forms(bundle, item)],
+        "post_forms": [(f["item_id"], f["kind"]) for f in forms],
+        "earlier_markets": [f["ai"]["family"] for f in forms[:place]],
         "post_siblings": A.post_siblings(bundle, item, scope),
         "table_row_details": A.table_row_details(bundle, item),
         "system_rows": A.system_rows(bundle, item),
         "form_context": [A.form_context(bundle, item, revealed=r) for r in (False, True)],
         "idea_options": R.offered("idea", bundle.families, others),
-        "evidence": [(p, [sha256(image(p["post_ref"], name)) for name in p["media"]])
-                     for p in posts],
+        "evidence": (post, sorted((r, bundle.posts[r]["published_at"], bundle.posts[r]["text"])
+                                  for r in set(item["context_refs"]) - {item["post_ref"]})),
+        "images": [(name, data and sha256(data)) for name in post["media"]
+                   for data in [image(item["post_ref"], name)]],
     }
 
 
 def parity_problems(full: A.Bundle, part: A.Bundle, media: dict[str, bytes],
                     scope: int) -> list[tuple[str, str]]:
     """(check, item id) wherever the published part would show a reviewer of ``scope`` anything
-    other than the full bundle does. Empty: identical for every item in scope."""
+    other than the full bundle does, an image included: every image a page shows must be in the
+    publication with the sha256 of the local file. Empty: identical for every item in scope."""
     def order(b: A.Bundle):
         return [(sid, [i["item_id"] for i in items]) for sid, items in A.ordered(b, scope)]
 
@@ -204,7 +262,7 @@ def parity_problems(full: A.Bundle, part: A.Bundle, media: dict[str, bytes],
         for item in items:
             a = _shown(full, item, scope, lambda ref, name: A.read_media(full, ref, name))
             b = _shown(part, part.items[item["item_id"]], scope,
-                       lambda _ref, name: media.get(name, b""))
+                       lambda _ref, name: media.get(name))
             out += [(check, item["item_id"]) for check in a if a[check] != b[check]]
     return out
 
@@ -226,17 +284,25 @@ def cmd_publish_bundle(args) -> int:
         raise refused("REMOTE_FULL_CONTEXT_NOT_AUTHORIZED")  # the owner's switch: posts stay home
     part = A.bundle_from_bytes(*files, access=A.FULL)
     problems = parity_problems(full, part, media, scope)
-    shown = sum(len(items) for _sid, items in A.ordered(part, scope))
+    offered = [i for _sid, items in A.ordered(part, scope) for i in items]
+    shown, texts = len(offered), sum(bool(p["text"]) for p in part.posts.values())
+    images = {(i["post_ref"], name) for i in offered for name in full.posts[i["post_ref"]]["media"]}
     print(f"bundle {full.bundle_id[:12]}: scope {min(scope, len(full.sequences))} of "
           f"{len(full.sequences)} sequence(s); items {shown} shown, {len(part.items) - shown} "
           f"kept for form numbering, {len(full.items) - len(part.items)} left out; posts "
-          f"{len(part.posts)} of {len(full.posts)}; images {len(media)}, "
-          f"{sum(map(len, media.values()))} bytes; files {sum(map(len, files))} bytes")
+          f"{texts} with text and {len(part.posts) - texts} named only, of {len(full.posts)}; "
+          f"images {len(media)}, {sum(map(len, media.values()))} bytes; files "
+          f"{sum(map(len, files))} bytes")
     print(f"parity with the full bundle: {'FAIL' if problems else 'PASS'}, {shown} item(s) in "
           f"scope, {len(problems)} difference(s)")
+    if not any(check == "images" for check, _item in problems):
+        print(f"images: all {len(images)} that a page shows are in the publication with the "
+              "sha256 of the local file; no other image is published"
+              if {name for _ref, name in images} == set(media)
+              else "images: MORE than the pages show would be published")
     for check, item_id in problems[:40]:
         print(f"  differs: {check} of {item_id}")
-    if problems:
+    if problems or {name for _ref, name in images} != set(media):
         return 1
     if args.check_only:
         print("checked only: nothing uploaded")

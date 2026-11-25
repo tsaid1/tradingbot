@@ -292,33 +292,40 @@ step everywhere, and nothing changes it silently:
 
 ### What is published
 
-`publish-bundle` uploads the part of the local bundle that the first `scope_sequences` sequences
-(review order) need, under the ORIGINAL `bundle_id` (the records carry it):
+`publish-bundle` uploads the part of the local bundle that a page of a reviewer of the first
+`scope_sequences` sequences (review order) shows, or a check of the site reads, and nothing
+else, under the ORIGINAL `bundle_id` (the records carry it):
 
-* the items the scope offers; the items of no sequence only once the scope covers every
-  sequence;
-* the posts those items, their context and their reply and quote chains need, and only the
-  images those posts list (at most 4 MB each: `MEDIA_TOO_LARGE`); of an item's and a post's
-  line only the keys the workspace reads;
-* every sequence id with its place in the review order, because the `idea` choices list them;
-  a sequence outside the scope keeps no post;
-* an instruction item outside the scope that shares its post with an item inside it, as a stub
-  (its place among the post's forms and its market; no context, no system reading): "form k of
-  m" of that post counts it;
+* the items the scope offers (those of no sequence only once the scope covers every sequence),
+  each with the keys the loader reads, at every level of its line; not its `set`;
+* the OWN post of each such item whole (text, numbers, links) and its images (at most 4 MB
+  each: `MEDIA_TOO_LARGE`): the only images a page shows; a post shown as context with its time
+  and text only; a post that is only named (the target of an own post's reply or quote) as a
+  stub without text, time or images;
+* every sequence id with its place in the review order, because the `idea` choices list them,
+  and nothing else of a sequence outside the scope;
+* an instruction item outside the scope that shares its post with an item inside it, as a stub:
+  its place among the post's forms ("form k of m" counts it), and its market only when it
+  comes before a form in scope (the comparison of the position fields reads the markets of the
+  earlier forms of a post);
 * a system reading that refers to an item left out refers to that item's sequence instead, which
-  reads as the same idea association.
+  reads as the same idea association;
+* of the manifest: its schema, the bundle id and the markets.
 
 Before anything is uploaded it compares the full bundle with the part for every item in scope,
 through the functions the workspace itself uses: the review order, the item's system fields,
-`system_reading`, `post_forms`, `post_siblings`, `table_row_details`, `system_rows`,
-`form_context`, the ideas the `idea` field offers, and the evidence (the posts shown and the
-sha256 of each image). One difference: `parity with the full bundle: FAIL`, the check and the item
-id of each, exit 1, nothing uploaded.
+`system_reading`, the forms of its post and the markets of the earlier ones, `post_siblings`,
+`table_row_details`, `system_rows`, `form_context`, the ideas the `idea` field offers, the
+evidence (the own post, and each context post's time and text), and the images: every image a
+page shows must be in the publication with the sha256 of the local file, and no other image may
+be. One difference: `parity with the full bundle: FAIL`, the check and the item id of each,
+exit 1, nothing uploaded.
 
 ```text
-bundle 5bee31e4acb2: scope 2 of 33 sequence(s); items 8 shown, 1 kept for form numbering, 37 left out; posts 10 of 41; images 1, 73 bytes; files 9120 bytes
+bundle 5bee31e4acb2: scope 2 of 33 sequence(s); items 8 shown, 1 kept for form numbering, 37 left out; posts 8 with text and 1 named only, of 41; images 1, 73 bytes; files 8620 bytes
 parity with the full bundle: PASS, 8 item(s) in scope, 0 difference(s)
-published and active: bundle 5bee31e4acb2, demonstration data
+images: all 1 that a page shows are in the publication with the sha256 of the local file; no other image is published
+published and active: bundle 5bee31e4acb2, demonstration data (for test identities; the real bundle stays)
 ```
 
 To raise the scope: raise `scope_sequences` in `reviewers.toml`, then `publish-bundle`, then

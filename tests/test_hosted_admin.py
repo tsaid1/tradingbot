@@ -6,6 +6,7 @@ and that no command prints an address, a name or a word of a post or a reading."
 
 from __future__ import annotations
 
+import dataclasses
 import importlib.util
 import json
 import os
@@ -157,6 +158,10 @@ def extend(base: Path, scope: int) -> None:
         rows["i08"]["ai"]["idea_ref"] = "s01a"
         rows["i05"]["ai"]["idea_ref"] = "i09"
         rows["i01"]["exporter_note"] = "a key the workspace never reads"
+        rows["i01"]["ai"]["rationale"] = "a key the workspace never reads"
+        rows["i01"]["ai"]["entry"]["quote"] = "a key the workspace never reads"
+        rows["i01"]["mapping"]["memo"] = "a key the workspace never reads"
+        rows["i01"]["holds"]["SHIPPED"]["trace"] = "a key the workspace never reads"
         rows["x01"] = {**rows["i07"], "item_id": "x01", "sequence_id": "scs01", "slot": 1,
                        "order_in_sequence": 2, "context_refs": ["s01"],
                        "ai": {**rows["i07"]["ai"], "idea_ref": "s01a"}}
@@ -191,8 +196,11 @@ def test_publish_bundle_uploads_only_what_the_scope_needs_and_proves_parity(run,
     assert "checked only: nothing uploaded" in out and store.published(demo=True) is None
     out = run("publish-bundle", "--demo", base)
     assert (f"bundle {full.bundle_id[:12]}: scope 2 of 33 sequence(s); items 8 shown, 1 kept for "
-            "form numbering, 37 left out; posts 10 of 41; images 1,") in out
+            "form numbering, 37 left out; posts 8 with text and 1 named only, of 41; images 1,"
+            ) in out
     assert "parity with the full bundle: PASS" in out and "published and active" in out
+    assert ("images: all 1 that a page shows are in the publication with the sha256 of the "
+            "local file; no other image is published") in out
     part = store.active_bundle()
     assert part.bundle_id == full.bundle_id and store.bundle_is_demo() is True
     assert {k: store.published(demo=True)[k]
@@ -202,20 +210,30 @@ def test_publish_bundle_uploads_only_what_the_scope_needs_and_proves_parity(run,
     # The items the scope offers, the second form of a post they share, and nothing else.
     assert [i["item_id"] for _s, items in A.ordered(part, 2) for i in items] == IN_SCOPE
     assert set(part.items) == {*IN_SCOPE, "x01"}
-    stub = part.items["x01"]  # its place among the forms and its market, nothing else
-    assert (stub["post_ref"], stub["slot"], stub["sequence_id"], stub["ai"]["family"]) == (
-        "p07", 1, "scs01", "OTHER")
-    assert (stub["context_refs"], stub["levels"], stub["holds"], stub["ai"]["action"],
-            stub["ai"]["instrument_as_read"]) == ([], [], {}, "", "")
-    # Only the posts those items, their context and their quote chain need; one image.
-    assert set(part.posts) == {"p01", "p02", "p03", "p04", "p05", "p06", "p07", "p08", "s02",
-                               "s03"}
     with store.connection() as conn:
-        stored = b"".join(map(bytes, conn.execute("SELECT posts, items FROM bundle").fetchone()))
+        files = list(map(bytes, conn.execute(
+            "SELECT manifest, sequences, items, posts FROM bundle").fetchone()))
         assert conn.execute("SELECT name FROM media").fetchall() == [("chart-p01.png",)]
+    stored = b"".join(files)
+    # The other form of the shared post: its place among the forms, nothing else (it comes
+    # after the form in scope, so not even its market is read).
+    [stub] = [r for r in map(json.loads, files[2].decode().splitlines())
+              if r["item_id"] == "x01"]
+    assert stub == {"item_id": "x01", "kind": "INSTRUCTION", "post_ref": "p07", "slot": 1,
+                    "order_in_sequence": 2}
+    # The forms' own posts whole; the post an own post quotes by its id only; nothing of the
+    # post THAT one replies to, nor of the stub form's context.
+    assert set(part.posts) == {"p01", "p02", "p03", "p04", "p05", "p06", "p07", "p08", "s02"}
+    assert part.posts["s02"] == {**part.posts["s02"], "text": "", "media": [], "numbers": [],
+                                 "reply_to": None, "published_at": "1970-01-01T00:00:00+00:00"}
     assert b"never reads" not in stored and b"exporter_note" not in stored  # read keys only
-    assert json.dumps(full.posts["s01"]["text"])[1:-1].encode() not in stored
-    assert json.dumps(full.posts["s03"]["text"])[1:-1].encode() in stored
+    for ref in ("s01", "s02", "s03"):
+        assert json.dumps(full.posts[ref]["text"])[1:-1].encode() not in stored
+    # Of the manifest and of the ideas: what the loader and the ``idea`` choices need.
+    assert sorted(json.loads(files[0])) == ["bundle_id", "families", "schema"]
+    assert {tuple(sorted(json.loads(x))) for x in files[1].decode().splitlines()} == {
+        ("post_refs", "review_order", "sequence_id")}
+    assert b"DESIGN" not in stored and b"CHECK" not in stored  # which set an idea is in
     assert store.media("p01", "chart-p01.png") == (
         (base / "bundle" / "media" / "chart-p01.png").read_bytes(), "image/png")
     # Every idea keeps its id and its place; one outside the scope keeps no post.
@@ -231,6 +249,21 @@ def test_publish_bundle_uploads_only_what_the_scope_needs_and_proves_parity(run,
     assert A.form_context(part, part.items["i07"], revealed=True) == A.form_context(
         full, full.items["i07"], revealed=True)
     assert A.form_context(part, part.items["i07"], revealed=True).forms_in_post == 2
+    # And by the web app's own page functions, for every form in scope.
+    from reviewer_web import forms
+
+    session = dataclasses.replace(ONE, scope=2)
+    assert forms.workspace(part, session, []) == forms.workspace(full, session, [])
+    assert forms.media_posts(part, session) == forms.media_posts(full, session)
+    for item_id in IN_SCOPE:
+        mine, theirs = part.items[item_id], full.items[item_id]
+        for page in (forms.evidence, forms.system_block, forms.form_header):
+            assert page(part, mine) == page(full, theirs), (page.__name__, item_id)
+        for system in (None, A.system_reading(full, theirs)):
+            built = [forms.build(b, i, [], session, system=system, defaults={},
+                                 phase=A.AFTER_REVEAL if system else A.INDEPENDENT)
+                     for b, i in ((part, mine), (full, theirs))]
+            assert built[0] == built[1], item_id
 
 
 def test_a_scope_that_covers_every_sequence_publishes_the_items_of_no_sequence_too(
@@ -239,12 +272,12 @@ def test_a_scope_that_covers_every_sequence_publishes_the_items_of_no_sequence_t
     full = A.load_bundle(base / "bundle", A.FULL)
     out = run("publish-bundle", "--demo", base)
     assert "scope 33 of 33 sequence(s); items 46 shown, 0 kept for form numbering, 0 left out; " \
-           "posts 41 of 41; images 2," in out and "PASS" in out
+           "posts 41 with text and 0 named only, of 41; images 2," in out and "PASS" in out
     part = store.active_bundle()
     assert list(part.items) == list(full.items) and "i09" in part.items
     assert [(s, [i["item_id"] for i in g]) for s, g in A.ordered(part, 40)] == [
         (s, [i["item_id"] for i in g]) for s, g in A.ordered(full, 40)]
-    assert part.items == full.items  # nothing rewritten, nothing stripped
+    assert part.items == {k: {**v, "set": None} for k, v in full.items.items()}  # as loaded
 
 
 def test_a_wrong_part_fails_parity_and_is_not_uploaded(cli, run, store, base, monkeypatch):
@@ -287,8 +320,8 @@ def test_a_wrong_part_fails_parity_and_is_not_uploaded(cli, run, store, base, mo
         == {("evidence", "i02"), ("evidence", "i03"), ("evidence", "i04")}
     assert problems({3: lambda rows: rows["p04"].update(text="Raising the stop to 88.00 now.")}) \
         >= {("table_row_details", "i04"), ("evidence", "i04"), ("evidence", "i05")}
-    assert problems({}, images={"chart-p01.png": DEMO._png() + b"."}) == {
-        ("evidence", i) for i in ("i01", "i02", "i03", "i04", "i05")}
+    assert problems({}, images={"chart-p01.png": DEMO._png() + b"."}) == {("images", "i01")}
+    assert problems({}, images={}) == {("images", "i01")}  # an image a page shows is missing
     # Without the ideas outside the scope the ``idea`` choices shrink for every form.
     assert problems({1: only_the_scope_s_ideas, 2: without_the_other_form}) >= {
         ("idea_options", i) for i in IN_SCOPE} | {("system_reading", "i08")}
@@ -1372,3 +1405,67 @@ def test_two_pulls_at_once_append_every_hosted_line_once(cli, run, store, base, 
             == HOSTED_1 + 4] == [next(r["seq"] for r in log.records if r.get(
                 "hosted", {}).get("seq") == HOSTED_1 + 2)]  # still the local line it means
     assert "PASS" in run("parity") and "pulled 0 hosted line(s)" in run("pull-to-local")
+
+
+# ------------------------------------------------------------------ only the material needed
+# (The independent review's finding 8.)
+
+
+def test_the_published_part_holds_nothing_that_no_page_shows(cli, run, store, base):
+    """Probes ``test_published_part_holds_more_than_is_shown`` and
+    ``test_an_image_of_a_post_no_page_shows_is_uploaded``: the text and the images of posts that
+    are only named, the images of context posts, the set of every idea, the system's market of a
+    stub form and the manifest's counts were published."""
+    extend(base, 2)
+
+    def posts(rows):  # the post that is only named has an image; so has a post shown as context
+        rows["s02"]["media"] = ["chart-s04.png"]
+
+    def items(rows):  # a post of an idea outside the scope, shown as context of a form in scope
+        rows["i08"]["context_refs"].append("s04")
+        rows["x01"]["slot"], rows["i07"]["slot"] = 0, 1  # the other form now comes FIRST
+
+    edit(base / "bundle" / "posts.jsonl", posts)
+    edit(base / "bundle" / "items.jsonl", items)
+    reseal(base)
+    full, files, media = cli.subset(base, 2)
+    part = A.bundle_from_bytes(*files, access=A.FULL)
+    assert cli.parity_problems(full, part, media, 2) == []
+    offered = [i for _s, group in A.ordered(part, 2) for i in group]
+    own = {i["post_ref"] for i in offered}
+    evidence = own | {r for i in offered for r in i["context_refs"]}
+    # A post no page shows: named by its id only, without text, time, numbers or images.
+    assert sorted(set(part.posts) - evidence) == ["s02"] and part.posts["s02"]["text"] == ""
+    # A post shown as context: its time and text, no image, no numbers, no links.
+    assert part.posts["s04"] == {
+        **full.posts["s04"], "media": [], "numbers": [], "revision": None}
+    assert full.posts["s04"]["media"] == ["chart-s04.png"] and full.posts["s04"]["numbers"]
+    # Images: exactly those of the forms' own posts, which is all the image route serves.
+    assert sorted(media) == sorted({n for r in own for n in part.posts[r]["media"]}) == [
+        "chart-p01.png"]
+    raw = {r["item_id"]: r for r in map(json.loads, files[2].decode().splitlines())}
+    # The other form of a shared post comes before the form in scope here: its market is read
+    # (``A.position_compared``), and nothing else of it is published.
+    assert raw["x01"] == {"item_id": "x01", "kind": "INSTRUCTION", "post_ref": "p07", "slot": 0,
+                          "order_in_sequence": 2, "ai": {"family": "OTHER"}}
+    without = dict(raw, x01={k: v for k, v in raw["x01"].items() if k != "ai"})
+    wrong = [files[0], files[1],
+             "".join(json.dumps(r) + "\n" for r in without.values()).encode(), files[3]]
+    assert cli.parity_problems(full, A.bundle_from_bytes(*wrong, access=A.FULL), media, 2) == [
+        ("earlier_markets", "i07")]
+    # Of an item in scope: the keys the loader reads, at every level.
+    assert set(raw["i01"]) <= set(cli.ITEM_KEYS) and set(raw["i01"]["ai"]) <= {
+        *cli.AI_KEYS, *cli.AI_PARTS, *cli.AI_LISTS}
+    assert set(raw["i01"]["ai"]["entry"]) == {"price", "role", "exactness"}
+    assert set(raw["i01"]["mapping"]) == set(cli.MAPPING_KEYS)
+    assert set(raw["i01"]["holds"]["SHIPPED"]) == {"status", "reasons"}
+    assert b"never reads" not in b"".join(files)
+    assert {s["set"] for s in part.sequences} == {None} and len(part.sequences) == 33
+    assert sorted(part.manifest) == ["bundle_id", "families", "schema"]
+    # The command says how many images it proved, and uploads no other.
+    out = run("publish-bundle", "--demo", base)
+    assert "posts 9 with text and 1 named only, of 41; images 1," in out
+    assert ("images: all 1 that a page shows are in the publication with the sha256 of the "
+            "local file; no other image is published") in out
+    with store.connection() as conn:
+        assert conn.execute("SELECT name FROM media").fetchall() == [("chart-p01.png",)]
