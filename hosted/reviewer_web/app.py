@@ -56,7 +56,7 @@ DEMO_ENVS = ("preview", "test")  # these show invented data only
 PUBLIC = ("healthz", "robots", "favicon", "static")  # no session, no database
 SIGN_IN = ("sign_in", "sign_in_code", "sign_in_verify")
 OPERATOR = ("send_queued",)  # the one route without a session: its own token, or it is a 404
-EVERY_METHOD = ("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS")
+SENDER = "/internal/send-queued"
 MIN_OPERATOR_TOKEN = 32
 MAIL_PER_CALL = 5
 IMAGE_TYPES = ("image/png", "image/jpeg", "image/gif", "image/webp")
@@ -210,6 +210,8 @@ def create_app(store, mailer, config: dict) -> Flask:
         """Before any route: a POST from another origin is refused, and a signed-in browser
         does not see the sign-in pages."""
         g.who = None
+        if request.path == SENDER and request.method != "POST":
+            return refuse(404)  # whatever the method, named or invented: no such path
         if request.endpoint is None or request.endpoint in (*PUBLIC, *OPERATOR):
             return None
         if request.method == "POST" and not same_origin():
@@ -329,16 +331,20 @@ def create_app(store, mailer, config: dict) -> Flask:
 
     # ------------------------------------------------------------- the operator's queued mail
 
-    @app.route("/internal/send-queued", methods=EVERY_METHOD, provide_automatic_options=False)
+    @app.post(SENDER, provide_automatic_options=False)
     def send_queued():
         """Send the invitations the operator queued (``hosted_admin.py invite``): the mail
         password exists only here. No session, no parameters, no body: the operator's token in
         ``Authorization: Bearer``, or the answer is that of a path that does not exist (also in
-        preview and test, which never send mail, and for any method but POST). At most five
-        messages a call, one sender at a time, each try recorded as it happens. The answer is
-        three counts; no address is returned or logged."""
+        preview and test, which never send mail, and for every method but POST: ``guard``).
+
+        At most five messages a call. Each try is counted and its start recorded, committed,
+        BEFORE the message is handed to the mail server, and its outcome after: no transaction
+        is open while the mail server is spoken to, and a call that is stopped in between leaves
+        a row that is never sent again by itself. The answer is three counts; no address is
+        returned or logged."""
         given = request.headers.get("Authorization", "").encode("utf-8")
-        if request.method != "POST" or demo_env or len(operator_token) < MIN_OPERATOR_TOKEN \
+        if demo_env or len(operator_token) < MIN_OPERATOR_TOKEN \
                 or not hmac.compare_digest(given, b"Bearer " + operator_token):
             return refuse(404)
         if not site_url.startswith("https://"):
@@ -346,22 +352,21 @@ def create_app(store, mailer, config: dict) -> Flask:
             return refuse(404)
         sent, failed, tried = 0, 0, []
         for _ in range(MAIL_PER_CALL):
-            with store.connection():  # one message, one transaction: its result is kept
-                due = store.mail_next(tried)
-                if due is None:
-                    break
-                row, kind, to = due
-                tried.append(row)
-                try:
-                    mailer(to, *mail.invitation(kind, site_url))
-                    result = "SENT"
-                except mail.Unreachable as exc:
-                    result = "MAIL_UNREACHABLE"
-                    app.logger.error("QUEUED_MAIL %s error=%s", result, _cause(exc))
-                except Exception as exc:  # noqa: BLE001 - a constant code, no detail
-                    result = "MAIL_FAILED"
-                    app.logger.error("QUEUED_MAIL %s error=%s", result, _cause(exc))
-                store.mail_done(row, result)
+            due = store.mail_claim(tried)  # the try is counted: committed here
+            if due is None:
+                break
+            row, kind, to = due
+            tried.append(row)
+            try:
+                mailer(to, *mail.invitation(kind, site_url))
+                result = "SENT"
+            except mail.Unreachable as exc:
+                result = "MAIL_UNREACHABLE"
+                app.logger.error("QUEUED_MAIL %s error=%s", result, _cause(exc))
+            except Exception as exc:  # noqa: BLE001 - a constant code, no detail
+                result = "MAIL_FAILED"
+                app.logger.error("QUEUED_MAIL %s error=%s", result, _cause(exc))
+            store.mail_done(row, result)
             sent, failed = sent + (result == "SENT"), failed + (result != "SENT")
         left = store.mail_left()
         app.logger.info("QUEUED_MAIL sent=%d failed=%d left=%d", sent, failed, left)

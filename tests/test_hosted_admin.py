@@ -1089,23 +1089,33 @@ def test_invite_queues_a_message_for_the_site_to_send_and_status_says_how_it_wen
                      r"  mail INVITE_START: queued \d{4}-\S+, sent -, result -\n", waiting)
     assert "mail" not in waiting.split("REMOTE-3:")[1]
     # What the site's sender records: one message went out, the other could not be sent.
-    for result in (cli.S.MAIL_SENT, "MAIL_UNREACHABLE"):
-        with store.connection():
-            row, _kind, _to = store.mail_next(())
-            store.mail_done(row, result)
-            if result != cli.S.MAIL_SENT:  # tried three times: given up
-                store.mail_done(row, result)
-                store.mail_done(row, result)
+    row, _kind, _to = store.mail_claim(())
+    store.mail_done(row, cli.S.MAIL_SENT)
+    for _ in range(3):  # tried three times, failed three times: given up
+        row, _kind, _to = store.mail_claim(())
+        store.mail_done(row, "MAIL_UNREACHABLE")
     after = run("status")
     assert re.search(r"REMOTE-2: [^\n]*invited \d{4}-\S+,[^\n]*\n"
                      r"  mail INVITE_CONTINUE: queued \d{4}-\S+, sent \d{4}-\S+, result SENT\n"
                      r"  mail INVITE_START: queued \d{4}-\S+, sent -, result MAIL_UNREACHABLE\n",
                      after)
-    with store.connection():
-        assert store.mail_next(()) is None and store.mail_left() == 0
+    assert store.mail_claim(()) is None and store.mail_left() == 0
     # A message that was given up may be queued again; one that waits may not.
     run("invite", "REMOTE-2", "--kind", "start")
     assert run("invite", "REMOTE-2", "--kind", "start", code=2) == "refused: ALREADY_QUEUED\n"
+    # A try whose outcome was never recorded (the site was stopped between the send and its
+    # record): status says so, the site does not send it again, the operator may queue again.
+    store.mail_claim(())
+    unknown = run("status")
+    assert re.search(r"  mail INVITE_START: queued \S+, sent -, result - \(sending began "
+                     r"\d{4}-\S+ and its outcome was not recorded: it is not sent again by "
+                     r"itself; ask the reviewer, then invite again\)\n", unknown)
+    assert store.mail_claim(()) is None and store.mail_left() == 0
+    run("invite", "REMOTE-2", "--kind", "start")
+    # Nobody who cannot sign in is invited.
+    with store.connection() as conn:
+        conn.execute("UPDATE reviewer SET access = 'RESTRICTED' WHERE alias = 'REMOTE-2'")
+    assert run("invite", "REMOTE-2", "--kind", "continue", code=2) == "refused: CANNOT_SIGN_IN\n"
     # The queue is no part of an export.
     out = tmp_path / "export.jsonl"
     run("export", "--out", out)

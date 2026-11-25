@@ -182,12 +182,15 @@ so without the origin check and the CSRF token: it sends the invitations the ope
 (see "Inviting a reviewer"), because the mail password exists only where the site runs. It reads
 no parameter and no body. It answers only to `Authorization: Bearer <OPERATOR_TOKEN>`, compared
 in constant time, where `OPERATOR_TOKEN` is an environment variable of at least 32 characters;
-with the variable unset or too short, a wrong header or any other method, the answer is exactly
-that of a path that does not exist. So it is in `preview` and `test`, which never send mail, and
+with the variable unset or too short, a wrong header or any other method (named or invented),
+the answer is exactly that of a path that does not exist. So it is in `preview` and `test`, which never send mail, and
 without `SITE_URL` (`SITE_URL_MISSING` is logged). `SITE_URL` (an `https://` address) is the
 site's address as the invitations name it: the only absolute address the site ever writes; no
 page and no redirect uses it, so the site works under each of its host names. The route's
-answer is three counts (`sent`, `failed`, `left`); it never returns or logs an address.
+answer is three counts (`sent`, `failed`, `left`); it never returns or logs an address. Each try
+is counted, and its start recorded, in a committed transaction before the message is handed to
+the mail server, and no transaction is open while the server is spoken to: a call that is
+stopped between a send and its record can never send that message a second time.
 
 **The database.** The site connects with `SITE_DATABASE_URL` when that variable is set (and
 not empty), otherwise with `DATABASE_URL`. `SITE_DATABASE_URL` is for the connection of a
@@ -518,14 +521,25 @@ python scripts/hosted_admin.py status
 1. `invite` writes one row of `mail_queue` (reviewer, kind, time). No address and no text is
    stored: the reviewer's row gives the address when the site sends, the kind gives the text
    (`mail.INVITATIONS`: the product owner's two messages, with the site's address filled in).
-2. The call to the site's sender sends every waiting message whose reviewer is not revoked, at
-   most five a call, and answers `{"sent": n, "failed": m, "left": k}`. Call it again while
+   Only a row that can sign in is invited: not revoked (`REVOKED`), not a test identity
+   (`TEST_IDENTITY_IS_NOT_INVITED`), role REVIEWER with FULL access (`CANNOT_SIGN_IN`), a bundle
+   assigned (`NO_BUNDLE_ASSIGNED`); and one message of a kind waits at a time
+   (`ALREADY_QUEUED`).
+2. The call to the site's sender sends every waiting message whose reviewer can still sign in,
+   at most five a call, and answers `{"sent": n, "failed": m, "left": k}`. Call it again while
    `left` is not 0. A message that went out is never sent again; its time is kept, and the
    reviewer's `invited_at` the first time.
 3. `status` shows per alias `mail INVITE_CONTINUE: queued ..., sent ..., result SENT`. A failure
    leaves `sent -` and a constant code (`MAIL_UNREACHABLE`: the mail server could not be reached
    or refused the site; `MAIL_FAILED`: it refused the message). A message is tried three times,
    once a call; after that it is given up, and `invite` may queue it again.
+4. If the site is stopped between a send and its record (the platform's time limit), `status`
+   says that sending began and its outcome was not recorded. Such a message may or may not have
+   arrived, and the site never sends it again by itself: ask the reviewer, then `invite` again.
+
+**When.** Queue and send the `continue` invitations only after step 7 of the cutover (the final
+`import-log`, with `parity` and `verify` passing): the message tells reviewers to stop using the
+old address, and a save on the hosted site before the final import would run ahead of it.
 
 On the platform, production needs two more environment variables: `OPERATOR_TOKEN` (a random
 secret of at least 32 characters; the same value on the operator's machine for the call above)

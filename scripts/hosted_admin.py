@@ -560,8 +560,12 @@ def cmd_status(_args) -> int:
         for origin in dict.fromkeys(e["origin"] for e in mine):
             print(f"  {origin}: " + _counts(e["phase"] for e in mine if e["origin"] == origin))
         for m in (m for m in mail if m["alias"] == r["alias"]):
+            unknown = m["sending_at"] and not m["sent_at"] and not m["result"]
             print(f"  mail {m['kind']}: queued {_time(m['queued_at'])}, sent "
-                  f"{_time(m['sent_at'])}, result {m['result'] or '-'}")
+                  f"{_time(m['sent_at'])}, result {m['result'] or '-'}" + (
+                      f" (sending began {_time(m['sending_at'])} and its outcome was not "
+                      "recorded: it is not sent again by itself; ask the reviewer, then invite "
+                      "again)" if unknown else ""))
         if locks[r["alias"]]:  # ten wrong codes within 24 hours
             print(f"  sign-in: locked until {_time(locks[r['alias']])} (unlock lifts it)")
     print(f"test identities: {sum(r['is_test'] for r in rows)} (see test-report ALIAS)")

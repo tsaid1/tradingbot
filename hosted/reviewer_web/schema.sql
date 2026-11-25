@@ -163,3 +163,11 @@ CREATE TABLE IF NOT EXISTS mail_queue (
 -- One row of a kind waits per reviewer (not sent, tries left).
 CREATE UNIQUE INDEX IF NOT EXISTS mail_queue_one_waiting ON mail_queue (reviewer_id, kind)
     WHERE sent_at IS NULL AND attempts < 3;
+
+-- A try is counted, and its start noted, BEFORE the message is handed to the mail server. A row
+-- whose sending began and whose outcome was never recorded (the site was stopped in between) is
+-- not sent again by itself: the operator asks the reviewer and queues it again.
+ALTER TABLE mail_queue ADD COLUMN IF NOT EXISTS sending_at TIMESTAMPTZ;
+DROP INDEX IF EXISTS mail_queue_one_waiting;
+CREATE UNIQUE INDEX IF NOT EXISTS mail_queue_one_to_send ON mail_queue (reviewer_id, kind)
+    WHERE sent_at IS NULL AND attempts < 3 AND (sending_at IS NULL OR result IS NOT NULL);

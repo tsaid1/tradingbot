@@ -66,10 +66,16 @@ HOSTED_BASE = 1_000_000  # a HOSTED line's seq is HOSTED_BASE + n (n = 1, 2, ...
 RETURN_BASE = 2_000_000  # a RETURN line's seq is RETURN_BASE + the seq of its local line
 LEGACY, HOSTED, RETURN = "LEGACY", "HOSTED", "RETURN"
 MAX_MEDIA_BYTES = 4 * 1024 * 1024
-MAIL_LOCK_KEY = 7_203_002  # pg_try_advisory_xact_lock: one sender of queued mail at a time
 MAIL_KINDS = ("INVITE_CONTINUE", "INVITE_START")
 MAIL_TRIES = 3  # of one queued message
 MAIL_SENT = "SENT"
+# A queued message that may be sent now: not sent, tries left, and no try whose outcome is
+# unknown (sending began and nothing was recorded: that one is never sent again by itself).
+_MAIL_DUE = ("q.sent_at IS NULL AND q.attempts < 3"
+             " AND (q.sending_at IS NULL OR q.result IS NOT NULL)")
+# Whom the site invites: only a row that can sign in and has something to read.
+_MAIL_FOR = ("r.revoked_at IS NULL AND NOT r.is_test AND r.role = 'REVIEWER'"
+             " AND r.access = 'FULL' AND r.bundle_id IS NOT NULL")
 _IMAGE_TYPES = dict(zip(A._MAGIC, ("image/png", "image/jpeg", "image/gif", "image/gif"),
                         strict=True))
 
@@ -242,30 +248,30 @@ class Store:
 
     # -------------------------------------------------------------- queued mail
 
-    def mail_next(self, skip=()) -> tuple[int, str, str] | None:
-        """The oldest queued message that may be sent now, as (row, kind, the reviewer's
-        address), or None: not sent yet, tries left, its reviewer not revoked, and not one of
-        ``skip``. Call it inside ``connection()``: it takes the senders' lock for that
-        transaction (None while another sender holds it), so no row is ever sent twice."""
+    def mail_claim(self, skip=()) -> tuple[int, str, str] | None:
+        """Take the oldest queued message that may be sent now, as (row, kind, the reviewer's
+        address), or None. Taking it COUNTS the try and notes that sending begins, committed
+        before the mail server hears of it: if the site is stopped between the send and its
+        record, the row is left with an unknown outcome and is never sent again by itself. A
+        message is for a reviewer who can sign in (not revoked, REVIEWER, FULL, not a test
+        identity, a bundle assigned). ``skip``: rows already tried in this call."""
         with self.connection() as conn:
-            if not conn.execute("SELECT pg_try_advisory_xact_lock(%s)",
-                                (MAIL_LOCK_KEY,)).fetchone()[0]:
-                return None
             row = conn.execute(
-                "SELECT q.id, q.kind, r.login_shown FROM mail_queue q JOIN reviewer r"
-                " ON r.id = q.reviewer_id WHERE q.sent_at IS NULL AND q.attempts < %s"
-                " AND r.revoked_at IS NULL AND NOT q.id = ANY(%s) ORDER BY q.id LIMIT 1",
-                (MAIL_TRIES, list(skip))).fetchone()
+                "UPDATE mail_queue SET attempts = attempts + 1, sending_at = now(), result = NULL"
+                " WHERE id = (SELECT q.id FROM mail_queue q JOIN reviewer r"
+                " ON r.id = q.reviewer_id WHERE " + _MAIL_DUE + " AND " + _MAIL_FOR
+                + " AND NOT q.id = ANY(%s) ORDER BY q.id LIMIT 1 FOR UPDATE OF q SKIP LOCKED)"
+                " RETURNING id, kind, (SELECT login_shown FROM reviewer"
+                " WHERE id = mail_queue.reviewer_id)", (list(skip),)).fetchone()
         return tuple(row) if row else None
 
     def mail_done(self, row: int, result: str) -> None:
-        """One try of a queued message: ``SENT`` (its time is kept, and the reviewer's
+        """The outcome of the try just made: ``SENT`` (its time is kept, and the reviewer's
         ``invited_at`` while that is empty) or the constant code of the failure."""
         with self.connection() as conn:
             conn.execute(
-                "UPDATE mail_queue SET attempts = attempts + 1, result = %s,"
-                " sent_at = CASE WHEN %s THEN now() END WHERE id = %s",
-                (result, result == MAIL_SENT, row))
+                "UPDATE mail_queue SET result = %s, sent_at = CASE WHEN %s THEN now() END"
+                " WHERE id = %s", (result, result == MAIL_SENT, row))
             if result == MAIL_SENT:
                 conn.execute(
                     "UPDATE reviewer SET invited_at = now() WHERE invited_at IS NULL"
@@ -276,8 +282,7 @@ class Store:
         with self.connection() as conn:
             return conn.execute(
                 "SELECT count(*) FROM mail_queue q JOIN reviewer r ON r.id = q.reviewer_id"
-                " WHERE q.sent_at IS NULL AND q.attempts < %s AND r.revoked_at IS NULL",
-                (MAIL_TRIES,)).fetchone()[0]
+                " WHERE " + _MAIL_DUE + " AND " + _MAIL_FOR).fetchone()[0]
 
     # -------------------------------------------------------------- one reviewer's records
 
@@ -465,34 +470,37 @@ class AdminStore(Store):
 
     def queue_mail(self, alias: str, kind: str) -> None:
         """Queue one invitation for a reviewer: the site sends it (the operator's machine holds
-        no mail password). Only for a reviewer who is neither a test identity nor revoked, and
-        only while no row of that kind is waiting for them."""
+        no mail password). Only for a row that can sign in and has a bundle (what the sign-in
+        itself requires), and only while no message of that kind waits for them."""
         if kind not in MAIL_KINDS:
             raise A.AdjudicationError("UNKNOWN_MAIL_KIND")
         with self.connection() as conn:
-            row = conn.execute("SELECT id, is_test, revoked_at IS NOT NULL FROM reviewer"
-                               " WHERE alias = %s FOR UPDATE", (alias,)).fetchone()
+            row = conn.execute(
+                "SELECT id, is_test, revoked_at IS NOT NULL, role = 'REVIEWER' AND access = 'FULL',"
+                " bundle_id IS NOT NULL FROM reviewer WHERE alias = %s FOR UPDATE",
+                (alias,)).fetchone()
             if row is None:
                 raise A.AdjudicationError("UNKNOWN_ALIAS")
-            if row[1]:
-                raise A.AdjudicationError("TEST_IDENTITY_IS_NOT_INVITED")
-            if row[2]:
-                raise A.AdjudicationError("REVOKED")
-            if conn.execute("SELECT 1 FROM mail_queue WHERE reviewer_id = %s AND kind = %s"
-                            " AND sent_at IS NULL AND attempts < %s",
-                            (row[0], kind, MAIL_TRIES)).fetchone():
+            for refused, code in ((row[1], "TEST_IDENTITY_IS_NOT_INVITED"), (row[2], "REVOKED"),
+                                  (not row[3], "CANNOT_SIGN_IN"),
+                                  (not row[4], "NO_BUNDLE_ASSIGNED")):
+                if refused:
+                    raise A.AdjudicationError(code)
+            if conn.execute("SELECT 1 FROM mail_queue q WHERE q.reviewer_id = %s AND q.kind = %s"
+                            " AND " + _MAIL_DUE, (row[0], kind)).fetchone():
                 raise A.AdjudicationError("ALREADY_QUEUED")
             conn.execute("INSERT INTO mail_queue (reviewer_id, kind) VALUES (%s, %s)",
                          (row[0], kind))
 
     def queued_mail(self) -> list[dict]:
-        """Every queued message, oldest first: alias, kind, times, result, tries. No address."""
-        keys = ("alias", "kind", "queued_at", "sent_at", "result", "attempts")
+        """Every queued message, oldest first: alias, kind, times, result, tries. No address.
+        ``sending_at`` with neither ``sent_at`` nor ``result``: a try whose outcome is unknown."""
+        keys = ("alias", "kind", "queued_at", "sent_at", "result", "attempts", "sending_at")
         with self.connection() as conn:
             rows = conn.execute(
-                "SELECT r.alias, q.kind, q.queued_at, q.sent_at, q.result, q.attempts"
-                " FROM mail_queue q JOIN reviewer r ON r.id = q.reviewer_id ORDER BY q.id"
-            ).fetchall()
+                "SELECT r.alias, q.kind, q.queued_at, q.sent_at, q.result, q.attempts,"
+                " q.sending_at FROM mail_queue q JOIN reviewer r ON r.id = q.reviewer_id"
+                " ORDER BY q.id").fetchall()
         return [dict(zip(keys, row, strict=True)) for row in rows]
 
     # -------------------------------------------------------------- content

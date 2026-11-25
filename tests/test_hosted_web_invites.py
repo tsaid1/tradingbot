@@ -75,12 +75,19 @@ def test_without_the_operators_token_the_sender_is_a_path_that_does_not_exist(
              {"X-Authorization": f"Bearer {TOKEN}"}, {"Cookie": f"Authorization=Bearer {TOKEN}"}]
     for headers in wrong:
         assert same_as_unknown(call(app, headers)), headers
-    # Only a POST: any other method is the unknown path too, and nothing tells them apart.
-    for method in ("GET", "PUT", "PATCH", "DELETE", "OPTIONS"):
+    # Only a POST: any other method, named or invented, is the unknown path too, and nothing
+    # tells them apart (the review: TRACE and PROPFIND answered 405 here and 404 there).
+    for method in ("GET", "PUT", "PATCH", "DELETE", "OPTIONS", "TRACE", "PROPFIND", "LINK",
+                   "CONNECT", "FOO"):
         answer = call(app, bearer(), method)
-        assert answer.status_code == 404 and "Allow" not in answer.headers
-        assert answer.get_data() == call(app, method=method, path="/internal/nothing").get_data()
+        missing = call(app, method=method, path="/internal/nothing")
+        assert answer.status_code == missing.status_code == 404 and "Allow" not in answer.headers
+        assert (answer.get_data(), dict(answer.headers)) == (
+            missing.get_data(), dict(missing.headers)), method
     assert call(app, bearer(), "HEAD").status_code == 404
+    # A header that is not text a token could be: the same answer, not a failure.
+    for odd in ("Bearer " + "é" * 40, "Bearer " + "x" * 100000, "Bearer \x7f\x01"):
+        assert same_as_unknown(call(app, {"Authorization": odd.encode().decode("latin-1")}))
     # No token configured, or one too short to be a secret: the right-looking header fails.
     for token in (None, "", "short", "x" * 31):
         for headers in (bearer(token or ""), {"Authorization": "Bearer "}, {}):
@@ -237,7 +244,8 @@ def test_only_a_reviewer_who_can_use_the_site_is_invited_and_once_per_kind(site)
     # The table itself holds no address and no text, and allows one waiting row of a kind.
     columns = [c for (c,) in site.sql("SELECT column_name FROM information_schema.columns "
                                       "WHERE table_name = 'mail_queue' ORDER BY ordinal_position")]
-    assert columns == ["id", "reviewer_id", "kind", "queued_at", "sent_at", "result", "attempts"]
+    assert columns == ["id", "reviewer_id", "kind", "queued_at", "sent_at", "result", "attempts",
+                       "sending_at"]
     import psycopg
 
     with pytest.raises(psycopg.errors.UniqueViolation):
@@ -246,3 +254,92 @@ def test_only_a_reviewer_who_can_use_the_site_is_invited_and_once_per_kind(site)
     with pytest.raises(psycopg.errors.CheckViolation):
         site.sql("INSERT INTO mail_queue (reviewer_id, kind) VALUES (%s, 'NEWSLETTER')",
                  site.reviewers[FIRST].id)
+
+
+def test_a_call_stopped_between_the_send_and_its_record_does_not_send_again(
+        site, monkeypatch):  # noqa: F811
+    """The review, on 24f78dd: the mailer ran before the try was recorded, in one transaction;
+    a failure in between left the row unsent with no try counted, and the next call sent the
+    invitation a second time."""
+    from reviewer_web import store as S
+
+    site.admin.queue_mail(FIRST, "INVITE_CONTINUE")
+    app = live(site)
+    done = S.Store.mail_done
+    stopped = []
+
+    def flaky(self, row, result):
+        if not stopped:
+            stopped.append(row)
+            raise OSError("the function was stopped after the send")
+        return done(self, row, result)
+
+    monkeypatch.setattr(S.Store, "mail_done", flaky)
+    first = call(app, bearer())
+    assert first.status_code == 500 and len(site.outbox.sent) == 1  # it went out, unrecorded
+    # The try was counted before the send: the row waits for the operator, not for a call.
+    [row] = site.admin.queued_mail()
+    assert (row["attempts"], row["sent_at"], row["result"]) == (1, None, None)
+    assert row["sending_at"] is not None
+    for _ in range(3):
+        assert call(app, bearer()).get_json() == {"sent": 0, "failed": 0, "left": 0}
+    assert len(site.outbox.sent) == 1
+    # The operator, having asked the reviewer, queues it again deliberately.
+    site.admin.queue_mail(FIRST, "INVITE_CONTINUE")
+    assert call(app, bearer()).get_json() == {"sent": 1, "failed": 0, "left": 0}
+    assert len(site.outbox.sent) == 2
+
+
+def test_no_transaction_is_open_while_the_mail_server_is_spoken_to(site):  # noqa: F811
+    import psycopg
+
+    site.admin.queue_mail(FIRST, "INVITE_START")
+    seen = {}
+
+    def mailer(_to, _subject, _text):
+        with psycopg.connect(site.dsn) as conn:
+            seen["idle in transaction"] = conn.execute(
+                "SELECT count(*) FROM pg_stat_activity WHERE state = 'idle in transaction'"
+            ).fetchone()[0]
+            seen["counted before the send"] = conn.execute(
+                "SELECT attempts, sending_at IS NOT NULL, result FROM mail_queue").fetchone()
+
+    assert call(live(site, mailer), bearer()).get_json() == {"sent": 1, "failed": 0, "left": 0}
+    assert seen == {"idle in transaction": 0, "counted before the send": (1, True, None)}
+
+
+def test_nobody_who_cannot_sign_in_is_invited(site):  # noqa: F811
+    """The review, on 24f78dd: an invitation was queued and sent for a row that cannot use the
+    site; that reviewer followed it and never received a code."""
+    site.set_reviewer(SECOND, access=A.RESTRICTED)
+    with pytest.raises(A.AdjudicationError, match="^CANNOT_SIGN_IN$"):
+        site.admin.queue_mail(SECOND, "INVITE_START")
+    site.set_reviewer(SECOND, access=A.FULL, role=A.APPROVER)
+    with pytest.raises(A.AdjudicationError, match="^CANNOT_SIGN_IN$"):
+        site.admin.queue_mail(SECOND, "INVITE_START")
+    site.sql("INSERT INTO reviewer (alias, login, login_shown, name, role, access, "
+             "scope_sequences) VALUES ('REMOTE-7', 'nobundle@example.invalid', "
+             "'nobundle@example.invalid', '', 'REVIEWER', 'FULL', 40)")
+    with pytest.raises(A.AdjudicationError, match="^NO_BUNDLE_ASSIGNED$"):
+        site.admin.queue_mail("REMOTE-7", "INVITE_START")
+    assert queue(site) == []
+    # Queued while they could sign in, changed before the site sends: the message waits.
+    site.set_reviewer(SECOND, access=A.FULL, role=A.REVIEWER)
+    site.admin.queue_mail(SECOND, "INVITE_START")
+    site.admin.queue_mail(FIRST, "INVITE_START")
+    app = live(site)
+    for change in ({"access": A.RESTRICTED}, {"role": A.APPROVER}):
+        site.set_reviewer(SECOND, access=A.FULL, role=A.REVIEWER)
+        site.set_reviewer(SECOND, **change)
+        answer = call(app, bearer()).get_json()
+        assert answer["left"] == 0 and site.reviewers[SECOND].login_shown not in [
+            to for to, _s, _t in site.outbox.sent]
+    assert [to for to, _s, _t in site.outbox.sent] == [site.reviewers[FIRST].login_shown]
+    site.set_reviewer(SECOND, access=A.FULL, role=A.REVIEWER)
+    assert call(app, bearer()).get_json() == {"sent": 1, "failed": 0, "left": 0}
+    # The token is the whole authority of this route: a request that carries it is served
+    # whatever its Origin says (a page cannot attach an Authorization header across sites).
+    site.admin.queue_mail(FIRST, "INVITE_CONTINUE")
+    crossing = {**bearer(), "Origin": "https://elsewhere.example.invalid",
+                "Sec-Fetch-Site": "cross-site"}
+    assert call(app, crossing).get_json() == {"sent": 1, "failed": 0, "left": 0}
