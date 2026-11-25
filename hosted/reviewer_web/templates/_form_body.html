@@ -48,7 +48,7 @@
 <fieldset class="verdict-choice">
   <legend>{{ legend }}</legend>
   <input type="hidden" name="{{ v.tag_name }}" value="{{ v.tag }}">
-  {%- if v.preset %}<p class="note preset">{{ w.VERDICT_PRESET }}</p>{% endif %}
+  {%- if v.preset %}<input type="hidden" name="{{ v.pre_name }}" value="{{ v.pre }}"><p class="note preset">{{ v.preset }}</p>{% endif %}
   <div class="options">
   {%- for code, text, chosen in v.options %}
   <label><input type="radio" name="{{ v.name }}" id="{{ (v.name ~ '-' ~ code) | ident }}" value="{{ code }}"{% if chosen %} checked{% endif %}> <span>{{ text }}</span></label>
@@ -206,7 +206,7 @@
   <div class="question proposal pair{{ ' is-later' if p.anchor in later else '' }}{{ ' has-error' if tried and form.errors.get(p.anchor) else '' }}" id="{{ p.anchor }}" data-q>
     <div class="pair-system">
       <p class="pair-head">{{ p.title }}</p>
-      <p class="proposal-value">{{ p.words or "Nothing proposed" }}{% if p.value and p.words != p.value %} <span class="proposal-code">stored as {{ p.value }}</span>{% endif %}</p>
+      <p class="proposal-value">{{ p.words or "Nothing proposed" }}{% if p.value and p.words != p.value %} <span class="proposal-code">({{ p.value }})</span>{% endif %}</p>
       <p class="note">{{ p.is }}</p>
       {% if p.mine %}<p class="note">{{ p.mine[0] }}: <strong>{{ p.mine[1] }}</strong>.</p>{% endif %}
     </div>

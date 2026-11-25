@@ -9,6 +9,7 @@
     (progress.dashboard). Nothing on it depends on the system's reading: the market shown is the
     one the reviewer read, once they saved a reading. Works without a script (<details>). -#}
 {%- set t = dash.totals -%}
+{%- set w_read = {1: "Market in your saved readings", 2: "Markets in your saved readings"} -%}
 <section class="dashboard">
   <h1>Your review</h1>
   <div class="dash-top">
@@ -46,7 +47,7 @@
       <details>
         <summary class="seq__row">
           <span class="seq__title"><strong>{{ row.title }}</strong></span>
-          <span class="seq__read">{% if row.read %}You read: <strong>{{ row.read }}</strong>{% elif row.drafts %}<span class="quiet-text">Draft kept, no reading submitted yet</span>{% else %}<span class="quiet-text">No reading saved yet</span>{% endif %}</span>
+          <span class="seq__read">{% if row.read %}{{ w_read[2 if "," in row.read else 1] }}: <strong>{{ row.read }}</strong>{% elif row.drafts %}<span class="quiet-text">Draft kept, no reading submitted yet</span>{% else %}<span class="quiet-text">No reading saved yet</span>{% endif %}</span>
           <span class="seq__done"><span class="count">{{ row.done }} of {{ row.total }}</span> <span class="quiet-text">· {{ row.remaining }} left</span></span>
           <span class="seq__status">{{ status_badge(row.status, row.status_text) }}
             {%- if row.returned %} <span class="seq__flag">{{ icon("returned") }}{{ row.returned }} returned</span>{% endif %}

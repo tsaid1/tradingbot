@@ -757,6 +757,9 @@ def test_a_reading_the_approver_returned_is_shown_to_its_reviewer_only(site):  #
     shown = a.open("i08")
     after = [r for r in site.records(FIRST) if r["phase"] == A.AFTER_REVEAL][-1]
     assert f"The approver returned your assessment (record {after['seq']}," in shown.text
+    # The header tells the same story as the notice (the phone acceptance's P3).
+    assert "was returned for changes" in shown.text and "Assessment: not submitted yet" \
+        not in shown.text
     assert "The approver returned this reading for changes." in shown.text
     assert note in shown.visible()
     assert "owner@example.invalid" not in shown.text and "Owner Example" not in shown.text

@@ -206,5 +206,6 @@ def test_three_databases_that_differ_only_in_the_system_s_reading_look_the_same_
     labels = [label for label, _text in walks[0]]
     first_home = walks[0][labels.index("workspace")][1]
     later_home = walks[0][labels.index("dashboard end")][1]
-    assert "You read: " not in first_home and "You read: <strong>" in later_home
+    assert "in your saved readings: " not in first_home and \
+        "in your saved readings: <strong>" in later_home
     assert "In progress" in later_home
