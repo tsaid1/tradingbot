@@ -175,6 +175,13 @@ class Store:
             row = conn.execute(_REVIEWER + " WHERE id = %s", (reviewer_id,)).fetchone()
         return ReviewerRow(*row) if row else None
 
+    def note_first_sign_in(self, reviewer_id: int) -> None:
+        """The reviewer signed in: the time of the FIRST sign-in is kept, a later one changes
+        nothing."""
+        with self.connection() as conn:
+            conn.execute("UPDATE reviewer SET first_sign_in_at = now() WHERE id = %s"
+                         " AND first_sign_in_at IS NULL", (reviewer_id,))
+
     # -------------------------------------------------------------- a reviewer's bundle
 
     def _bundle(self, reviewer: ReviewerRow | None) -> tuple[A.Bundle, bool]:

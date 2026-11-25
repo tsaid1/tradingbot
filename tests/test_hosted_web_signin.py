@@ -77,6 +77,31 @@ def test_a_mailed_code_signs_in_and_only_hashes_are_stored(site):  # noqa: F811
     assert b.get("/sign-in").status_code == 303
 
 
+def test_the_first_sign_in_is_noted_once(site):  # noqa: F811
+    def first(alias):
+        return next(r for r in site.admin.status() if r["alias"] == alias)["first_sign_in_at"]
+
+    assert first(FIRST) is None and first(SECOND) is None
+    b, login = site.browser(), login_of(site)
+    ask(b, login)
+    assert enter(b, login, wrong(site.code())).status_code == 401
+    assert first(FIRST) is None  # a refused code is not a sign-in
+    assert enter(b, login, site.code()).status_code == 303
+    noted = first(FIRST)
+    assert noted is not None and first(SECOND) is None
+    site.sql("UPDATE reviewer SET first_sign_in_at = first_sign_in_at - interval '3 days' "
+             "WHERE alias = %s", FIRST)
+    earlier = first(FIRST)
+    assert earlier < noted
+    site.browser().sign_in(FIRST)  # another device, later: the first time stands
+    b.post("/sign-out", {"_csrf": b.csrf()})
+    b.sign_in(FIRST)
+    assert first(FIRST) == earlier and first(SECOND) is None
+    site.store.note_first_sign_in(site.reviewers[SECOND].id)
+    site.store.note_first_sign_in(10 ** 9)  # nobody: nothing happens
+    assert first(SECOND) is not None
+
+
 def test_the_answer_is_the_same_for_every_address_and_an_unlisted_one_gets_no_mail(site):  # noqa: F811
     listed, unlisted = site.browser(), site.browser()
     one, two = ask(listed, login_of(site)), ask(unlisted, NOBODY)

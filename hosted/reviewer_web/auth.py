@@ -157,6 +157,7 @@ def verify_code(store, secret: bytes, address: str, code: str, network: str,
         cur.execute("INSERT INTO web_session (token_sha256, reviewer_id, created_at, "
                     "last_seen_at, expires_at) VALUES (%s, %s, %s, %s, %s)",
                     (_sha(token), reviewer.id, now, now, now + SESSION_VALID))
+        store.note_first_sign_in(reviewer.id)  # in the same transaction as the session
     return token
 
 
