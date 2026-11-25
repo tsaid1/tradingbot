@@ -9,11 +9,11 @@
 <section class="narrow choose">
   <h1>What would you like to open?</h1>
   <p>This address has two separate workspaces. To switch later, sign out and sign in again.</p>
-  <form method="post" action="/sign-in/choose" class="choose-identity">
+  <form method="post" action="/sign-in/choose" class="choose-identity" data-once>
     {% for value, label in options %}
     {%- set w = words.get(value, (label, "")) -%}
     <div class="choose__option">
-      <button type="submit" name="identity" value="{{ value }}" aria-describedby="choose-{{ value | ident }}"
+      <button type="submit" name="identity" value="{{ value }}" data-busy="Opening…" aria-describedby="choose-{{ value | ident }}"
         class="button {{ 'button--primary' if loop.first else 'button--quiet' }}">{{ w[0] }}</button>
       {% if w[1] %}<p class="quiet-text" id="choose-{{ value | ident }}">{{ w[1] }}</p>{% endif %}
     </div>

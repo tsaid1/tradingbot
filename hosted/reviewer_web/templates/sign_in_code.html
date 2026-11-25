@@ -25,16 +25,16 @@
   {% endif %}
   <p class="quiet-text">At most five codes an hour are sent to one address. If no code arrives,
   wait and ask again, or write to the person who invited you.</p>
-  <form method="post" action="/sign-in/verify" class="stack">
+  <form method="post" action="/sign-in/verify" class="stack" data-once>
     <input type="hidden" name="address" value="{{ address }}">
     <label for="code">One-time code</label>
     <input type="text" id="code" name="code" class="code" inputmode="numeric"
            autocomplete="one-time-code" pattern="[0-9 ]*" maxlength="12" required autofocus>
-    <button type="submit" class="primary">Sign in</button>
+    <button type="submit" class="primary" data-busy="Checking the code…">Sign in</button>
   </form>
-  <form method="post" action="/sign-in" class="stack again">
+  <form method="post" action="/sign-in" class="stack again" data-once>
     <input type="hidden" name="address" value="{{ address }}">
-    <button type="submit" class="quiet">Send a new code</button>
+    <button type="submit" class="quiet" data-busy="Sending a new code…">Send a new code</button>
     <a href="/sign-in">Use another address</a>
   </form>
 </section>

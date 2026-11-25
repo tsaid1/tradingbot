@@ -183,6 +183,56 @@
     if (stay) { stay.focus({ preventScroll: true }); } else if (post) { post.focus({ preventScroll: true }); }
   }
 
+  /* A form that sends a step of the sign-in (and the Save of a review form) is sent ONCE: the
+     first submit goes out; its buttons are then disabled and the pressed one says what is
+     happening; a second tap, Enter or the keyboard's Go is ignored. A page shown again from the
+     browser's back/forward cache is usable again. Without a script every form works as before
+     (the server answers a repeated save once). */
+  function sending(form, button) {
+    form.setAttribute("data-sent", "1");
+    form.setAttribute("aria-busy", "true");
+    window.setTimeout(function () {   /* after the submit has started: the request goes out */
+      [].forEach.call(form.querySelectorAll("button"), function (b) {
+        if (!b.hasAttribute("data-was")) { b.setAttribute("data-was", b.disabled ? "1" : ""); }
+        b.disabled = true;
+      });
+      if (button && button.getAttribute("data-busy")) {
+        var busyWords = button.getAttribute("data-busy");
+        var last = button.lastChild;
+        button.setAttribute("aria-busy", "true");
+        button.setAttribute("data-html", button.innerHTML);
+        if (last && last.nodeType === 3 && last.textContent.trim()) { last.textContent = busyWords; }
+        else { button.textContent = busyWords; }
+      }
+    }, 0);
+  }
+
+  document.addEventListener("submit", function (event) {
+    var f = event.target;
+    var button = event.submitter || null;
+    var once = f.hasAttribute("data-once") || (button && button.id === "save-button");
+    if (!once) { return; }
+    if (f.getAttribute("data-sent") === "1") { event.preventDefault(); return; }
+    sending(f, button);
+  }, true);
+
+  window.addEventListener("pageshow", function (event) {
+    if (!event.persisted) { return; }
+    [].forEach.call(document.querySelectorAll("form[data-sent]"), function (f) {
+      f.removeAttribute("data-sent");
+      f.removeAttribute("aria-busy");
+      [].forEach.call(f.querySelectorAll("button"), function (b) {
+        b.disabled = b.getAttribute("data-was") === "1";
+        b.removeAttribute("data-was");
+        if (b.hasAttribute("data-html")) {
+          b.innerHTML = b.getAttribute("data-html");
+          b.removeAttribute("data-html");
+          b.removeAttribute("aria-busy");
+        }
+      });
+    });
+  });
+
   /* The images of the post: loaded at once; "Loading…" until there, a plain message and "Try
      again" if one fails. */
   [].forEach.call(document.querySelectorAll("[data-media]"), function (fig) {
