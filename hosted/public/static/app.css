@@ -282,7 +282,7 @@ button:disabled { border-color: var(--line); background: var(--sunk); color: var
 .form-status { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2) var(--space-3); }
 .save-state { display: inline-flex; align-items: center; gap: 0.35em; margin: 0; font-size: 0.9rem;
   color: var(--text-quiet); font-weight: 600; }
-.save-state--draft, .save-state.is-editing { color: var(--attention); }
+.save-state--draft, .save-state.is-editing, .save-state--returned { color: var(--attention); }
 .ss-icon { display: inline-flex; }
 .save-state .ss-icon--draft { display: none; }
 .save-state--draft .ss-icon--draft, .save-state.is-editing .ss-icon--draft { display: inline-flex; }
@@ -608,3 +608,26 @@ table.ref th { color: var(--text-quiet); font-weight: 600; }
 .media.is-failed .media__failed { display: block; }
 .js .media.is-loaded .media__state { display: none; }
 .js .media.is-loaded .media__frame { min-height: 0; background: none; }
+
+/* The Field reference's table: its own sideways scroll on a narrow screen. */
+.table-scroll { overflow-x: auto; max-width: 100%; border: 1px solid var(--line);
+  border-radius: var(--radius-small); margin: var(--space-2) 0 var(--space-4); }
+.table-scroll:focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
+.table-scroll table.ref { margin: 0; min-width: 52rem; }
+table.apply th, table.apply td { overflow-wrap: normal; word-break: normal; min-width: 6.5rem; }
+.table-scroll table.ref th[scope="row"] { color: var(--text); min-width: 10rem; }
+
+/* Touch: every tap target at least 44 px high; "Sign out" set apart from the links. */
+header.site nav a { display: inline-flex; align-items: center; min-height: 2.75rem; }
+header.site nav form { margin-left: var(--space-4); padding-left: var(--space-4);
+  border-left: 1px solid var(--line); }
+header.site nav button.quiet { min-height: 2.75rem; }
+@media (pointer: coarse), (max-width: 48rem) {
+  .later-toggle, details.help > summary { min-height: 2.75rem; }
+  .later-toggle { padding: 0 var(--space-3); }
+}
+@media (max-width: 48rem) {
+  header.site nav form { flex-basis: 100%; margin: var(--space-1) 0 0; padding: var(--space-1) 0 0;
+    border-left: 0; border-top: 1px solid var(--line); }
+  header.site nav button.quiet { padding-left: 0; }
+}

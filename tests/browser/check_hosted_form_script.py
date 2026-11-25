@@ -84,7 +84,7 @@ STEPS = [
     ("click", "s.instrument_as_read", "VALUE"), ("type", "instrument_as_read", "Zed Metals", "tab"),
     ("click", "quoted_series", "SPOT_OR_INDEX"), ("click", "traded_instrument", "NOT_STATED"),
     ("click", "side", "SHORT"), ("click", "position_state", "FLAT"), ("click", "effect", "OPENS"),
-    ("click", "s.entry_price", "VALUE"), ("type", "entry_price", "412", "enter"),
+    ("click", "s.entry_price", "VALUE"), ("type", "entry_price", "412", "watch"),
     ("click", "entry_role", "CURRENT_MARKET"), ("click", "entry_exactness", "APPROXIMATE"),
     ("click", "s.stop_price", "VALUE"), ("type", "stop_price", "420", "wait"),
     ("click", "s.targets", "VALUE"), ("type", "targets", "400, 390", "tab"),
@@ -211,6 +211,23 @@ async def answer(tab: Tab, base: str, shots: Path | None) -> list[str]:
                 focus = json.loads(await tab.js(FOCUS))
                 if not focus["inForm"]:
                     problems.append(f"after Tab out of {name} the focus left the form ({focus})")
+            elif leave == "watch":
+                # The phone acceptance's P1: typing changes no layout. The question that is
+                # next on the screen stays where it is one and two seconds later.
+                where = f"""(function(){{const box=document.querySelector({json.dumps(sel)});
+                    const all=[...document.querySelectorAll('#form-body [data-q]')];
+                    const here=box.closest('[data-q]'); const next=all[all.indexOf(here)+1];
+                    return next ? [next.id, Math.round(next.getBoundingClientRect().top)] : null;}})()"""
+                before = await tab.js(where)
+                for wait in (1.0, 1.0):
+                    await asyncio.sleep(wait)
+                    after = await tab.js(where)
+                    if before is None or after != before:
+                        problems.append(f"typing in {name} moved the next question: {before} "
+                                        f"then {after}")
+                        break
+                await tab.key("Enter", "Enter", 13)
+                await tab.quiet()
             elif leave == "enter":
                 await tab.key("Enter", "Enter", 13)
                 await tab.quiet()
@@ -341,7 +358,7 @@ def main() -> int:
             print("  -", p)
         return 1
     print(f"PASS: {len(STEPS)} steps (every kind of answer, Tab, Enter and a pause in a box), "
-          "the focus kept after every Tab, eight clicks 0.6 to 1.6 s after typing, and the "
+          "the focus kept after every Tab, the next question still after typing, eight clicks 0.6 to 1.6 s after typing, and the "
           "reload equal to what was entered.")
     return 0
 

@@ -140,7 +140,7 @@ def test_every_question_and_option_the_form_can_show_has_its_words():
             if f == "family" and c not in ("OTHER", "UNKNOWN"):
                 assert words == c  # a market keeps its own name
             elif f == "idea" and c.startswith("SEQUENCE:"):
-                assert words == "Another listed idea: " + c.split(":")[1]
+                assert words == "Another listed idea"  # the form names each (Sequence n)
             else:
                 assert c in W.OPTIONS[f] and words and words != c, (f, c)
     # The further actions, the judgments, the derived fields, every rubric reason.

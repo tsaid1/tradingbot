@@ -83,8 +83,8 @@ QUESTIONS = {
     "notes": "Notes",
     "role": "What is this number?",
     "exactness": "How exactly is it given?",
-    "contract_month": "Which contract month is it for?",
-    "month_named": "Which month or contract code is named?",
+    "contract_month": "For which futures month is this number?",
+    "month_named": "Which month does the post name? (type it)",
 }
 
 # One short example or hint, behind a disclosure ("Example"): reachable by keyboard and touch.
@@ -124,10 +124,10 @@ HELP = {
     "amendment_to": "“Raising the stop to 70” gives 70.",
     "amendment_from": "“Moving the target from 80 to 82” replaces 80.",
     "idea": "An idea is one position, from its opening to its final close.",
-    "reference_series_right": "The series the system reads the post's numbers against. A check "
-                              "of a source fact.",
-    "execution_instrument_right": "Your opinion on the system's proposal. It approves nothing: "
-                                  "approving a mapping is the owner's separate decision.",
+    "reference_series_right": "This checks a fact about the post: which prices its numbers are. "
+                              "It approves nothing.",
+    "execution_instrument_right": "Your view only. It approves nothing: whether the system may "
+                                  "trade this instrument is the owner's separate decision.",
     "ambiguities": "Leave every box empty when nothing is unclear.",
     "additional_actions": "“Closed the crude long and bought gold”, with one form: list the gold "
                           "trade here.",
@@ -136,8 +136,10 @@ HELP = {
     "notes": "Refer to a number by its row (“number 2”); don't paste the post.",
     "role": "“Crude bounced from 70 last week. Our stop goes to 70.”: the first 70 is a chart "
             "level, the second a stop.",
-    "contract_month": "Only from evidence at the time of the post, never from its date or the "
-                      "price level.",
+    "contract_month": "For futures: the nearest month, the one after it, or a month the post "
+                      "names (you type which one next). Only from what the posts show, never "
+                      "from the post's date or the price level.",
+    "month_named": "Type the month as the post names it, such as DEC or Z6.",
 }
 
 # ------------------------------------------------------------------ options
@@ -411,6 +413,23 @@ def set_by_form(f: str, value: str = "", answers: dict | None = None) -> str:
 
 VERDICT_PRESET = ("Pre-set to “Yes, the system is right” because your answer is the same. "
                   "You can change it.")
+# Every pre-set judgment says why (the rule is the rubric's own: same, different, or no answer).
+VERDICT_PRESETS = {
+    "CONFIRM": VERDICT_PRESET,
+    "CORRECT": ("Pre-set to “No, my answer is right” because your answer differs from the "
+                "system's. Compare both with the post, and change this if the system is right."),
+    "UNSURE": ("Pre-set to “Unsure” because you gave no answer here, or said the evidence "
+               "doesn't settle it. You can change it."),
+}
+VERDICT_PRESET_EMPTY = ("Pre-set to “Yes, the system is right”: the system read nothing here, "
+                        "which counts as the same as your “{mine}”. You can change it.")
+SYSTEM_NOTHING = "The system read nothing here"
+ASSESSMENT_RETURNED = "Your assessment of {hhmm} UTC was returned for changes"
+
+# The idea choices: the reviewer's own sequences by their dashboard number.
+IDEA_OWN = "The same idea as the earlier posts shown ({seq}, this form's own)"
+IDEA_LISTED = "Another idea of your list: {seq}"
+IDEA_OUTSIDE = "An idea outside your list (number {k} of those)"
 
 
 # What belongs on each form of a post with several forms (the rubric's own rule; nothing of
@@ -669,7 +688,7 @@ def option(f: str, code: str) -> str:
     if f == "family" and code not in OPTIONS["family"]:
         return code
     if f == "idea" and code.startswith("SEQUENCE:"):
-        return f"{OPTIONS['idea']['SEQUENCE:']}: {code.split(':', 1)[1]}"
+        return OPTIONS["idea"]["SEQUENCE:"]  # the form names each one (forms.idea_names)
     if f == "post_label" and code not in OPTIONS[f]:
         return code
     if f in VALUE_CHOICE:
@@ -814,3 +833,129 @@ def wording_table_markdown() -> str:
     lines += ["", "## Statuses", "", "| Code | As shown |", "|---|---|"]
     lines += [f"| `{c}` | {t} |" for c, t in STATUS.items()]
     return "\n".join(lines) + "\n"
+
+
+# ------------------------------------------------------------------ the reviewer guide and the reference
+
+# The guide as the site shows it: the rubric's guide (REVIEWER_GUIDE) in the form's own words.
+GUIDE = """# Reviewer guide
+
+## Purpose and confidentiality
+
+You read a publisher's trading posts and record what each one says. Your readings are the ground
+truth the system is measured against. Nothing you save places, changes or approves a trade, a
+rule, or the system's proposal of an instrument to trade. "What this means for someone following
+the publisher" is not an order.
+
+The posts are paid subscriber content, shown to you for this review only. Do not copy them, take
+screenshots, forward them, or paste them into any other tool or assistant. Your access is personal
+and can be withdrawn.
+
+## Forms and questions
+
+A form records ONE action: one thing the publisher does, reports or plans, on one position in one
+market. A post with several actions has one form per action, in the order the actions first
+appear: the first on form 1, the second on form 2. Closing one position and opening another are
+two actions. A form left over answers "No, the post has fewer actions than forms"; an action no
+form covers goes under "further actions" on the last form. "One form for the whole post" labels a
+post the system did not read as an instruction: say what the post is as a whole (a trade made now,
+then a plan, then a report of an earlier trade, then commentary) and list its actions as further
+actions.
+
+The questions come in groups: the action; market and instrument; the position just before this
+action (from the earlier posts shown and the earlier actions of this post) and what happened to
+it; the entry; stop and targets; the change; the trade idea; every number in the post; after your
+reading is saved, the system's proposals; anything unclear. A question appears only once the
+answer it depends on is given ("Answer … first"), and one that does not apply says so. "Example"
+and "More about this question" open a short help in place; the Field reference lists every
+question and every choice.
+
+## When it happens, and the numbers
+
+The post's own time words decide when the action happens. "Now, or just done": "a few minutes
+ago", or a plain past with no time word ("Bought gold at 2,395."). "Earlier, as the post itself
+says": "this morning", "overnight", or an existing order did it (stopped out). "Later, only if
+something stated happens": a plan. If none fits, say the evidence doesn't settle it. An earlier
+action is either first reported by this post, or an earlier post shown already reported it (then
+the position before is the one after that report). "We bought gold this morning at 2,395." is an
+earlier action first reported here: a position to catch up with, not an instruction.
+
+Each number of the post is a row of "Every number in the post". Give it the first kind that
+applies, in the order of the list. Context decides, never a phrase alone. A price a trade was
+actually done at is "A price a trade was actually done at", even at the stop ("stopped out at
+2.84"); a level named as the stop is "A stop" ("the 69.50 stop was hit, filled 69.40": 69.50 a
+stop, 69.40 a price a trade was done at). Only "A price to enter at" tells subscribers a price to
+trade at. If two readings remain, say the evidence doesn't settle it and flag "What a number is
+can't be settled": there is no default.
+
+## Earlier posts and doubt
+
+Use only the earlier posts shown. Answer that no position was open only when those posts, or this
+post's own words, show that none existed. When they do not settle it, say the evidence doesn't
+settle it and flag "An earlier post I need isn't shown", never "no position". "The post doesn't
+say" (or "The posts shown don't say") means the publisher did not state it. Whenever the evidence
+does not settle an answer, say so and tick what is unclear or a flag. Never guess. If the form has
+no truthful way to record a case, flag it, explain in the notes, and leave unanswered only what
+cannot be answered truthfully.
+
+## Saving, the system's answers, coming back
+
+Your answers are kept as a draft while you work ("Draft kept at …, not submitted"); they are
+submitted only when you save. If something is missing or contradicts another answer, the save is
+refused, every answer stays on the page, and "Go to question" takes you to each point; points to
+check need the tick "I have checked these". Once every form of a post has your own reading, the
+system's answers appear beside yours. Judge each one: "Yes, the system is right", "No, my answer
+is right" or "Unsure"; the form pre-sets a judgment from the comparison and says why. Change your
+own answer only for evidence you missed, never because the system disagrees. Every save is kept;
+nothing is overwritten. "Continue" on the dashboard takes you to your next step.
+"""
+
+# Codes in the rubric's texts (the Field reference's explanations), in the form's words. One
+# choice per code, by the field where a reviewer meets it first.
+_PLAIN_FIELDS = ("timing", "action", "announcement", "post_label", "follower_implication",
+                 "position_state", "effect", "entry_role", "entry_exactness", "role",
+                 "contract_month", "amendment_field", "idea", "component", "side",
+                 "quoted_series", "traded_instrument", "ambiguities", "flags", "confidence",
+                 "explicit")
+
+
+def plain(text: str) -> str:
+    """A text of the rubric with its codes and field names in the form's own words."""
+    import re
+
+    words: dict[str, str] = {}
+    for f in reversed(_PLAIN_FIELDS):
+        for code, label in OPTIONS.get(f, {}).items():
+            if code and code.replace("_", "").isalpha() and code.isupper():
+                words[code] = label
+    words.update({R.NOT_STATED: POST_SILENT, R.CANNOT_DETERMINE: UNSETTLED,
+                  R.NOT_APPLICABLE: DOES_NOT_APPLY, "NOT_READ": "not read by the system",
+                  "UNCERTAIN": UNSETTLED, "UNRESOLVED": UNSETTLED, "UNKNOWN": UNSETTLED,
+                  "CONFIRM": VERDICTS["CONFIRM"], "CORRECT": VERDICTS["CORRECT"],
+                  "UNSURE": "Unsure", "YES": "Yes", "NO": "No", "VALUE": "a typed value"})
+    names = {f: QUESTIONS[f] for f in QUESTIONS if "@" not in f}
+
+    def code(m):
+        token = m.group(0)
+        return f"“{words[token]}”" if token in words else token
+
+    def name(m):
+        token = m.group(1) or m.group(2)
+        return f"“{names[token]}”" if token in names else m.group(0)
+
+    text = re.sub(r"'([a-z_]+)'|\b([a-z]+_[a-z_]+)\b", name, text)
+    return re.sub(r"\b[A-Z][A-Z_]{1,}[A-Z]\b", code, text)
+
+
+def applicability_table() -> tuple[list[str], list[tuple[str, list[str]]]]:
+    """The rubric's "which questions apply" table, in words: (headings, rows)."""
+    head = ["Questions", *(OPTIONS["action"][c] for c in R.APPLICABILITY_HEAD[1:6]),
+            "No action (commentary)"]
+    groups = {"A": SECTIONS["A"], "B": SECTIONS["B"], "C": SECTIONS["C"], "D": SECTIONS["D"],
+              "E": SECTIONS["E"], "F": SECTIONS["F"], "G": SECTIONS["G"], "p": SECTIONS["T"],
+              "H": SECTIONS["H"] + " (after your reading)", "I": SECTIONS["I"] + ", flags, "
+              "confidence, notes"}
+    cells = {"yes": "Asked", "no": "—", "label only": "Only on a form for the whole post"}
+    rows = [(groups.get(r[0][0], r[0]), [cells.get(c, c) for c in r[1:]])
+            for r in R.APPLICABILITY]
+    return head, rows

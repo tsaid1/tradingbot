@@ -396,7 +396,7 @@ def _system_words(f: str, v) -> str:
         return "; ".join(W.OPTIONS["ambiguities"].get(x, x) for x in codes if x) or \
             "Nothing marked unclear"
     if v in (None, "", []):
-        return "No answer"
+        return W.SYSTEM_NOTHING
     return W.shown(f, v)
 
 
@@ -567,6 +567,28 @@ class Form:
         return [a for a, _ in self.later]
 
 
+EARLY = {"entry_role": "entry_price", "entry_exactness": "entry_price"}
+
+
+def _idea_names(bundle: A.Bundle, session: A.Session, item: dict, others: list[str]) -> dict:
+    """The idea choices in words: the reviewer's sequences as the dashboard numbers them (their
+    own one named as such), an idea outside their list by the time of its first post. The
+    stored value stays the id. From the bundle's structure only: nothing of the system."""
+    mine = [sid for sid, _ in A.ordered(bundle, session.scope) if sid]
+    number = {sid: W.SEQUENCE.format(n=k) for k, sid in enumerate(mine, 1)}
+    out, outside = {}, 0
+    for sid in others:
+        if sid in number:
+            out[f"SEQUENCE:{sid}"] = W.IDEA_LISTED.format(seq=number[sid])
+        else:
+            outside += 1
+            out[f"SEQUENCE:{sid}"] = W.IDEA_OUTSIDE.format(k=outside)
+    own = number.get(item["sequence_id"])
+    if own:
+        out["SAME_AS_PREVIOUS"] = W.IDEA_OWN.format(seq=own)
+    return out
+
+
 def _invalid_message(code: str) -> str:
     kind = code.split(":")[0]
     if kind == "BAD_PRICE":
@@ -599,6 +621,7 @@ def build(bundle: A.Bundle, item: dict, records: list[dict], session: A.Session,
     sequences = [s["sequence_id"] for s in bundle.sequences
                  if s["sequence_id"] != item["sequence_id"]]
     kind = item["kind"]
+    idea_names = _idea_names(bundle, session, item, sequences)
     form = Form(item["item_id"], phase, form_header(bundle, item), notice=notice, reading=raw,
                 save_title=W.SAVE[phase], save_hint=W.SAVE_HINT[phase])
     verdicts = form.verdicts
@@ -610,16 +633,22 @@ def build(bundle: A.Bundle, item: dict, records: list[dict], session: A.Session,
     anchors: dict[str, str] = {}  # field or row key -> the id of the element showing it
     order: list[tuple[str, bool]] = []  # (anchor, answered) of every asked control, in page order
 
-    def verdict(name: str, tag: str, pre: str) -> dict:
+    def verdict(name: str, tag: str, pre: str, nothing: str = "") -> dict:
+        """A judgment of the system's answer, pre-set by the rubric's rule; a pre-set one says
+        why. ``nothing``: the reviewer's own answer in words when the system read nothing."""
         chosen = given.get(f"v.{name}") if given.get(f"vt.{name}") == tag else None
-        mine = chosen in A.VERDICTS
-        chosen = chosen if mine else pre
+        # Still the pre-set one when the page sent back the judgment it was given (ui.vp.*:
+        # the interface's own note of it, never stored).
+        mine = chosen in A.VERDICTS and not (chosen == pre == given.get(f"ui.vp.{name}"))
+        chosen = chosen if chosen in A.VERDICTS else pre
+        why = "" if mine else (W.VERDICT_PRESET_EMPTY.format(mine=nothing)
+                               if nothing and pre == "CONFIRM" else W.VERDICT_PRESETS.get(pre, ""))
         return {"name": f"v.{name}", "tag_name": f"vt.{name}", "tag": tag, "chosen": chosen,
-                "preset": not mine and pre == "CONFIRM",
+                "preset": why, "pre": pre if not mine else "", "pre_name": f"ui.vp.{name}",
                 "options": [(c, W.VERDICTS[c], c == chosen) for c in A.VERDICTS]}
 
-    def control(f: str) -> dict:
-        value = raw[f]
+    def control(f: str, early: bool = False) -> dict:
+        value = held.value(f) if early else raw[f]
         if f == "component":
             return {"type": "radio", "name": f, "options": [
                 (c, W.option(f, c), c == value) for c in R.COMPONENTS]}
@@ -649,8 +678,11 @@ def build(bundle: A.Bundle, item: dict, records: list[dict], session: A.Session,
         options = R.offered(f, bundle.families, sequences)  # never a value only the form sets
         if len(options) <= RADIO_UP_TO:
             return {"type": "radio", "name": f, "options": [
-                (c, W.option(f, c), c == value) for c in options]}
-        return _select(f, options, value, "", f)
+                (c, idea_names.get(c) or W.option(f, c), c == value) for c in options]}
+        chosen = _select(f, options, value, "", f)
+        chosen["options"] = [(o, idea_names.get(o, t) if f == "idea" else t, c)
+                             for o, t, c in chosen["options"]]
+        return chosen
 
     def answered(f: str) -> bool:
         v = raw[f]
@@ -672,6 +704,10 @@ def build(bundle: A.Bundle, item: dict, records: list[dict], session: A.Session,
                 e["sentence"] = R.FOLLOWER_SENTENCE + (
                     " Inferred from context: not counted as something to act on."
                     if raw.get("explicit") == "NO" else "")
+        elif s.state == R.PENDING and f in EARLY and held.state(EARLY[f]) == VALUE:
+            # Asked as soon as "It gives a number" is chosen, before a digit is typed: typing
+            # then changes nothing on the screen. (Kept by the page; counted once the number is.)
+            e["control"], e["state"] = control(f, early=True), R.ASK
         elif s.state == R.PENDING:
             e["note"] = W.reason(s.reason)
         else:
@@ -679,17 +715,19 @@ def build(bundle: A.Bundle, item: dict, records: list[dict], session: A.Session,
         if revealed and f in compared:
             value = R.NOT_APPLICABLE if s.state == R.NA else (
                 s.value if s.state == R.DERIVED else raw[f])
-            e["system"] = _system_words(f, system.get(f, ""))
+            e["system"] = idea_names.get(system.get(f, "")) or _system_words(f, system.get(f, ""))
             if value == R.NOT_APPLICABLE:
                 verdicts[f] = R.VERDICT_NOT_APPLICABLE
                 e["verdict_fixed"] = W.VERDICT_FIXED
             else:
                 e["verdict"] = verdict(f, _tag(repr(value)),
-                                       R.prefill_verdict(f, value, system.get(f, "")))
+                                       R.prefill_verdict(f, value, system.get(f, "")),
+                                       W.shown(f, value) if system.get(f) in (None, "", [])
+                                       else "")
                 verdicts[f] = e["verdict"]["chosen"]
             if f in original and original[f] != value and original[f] not in (
                     "", R.NOT_APPLICABLE, []):
-                e["original"] = W.shown(f, original[f])
+                e["original"] = idea_names.get(original[f]) or W.shown(f, original[f])
         elif revealed and f in A.SYSTEM_FIELDS:
             e["system"], e["not_compared"] = _system_words(f, system.get(f, "")), True
         return e
@@ -943,22 +981,28 @@ def field_reference() -> dict:
     groups = [{"code": code, "title": W.SECTIONS[code], "before": title,
                "fields": [{"field": f, "asked": W.question(f.name, R.LABEL_ONLY)
                            if f.name in W.QUESTIONS else f.question,
+                           "about": W.plain(f.tooltip), "applies": W.plain(f.applies),
+                           "set_by_form": W.plain(f.set_by_form),
+                           "examples": [W.plain(e) for e in f.examples],
                            "options": [(W.shown(f.name, c) if not c.startswith("<") else "",
-                                        c, m) for c, m in f.values]}
+                                        c, W.plain(m)) for c, m in f.values]}
                           for f in R.RUBRIC if f.group == code]}
               for code, title in R.GROUPS]
+    head, rows = W.applicability_table()
     return {"groups": groups, "applicability": R.applicability_text(),
-            "blocking": [(c, W.BLOCKING[c], m) for c, m in R.BLOCKING_CODES.items()],
-            "warnings": [(c, W.WARNINGS[c], m) for c, m in R.WARNING_CODES.items()],
+            "apply_head": head, "apply_rows": rows,
+            "blocking": [(c, W.BLOCKING[c], W.plain(m)) for c, m in R.BLOCKING_CODES.items()],
+            "warnings": [(c, W.WARNINGS[c], W.plain(m)) for c, m in R.WARNING_CODES.items()],
             "w": W}
 
 
 def guide_blocks(text: str) -> list[tuple[str, str]]:
     """(kind, text) of the reviewer guide: ``title``, ``heading`` or ``para`` (a bullet or a
-    paragraph, joined), as the workspace's guide page reads it. Rendered as text. The site's
-    own "How to review", in the form's words, comes first."""
-    out: list[tuple[str, str]] = [("heading", "How to review"),
-                                  *(("para", line) for line in W.HOW_TO_REVIEW)]
+    paragraph, joined), as the workspace's guide page reads it. Rendered as text. The site shows
+    its own guide (``wording.GUIDE``: the rubric's guide in the form's words); ``text`` is the
+    rubric's, kept for the call's shape."""
+    text = W.GUIDE
+    out: list[tuple[str, str]] = []
     para: list[str] = []
 
     def flush():
@@ -969,7 +1013,7 @@ def guide_blocks(text: str) -> list[tuple[str, str]]:
     for line in text.splitlines():
         if line.startswith("# "):
             flush()
-            out.insert(0, ("title", line[2:]))
+            out.append(("title", line[2:]))
         elif line.startswith("## "):
             flush()
             out.append(("heading", line[3:]))
