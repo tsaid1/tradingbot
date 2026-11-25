@@ -612,8 +612,10 @@ def build(bundle: A.Bundle, item: dict, records: list[dict], session: A.Session,
 
     def verdict(name: str, tag: str, pre: str) -> dict:
         chosen = given.get(f"v.{name}") if given.get(f"vt.{name}") == tag else None
-        chosen = chosen if chosen in A.VERDICTS else pre
+        mine = chosen in A.VERDICTS
+        chosen = chosen if mine else pre
         return {"name": f"v.{name}", "tag_name": f"vt.{name}", "tag": tag, "chosen": chosen,
+                "preset": not mine and pre == "CONFIRM",
                 "options": [(c, W.VERDICTS[c], c == chosen) for c in A.VERDICTS]}
 
     def control(f: str) -> dict:
@@ -665,7 +667,7 @@ def build(bundle: A.Bundle, item: dict, records: list[dict], session: A.Session,
             order.append((e["anchor"], answered(f)))
         elif s.state == R.DERIVED:
             e["derived"] = W.shown(f, s.value) if s.value not in ("", None) else UNANSWERED_TEXT
-            e["derived_from"] = W.set_by_form(f)
+            e["derived_from"] = W.set_by_form(f, s.value, raw)
             if f == "follower_implication":
                 e["sentence"] = R.FOLLOWER_SENTENCE + (
                     " Inferred from context: not counted as something to act on."
