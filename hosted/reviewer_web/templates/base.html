@@ -28,9 +28,9 @@
     <a href="/">Dashboard</a>
     <a href="/guide">Reviewer guide</a>
     <a href="/fields">Field reference</a>
-    <form method="post" action="/sign-out">
+    <form method="post" action="/sign-out" data-once>
       <input type="hidden" name="_csrf" value="{{ csrf }}">
-      <button type="submit" class="quiet">Sign out</button>
+      <button type="submit" class="quiet" data-busy="Signing out…">Sign out</button>
     </form>
   </nav>
   {% endif %}

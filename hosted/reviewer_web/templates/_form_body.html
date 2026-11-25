@@ -392,7 +392,7 @@
 </section>
 
 <div class="actions" id="save">
-  <button type="submit" class="button button--primary save" id="save-button">{{ icon("ok") }}{{ form.save_title }}</button>
+  <button type="submit" class="button button--primary save" id="save-button" data-busy="Saving…">{{ icon("ok") }}{{ form.save_title }}</button>
   <button type="submit" class="button button--quiet no-script" formaction="{{ state_url }}#save">Refresh the form</button>
   <span class="busy" id="busy" role="status"></span>
 </div>
