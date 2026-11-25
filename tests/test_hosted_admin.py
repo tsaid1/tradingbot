@@ -1335,3 +1335,40 @@ def test_a_reviewer_s_hosted_line_before_any_import_is_never_built_upon(run, sto
     assert "pulled 1 hosted line(s) into the local log: REMOTE-2 1; 0 already held" in run(
         "pull-to-local")
     assert A.read_annotations(base).records[0]["hosted"]["seq"] == HOSTED_1
+
+
+def test_two_pulls_at_once_append_every_hosted_line_once(cli, run, store, base, monkeypatch,
+                                                         capsys):
+    """Probe ``test_two_pulls_at_once_append_twice`` (finding 9): both runs read the log before
+    either appended, and six hosted lines became twelve."""
+    import threading
+
+    rows = cutover(run, store, base)
+    hosted_work(store, rows)
+    both_have_read, read_log = threading.Barrier(2, timeout=30), cli.read_log
+
+    def read_then_wait(folder):
+        got = read_log(folder)
+        both_have_read.wait()
+        return got
+
+    monkeypatch.setattr(cli, "read_log", read_then_wait)
+    codes = []
+    threads = [threading.Thread(target=lambda: codes.append(cli.main(["pull-to-local"])))
+               for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(60)
+    monkeypatch.setattr(cli, "read_log", read_log)
+    printed = capsys.readouterr().out
+    log = A.read_annotations(base)
+    assert codes == [0, 0] and log.ok and log.count == 8 + 6
+    assert sorted(r["hosted"]["seq"] for r in log.records[8:]) == [
+        HOSTED_1 + n for n in range(6)]  # each exactly once, whichever run wrote it
+    counts = [int(x) for x in re.findall(r"pulled (\d+) hosted line", printed)]
+    assert len(counts) == 2 and sum(counts) == 6
+    assert [r["refers_to"] for r in log.records if r.get("hosted", {}).get("seq")
+            == HOSTED_1 + 4] == [next(r["seq"] for r in log.records if r.get(
+                "hosted", {}).get("seq") == HOSTED_1 + 2)]  # still the local line it means
+    assert "PASS" in run("parity") and "pulled 0 hosted line(s)" in run("pull-to-local")

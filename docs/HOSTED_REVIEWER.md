@@ -404,8 +404,10 @@ python scripts/adjudication_freeze.py verify
 
 `pull-to-local` appends each hosted save the local log does not hold yet, through the log's own
 chained append: the same record with its own time, `refers_to` pointing at the local line of the
-record it means, and `hosted = {"seq", "sha256"}` naming the hosted line. It can be run again
-(nothing is appended twice), never touches a line already there, and skips test identities. It
+record it means, and `hosted = {"seq", "sha256"}` naming the hosted line. It can be run again,
+and two runs at once are safe: whether a line is already held is decided under the log's own
+lock at each append, so nothing is appended twice. It never touches a line already there and
+never pulls a test identity's line. It
 refuses a folder whose log does not hold the anchored head at the anchored line count
 (`LOCAL_LOG_IS_NOT_THE_ANCHORED_LOG`), any log but an empty one while nothing was imported
 (`NO_ANCHOR_IMPORT_LOG_FIRST`), and a store that fails verification; `push-returns` refuses

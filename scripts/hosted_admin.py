@@ -771,36 +771,44 @@ def cmd_restore(args) -> int:
 # ------------------------------------------------------------------ hosted saves, back home
 
 
+class _Held(Exception):
+    """The local log already holds this hosted line."""
+
+
 def cmd_pull_to_local(args) -> int:
     base, store = _base(args), _store()
-    data, _head, log = read_log(base)
+    data, _head, _log = read_log(base)
     with store.connection():
         events, anchor = store.events(), store.anchor()
     anchored(_lines(data), anchor)
     if chain_problems(events, anchor):
         raise refused("HOSTED_STORE_FAILS_VERIFICATION")
-    held = {_pulled(r): r["seq"] for r in log.records if _pulled(r)}
-    local: dict[int, int] = {}  # a hosted line's seq -> the seq of its copy in the local log
-    pulled = []
-    for e in events:
-        if e["origin"] != HOSTED:  # the reviewers' chain only: never a TEST or RETURN line
-            continue
-        if e["sha256"] in held:
-            local[e["seq"]] = held[e["sha256"]]
-            continue
-        rec = json.loads(e["line"])
-        body = {k: v for k, v in rec.items() if k not in ENVELOPE}
-        if isinstance(body.get("refers_to"), int) and body["refers_to"] > HOSTED_BASE:
-            if body["refers_to"] not in local:
-                raise refused("REFERS_TO_A_LINE_NOT_PULLED")
-            body["refers_to"] = local[body["refers_to"]]
-        body["hosted"] = {"seq": e["seq"], "sha256": e["sha256"]}
-        local[e["seq"]] = V.append_chained(A.annotations_path(base), WHAT, A.ANNOTATION_SCHEMA,
-                                           lambda _v, body=body: body)["seq"]
-        pulled.append(e["alias"])
+    hosted = [e for e in events if e["origin"] == HOSTED]  # never a TEST or RETURN line
+    known = {e["sha256"] for e in hosted}
+    pulled, held = [], 0
+    for e in hosted:
+        def make(v: V.Verification, e=e) -> dict:
+            # Decided HERE, from the log as it is under its lock: since this command read the
+            # log another pull may have appended this very line (two runs at once).
+            local = {r["hosted"]["seq"]: r["seq"] for r in v.records if _pulled(r) in known}
+            if e["seq"] in local:
+                raise _Held
+            body = {k: x for k, x in json.loads(e["line"]).items() if k not in ENVELOPE}
+            if isinstance(body.get("refers_to"), int) and body["refers_to"] > HOSTED_BASE:
+                if body["refers_to"] not in local:
+                    raise refused("REFERS_TO_A_LINE_NOT_PULLED")
+                body["refers_to"] = local[body["refers_to"]]  # the local line of that record
+            return {**body, "hosted": {"seq": e["seq"], "sha256": e["sha256"]}}
+
+        try:
+            V.append_chained(A.annotations_path(base), WHAT, A.ANNOTATION_SCHEMA, make)
+        except _Held:
+            held += 1
+        else:
+            pulled.append(e["alias"])
     after = A.read_annotations(base)
     print(f"pulled {len(pulled)} hosted line(s) into the local log: {_counts(pulled)}; "
-          f"{len(held)} already held")
+          f"{held} already held")
     print(f"annotation log: {'OK' if after.ok else 'FAILS ' + str(after.problem)}, "
           f"{after.count} line(s), head {after.head[:12]}")
     return 0 if after.ok else 1
