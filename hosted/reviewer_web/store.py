@@ -284,13 +284,16 @@ class AdminStore(Store):
                                 " OR login = %s", (alias, key)).fetchall()
             if held and held != [(alias, key, is_test)]:
                 raise A.AdjudicationError("ALIAS_OR_LOGIN_HELD_BY_ANOTHER_ROW")
-            conn.execute(
-                "INSERT INTO reviewer (alias, login, login_shown, name, role, access,"
-                " scope_sequences, is_test) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)"
-                " ON CONFLICT (alias) DO UPDATE SET login_shown = EXCLUDED.login_shown,"
-                " name = EXCLUDED.name, role = EXCLUDED.role, access = EXCLUDED.access,"
-                " scope_sequences = EXCLUDED.scope_sequences",
-                (alias, key, login, name, role, access, scope_sequences, is_test))
+            if held:
+                conn.execute(
+                    "UPDATE reviewer SET login_shown = %s, name = %s, role = %s, access = %s,"
+                    " scope_sequences = %s WHERE alias = %s",
+                    (login, name, role, access, scope_sequences, alias))
+            else:
+                conn.execute(
+                    "INSERT INTO reviewer (alias, login, login_shown, name, role, access,"
+                    " scope_sequences, is_test) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                    (alias, key, login, name, role, access, scope_sequences, is_test))
             return self.reviewer_by_login(login)
 
     def sync_reviewers(self, reviewers: A.Reviewers) -> list[ReviewerRow]:
@@ -314,6 +317,17 @@ class AdminStore(Store):
         with self.connection() as conn:
             return [ReviewerRow(*row)
                     for row in conn.execute(_REVIEWER + " ORDER BY id").fetchall()]
+
+    def status(self) -> list[dict]:
+        """Per reviewer row: alias, scope and the times the operator's ``status`` prints."""
+        keys = ("alias", "is_test", "scope_sequences", "invited_at", "first_sign_in_at",
+                "revoked_at", "first_hosted_at")
+        with self.connection() as conn:
+            rows = conn.execute(
+                "SELECT r.alias, r.is_test, r.scope_sequences, r.invited_at, r.first_sign_in_at,"
+                " r.revoked_at, (SELECT min(e.at) FROM event e WHERE e.reviewer_id = r.id"
+                " AND e.origin = 'HOSTED') FROM reviewer r ORDER BY r.id").fetchall()
+        return [dict(zip(keys, row, strict=True)) for row in rows]
 
     def set_revoked(self, alias: str, revoked: bool) -> int:
         """Set or clear ``revoked_at`` and delete that reviewer's web sessions (WEB's table
@@ -375,6 +389,20 @@ class AdminStore(Store):
                     " VALUES (%s, %s, %s, %s, %s, %s)", rows)
         return bundle
 
+    def published(self) -> dict | None:
+        """The active bundle's row without its content: id, flags, scope and sizes."""
+        keys = ("bundle_id", "is_demo", "published_at", "source_sequences", "scope_sequences",
+                "bytes", "images", "image_bytes")
+        with self.connection() as conn:
+            row = conn.execute(
+                "SELECT b.bundle_id, b.is_demo, b.published_at, b.source_sequences,"
+                " b.scope_sequences, octet_length(b.manifest) + octet_length(b.sequences)"
+                " + octet_length(b.items) + octet_length(b.posts), count(m.name),"
+                " COALESCE(sum(octet_length(m.bytes)), 0)::bigint FROM bundle b"
+                " LEFT JOIN media m ON m.bundle_id = b.bundle_id WHERE b.active"
+                " GROUP BY b.bundle_id").fetchone()
+        return row and dict(zip(keys, row, strict=True))
+
     # -------------------------------------------------------------- events, verbatim
 
     def insert_events(self, lines: list[EventLine]) -> None:
@@ -387,11 +415,11 @@ class AdminStore(Store):
     def events(self) -> list[dict]:
         """EVERY event, in seq order, with its reviewer's alias (operator tool only)."""
         keys = ("alias", "is_test", "origin", "seq", "prev_sha256", "sha256", "line",
-                "idempotency_key", "batch", "created_at")
+                "idempotency_key", "batch", "created_at", "item_id", "phase", "at")
         with self.connection() as conn:
             rows = conn.execute(
                 "SELECT r.alias, r.is_test, e.origin, e.seq, e.prev_sha256, e.sha256, e.line,"
-                " e.idempotency_key, e.batch, e.created_at FROM event e"
+                " e.idempotency_key, e.batch, e.created_at, e.item_id, e.phase, e.at FROM event e"
                 " JOIN reviewer r ON r.id = e.reviewer_id ORDER BY e.seq").fetchall()
         return [{**dict(zip(keys, row, strict=True)), "line": bytes(row[6])} for row in rows]
 

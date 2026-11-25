@@ -42,16 +42,21 @@ def _server():
     return pgserver.get_server(tempfile.mkdtemp(prefix="hosted-pg-"), cleanup_mode="delete")
 
 
-@pytest.fixture
-def dsn() -> str:
-    """A fresh, EMPTY database (no schema yet) on the embedded server."""
+def fresh_database() -> str:
+    """The address of a new, EMPTY database (no schema yet) on the embedded server."""
+    server, name = _server(), next(_names)
     import psycopg
     from psycopg import sql
 
-    server, name = _server(), next(_names)
     with psycopg.connect(server.get_uri(), autocommit=True) as conn:
         conn.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(name)))
     return server.get_uri(name)
+
+
+@pytest.fixture
+def dsn() -> str:
+    """A fresh, EMPTY database (no schema yet) on the embedded server."""
+    return fresh_database()
 
 
 @pytest.fixture
