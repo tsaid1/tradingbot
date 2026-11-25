@@ -7,6 +7,7 @@ and that no command prints an address, a name or a word of a post or a reading."
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import importlib.util
 import json
 import os
@@ -1441,24 +1442,45 @@ def test_a_test_identity_saves_in_a_stream_of_its_own_and_never_fixes_the_anchor
 
 def test_a_reviewer_s_hosted_line_before_any_import_is_never_built_upon(run, store, base,
                                                                         tmp_path):
+    """Re-check R1 (probe ``test_r11::test_real_save_before_any_import_and_the_empty_log_case``):
+    a reviewer's saves before the first ``import-log`` left lines that ``pull-to-local``,
+    ``push-returns`` and ``import-log`` then refused for good. Now the store refuses such a
+    save (NO_ANCHOR; the site says calmly that the workspace is not open yet), and a database
+    that holds such lines anyway (made before this rule, or restored from one) can still bring
+    them home: a log that holds only its own pulled copies is the log they continue."""
+    from reviewer_web.store import EventLine
+
     run("init-db")
     run("publish-bundle", "--demo", base)
     run("sync-reviewers", "--demo")
     one = store.reviewer_by_login(ONE.login)
-    [line] = hosted_save(store, one, "i07", A.INDEPENDENT).records  # no log was ever imported
-    assert (line["seq"], line["prev_sha256"]) == (HOSTED_1, V.GENESIS) and store.anchor() is None
-    # A folder with a log: not the (empty) log this chain continues. Nothing is written.
+    with pytest.raises(A.AdjudicationError, match="^NO_ANCHOR$"):
+        hosted_save(store, one, "i07", A.INDEPENDENT)
+    assert store.events() == [] and store.anchor() is None
+    # Lines of the old rule: two saves of a reviewer before any import, one after a pull.
+    b = store.bundle_for(one)
+    body = A.build_annotation([], b, one.session(), **reading_kw(b, "i07", [], one.session(),
+                                                                 phase=A.INDEPENDENT))
+    first = {**body, "schema": A.ANNOTATION_SCHEMA, "seq": HOSTED_1, "prev_sha256": V.GENESIS}
+    store.insert_events([EventLine(one.id, "HOSTED", V.encode_line(first))])
+    # A folder with a log of its own: not the (empty) log this chain continues.
     other = write_demo(tmp_path / "other")
     local_save(other, TWO, "i08", A.INDEPENDENT)
     for command in ("pull-to-local", "push-returns"):
         assert run(command, "--dir", other, code=2) == "refused: NO_ANCHOR_IMPORT_LOG_FIRST\n"
-    assert run("import-log", "--dir", other, code=2) == \
-        "refused: HOSTED_LINES_BEFORE_FIRST_IMPORT\n"
-    assert len(log_lines(other)) == 1 and len(store.events()) == 1 and store.anchor() is None
-    # An empty log IS that log (a preview's saves can be taken home).
+    assert len(log_lines(other)) == 1 and store.anchor() is None
     assert "pulled 1 hosted line(s) into the local log: REMOTE-2 1; 0 already held" in run(
         "pull-to-local")
-    assert A.read_annotations(base).records[0]["hosted"]["seq"] == HOSTED_1
+    [marker] = A.build_system_shown([first], b, one.session(), "i07")
+    second = {**marker, "schema": A.ANNOTATION_SCHEMA, "seq": HOSTED_1 + 1,
+              "prev_sha256": hashlib.sha256(V.encode_line(first)).hexdigest()}
+    store.insert_events([EventLine(one.id, "HOSTED", V.encode_line(second))])
+    # The second pull: the log holds only its own pulled copy, so it is still that log.
+    assert "pulled 1 hosted line(s) into the local log: REMOTE-2 1; 1 already held" in run(
+        "pull-to-local")
+    assert [r["hosted"]["seq"] for r in A.read_annotations(base).records] == [
+        HOSTED_1, HOSTED_1 + 1]
+    assert "returns that stand in the local log: 0" in run("push-returns")
 
 
 def test_two_pulls_at_once_append_every_hosted_line_once(cli, run, store, base, monkeypatch,

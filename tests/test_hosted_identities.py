@@ -415,3 +415,18 @@ def test_the_test_identity_s_lines_never_reach_the_chain_the_anchor_or_a_pull(
     assert "verify: PASS" in run("verify")
     before = V.verify_bytes(A.annotations_path(base).read_bytes(), A.ANNOTATION_SCHEMA).count
     assert before == 13
+
+
+def test_before_the_first_import_a_reviewer_is_told_calmly_and_the_test_identity_works(two):
+    """Re-check R1 on the pages: with no local log imported (no anchor) a reviewer's identity is
+    served one calm page and can store nothing; the test identity tests production as before."""
+    from reviewer_web import app as web
+
+    site = two.site
+    site.sql("DELETE FROM chain_anchor")
+    mine, test = two.open("review"), two.open("test")
+    page = mine.get("/")
+    assert page.status_code == 503 and web.NOT_OPEN in page.get_data(as_text=True)
+    assert mine.get("/form/ri07").status_code == 503
+    test.review("i07", after=False)
+    assert {e["origin"] for e in site.admin.events()} == {"TEST"}

@@ -78,6 +78,8 @@ HEADERS = {
 }
 _KEY = re.compile(r"^([A-Za-z0-9_-]{16,64})\.([0-9a-f]{32})$")
 _BUNDLE = re.compile(r"^[0-9a-f]{64}$")
+NOT_OPEN = ("Your workspace is not open yet: your earlier work is still being carried over. "
+            "Nothing has been saved here. You will be told when it opens.")
 MESSAGES = {
     400: "The request could not be read.",
     403: "The request was refused. Open the page again from the site and repeat it.",
@@ -254,6 +256,11 @@ def create_app(store, mailer, config: dict) -> Flask:
             return refuse(503)  # no bundle is assigned to this reviewer: nothing is served
         if demo_env and not (demo and store.bundle_is_demo()):
             return refuse(503)  # a preview serves nobody whose bundle is not invented
+        if not store.is_open(reviewer):
+            # Before the first import nothing of a reviewer's may be stored (it would continue no
+            # local log): every page says so calmly, and nothing is lost, as nothing was saved.
+            return render_template("message.html", message=NOT_OPEN, status=503, who=None,
+                                   csrf="", demo=demo), 503
         g.who = Who(reviewer, reviewer.session(), token, demo)
         return None
 

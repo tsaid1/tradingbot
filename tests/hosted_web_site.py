@@ -16,6 +16,7 @@ hand-written request.
 from __future__ import annotations
 
 import functools
+import hashlib
 import html
 import importlib.util
 import json
@@ -38,7 +39,7 @@ from werkzeug.datastructures import MultiDict
 from tradingbot.runtime import adjudication as A
 from tradingbot.runtime import adjudication_rubric as R
 from tradingbot.runtime import adjudication_scenarios as SC
-from tradingbot.runtime.vocab_recommend import encode_line
+from tradingbot.runtime.vocab_recommend import GENESIS, encode_line
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -377,6 +378,8 @@ class Site:
         self.admin, self.dsn = admin, dsn
         self.bundle = publish_demo(admin, base)
         demo_reviewers(admin, base)
+        # The local log is imported (here an empty one): reviewers may save (NO_ANCHOR before).
+        admin.set_anchor(0, GENESIS, hashlib.sha256(b"").hexdigest())
         self.store = Store(dsn)  # the web app's own object: no operator call
         self.outbox, self.clock = mail.Outbox(), Clock()
         self.config = {"SESSION_SECRET": SECRET, "SITE_ENV": site_env, "CLOCK": self.clock,

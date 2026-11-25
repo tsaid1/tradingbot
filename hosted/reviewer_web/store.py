@@ -216,6 +216,15 @@ class Store:
                                 (sign_in.casefold(),)).fetchall()
         return [ReviewerRow(*row) for row in rows]
 
+    def is_open(self, reviewer: ReviewerRow) -> bool:
+        """Whether this identity may work here: a test identity always; a reviewer once the
+        local log is imported (the anchor exists), so that every hosted line continues it."""
+        if reviewer.is_test:
+            return True
+        with self.connection() as conn:
+            return conn.execute("SELECT EXISTS (SELECT 1 FROM chain_anchor WHERE id = 1)"
+                                ).fetchone()[0]
+
     def reviewer_by_id(self, reviewer_id: int) -> ReviewerRow | None:
         with self.connection() as conn:
             row = conn.execute(_REVIEWER + " WHERE id = %s", (reviewer_id,)).fetchone()
@@ -358,6 +367,10 @@ class Store:
                 raise A.AdjudicationError("REVOKED")
             if bundle_id is None:
                 raise A.AdjudicationError("NO_BUNDLE_ASSIGNED")
+            if not test and anchor is None:
+                # Nothing is imported yet: a reviewer's line now would continue no local log, and
+                # no command could bring it home. A test identity's stream needs no anchor.
+                raise A.AdjudicationError("NO_ANCHOR")
             mine = conn.execute(
                 "SELECT line, bundle_id, idempotency_key, batch, seq FROM event"
                 " WHERE reviewer_id = %s ORDER BY seq", (reviewer.id,)).fetchall()

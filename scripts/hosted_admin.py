@@ -533,9 +533,10 @@ def continues(lines: list[bytes], anchor: dict | None) -> bool:
 
 def anchored(lines: list[bytes], anchor: dict | None) -> None:
     """Refuse a folder whose log is not the log the hosted chain continues: it must hold the
-    anchored head at the anchored line count. Without an anchor (nothing imported yet) only an
-    empty log is that log."""
-    if anchor is None and lines:
+    anchored head at the anchored line count. Without an anchor (nothing imported yet) only a
+    log that holds nothing but its own pulled copies of hosted lines is that log (an empty log,
+    or one a previous pull wrote)."""
+    if anchor is None and any(_pulled(_record(line)) is None for line in lines):
         raise refused("NO_ANCHOR_IMPORT_LOG_FIRST")
     if not continues(lines, anchor):
         raise refused("LOCAL_LOG_IS_NOT_THE_ANCHORED_LOG")
