@@ -1059,3 +1059,54 @@ def test_a_test_identity_works_on_invented_forms_beside_the_reviewers_on_the_rea
     assert (store.published(demo=False)["bundle_id"], store.published(demo=True)["bundle_id"]) \
         == (real_id, demo_id)
     assert store.bundle_for(tester).bundle_id == demo_id
+
+
+# ------------------------------------------------------------------ invitations
+
+
+def test_invite_queues_a_message_for_the_site_to_send_and_status_says_how_it_went(
+        cli, run, store, base, tmp_path, capsys):
+    """The operator's machine holds no mail password: ``invite`` only queues, the site sends
+    (tests/test_hosted_web_invites.py), and ``status`` shows what became of each message."""
+    run("publish-bundle", "--demo", base)
+    run("sync-reviewers", "--demo")
+    run("sync-reviewers", "--test-identity", "TEST-1", TESTER)
+    assert run("invite", "REMOTE-2", "--kind", "continue") == (
+        "REMOTE-2: INVITE_CONTINUE queued; the site sends it when its sender is called\n")
+    assert run("invite", "REMOTE-2", "--kind", "continue", code=2) == "refused: ALREADY_QUEUED\n"
+    run("invite", "REMOTE-2", "--kind", "start")  # the other kind is a message of its own
+    assert run("invite", "TEST-1", "--kind", "start", code=2) == \
+        "refused: TEST_IDENTITY_IS_NOT_INVITED\n"
+    assert run("invite", "REMOTE-9", "--kind", "start", code=2) == "refused: UNKNOWN_ALIAS\n"
+    run("revoke", "REMOTE-3")
+    assert run("invite", "REMOTE-3", "--kind", "start", code=2) == "refused: REVOKED\n"
+    with pytest.raises(SystemExit):  # the two kinds are the command line's only choices
+        cli.main(["invite", "REMOTE-2", "--kind", "newsletter"])
+    capsys.readouterr()
+    waiting = run("status")
+    assert re.search(r"REMOTE-2: [^\n]*invited -,[^\n]*\n"
+                     r"  mail INVITE_CONTINUE: queued \d{4}-\S+, sent -, result -\n"
+                     r"  mail INVITE_START: queued \d{4}-\S+, sent -, result -\n", waiting)
+    assert "mail" not in waiting.split("REMOTE-3:")[1]
+    # What the site's sender records: one message went out, the other could not be sent.
+    for result in (cli.S.MAIL_SENT, "MAIL_UNREACHABLE"):
+        with store.connection():
+            row, _kind, _to = store.mail_next(())
+            store.mail_done(row, result)
+            if result != cli.S.MAIL_SENT:  # tried three times: given up
+                store.mail_done(row, result)
+                store.mail_done(row, result)
+    after = run("status")
+    assert re.search(r"REMOTE-2: [^\n]*invited \d{4}-\S+,[^\n]*\n"
+                     r"  mail INVITE_CONTINUE: queued \d{4}-\S+, sent \d{4}-\S+, result SENT\n"
+                     r"  mail INVITE_START: queued \d{4}-\S+, sent -, result MAIL_UNREACHABLE\n",
+                     after)
+    with store.connection():
+        assert store.mail_next(()) is None and store.mail_left() == 0
+    # A message that was given up may be queued again; one that waits may not.
+    run("invite", "REMOTE-2", "--kind", "start")
+    assert run("invite", "REMOTE-2", "--kind", "start", code=2) == "refused: ALREADY_QUEUED\n"
+    # The queue is no part of an export.
+    out = tmp_path / "export.jsonl"
+    run("export", "--out", out)
+    assert "INVITE" not in out.read_text() and "mail" not in out.read_text()

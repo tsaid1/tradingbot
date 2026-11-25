@@ -376,13 +376,13 @@ class Site:
         """A new browser on the site's application, or on another one over the same database."""
         return Browser(self, app)
 
-    def production(self):
+    def production(self, mailer=None, **config):
         """The same database served as production (mail goes to the same outbox)."""
         from reviewer_web import app as web
         from reviewer_web.store import Store
 
-        return web.create_app(Store(self.dsn), self.outbox,
-                              {**self.config, "SITE_ENV": "production"})
+        return web.create_app(Store(self.dsn), mailer or self.outbox,
+                              {**self.config, "SITE_ENV": "production", **config})
 
     def publish_real(self, base: Path):
         """Publish an invented stand-in for the REAL bundle beside the demonstration one: the

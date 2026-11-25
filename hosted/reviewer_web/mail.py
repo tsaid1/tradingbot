@@ -28,6 +28,49 @@ def configured(env=os.environ) -> bool | None:
     return True if all(given) else False if not any(given) else None
 
 
+# The two invitations the site sends for the operator (``/internal/send-queued``). Their words
+# are the product owner's; only ``{URL}`` (the site's address) is filled in. No name is used.
+INVITATIONS = {
+    "INVITE_CONTINUE": (
+        "The review site has moved: continue where you left off",
+        ("The trade review has moved to a normal website. You no longer need Tailscale, and it is "
+         "available at any hour.\n\n"
+         "Open: {URL}\n"
+         "Enter this email address, and type the six-digit code that arrives in your inbox. That "
+         "is the whole sign-in.\n\n"
+         "Everything you saved is there. \"Continue\" takes you to your next unfinished step. If "
+         "you had saved your own reading of a form and not yet answered the questions shown "
+         "afterwards, that form opens at those questions with your own reading intact.\n\n"
+         "One change after you save your own reading: two questions now stand on their own, each "
+         "beside what the system proposed. The first asks whether the system's price series is "
+         "the one the post's numbers use. The second asks whether trading the system's proposed "
+         "instrument would faithfully follow the publisher's idea. Answer Yes, No or Unsure.\n\n"
+         "Please stop using the old address. If the code does not arrive within two minutes, "
+         "check spam, then tell the person who invited you.")),
+    "INVITE_START": (
+        "Trade review: your access is ready",
+        ("Your access to the trade review is ready on a normal website. You do not need "
+         "Tailscale.\n\n"
+         "Open: {URL}\n"
+         "Enter this email address, and type the six-digit code that arrives in your inbox. That "
+         "is the whole sign-in.\n\n"
+         "\"Continue\" opens your first form. For each one: read the post and its charts, record "
+         "your own reading, and save it. Only then does the site show the system's reading and "
+         "ask for your verdicts, including two questions on the system's proposed price series "
+         "and trading instrument. The guide is linked at the top of every page.\n\n"
+         "You can stop at any time; saved work is kept, and \"Continue\" brings you back to the "
+         "next unfinished step, from any device.\n\n"
+         "If the code does not arrive within two minutes, check spam, then tell the person who "
+         "invited you.")),
+}
+
+
+def invitation(kind: str, url: str) -> tuple[str, str]:
+    """(subject, text) of an invitation, with the site's address in it."""
+    subject, text = INVITATIONS[kind]
+    return subject, text.replace("{URL}", url)
+
+
 class Unreachable(Exception):
     """The mail server could not be reached or would not let the site in: no message, to
     anybody, can go out now. Carries the class name of what failed, nothing else."""

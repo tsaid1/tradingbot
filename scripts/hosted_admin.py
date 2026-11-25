@@ -4,6 +4,7 @@
     python scripts/hosted_admin.py sync-reviewers [--demo | --test-identity ALIAS LOGIN]
     python scripts/hosted_admin.py revoke ALIAS
     python scripts/hosted_admin.py restore-access ALIAS
+    python scripts/hosted_admin.py invite ALIAS --kind continue|start
     python scripts/hosted_admin.py publish-bundle [--check-only] [--demo DIR]
     python scripts/hosted_admin.py import-log [--snapshots DIR]
     python scripts/hosted_admin.py parity
@@ -307,6 +308,15 @@ def cmd_revoke(args) -> int:
     return 0
 
 
+def cmd_invite(args) -> int:
+    """Queue an invitation: the SITE sends it (its sender is called with the operator's token),
+    because the mail password exists only where the site runs."""
+    kind = {"continue": "INVITE_CONTINUE", "start": "INVITE_START"}[args.kind]
+    _store().queue_mail(args.alias, kind)
+    print(f"{args.alias}: {kind} queued; the site sends it when its sender is called")
+    return 0
+
+
 # ------------------------------------------------------------------ the local log
 
 
@@ -517,6 +527,7 @@ def cmd_status(_args) -> int:
     with store.connection():
         real, demo = store.published(demo=False), store.published(demo=True)
         anchor, events, rows = store.anchor(), store.events(), store.status()
+        mail = store.queued_mail()
     _print_bundle(real, "real")
     _print_bundle(demo, "demonstration")
     print(f"anchor: {anchor['count']} line(s), head {anchor['head'][:12]}, imported "
@@ -531,6 +542,9 @@ def cmd_status(_args) -> int:
               f"revoked {_time(r['revoked_at'])}")
         for origin in dict.fromkeys(e["origin"] for e in mine):
             print(f"  {origin}: " + _counts(e["phase"] for e in mine if e["origin"] == origin))
+        for m in (m for m in mail if m["alias"] == r["alias"]):
+            print(f"  mail {m['kind']}: queued {_time(m['queued_at'])}, sent "
+                  f"{_time(m['sent_at'])}, result {m['result'] or '-'}")
     print(f"test identities: {sum(r['is_test'] for r in rows)} (see test-report ALIAS)")
     return 0
 
@@ -840,6 +854,10 @@ def main(argv: list[str] | None = None) -> int:
     for name, text in (("revoke", "stop a reviewer's access at once"),
                        ("restore-access", "lift a revocation")):
         command(name, cmd_revoke, text).add_argument("alias")
+    p = command("invite", cmd_invite, "queue an invitation for the site to send")
+    p.add_argument("alias")
+    p.add_argument("--kind", required=True, choices=("continue", "start"),
+                   help="continue: the site has moved; start: a first access")
     p = command("publish-bundle", cmd_publish_bundle,
                 "publish the part of the local bundle the scope needs, after a parity check")
     p.add_argument("--check-only", action="store_true", help="cut and check; upload nothing")

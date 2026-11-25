@@ -113,7 +113,7 @@ CREATE TABLE IF NOT EXISTS chain_anchor (
 );
 
 -- ---------------------------------------------------------------------------------------------
--- WEB's section (sign-in codes, sessions, rate limits) starts below this line.
+-- WEB's section (sign-in codes, sessions, rate limits, queued mail) starts below this line.
 -- ---------------------------------------------------------------------------------------------
 -- Sign-in codes, sessions and rate limits of the web app (hosted/reviewer_web/auth.py).
 -- No address, code or token is stored: a code as HMAC-SHA256 under the server's secret, a session
@@ -145,3 +145,20 @@ CREATE TABLE IF NOT EXISTS rate_limit (
     at     TIMESTAMPTZ NOT NULL
 );
 CREATE INDEX IF NOT EXISTS rate_limit_by_bucket ON rate_limit (bucket, at);
+
+-- Mail the operator asks the site to send (the mail password exists only where the site runs):
+-- one invitation per row. No address and no text is stored: the reviewer's row gives the address
+-- when the site sends, the kind gives the text. Written by the operator tool's `invite`, sent by
+-- the site's own sender; not part of an export.
+CREATE TABLE IF NOT EXISTS mail_queue (
+    id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    reviewer_id BIGINT NOT NULL REFERENCES reviewer (id) ON DELETE CASCADE,
+    kind        TEXT NOT NULL CHECK (kind IN ('INVITE_CONTINUE', 'INVITE_START')),
+    queued_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    sent_at     TIMESTAMPTZ,                   -- set when the message went out
+    result      TEXT,                          -- SENT, or the constant code of the last failure
+    attempts    INT NOT NULL DEFAULT 0 CHECK (attempts BETWEEN 0 AND 3)
+);
+-- One row of a kind waits per reviewer (not sent, tries left).
+CREATE UNIQUE INDEX IF NOT EXISTS mail_queue_one_waiting ON mail_queue (reviewer_id, kind)
+    WHERE sent_at IS NULL AND attempts < 3;

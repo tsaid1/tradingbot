@@ -20,7 +20,8 @@ read. So a marker or a save is durable before any page says so.
 
 ``create_app(store, mailer, config)`` builds the application; ``app`` (module level, built on
 first use) is the one the platform serves, configured by the environment: ``DATABASE_URL``,
-``SESSION_SECRET``, ``SITE_ENV`` and the five SMTP variables of ``mail`` (``from_environment``).
+``SESSION_SECRET``, ``SITE_ENV``, the five SMTP variables of ``mail``, and for the operator's
+queued invitations ``OPERATOR_TOKEN`` and ``SITE_URL`` (``from_environment``).
 """
 
 from __future__ import annotations
@@ -36,7 +37,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from flask import Flask, Response, abort, g, redirect, render_template, request
+from flask import Flask, Response, abort, g, jsonify, redirect, render_template, request
 
 from tradingbot.runtime import adjudication as A
 from tradingbot.runtime import adjudication_rubric as R
@@ -49,6 +50,10 @@ SITE_ENVS = ("production", "preview", "test")
 DEMO_ENVS = ("preview", "test")  # these show invented data only
 PUBLIC = ("healthz", "robots", "favicon", "static")  # no session, no database
 SIGN_IN = ("sign_in", "sign_in_code", "sign_in_verify")
+OPERATOR = ("send_queued",)  # the one route without a session: its own token, or it is a 404
+EVERY_METHOD = ("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS")
+MIN_OPERATOR_TOKEN = 32
+MAIL_PER_CALL = 5
 IMAGE_TYPES = ("image/png", "image/jpeg", "image/gif", "image/webp")
 MAX_IMAGE_BYTES = 4 * 1024 * 1024  # the platform caps a response at 4.5 MB
 MAX_REQUEST_BYTES = 512 * 1024
@@ -92,12 +97,20 @@ def _code(exc: Exception) -> str:
     return getattr(exc, "code", None) or type(exc).__name__
 
 
+def _cause(exc: Exception) -> str:
+    """What a log line may say of a mail failure: a class name, never a message (a message may
+    quote an address or a code). ``mail.Unreachable`` carries the class name of what failed."""
+    named = str(exc) if isinstance(exc, mail.Unreachable) else type(exc).__name__
+    return named if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,60}", named) else type(exc).__name__
+
+
 def create_app(store, mailer, config: dict) -> Flask:
     """``store``: the contract's ``Store``. ``mailer(to, subject, text)``, or None for synthetic
     mail (preview and test only: the code is shown on the page). ``config``:
-    ``SESSION_SECRET`` (at least 32 characters), ``SITE_ENV`` (production | preview | test), and
-    for tests and the development server ``CLOCK`` (a function returning the time),
-    ``SIGN_IN_FLOOR_SECONDS``."""
+    ``SESSION_SECRET`` (at least 32 characters), ``SITE_ENV`` (production | preview | test);
+    for the operator's queued mail ``OPERATOR_TOKEN`` (at least 32 characters) and ``SITE_URL``
+    (the address the invitations name); and for tests and the development server ``CLOCK`` (a
+    function returning the time) and ``SIGN_IN_FLOOR_SECONDS``."""
     secret = config.get("SESSION_SECRET") or ""
     secret = secret.encode("utf-8") if isinstance(secret, str) else bytes(secret)
     site_env = config.get("SITE_ENV") or "production"
@@ -114,6 +127,8 @@ def create_app(store, mailer, config: dict) -> Flask:
     if synthetic and not demo_env:
         raise RuntimeError("MAIL_NOT_CONFIGURED")
     clock = config.get("CLOCK") or (lambda: datetime.now(UTC))
+    operator_token = str(config.get("OPERATOR_TOKEN") or "").encode("utf-8")
+    site_url = str(config.get("SITE_URL") or "").strip()
     floor = float(config.get("SIGN_IN_FLOOR_SECONDS", 2.0))
 
     app = Flask(__name__, static_folder=str(STATIC), static_url_path="/static")
@@ -158,7 +173,7 @@ def create_app(store, mailer, config: dict) -> Flask:
         """Before any route: a POST from another origin is refused, and a signed-in browser
         does not see the sign-in pages."""
         g.who = None
-        if request.endpoint is None or request.endpoint in PUBLIC:
+        if request.endpoint is None or request.endpoint in (*PUBLIC, *OPERATOR):
             return None
         if request.method == "POST" and not same_origin():
             return refuse(403)
@@ -253,6 +268,46 @@ def create_app(store, mailer, config: dict) -> Flask:
     def favicon():
         return Response(status=204)  # browsers ask; the site has no image of its own
 
+    # ------------------------------------------------------------- the operator's queued mail
+
+    @app.route("/internal/send-queued", methods=EVERY_METHOD, provide_automatic_options=False)
+    def send_queued():
+        """Send the invitations the operator queued (``hosted_admin.py invite``): the mail
+        password exists only here. No session, no parameters, no body: the operator's token in
+        ``Authorization: Bearer``, or the answer is that of a path that does not exist (also in
+        preview and test, which never send mail, and for any method but POST). At most five
+        messages a call, one sender at a time, each try recorded as it happens. The answer is
+        three counts; no address is returned or logged."""
+        given = request.headers.get("Authorization", "").encode("utf-8")
+        if request.method != "POST" or demo_env or len(operator_token) < MIN_OPERATOR_TOKEN \
+                or not hmac.compare_digest(given, b"Bearer " + operator_token):
+            return refuse(404)
+        if not site_url.startswith("https://"):
+            app.logger.error("SITE_URL_MISSING")
+            return refuse(404)
+        sent, failed, tried = 0, 0, []
+        for _ in range(MAIL_PER_CALL):
+            with store.connection():  # one message, one transaction: its result is kept
+                due = store.mail_next(tried)
+                if due is None:
+                    break
+                row, kind, to = due
+                tried.append(row)
+                try:
+                    mailer(to, *mail.invitation(kind, site_url))
+                    result = "SENT"
+                except mail.Unreachable as exc:
+                    result = "MAIL_UNREACHABLE"
+                    app.logger.error("QUEUED_MAIL %s error=%s", result, _cause(exc))
+                except Exception as exc:  # noqa: BLE001 - a constant code, no detail
+                    result = "MAIL_FAILED"
+                    app.logger.error("QUEUED_MAIL %s error=%s", result, _cause(exc))
+                store.mail_done(row, result)
+            sent, failed = sent + (result == "SENT"), failed + (result != "SENT")
+        left = store.mail_left()
+        app.logger.info("QUEUED_MAIL sent=%d failed=%d left=%d", sent, failed, left)
+        return jsonify(sent=sent, failed=failed, left=left)
+
     # ------------------------------------------------------------- sign-in and sign-out
 
     @app.get("/sign-in")
@@ -285,10 +340,10 @@ def create_app(store, mailer, config: dict) -> Flask:
                 elif asked.allowed and hasattr(mailer, "probe"):
                     mailer.probe()
             except mail.Unreachable as exc:
-                app.logger.error("MAIL_UNREACHABLE error=%s", str(exc)[:60])  # a class name
+                app.logger.error("MAIL_UNREACHABLE error=%s", _cause(exc))
                 unsent = True
             except Exception as exc:  # noqa: BLE001 - whatever failed: a constant code, no detail
-                app.logger.error("MAIL_FAILED error=%s", type(exc).__name__)
+                app.logger.error("MAIL_FAILED error=%s", _cause(exc))
             else:
                 asked = asked._replace(code=None)  # delivered, or none was made: nothing to end
             if asked.code is not None:
@@ -541,7 +596,9 @@ def from_environment(env=os.environ) -> Flask:
     if with_mail is None or (not with_mail and site_env not in DEMO_ENVS):
         raise RuntimeError("MAIL_NOT_CONFIGURED")
     return create_app(Store(env["DATABASE_URL"]), mail.Smtp(env) if with_mail else None,
-                      {"SESSION_SECRET": env.get("SESSION_SECRET", ""), "SITE_ENV": site_env})
+                      {"SESSION_SECRET": env.get("SESSION_SECRET", ""), "SITE_ENV": site_env,
+                       "OPERATOR_TOKEN": env.get("OPERATOR_TOKEN", ""),
+                       "SITE_URL": env.get("SITE_URL", "")})
 
 
 def __getattr__(name: str):
