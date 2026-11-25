@@ -789,7 +789,11 @@ pulled copies included, is then imported as the reviewers' local lines.
 `revoke REMOTE-2` takes effect at once: the site checks the row on every request and every save,
 and the reviewer's sessions and open sign-in codes are deleted. Nothing of the reviewer's work is
 removed.
-`restore-access REMOTE-2` lifts it. Removing the entry from `reviewers.toml` does not revoke.
+`restore-access REMOTE-2` lifts it. Removing the entry from `reviewers.toml` does not revoke:
+a reviewer who leaves is REVOKED and the entry stays. An entry removed while its row is not
+revoked and holds hosted lines makes `import-log` and `pull-to-local` refuse
+(`HOSTED_LINES_OF_ROWS_NOT_IN_THE_FILE`, after a line naming the alias and the remedy: put the
+entry back); a revoked row's lines come home as anyone's.
 
 ### Inviting a reviewer
 

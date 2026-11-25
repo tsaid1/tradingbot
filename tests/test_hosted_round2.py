@@ -425,3 +425,32 @@ def test_r2_1_the_documented_order_opens_no_row_before_the_cutover(
     assert F.step_state(bundle, session, store.records_of(owner), "i02") == F.AFTER_REVEAL_DUE
     with pytest.raises(A.AdjudicationError, match="^SYSTEM_READING_ALREADY_SEEN$"):
         hosted_save(store, owner, "i02", A.INDEPENDENT)
+
+
+# ------------------------------------------------------------------ re-check R2-2
+
+
+def test_r2_2_an_offboarded_reviewer_s_row_stops_no_pull(run, store, base):  # noqa: F811
+    """R2-2 (probe ``test_q11_recheck::test_a2``): REMOTE-3 revoked and removed from the file;
+    its hosted lines made import-log and pull-to-local refuse for everybody. A revoked row's
+    lines now come home as anyone's; a row removed WITHOUT revoking is named with the remedy."""
+    half_way(base)
+    run("init-db")
+    run("publish-bundle", "--demo", base)
+    run("sync-reviewers", "--demo", "--without-owner")
+    run("import-log")
+    open_rows(store)
+    rows = {r.alias: r for r in store.reviewers()}
+    hosted_save(store, rows["REMOTE-3"], "i08", A.INDEPENDENT)
+    hosted_save(store, rows["REMOTE-2"], "i03", A.INDEPENDENT)
+    path = base / "reviewers.toml"
+    whole = path.read_text()
+    path.write_text("[[reviewer]]".join(b for b in whole.split("[[reviewer]]")
+                                        if rows["REMOTE-3"].login_shown not in b))
+    out = run("pull-to-local", code=2)  # removed without revoking: named, with the remedy
+    assert "REMOTE-3: 1 hosted line(s) of a row that is not an entry of the reviewers file: put " \
+        "its entry back" in out and out.endswith("refused: HOSTED_LINES_OF_ROWS_NOT_IN_THE_FILE\n")
+    run("revoke", "REMOTE-3")
+    out = run("pull-to-local")
+    assert "pulled 2 hosted line(s) into the local log: REMOTE-3 1, REMOTE-2 1" in out
+    assert "imported 0 new line(s)" in run("import-log")

@@ -564,11 +564,27 @@ def own_anchor(store, lines: list[bytes], anchor: dict | None) -> None:
         raise refused("ANCHOR_NOT_OF_THIS_LOG")
 
 
+OWN_ALIAS = re.compile(r"^(REMOTE-[0-9]+|OWNER-REVIEWER)$")  # what sync-reviewers writes
+
+
 def strangers(events: list[dict], rows, listed) -> int:
     """HOSTED lines of reviewer rows that are not entries of the reviewers file (an invented
-    tester of a preview, a row of another folder): such a database is not this cutover's."""
-    logins = {r.alias for r in rows if not r.is_test and r.login not in listed}
-    return sum(e["origin"] == HOSTED and e["alias"] in logins for e in events)
+    tester of a preview, a row of another folder): such a database is not this cutover's. A
+    REVOKED row of the file's own kind (``REMOTE-n``, ``OWNER-REVIEWER``) is an offboarded
+    reviewer: their lines are theirs and come home like anyone's. Each other row is named with
+    its count and the remedy; returns the number of such lines."""
+    found = 0
+    for r in rows:
+        if r.is_test or r.login in listed or (r.revoked and OWN_ALIAS.match(r.alias)):
+            continue
+        n = sum(e["origin"] == HOSTED and e["alias"] == r.alias for e in events)
+        if n:
+            found += n
+            print(f"{r.alias}: {n} hosted line(s) of a row that is not an entry of the reviewers "
+                  "file: put its entry back (a reviewer who leaves is revoked; the entry stays)"
+                  + ("" if OWN_ALIAS.match(r.alias) else "; this row was not written from "
+                     "this file: start from an empty database"))
+    return found
 
 
 def anchored(lines: list[bytes], anchor: dict | None) -> None:
