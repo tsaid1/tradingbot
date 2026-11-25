@@ -235,6 +235,7 @@ python scripts/hosted_admin.py status
 | `push-returns` | Stores the approver's standing local RETURN decisions for the reviewers whose readings they return. |
 | `status` | The two bundles and the anchor; per reviewer: bundle, scope, invited, first sign-in, first hosted save, revoked, the lines by origin and phase, and each queued message (kind, queued, sent, result). Test identities are only counted. |
 | `test-report ALIAS` | For a test identity only: its bundle, first sign-in, number of web sessions, each of its events (seq, time, phase, item id) and the state of every form that is not open. This is how a sign-in, a save and a resume on the production site are checked without touching a reviewer. |
+| `make-site-role --out FILE` | Creates the database role the SITE connects as (default name `reviewer_site`), or gives it a new password, and writes its database address (the given address with user and password replaced) to FILE, mode 0600, never over an existing file. Nothing secret is printed. See "The site's own database role". |
 | `verify` | The hosted chain (every line against its hash, 1000001, 1000002, ... from the anchor), the test identities' stream as a chain of its own, every line under a row spelled as the line, and the imported lines against the newest snapshot, in both directions. |
 
 ### Real reviewers and test identities in one database
@@ -354,6 +355,29 @@ of it: a later line supersedes, as in the local log.
 The **anchor** is the local log's state that the reviewers' hosted chain continues. Every
 `import-log` moves it to the log's present head, until the first HOSTED line of a reviewer
 exists: from then on it is fixed, and `import-log` says so (`anchor: ...: FIXED ...`).
+
+### The site's own database role
+
+The role that owns the tables can disable or drop the trigger that makes `event` append-only.
+The operator tool connects as that role; the SITE must not. `make-site-role` creates a second
+login role that owns nothing and has exactly the rights the site's code uses:
+
+* read `reviewer`, `bundle`, `media`, `event`, `chain_anchor`, `mail_queue`;
+* add rows to `event` (never change or delete one);
+* every row operation on the sign-in tables `login_code`, `web_session`, `rate_limit`;
+* set `reviewer.first_sign_in_at` and `reviewer.invited_at`, and `mail_queue.attempts`,
+  `result`, `sent_at`; no other column of either table.
+
+```bash
+python scripts/hosted_admin.py make-site-role --out ~/hosted-keys/site-address-1
+```
+
+Give the content of that file to the site as its `DATABASE_URL` (the pooled address, if
+`HOSTED_DATABASE_URL` is the pooled one), and keep `HOSTED_DATABASE_URL` (the owner's role) on
+the Mac only. Run it again with another `--out` to change the password. It runs after
+`init-db` (the tables must exist), over the direct connection when
+`HOSTED_DATABASE_URL_UNPOOLED` is set. It refuses a role that is an administrator, owns
+anything or is a member of another role (`NOT_A_SITE_ROLE`).
 
 ### Cutover
 

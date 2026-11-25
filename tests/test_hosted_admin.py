@@ -1568,3 +1568,100 @@ def test_sync_reviewers_demo_is_refused_beside_a_real_bundle_unless_forced(run, 
     assert {r.bundle_id for r in store.reviewers()} == {demo_id}
     run("sync-reviewers")  # and back
     assert {r.bundle_id for r in store.reviewers()} == {real_id}
+
+
+# ------------------------------------------------------------------ the site's own database role
+# (The independent review's finding 12.)
+
+
+def test_the_site_s_role_does_what_the_site_does_and_cannot_touch_the_append_only_rule(
+        cli, run, store, dsn, tmp_path):
+    """Probe ``test_what_defeats_the_append_only_trigger``: the role that owns ``event`` can
+    disable or drop its trigger, so the site must not connect as that role."""
+    import psycopg
+    from hosted_web_site import FIRST, ORIGIN, SECOND, Site
+    from psycopg.conninfo import conninfo_to_dict
+
+    site = Site(tmp_path / "site", store, dsn)  # the invented bundle and its two reviewers
+    role = f"site_{conninfo_to_dict(dsn)['dbname']}"  # a role is of the whole server: one a test
+    address = tmp_path / "keys" / "site-address"
+    out = run("make-site-role", "--role", role, "--out", address)
+    url = address.read_text().strip()
+    secret = conninfo_to_dict(url)["password"]
+    assert out.startswith(f"site role {role}: created; it owns nothing and may: read reviewer, ")
+    assert len(secret) >= 40 and secret not in out and "://" not in out
+    assert stat.S_IMODE(address.stat().st_mode) == 0o600
+    assert {**conninfo_to_dict(url), "password": ""} == {
+        **conninfo_to_dict(dsn), "user": role, "password": ""}
+    # The site through that role: sign-in, a save, the reveal, the second save, an image, and
+    # an invitation sent by the site's own sender.
+    site.dsn = url
+    token, operator = "an-invented-operator-token-0123456789abcdef", None
+    app = site.production(OPERATOR_TOKEN=token, SITE_URL="https://review.example.invalid")
+    browser = site.browser(app).sign_in(FIRST)
+    browser.review("i07")
+    assert [r["phase"] for r in site.records(FIRST)] == [A.INDEPENDENT, A.SYSTEM_SHOWN,
+                                                         A.AFTER_REVEAL]
+    image = browser.get(f"/media/{site.bundle.bundle_id}/p01/chart-p01.png")
+    assert image.status_code == 200 and image.get_data().startswith(b"\x89PNG")
+    store.queue_mail(SECOND, "INVITE_START")
+    operator = app.test_client().post("/internal/send-queued", base_url=ORIGIN,
+                                      headers={"Authorization": f"Bearer {token}"})
+    assert operator.status_code == 200
+    assert [(m["alias"], m["result"]) for m in store.queued_mail()] == [(SECOND, "SENT")]
+    times = {r["alias"]: (r["first_sign_in_at"], r["invited_at"]) for r in store.status()}
+    assert times[FIRST][0] is not None and times[SECOND][1] is not None
+
+    def as_site(statement: str):
+        with psycopg.connect(url) as conn:
+            return conn.execute(statement)
+
+    # ... and nothing else: not the append-only rule, not a row it has no business with.
+    for statement in (
+            "UPDATE event SET item_id = 'x'", "DELETE FROM event", "TRUNCATE event",
+            "TRUNCATE reviewer CASCADE", "ALTER TABLE event DISABLE TRIGGER USER",
+            "ALTER TABLE event DISABLE TRIGGER ALL",
+            "DROP TRIGGER event_no_update_or_delete ON event",
+            "DROP TRIGGER event_no_truncate ON event", "DROP TABLE event",
+            "ALTER TABLE event OWNER TO CURRENT_USER", "SET session_replication_role = replica",
+            ("CREATE OR REPLACE FUNCTION event_is_append_only() RETURNS trigger LANGUAGE plpgsql"
+             " AS $$ BEGIN RETURN NEW; END $$"),
+            "SET ROLE postgres", "CREATE TABLE elsewhere (x int)",
+            "UPDATE reviewer SET revoked_at = NULL", "UPDATE reviewer SET alias = 'x'",
+            "UPDATE reviewer SET bundle_id = bundle_id", "DELETE FROM reviewer",
+            ("INSERT INTO reviewer (alias, login, login_shown, role, access, scope_sequences)"
+             " VALUES ('x', 'x', 'x', 'REVIEWER', 'FULL', 1)"),
+            "UPDATE bundle SET active = FALSE", "DELETE FROM bundle", "DELETE FROM media",
+            "UPDATE media SET bytes = ''", "UPDATE chain_anchor SET snapshot_count = 0",
+            "INSERT INTO chain_anchor VALUES (1, 0, repeat('0', 64), repeat('0', 64))",
+            "INSERT INTO mail_queue (reviewer_id, kind) VALUES (1, 'INVITE_START')",
+            "UPDATE mail_queue SET kind = 'INVITE_CONTINUE'", "DELETE FROM mail_queue"):
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            as_site(statement)
+    assert as_site("SELECT count(*) FROM event").fetchone() == (3,) == (len(store.events()),)
+    assert as_site("SELECT count(*) FROM pg_trigger WHERE tgrelid = 'event'::regclass"
+                   " AND NOT tgisinternal AND tgenabled = 'O'").fetchone() == (3,)
+    with pytest.raises(psycopg.errors.RestrictViolation):  # what it MAY insert is still checked
+        as_site("INSERT INTO event (seq, prev_sha256, sha256, line, reviewer_id, bundle_id,"
+                " item_id, phase, at, origin, batch) SELECT 3000009, prev_sha256, repeat('a', 64),"
+                " line, reviewer_id, bundle_id, item_id, phase, at, 'TEST', 3000009 FROM event"
+                " LIMIT 1")
+    # Again: a new password, the same rights; the administrator's own role is never touched.
+    with store.connection() as conn:
+        before = conn.execute("SELECT rolpassword FROM pg_authid WHERE rolname = %s",
+                              (role,)).fetchone()[0]
+    assert run("make-site-role", "--role", role, "--out", address, code=2) == \
+        "refused: FileExistsError\n"  # never over an address file that exists
+    out = run("make-site-role", "--role", role, "--out", tmp_path / "keys" / "second")
+    assert out.startswith(f"site role {role}: password changed;")
+    again = conninfo_to_dict((tmp_path / "keys" / "second").read_text().strip())["password"]
+    with store.connection() as conn:
+        after = conn.execute("SELECT rolpassword FROM pg_authid WHERE rolname = %s",
+                             (role,)).fetchone()[0]
+    assert again != secret and after != before and after.startswith("SCRAM-SHA-256$")
+    assert site.browser(app).sign_in(SECOND).get("/").status_code == 200  # still what it needs
+    for name, code in (("postgres", "NOT_A_SITE_ROLE"), ("Bad-Name", "BAD_ROLE_NAME"),
+                       ("x; DROP TABLE event", "BAD_ROLE_NAME")):
+        assert run("make-site-role", "--role", name, "--out", tmp_path / "keys" / "third",
+                   code=2) == f"refused: {code}\n"
+    assert not (tmp_path / "keys" / "third").exists()

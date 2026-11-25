@@ -15,6 +15,7 @@
     python scripts/hosted_admin.py status
     python scripts/hosted_admin.py test-report ALIAS
     python scripts/hosted_admin.py verify [--snapshots DIR]
+    python scripts/hosted_admin.py make-site-role --out FILE [--role NAME]
 
 The database is ``HOSTED_DATABASE_URL`` (``init-db`` prefers ``HOSTED_DATABASE_URL_UNPOOLED``);
 the adjudication folder is ``--dir`` or ``TRADINGBOT_ADJUDICATION_DIR``. Never deployed. It
@@ -32,11 +33,15 @@ import importlib
 import json
 import os
 import re
+import secrets
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
+from urllib.parse import quote, urlsplit, urlunsplit
 
 import psycopg
+from psycopg import sql
+from psycopg.conninfo import make_conninfo
 
 from tradingbot.runtime import adjudication as A
 from tradingbot.runtime import adjudication_rubric as R
@@ -81,6 +86,14 @@ MAX_LOCAL_LINES = 499_999  # a RETURN-stream seq is 2000000 + twice a local line
 ENVELOPE = ("schema", "seq", "prev_sha256")
 EVENT_KEYS = ("alias", "is_test", "origin", "seq", "prev_sha256", "sha256", "line",
               "idempotency_key", "batch", "created_at")
+# What the SITE's own database role may do, and nothing else. It owns nothing, so it can neither
+# disable nor drop the trigger that makes ``event`` append-only.
+SITE_ROLE = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
+SITE_READS = ("reviewer", "bundle", "media", "event", "chain_anchor", "mail_queue")
+SITE_INSERTS = ("event",)
+SITE_OWN = ("login_code", "web_session", "rate_limit")  # the sign-in tables: every row operation
+SITE_SETS = {"reviewer": ("first_sign_in_at", "invited_at"),
+             "mail_queue": ("attempts", "result", "sent_at")}
 
 
 def refused(code: str) -> A.AdjudicationError:
@@ -1026,6 +1039,84 @@ def cmd_push_returns(args) -> int:
     return 0
 
 
+# ------------------------------------------------------------------ the site's own role
+
+
+def _site_url(url: str, role: str, password: str) -> str:
+    """The database address with the user and the password replaced."""
+    if "://" not in url:
+        return make_conninfo(url, user=role, password=password)
+    parts = urlsplit(url)
+    host = parts.netloc.rpartition("@")[2]
+    return urlunsplit(parts._replace(
+        netloc=f"{quote(role, safe='')}:{quote(password, safe='')}@{host}"))
+
+
+def cmd_make_site_role(args) -> int:
+    """Create the login role the SITE connects as, or give it a new password: the rights the
+    site's code uses and no other, no ownership. The new address goes to a file (mode 0600);
+    nothing secret is printed."""
+    url = os.environ.get(URL_ENV)
+    if not SITE_ROLE.match(args.role):
+        raise refused("BAD_ROLE_NAME")
+    if not url:
+        raise refused(f"SET_{URL_ENV}")
+    store, role, password = _store(unpooled=True), sql.Identifier(args.role), \
+        secrets.token_urlsafe(32)
+    with store.exclusive() as conn:
+        found = conn.execute(
+            "SELECT r.rolsuper OR r.rolcreaterole OR r.rolcreatedb OR r.rolbypassrls"
+            " OR r.rolname = current_user"
+            " OR EXISTS (SELECT 1 FROM pg_class c WHERE c.relowner = r.oid)"
+            " OR EXISTS (SELECT 1 FROM pg_auth_members m WHERE m.member = r.oid)"
+            " FROM pg_roles r WHERE r.rolname = %s", (args.role,)).fetchone()
+        if found and found[0]:  # an administrator, an owner, or a member of another role
+            raise refused("NOT_A_SITE_ROLE")
+        conn.execute(sql.SQL(
+            "{} ROLE {} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION"
+            " NOBYPASSRLS PASSWORD {}").format(
+                sql.SQL("ALTER" if found else "CREATE"), role, sql.Literal(password)))
+        schema, database = (sql.Identifier(x) for x in conn.execute(
+            "SELECT current_schema(), current_database()").fetchone())
+        for statement in ("REVOKE ALL ON ALL TABLES IN SCHEMA {s} FROM {r}",
+                          "REVOKE ALL ON ALL SEQUENCES IN SCHEMA {s} FROM {r}",
+                          "REVOKE ALL ON SCHEMA {s} FROM {r}",
+                          "GRANT CONNECT ON DATABASE {d} TO {r}",
+                          "GRANT USAGE ON SCHEMA {s} TO {r}"):
+            conn.execute(sql.SQL(statement).format(s=schema, d=database, r=role))
+
+        def grant(what: str, table: str, columns=()) -> None:
+            listed = sql.SQL(" ({})").format(sql.SQL(", ").join(map(sql.Identifier, columns))) \
+                if columns else sql.SQL("")
+            conn.execute(sql.SQL("GRANT {}{} ON {} TO {}").format(
+                sql.SQL(what), listed, sql.Identifier(table), role))
+
+        for table in (*SITE_READS, *SITE_OWN):
+            grant("SELECT", table)
+        for table in (*SITE_INSERTS, *SITE_OWN):
+            grant("INSERT", table)
+            for sequence in conn.execute(  # the sequences its columns draw from, if any
+                    "SELECT n.nspname, q.relname FROM pg_depend d JOIN pg_class q"
+                    " ON q.oid = d.objid AND q.relkind = 'S' JOIN pg_namespace n"
+                    " ON n.oid = q.relnamespace WHERE d.refobjid = %s::regclass"
+                    " AND d.deptype IN ('a', 'i')", (table,)).fetchall():
+                conn.execute(sql.SQL("GRANT USAGE ON SEQUENCE {} TO {}").format(
+                    sql.Identifier(*sequence), role))
+        for table in SITE_OWN:
+            grant("UPDATE, DELETE", table)
+        for table, columns in SITE_SETS.items():
+            grant("UPDATE", table, columns)
+        with PrivateDir(args.out, "site database address", create=True) as d:
+            d.create(d.name, (_site_url(url, args.role, password) + "\n").encode("utf-8"))
+    print(f"site role {args.role}: {'password changed' if found else 'created'}; it owns "
+          f"nothing and may: read {', '.join(SITE_READS)}; add to {', '.join(SITE_INSERTS)}; "
+          f"use {', '.join(SITE_OWN)}; set "
+          + "; ".join(f"{t}.({', '.join(c)})" for t, c in SITE_SETS.items()))
+    print(f"its database address is in {Path(args.out).name} (mode 0600): the site's "
+          "DATABASE_URL. Nothing of it is printed.")
+    return 0
+
+
 # ------------------------------------------------------------------ the command line
 
 
@@ -1080,6 +1171,11 @@ def main(argv: list[str] | None = None) -> int:
     command("verify", cmd_verify,
             "the hosted chain, and the imported lines against the snapshot").add_argument(
         "--snapshots", metavar="DIR", help=f"snapshot root (default: <dir>/{SNAPSHOTS})")
+    p = command("make-site-role", cmd_make_site_role,
+                "create the site's own database role (or change its password): no ownership")
+    p.add_argument("--out", required=True, metavar="FILE",
+                   help="where the new database address is written (mode 0600)")
+    p.add_argument("--role", default="reviewer_site", help="the role's name")
     args = ap.parse_args(argv)
     try:
         return args.run(args)
