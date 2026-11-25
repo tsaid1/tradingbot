@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import re
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -186,11 +187,60 @@ def test_the_public_folder_holds_the_stylesheet_and_the_script_and_nothing_else(
     files = sorted(p.relative_to(HOSTED / "public").as_posix()
                    for p in (HOSTED / "public").rglob("*") if p.is_file())
     assert files == ["static/app.css", "static/app.js"]
-    lines = (HOSTED / "requirements.txt").read_text().splitlines()
-    assert [re.split(r"[=<>\[]", x)[0] for x in lines if x and not x.startswith("#")] == [
-        "flask", "psycopg", "pydantic"]
     assert (HOSTED / ".python-version").read_text().strip() == "3.12"
     assert "from reviewer_web.app import app" in (HOSTED / "wsgi.py").read_text()
+
+
+def test_the_deployed_folder_holds_the_site_and_no_way_around_the_sign_in():
+    """The review's finding 14: the development server, the only code with a sign-in bypass,
+    sat inside the folder the deployment takes whole."""
+    tracked = subprocess.run(["git", "ls-files", "hosted"], cwd=HOSTED.parent, check=True,
+                             capture_output=True, text=True).stdout.split()
+    code = sorted(f for f in tracked if f.endswith(".py"))
+    assert code == ["hosted/reviewer_web/__init__.py", "hosted/reviewer_web/app.py",
+                    "hosted/reviewer_web/auth.py", "hosted/reviewer_web/forms.py",
+                    "hosted/reviewer_web/mail.py", "hosted/reviewer_web/store.py",
+                    "hosted/wsgi.py"]
+    for name in tracked:
+        text = (HOSTED.parent / name).read_text()
+        for word in ("auto-sign-in", "auto_sign_in", "dev_seed", "run_simple", "pgserver"):
+            assert word not in text, (name, word)
+    assert (HOSTED.parent / "scripts" / "hosted_dev_server.py").is_file()
+
+
+def test_every_package_the_site_installs_is_pinned_to_the_version_the_tests_run_on():
+    """The review's finding 14: psycopg was a range and Flask's own dependencies were not
+    listed, so a new release reached production with the next deployment."""
+    from importlib import metadata
+
+    from packaging.markers import default_environment
+    from packaging.requirements import Requirement
+    from packaging.utils import canonicalize_name
+
+    lines = [x for x in (HOSTED / "requirements.txt").read_text().splitlines()
+             if x and not x.startswith("#")]
+    pinned = {}
+    for line in lines:
+        found = re.fullmatch(r"([A-Za-z0-9_.-]+)(\[[a-z,]+\])?==([0-9][0-9A-Za-z.]*)", line)
+        assert found, line  # a name and one exact version, nothing else
+        pinned[canonicalize_name(found.group(1))] = found.group(3)
+    assert len(pinned) == len(lines)
+    for name, version in pinned.items():
+        assert metadata.version(name) == version, name  # what the tests ran on
+    # Nothing the three packages need is left to chance.
+    needed, todo = set(), [("flask", set()), ("psycopg", {"binary"}), ("pydantic", set())]
+    while todo:
+        name, extras = todo.pop()
+        name = canonicalize_name(name)
+        if (name, frozenset(extras)) in needed:
+            continue
+        needed.add((name, frozenset(extras)))
+        for line in metadata.distribution(name).requires or []:
+            req = Requirement(line)
+            if req.marker is None or any(req.marker.evaluate({**default_environment(), "extra": e})
+                                         for e in (extras or {""})):
+                todo.append((req.name, set(req.extras)))
+    assert {name for name, _extras in needed} == set(pinned)
 
 
 def test_the_health_page_and_the_static_files_touch_neither_the_store_nor_a_session(

@@ -1,6 +1,6 @@
 """Look at the hosted reviewer site on INVENTED data, on this machine. Never deployed.
 
-    PYTHONPATH=src .venv/bin/python hosted/dev_server.py [--port 8600]
+    PYTHONPATH=src .venv/bin/python scripts/hosted_dev_server.py [--port 8600]
         [--dev-auto-sign-in REMOTE-2] [--dev-seed s14a --dev-seed s14b]
 
 Starts an embedded Postgres (``pgserver``) in a temporary folder, applies the schema, publishes
@@ -14,7 +14,7 @@ the Secure session cookie on ``http://127.0.0.1``; Safari does not).
 
 ``--dev-auto-sign-in ALIAS`` exists ONLY here, for a headless browser taking screenshots: every
 request but those to ``/sign-in`` is served as that reviewer, without a cookie. The application
-has no such switch. ``--dev-seed ITEM`` stores that reviewer's independent reading of a scenario
+has no such switch, and this script lives outside ``hosted/`` (the folder that is deployed). ``--dev-seed ITEM`` stores that reviewer's independent reading of a scenario
 item of the demo (its expected answers) before serving, so the page after the reveal can be seen
 at once: seed every form of a post (``s14a`` and ``s14b`` are the two forms of one post).
 """
@@ -31,6 +31,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO / "hosted"))  # the deployed layout: ``reviewer_web`` is top-level
 SECRET = "dev-server-secret-not-a-secret-0123456789abcdef"
 
 

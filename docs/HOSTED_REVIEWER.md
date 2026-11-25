@@ -215,7 +215,8 @@ same for both); a sending time far above the floor could still be told apart. Th
 network address rely on the platform's forwarding headers. Nothing prevents a signed-in reviewer
 from copying what they are shown: confidentiality rests on the reviewer's undertaking, as today.
 
-**Looking at the site locally.** `PYTHONPATH=src python hosted/dev_server.py` (never deployed)
+**Looking at the site locally.** `PYTHONPATH=src python scripts/hosted_dev_server.py` (outside
+`hosted/`, the folder that is deployed: it is the only code with a way around the sign-in)
 starts an embedded Postgres with the invented demo bundle and two invented reviewers on
 `127.0.0.1:8600` and prints the one-time code in the terminal.
 

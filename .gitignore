@@ -16,5 +16,5 @@ __pycache__/
 build/
 dist/
 
-# Screenshots of the hosted site on invented data (hosted/dev_server.py)
+# Screenshots of the hosted site on invented data (scripts/hosted_dev_server.py)
 hosted/dev_screenshots/

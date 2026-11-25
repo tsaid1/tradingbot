@@ -1,4 +1,23 @@
-# What the deployed site imports: Flask, the Postgres driver, and pydantic (the runtime modules).
+# Everything the deployed site installs, each at the exact version the tests ran on: Flask, the
+# Postgres driver (both of its packages) and pydantic (the runtime modules), with all they need.
+# A new release of any of them reaches the site only through this file.
+#
+# To regenerate: upgrade the virtualenv the tests run in, then list the installed closure of
+# flask, psycopg[binary] and pydantic, for instance with
+#     printf 'flask\npsycopg[binary]\npydantic\n' | uv pip compile --python-version 3.12 -
+# install exactly that, and run the whole suite: tests/test_hosted_web_access.py fails when
+# this file and the tested virtualenv differ, or when a needed package is not pinned here.
+annotated-types==0.8.0
+blinker==1.9.0
+click==8.5.1
 flask==3.1.3
+itsdangerous==2.2.0
+jinja2==3.1.6
+markupsafe==3.0.4
 psycopg[binary]==3.3.9
+psycopg-binary==3.3.9
 pydantic==2.14.4
+pydantic-core==2.50.5
+typing-extensions==4.16.0
+typing-inspection==0.4.5
+werkzeug==3.1.9
