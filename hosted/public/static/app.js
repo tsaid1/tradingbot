@@ -29,6 +29,12 @@
   fitPanel();
   if (wide && wide.addEventListener) { wide.addEventListener("change", fitPanel); }
 
+  /* The region that scrolls: the page's own one when a bottom bar is shown, else the window. */
+  function scroller() {
+    var region = document.getElementById("page-scroll");
+    return region && region.scrollHeight > region.clientHeight ? region : window;
+  }
+
   function moveTo(el, where) {
     if (!el) { return; }
     el.scrollIntoView({ behavior: reduce ? "auto" : "smooth", block: where || "center" });
@@ -240,7 +246,7 @@
       if (again) {
         again.focus({ preventScroll: true });
         if (typed(again) && from !== null) { again.setSelectionRange(from, to); }
-        window.scrollBy(0, again.getBoundingClientRect().top - top);
+        scroller().scrollBy(0, again.getBoundingClientRect().top - top);
         markCurrent(questionOf(again));
       }
       busy("");

@@ -11,6 +11,9 @@
 <script src="/static/app.js" defer></script>
 </head>
 <body>
+{#- Everything scrolls in one region; a page's bottom bar (block ``dock``) sits below it, never
+    over it, so it can cover nothing. -#}
+<div class="page-scroll" id="page-scroll">
 {% if demo %}
 <div class="demo-band" role="note">
   <p>Demonstration data: every post, price and reading on this site is invented.</p>
@@ -46,5 +49,7 @@
 {{ self.main() }}
 {% endif %}
 </main>
+</div>
+{% block dock %}{% endblock %}
 </body>
 </html>
