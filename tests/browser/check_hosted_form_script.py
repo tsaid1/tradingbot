@@ -6,7 +6,8 @@ INVENTED data. Not a pytest test (the test client runs no script); a development
         [--keep-shots DIR]
 
 It starts the development server on the demo (``scripts/hosted_dev_server.py``, signed in as the
-invented reviewer REMOTE-2) and headless Google Chrome, and answers the demo's form i07 as a
+invented reviewer REMOTE-2; ``BOOT`` below records the empty local log as imported for the demo's
+reviewers, as an operator's ``import-log`` would, so that they may save) and headless Google Chrome, and answers the demo's form i07 as a
 person does: real mouse clicks on radio buttons and check boxes, words and prices typed key by key
 into every one-line box, Tab and Enter out of them, a pause inside a box long enough for the
 round trip to come back while the box still has the focus (finding A of the acceptance), a list
@@ -37,6 +38,42 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+
+# The development server, with the demo's reviewers open for saving (an empty local log counts
+# as imported for them: the dev server records the anchor, this records the import).
+BOOT = """
+import importlib.util, sys
+from pathlib import Path
+repo = Path.cwd()
+sys.path[:0] = [str(repo / "src"), str(repo / "hosted")]
+from reviewer_web.store import AdminStore
+anchor = AdminStore.set_anchor
+def set_anchor(self, *args, **kw):
+    anchor(self, *args, **kw)
+    with self.connection() as conn:
+        conn.execute("UPDATE reviewer SET imported_at = now() WHERE imported_at IS NULL")
+AdminStore.set_anchor = set_anchor
+# The preview's network: every round trip takes 0.4 s, as across the internet (on this machine it
+# takes a few milliseconds, which hides the races a reviewer meets).
+import time
+from reviewer_web import app as web
+create = web.create_app
+def create_app(*args, **kw):
+    made = create(*args, **kw)
+    inner = made.wsgi_app
+    def slow(environ, start_response):
+        if environ.get("REQUEST_METHOD") == "POST" and environ.get("PATH_INFO", "").endswith("/state"):
+            time.sleep(0.4)
+        return inner(environ, start_response)
+    made.wsgi_app = slow
+    return made
+web.create_app = create_app
+spec = importlib.util.spec_from_file_location("dev", repo / "scripts" / "hosted_dev_server.py")
+dev = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(dev)
+sys.argv = ["dev", "--port", sys.argv[1], "--dev-auto-sign-in", "REMOTE-2"]
+dev.main()
+"""
 
 # (what, control name, value): the order a reviewer answers i07 (each answer makes the next
 # question appear). "type" ends with how the box is left: "tab", "enter" or "wait" (the focus
@@ -100,18 +137,23 @@ class Tab:
             await asyncio.sleep(0.1)
         await asyncio.sleep(0.3)
 
-    async def click_at(self, selector):
-        """A real mouse click in the middle of the element (scrolled into view first)."""
+    async def click_at(self, selector, hold=0.0, on_words=False):
+        """A real mouse click on the element (scrolled into view first): on its box, or with
+        ``on_words`` on the words of its label, where a person usually clicks."""
         box = await self.js(f"""(function(){{const el=document.querySelector({json.dumps(selector)});
             if(!el) return null; el.scrollIntoView({{block:'center'}});
             const lab = el.closest('label') || (el.id && document.querySelector('label[for="'+el.id+'"]')) || el;
-            const r=lab.getBoundingClientRect(); return [r.left+Math.min(12, r.width/2), r.top+r.height/2];}})()""")
+            const words = {json.dumps(on_words)} && lab.querySelector('span');
+            const r=(words || lab).getBoundingClientRect();
+            return [words ? r.left + r.width/2 : r.left+Math.min(12, r.width/2), r.top+r.height/2];}})()""")
         if box is None:
             return False
         await asyncio.sleep(0.15)
         for kind in ("mousePressed", "mouseReleased"):
             await self.call("Input.dispatchMouseEvent", type=kind, x=box[0], y=box[1],
                             button="left", clickCount=1)
+            if kind == "mousePressed" and hold:
+                await asyncio.sleep(hold)  # a finger rests on the button as a person's does
         return True
 
     async def key(self, key, code, vk):
@@ -185,6 +227,31 @@ async def answer(tab: Tab, base: str, shots: Path | None) -> list[str]:
         if lost:
             problems.append(f"after {what} {name}: lost {lost}")
             break
+    # Finding 3 of the second run: the first click right after typing must not be lost. Type in
+    # a one-line box (no Tab, no Enter), then click another answer after 0.6 to 1.6 seconds,
+    # when the reply to the typing comes back.
+    if not problems:
+        for n, delay in enumerate((0.6, 0.7, 0.8, 0.9, 1.0, 1.2, 1.4, 1.6)):
+            words = f"Zed Metals {n}"
+            choice = "NO" if n % 2 == 0 else "YES"
+            box = '#form-body [name="instrument_as_read"]'
+            await tab.js(f"""(function(){{const el=document.querySelector({json.dumps(box)});
+                el.scrollIntoView({{block:'center'}}); el.focus(); el.select();}})()""")
+            await tab.type_text(words)
+            await asyncio.sleep(delay)
+            if not await tab.click_at(f'#form-body [name="explicit"][value="{choice}"]',
+                                      hold=0.15, on_words=True):
+                problems.append(f"after typing, at {delay} s: no answer to click")
+                break
+            want["instrument_as_read"], want["explicit"] = words, choice
+            await tab.quiet(2.0)
+            got = json.loads(await tab.js(READ))
+            if got.get("explicit") != choice:
+                problems.append(f"a click {delay} s after typing was lost (explicit is "
+                                f"{got.get('explicit')!r}, not {choice!r})")
+            if got.get("instrument_as_read") != words:
+                problems.append(f"typed words lost around a click at {delay} s: "
+                                f"{got.get('instrument_as_read')!r}")
     if shots:
         await shot(tab, shots / "check-before-reload.png")
     # The kept draft: a reload must bring back exactly what was entered.
@@ -238,8 +305,7 @@ def main() -> int:
     args = parser.parse_args()
     work = Path(tempfile.mkdtemp(prefix="hosted-browser-check-"))
     server = subprocess.Popen(
-        [sys.executable, str(REPO / "scripts" / "hosted_dev_server.py"), "--port", str(args.port),
-         "--dev-auto-sign-in", "REMOTE-2"], cwd=REPO, stdout=subprocess.PIPE,
+        [sys.executable, "-c", BOOT, str(args.port)], cwd=REPO, stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT, text=True, env={"PYTHONPATH": str(REPO / "src"),
                                                   "PATH": "/usr/bin:/bin"})
     chrome = None
@@ -275,7 +341,8 @@ def main() -> int:
             print("  -", p)
         return 1
     print(f"PASS: {len(STEPS)} steps (every kind of answer, Tab, Enter and a pause in a box), "
-          "the focus kept after every Tab, and the reload equal to what was entered.")
+          "the focus kept after every Tab, eight clicks 0.6 to 1.6 s after typing, and the "
+          "reload equal to what was entered.")
     return 0
 
 

@@ -11,6 +11,7 @@
 <script src="/static/app.js" defer></script>
 </head>
 <body>
+{% block skip %}{% endblock %}
 {#- On a page with a bottom bar (block ``dock``) the page scrolls in one region between the
     demonstration band and the bar: neither can cover anything. -#}
 {% if demo %}

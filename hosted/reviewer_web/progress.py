@@ -72,6 +72,12 @@ class _View:
     def code(self, item_id: str) -> str:
         return _BY_STATE[self.gates[item_id].state]
 
+    def shown(self, item_id: str) -> str:
+        """The status as a reviewer reads it: a form with a kept draft and nothing submitted is
+        In progress (its code, the counts and completion stay those of the confirmed saves)."""
+        code = self.code(item_id)
+        return IN_PROGRESS if code == NOT_STARTED and item_id in self.drafts else code
+
     def waiting_for(self, item_id: str) -> dict | None:
         if self.gates[item_id].state != F.REVEAL_PENDING:
             return None
@@ -121,6 +127,7 @@ def form_status(bundle: A.Bundle, session: A.Session, records: list[dict], item_
     nothing else) and ``step`` (the code of ``remaining_step``)."""
     view = _view or _View(bundle, session, records, drafts)
     return {"code": view.code(item_id), "text": TEXT[view.code(item_id)],
+            "shown": view.shown(item_id), "shown_text": TEXT[view.shown(item_id)],
             "waiting_for": view.waiting_for(item_id), "draft": item_id in view.drafts,
             "step": remaining_step(bundle, session, records, item_id, _view=view)["code"]}
 
@@ -153,6 +160,8 @@ def _rows(view: _View, current: str | None) -> list[dict]:
             posts.setdefault(view.items[i]["post_ref"], []).append(i)
         nxt = view.next_in(ids)
         begun = status != NOT_STARTED or any(i in view.drafts for i in ids)
+        if status == NOT_STARTED and begun:
+            status = IN_PROGRESS  # a kept draft is work begun (shown so; counts stay as saved)
         start_or_continue = "CONTINUE" if begun else "START"
         ordered_posts = sorted(posts.items(), key=lambda p: (
             view.bundle.posts[p[0]]["published_at"], p[0]))
@@ -174,7 +183,7 @@ def _rows(view: _View, current: str | None) -> list[dict]:
                        "number": p, "when_text": W.post_time(view.bundle.posts[ref][
                            "published_at"]),
                        "forms": [{"item_id": i, **dict(zip(("k", "n"), _place(view.bundle, i))),
-                                  "status": view.code(i), "status_text": TEXT[view.code(i)],
+                                  "status": view.shown(i), "status_text": TEXT[view.shown(i)],
                                   "draft": i in view.drafts, "current": i == current,
                                   "label": W.form_label(p, *_place(view.bundle, i))}
                                  for i in forms]}

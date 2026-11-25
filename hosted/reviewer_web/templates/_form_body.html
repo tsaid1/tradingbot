@@ -48,6 +48,7 @@
 <fieldset class="verdict-choice">
   <legend>{{ legend }}</legend>
   <input type="hidden" name="{{ v.tag_name }}" value="{{ v.tag }}">
+  {%- if v.preset %}<p class="note preset">{{ w.VERDICT_PRESET }}</p>{% endif %}
   <div class="options">
   {%- for code, text, chosen in v.options %}
   <label><input type="radio" name="{{ v.name }}" id="{{ (v.name ~ '-' ~ code) | ident }}" value="{{ code }}"{% if chosen %} checked{% endif %}> <span>{{ text }}</span></label>
@@ -194,6 +195,7 @@
 </section>
 {% endif %}
 
+<span id="form-start" tabindex="-1"></span>
 {% for block in form.blocks %}
 {% if block.kind == "group" %}
 <section class="group card{{ ' proposals' if block.proposals else '' }}" id="{{ block.anchor }}" aria-labelledby="g-{{ block.code }}">

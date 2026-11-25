@@ -3,6 +3,7 @@
 {% block title %}Your review{% endblock %}
 {% block sidebar %}{% endblock %}
 {% block main_class %} class="wide"{% endblock %}
+{% block skip %}<a class="skip-link" href="/#sequences">Skip to your sequences</a>{% endblock %}
 {% block main %}
 {#- The dashboard: one row per assigned sequence, from the reviewer's own confirmed saves
     (progress.dashboard). Nothing on it depends on the system's reading: the market shown is the
@@ -34,7 +35,7 @@
     </div>
   </div>
 
-  <h2 class="dash-h2">Sequences <span class="quiet-text">in review order</span></h2>
+  <h2 class="dash-h2" id="sequences" tabindex="-1">Sequences <span class="quiet-text">in review order</span></h2>
   <div class="seq-head" aria-hidden="true"><span>Sequence</span><span>Market</span><span>Done</span><span>Status</span><span></span></div>
   {%- set grouped = dash.sequences | selectattr("number") | list -%}
   {%- set loose = dash.sequences | rejectattr("number") | list -%}
@@ -44,7 +45,7 @@
     <li class="seq" id="sequence-{{ row.id | ident }}">
       <details>
         <summary class="seq__row">
-          <span class="seq__title"><strong>{{ row.title }}</strong>{% if row.number %} <span class="quiet-text seq__id">{{ row.id }}</span>{% endif %}</span>
+          <span class="seq__title"><strong>{{ row.title }}</strong></span>
           <span class="seq__read">{% if row.read %}You read: <strong>{{ row.read }}</strong>{% elif row.drafts %}<span class="quiet-text">Draft kept, no reading submitted yet</span>{% else %}<span class="quiet-text">No reading saved yet</span>{% endif %}</span>
           <span class="seq__done"><span class="count">{{ row.done }} of {{ row.total }}</span> <span class="quiet-text">· {{ row.remaining }} left</span></span>
           <span class="seq__status">{{ status_badge(row.status, row.status_text) }}

@@ -3,11 +3,12 @@
 {% set w = evidence.w %}
 {% block title %}{{ nav.place if nav is defined and nav and nav.place else names[item_id] }}{% endblock %}
 {% block main_class %} class="wide"{% endblock %}
+{% block skip %}{% if form %}<a class="skip-link" href="/form/{{ item_id }}#form-start" data-skip>Skip to the form</a>{% endif %}{% endblock %}
 {% block main %}
 {#- The page's state, in words and colour: progress's code when the route gives it (``status``
     as a mapping), else the page's own text of forms.STATUS_TEXT. -#}
 {%- if status is mapping -%}
-{%- set status_code = status.code -%}
+{%- set status_code = status.shown or status.code -%}
 {%- else -%}
 {%- set status_code = (w.STATUS | dictsort | selectattr(1, "equalto", status) | map(attribute=0) | first) or "NOT_STARTED" -%}
 {%- endif -%}
@@ -20,7 +21,10 @@
     <strong>{{ nav.place if nav is defined and nav and nav.place else names[item_id] }}</strong>
     {% if multi and not (nav is defined and nav and nav.place) %}<span class="quiet-text">{{ header }}</span>{% endif %}</p>
   <div class="form-status">
-    {{ status_badge(status_code, w.STATUS[status_code]) }}
+    {#- A draft kept during this visit makes the form In progress: the script shows the second
+        badge then (a draft and "Not started" never stand together). -#}
+    <span class="badge-now">{{ status_badge(status_code, w.STATUS[status_code]) }}</span>
+    {% if status_code == "NOT_STARTED" %}<span class="badge-if-draft" hidden>{{ status_badge("IN_PROGRESS", w.STATUS["IN_PROGRESS"]) }}</span>{% endif %}
     {% if form %}
     {%- set kept = draft.saved_at if draft is defined and draft else none -%}
     <p class="save-state{{ ' save-state--draft' if kept else '' }}" id="save-state" role="status"
@@ -139,8 +143,13 @@
           {%- for kind, ref in evidence.post.links %} · {{ "a reply" if kind == "reply_to" else "quotes a post" }}{% endfor %}</p>
         <p class="post-text">{{ evidence.post.text }}</p>
         {% for name in evidence.post.media %}
-        <figure>
-          <img src="/media/{{ bundle_id }}/{{ evidence.post.ref }}/{{ name }}" alt="Chart or image attached to the post you're reviewing ({{ loop.index }} of {{ loop.length }})" loading="lazy">
+        {#- Loaded at once. The frame keeps its place and says "Loading…" under the image until
+            the image covers it; if it fails, the script says so and offers to try again. -#}
+        <figure class="media" data-media>
+          <div class="media__frame">
+            <p class="media__state" aria-live="polite"><span class="media__loading">Loading image {{ loop.index }} of {{ loop.length }}…</span><span class="media__failed">Image {{ loop.index }} of {{ loop.length }} could not be loaded. <button type="button" class="button button--quiet media__retry">Try again</button></span></p>
+            <img src="/media/{{ bundle_id }}/{{ evidence.post.ref }}/{{ name }}" alt="Chart or image attached to the post you're reviewing ({{ loop.index }} of {{ loop.length }})" decoding="async" fetchpriority="high">
+          </div>
           <figcaption>Attached to this post · image {{ loop.index }} of {{ loop.length }}</figcaption>
         </figure>
         {% endfor %}

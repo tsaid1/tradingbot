@@ -48,7 +48,11 @@ def test_each_form_has_a_status_from_the_reviewer_s_own_saves(site14):
     b = site14.bundle
     assert P.form_status(b, session, records, "s14a") == {
         "code": "NOT_STARTED", "text": "Not started", "waiting_for": None, "draft": False,
-        "step": "SAVE_YOUR_READING"}
+        "step": "SAVE_YOUR_READING", "shown": "NOT_STARTED", "shown_text": "Not started"}
+    # A kept draft shows the form In progress; its code (what was saved) stays NOT_STARTED.
+    drafted = P.form_status(b, session, records, "s14a", drafts={"s14a"})
+    assert (drafted["code"], drafted["shown"], drafted["draft"]) == (
+        "NOT_STARTED", "IN_PROGRESS", True)
     browser = site14.browser().sign_in(FIRST)
     browser.review("s14a", after=False)
     P, session, records = model(site14)
