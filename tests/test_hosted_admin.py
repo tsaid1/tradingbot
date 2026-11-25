@@ -154,6 +154,7 @@ def extend(base: Path, scope: int) -> None:
     def items(rows):
         rows["i08"]["ai"]["idea_ref"] = "s01a"
         rows["i05"]["ai"]["idea_ref"] = "i09"
+        rows["i01"]["exporter_note"] = "a key the workspace never reads"
         rows["x01"] = {**rows["i07"], "item_id": "x01", "sequence_id": "scs01", "slot": 1,
                        "order_in_sequence": 2, "context_refs": ["s01"],
                        "ai": {**rows["i07"]["ai"], "idea_ref": "s01a"}}
@@ -162,6 +163,7 @@ def extend(base: Path, scope: int) -> None:
         rows["p05"]["quotes"] = "s02"
         rows["s02"]["reply_to"] = "s03"
         rows["s04"]["media"] = ["chart-s04.png"]
+        rows["p01"]["source_handle"] = "a key the workspace never reads"
 
     edit(base / "bundle" / "items.jsonl", items)
     edit(base / "bundle" / "posts.jsonl", posts)
@@ -207,8 +209,9 @@ def test_publish_bundle_uploads_only_what_the_scope_needs_and_proves_parity(run,
     assert set(part.posts) == {"p01", "p02", "p03", "p04", "p05", "p06", "p07", "p08", "s02",
                                "s03"}
     with store.connection() as conn:
-        stored = bytes(conn.execute("SELECT posts FROM bundle").fetchone()[0])
+        stored = b"".join(map(bytes, conn.execute("SELECT posts, items FROM bundle").fetchone()))
         assert conn.execute("SELECT name FROM media").fetchall() == [("chart-p01.png",)]
+    assert b"never reads" not in stored and b"exporter_note" not in stored  # read keys only
     assert json.dumps(full.posts["s01"]["text"])[1:-1].encode() not in stored
     assert json.dumps(full.posts["s03"]["text"])[1:-1].encode() in stored
     assert store.media("p01", "chart-p01.png") == (

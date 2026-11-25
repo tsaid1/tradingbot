@@ -49,6 +49,12 @@ URL_ENV, UNPOOLED_ENV = "HOSTED_DATABASE_URL", "HOSTED_DATABASE_URL_UNPOOLED"
 EXPORT_SCHEMA = "tradingbot.hosted.export/1"
 SNAPSHOTS, LOG, WHAT = "hosted_snapshots", "annotations.jsonl", "annotation log"
 BUNDLE_FILES = ("manifest.json", "sequences.jsonl", "items.jsonl", "posts.jsonl")
+# The keys of an item line and of a post line that the workspace reads: no other key of a line is
+# published (``parity_problems`` fails if one that matters is ever missing here).
+ITEM_KEYS = ("item_id", "kind", "sequence_id", "set", "post_ref", "slot", "order_in_sequence",
+             "context_refs", "ai", "holds", "mapping")
+POST_KEYS = ("post_ref", "published_at", "text", "media", "revision", "numbers", "reply_to",
+             "quotes")
 TEST_ALIAS = re.compile(r"^TEST-[0-9]{1,3}$")
 APPROVER_SHOWN = "approver"  # all a reviewer learns of who returned a reading
 ENVELOPE = ("schema", "seq", "prev_sha256")
@@ -109,9 +115,10 @@ def subset(base: Path, scope: int) -> tuple[A.Bundle, list[bytes], dict[str, byt
     reviewer is not shown:
 
     * the items ``ordered(bundle, scope)`` offers (those of no sequence only when the scope
-      covers every sequence), each line as it is in the local file;
-    * the posts those items, their context and their reply and quote chains need, each line as
-      it is, and only the images those posts list;
+      covers every sequence);
+    * the posts those items, their context and their reply and quote chains need, and only the
+      images those posts list; of an item's and a post's line only the keys the workspace reads
+      (``ITEM_KEYS``, ``POST_KEYS``);
     * EVERY sequence id with its place in the review order (the ``idea`` choices and the scope
       rule read them); a sequence outside the scope keeps no post;
     * an instruction item outside the scope that shares its post with an item inside it, as a
@@ -142,18 +149,19 @@ def subset(base: Path, scope: int) -> tuple[A.Bundle, list[bytes], dict[str, byt
     sequences = [_dump({**s, "post_refs": [r for r in s["post_refs"] if r in needed]
                         if s["sequence_id"] in in_scope else []}) for s in full.sequences]
     items = []
-    for line, row in _json_lines(raw[2]):
+    for _line, row in _json_lines(raw[2]):
+        row = {k: row[k] for k in ITEM_KEYS if k in row}
         if row["item_id"] in shown:
             ref = (row.get("ai") or {}).get("idea_ref")
             gone = ref in full.items and ref not in shown | numbered
             if gone and full.items[ref]["sequence_id"] is not None:
-                line = _dump({**row, "ai": {**row["ai"],
-                                            "idea_ref": full.items[ref]["sequence_id"]}})
-            items.append(line)
+                row["ai"] = {**row["ai"], "idea_ref": full.items[ref]["sequence_id"]}
+            items.append(_dump(row))
         elif row["item_id"] in numbered:
             items.append(_dump({**row, "context_refs": [], "holds": {}, "mapping": {},
                                 "ai": {"family": (row.get("ai") or {}).get("family")}}))
-    posts = [line for line, row in _json_lines(raw[3]) if row.get("post_ref") in needed]
+    posts = [_dump({k: row[k] for k in POST_KEYS if k in row})
+             for _line, row in _json_lines(raw[3]) if row.get("post_ref") in needed]
     media = {name: A.read_media(full, ref, name)
              for ref in sorted(needed) for name in full.posts[ref]["media"]}
     return full, [raw[0], _jsonl(sequences), _jsonl(items), _jsonl(posts)], media

@@ -265,7 +265,8 @@ only.
 * the items the scope offers; the items of no sequence only once the scope covers every
   sequence;
 * the posts those items, their context and their reply and quote chains need, and only the
-  images those posts list (at most 4 MB each: `MEDIA_TOO_LARGE`);
+  images those posts list (at most 4 MB each: `MEDIA_TOO_LARGE`); of an item's and a post's
+  line only the keys the workspace reads;
 * every sequence id with its place in the review order, because the `idea` choices list them;
   a sequence outside the scope keeps no post;
 * an instruction item outside the scope that shares its post with an item inside it, as a stub
