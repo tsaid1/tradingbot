@@ -558,7 +558,6 @@ body:has(> .dock) > .demo-band { position: static; flex: none; }
   letter-spacing: 0.05em; }
 .seq-list { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); }
 .seq + .seq { border-top: 1px solid var(--line); }
-.seq__id { font-size: 0.82rem; font-family: var(--mono); }
 .seq__flag { color: var(--attention); font-weight: 600; font-size: 0.88rem; }
 .seq__draft { color: var(--attention); font-size: 0.88rem; font-weight: 600; }
 .seq__go--done { color: var(--ok); font-weight: 600; display: inline-flex; gap: 0.3em; align-items: center; }
@@ -586,3 +585,26 @@ table.ref th { color: var(--text-quiet); font-weight: 600; }
   *, *::before, *::after { transition-duration: 0ms !important; animation-duration: 0ms !important;
     scroll-behavior: auto !important; }
 }
+
+/* "Skip to the form": the first stop of the keyboard, shown when it has the focus. */
+.skip-link { position: absolute; left: var(--space-3); top: var(--space-2); z-index: 20;
+  transform: translateY(-200%); background: var(--surface); color: var(--accent); font-weight: 700;
+  padding: var(--space-2) var(--space-4); border: 2px solid var(--accent); border-radius: var(--radius); }
+.skip-link:focus { transform: none; }
+#form-start:focus, #sequences:focus { outline: none; }
+
+/* An image of the post: its place kept while it loads, "Loading…" under it until it covers it,
+   a plain message and "Try again" if it fails. */
+.media__state { display: none; }
+.js .media__frame { display: grid; min-height: 10rem; background: var(--surface-earlier);
+  border: 1px solid var(--line); border-radius: var(--radius-small); overflow: hidden; }
+.js .media__frame > * { grid-area: 1 / 1; }
+.js .media__frame img { border: 0; border-radius: 0; }
+.js .media__state { display: block; align-self: center; justify-self: center; margin: 0;
+  padding: var(--space-3); color: var(--text-quiet); font-size: 0.92rem; text-align: center; }
+.media__failed { display: none; color: var(--error); font-weight: 600; }
+.js .media:not(.is-loaded) img { visibility: hidden; }
+.media.is-failed .media__loading { display: none; }
+.media.is-failed .media__failed { display: block; }
+.js .media.is-loaded .media__state { display: none; }
+.js .media.is-loaded .media__frame { min-height: 0; background: none; }

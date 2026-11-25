@@ -35,6 +35,26 @@
     return region && region.scrollHeight > region.clientHeight ? region : window;
   }
 
+  /* A control with the focus stands wholly within the region that scrolls, clear of both edges. */
+  function keepInView(el) {
+    if (!el || !el.getBoundingClientRect) { return; }
+    var region = scroller();
+    var top = 0;
+    var bottom = window.innerHeight;
+    if (region !== window) {
+      var r = region.getBoundingClientRect();
+      top = r.top;
+      bottom = r.bottom;
+    }
+    var box = el.getBoundingClientRect();
+    var margin = 24;
+    if (box.top < top + margin) {
+      region.scrollBy(0, box.top - top - margin);
+    } else if (box.bottom > bottom - margin) {
+      region.scrollBy(0, Math.min(box.bottom - bottom + margin, box.top - top - margin));
+    }
+  }
+
   function moveTo(el, where) {
     if (!el) { return; }
     el.scrollIntoView({ behavior: reduce ? "auto" : "smooth", block: where || "center" });
@@ -46,6 +66,27 @@
       el = el.parentNode;
     }
     return null;
+  }
+
+  function usable(c) {
+    return c.type !== "hidden" && !c.disabled && c.name !== "ui.later" && c.offsetParent !== null;
+  }
+
+  /* The control of a question that still needs its answer: one marked wrong, else the first
+     empty box or list, else the first group of choices with nothing chosen (in a number row:
+     the missing part). None: null. */
+  function missingControl(box) {
+    if (!box) { return null; }
+    var all = [].filter.call(box.querySelectorAll("input, select, textarea"), usable);
+    var empty = function (c) {
+      if (c.type === "radio") { return !box.querySelector('input[type="radio"][name="' + c.name + '"]:checked'); }
+      if (c.type === "checkbox") { return false; }
+      return !c.value;
+    };
+    var wrong = all.filter(function (c) { return c.getAttribute("aria-invalid") === "true" && empty(c); });
+    if (wrong.length) { return wrong[0]; }
+    var blank = all.filter(empty);
+    return blank.length ? blank[0] : null;
   }
 
   function firstControl(box) {
@@ -76,7 +117,8 @@
     var box = document.getElementById(id);
     if (!box) { return false; }
     openAround(box);
-    var control = box.matches("input, select, textarea, button") ? box : firstControl(box);
+    var control = box.matches("input, select, textarea, button") ? box
+      : (missingControl(box) || firstControl(box));
     moveTo(box);
     if (control) {
       control.focus({ preventScroll: true });
@@ -141,7 +183,33 @@
     if (stay) { stay.focus({ preventScroll: true }); } else if (post) { post.focus({ preventScroll: true }); }
   }
 
+  /* The images of the post: loaded at once; "Loading…" until there, a plain message and "Try
+     again" if one fails. */
+  [].forEach.call(document.querySelectorAll("[data-media]"), function (fig) {
+    var img = fig.querySelector("img");
+    var source = img.getAttribute("src");
+    var tries = 0;
+    function loaded() { fig.classList.remove("is-failed"); fig.classList.add("is-loaded"); }
+    function failed() { fig.classList.remove("is-loaded"); fig.classList.add("is-failed"); }
+    img.addEventListener("load", loaded);
+    img.addEventListener("error", failed);
+    if (img.complete) { if (img.naturalWidth > 0) { loaded(); } else { failed(); } }
+    var again = fig.querySelector(".media__retry");
+    if (again) {
+      again.addEventListener("click", function () {
+        tries += 1;
+        fig.classList.remove("is-failed");
+        img.setAttribute("src", source + "?try=" + tries);
+      });
+    }
+  });
+
   document.addEventListener("click", function (event) {
+    var skip = event.target.closest ? event.target.closest("[data-skip]") : null;
+    if (skip && body) {
+      var first = body.querySelector("[data-q]");
+      if (first) { event.preventDefault(); goTo(first.id); return; }
+    }
     var el = event.target.closest ? event.target.closest("[data-go], [data-back], #view-post") : null;
     if (!el) { return; }
     if (el.id === "view-post") {
@@ -160,6 +228,9 @@
 
   /* The question the reviewer is at: marked, and carried with the form. */
   document.addEventListener("focusin", function (event) {
+    if (event.target && event.target !== document.body && !event.target.closest(".dock")) {
+      window.setTimeout(function () { keepInView(document.activeElement); }, reduce ? 0 : 350);
+    }
     if (!body || !body.contains(event.target)) { return; }
     /* (The focus put back after a replacement is the same place: marking it again is harmless.) */
     var q = questionOf(event.target);
@@ -191,6 +262,9 @@
   var version = 0;       /* counts every edit of the reviewer */
   var inFlight = false;  /* one request at a time */
   var replacing = false; /* while the form is being replaced, nothing it fires is an edit */
+  var held = false;      /* a pointer press or a key is down */
+  var pending = null;    /* a reply waiting for that release */
+  var lastHtml = null;   /* the server's form last put in place */
   var timer = null;
   var saveState = document.getElementById("save-state");
 
@@ -206,6 +280,10 @@
   /* A draft the server kept (it says when, in a header): "Draft kept at HH:MM, not submitted". */
   function kept(at) {
     if (!saveState || !at) { return; }
+    /* A kept draft makes a form not started In progress. */
+    var now = document.querySelector(".badge-now");
+    var then = document.querySelector(".badge-if-draft");
+    if (now && then) { now.hidden = true; then.hidden = false; }
     var time = at.slice(11, 16);
     var words = saveState.querySelector("span:last-child");
     if (words) { words.textContent = saveState.getAttribute("data-draft").replace("{time}", time); }
@@ -302,16 +380,65 @@
     }).then(function (got) {
       inFlight = false;
       if (got === null) { return; }
-      if (mine !== version) { send(); return; }   /* the reviewer went on: send the newest */
-      replace(got.html);
-      kept(got.at);
-      busy("");
+      got.mine = mine;
+      if (held) { pending = got; return; }   /* a press or a key is down: after its release */
+      apply(got);
     }).catch(function () {
       inFlight = false;
       if (mine !== version) { send(); return; }
       busy("The form could not be updated. Check the connection and change an answer again.");
     });
   }
+
+  /* A reply is applied only when nothing changed since its request (else the newest state is
+     sent), and the form is replaced only when the server's form differs from the one on the
+     screen in more than the entered values (most typed entries change nothing else). */
+  function apply(got) {
+    if (got.mine !== version) { send(); return; }   /* the reviewer went on: send the newest */
+    if (lastHtml !== null && shape(got.html) === shape(lastHtml)) {
+      var made = document.createElement("template");
+      made.innerHTML = got.html;
+      var fresh = made.content.getElementById("form-state");
+      var here = document.getElementById("form-state");
+      if (fresh && here) {
+        here.setAttribute("data-ready", fresh.getAttribute("data-ready") || "");
+        here.setAttribute("data-next", fresh.getAttribute("data-next") || "");
+      }
+    } else {
+      replace(got.html);
+    }
+    lastHtml = got.html;
+    kept(got.at);
+    busy("");
+  }
+
+  function shape(html) {
+    return html.replace(/ value="[^"]*"/g, "").replace(/ (checked|selected)(?=[ >])/g, "")
+      .replace(/(<textarea[^>]*>)[\s\S]*?(<\/textarea>)/g, "$1$2")
+      .replace(/ data-(ready|next)="[^"]*"/g, "");
+  }
+
+  /* A press of the pointer or a key that is down holds every replacement until its release
+     (the click lands on the control it began on). */
+  function release() {
+    held = false;
+    if (pending) {
+      window.setTimeout(function () {
+        if (held || !pending) { return; }
+        var got = pending;
+        pending = null;
+        apply(got);
+      }, 0);
+    }
+  }
+  document.addEventListener("pointerdown", function () { held = true; }, true);
+  document.addEventListener("pointerup", release, true);
+  document.addEventListener("pointercancel", release, true);
+  document.addEventListener("keydown", function (event) {
+    if (!/^(Shift|Control|Alt|Meta)$/.test(event.key)) { held = true; }
+  }, true);
+  document.addEventListener("keyup", release, true);
+  window.addEventListener("blur", release);
 
   function later(ms) {
     window.clearTimeout(timer);

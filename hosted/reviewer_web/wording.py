@@ -382,8 +382,35 @@ DERIVED_FROM = {
 }
 
 
-def set_by_form(f: str) -> str:
+# The answer a value the form sets follows from, to name it in words.
+DERIVED_SOURCE = {"post_label": "timing", "announcement": "timing", "action": "timing",
+                  "follower_implication": "timing", "entry_role": "entry_price",
+                  "stop_price": "amendment_to", "amendment_from": "position_last_stop"}
+
+
+def set_by_form(f: str, value: str = "", answers: dict | None = None) -> str:
+    """Why the form set this value, in one clause a reviewer can follow."""
+    answers = answers or {}
+    if f == "announcement" and value == "FIRST_REPORT" and answers.get("timing") == "CURRENT":
+        return "set by the form: the action happens now, so this post is its first report"
+    if f == "announcement" and answers.get("timing") == "UNCERTAIN":
+        return ("set by the form: when the action happens is not settled, so this cannot be "
+                "settled either")
+    if f == "effect" and value == "NONE" and answers.get("announcement") == "REPEAT":
+        return "set by the form: this post repeats an earlier report, so nothing changes"
+    if f == "effect" and value == "AMENDS_PROTECTION":
+        return "set by the form: a change of the stop or a target keeps the size"
+    if f == "component":
+        return "set by the form: this post has one form, so this form records its action"
+    source = DERIVED_SOURCE.get(f)
+    if source and answers.get(source) not in (None, "", R.NOT_APPLICABLE):
+        return (f"set by the form because you answered “{shown(source, answers[source])}” to "
+                f"“{QUESTIONS[source]}”")
     return "set by the form " + DERIVED_FROM.get(f, "from your answers")
+
+
+VERDICT_PRESET = ("Pre-set to “Yes, the system is right” because your answer is the same. "
+                  "You can change it.")
 
 
 # What belongs on each form of a post with several forms (the rubric's own rule; nothing of
@@ -425,7 +452,9 @@ BLOCKING = {
     "DERIVED_VALUE": "This value follows from your other answers: change those instead.",
 }
 # Answering, rather than correcting: how the summary counts a problem.
-UNANSWERED_CODES = ("REQUIRED_UNANSWERED", "CONFIDENCE", "ADDITIONAL_ACTION_REQUIRED")
+UNANSWERED_CODES = ("REQUIRED_UNANSWERED", "CONFIDENCE", "ADDITIONAL_ACTION_REQUIRED",
+                    "TABLE_ROW", "ENTRY_FIELDS", "AMENDMENT", "CANNOT_DETERMINE_NEEDS_REASON",
+                    "CANNOT_DETERMINE_NEEDS_NOTES", "ESCALATION_NEEDS_NOTES")
 
 WARNINGS = {
     "ENTRY_NOT_IN_TABLE": "You gave an entry number, but no number below has that kind.",
@@ -540,7 +569,7 @@ NEXT_ACTION = {"review": "Review the system's answers", "other": "Go to form {k}
 
 # The dashboard and the sidebar.
 SEQUENCE = "Sequence {n}"
-NO_SEQUENCE = "Posts of no sequence"
+NO_SEQUENCE = "Single posts outside any sequence"
 YOU_READ = "You read"
 
 
