@@ -18,7 +18,7 @@
   var body = document.getElementById("form-body");
   var dock = document.getElementById("view-post");
   var post = document.getElementById("post-under-review");
-  var remembered = "";   /* the id of the control the reviewer was at when they left for the post */
+  var remembered = null; /* the control the reviewer was at when they left for the post (keyOf) */
   var wide = window.matchMedia ? window.matchMedia("(min-width: 80rem)") : null;
   var panel = document.getElementById("nav-panel");
 
@@ -108,7 +108,6 @@
   /* Where "Back to my question" goes: the remembered control, else the question last
      visited, else the next unanswered question after it (the server names it). */
   function backTarget() {
-    if (remembered && document.getElementById(remembered)) { return remembered; }
     var last = lastField();
     if (last && last.value && document.getElementById(last.value)) { return last.value; }
     var state = document.getElementById("form-state");
@@ -117,11 +116,12 @@
   }
 
   function back() {
-    var id = backTarget();
     setDock(false);
-    if (!id) { moveTo(form, "start"); return; }
-    var el = document.getElementById(id);
-    if (el && el.matches("input, select, textarea")) {
+    var el = body ? findKey(remembered) : null;
+    var id = el ? "" : backTarget();
+    if (!el && !id) { moveTo(form, "start"); return; }
+    el = el || document.getElementById(id);
+    if (el && !id) {
       openAround(el);
       moveTo(el);
       el.focus({ preventScroll: true });
@@ -133,7 +133,7 @@
 
   function viewPost() {
     var active = document.activeElement;
-    if (body && active && body.contains(active) && active.id) { remembered = active.id; }
+    if (body && active && body.contains(active)) { remembered = keyOf(active); }
     setDock(true);
     moveTo(post, "start");
     /* The focus waits in the post's own "Back to my question": one key press returns. */
@@ -161,12 +161,13 @@
   /* The question the reviewer is at: marked, and carried with the form. */
   document.addEventListener("focusin", function (event) {
     if (!body || !body.contains(event.target)) { return; }
+    /* (The focus put back after a replacement is the same place: marking it again is harmless.) */
     var q = questionOf(event.target);
     if (!q) { return; }
     markCurrent(q);
     var last = lastField();
     if (last) { last.value = q.id; }
-    if (event.target.id) { remembered = event.target.id; }
+    remembered = keyOf(event.target);
   });
 
   /* After a refused submission: the summary takes the focus (the page has already moved to it). */
@@ -187,7 +188,9 @@
 
   if (!form || !body || !window.fetch || !window.URLSearchParams) { return; }
   var url = form.getAttribute("data-state");
-  var changes = 0;   /* counts every change: a reply for an older state is dropped */
+  var version = 0;       /* counts every edit of the reviewer */
+  var inFlight = false;  /* one request at a time */
+  var replacing = false; /* while the form is being replaced, nothing it fires is an edit */
   var timer = null;
   var saveState = document.getElementById("save-state");
 
@@ -204,7 +207,7 @@
   function kept(at) {
     if (!saveState || !at) { return; }
     var time = at.slice(11, 16);
-    var words = saveState.querySelector("span");
+    var words = saveState.querySelector("span:last-child");
     if (words) { words.textContent = saveState.getAttribute("data-draft").replace("{time}", time); }
     saveState.classList.remove("is-editing");
     saveState.classList.add("save-state--draft");
@@ -214,65 +217,125 @@
     if (!saveState || saveState.classList.contains("is-editing")) { return; }
     saveState.classList.remove("save-state--draft");
     saveState.classList.add("is-editing");
-    var words = saveState.querySelector("span");
+    var words = saveState.querySelector("span:last-child");
     if (words) { words.textContent = saveState.getAttribute("data-editing"); }
   }
 
-  function refresh() {
-    var mine = changes;
+  /* A control, found again in a new copy of the form: by its id, else by what it is (its tag,
+     name, value and words) within the nearest element with an id, and its place among equals. */
+  function keyOf(el) {
+    if (!el || !body.contains(el) || el === body) { return null; }
+    if (el.id) { return { id: el.id }; }
+    var box = el.parentNode;
+    while (box && box !== body && !box.id) { box = box.parentNode; }
+    var k = { box: box && box !== body ? box.id : "", tag: el.tagName, name: el.getAttribute("name"),
+              value: el.getAttribute("value"), words: (el.textContent || "").trim() };
+    k.n = equals(k).indexOf(el);
+    return k;
+  }
+
+  function equals(k) {
+    var root = k.box ? document.getElementById(k.box) : body;
+    if (!root) { return []; }
+    return [].filter.call(root.querySelectorAll(k.tag), function (x) {
+      return x.getAttribute("name") === k.name && x.getAttribute("value") === k.value &&
+        (x.textContent || "").trim() === k.words;
+    });
+  }
+
+  function findKey(k) {
+    if (!k) { return null; }
+    if (k.id) { return document.getElementById(k.id); }
+    var found = equals(k);
+    return found[k.n] || found[0] || null;
+  }
+
+  /* Put the server's form in place. Nothing the replacement fires (a "change" of a removed box,
+     a blur) is an edit, and the form is never read while it is being replaced. The focus, the
+     caret, the open disclosures and the place on the screen stay where they were. */
+  function replace(html) {
+    var active = document.activeElement;
+    var key = keyOf(active);
+    var top = key ? active.getBoundingClientRect().top : 0;
+    var from = typed(active) ? active.selectionStart : null;
+    var to = typed(active) ? active.selectionEnd : null;
+    var open = [].map.call(body.querySelectorAll("details[open] > summary"), keyOf);
+    replacing = true;
+    try {
+      body.innerHTML = html;
+    } finally {
+      replacing = false;
+    }
+    open.forEach(function (k) {
+      var s = findKey(k);
+      if (s && s.parentNode.tagName === "DETAILS") { s.parentNode.open = true; }
+    });
+    var again = findKey(key);
+    if (again) {
+      again.focus({ preventScroll: true });
+      if (typed(again) && from !== null) { again.setSelectionRange(from, to); }
+      scroller().scrollBy(0, again.getBoundingClientRect().top - top);
+      markCurrent(questionOf(again));
+    }
+  }
+
+  /* Send the form as it stands now. One request at a time; a reply is put in place only when
+     nothing changed since its request was built; otherwise the newest state is sent at once,
+     so the server always ends with the newest state as the draft. */
+  function send() {
     window.clearTimeout(timer);
+    timer = null;
+    if (inFlight || replacing) { return; }
+    var mine = version;
+    var data = new URLSearchParams(new FormData(form));
+    inFlight = true;
     busy("Updating the form…");
     window.fetch(url, {
-      method: "POST",
-      body: new URLSearchParams(new FormData(form)),
-      credentials: "same-origin",
-      headers: { "X-Fragment": "form" }
+      method: "POST", body: data, credentials: "same-origin", headers: { "X-Fragment": "form" }
     }).then(function (reply) {
       if (reply.status === 409 || (reply.ok && reply.headers.get("X-Fragment") !== "form")) {
         window.location.reload();   /* the form moved on, or the session ended */
         return null;
       }
-      if (reply.ok && mine === changes) { kept(reply.headers.get("X-Draft-Kept")); }
-      return reply.ok ? reply.text() : Promise.reject(new Error("refused"));
-    }).then(function (html) {
-      if (html === null || mine !== changes) { return; }
-      var active = document.activeElement;
-      var id = active && body.contains(active) ? active.id : "";
-      var top = id ? active.getBoundingClientRect().top : 0;
-      var from = typed(active) ? active.selectionStart : null;
-      var to = typed(active) ? active.selectionEnd : null;
-      body.innerHTML = html;
-      var again = id ? document.getElementById(id) : null;
-      if (again) {
-        again.focus({ preventScroll: true });
-        if (typed(again) && from !== null) { again.setSelectionRange(from, to); }
-        scroller().scrollBy(0, again.getBoundingClientRect().top - top);
-        markCurrent(questionOf(again));
-      }
+      if (!reply.ok) { return Promise.reject(new Error("refused")); }
+      return reply.text().then(function (html) { return { html: html, at: reply.headers.get("X-Draft-Kept") }; });
+    }).then(function (got) {
+      inFlight = false;
+      if (got === null) { return; }
+      if (mine !== version) { send(); return; }   /* the reviewer went on: send the newest */
+      replace(got.html);
+      kept(got.at);
       busy("");
     }).catch(function () {
-      if (mine === changes) { busy("The form could not be updated. Check the connection and change an answer again."); }
+      inFlight = false;
+      if (mine !== version) { send(); return; }
+      busy("The form could not be updated. Check the connection and change an answer again.");
     });
   }
 
+  function later(ms) {
+    window.clearTimeout(timer);
+    timer = window.setTimeout(send, ms);
+  }
+
   form.addEventListener("change", function (event) {
-    changes += 1;
+    if (replacing) { return; }
+    version += 1;
     if ((event.target.name || "").indexOf("ui.") !== 0) { edited(); }
-    refresh();
+    send();
   });
   form.addEventListener("input", function (event) {
-    if (!typed(event.target)) { return; }
-    changes += 1;
+    if (replacing || !typed(event.target)) { return; }
+    version += 1;
     edited();
-    window.clearTimeout(timer);
-    timer = window.setTimeout(refresh, 700);
+    later(700);
   });
   form.addEventListener("keydown", function (event) {
     /* Enter in a one-line box applies the value; it never saves. */
     if (event.key === "Enter" && event.target.tagName === "INPUT" && event.target.type === "text") {
       event.preventDefault();
-      changes += 1;
-      refresh();
+      version += 1;
+      send();
     }
   });
 }());
