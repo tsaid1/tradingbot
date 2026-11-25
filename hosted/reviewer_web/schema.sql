@@ -199,6 +199,20 @@ CREATE TABLE IF NOT EXISTS rate_limit (
 );
 CREATE INDEX IF NOT EXISTS rate_limit_by_bucket ON rate_limit (bucket, at);
 
+-- A form's DRAFT: what the page last sent for one reviewer's form in one phase, kept by the
+-- applicability round trip and by a refused save, deleted in the transaction of the form's
+-- successful save. Never an event: never exported, pulled, counted or shown to anybody else; a
+-- draft of another phase than the form's current one is dropped when the form is opened.
+CREATE TABLE IF NOT EXISTS draft (
+    reviewer_id BIGINT NOT NULL REFERENCES reviewer (id) ON DELETE CASCADE,
+    bundle_id   TEXT NOT NULL,
+    item_id     TEXT NOT NULL,
+    phase       TEXT NOT NULL CHECK (phase IN ('INDEPENDENT', 'AFTER_REVEAL')),
+    fields      JSONB NOT NULL,                -- [[name, value], ...] as posted
+    saved_at    TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (reviewer_id, bundle_id, item_id)
+);
+
 -- After a right code for an address with two identities: the choice of the identity to open,
 -- bound to that verified code. Single use, five minutes, held by its browser in a cookie of its
 -- own; only the token's SHA-256 is stored. ``sign_in_key``: the address's key row (the lowest id

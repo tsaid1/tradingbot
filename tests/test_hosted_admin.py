@@ -1820,9 +1820,11 @@ def test_the_site_s_role_covers_every_write_of_the_sign_in_the_save_and_the_send
     reading, _form = scenario_reading(site.bundle, "i08")
     one.open("i08")
     one.fill(reading)
-    one.set({"confidence": "HIGH", "notes": "sent twice"})
+    one.set({"confidence": "HIGH", "notes": "sent twice", "ui.later": "timing"})
+    assert site.sql("SELECT item_id FROM draft") == [("i08",)]  # kept by the round trips
     answers = [one.post("/form/i08/save", one.shown.data()) for _ in range(2)]
     assert [a.status_code for a in answers] == [303, 303]
+    assert site.sql("SELECT count(*) FROM draft") == [(0,)]  # ended with the save
     assert {a.headers["Location"] for a in answers} == {"/form/i08?saved=1000004"}
     # The test identity, on the same site as the same role: a stream of its own.
     expiry = "SELECT expires_at FROM web_session WHERE reviewer_id = %s"

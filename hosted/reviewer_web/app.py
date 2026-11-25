@@ -40,7 +40,18 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from flask import Flask, Response, abort, g, jsonify, redirect, render_template, request
+from flask import (
+    Flask,
+    Response,
+    abort,
+    g,
+    jsonify,
+    make_response,
+    redirect,
+    render_template,
+    request,
+)
+from werkzeug.datastructures import MultiDict
 from werkzeug.exceptions import HTTPException
 from werkzeug.routing import RoutingException
 
@@ -57,6 +68,10 @@ DEMO_ENVS = ("preview", "test")  # these show invented data only
 PUBLIC = ("healthz", "robots", "favicon", "static")  # no session, no database
 SIGN_IN = ("sign_in", "sign_in_code", "sign_in_verify", "choose_identity", "chosen_identity")
 CHOICE_SECONDS = int(auth.CHOICE_VALID.total_seconds())
+UI_PREFIX = "ui."  # posted interface state: kept in a draft, never validated, never an event
+# The phase whose draft a form in this state may hold.
+CURRENT_PHASE = {"INDEPENDENT_DUE": "INDEPENDENT", "AFTER_REVEAL_DUE": "AFTER_REVEAL",
+                 "RETURNED": "AFTER_REVEAL"}
 IDENTITY_TEXT = {auth.REAL: "Your review", auth.TEST: "Test forms (invented data)"}
 OPERATOR = ("send_queued",)  # the one route without a session: its own token, or it is a 404
 SENDER = "/internal/send-queued"
@@ -514,22 +529,25 @@ def create_app(store, mailer, config: dict) -> Flask:
 
     # ------------------------------------------------------------- the workspace
 
-    def drafts_of(bundle) -> set[str]:
-        """The forms of this reviewer that hold a draft of their current phase (a draft changes
-        nothing but its own flag)."""
-        reader = getattr(store, "draft_items", None)
-        return reader(g.who.reviewer, bundle) if reader else set()
+    def drafts_of(bundle, records) -> set[str]:
+        """The forms of this reviewer that hold a draft of their CURRENT phase (a draft changes
+        nothing but its own flag; one of another phase counts for nothing)."""
+        held = store.draft_items(g.who.reviewer)
+        if not held:
+            return set()
+        states = F.states(bundle, g.who.session, records)
+        return {i for i, phase in held.items() if CURRENT_PHASE.get(states.get(i)) == phase}
 
     def navigation(bundle, records, item_id=None) -> dict:
         """The sidebar's model (``progress.sidebar``) of this reviewer's own saves."""
-        return P.sidebar(bundle, g.who.session, records, item_id, drafts_of(bundle))
+        return P.sidebar(bundle, g.who.session, records, item_id, drafts_of(bundle, records))
 
     @app.get("/")
     @reviewer_route
     def workspace():
         bundle = store.bundle_for(g.who.reviewer)
         records = store.records_of(g.who.reviewer)
-        drafts = drafts_of(bundle)
+        drafts = drafts_of(bundle, records)
         old = F.workspace(bundle, g.who.session, records)
         dash = P.dashboard(bundle, g.who.session, records, drafts)
         nav = P.sidebar(bundle, g.who.session, records, None, drafts)
@@ -640,7 +658,7 @@ def create_app(store, mailer, config: dict) -> Flask:
         if posted is not None and posted.get("_phase") != phase:
             posted = None
         step = F.step_from(bundle, who.session, records, item)
-        drafts = drafts_of(bundle)
+        drafts = drafts_of(bundle, records)
         return render_template(
             "form.html", item_id=item_id, bundle_id=bundle.bundle_id,
             names=F.names(bundle, who.session),
@@ -669,13 +687,33 @@ def create_app(store, mailer, config: dict) -> Flask:
                      if str(r.get("seq")) == seq
                      and r["phase"] in (A.INDEPENDENT, A.AFTER_REVEAL)), None)
 
+    def kept(form_data) -> list[tuple[str, str]]:
+        """What a draft keeps of a posted form: every field (the ``ui.*`` interface state too),
+        never the session's token or the page's key."""
+        return [(k, v) for k, v in form_data.items(multi=True) if k not in ("_csrf", "_key")]
+
+    def keep(item_id, phase, form_data) -> dict | None:
+        """Keep the draft of the form the page holds now (only for the phase it shows)."""
+        if phase is None or form_data.get("_phase") != phase:
+            return None
+        now = clock()
+        store.keep_draft(g.who.reviewer, item_id, phase, kept(form_data), now)
+        return {"saved_at": now}
+
     @app.get("/form/<item_id>")
     @reviewer_route
     def form(item_id):
         bundle, item = item_of(item_id)
         records, gate, problem = reveal(bundle, item)
         saved = saved_record(bundle, records, item_id, request.args.get("saved", ""))
-        return lambda: page(bundle, item, records, gate, problem, saved=saved)
+        phase = phase_of(bundle, item, records, gate)
+        found, posted, draft = store.draft_of(g.who.reviewer, item_id), None, None
+        if found is not None and found["phase"] != phase:
+            store.drop_draft(g.who.reviewer, item_id)  # the form moved on: its draft is dropped
+        elif found is not None and saved is None:
+            posted, draft = MultiDict(found["fields"]), {"saved_at": found["saved_at"]}
+        return lambda: page(bundle, item, records, gate, problem, saved=saved, posted=posted,
+                            draft=draft)
 
     @app.post("/form/<item_id>/state")
     @reviewer_route
@@ -685,19 +723,30 @@ def create_app(store, mailer, config: dict) -> Flask:
         bundle, item = item_of(item_id)
         records, gate, problem = reveal(bundle, item)
         phase = phase_of(bundle, item, records, gate)
-        if request.headers.get("X-Fragment") != "form":
-            return lambda: page(bundle, item, records, gate, problem, posted=request.form)
+        draft = keep(item_id, phase, request.form)  # every round trip keeps the draft
+
+        def marked(response):
+            """The script cannot see the draft in a fragment: the answer says it was kept, and
+            when (a time, nothing of the content)."""
+            if draft is not None:
+                response.headers["X-Draft-Kept"] = draft["saved_at"].astimezone(UTC).isoformat(
+                    timespec="seconds")
+            return response
+
+        if request.headers.get("X-Fragment") != "form":  # without a script: the whole page
+            return lambda: marked(make_response(page(bundle, item, records, gate, problem,
+                                                     posted=request.form, draft=draft)))
         if phase is None or request.form.get("_phase") != phase:
             return Response("", status=409)  # the form moved on: the script reloads the page
 
         def fragment():
             response = Response(render_template(
                 "_form_body.html", item_id=item_id,
-                key=page_key(secret, g.who.reviewer.id, item_id),
+                key=page_key(secret, g.who.reviewer.id, item_id), draft=draft,
                 form=build(bundle, item, records, gate, phase, request.form)),
                 mimetype="text/html")
             response.headers["X-Fragment"] = "form"
-            return response
+            return marked(response)
         return fragment
 
     @app.post("/form/<item_id>/save")
@@ -713,8 +762,11 @@ def create_app(store, mailer, config: dict) -> Flask:
         if phase not in (A.INDEPENDENT, A.AFTER_REVEAL) or not page_key_fits(
                 secret, who.reviewer.id, item_id, key):
             return refuse(400)
+        # The session's token is not what was saved, and the interface state (``ui.*``: the
+        # "For later" marks, the last active question) is no part of a save: the same save
+        # sent again with other marks is the same save.
         posted = save_key(key, [(k, v) for k, v in request.form.items(multi=True)
-                                if k != "_csrf"])  # the session's token is not what was saved
+                                if k != "_csrf" and not k.startswith(UI_PREFIX)])
 
         def make(current):
             """Under the store's lock, with the reviewer's current records."""
@@ -742,8 +794,9 @@ def create_app(store, mailer, config: dict) -> Flask:
             app.logger.info("SAVE_REFUSED code=%s", exc.code.split(":")[0])
             records, gate, problem = reveal(bundle, item)
             code = exc.code
+            draft = keep(item_id, phase_of(bundle, item, records, gate), request.form)
             return lambda: page(bundle, item, records, gate, problem, posted=request.form,
-                                refusal=code, status=422)
+                                refusal=code, status=422, draft=draft)
         return lambda: redirect(f"/form/{item_id}?saved={done.records[0]['seq']}", 303)
 
     @app.get("/media/<bundle_id>/<post_ref>/<name>")

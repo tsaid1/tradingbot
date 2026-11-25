@@ -349,6 +349,42 @@ class Store:
                 + " ORDER BY e.seq", (reviewer.id, reviewer.id)).fetchall()
         return [json.loads(bytes(line)) for (line,) in rows]
 
+    # -------------------------------------------------------------- one reviewer's drafts
+
+    def keep_draft(self, reviewer: ReviewerRow, item_id: str, phase: str, fields,
+                   now: datetime) -> None:
+        """Keep what the page sent for this form in this phase (the latest only). A draft is
+        never an event."""
+        with self.connection() as conn:
+            conn.execute(
+                "INSERT INTO draft (reviewer_id, bundle_id, item_id, phase, fields, saved_at)"
+                " SELECT %s, " + _THEIRS + ", %s, %s, %s, %s"
+                " ON CONFLICT (reviewer_id, bundle_id, item_id) DO UPDATE SET"
+                " phase = EXCLUDED.phase, fields = EXCLUDED.fields, saved_at = EXCLUDED.saved_at",
+                (reviewer.id, reviewer.id, item_id, phase,
+                 json.dumps([[k, v] for k, v in fields], ensure_ascii=False), now))
+
+    def draft_of(self, reviewer: ReviewerRow, item_id: str) -> dict | None:
+        """This reviewer's draft of this form of their bundle: phase, fields, saved_at."""
+        with self.connection() as conn:
+            row = conn.execute("SELECT phase, fields, saved_at FROM draft WHERE reviewer_id = %s"
+                               " AND bundle_id = " + _THEIRS + " AND item_id = %s",
+                               (reviewer.id, reviewer.id, item_id)).fetchone()
+        return row and {"phase": row[0], "fields": [tuple(f) for f in row[1]],
+                        "saved_at": row[2]}
+
+    def draft_items(self, reviewer: ReviewerRow) -> dict[str, str]:
+        """{form: the phase of its draft} of this reviewer's bundle."""
+        with self.connection() as conn:
+            rows = conn.execute("SELECT item_id, phase FROM draft WHERE reviewer_id = %s"
+                                " AND bundle_id = " + _THEIRS, (reviewer.id, reviewer.id))
+            return dict(rows.fetchall())
+
+    def drop_draft(self, reviewer: ReviewerRow, item_id: str) -> None:
+        with self.connection() as conn:
+            conn.execute("DELETE FROM draft WHERE reviewer_id = %s AND item_id = %s",
+                         (reviewer.id, item_id))
+
     def append(self, reviewer: ReviewerRow, make, *,
                idempotency_key: str | None = None) -> Appended:
         """The site's only write of a reading. ``make(records)`` gets the reviewer's CURRENT
@@ -410,6 +446,12 @@ class Store:
                 records.append(rec)
             if rows:
                 conn.cursor().executemany(_INSERT_EVENT, rows)
+                # A reading saved: its form's draft ends in the same transaction.
+                saved = [r["item_id"] for r in records
+                         if r["phase"] in (A.INDEPENDENT, A.AFTER_REVEAL)]
+                if saved:
+                    conn.execute("DELETE FROM draft WHERE reviewer_id = %s AND item_id = ANY(%s)",
+                                 (reviewer.id, saved))
         return Appended(records, False)
 
 

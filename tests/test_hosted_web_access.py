@@ -203,7 +203,8 @@ def test_the_deployed_folder_holds_the_site_and_no_way_around_the_sign_in():
     code = sorted(f for f in tracked if f.endswith(".py"))
     assert code == ["hosted/reviewer_web/__init__.py", "hosted/reviewer_web/app.py",
                     "hosted/reviewer_web/auth.py", "hosted/reviewer_web/forms.py",
-                    "hosted/reviewer_web/mail.py", "hosted/reviewer_web/store.py",
+                    "hosted/reviewer_web/mail.py", "hosted/reviewer_web/progress.py",
+                    "hosted/reviewer_web/store.py",
                     "hosted/wsgi.py"]
     for name in tracked:
         text = (HOSTED.parent / name).read_text()

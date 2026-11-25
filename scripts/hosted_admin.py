@@ -98,7 +98,7 @@ EVENT_KEYS = ("alias", "is_test", "origin", "seq", "prev_sha256", "sha256", "lin
 SITE_ROLE = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
 SITE_READS = ("reviewer", "bundle", "media", "event", "chain_anchor", "mail_queue")
 SITE_INSERTS = ("event",)
-SITE_OWN = ("login_code", "web_session", "rate_limit", "sign_in_choice")  # the sign-in tables: every row operation
+SITE_OWN = ("login_code", "web_session", "rate_limit", "sign_in_choice", "draft")  # the sign-in tables: every row operation
 SITE_SETS = {"reviewer": ("first_sign_in_at", "invited_at"),
              # a try is counted and its start noted BEFORE the mail server hears of it
              "mail_queue": ("attempts", "sending_at", "result", "sent_at")}
