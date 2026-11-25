@@ -28,14 +28,26 @@ connection and commits with the block (one connection per request).
 #   shape (decision RETURN, the approver's notes; of the approver only the role), ``refers_to``
 #   the seq the returned reading has HERE, so ``A.effective_approval`` / ``A._outcome`` give the
 #   site what they give the local workspace, and the reviewer's next reading after the reveal
-#   supersedes it. It is outside the hosted chain: seq 2000000 + its local line's seq (after
-#   every record of the reviewer's own), ``prev_sha256`` the sha256 of the returned reading. The
-#   site never writes one; ``pull-to-local`` never copies one back.
+#   supersedes it. It is outside the hosted chain: seq 2000000 + twice its local line's seq
+#   (after every record of the reviewer's own, in the local log's order), ``prev_sha256`` the
+#   sha256 of the returned reading. A return that no longer stands locally is followed by ONE
+#   clearing line of the same shape without content (decision WITHDRAWN, one seq above the place
+#   of the local decision that came after), so that ``effective_approval`` no longer gives the
+#   return. The site never writes either; ``pull-to-local`` never copies one back.
+# * ``event.origin`` TEST: the lines of a test identity are a stream of their own (seq 3000000
+#   + n, chained among themselves from TEST_GENESIS). A test identity may save before the real
+#   log is imported: its lines never touch the reviewers' chain or its anchor, and no "is there
+#   a hosted line yet" decision sees them. The table refuses a TEST line of anyone else and any
+#   other line of a test identity.
 # * A parsed bundle is cached by (bundle_id, published_at), not bundle_id alone: a larger scope
 #   of the same local bundle is published under the same bundle_id and must replace the cache.
 # * ``append`` also refuses a record whose annotator is not the reviewer or whose bundle is not
 #   the reviewer's (RECORD_NOT_OF_THIS_REVIEWER_AND_BUNDLE): ``records_of`` relies on both.
 # * A reviewer row is one person: ``upsert_reviewer`` refuses an alias that another sign-in holds.
+# * The spelling of a sign-in is part of a reviewer's history: the core finds a reviewer's
+#   records by ``annotator.login`` EXACTLY equal to the session's login (``login_shown``). So a
+#   row that has events keeps its spelling (LOGIN_SPELLING_HAS_RECORDS), and no line of a
+#   reviewer's own is stored under a row spelled otherwise (LINE_NOT_SPELLED_AS_ITS_ROW).
 # * ``reviewer.bundle_id``: the one bundle a reviewer is served (``bundle_for``, ``is_demo``,
 #   ``media(reviewer, ...)``, ``records_of``, ``append``). A test identity is served a bundle
 #   only while that bundle is flagged ``is_demo`` (checked in every query, not only when it is
@@ -63,8 +75,10 @@ from tradingbot.runtime.vocab_recommend import GENESIS, encode_line
 SCHEMA_SQL = Path(__file__).with_name("schema.sql")
 LOCK_KEY = 7_203_001  # pg_advisory_xact_lock: one writer of ``event`` at a time
 HOSTED_BASE = 1_000_000  # a HOSTED line's seq is HOSTED_BASE + n (n = 1, 2, ...)
-RETURN_BASE = 2_000_000  # a RETURN line's seq is RETURN_BASE + the seq of its local line
-LEGACY, HOSTED, RETURN = "LEGACY", "HOSTED", "RETURN"
+RETURN_BASE = 2_000_000  # a RETURN line's seq: RETURN_BASE + twice its local line's seq (+ 1)
+TEST_BASE = 3_000_000  # a TEST line's seq is TEST_BASE + n: the test identities' own stream
+TEST_GENESIS = hashlib.sha256(b"tradingbot.hosted.test-stream/1").hexdigest()  # its first prev
+LEGACY, HOSTED, RETURN, TEST = "LEGACY", "HOSTED", "RETURN", "TEST"
 MAX_MEDIA_BYTES = 4 * 1024 * 1024
 MAIL_KINDS = ("INVITE_CONTINUE", "INVITE_START")
 MAIL_TRIES = 3  # of one queued message
@@ -122,6 +136,15 @@ class Appended:
 
 def sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def annotator_login(line: bytes) -> str | None:
+    """The ``annotator.login`` of a line, exactly as spelled; None when it has none."""
+    try:
+        who = json.loads(line).get("annotator")
+    except (ValueError, AttributeError):
+        return None
+    return who.get("login") if isinstance(who, dict) else None
 
 
 def image_type(data: bytes) -> str | None:
@@ -304,16 +327,20 @@ class Store:
         nothing and propagates. A known ``idempotency_key`` returns what that save stored, with
         ``duplicate=True``, and does not call ``make``. A revoked reviewer: REVOKED.
 
+        A reviewer's line continues the HOSTED chain (from the anchor on the local log); a test
+        identity's line continues the TEST stream, which never touches that chain.
+
         One writer at a time: the transaction first takes the advisory lock, and only then reads
         (READ COMMITTED: each statement sees what earlier writers committed)."""
         with self.connection() as conn:
             conn.execute("SELECT pg_advisory_xact_lock(%s)", (LOCK_KEY,))
-            allowed, bundle_id, anchor, last_seq, last_sha = conn.execute(
-                "SELECT (SELECT revoked_at IS NULL FROM reviewer WHERE id = %s), " + _THEIRS + ","
-                " (SELECT snapshot_head_sha256 FROM chain_anchor WHERE id = 1),"
-                " (SELECT max(seq) FROM event WHERE origin = 'HOSTED'),"
-                " (SELECT sha256 FROM event WHERE origin = 'HOSTED' ORDER BY seq DESC LIMIT 1)",
-                (reviewer.id, reviewer.id)).fetchone()
+            allowed, test, bundle_id, anchor, last_seq, last_sha = conn.execute(
+                "SELECT r.revoked_at IS NULL, r.is_test, " + _THEIRS + ","
+                " (SELECT snapshot_head_sha256 FROM chain_anchor WHERE id = 1), t.seq, t.sha256"
+                " FROM reviewer r LEFT JOIN LATERAL (SELECT e.seq, e.sha256 FROM event e"
+                " WHERE e.origin = CASE WHEN r.is_test THEN 'TEST' ELSE 'HOSTED' END"
+                " ORDER BY e.seq DESC LIMIT 1) t ON TRUE WHERE r.id = %s",
+                (reviewer.id, reviewer.id)).fetchone() or (None,) * 6
             if not allowed:
                 raise A.AdjudicationError("REVOKED")
             if bundle_id is None:
@@ -327,7 +354,10 @@ class Store:
                     return Appended([json.loads(bytes(r[0])) for r in mine if r[3] == first], True)
             made = make([json.loads(bytes(r[0])) for r in mine if r[1] == bundle_id])
             bodies = [made] if isinstance(made, dict) else list(made or [])
-            seq, prev = last_seq or HOSTED_BASE, last_sha or anchor or GENESIS
+            if test:
+                origin, seq, prev = TEST, last_seq or TEST_BASE, last_sha or TEST_GENESIS
+            else:
+                origin, seq, prev = HOSTED, last_seq or HOSTED_BASE, last_sha or anchor or GENESIS
             records, rows = [], []
             for body in bodies:
                 if (body.get("annotator") or {}).get("login") != reviewer.login_shown \
@@ -337,7 +367,7 @@ class Store:
                 rec = {**body, "schema": A.ANNOTATION_SCHEMA, "seq": seq, "prev_sha256": prev}
                 line = encode_line(rec)
                 rows.append(_event_row(EventLine(
-                    reviewer.id, HOSTED, line, None if records else idempotency_key,
+                    reviewer.id, origin, line, None if records else idempotency_key,
                     seq - len(records))))
                 prev = sha256(line)
                 records.append(rec)
@@ -374,9 +404,10 @@ class AdminStore(Store):
                         role: str = A.REVIEWER, access: str = A.FULL,
                         scope_sequences: int = A.DEFAULT_SCOPE, is_test: bool = False,
                         bundle_id: str | None = None) -> ReviewerRow:
-        """Insert the reviewer, or update the spelling, name, role, access, scope and bundle of
-        the row that holds this alias AND this sign-in. Anything else is refused: a row is one
-        person, and its events stay theirs. Never deletes.
+        """Insert the reviewer, or update the name, role, access, scope and bundle of the row
+        that holds this alias AND this sign-in; its spelling too, but only while the row has no
+        event (its records are found by that exact spelling). Anything else is refused: a row
+        is one person, and its events stay theirs. Never deletes.
 
         ``bundle_id``: the bundle the reviewer works on; a test identity takes an invented one
         only (TEST_IDENTITY_NEEDS_A_DEMO_BUNDLE). None keeps the row's bundle; for a new row it
@@ -385,10 +416,14 @@ class AdminStore(Store):
         served nothing."""
         key = login.casefold()
         with self.connection() as conn:
-            held = conn.execute("SELECT alias, login, is_test FROM reviewer WHERE alias = %s"
-                                " OR login = %s", (alias, key)).fetchall()
-            if held and held != [(alias, key, is_test)]:
+            held = conn.execute(
+                "SELECT alias, login, is_test, login_shown <> %s AND EXISTS (SELECT 1 FROM event e"
+                " WHERE e.reviewer_id = reviewer.id) FROM reviewer WHERE alias = %s OR login = %s",
+                (login, alias, key)).fetchall()
+            if held and [h[:3] for h in held] != [(alias, key, is_test)]:
                 raise A.AdjudicationError("ALIAS_OR_LOGIN_HELD_BY_ANOTHER_ROW")
+            if held and held[0][3]:
+                raise A.AdjudicationError("LOGIN_SPELLING_HAS_RECORDS")
             if bundle_id is None and not held:
                 found = conn.execute(
                     "SELECT bundle_id FROM bundle WHERE active AND (is_demo OR NOT %s)"
@@ -575,20 +610,34 @@ class AdminStore(Store):
 
     def insert_events(self, lines: list[EventLine]) -> None:
         """Store lines exactly as given (the import's LEGACY lines; a restore's lines of every
-        origin), under the writers' lock. Nothing is checked here but the table's own rules."""
+        origin), under the writers' lock. A reviewer's own line (every origin but RETURN) is
+        refused unless its ``annotator.login`` is EXACTLY its row's ``login_shown``: under any
+        other spelling the site would not find it and the form would look open again. A test
+        identity's lines are TEST lines, and no one else's are."""
         with self.exclusive() as conn:
+            rows = {r[0]: r[1:] for r in conn.execute(
+                "SELECT id, login_shown, is_test FROM reviewer WHERE id = ANY(%s)",
+                ([e.reviewer_id for e in lines],)).fetchall()}
+            if any((e.origin == TEST) != rows.get(e.reviewer_id, (None, None))[1] for e in lines):
+                raise A.AdjudicationError("LINE_NOT_IN_ITS_ROW_S_STREAM")
+            if any(e.origin != RETURN and annotator_login(e.line) != rows[e.reviewer_id][0]
+                   for e in lines):
+                raise A.AdjudicationError("LINE_NOT_SPELLED_AS_ITS_ROW")
             if lines:
                 conn.cursor().executemany(_INSERT_EVENT, [_event_row(e) for e in lines])
 
     def events(self) -> list[dict]:
-        """EVERY event, in seq order, with its reviewer's alias (operator tool only)."""
+        """EVERY event, in seq order, with its reviewer's alias and the row's spelling of the
+        sign-in (operator tool only; the tool prints the alias, never the sign-in)."""
         keys = ("alias", "is_test", "origin", "seq", "prev_sha256", "sha256", "line",
-                "idempotency_key", "batch", "created_at", "item_id", "phase", "at")
+                "idempotency_key", "batch", "created_at", "item_id", "phase", "at",
+                "login_shown")
         with self.connection() as conn:
             rows = conn.execute(
                 "SELECT r.alias, r.is_test, e.origin, e.seq, e.prev_sha256, e.sha256, e.line,"
-                " e.idempotency_key, e.batch, e.created_at, e.item_id, e.phase, e.at FROM event e"
-                " JOIN reviewer r ON r.id = e.reviewer_id ORDER BY e.seq").fetchall()
+                " e.idempotency_key, e.batch, e.created_at, e.item_id, e.phase, e.at,"
+                " r.login_shown FROM event e JOIN reviewer r ON r.id = e.reviewer_id"
+                " ORDER BY e.seq").fetchall()
         return [{**dict(zip(keys, row, strict=True)), "line": bytes(row[6])} for row in rows]
 
     def anchor(self) -> dict | None:

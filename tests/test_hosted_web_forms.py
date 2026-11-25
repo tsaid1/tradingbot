@@ -18,6 +18,7 @@ from hosted_web_site import (  # noqa: F401 - fixtures
     SECOND,
     SYSTEM_MARKS,
     SYSTEM_WORDS,
+    Shown,
     Site,
     dsn,
     scenario_reading,
@@ -709,7 +710,11 @@ def test_a_reading_the_approver_returned_is_shown_to_its_reviewer_only(site):  #
     b.review("i08")
     assert a.get("/continue").headers["Location"] == "/form/i01"  # the first never started
     note = "Row 1 is a fill, not the market: please look at it again."
-    returned = site.return_reading(FIRST, "i08", note)
+    # The operator tool stores of the approver the role only. Here the line names the approver
+    # all the same: whatever a stored line says of them, no page shows it.
+    returned = site.return_reading(FIRST, "i08", note, annotator={
+        "login": "owner@example.invalid", "name": "Owner Example", "role": A.APPROVER,
+        "access": A.FULL})
     shown = a.open("i08")
     after = [r for r in site.records(FIRST) if r["phase"] == A.AFTER_REVEAL][-1]
     assert f"SAVED, and RETURNED by the approver. Your reading of this form after the reveal " \
@@ -751,6 +756,75 @@ def test_a_reading_the_approver_returned_is_shown_to_its_reviewer_only(site):  #
     assert newest["seq"] > after["seq"] and newest["notes"] == "corrected after the return"
     assert newest["reading"]["levels"][0]["exactness"] == "APPROXIMATE"
     assert [r["phase"] for r in site.records(FIRST)][-1] == A.APPROVAL  # kept, and overtaken
+
+
+def test_a_return_the_approver_took_back_shows_nowhere_on_the_site(site):  # noqa: F811
+    """When a pushed return no longer stands locally, the operator tool stores ONE line without
+    content after it (decision WITHDRAWN; the RETURN stream is numbered 2000000 + twice a local
+    line's seq, a clearing line one above). The pages go by the latest approval of the
+    reviewer's latest reading: after a clearing line nothing says "returned", nothing of the
+    return or of the later decision is shown, and "continue" asks for no save."""
+    from reviewer_web import forms as F
+
+    a = site.browser().sign_in(FIRST)
+    a.review("i07")
+    a.review("i08")
+    note = "Row 1 is a fill, not the market: please look at it again."
+    returned = site.return_reading(FIRST, "i08", note)
+    assert returned["annotator"] == {"login": "approver", "name": "Approver",
+                                     "role": A.APPROVER, "access": A.FULL}  # as the tool stores
+    assert 2_000_000 < returned["seq"] < 3_000_000 and returned["seq"] % 2 == 0
+    assert a.get("/continue").headers["Location"] == "/form/i08"
+    assert "Returned to you" in a.get("/").get_data(as_text=True)
+
+    def state() -> str:
+        return F.step_state(site.bundle, site.reviewers[FIRST].session(), site.records(FIRST),
+                            "i08")
+
+    def nothing_is_returned(*notes: str) -> None:
+        home, shown = Shown(a.get("/")), a.open("i08")
+        for page in (home, shown):
+            assert "Returned to you" not in page.text and "RETURNED" not in page.text
+            assert "The approver returned" not in page.text and "WITHDRAWN" not in page.text
+            assert not [n for n in (*notes, "never stored") if n in page.plain]
+        assert "SAVED. Your reading of this form after the reveal is record" in shown.text
+        assert "2 of 45" in home.text and state() == F.DONE
+        assert a.get("/continue").headers["Location"] == "/form/i01"
+
+    assert state() == F.RETURNED
+    cleared = site.clear_return(FIRST, returned)
+    assert cleared["seq"] > returned["seq"] and cleared["seq"] % 2 == 1
+    assert (cleared["decision"], cleared["notes"], cleared["reading"], cleared["clears"]) == (
+        "WITHDRAWN", "", {}, returned["seq"])
+    assert site.records(FIRST)[-2:] == [returned, cleared]
+    nothing_is_returned(note)
+    # Neither line of the approver is ever taken for a save of the reviewer's own.
+    for record in (returned, cleared):
+        page = a.get(f"/form/i08?saved={record['seq']}").get_data(as_text=True)
+        assert "Saved." not in page and "RETURNED" not in page
+    # The other reviewer's pages never knew of either line.
+    b = site.browser().sign_in(SECOND)
+    assert "Returned" not in b.get("/").get_data(as_text=True)
+    assert not [r for r in site.records(SECOND) if r["phase"] == A.APPROVAL]
+    # The store keeps the local order: a return made AFTER the clearing line shows again,
+    again = site.return_reading(FIRST, "i08", "Once more: row 1.")
+    assert again["seq"] > cleared["seq"] and state() == F.RETURNED
+    assert a.get("/continue").headers["Location"] == "/form/i08"
+    shown = a.open("i08")
+    assert "The approver returned this reading." in shown.text
+    assert "Once more: row 1." in shown.visible() and note not in shown.visible()
+    # and the reviewer's corrected save ends it, with all three lines among the records.
+    a.set({"lv.n:0.exactness": "APPROXIMATE"})
+    done = a.save(confidence="MEDIUM", notes="corrected after the second return")
+    assert "Saved." in done.text and "RETURNED" not in done.text
+    assert [r["decision"] for r in site.records(FIRST) if r["phase"] == A.APPROVAL] == [
+        "RETURN", "WITHDRAWN", "RETURN"]
+    newest = [r for r in site.records(FIRST) if r["phase"] == A.AFTER_REVEAL][-1]
+    assert newest["notes"] == "corrected after the second return"
+    nothing_is_returned(note, "Once more: row 1.")
+    # A clearing line that comes when the reviewer has already answered changes nothing.
+    site.clear_return(FIRST, again)
+    nothing_is_returned(note, "Once more: row 1.")
 
 
 def test_publisher_text_is_shown_as_text_never_as_markup(tmp_path, store, dsn):  # noqa: F811
@@ -838,3 +912,45 @@ def test_a_form_that_enters_the_scope_after_its_post_was_revealed_can_be_complet
         offered = site.browser().sign_in(FIRST).open(item_id).value("_phase")
         assert offered == {F.INDEPENDENT_DUE: A.INDEPENDENT, F.REVEAL_PENDING: None}.get(
             state(item_id), A.AFTER_REVEAL), item_id
+
+
+def test_a_save_carries_the_rows_spelling_of_the_sign_in_however_it_was_typed(site):  # noqa: F811
+    """The core finds a reviewer's records by the address in each record, compared exactly with
+    the session's; the store refuses a line spelled otherwise than its row. So whatever capitals
+    a reviewer types at sign-in, the lines the site builds carry the row's spelling, and the
+    reviewer finds their work again under any other."""
+    from reviewer_web import forms as F
+
+    row = site.reviewers[FIRST]
+    spelled = row.login_shown.title()  # the row as the reviewers file might spell it
+    assert spelled not in (row.login_shown, row.login_shown.upper())
+    site.admin.upsert_reviewer(FIRST, spelled, name=row.name, scope_sequences=row.scope_sequences)
+    assert site.reviewers[FIRST].login_shown == spelled
+
+    def sign_in(typed: str):
+        b = site.browser()
+        site.sql("DELETE FROM rate_limit")
+        assert b.post("/sign-in", {"address": typed}).status_code == 200
+        assert site.outbox.sent[-1][0] == spelled  # mail goes to the row's spelling
+        assert b.post("/sign-in/verify", {"address": typed,
+                                          "code": site.code()}).status_code == 303
+        return b
+
+    a = sign_in(spelled.lower())
+    a.review("i07")
+    lines = [e for e in site.admin.events() if e["alias"] == FIRST]
+    assert [json.loads(e["line"])["annotator"]["login"] for e in lines] == [spelled] * 3
+    assert {e["login_shown"] for e in lines} == {spelled}
+    assert F.step_state(site.bundle, site.reviewers[FIRST].session(), site.records(FIRST),
+                        "i07") == F.DONE
+    # Typed in capitals on another device: the same history, the same next step.
+    again = sign_in(spelled.upper())
+    assert "1 of 45" in again.get("/").get_data(as_text=True)
+    assert again.get("/continue").headers["Location"] == "/form/i08"
+    assert "SAVED. Your reading of this form after the reveal is record" in again.open("i07").text
+    again.review("i08")
+    assert {r["annotator"]["login"] for r in site.records(FIRST)} == {spelled}
+    # From now on the row keeps that spelling: its lines are found by it.
+    with pytest.raises(A.AdjudicationError, match="LOGIN_SPELLING_HAS_RECORDS"):
+        site.admin.upsert_reviewer(FIRST, spelled.lower(), name=row.name,
+                                   scope_sequences=row.scope_sequences)

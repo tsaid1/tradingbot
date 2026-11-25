@@ -84,6 +84,8 @@ can check a reviewer's resume point with them, without signing in as that review
 "Returned to you" and the form opens again with your latest answers. The notice above the
 confidence says "RETURNED by the approver" and gives the approver's note. Correct the answers,
 give flags, confidence and notes, and save: the corrected reading replaces the returned one.
+If the approver takes a return back before you answer it, the mark and the notice go away and
+nothing is asked of you.
 
 ## Security model
 
@@ -123,14 +125,17 @@ bundle (`Store.bundle_for`), then the item: a form or an image is found only ins
 reviewer's scope of that bundle (`ordered(bundle, scope)`); every id from a URL is looked up,
 never used. Anything else is a 404 that is the same page for every reason. The store has no call
 that returns another reviewer's records, so no page can show them; beside a reviewer's own
-records it hands over only the approver's RETURN of that reviewer's readings.
+records it hands over only the approver's RETURN of that reviewer's readings (of the approver
+the role alone, no name and no address) and the line without content that takes one back. A
+page shows a return only while it is the latest decision on the reviewer's latest reading.
 
 **A test identity beside the real reviewers.** A reviewer row flagged as a test identity reads a
 bundle of invented forms in the same database, while the real reviewers read the real one. Every
 route asks the store for the signed-in reviewer's bundle and never for "the" bundle, so a form,
 an image or a record of one bundle is a 404 for a session of the other. Whoever reads a bundle
 flagged as demonstration data sees the "Demonstration data" band on every page, in production
-too.
+too. A test identity's saves are a stream of their own in the store (see "The events"): they go
+through the same pages and the same checks, and never touch the reviewers' chain.
 
 **Blind-first.** Before the reveal a response holds nothing of the system: not its reading of any
 field, not its price rows or levels, not the holds, not the mapping (reference series, proposed
@@ -196,7 +201,9 @@ stopped between a send and its record can never send that message a second time.
 not empty), otherwise with `DATABASE_URL`. `SITE_DATABASE_URL` is for the connection of a
 restricted role that may read and append but does not own the tables (so it cannot switch off
 the rule that no event is changed or deleted), while the platform keeps managing `DATABASE_URL`
-for the owning role.
+for the owning role. `hosted_admin.py make-site-role` creates that role and writes its address
+to a file (see "The site's own database role"); a test runs every path of the site that writes
+as that role.
 
 **Environments** (`SITE_ENV`). `preview` and `test` serve only bundles flagged as demonstration
 data: they do not start on any other, stop answering if one is published, and refuse a reviewer
@@ -239,7 +246,9 @@ python scripts/hosted_admin.py status
 * It prints counts, ids, aliases, times, sizes and fingerprints only: never a sign-in address, a
   name, or a word of a post or a reading. A refusal is one constant code (`refused: CODE`), a
   database error only its class (`refused: DATABASE_OperationalError`). Exit 0: all is well;
-  1: a check failed (parity, verify); 2: refused, nothing changed.
+  1: a check failed (parity, verify); 2: refused. A refusal changes nothing, with one exception:
+  a `pull-to-local` that fails midway has already appended the lines before the failure (run it
+  again: it appends the rest).
 * A reviewer is named by **alias**: an entry of `reviewers.toml` whose login contains `@` is
   `REMOTE-<n>`, n its place among those entries in file order (the alias the owner's other tools
   print). Only the REVIEWER entries get a row. The reviewers file is only ever read.
@@ -249,7 +258,7 @@ python scripts/hosted_admin.py status
 | command | what it does |
 | --- | --- |
 | `init-db` | Applies `hosted/reviewer_web/schema.sql`. Every statement can be run again. |
-| `sync-reviewers` | Writes the remote reviewers of `reviewers.toml` as rows, bound to the active REAL bundle: login, name, role, scope, and the access a remote session has by that file (FULL only while `remote_full_context_authorized = true`, else RESTRICTED, which the site does not serve). Never deletes: an entry that left the file keeps its row, so revoke it. Refused while no real bundle is published (`NO_REAL_BUNDLE_PUBLISHED`), when an alias would pass to another sign-in (`ALIAS_OR_LOGIN_HELD_BY_ANOTHER_ROW`) or the file's scope is larger than the published one (`SCOPE_NOT_PUBLISHED`: publish first). `--demo` binds them to the demonstration bundle instead (a preview database, tests). |
+| `sync-reviewers` | Writes the remote reviewers of `reviewers.toml` as rows, bound to the active REAL bundle: login, name, role, scope, and the access a remote session has by that file (FULL only while `remote_full_context_authorized = true`, else RESTRICTED, which the site does not serve). Never deletes: an entry that left the file keeps its row, so revoke it. Refused while no real bundle is published (`NO_REAL_BUNDLE_PUBLISHED`), when an alias would pass to another sign-in (`ALIAS_OR_LOGIN_HELD_BY_ANOTHER_ROW`), when the file spells differently (capitals included) a sign-in whose row already has lines (`LOGIN_SPELLING_HAS_RECORDS`, with the alias: put the earlier spelling back), or when the file's scope is larger than the published one (`SCOPE_NOT_PUBLISHED`: publish first). `--demo` binds them to the demonstration bundle instead (a preview database, tests); on a database that holds a real bundle that would move the reviewers from the real forms to the invented ones, so it is refused there (`REAL_BUNDLE_IS_PUBLISHED`) unless `--force` is given (run `sync-reviewers` without `--demo` to move them back). |
 | `sync-reviewers --test-identity TEST-1 LOGIN` | Instead: writes (or updates) the test identity `TEST-<n>` for that sign-in, bound to the active DEMONSTRATION bundle with that bundle's scope (`NO_DEMO_BUNDLE_PUBLISHED` while there is none). The reviewers file is not read. |
 | `revoke ALIAS` | Sets `revoked_at` and deletes that reviewer's web sessions and sign-in codes not yet used. From that moment sign-in, every page and every save are refused; the records stay. |
 | `restore-access ALIAS` | Clears the revocation (the reviewer signs in again). |
@@ -264,7 +273,8 @@ python scripts/hosted_admin.py status
 | `push-returns` | Stores the approver's standing local RETURN decisions for the reviewers whose readings they return. |
 | `status` | The two bundles and the anchor; per reviewer: bundle, scope, invited, first sign-in, first hosted save, revoked, the lines by origin and phase, and each queued message (kind, queued, sent, result). Test identities are only counted. |
 | `test-report ALIAS` | For a test identity only: its bundle, first sign-in, number of web sessions, each of its events (seq, time, phase, item id) and the state of every form that is not open. This is how a sign-in, a save and a resume on the production site are checked without touching a reviewer. |
-| `verify` | The hosted chain (every line against its hash, 1000001, 1000002, ... from the anchor) and the imported lines against the newest snapshot, in both directions. |
+| `make-site-role --out FILE` | Creates the database role the SITE connects as (default name `reviewer_site`), or gives it a new password, and writes its database address (the given address with user and password replaced) to FILE, mode 0600, never over an existing file. Nothing secret is printed. See "The site's own database role". |
+| `verify` | The hosted chain (every line against its hash, 1000001, 1000002, ... from the anchor), the test identities' stream as a chain of its own, every line under a row spelled as the line, and the imported lines against the newest snapshot, in both directions. |
 
 ### Real reviewers and test identities in one database
 
@@ -304,35 +314,59 @@ A new real bundle (another `bundle_id`) does not move anyone by itself: after `p
 `sync-reviewers` binds the reviewers to it, and they are then served the records of that bundle
 only.
 
+### One spelling of a sign-in
+
+The workspace finds a reviewer's history by the address in each record, compared character for
+character with the address the reviewer signs in under. A line under any other spelling
+(capitals included) is not found: the form looks open again, and a second "independent" reading
+could be saved for a form whose system reading was already shown. So the spelling is kept in
+step everywhere, and nothing changes it silently:
+
+* `sync-reviewers` refuses to respell a row that has lines (`LOGIN_SPELLING_HAS_RECORDS`);
+* `import-log` prints, per alias, the number of spellings of that sign-in among its local lines,
+  and refuses unless there is one and it is the row's and the reviewers file's
+  (`LOGIN_SPELLED_OTHERWISE`): such a log needs the owner's decision before any cutover;
+* the store accepts no line of a reviewer under a row spelled otherwise
+  (`LINE_NOT_SPELLED_AS_ITS_ROW`), and `restore` places every line by its own sign-in;
+* `verify` fails on any line not spelled as its row, and `parity` fails when the local log holds
+  lines of a remote reviewer that no row holds under that spelling (counts only).
+
 ### What is published
 
-`publish-bundle` uploads the part of the local bundle that the first `scope_sequences` sequences
-(review order) need, under the ORIGINAL `bundle_id` (the records carry it):
+`publish-bundle` uploads the part of the local bundle that a page of a reviewer of the first
+`scope_sequences` sequences (review order) shows, or a check of the site reads, and nothing
+else, under the ORIGINAL `bundle_id` (the records carry it):
 
-* the items the scope offers; the items of no sequence only once the scope covers every
-  sequence;
-* the posts those items, their context and their reply and quote chains need, and only the
-  images those posts list (at most 4 MB each: `MEDIA_TOO_LARGE`); of an item's and a post's
-  line only the keys the workspace reads;
-* every sequence id with its place in the review order, because the `idea` choices list them;
-  a sequence outside the scope keeps no post;
-* an instruction item outside the scope that shares its post with an item inside it, as a stub
-  (its place among the post's forms and its market; no context, no system reading): "form k of
-  m" of that post counts it;
+* the items the scope offers (those of no sequence only once the scope covers every sequence),
+  each with the keys the loader reads, at every level of its line; not its `set`;
+* the OWN post of each such item whole (text, numbers, links) and its images (at most 4 MB
+  each: `MEDIA_TOO_LARGE`): the only images a page shows; a post shown as context with its time
+  and text only; a post that is only named (the target of an own post's reply or quote) as a
+  stub without text, time or images;
+* every sequence id with its place in the review order, because the `idea` choices list them,
+  and nothing else of a sequence outside the scope;
+* an instruction item outside the scope that shares its post with an item inside it, as a stub:
+  its place among the post's forms ("form k of m" counts it), and its market only when it
+  comes before a form in scope (the comparison of the position fields reads the markets of the
+  earlier forms of a post);
 * a system reading that refers to an item left out refers to that item's sequence instead, which
-  reads as the same idea association.
+  reads as the same idea association;
+* of the manifest: its schema, the bundle id and the markets.
 
 Before anything is uploaded it compares the full bundle with the part for every item in scope,
 through the functions the workspace itself uses: the review order, the item's system fields,
-`system_reading`, `post_forms`, `post_siblings`, `table_row_details`, `system_rows`,
-`form_context`, the ideas the `idea` field offers, and the evidence (the posts shown and the
-sha256 of each image). One difference: `parity with the full bundle: FAIL`, the check and the item
-id of each, exit 1, nothing uploaded.
+`system_reading`, the forms of its post and the markets of the earlier ones, `post_siblings`,
+`table_row_details`, `system_rows`, `form_context`, the ideas the `idea` field offers, the
+evidence (the own post, and each context post's time and text), and the images: every image a
+page shows must be in the publication with the sha256 of the local file, and no other image may
+be. One difference: `parity with the full bundle: FAIL`, the check and the item id of each,
+exit 1, nothing uploaded.
 
 ```text
-bundle 5bee31e4acb2: scope 2 of 33 sequence(s); items 8 shown, 1 kept for form numbering, 37 left out; posts 10 of 41; images 1, 73 bytes; files 9120 bytes
+bundle 5bee31e4acb2: scope 2 of 33 sequence(s); items 8 shown, 1 kept for form numbering, 37 left out; posts 8 with text and 1 named only, of 41; images 1, 73 bytes; files 8620 bytes
 parity with the full bundle: PASS, 8 item(s) in scope, 0 difference(s)
-published and active: bundle 5bee31e4acb2, demonstration data
+images: all 1 that a page shows are in the publication with the sha256 of the local file; no other image is published
+published and active: bundle 5bee31e4acb2, demonstration data (for test identities; the real bundle stays)
 ```
 
 To raise the scope: raise `scope_sequences` in `reviewers.toml`, then `publish-bundle`, then
@@ -351,30 +385,69 @@ of it: a later line supersedes, as in the local log.
   (`chain_anchor`). A line hashes the same as a local one (`vocab_recommend.encode_line`).
 * **RETURN**: the approver's local decision to return a reading, stored by `push-returns` for
   the reviewer it concerns (below). Outside the hosted chain; the site never writes one.
+* **TEST**: a line of a test identity, written by the site: a stream of its own (`seq` 3000001,
+  3000002, ..., chained among themselves from a fixed value). It never touches the reviewers'
+  chain or the anchor, whenever it is written, and is never imported, pulled or pushed; the
+  table refuses a TEST line of anyone else and any other line of a test identity.
+
+The **anchor** is the local log's state that the reviewers' hosted chain continues. Every
+`import-log` moves it to the log's present head, until the first HOSTED line of a reviewer
+exists: from then on it is fixed, and `import-log` says so (`anchor: ...: FIXED ...`).
+
+### The site's own database role
+
+The role that owns the tables can disable or drop the trigger that makes `event` append-only.
+The operator tool connects as that role; the SITE must not. `make-site-role` creates a second
+login role that owns nothing and has exactly the rights the site's code uses:
+
+* read `reviewer`, `bundle`, `media`, `event`, `chain_anchor`, `mail_queue`;
+* add rows to `event` (never change or delete one);
+* every row operation on the sign-in tables `login_code`, `web_session`, `rate_limit`;
+* set `reviewer.first_sign_in_at` and `reviewer.invited_at`, and `mail_queue.attempts`,
+  `sending_at`, `result`, `sent_at`; no other column of either table.
+
+```bash
+python scripts/hosted_admin.py make-site-role --out ~/hosted-keys/site-address-1
+```
+
+Give the content of that file to the site as its `DATABASE_URL` (the pooled address, if
+`HOSTED_DATABASE_URL` is the pooled one), and keep `HOSTED_DATABASE_URL` (the owner's role) on
+the Mac only. Run it again with another `--out` to change the password. It runs after
+`init-db` (the tables must exist), over the direct connection when
+`HOSTED_DATABASE_URL_UNPOOLED` is set. It refuses a role that is an administrator, owns
+anything or is a member of another role (`NOT_A_SITE_ROLE`).
 
 ### Cutover
 
-Rehearse steps 1 to 3 while the present site still serves: every command can be run again.
+Rehearse steps 1 to 3 while the present site still serves: every command can be run again, and
+no reviewer may sign in to the hosted site before step 8 (a reviewer's first save there fixes
+the anchor).
 
 1. `init-db`, `publish-bundle --check-only`, `publish-bundle`, `sync-reviewers`, `status`.
 2. `import-log`, then `parity` and `verify`: both PASS.
 3. `publish-bundle --demo DIR`, `sync-reviewers --test-identity TEST-1 LOGIN`: sign in as that
-   test identity, work through an invented form, and read `test-report TEST-1`.
+   test identity, work through an invented form, and read `test-report TEST-1`. This may be
+   done at any time, before the first import too: a test identity's lines are a stream of
+   their own and leave the anchor alone.
 4. **Pause the writers**: stop the present published site, so that no remote reviewer can save
    into the local log. Do not save locally yourself during the next steps.
 5. **Verify** the local log: `python scripts/adjudication_freeze.py verify`.
 6. **Snapshot and import**: `import-log`. It verifies chain and head again, writes
    `<adjudication dir>/hosted_snapshots/log-<lines>-<sha256 prefix>/` (folder 0700, files 0600:
    the log, its head file, the sha256 of the log's bytes), imports only the lines that are new
-   since the rehearsal, and moves the anchor to the log's present head.
-7. **Parity**: `parity` PASS, `verify` PASS. Compare the per-alias lines and form states that
-   `import-log` printed, and each reviewer's next step, with what you expect.
+   since the rehearsal, and moves the anchor to the log's present head (it prints
+   `anchor: <lines> line(s), head <...>: moved to the log's present head`; if it prints FIXED
+   instead, a reviewer has already saved on the site: stop and decide with the owner).
+7. **Returns and parity**: `push-returns` (a return the approver decided before the cutover
+   and that still stands reaches its reviewer only by this command; until it is run, `parity`
+   fails on that form), then `parity` PASS and `verify` PASS. Compare the per-alias lines and
+   form states that `import-log` printed, and each reviewer's next step, with what you expect.
 8. Open the hosted site to the reviewers.
 
 ```text
 local log: 8 line(s), head ba9b895aae2b, 10174 bytes, sha256 dcb3...4622
 snapshot: log-00000008-dcb320867b5390e1
-anchor: 8 line(s), head ba9b895aae2b
+anchor: 8 line(s), head ba9b895aae2b: moved to the log's present head
 imported 7 new line(s); 0 already imported
 REMOTE-1: lines 6 (6 new); forms 45: DONE 1, INDEPENDENT_SAVED 1, INDEPENDENT_SAVED+SHOWN 1, OPEN 42
   i07 DONE
@@ -387,12 +460,15 @@ the system's reading was already shown and the reading after the reveal is still
 
 `import-log` refuses, and changes nothing, when the lines it imported earlier are no longer the
 local log's (`IMPORTED_PREFIX_DIFFERS`), when the log fails verification
-(`ANNOTATION_LOG_FAILS_VERIFICATION`), and when a reviewer who has saved on the site has also
-saved locally since (`LOCAL_SAVE_AFTER_HOSTED_SAVES`: two histories; see Rollback).
+(`ANNOTATION_LOG_FAILS_VERIFICATION`), when a reviewer who has saved on the site has also
+saved locally since (`LOCAL_SAVE_AFTER_HOSTED_SAVES`: two histories; see Rollback), and when a
+reviewer saved on the site before any log was imported (`HOSTED_LINES_BEFORE_FIRST_IMPORT`: that
+chain continues no log; start from an empty database).
 
 ### Day to day: hosted saves in the local log
 
-Approval, freeze and scoring read the local log. Before them:
+Approval, freeze and scoring read the local log, and nothing in them knows of the site: a
+freeze taken without a pull simply lacks the hosted saves. Before them, always:
 
 ```bash
 python scripts/hosted_admin.py pull-to-local
@@ -402,10 +478,14 @@ python scripts/adjudication_freeze.py verify
 
 `pull-to-local` appends each hosted save the local log does not hold yet, through the log's own
 chained append: the same record with its own time, `refers_to` pointing at the local line of the
-record it means, and `hosted = {"seq", "sha256"}` naming the hosted line. It can be run again
-(nothing is appended twice), never touches a line already there, and skips test identities. It
-refuses a folder whose log is not the one the site continues
-(`LOCAL_LOG_IS_NOT_THE_ANCHORED_LOG`) and a store that fails verification. Between pulls `parity`
+record it means, and `hosted = {"seq", "sha256"}` naming the hosted line. It can be run again,
+and two runs at once are safe: whether a line is already held is decided under the log's own
+lock at each append, so nothing is appended twice. It never touches a line already there and
+never pulls a test identity's line. It
+refuses a folder whose log does not hold the anchored head at the anchored line count
+(`LOCAL_LOG_IS_NOT_THE_ANCHORED_LOG`), any log but an empty one while nothing was imported
+(`NO_ANCHOR_IMPORT_LOG_FIRST`), and a store that fails verification; `push-returns` refuses
+the same. Between pulls `parity`
 says FAIL with `hosted lines not pulled: n`; after a pull it must PASS.
 
 ```text
@@ -415,6 +495,11 @@ REMOTE-1: bundle 5bee31e4acb2; records local 6, hosted 8: DIFFERENT; forms 45: 4
   next step: local i08 AFTER_REVEAL_DUE, hosted i01 AFTER_REVEAL_DUE: DIFFERENT
 parity of the local log and the hosted store: FAIL, 1 reviewer(s)
 ```
+
+`parity` also compares the site's state of EVERY form on both sides (a return that is missing
+or stale on a form that is not the next step shows there), and fails when the local log holds
+lines of a remote reviewer that no row holds; compare the number of reviewers it prints with
+the reviewers file.
 
 The next step is the form the site's "Continue" opens and where it stands (INDEPENDENT_DUE,
 REVEAL_PENDING, AFTER_REVEAL_DUE, RETURNED). On the local side it is computed over the
@@ -440,9 +525,9 @@ field) and stores one RETURN event under that reviewer:
 * an APPROVAL record of the log's shape with `decision: "RETURN"`, the approver's notes and
   time, and `refers_to` the `seq` the returned reading has in the store; of the approver only
   the role (`annotator` is `approver` / `Approver`, never a sign-in or a name);
-* `seq` 2000000 + the seq of the local approval line (so the same decision is stored once),
-  `prev_sha256` the sha256 of the returned reading, `local = {"seq", "sha256"}` naming the local
-  line.
+* `seq` 2000000 + twice the seq of the local approval line (so the same decision is stored
+  once, in the local log's order), `prev_sha256` the sha256 of the returned reading,
+  `local = {"seq", "sha256"}` naming the local line.
 
 The site serves it to that reviewer only, after the reviewer's own records, and computes
 "returned" with the workspace's own functions (`effective_approval`, `_outcome`), so the form
@@ -455,7 +540,8 @@ again.
 ```text
 returns that stand in the local log: 2; 0 of a reading that was not made by a hosted reviewer
 pushed 1 new return(s): REMOTE-1 1; 1 already stored; 0 skipped (the returned reading is not in the hosted store)
-  REMOTE-1 i03: return 2000012 of the reading 1000003
+  REMOTE-1 i03: return 2000024 of the reading 1000003
+cleared 0 pushed return(s) that no longer stand locally: -
 ```
 
 It can be run again (nothing is stored twice). A RETURN of a reading the store does not hold
@@ -464,11 +550,21 @@ It can be run again (nothing is stored twice). A RETURN of a reading the store d
 seq and sha256; `export` and `restore` carry RETURN events like the others; `parity` compares the
 reviewers' own records only.
 
-One limit: no event can be taken back. If the approver decides again on the same reading
-(ACCEPT or AMEND after a RETURN) before the reviewer has answered, the site still shows the
-return until that reviewer saves again; `push-returns` then prints
-`NO_LONGER_STANDS_LOCALLY <alias> <item>`. The same holds for the return of one reviewer's
-reading once the approver's latest decision on that item concerns another reviewer's reading.
+No event can be taken back. When a pushed return no longer stands locally (the approver decided
+again on that reading, or the item's latest decision now concerns another reviewer's reading)
+and the site still shows it, `push-returns` stores ONE clearing line after it: the same shape
+without content (`decision: "WITHDRAWN"`, no notes: nothing of what the approver decided), made
+from the local decision that came after, at one seq above that decision's place. The site's
+`effective_approval` then no longer gives the return, the form stands as done, and nothing asks
+the reviewer for a save that would undo an acceptance. Stored once, like a return:
+
+```text
+cleared 1 pushed return(s) that no longer stand locally: REMOTE-1 1
+  REMOTE-1 i07: line 2000021 clears the return 2000018
+```
+
+Only when there is no later local decision to make the line from (the reading was superseded
+by a local save of the reviewer) it prints `NO_LONGER_STANDS_LOCALLY <alias> <item>` instead.
 
 ### Backup: export and restore
 
@@ -483,8 +579,10 @@ restored, so after a restore everyone signs in again; bundles and reviewer rows 
 again by their own commands. To restore into a new database: `init-db`, `publish-bundle` (and
 `publish-bundle --demo DIR`), `sync-reviewers` (the same reviewers file gives the same aliases;
 the test identities again by `--test-identity`), `restore --in FILE`, `verify`. "Empty" means no
-event and no anchor. Refused: `DATABASE_NOT_EMPTY`, `UNKNOWN_ALIAS` (sync first),
-`ALIAS_IS_NOT_THE_SAME_KIND` (a test identity's lines under a reviewer's alias, or the reverse),
+event and no anchor. A line is restored under the row whose sign-in is spelled exactly as the
+line's annotator (a return: under the row of the reading it returns), never by alias. Refused:
+`DATABASE_NOT_EMPTY`, `NO_ROW_FOR_A_LINE_S_SIGN_IN` (sync first, from the same file),
+`ROW_IS_NOT_THE_SAME_KIND` (a test identity's lines under a reviewer's row, or the reverse),
 `EXPORT_UNREADABLE`, `EXPORT_FAILS_VERIFICATION` (a line that does not match its hash, a gap in
 the hosted chain, an anchor the first hosted line does not name). The restored site continues
 the same chain.

@@ -136,7 +136,9 @@ def returned(bundle: A.Bundle, item: dict, records: list[dict], after: dict | No
     """The approver's RETURN of this reviewer's latest reading after the reveal, while it stands
     (``_reviewer``). The store hands a reviewer the approver's RETURN records of their own
     readings beside their own records: this is the one place that reads a record of another
-    login. A later save by the reviewer ends it (the approval then refers to an older record)."""
+    login. A later save by the reviewer ends it (the approval then refers to an older record),
+    and so does the line the operator tool stores when the approver took the return back: the
+    latest approval of the item is then that line, whose decision is not RETURN."""
     appr = A.effective_approval(A.rubric2(records), item["item_id"], bundle) \
         if after is not None else None
     return appr if appr is not None and A._outcome(appr) == "RETURN" and appr[

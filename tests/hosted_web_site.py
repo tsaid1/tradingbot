@@ -15,7 +15,9 @@ hand-written request.
 
 from __future__ import annotations
 
+import functools
 import html
+import importlib.util
 import json
 import re
 from datetime import UTC, datetime, timedelta
@@ -53,6 +55,17 @@ SYSTEM_MARKS = {
              "basis": "ZQSYS_BASIS_BETA", "ambiguity": "ZQSYS_AMBIGUITY_BETA"},
 }
 SYSTEM_WORDS = ("ZQSYS", "holds SHIPPED", "system-value", "proposal-value", "not read by")
+
+
+@functools.cache
+def operator_tool():
+    """``scripts/hosted_admin.py`` as a module. A test's line of the RETURN stream is built by the
+    operator tool's own ``return_record``: the page is then shown what ``push-returns`` stores."""
+    spec = importlib.util.spec_from_file_location("hosted_admin_for_the_site",
+                                                  REPO / "scripts" / "hosted_admin.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def mark_system(base: Path) -> None:
@@ -322,11 +335,13 @@ class Browser:
             self.shown = shown = Shown(self.get(shown.response.headers["Location"]))
         return shown
 
-    def review(self, item_id: str, *, after: bool = True, like: str | None = None) -> None:
+    def review(self, item_id: str, *, after: bool = True, like: str | None = None,
+               answers: dict | None = None) -> None:
         """The scenario's reading of ``item_id`` (or of the demo item ``like`` it is a copy of):
         independent, and (when the system's reading is revealed) after the reveal with the two
-        mapping questions answered YES."""
+        mapping questions answered YES. ``answers``: what this bundle's form asks beside it."""
         reading, form = scenario_reading(self.site.bundle, like or item_id)
+        reading = {**(answers or {}), **reading}
         self.open(item_id)
         self.fill(reading)
         saved = self.save(confidence=form["confidence"], flags=form["flags"],
@@ -444,25 +459,42 @@ class Site:
             cur = conn.execute(statement, values)
             return cur.fetchall() if cur.description else []
 
-    def return_reading(self, alias: str, item_id: str, note: str = "") -> dict:
-        """The approver's RETURN of the reviewer's latest reading after the reveal, stored for
-        THAT reviewer as the operator tool stores it (origin RETURN, outside the hosted chain)."""
+    def _approver_line(self, alias: str, reviewed: dict, note: str, clears: int | None,
+                       annotator: dict | None = None) -> dict:
+        """Store, for that reviewer, the line ``push-returns`` makes from a local approval line
+        (here an invented one, after every local line a return was made from so far): seq
+        2000000 + twice that line's seq, one above for a clearing line; outside the chain."""
         from reviewer_web.store import EventLine
 
-        reviewer = self.reviewers[alias]
-        after = [r for r in self.records(alias) if r["item_id"] == item_id
-                 and r["phase"] == A.AFTER_REVEAL][-1]
-        seq = 2_000_001 + len(self.sql("SELECT 1 FROM event WHERE origin = 'RETURN'"))
-        record = {"schema": A.ANNOTATION_SCHEMA, "seq": seq, "prev_sha256": "0" * 64,
-                  "at": self.clock().isoformat(), "bundle_id": self.bundle.bundle_id,
-                  "item_id": item_id,
-                  "annotator": {"login": "owner@example.invalid", "name": "Owner Example",
-                                "role": A.APPROVER, "access": A.FULL},
-                  "phase": A.APPROVAL, "blind": False, "reading": {}, "field_verdicts": {},
-                  "flags": [], "confidence": "", "notes": note, "refers_to": after["seq"],
-                  "decision": "RETURN", "rubric": A.RUBRIC, "acknowledged_warnings": []}
-        self.admin.insert_events([EventLine(reviewer.id, "RETURN", encode_line(record))])
+        held = [json.loads(e["line"])["local"]["seq"] for e in self.admin.events()
+                if e["origin"] == "RETURN"]
+        approval = {"seq": max(held, default=8) + 1, "at": self.clock().isoformat(),
+                    "bundle_id": json.loads(reviewed["line"])["bundle_id"],
+                    "item_id": reviewed["item_id"], "notes": note}
+        record = operator_tool().return_record(approval, "0" * 64, reviewed, clears=clears)
+        if annotator is not None:
+            record["annotator"] = annotator
+        self.admin.insert_events([EventLine(self.reviewers[alias].id, "RETURN",
+                                            encode_line(record))])
         return record
+
+    def return_reading(self, alias: str, item_id: str, note: str = "", *,
+                       annotator: dict | None = None) -> dict:
+        """The approver's RETURN of the reviewer's latest reading after the reveal, stored for
+        THAT reviewer as the operator tool stores it (origin RETURN; of the approver the role
+        only). ``annotator``: what the line says of the approver instead, for a line as no tool
+        writes it: a page shows nothing of that either."""
+        after = [e for e in self.admin.events() if (e["alias"], e["item_id"], e["phase"]) == (
+            alias, item_id, A.AFTER_REVEAL)][-1]
+        return self._approver_line(alias, after, note, None, annotator)
+
+    def clear_return(self, alias: str, returned: dict) -> dict:
+        """The approver decided again on a reading whose return was pushed: the ONE line without
+        content that ``push-returns`` then stores after it (decision WITHDRAWN). Whatever the
+        approver noted with that later decision is no part of it."""
+        reviewed = next(e for e in self.admin.events() if e["seq"] == returned["refers_to"])
+        return self._approver_line(alias, reviewed, "a note of the approver's own, never stored",
+                                   returned["seq"])
 
 
 @pytest.fixture
