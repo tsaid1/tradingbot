@@ -154,7 +154,8 @@ def test_every_response_carries_the_headers_and_nothing_is_kept_by_a_browser(sit
                     "_csrf": signed.csrf(), "_phase": A.INDEPENDENT},
                     headers={"X-Fragment": "form"})),
                 ("POST save", signed.post("/form/i07/save", {
-                    "_csrf": signed.csrf(), "_phase": A.INDEPENDENT, "_key": "k" * 24})),
+                    "_csrf": signed.csrf(), "_phase": A.INDEPENDENT,
+                    "_key": site.page_key(FIRST, "i07")})),
                 ("POST sign-out", signed.post("/sign-out", {"_csrf": signed.csrf()}))]
     assert {a.status_code for _, a in answers} >= {200, 303, 401, 403, 404, 422}
     for path, answer in answers:

@@ -372,6 +372,12 @@ class Site:
     def reviewers(self) -> dict:
         return {r.alias: r for r in self.admin.reviewers()}
 
+    def page_key(self, alias: str, item_id: str) -> str:
+        """A key as a page of that form would carry it for that reviewer."""
+        from reviewer_web import app as web
+
+        return web.page_key(SECRET.encode(), self.reviewers[alias].id, item_id)
+
     def browser(self, app=None) -> Browser:
         """A new browser on the site's application, or on another one over the same database."""
         return Browser(self, app)

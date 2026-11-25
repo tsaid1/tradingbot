@@ -239,7 +239,8 @@ def test_nothing_of_the_system_leaves_the_server_before_every_form_of_the_post_i
     # A request for the form after the reveal, sent anyway, for either form: refused, empty.
     for item in ("s14a", "s14b"):
         b.open("s14b")
-        hostile = [(n, A.AFTER_REVEAL if n == "_phase" else v) for n, v in b.shown.data()]
+        hostile = [(n, A.AFTER_REVEAL if n == "_phase" else site.page_key(FIRST, item)
+                    if n == "_key" else v) for n, v in b.shown.data()]
         hostile += [("reference_series_right", "YES"), ("confidence", "HIGH")]
         answer = b.post(f"/form/{item}/save", hostile)
         assert answer.status_code == 422
@@ -329,7 +330,7 @@ def test_an_independent_reading_cannot_be_saved_once_the_system_was_shown(site):
     before = site.records(FIRST)
     assert [r["phase"] for r in before] == [A.INDEPENDENT, A.SYSTEM_SHOWN]
     # The same answers again from the old page, with a new key: the core refuses, calmly.
-    again = [(n, "another-key-0123456789abcdef" if n == "_key" else v) for n, v in independent]
+    again = [(n, site.page_key(FIRST, "i07") if n == "_key" else v) for n, v in independent]
     answer = b.post("/form/i07/save", again)
     text = answer.get_data(as_text=True)
     assert answer.status_code == 422 and "Not saved (SYSTEM_READING_ALREADY_SEEN)" in text
@@ -529,16 +530,66 @@ def test_the_same_key_twice_stores_one_record(site):  # noqa: F811
     assert [r["phase"] for r in site.records(FIRST)] == [
         A.INDEPENDENT, A.SYSTEM_SHOWN, A.AFTER_REVEAL]
     assert len(site.sql("SELECT 1 FROM event")) == 3
-    # A key is the page's own: no key, or a malformed one, saves nothing.
-    for key in ("", "short", "x" * 80, "has spaces in it 0123456789"):
+    # A key is the page's own: no key, a malformed or made-up one, the key of another form or
+    # of another reviewer's page saves nothing.
+    for key in ("", "short", "x" * 80, "has spaces in it 0123456789", "k" * 24,
+                "k" * 24 + "." + "0" * 32, site.page_key(FIRST, "i08"),
+                site.page_key(SECOND, "i07"), site.page_key(FIRST, "i07") + "0"):
         bad = [(n, key if n == "_key" else v) for n, v in data]
-        assert later.post("/form/i07/save", bad).status_code == 400
+        assert later.post("/form/i07/save", bad).status_code == 400, key
     assert len(site.sql("SELECT 1 FROM event")) == 3
     # A confirmation names only the reviewer's own record of that form.
     assert "Saved." not in later.get("/form/i08?saved=" + str(ind["seq"])).get_data(as_text=True)
     assert "Saved." not in later.get("/form/i07?saved=999").get_data(as_text=True)
     other = site.browser().sign_in(SECOND)
     assert "Saved." not in other.get(first.headers["Location"]).get_data(as_text=True)
+
+
+def test_the_same_page_posted_with_other_answers_is_another_save(site):  # noqa: F811
+    """The review's finding 7: a second POST with the key of a stored save and a CHANGED body
+    was answered "Saved." although the changed body was not stored; the same key sent to another
+    form redirected there without a word."""
+    b = site.browser().sign_in(FIRST)
+    reading, _form = scenario_reading(site.bundle, "i07")
+    b.open("i07")
+    b.fill(reading)
+    b.set({"confidence": "HIGH", "notes": "first body"})
+    data = b.shown.data()
+    first = b.post("/form/i07/save", data)
+    assert first.status_code == 303
+    changed = [(n, "LOW" if n == "confidence" else "second body, changed" if n == "notes" else v)
+               for n, v in data]
+    second = b.post("/form/i07/save", changed)
+    # Another save: checked as one. An independent reading exists, so the core refuses it; the
+    # page says "Not saved", never "Saved".
+    text = second.get_data(as_text=True)
+    assert second.status_code == 422 and "Not saved (SYSTEM_READING_ALREADY_SEEN)" in text
+    assert "<strong>Saved.</strong>" not in text
+    assert [(r["confidence"], r["notes"]) for r in site.records(FIRST, markers=False)] == [
+        ("HIGH", "first body")]
+    # The first POST again, unchanged, is still the same save.
+    assert b.post("/form/i07/save", data).headers["Location"] == first.headers["Location"]
+    # The same key on another form is not a key there: an error page, nothing stored.
+    other = b.post("/form/i08/save", data)
+    assert other.status_code == 400 and "Location" not in other.headers
+    assert b"could not be read" in other.get_data()
+    assert {r["item_id"] for r in site.records(FIRST)} == {"i07"}
+    # After the reveal a changed body is a changed reading: stored as the new record it is.
+    b.open("i07")
+    b.set({"confidence": "MEDIUM", "notes": "after the reveal"})
+    data = b.shown.data()
+    assert b.post("/form/i07/save", data).status_code == 303
+    changed = [(n, "after the reveal, corrected" if n == "notes" else v) for n, v in data]
+    again = b.post("/form/i07/save", changed)
+    assert again.status_code == 303
+    assert b.post("/form/i07/save", changed).headers["Location"] == again.headers["Location"]
+    assert [r["notes"] for r in site.records(FIRST) if r["phase"] == A.AFTER_REVEAL] == [
+        "after the reveal", "after the reveal, corrected"]
+    # What the store keeps is a hash: neither the page's key nor an answer.
+    kept = [row[0] for row in site.sql("SELECT idempotency_key FROM event WHERE "
+                                       "idempotency_key IS NOT NULL")]
+    assert len(kept) == 3 and all(len(k) == 64 and "corrected" not in k for k in kept)
+    assert dict(data)["_key"] not in kept
 
 
 def test_two_reviewers_saving_at_the_same_moment_both_succeed_as_themselves(site):  # noqa: F811

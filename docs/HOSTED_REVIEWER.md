@@ -147,8 +147,10 @@ is an instruction or label-only, and the market names and idea identifiers offer
 **Saving.** One connection and one transaction per request; the page is built after the commit.
 The server validates every save with the rubric (`build_annotation` through `Store.append`,
 under the store's lock, against the reviewer's current records); the browser decides nothing. A
-save carries a key made for that rendering of the form: the same key again stores nothing and
-shows the saved state.
+save carries a key made for that rendering of that form for that reviewer (a key sent to another
+form, or made up, is refused). The store knows a save by a hash of that key and of what was
+posted with it: the same POST again stores nothing and shows the saved state; the same page
+posted with other answers is a new save and is checked as one.
 
 **Images** are served only for the post of a form in the reviewer's scope, of the reviewer's
 bundle, by a name that post lists, as PNG, JPEG, GIF or WEBP of at most 4 MB.

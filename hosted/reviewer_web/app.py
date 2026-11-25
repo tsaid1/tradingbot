@@ -28,8 +28,10 @@ queued invitations ``OPERATOR_TOKEN`` and ``SITE_URL`` (``from_environment``).
 from __future__ import annotations
 
 import functools
+import hashlib
 import hmac
 import inspect
+import json
 import os
 import re
 import secrets
@@ -72,7 +74,7 @@ HEADERS = {
     "Cross-Origin-Opener-Policy": "same-origin",
     "Cross-Origin-Resource-Policy": "same-origin",
 }
-_KEY = re.compile(r"^[A-Za-z0-9_-]{16,64}$")
+_KEY = re.compile(r"^([A-Za-z0-9_-]{16,64})\.([0-9a-f]{32})$")
 _BUNDLE = re.compile(r"^[0-9a-f]{64}$")
 MESSAGES = {
     400: "The request could not be read.",
@@ -98,6 +100,32 @@ class Who:
 
 def _code(exc: Exception) -> str:
     return getattr(exc, "code", None) or type(exc).__name__
+
+
+def page_key(secret: bytes, reviewer_id: int, item_id: str) -> str:
+    """The key of ONE rendering of one form for one reviewer: a random part, and a signature
+    that binds it to that form. Posted to another form, or made up, it is not a key."""
+    nonce = secrets.token_urlsafe(18)
+    return f"{nonce}.{_key_mac(secret, reviewer_id, item_id, nonce)}"
+
+
+def _key_mac(secret: bytes, reviewer_id: int, item_id: str, nonce: str) -> str:
+    text = "\0".join(("key", str(reviewer_id), item_id, nonce)).encode("utf-8")
+    return hmac.new(secret, text, hashlib.sha256).hexdigest()[:32]
+
+
+def page_key_fits(secret: bytes, reviewer_id: int, item_id: str, key: str) -> bool:
+    found = _KEY.fullmatch(key)
+    return found is not None and hmac.compare_digest(
+        found.group(2), _key_mac(secret, reviewer_id, item_id, found.group(1)))
+
+
+def save_key(key: str, fields) -> str:
+    """What the store keeps of a save, to know it again: the page's key AND what was posted. The
+    same POST again (a double click, a retry after a dropped connection) is the same save; the
+    same page posted with other answers is another save, and is checked as one."""
+    body = json.dumps(sorted(fields), ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(f"{key}\n{body}".encode()).hexdigest()
 
 
 def _cause(exc: Exception) -> str:
@@ -503,7 +531,7 @@ def create_app(store, mailer, config: dict) -> Flask:
             how=R.HOW_TO_REVIEW, verdict_help=R.VERDICT_HELP,
             overall=F.overall(bundle, item, records, who.session.login),
             form=build(bundle, item, records, gate, phase, posted) if phase else None,
-            key=secrets.token_urlsafe(24), revealed=revealed,
+            key=page_key(secret, who.reviewer.id, item_id), revealed=revealed,
             system=F.system_block(bundle, item) if revealed else None,
             described=F.describe(gate.ind) if gate.ind is not None and not revealed else None,
             waiting=[i for i in gate.waiting if i != item_id], problem=problem,
@@ -540,7 +568,8 @@ def create_app(store, mailer, config: dict) -> Flask:
 
         def fragment():
             response = Response(render_template(
-                "_form_body.html", item_id=item_id, key=secrets.token_urlsafe(24),
+                "_form_body.html", item_id=item_id,
+                key=page_key(secret, g.who.reviewer.id, item_id),
                 form=build(bundle, item, records, gate, phase, request.form)),
                 mimetype="text/html")
             response.headers["X-Fragment"] = "form"
@@ -550,12 +579,18 @@ def create_app(store, mailer, config: dict) -> Flask:
     @app.post("/form/<item_id>/save")
     @reviewer_route
     def save(item_id):
-        """ONE record per idempotency key: a second POST with the same key (a double click, a
-        retry after a dropped connection) stores nothing and shows the saved state."""
+        """ONE record per save: the same POST again (a double click, a retry after a dropped
+        connection) stores nothing and shows the saved state. A save is known by the page's key
+        and what was posted with it (``save_key``): the same page sent with other answers is a
+        new save, checked as one, and is never answered "Saved" for something not stored. The
+        key belongs to this form of this reviewer; any other key is no request at all."""
         bundle, item = item_of(item_id)
         who, phase, key = g.who, request.form.get("_phase"), request.form.get("_key", "")
-        if phase not in (A.INDEPENDENT, A.AFTER_REVEAL) or not _KEY.fullmatch(key):
+        if phase not in (A.INDEPENDENT, A.AFTER_REVEAL) or not page_key_fits(
+                secret, who.reviewer.id, item_id, key):
             return refuse(400)
+        posted = save_key(key, [(k, v) for k, v in request.form.items(multi=True)
+                                if k != "_csrf"])  # the session's token is not what was saved
 
         def make(current):
             """Under the store's lock, with the reviewer's current records."""
@@ -575,7 +610,7 @@ def create_app(store, mailer, config: dict) -> Flask:
                 acknowledged_warnings=filled.ack)
 
         try:
-            done = store.append(who.reviewer, make, idempotency_key=key)
+            done = store.append(who.reviewer, make, idempotency_key=posted)
         except A.AdjudicationError as exc:
             if exc.code == "REVOKED":
                 auth.end_session(store, who.token)
