@@ -146,6 +146,24 @@ def test_a_call_with_the_token_sends_each_queued_invitation_once(site, caplog): 
     assert call(app, bearer(), path="/sign-out").status_code == 403
 
 
+def test_the_sites_configured_address_is_written_into_the_invitation_and_nowhere_else(
+        site):  # noqa: F811
+    """One deployment answers under two host names: no page and no redirect may name a host.
+    ``SITE_URL`` is for the invitation alone."""
+    app = live(site)
+    b = site.browser(app).sign_in(FIRST)
+    b.review("i07", after=False)
+    seen = [b.shown.response, b.get("/"), b.get("/continue"), b.get("/guide"), b.get("/fields"),
+            b.get("/form/i01"), b.get("/sign-in"), site.browser(app).get("/sign-in"),
+            b.post("/sign-out", {"_csrf": b.csrf()})]
+    for response in seen:
+        text = response.get_data(as_text=True) + repr(sorted(response.headers.items()))
+        assert "review.example.invalid" not in text and "://" not in text
+    site.admin.queue_mail(FIRST, "INVITE_START")
+    assert call(app, bearer()).get_json() == {"sent": 1, "failed": 0, "left": 0}
+    assert f"Open: {URL}\n" in site.outbox.sent[-1][2]
+
+
 def test_a_message_that_fails_is_tried_three_times_and_five_go_out_per_call(
         site, caplog):  # noqa: F811
     from reviewer_web import mail

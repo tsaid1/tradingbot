@@ -160,6 +160,18 @@ same connection and sends nothing. When the server refuses or loses the one mess
 unlisted address could meet), the page stays the neutral one and `MAIL_FAILED` is logged:
 saying so would tell that the address is listed. In both cases the undelivered code is ended.
 
+**The operator's sender.** `POST /internal/send-queued` is the one route without a session, and
+so without the origin check and the CSRF token: it sends the invitations the operator queued
+(see "Inviting a reviewer"), because the mail password exists only where the site runs. It reads
+no parameter and no body. It answers only to `Authorization: Bearer <OPERATOR_TOKEN>`, compared
+in constant time, where `OPERATOR_TOKEN` is an environment variable of at least 32 characters;
+with the variable unset or too short, a wrong header or any other method, the answer is exactly
+that of a path that does not exist. So it is in `preview` and `test`, which never send mail, and
+without `SITE_URL` (`SITE_URL_MISSING` is logged). `SITE_URL` (an `https://` address) is the
+site's address as the invitations name it: the only absolute address the site ever writes; no
+page and no redirect uses it, so the site works under each of its host names. The route's
+answer is three counts (`sent`, `failed`, `left`); it never returns or logs an address.
+
 **Environments** (`SITE_ENV`). `preview` and `test` serve only bundles flagged as demonstration
 data: they do not start on any other, stop answering if one is published, and refuse a reviewer
 whose bundle is not flagged. With none of the mail variables set they use synthetic mail: no
@@ -211,6 +223,7 @@ python scripts/hosted_admin.py status
 | `sync-reviewers --test-identity TEST-1 LOGIN` | Instead: writes (or updates) the test identity `TEST-<n>` for that sign-in, bound to the active DEMONSTRATION bundle with that bundle's scope (`NO_DEMO_BUNDLE_PUBLISHED` while there is none). The reviewers file is not read. |
 | `revoke ALIAS` | Sets `revoked_at` and deletes that reviewer's web sessions and sign-in codes not yet used. From that moment sign-in, every page and every save are refused; the records stay. |
 | `restore-access ALIAS` | Clears the revocation (the reviewer signs in again). |
+| `invite ALIAS --kind continue\|start` | Queues one invitation for the SITE to send (the operator's machine holds no mail password): `continue` for a reviewer whose work moved here, `start` for a first access. Refused for a test identity (`TEST_IDENTITY_IS_NOT_INVITED`), a revoked reviewer (`REVOKED`), an unknown alias, and while a message of that kind already waits (`ALREADY_QUEUED`). |
 | `publish-bundle` | Verifies the local bundle (`BUNDLE_ID_MISMATCH` otherwise), cuts the part the scope needs, checks parity, uploads and marks it THE active real bundle. Refused unless `remote_full_context_authorized = true` (`REMOTE_FULL_CONTEXT_NOT_AUTHORIZED`): the posts leave the Mac only by the owner's switch. `--check-only` cuts and checks without a database. `--demo DIR` publishes the invented demo folder `DIR` instead, as THE active demonstration bundle (and refuses any other bundle: `NOT_A_DEMO_BUNDLE`). The two kinds are active side by side: publishing one never deactivates the other. |
 | `import-log` | Verifies the local log (chain and head), copies it and its head file into a snapshot folder, imports the remote reviewers' lines, records the anchor. Can be run again. |
 | `parity` | Compares, per reviewer, the local log with the hosted store: the reviewer's records, the state of every form in scope, and the NEXT STEP as the web app's own functions compute it (`reviewer_web.forms.next_step` and `step_state`), once over the local log and once over what the site serves. PASS only when all agree. |
@@ -218,7 +231,7 @@ python scripts/hosted_admin.py status
 | `restore --in FILE` | Loads an export into an EMPTY database and verifies every hash and the hosted chain. |
 | `pull-to-local` | Appends the hosted saves the local log does not hold yet to the local log. |
 | `push-returns` | Stores the approver's standing local RETURN decisions for the reviewers whose readings they return. |
-| `status` | The two bundles and the anchor; per reviewer: bundle, scope, invited, first sign-in, first hosted save, revoked, and the lines by origin and phase. Test identities are only counted. |
+| `status` | The two bundles and the anchor; per reviewer: bundle, scope, invited, first sign-in, first hosted save, revoked, the lines by origin and phase, and each queued message (kind, queued, sent, result). Test identities are only counted. |
 | `test-report ALIAS` | For a test identity only: its bundle, first sign-in, number of web sessions, each of its events (seq, time, phase, item id) and the state of every form that is not open. This is how a sign-in, a save and a resume on the production site are checked without touching a reviewer. |
 | `verify` | The hosted chain (every line against its hash, 1000001, 1000002, ... from the anchor) and the imported lines against the newest snapshot, in both directions. |
 
@@ -463,3 +476,31 @@ pulled copies included, is then imported as the reviewers' local lines.
 and the reviewer's sessions and open sign-in codes are deleted. Nothing of the reviewer's work is
 removed.
 `restore-access REMOTE-2` lifts it. Removing the entry from `reviewers.toml` does not revoke.
+
+### Inviting a reviewer
+
+The site sends the invitation itself, through the mailer of the sign-in codes; the operator
+only says who gets which one.
+
+```bash
+python scripts/hosted_admin.py invite REMOTE-2 --kind continue   # or: --kind start
+curl -sS -X POST -H "Authorization: Bearer $OPERATOR_TOKEN" "$SITE_URL/internal/send-queued"
+python scripts/hosted_admin.py status
+```
+
+1. `invite` writes one row of `mail_queue` (reviewer, kind, time). No address and no text is
+   stored: the reviewer's row gives the address when the site sends, the kind gives the text
+   (`mail.INVITATIONS`: the product owner's two messages, with the site's address filled in).
+2. The call to the site's sender sends every waiting message whose reviewer is not revoked, at
+   most five a call, and answers `{"sent": n, "failed": m, "left": k}`. Call it again while
+   `left` is not 0. A message that went out is never sent again; its time is kept, and the
+   reviewer's `invited_at` the first time.
+3. `status` shows per alias `mail INVITE_CONTINUE: queued ..., sent ..., result SENT`. A failure
+   leaves `sent -` and a constant code (`MAIL_UNREACHABLE`: the mail server could not be reached
+   or refused the site; `MAIL_FAILED`: it refused the message). A message is tried three times,
+   once a call; after that it is given up, and `invite` may queue it again.
+
+On the platform, production needs two more environment variables: `OPERATOR_TOKEN` (a random
+secret of at least 32 characters; the same value on the operator's machine for the call above)
+and `SITE_URL` (the site's `https://` address as reviewers should open it). The queue is no part
+of `export` and `restore`. A preview never sends: there the sender does not exist.
