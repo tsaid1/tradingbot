@@ -386,33 +386,30 @@ class AdminStore(Store):
 
     def status(self) -> list[dict]:
         """Per reviewer row: alias, scope, bundle, the times the operator's ``status`` prints
-        and the number of web sessions (None while the web app's table does not exist)."""
+        and the number of web sessions (the web app's ``web_session``)."""
         keys = ("alias", "is_test", "scope_sequences", "bundle_id", "invited_at",
                 "first_sign_in_at", "revoked_at", "first_hosted_at", "sessions")
         with self.connection() as conn:
-            sessions = "NULL::bigint" if conn.execute(
-                "SELECT to_regclass('web_session')").fetchone()[0] is None else (
-                "(SELECT count(*) FROM web_session w WHERE w.reviewer_id = r.id)")
             rows = conn.execute(
                 "SELECT r.alias, r.is_test, r.scope_sequences, r.bundle_id, r.invited_at,"
                 " r.first_sign_in_at, r.revoked_at, (SELECT min(e.at) FROM event e"
-                " WHERE e.reviewer_id = r.id AND e.origin = 'HOSTED'), " + sessions
-                + " FROM reviewer r ORDER BY r.id").fetchall()
+                " WHERE e.reviewer_id = r.id AND e.origin = 'HOSTED'), (SELECT count(*)"
+                " FROM web_session w WHERE w.reviewer_id = r.id) FROM reviewer r ORDER BY r.id"
+            ).fetchall()
         return [dict(zip(keys, row, strict=True)) for row in rows]
 
     def set_revoked(self, alias: str, revoked: bool) -> int:
-        """Set or clear ``revoked_at`` and delete that reviewer's web sessions (WEB's table
-        ``web_session``, by ``reviewer_id``, once it exists). Returns the sessions deleted."""
+        """Set or clear ``revoked_at`` and delete that reviewer's web sessions and sign-in codes
+        not yet used (the web app's ``web_session`` and ``login_code``). Returns the sessions
+        deleted."""
         with self.connection() as conn:
             row = conn.execute(
                 "UPDATE reviewer SET revoked_at = CASE WHEN %s THEN COALESCE(revoked_at, now())"
                 " END WHERE alias = %s RETURNING id", (revoked, alias)).fetchone()
             if row is None:
                 raise A.AdjudicationError("UNKNOWN_ALIAS")
-            if conn.execute("SELECT to_regclass('web_session')").fetchone()[0] is None:
-                return 0
-            return conn.execute("DELETE FROM web_session WHERE reviewer_id = %s",
-                                (row[0],)).rowcount
+            conn.execute("DELETE FROM login_code WHERE reviewer_id = %s AND used_at IS NULL", row)
+            return conn.execute("DELETE FROM web_session WHERE reviewer_id = %s", row).rowcount
 
     # -------------------------------------------------------------- content
 
