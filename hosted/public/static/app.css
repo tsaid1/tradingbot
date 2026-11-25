@@ -92,6 +92,11 @@ code, .mono, .fname, pre { font-family: var(--mono); font-size: 0.92em; }
   font-weight: 600; text-align: center;
 }
 .demo-band p { margin: 0; }
+@media (max-width: 30rem) {
+  .demo-band { font-size: 0.85rem; padding: 0.25rem 0.6rem; }
+}
+/* A jump inside a page lands below the band. */
+[id] { scroll-margin-top: 4.5rem; }
 .demo-band .demo-code { margin-top: 0.2rem; color: var(--text); font-size: 1.1rem; }
 .demo-band .demo-code strong { font-family: var(--mono); font-size: 1.3em; letter-spacing: 0.15em; }
 
@@ -196,7 +201,8 @@ button:disabled { border-color: var(--line); background: var(--sunk); color: var
 /* ------------------------------------------------------------ the form page */
 
 .crumbs { display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem; }
-.crumbs strong { font-family: var(--mono); overflow-wrap: anywhere; }
+.crumbs strong { overflow-wrap: anywhere; }
+.crumbs .quiet-text { font-family: var(--mono); font-size: 0.9rem; }
 
 .work { display: grid; gap: 1.25rem; grid-template-columns: minmax(0, 1fr); }
 .evidence, .reading, .system { background: var(--surface); border: 1px solid var(--line);

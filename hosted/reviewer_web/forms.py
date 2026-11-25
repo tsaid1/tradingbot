@@ -165,26 +165,36 @@ def step_from(bundle: A.Bundle, session: A.Session, records: list[dict],
     return item_id if status != "DONE" else next_step(bundle, session, records)
 
 
+def names(bundle: A.Bundle, session: A.Session) -> dict[str, str]:
+    """Each form's name in the workspace's list ("<idea> <n>: <kind>", as the Streamlit
+    selector names it)."""
+    return {item["item_id"]: f"{sid or 'no sequence'} {n}: {item['kind'].lower()}"
+            for sid, items in A.ordered(bundle, session.scope)
+            for n, item in enumerate(items, 1)}
+
+
 def workspace(bundle: A.Bundle, session: A.Session, records: list[dict]) -> dict:
     """The workspace page: progress, and every form of the scope in review order with its
     status. Names are those of the Streamlit selector ("<idea> <n>: <kind>")."""
     prog = A.progress(bundle, records, session)
     status = statuses(bundle, session, records)
+    name = names(bundle, session)
     groups = []
     for sid, items in A.ordered(bundle, session.scope):
         rows = []
-        for n, item in enumerate(items, 1):
+        for item in items:
             forms = A.post_forms(bundle, item)
             k = next(j for j, f in enumerate(forms, 1) if f["item_id"] == item["item_id"])
-            rows.append({"item_id": item["item_id"], "n": n, "kind": item["kind"].lower(),
+            rows.append({"item_id": item["item_id"], "name": name[item["item_id"]],
                          "form": f"form {k} of {len(forms)}" if len(forms) > 1 else "",
                          "status": status[item["item_id"]],
                          "status_text": STATUS_TEXT[status[item["item_id"]]]})
         groups.append({"sequence": sid or "no sequence", "rows": rows})
+    step = next_step(bundle, session, records)
     return {"progress": prog, "groups": groups, "forms": prog.total,
             "ideas": sum(g["sequence"] != "no sequence" for g in groups),
             "returned": sum(v == RETURNED for v in status.values()),
-            "next": next_step(bundle, session, records)}
+            "next": step, "next_name": name.get(step, "")}
 
 
 def saved_notice(ind: dict | None, after: dict | None,

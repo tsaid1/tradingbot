@@ -13,7 +13,7 @@
       <span class="metric-label">forms done</span></p>
     {% if next %}
     <p class="metric-action"><a class="button primary" href="/continue">Continue</a>
-      <span class="quiet-text">the next unfinished step: {{ next }}</span></p>
+      <span class="quiet-text">the next unfinished step: {{ next_name }}</span></p>
     {% else %}
     <p class="banner success" role="status">Every form in your scope is done.</p>
     {% endif %}
@@ -28,7 +28,7 @@
     {% for group in groups %}
     {% for row in group.rows %}
     <li class="{{ 'first' if loop.first else '' }} {{ 'next' if row.item_id == next else '' }}">
-      <a href="/form/{{ row.item_id }}">{{ group.sequence }} {{ row.n }}: {{ row.kind }}</a>
+      <a href="/form/{{ row.item_id }}">{{ row.name }}</a>
       {% if row.form %}<span class="quiet-text">{{ row.form }}</span>{% endif %}
       <span class="status status-{{ row.status | lower }}">{{ row.status_text }}</span>
       {% if row.item_id == next %}<span class="status status-next">next step</span>{% endif %}

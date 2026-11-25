@@ -1,9 +1,10 @@
 {% extends "base.html" %}
-{% block title %}{{ item_id }}{% endblock %}
+{% block title %}{{ names[item_id] }}{% endblock %}
 {% block main_class %} class="wide"{% endblock %}
 {% block main %}
 <p class="crumbs"><a href="/">Workspace</a> <span aria-hidden="true">/</span>
-  <strong>{{ item_id }}</strong> <span class="status">{{ status }}</span></p>
+  <strong>{{ names[item_id] }}</strong> <span class="quiet-text">({{ item_id }})</span>
+  <span class="status">{{ status }}</span></p>
 
 {% if saved %}
 <div class="banner success" role="status" id="saved">
@@ -12,7 +13,7 @@
   {% if next_step == item_id %}
   <p>Next step: on this same form, below.</p>
   {% elif next_step %}
-  <p>Next step: <a href="/form/{{ next_step }}">continue with {{ next_step }}</a>.</p>
+  <p>Next step: <a href="/form/{{ next_step }}">continue with {{ next_step }}</a> ({{ names[next_step] }}).</p>
   {% else %}
   <p>Every form in your scope is done. <a href="/">Back to the workspace</a>.</p>
   {% endif %}
@@ -95,7 +96,7 @@
       once every form of this post has an independent reading.</p>
       {% if waiting %}
       <p class="banner info">Still without an independent reading:
-        {% for other in waiting %}<a href="/form/{{ other }}">{{ other }}</a>{{ ", " if not loop.last else "" }}{% endfor %}.</p>
+        {% for other in waiting %}<a href="/form/{{ other }}">{{ other }}</a> ({{ names[other] }}){{ ", " if not loop.last else "" }}{% endfor %}.</p>
       {% endif %}
       <p class="plain">{{ described.head }}</p>
       <dl class="meanings saved-reading">
@@ -125,7 +126,7 @@
     </section>
 
     <p class="after">
-      {% if next_step and next_step != item_id %}<a class="button" href="/form/{{ next_step }}">Continue: {{ next_step }}</a>{% endif %}
+      {% if next_step and next_step != item_id %}<a class="button" href="/form/{{ next_step }}">Continue: {{ names[next_step] }}</a>{% endif %}
       <a href="/">Back to the workspace</a>
     </p>
   </div>

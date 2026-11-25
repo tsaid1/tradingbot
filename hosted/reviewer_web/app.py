@@ -372,6 +372,7 @@ def create_app(store, mailer, config: dict) -> Flask:
         step = F.step_from(bundle, who.session, records, item)
         return render_template(
             "form.html", item_id=item_id, bundle_id=bundle.bundle_id,
+            names=F.names(bundle, who.session),
             status=F.STATUS_TEXT[F.statuses(bundle, who.session, records)[item_id]],
             returned=gate.returned is not None and revealed,
             evidence=F.evidence(bundle, item), header=F.form_header(bundle, item),
