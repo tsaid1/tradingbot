@@ -1019,6 +1019,7 @@ def cmd_verify(args) -> int:
     with store.connection():
         events, anchor = store.events(), store.anchor()
         logins = {r.login for r in store.reviewers() if not r.is_test}
+        closed = {r.login for r in store.reviewers() if r.alias in set(store.closed_rows())}
     problems = chain_problems(events, anchor)
     problems += [f"LINE_NOT_SPELLED_AS_ITS_ROW at {e['seq']}" for e in events
                  if e["origin"] != RETURN and S.annotator_login(e["line"]) != e["login_shown"]]
@@ -1044,9 +1045,14 @@ def cmd_verify(args) -> int:
         else:
             problems += [f"LEGACY_LINE_DIFFERS at {seq}" for seq, line in legacy.items()
                          if seq > len(lines) or lines[seq - 1] != line]
-            problems += [f"LEGACY_LINE_MISSING at {n}" for n, rec in enumerate(log.records, 1)
-                         if _login(rec) in logins and n not in legacy
-                         and _pulled(rec) not in hosted]
+            missing = [(n, rec) for n, rec in enumerate(log.records, 1)
+                       if _login(rec) in logins and n not in legacy
+                       and _pulled(rec) not in hosted]
+            # A row no import has considered yet: its lines come with the next import; nothing
+            # is damaged, but verify does not pass until then.
+            problems += [f"NOT_IMPORTED_YET at {n} (a row closed until import-log)"
+                         if _login(rec) in closed else f"LEGACY_LINE_MISSING at {n}"
+                         for n, rec in missing]
         print(f"snapshot {folders[-1].name}: {len(lines)} line(s); {len(legacy)} LEGACY line(s) "
               "compared with it")
     problems += published_problems(store, _base(args))
@@ -1148,7 +1154,12 @@ def write_reviews_on_the_site(base: Path, events: list[dict], rows, closed, *,
     number of logins."""
     path = base / A.REVIEWS_ON_THE_SITE_FILE
     held = V._read_private(path, "reviews-on-the-site marker")
-    was = json.loads(held) if held else {}
+    try:
+        was = json.loads(held) if held else {}
+        if not isinstance(was, dict) or not isinstance(was.get("logins", []), list):
+            raise ValueError
+    except ValueError:  # a marker no one can read refuses every reviewer save: written anew
+        was = {"cutover": True, "logins": []}
     cutover = cutover or bool(was.get("cutover"))
     writers = {e["alias"] for e in events if e["origin"] == HOSTED}
     logins = sorted({r.login_shown for r in rows if not r.is_test and (

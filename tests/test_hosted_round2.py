@@ -485,3 +485,53 @@ def test_r2_3_the_cutover_says_where_it_writes_and_refuses_the_wrong_pair(
     out = run("import-log", "--cutover")
     assert "cutover: demonstration bundle into a database marked preview" in out
     assert store.closed_rows() == []
+
+
+# ------------------------------------------------------------------ re-check R2-4
+
+
+@pytest.mark.parametrize("logins", ['"reviewer@example.invalid"', '{"a": 1}', "7", "null"])
+def test_r2_4_a_marker_that_is_no_list_of_logins_refuses_every_reviewer_save(
+        base, logins):  # noqa: F811
+    """R2-4 (a) (probe ``test_q11_recheck::test_a3``): "logins" given as a string became a set of
+    characters and refused nobody. Anything but a list of logins refuses every reviewer save and
+    reveal; the approver decides as before; pull-to-local writes the file anew."""
+    from test_hosted_admin import OWNER
+
+    half_way(base)
+    path = base / A.REVIEWS_ON_THE_SITE_FILE
+    path.write_text('{"schema": "%s", "logins": %s}' % (A.REVIEWS_ON_THE_SITE_SCHEMA, logins))
+    path.chmod(0o600)
+    b = A.load_bundle(base / "bundle", A.FULL)
+    for save in (lambda: local_save(base, ONE, "i02", A.INDEPENDENT),
+                 lambda: A.mark_system_shown(base, b, ONE, "i05")):
+        with pytest.raises(A.AdjudicationError, match="^REVIEWS_ON_THE_SITE_MARKER_UNREADABLE$"):
+            save()
+    A.append_annotation(base, b, OWNER, item_id="i07", phase=A.APPROVAL, blind=False,
+                        reading={}, refers_to=3, outcome="ACCEPT")
+
+
+def test_r2_4_verify_names_the_lines_of_a_closed_row(run, store, base, tmp_path):  # noqa: F811
+    """R2-4 (b): the lines of a row no import has considered yet read as LEGACY_LINE_MISSING."""
+    owner_history(base)
+    run("init-db")
+    run("publish-bundle", "--demo", base)
+    run("sync-reviewers", "--demo", "--without-owner")
+    run("import-log", "--accept-unlisted-lines", "3")
+    run("sync-reviewers", "--demo", "--owner-address-file", address_file(tmp_path / "keys"))
+    out = run("verify", code=1)
+    assert "  NOT_IMPORTED_YET at 9 (a row closed until import-log)" in out
+    assert "LEGACY_LINE_MISSING" not in out
+    run("import-log")
+    assert "verify: PASS" in run("verify")
+
+
+def test_r2_4_pull_writes_an_unreadable_marker_anew(run, store, base, tmp_path):  # noqa: F811
+    from test_hosted_identities import owner_cutover
+
+    owner_cutover(run, store, base, tmp_path)
+    path = base / A.REVIEWS_ON_THE_SITE_FILE
+    path.write_text("{not json")
+    path.chmod(0o600)
+    run("pull-to-local")
+    assert isinstance(A.reviews_on_the_site(base), frozenset)

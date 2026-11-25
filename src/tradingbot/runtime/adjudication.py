@@ -1153,8 +1153,8 @@ def reviews_on_the_site(base: str | Path) -> frozenset[str]:
     try:
         raw = json.loads(data)
         logins = raw["logins"]
-        if raw.get("schema") != REVIEWS_ON_THE_SITE_SCHEMA or not all(
-                isinstance(x, str) for x in logins):
+        if raw.get("schema") != REVIEWS_ON_THE_SITE_SCHEMA or not isinstance(logins, list) \
+                or not all(isinstance(x, str) for x in logins):
             raise ValueError
     except (ValueError, KeyError, TypeError):
         raise AdjudicationError("REVIEWS_ON_THE_SITE_MARKER_UNREADABLE") from None

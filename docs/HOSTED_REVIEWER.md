@@ -680,6 +680,12 @@ workspace then refuses a REVIEWER save or marker of those logins (`Not saved
 its copies as before. A folder without the file behaves as before. To let someone review locally
 again (Rollback), delete the file after `revoke`.
 
+A file that cannot be read as a list of logins (edited by hand, cut short) refuses EVERY
+reviewer save in the local workspace (`REVIEWS_ON_THE_SITE_MARKER_UNREADABLE`; the approver's
+decisions are not affected). Repair it with `hosted_admin.py pull-to-local`, which writes it
+anew (counting the cutover as declared), or delete it to let the local workspace behave as
+before the cutover.
+
 If it happened anyway (a folder without the file), `pull-to-local` pulls everybody else, names
 the identity (`<ALIAS>: NOT pulled: n hosted line(s) ... LOCAL_SAVE_AFTER_HOSTED_SAVES`) and
 exits 1; `import-log` refuses. No command merges two histories, and no line can be taken back:
