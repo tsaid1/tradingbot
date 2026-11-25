@@ -219,7 +219,7 @@ python scripts/hosted_admin.py status
 | command | what it does |
 | --- | --- |
 | `init-db` | Applies `hosted/reviewer_web/schema.sql`. Every statement can be run again. |
-| `sync-reviewers` | Writes the remote reviewers of `reviewers.toml` as rows, bound to the active REAL bundle: login, name, role, scope, and the access a remote session has by that file (FULL only while `remote_full_context_authorized = true`, else RESTRICTED, which the site does not serve). Never deletes: an entry that left the file keeps its row, so revoke it. Refused while no real bundle is published (`NO_REAL_BUNDLE_PUBLISHED`), when an alias would pass to another sign-in (`ALIAS_OR_LOGIN_HELD_BY_ANOTHER_ROW`) or the file's scope is larger than the published one (`SCOPE_NOT_PUBLISHED`: publish first). `--demo` binds them to the demonstration bundle instead (a preview database, tests). |
+| `sync-reviewers` | Writes the remote reviewers of `reviewers.toml` as rows, bound to the active REAL bundle: login, name, role, scope, and the access a remote session has by that file (FULL only while `remote_full_context_authorized = true`, else RESTRICTED, which the site does not serve). Never deletes: an entry that left the file keeps its row, so revoke it. Refused while no real bundle is published (`NO_REAL_BUNDLE_PUBLISHED`), when an alias would pass to another sign-in (`ALIAS_OR_LOGIN_HELD_BY_ANOTHER_ROW`), when the file spells differently (capitals included) a sign-in whose row already has lines (`LOGIN_SPELLING_HAS_RECORDS`, with the alias: put the earlier spelling back), or when the file's scope is larger than the published one (`SCOPE_NOT_PUBLISHED`: publish first). `--demo` binds them to the demonstration bundle instead (a preview database, tests). |
 | `sync-reviewers --test-identity TEST-1 LOGIN` | Instead: writes (or updates) the test identity `TEST-<n>` for that sign-in, bound to the active DEMONSTRATION bundle with that bundle's scope (`NO_DEMO_BUNDLE_PUBLISHED` while there is none). The reviewers file is not read. |
 | `revoke ALIAS` | Sets `revoked_at` and deletes that reviewer's web sessions and sign-in codes not yet used. From that moment sign-in, every page and every save are refused; the records stay. |
 | `restore-access ALIAS` | Clears the revocation (the reviewer signs in again). |
@@ -272,6 +272,23 @@ TEST-1: records 2; forms 45: INDEPENDENT_SAVED+SHOWN 1, OPEN 44
 A new real bundle (another `bundle_id`) does not move anyone by itself: after `publish-bundle`,
 `sync-reviewers` binds the reviewers to it, and they are then served the records of that bundle
 only.
+
+### One spelling of a sign-in
+
+The workspace finds a reviewer's history by the address in each record, compared character for
+character with the address the reviewer signs in under. A line under any other spelling
+(capitals included) is not found: the form looks open again, and a second "independent" reading
+could be saved for a form whose system reading was already shown. So the spelling is kept in
+step everywhere, and nothing changes it silently:
+
+* `sync-reviewers` refuses to respell a row that has lines (`LOGIN_SPELLING_HAS_RECORDS`);
+* `import-log` prints, per alias, the number of spellings of that sign-in among its local lines,
+  and refuses unless there is one and it is the row's and the reviewers file's
+  (`LOGIN_SPELLED_OTHERWISE`): such a log needs the owner's decision before any cutover;
+* the store accepts no line of a reviewer under a row spelled otherwise
+  (`LINE_NOT_SPELLED_AS_ITS_ROW`), and `restore` places every line by its own sign-in;
+* `verify` fails on any line not spelled as its row, and `parity` fails when the local log holds
+  lines of a remote reviewer that no row holds under that spelling (counts only).
 
 ### What is published
 
@@ -452,8 +469,10 @@ restored, so after a restore everyone signs in again; bundles and reviewer rows 
 again by their own commands. To restore into a new database: `init-db`, `publish-bundle` (and
 `publish-bundle --demo DIR`), `sync-reviewers` (the same reviewers file gives the same aliases;
 the test identities again by `--test-identity`), `restore --in FILE`, `verify`. "Empty" means no
-event and no anchor. Refused: `DATABASE_NOT_EMPTY`, `UNKNOWN_ALIAS` (sync first),
-`ALIAS_IS_NOT_THE_SAME_KIND` (a test identity's lines under a reviewer's alias, or the reverse),
+event and no anchor. A line is restored under the row whose sign-in is spelled exactly as the
+line's annotator (a return: under the row of the reading it returns), never by alias. Refused:
+`DATABASE_NOT_EMPTY`, `NO_ROW_FOR_A_LINE_S_SIGN_IN` (sync first, from the same file),
+`ROW_IS_NOT_THE_SAME_KIND` (a test identity's lines under a reviewer's row, or the reverse),
 `EXPORT_UNREADABLE`, `EXPORT_FAILS_VERIFICATION` (a line that does not match its hash, a gap in
 the hosted chain, an anchor the first hosted line does not name). The restored site continues
 the same chain.

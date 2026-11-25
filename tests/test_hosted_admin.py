@@ -433,9 +433,12 @@ def test_import_log_is_verbatim_verifiable_and_idempotent(run, store, base):
     assert f"local log: 8 line(s), head {V._sha(lines[-1])[:12]}, {len(data)} bytes, sha256 " \
            f"{V._sha(data)}" in out
     assert "imported 7 new line(s); 0 already imported" in out
-    assert out.split("REMOTE-2: ")[1].splitlines()[:4] == [
-        ("lines 6 (6 new); forms 45: DONE 1, INDEPENDENT_SAVED 1, INDEPENDENT_SAVED+SHOWN 1, "
-         "OPEN 42"), "  i07 DONE", "  i08 INDEPENDENT_SAVED", "  i01 INDEPENDENT_SAVED+SHOWN"]
+    assert out.splitlines()[:2] == [
+        "REMOTE-2: 1 spelling(s) of its sign-in among its local lines",
+        "REMOTE-3: 1 spelling(s) of its sign-in among its local lines"]
+    assert out.split("REMOTE-2: lines ")[1].splitlines()[:4] == [
+        "6 (6 new); forms 45: DONE 1, INDEPENDENT_SAVED 1, INDEPENDENT_SAVED+SHOWN 1, OPEN 42",
+        "  i07 DONE", "  i08 INDEPENDENT_SAVED", "  i01 INDEPENDENT_SAVED+SHOWN"]
     assert "REMOTE-3: lines 1 (1 new); forms 45: INDEPENDENT_SAVED 1, OPEN 44" in out
     # LEGACY events: the remote reviewers' lines, byte for byte, under their own seq. The
     # approver's line 6 never leaves the Mac.
@@ -621,7 +624,7 @@ def test_hosted_saves_come_home_into_a_log_the_local_code_accepts(run, store, ba
     assert FREEZE.main(["verify", "--dir", str(base)]) == 0
     # A reviewer with saves on the site AND later local saves has two histories: the import
     # refuses to mix them (start again from an empty database, or pull and keep the site).
-    assert run("import-log", code=2) == "refused: LOCAL_SAVE_AFTER_HOSTED_SAVES\n"
+    assert run("import-log", code=2).endswith("refused: LOCAL_SAVE_AFTER_HOSTED_SAVES\n")
 
 
 def test_pull_to_local_refuses_a_store_that_fails_verification(run, store, base):
@@ -649,7 +652,7 @@ def test_verify_checks_the_chain_the_anchor_and_the_imported_lines(cli, run, sto
     assert "events: LEGACY 7, HOSTED 7; hosted chain on " in out and ": OK" in out
     assert "7 LEGACY line(s) compared with it" in out and "verify: PASS" in out
     # A hosted line that does not continue the chain (stored by other means than the site).
-    last = json.loads(store.events()[-1]["line"])
+    last = json.loads(store.events()[-3]["line"])  # the first reviewer's latest hosted line
     stray = V.encode_line({**last, "seq": HOSTED_1 + 9})
     store.insert_events([cli.S.EventLine(rows["REMOTE-2"].id, "HOSTED", stray)])
     assert f"  HOSTED_CHAIN_BROKEN at {HOSTED_1 + 9}" in run("verify", code=1)
@@ -693,12 +696,12 @@ def test_an_export_restored_into_an_empty_database_is_identical(cli, run, store,
     empty = hosted_pg.fresh_database()
     monkeypatch.setenv(cli.URL_ENV, empty)
     run("init-db")
-    assert run("restore", "--in", out_file, code=2) == "refused: UNKNOWN_ALIAS\n"
+    assert run("restore", "--in", out_file, code=2) == "refused: NO_ROW_FOR_A_LINE_S_SIGN_IN\n"
     run("publish-bundle", "--demo", base)
     run("sync-reviewers", "--demo")
     restored = cli.S.AdminStore(empty)
     restored.upsert_reviewer("TEST-1", TESTER)  # the alias of a test identity, as a reviewer
-    assert run("restore", "--in", out_file, code=2) == "refused: ALIAS_IS_NOT_THE_SAME_KIND\n"
+    assert run("restore", "--in", out_file, code=2) == "refused: ROW_IS_NOT_THE_SAME_KIND\n"
     with restored.connection() as conn:
         conn.execute("DELETE FROM reviewer WHERE alias = 'TEST-1'")
     run("sync-reviewers", "--test-identity", "TEST-1", TESTER)
@@ -1110,3 +1113,125 @@ def test_invite_queues_a_message_for_the_site_to_send_and_status_says_how_it_wen
     out = tmp_path / "export.jsonl"
     run("export", "--out", out)
     assert "INVITE" not in out.read_text() and "mail" not in out.read_text()
+
+
+# ------------------------------------------------------------------ one spelling of a sign-in
+# The core finds a reviewer's records by ``annotator.login`` EXACTLY equal to the session's login.
+# (The independent review's finding 1; its probes are named in each test.)
+
+RESPELLED = A.Session("Reviewer@Example.invalid", ONE.name, A.REVIEWER, A.FULL, True, 40)
+
+
+def test_a_sign_in_with_lines_keeps_its_spelling(run, store, base):
+    """Probe ``test_respelled_login_hides_history``: a respelled row hid the reviewer's history
+    and let them save a second "independent" reading of a form they had seen revealed."""
+    from reviewer_web import forms
+
+    rows = cutover(run, store, base)
+    file = base / "reviewers.toml"
+    file.write_text(file.read_text().replace('"reviewer@example', '"Reviewer@Example'))
+    out = run("sync-reviewers", "--demo", code=2)
+    assert out.splitlines() == [
+        ("REMOTE-2: the file spells this sign-in otherwise than this row, which has lines under "
+         "its spelling; put the earlier spelling back in the file"),
+        "refused: LOGIN_SPELLING_HAS_RECORDS"]
+    with pytest.raises(A.AdjudicationError, match="^LOGIN_SPELLING_HAS_RECORDS$"):
+        store.upsert_reviewer("REMOTE-2", RESPELLED.login, name=ONE.name, scope_sequences=40)
+    one = store.reviewer_by_login(ONE.login)
+    assert one == rows["REMOTE-2"] and one.session() == ONE  # nothing was written
+    # The history is still found, by the site's own functions and by the core.
+    assert forms.step_state(store.bundle_for(one), one.session(), store.records_of(one),
+                            "i07") == forms.DONE
+    with pytest.raises(A.AdjudicationError, match="SYSTEM_READING_ALREADY_SEEN"):
+        hosted_save(store, one, "i07", A.INDEPENDENT)
+    # The import refuses too while the file, the row and the log do not spell it alike.
+    out = run("import-log", code=2)
+    assert ("REMOTE-2: 1 spelling(s) of its sign-in among its local lines: NOT the one spelling "
+            "of its row and of the reviewers file") in out
+    assert out.endswith("refused: LOGIN_SPELLED_OTHERWISE\n")
+    # A row whose spelling was changed by other means than the tool: verify says which lines.
+    assert "PASS" in run("verify")
+    with store.connection() as conn:
+        conn.execute("UPDATE reviewer SET login_shown = %s WHERE alias = 'REMOTE-2'",
+                     (RESPELLED.login,))
+    out = run("verify", code=1)
+    assert [x for x in out.splitlines() if x.startswith("  ")] == [
+        f"  LINE_NOT_SPELLED_AS_ITS_ROW at {n}" for n in (1, 2, 3, 4, 7, 8)]
+
+
+def test_local_lines_spelled_otherwise_are_refused_and_parity_fails(cli, run, store, base):
+    """Probe ``test_legacy_lines_spelled_otherwise_are_invisible_and_parity_passes``: lines the
+    legacy site wrote while the owner's file spelled the address otherwise were imported, never
+    served, and ``parity`` and ``verify`` passed."""
+    b = A.load_bundle(base / "bundle", A.FULL)
+    A.append_annotation(base, b, RESPELLED, **reading_kw(b, "i07", [], RESPELLED,
+                                                         phase=A.INDEPENDENT))
+    A.mark_system_shown(base, b, RESPELLED, "i07")
+    A.append_annotation(base, b, RESPELLED, **reading_kw(
+        b, "i07", A.read_annotations(base).records, RESPELLED, phase=A.AFTER_REVEAL,
+        refers_to=1))
+    local_save(base, TWO, "i07", A.INDEPENDENT)
+    run("init-db")
+    run("publish-bundle", "--demo", base)
+    run("sync-reviewers", "--demo")
+    out = run("import-log", code=2)
+    assert out.splitlines() == [
+        ("REMOTE-2: 1 spelling(s) of its sign-in among its local lines: NOT the one spelling of "
+         "its row and of the reviewers file"),
+        "REMOTE-3: 1 spelling(s) of its sign-in among its local lines",
+        "refused: LOGIN_SPELLED_OTHERWISE"]
+    assert store.events() == [] and store.anchor() is None  # nothing imported, no anchor
+    assert not (base / "hosted_snapshots").exists()
+    local_save(base, ONE, "i08", A.INDEPENDENT)  # the file's spelling, beside the other
+    assert "REMOTE-2: 2 spelling(s) of its sign-in" in run("import-log", code=2)
+    out = run("parity", code=1)
+    assert ("local lines of remote reviewers that NO row holds under that spelling: 3, of 1 "
+            "sign-in spelling(s)") in out and out.splitlines()[-1].endswith("FAIL, 2 reviewer(s)")
+    # Whoever asks: no line is stored under a row spelled otherwise.
+    row = store.reviewer_by_login(ONE.login)
+    with pytest.raises(A.AdjudicationError, match="^LINE_NOT_SPELLED_AS_ITS_ROW$"):
+        store.insert_events([cli.S.EventLine(row.id, "LEGACY", log_lines(base)[0])])
+    assert store.events() == []
+
+
+def test_restore_follows_the_sign_in_not_the_alias(cli, run, store, base, monkeypatch,
+                                                   tmp_path):
+    """Probe ``test_restore_under_swapped_aliases``: restored under a reviewers file that lists
+    the two remote reviewers in the other order, every line landed under the other person."""
+    from reviewer_web import forms
+
+    rows = cutover(run, store, base)
+    hosted_work(store, rows)
+    decide(base, "i07", 3, "RETURN", NOTE)
+    run("push-returns")
+    served = {row.login: store.records_of(row) for row in rows.values()}
+    run("export", "--out", tmp_path / "x" / "events.jsonl")
+    head, owner, first, second = (base / "reviewers.toml").read_text().split("[[reviewer]]")
+    other = write_demo(tmp_path / "other")
+    (other / "reviewers.toml").write_text("[[reviewer]]".join(
+        [head, owner, second.rstrip("\n") + "\n\n", first]))
+    monkeypatch.setenv(cli.URL_ENV, hosted_pg.fresh_database())
+    run("init-db")
+    run("publish-bundle", "--demo", other)
+    run("sync-reviewers", "--demo", "--dir", other)
+    run("sync-reviewers", "--test-identity", "TEST-1", TESTER)
+    new = cli.S.AdminStore(os.environ[cli.URL_ENV])
+    assert [(r.alias, r.login) for r in new.reviewers()] == [
+        ("REMOTE-2", TWO.login), ("REMOTE-3", ONE.login), ("TEST-1", TESTER)]  # swapped
+    assert "restored 15 event(s): LEGACY 7, HOSTED 7, RETURN 1" in run(
+        "restore", "--in", tmp_path / "x" / "events.jsonl")
+    for row in new.reviewers():  # each person has exactly their own history again
+        assert new.records_of(row) == served[row.login]
+    one = new.reviewer_by_login(ONE.login)
+    state = forms.states(new.bundle_for(one), one.session(), new.records_of(one))
+    assert (one.alias, state["i07"], state["i08"], state["i03"]) == (
+        "REMOTE-3", forms.RETURNED, forms.DONE, forms.DONE)
+    assert "verify: PASS" in run("verify")
+    # A line whose sign-in no row spells that way is not restored under anyone.
+    monkeypatch.setenv(cli.URL_ENV, hosted_pg.fresh_database())
+    run("init-db")
+    run("publish-bundle", "--demo", other)
+    run("sync-reviewers", "--test-identity", "TEST-1", TESTER)
+    cli.S.AdminStore(os.environ[cli.URL_ENV]).upsert_reviewer("REMOTE-2", RESPELLED.login)
+    assert run("restore", "--in", tmp_path / "x" / "events.jsonl", code=2) == \
+        "refused: NO_ROW_FOR_A_LINE_S_SIGN_IN\n"

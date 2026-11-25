@@ -291,6 +291,16 @@ def cmd_sync_reviewers(args) -> int:
                               else "NO_REAL_BUNDLE_PUBLISHED")
             if not _scope_fits(bundle, reviewers.scope_sequences):
                 raise refused("SCOPE_NOT_PUBLISHED")  # publish-bundle first
+            # A row with lines keeps its spelling: the site finds a reviewer's history by it.
+            written = {e["alias"] for e in store.events()}
+            respelled = [r.alias for r in store.reviewers() if r.alias in written
+                         and r.login in reviewers.entries
+                         and reviewers.entries[r.login].login != r.login_shown]
+            for alias in respelled:
+                print(f"{alias}: the file spells this sign-in otherwise than this row, which has "
+                      "lines under its spelling; put the earlier spelling back in the file")
+            if respelled:
+                raise refused("LOGIN_SPELLING_HAS_RECORDS")
             rows = store.sync_reviewers(reviewers, bundle_id=bundle["bundle_id"])
     for r in rows:
         print(f"{r.alias}: id {r.id}, {r.role}, {r.access}, scope {r.scope_sequences}, bundle "
@@ -342,9 +352,14 @@ def continues(lines: list[bytes], anchor: dict | None) -> bool:
     return count <= len(lines) and (sha256(lines[count - 1]) if count else V.GENESIS) == head
 
 
-def _login(rec: dict) -> str:
+def _spelled(rec: dict) -> str:
+    """A record's ``annotator.login`` exactly as spelled ("" when it has none)."""
     login = (rec.get("annotator") or {}).get("login")
-    return login.casefold() if isinstance(login, str) else ""
+    return login if isinstance(login, str) else ""
+
+
+def _login(rec: dict) -> str:
+    return _spelled(rec).casefold()
 
 
 def _pulled(rec: dict) -> str | None:
@@ -398,6 +413,7 @@ def cmd_import_log(args) -> int:
     if log.count >= HOSTED_BASE:
         raise refused("LOCAL_LOG_TOO_LONG")
     local = A.load_bundle(base / "bundle", A.RESTRICTED)
+    listed = A.load_reviewers(base / "reviewers.toml").entries
     with store.exclusive():
         events, anchor = store.events(), store.anchor()
         legacy = {e["seq"]: e["line"] for e in events if e["origin"] == LEGACY}
@@ -405,6 +421,17 @@ def cmd_import_log(args) -> int:
                 seq > len(lines) or lines[seq - 1] != line for seq, line in legacy.items()):
             raise refused("IMPORTED_PREFIX_DIFFERS")
         rows = {r.login: r for r in store.reviewers() if not r.is_test}
+        # One spelling per reviewer: the log's, the row's and the file's. The site finds a
+        # reviewer's history by the exact spelling, so a line spelled otherwise would be lost.
+        spellings = {key: {_spelled(r) for r in log.records if _login(r) == key} for key in rows}
+        wrong = [row.alias for key, row in rows.items() if not spellings[key] <= {
+            row.login_shown} or (key in listed and listed[key].login != row.login_shown)]
+        for row in rows.values():
+            print(f"{row.alias}: {len(spellings[row.login])} spelling(s) of its sign-in among "
+                  "its local lines" + (": NOT the one spelling of its row and of the reviewers "
+                                       "file" if row.alias in wrong else ""))
+        if wrong:
+            raise refused("LOGIN_SPELLED_OTHERWISE")
         hosted = {e["sha256"] for e in events if e["origin"] == HOSTED}
         writers = {e["alias"] for e in events if e["origin"] == HOSTED}
         new = []
@@ -476,6 +503,13 @@ def cmd_parity(args) -> int:
     if steps is None:  # the web app's resume rule is part of what must agree
         print("NEXT_STEP_FUNCTION_MISSING: reviewer_web.forms gives no next_step and step_state")
     print(f"local bundle {local.bundle_id[:12]}")
+    held_as = {row.login_shown for row, _served, _stored in theirs.values()}
+    strays = [_spelled(r) for r in log.records if "@" in _spelled(r) and (
+        r.get("annotator") or {}).get("role") == A.REVIEWER and _spelled(r) not in held_as]
+    if strays:  # a remote reviewer without a row, or lines under another spelling of a sign-in
+        print(f"local lines of remote reviewers that NO row holds under that spelling: "
+              f"{len(strays)}, of {len(set(strays))} sign-in spelling(s)")
+        failed = True
     for alias, (row, served, stored) in theirs.items():
         session = row.session()
         mine = [r for r in log.records if _login(r) == row.login
@@ -610,6 +644,8 @@ def cmd_verify(args) -> int:
         events, anchor = store.events(), store.anchor()
         logins = {r.login for r in store.reviewers() if not r.is_test}
     problems = chain_problems(events, anchor)
+    problems += [f"LINE_NOT_SPELLED_AS_ITS_ROW at {e['seq']}" for e in events
+                 if e["origin"] != RETURN and S.annotator_login(e["line"]) != e["login_shown"]]
     legacy = {e["seq"]: e["line"] for e in events if e["origin"] == LEGACY}
     hosted = {e["sha256"] for e in events if e["origin"] == HOSTED}
     print(f"events: {_counts(e['origin'] for e in events)}; hosted chain on "
@@ -682,19 +718,28 @@ def cmd_restore(args) -> int:
     with store.exclusive():
         if store.events() or store.anchor():
             raise refused("DATABASE_NOT_EMPTY")
-        rows = {r.alias: r for r in store.reviewers()}
-        if not {e["alias"] for e in events} <= set(rows):
-            raise refused("UNKNOWN_ALIAS")  # sync-reviewers first
-        if any(rows[e["alias"]].is_test != e["is_test"] for e in events):
-            raise refused("ALIAS_IS_NOT_THE_SAME_KIND")  # a test identity's lines stay a test's
+        # A line goes to the row whose sign-in is spelled exactly as the line's annotator (a
+        # return: to the row of the reading it returns). Never by alias: aliases follow the
+        # order of the reviewers file, which may have changed.
+        spelled = {r.login_shown: r for r in store.reviewers()}
+        owner: dict[int, object] = {}
+        for e in events:
+            row = owner.get(_record(e["line"]).get("refers_to")) if e["origin"] == RETURN \
+                else spelled.get(S.annotator_login(e["line"]))
+            if row is None:
+                raise refused("NO_ROW_FOR_A_LINE_S_SIGN_IN")  # sync-reviewers first
+            if row.is_test != e["is_test"]:
+                raise refused("ROW_IS_NOT_THE_SAME_KIND")  # a test identity's lines stay a test's
+            owner[e["seq"]] = row
         if anchor:
             store.set_anchor(anchor["count"], anchor["head"], anchor["file_sha256"],
                              anchor["imported_at"])
-        store.insert_events([S.EventLine(rows[e["alias"]].id, e["origin"], e["line"],
+        store.insert_events([S.EventLine(owner[e["seq"]].id, e["origin"], e["line"],
                                          e["idempotency_key"], e["batch"], e["created_at"])
                              for e in events])
-        stored = [{k: e[k] for k in EVENT_KEYS} for e in store.events()]
-        if stored != events or store.anchor() != anchor:
+        keys = [k for k in EVENT_KEYS if k != "alias"]
+        if [{k: e[k] for k in keys} for e in store.events()] != [
+                {k: e[k] for k in keys} for e in events] or store.anchor() != anchor:
             raise refused("RESTORE_DIFFERS")  # rolled back
     print(f"restored {len(events)} event(s): {_counts(e['origin'] for e in events)}; every "
           f"hash and the hosted chain verified; file sha256 {sha256(data)}")

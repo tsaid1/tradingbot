@@ -36,6 +36,10 @@ connection and commits with the block (one connection per request).
 # * ``append`` also refuses a record whose annotator is not the reviewer or whose bundle is not
 #   the reviewer's (RECORD_NOT_OF_THIS_REVIEWER_AND_BUNDLE): ``records_of`` relies on both.
 # * A reviewer row is one person: ``upsert_reviewer`` refuses an alias that another sign-in holds.
+# * The spelling of a sign-in is part of a reviewer's history: the core finds a reviewer's
+#   records by ``annotator.login`` EXACTLY equal to the session's login (``login_shown``). So a
+#   row that has events keeps its spelling (LOGIN_SPELLING_HAS_RECORDS), and no line of a
+#   reviewer's own is stored under a row spelled otherwise (LINE_NOT_SPELLED_AS_ITS_ROW).
 # * ``reviewer.bundle_id``: the one bundle a reviewer is served (``bundle_for``, ``is_demo``,
 #   ``media(reviewer, ...)``, ``records_of``, ``append``). A test identity is served a bundle
 #   only while that bundle is flagged ``is_demo`` (checked in every query, not only when it is
@@ -116,6 +120,15 @@ class Appended:
 
 def sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def annotator_login(line: bytes) -> str | None:
+    """The ``annotator.login`` of a line, exactly as spelled; None when it has none."""
+    try:
+        who = json.loads(line).get("annotator")
+    except (ValueError, AttributeError):
+        return None
+    return who.get("login") if isinstance(who, dict) else None
 
 
 def image_type(data: bytes) -> str | None:
@@ -369,9 +382,10 @@ class AdminStore(Store):
                         role: str = A.REVIEWER, access: str = A.FULL,
                         scope_sequences: int = A.DEFAULT_SCOPE, is_test: bool = False,
                         bundle_id: str | None = None) -> ReviewerRow:
-        """Insert the reviewer, or update the spelling, name, role, access, scope and bundle of
-        the row that holds this alias AND this sign-in. Anything else is refused: a row is one
-        person, and its events stay theirs. Never deletes.
+        """Insert the reviewer, or update the name, role, access, scope and bundle of the row
+        that holds this alias AND this sign-in; its spelling too, but only while the row has no
+        event (its records are found by that exact spelling). Anything else is refused: a row
+        is one person, and its events stay theirs. Never deletes.
 
         ``bundle_id``: the bundle the reviewer works on; a test identity takes an invented one
         only (TEST_IDENTITY_NEEDS_A_DEMO_BUNDLE). None keeps the row's bundle; for a new row it
@@ -380,10 +394,14 @@ class AdminStore(Store):
         served nothing."""
         key = login.casefold()
         with self.connection() as conn:
-            held = conn.execute("SELECT alias, login, is_test FROM reviewer WHERE alias = %s"
-                                " OR login = %s", (alias, key)).fetchall()
-            if held and held != [(alias, key, is_test)]:
+            held = conn.execute(
+                "SELECT alias, login, is_test, login_shown <> %s AND EXISTS (SELECT 1 FROM event e"
+                " WHERE e.reviewer_id = reviewer.id) FROM reviewer WHERE alias = %s OR login = %s",
+                (login, alias, key)).fetchall()
+            if held and [h[:3] for h in held] != [(alias, key, is_test)]:
                 raise A.AdjudicationError("ALIAS_OR_LOGIN_HELD_BY_ANOTHER_ROW")
+            if held and held[0][3]:
+                raise A.AdjudicationError("LOGIN_SPELLING_HAS_RECORDS")
             if bundle_id is None and not held:
                 found = conn.execute(
                     "SELECT bundle_id FROM bundle WHERE active AND (is_demo OR NOT %s)"
@@ -567,20 +585,30 @@ class AdminStore(Store):
 
     def insert_events(self, lines: list[EventLine]) -> None:
         """Store lines exactly as given (the import's LEGACY lines; a restore's lines of every
-        origin), under the writers' lock. Nothing is checked here but the table's own rules."""
+        origin), under the writers' lock. A reviewer's own line (every origin but RETURN) is
+        refused unless its ``annotator.login`` is EXACTLY its row's ``login_shown``: under any
+        other spelling the site would not find it and the form would look open again."""
         with self.exclusive() as conn:
+            spelled = dict(conn.execute("SELECT id, login_shown FROM reviewer WHERE id = ANY(%s)",
+                                        ([e.reviewer_id for e in lines],)).fetchall())
+            if any(e.origin != RETURN and annotator_login(e.line) != spelled.get(e.reviewer_id)
+                   for e in lines):
+                raise A.AdjudicationError("LINE_NOT_SPELLED_AS_ITS_ROW")
             if lines:
                 conn.cursor().executemany(_INSERT_EVENT, [_event_row(e) for e in lines])
 
     def events(self) -> list[dict]:
-        """EVERY event, in seq order, with its reviewer's alias (operator tool only)."""
+        """EVERY event, in seq order, with its reviewer's alias and the row's spelling of the
+        sign-in (operator tool only; the tool prints the alias, never the sign-in)."""
         keys = ("alias", "is_test", "origin", "seq", "prev_sha256", "sha256", "line",
-                "idempotency_key", "batch", "created_at", "item_id", "phase", "at")
+                "idempotency_key", "batch", "created_at", "item_id", "phase", "at",
+                "login_shown")
         with self.connection() as conn:
             rows = conn.execute(
                 "SELECT r.alias, r.is_test, e.origin, e.seq, e.prev_sha256, e.sha256, e.line,"
-                " e.idempotency_key, e.batch, e.created_at, e.item_id, e.phase, e.at FROM event e"
-                " JOIN reviewer r ON r.id = e.reviewer_id ORDER BY e.seq").fetchall()
+                " e.idempotency_key, e.batch, e.created_at, e.item_id, e.phase, e.at,"
+                " r.login_shown FROM event e JOIN reviewer r ON r.id = e.reviewer_id"
+                " ORDER BY e.seq").fetchall()
         return [{**dict(zip(keys, row, strict=True)), "line": bytes(row[6])} for row in rows]
 
     def anchor(self) -> dict | None:
