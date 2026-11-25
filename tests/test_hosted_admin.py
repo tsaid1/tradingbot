@@ -2192,8 +2192,13 @@ def test_local_lines_of_a_reviewer_without_a_row_are_accepted_only_by_their_coun
     run("init-db")
     run("publish-bundle", "--demo", base)
     run("sync-reviewers", "--demo")
+    out = run("import-log", code=2)  # nothing imported until the count is named (round 2, M2)
     assert "local lines of reviewers that no row holds: 1, of 1 sign-in spelling(s): give them " \
-        "a row, or accept exactly that many with --accept-unlisted-lines 1" in run("import-log")
+        "a row, or accept exactly that many with --accept-unlisted-lines 1" in out
+    assert out.endswith("refused: UNLISTED_LOCAL_LINES\n") and store.anchor() is None
+    assert run("import-log", "--accept-unlisted-lines", "2", code=2).endswith(
+        "refused: UNLISTED_LOCAL_LINES\n")
+    assert "accepted as named" in run("import-log", "--accept-unlisted-lines", "1")
     assert run("parity", code=1).splitlines()[-1].endswith("FAIL, 2 reviewer(s)")
     for wrong in ("0", "2"):
         out = run("parity", "--accept-unlisted-lines", wrong, code=1)

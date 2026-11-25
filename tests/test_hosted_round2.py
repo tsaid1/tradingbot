@@ -302,3 +302,28 @@ def test_m1_a_changed_sign_in_address_of_a_row_with_lines_needs_the_flag(
     assert "OWNER-REVIEWER: sign-in address CHANGED" in out
     owner = {r.alias: r for r in store.reviewers()}["OWNER-REVIEWER"]
     assert owner.address == "Owner.Other@example.invalid"
+
+
+# ------------------------------------------------------------------ M2
+
+
+def test_m2_a_reviewer_signs_out_before_the_import(tmp_path, store, dsn):  # noqa: F811
+    """Before the import a reviewer could not sign out: /sign-out was behind the calm page, so
+    a session opened then lived on for 30 days. The calm page offers Sign out, and it works,
+    for a row closed before the first import and for one written after it."""
+    from hosted_web_site import FIRST, Site
+
+    site = Site(tmp_path, store, dsn)
+    late = store.upsert_reviewer("REMOTE-9", "late@example.invalid", scope_sequences=40)
+    for alias in (FIRST, "REMOTE-9"):
+        if alias == FIRST:
+            site.sql("UPDATE reviewer SET imported_at = NULL")  # as before the first import
+        b = site.browser().sign_in(alias)
+        page = b.get("/")
+        text = page.get_data(as_text=True)
+        assert page.status_code == 503 and "Not open yet" in text and 'action="/sign-out"' in text
+        csrf = text.split('name="_csrf" value="')[1].split('"')[0]
+        assert b.post("/sign-out", {"_csrf": csrf}).headers["Location"] == "/sign-in"
+        assert b.get("/").headers["Location"] == "/sign-in"
+    assert site.sql("SELECT count(*) FROM web_session") == [(0,)]
+    del late

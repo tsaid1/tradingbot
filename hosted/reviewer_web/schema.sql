@@ -233,7 +233,8 @@ CREATE TABLE IF NOT EXISTS draft (
 );
 
 -- After a right code for an address with two identities: the choice of the identity to open,
--- bound to that verified code. Single use, five minutes, held by its browser in a cookie of its
+-- made only when a right code was entered (it holds the address's key row and its times, not the
+-- code). Single use, five minutes, held by its browser in a cookie of its
 -- own; only the token's SHA-256 is stored. ``sign_in_key``: the address's key row (the lowest id
 -- of the rows of that address), under which its codes and counters are kept.
 CREATE TABLE IF NOT EXISTS sign_in_choice (

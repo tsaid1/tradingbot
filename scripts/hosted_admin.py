@@ -685,6 +685,13 @@ def cmd_import_log(args) -> int:
             except UnicodeDecodeError:
                 raise refused("LINE_NOT_UTF8") from None
             new.append(S.EventLine(row.id, LEGACY, line))
+        # Local reviewer lines that no row holds: only a count the operator names is accepted,
+        # as by parity; otherwise nothing is imported (UNLISTED_LOCAL_LINES).
+        unlisted_note, unlisted_fails = _unlisted_line(unlisted(log.records, rows.values()),
+                                                       args.accept_unlisted_lines)
+        if unlisted_fails:
+            print(unlisted_note)
+            raise refused("UNLISTED_LOCAL_LINES")
         folder = snapshot(Path(args.snapshots).expanduser() if args.snapshots
                           else base / SNAPSHOTS, data, head, log.count)
         store.insert_events(new)
@@ -703,7 +710,7 @@ def cmd_import_log(args) -> int:
     print(f"imported {len(new)} new line(s); {len(legacy)} already imported")
     print(f"reviewers who review on the site, marked in the adjudication folder: {on_site}"
           + (" (cutover: every imported reviewer)" if args.cutover else ""))
-    print(_unlisted_line(unlisted(log.records, rows.values()), args.accept_unlisted_lines)[0])
+    print(unlisted_note)
     for row in rows.values():
         mine = [json.loads(e["line"]) for e in events
                 if e["alias"] == row.alias and e["origin"] != RETURN]

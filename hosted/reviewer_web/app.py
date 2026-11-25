@@ -299,11 +299,13 @@ def create_app(store, mailer, config: dict) -> Flask:
             return refuse(503)  # no bundle is assigned to this reviewer: nothing is served
         if demo_env and not (demo and store.bundle_is_demo()):
             return refuse(503)  # a preview serves nobody whose bundle is not invented
-        if not store.is_open(reviewer):
+        if not store.is_open(reviewer) and request.endpoint != "sign_out":
             # Before the first import nothing of a reviewer's may be stored (it would continue no
             # local log): every page says so calmly, and nothing is lost, as nothing was saved.
-            return render_template("message.html", message=NOT_OPEN, status=503, who=None,
-                                   csrf="", demo=demo), 503
+            # Signing out stays possible from that page (the session ends at once).
+            return render_template("message.html", message=NOT_OPEN, status=503,
+                                   who=Who(reviewer, reviewer.session(), token, demo),
+                                   csrf=auth.csrf_token(secret, token), demo=demo), 503
         g.who = Who(reviewer, reviewer.session(), token, demo)
         return None
 

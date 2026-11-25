@@ -149,7 +149,8 @@ reviewer identity, `OWNER-REVIEWER`, the identity is the local identity string e
 owner's reviewers file and the local log spell it, and the address comes from a private file
 (see "Operations"). One address may open at most one real identity and one test identity (a
 unique index). After a right code such an address chooses which to open: the choice is stored
-as `sign_in_choice` (only its token's SHA-256), bound to that verified code, used once, valid
+as `sign_in_choice` (only its token's SHA-256), made only when a right code was entered (it
+holds the address's key row and its times, not the code), used once, valid
 five minutes, held by the browser that entered the code in its own cookie `__Host-choice`; it
 can name only an identity of that address that may sign in, and anything else uses it up and
 opens nothing. A session belongs to one identity. The address's codes and counters are kept
