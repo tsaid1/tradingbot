@@ -75,6 +75,7 @@ def norm(text: str) -> str:
     # The wall-clock time of a save (the records carry the real time, not the test's clock).
     text = re.sub(r"saved \d{4}-\d\d-\d\d at \d\d:\d\d", "saved T", text)
     text = re.sub(r"\(\d{4}-\d\d-\d\d at \d\d:\d\d UTC\)", "(T)", text)
+    text = re.sub(r"\d{1,2} [A-Z][a-z]{2} \d{4} at \d\d:\d\d UTC", "D at T UTC", text)
     return re.sub(r"(Submitted|Saved) at \d\d:\d\d", r"\1 at T", text)
 
 

@@ -327,3 +327,38 @@ def test_m2_a_reviewer_signs_out_before_the_import(tmp_path, store, dsn):  # noq
         assert b.get("/").headers["Location"] == "/sign-in"
     assert site.sql("SELECT count(*) FROM web_session") == [(0,)]
     del late
+
+
+# ------------------------------------------------------------------ M4
+
+
+def test_m4_a_draft_keeps_only_the_names_of_the_form_and_a_bounded_interface_state(
+        tmp_path, store, dsn):  # noqa: F811
+    """M4 (probe ``test_q06_drafts``): a draft kept any posted name, 4,000 invented fields of
+    100 bytes per form. It keeps the names the form has and at most 64 short ``ui.*`` fields;
+    every control a form page shows, before and after the reveal, is among those names."""
+    from hosted_web_site import FIRST, Site
+    from reviewer_web import app as web
+
+    site = Site(tmp_path, store, dsn)
+    b = site.browser().sign_in(FIRST)
+    for item in list(site.bundle.items)[:12]:
+        shown = b.open(item)
+        names = shown.names - {"_csrf", "_key"}
+        allowed = web.draft_names(site.bundle, site.bundle.items[item])
+        assert {n for n in names if not n.startswith("ui.")} <= allowed, item
+        junk = [(f"zz{n}", "x" * 100) for n in range(4000)]
+        junk += [(f"ui.n{n}", "y") for n in range(100)] + [("ui.long", "z" * 1000)]
+        assert b.post(f"/form/{item}/state", shown.data() + junk).status_code == 200
+        [(fields,)] = site.sql("SELECT fields FROM draft d JOIN reviewer r ON r.id ="
+                               " d.reviewer_id WHERE d.item_id = %s", item)
+        kept = [name for name, _value in fields]
+        assert not [n for n in kept if n.startswith("zz")] and "ui.long" not in kept
+        assert sum(n.startswith("ui.") for n in kept) <= web.MAX_UI_FIELDS
+        assert set(kept) - allowed <= {n for n in kept if n.startswith("ui.")}
+    # After the reveal too.
+    b.review("i07", after=False)
+    shown = b.open("i07")
+    names = shown.names - {"_csrf", "_key"}
+    assert {n for n in names if not n.startswith("ui.")} <= web.draft_names(
+        site.bundle, site.bundle.items["i07"])
