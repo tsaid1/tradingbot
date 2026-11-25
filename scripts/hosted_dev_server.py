@@ -111,6 +111,9 @@ def main() -> None:
     dsn = server.get_uri()
     admin = AdminStore(dsn)
     admin.init_schema()
+    # Its own embedded database is a preview of invented data, opened as the real order opens
+    # one: an import of the (empty) local log, then the cutover's opening of the reviewer rows.
+    admin.mark_preview()
     if args.acceptance:
         spec = importlib.util.spec_from_file_location(
             "hosted_acceptance_seed_dev", REPO / "scripts" / "hosted_acceptance_seed.py")
@@ -125,7 +128,8 @@ def main() -> None:
 
         from tradingbot.runtime.vocab_recommend import GENESIS
 
-        admin.set_anchor(0, GENESIS, sha256(b""))
+        admin.set_anchor(0, GENESIS, sha256(b""), writer="IMPORT")
+        admin.stamp_imported(r.id for r in reviewers.values())  # what import-log --cutover does
     store = Store(dsn)
 
     def mailer(to: str, _subject: str, text: str) -> None:
