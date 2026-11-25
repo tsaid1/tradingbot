@@ -6,8 +6,8 @@ INVENTED data. Not a pytest test (the test client runs no script); a development
         [--keep-shots DIR]
 
 It starts the development server on the demo (``scripts/hosted_dev_server.py``, signed in as the
-invented reviewer REMOTE-2; ``BOOT`` below records the empty local log as imported for the demo's
-reviewers, as an operator's ``import-log`` would, so that they may save) and headless Google Chrome, and answers the demo's form i07 as a
+invented reviewer REMOTE-2; the server opens its invented reviewers for saving itself) and
+headless Google Chrome, and answers the demo's form i07 as a
 person does: real mouse clicks on radio buttons and check boxes, words and prices typed key by key
 into every one-line box, Tab and Enter out of them, a pause inside a box long enough for the
 round trip to come back while the box still has the focus (finding A of the acceptance), a list
@@ -39,20 +39,12 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 
-# The development server, with the demo's reviewers open for saving (an empty local log counts
-# as imported for them: the dev server records the anchor, this records the import).
+# The development server (it opens the demo's reviewers for saving itself).
 BOOT = """
 import importlib.util, sys
 from pathlib import Path
 repo = Path.cwd()
 sys.path[:0] = [str(repo / "src"), str(repo / "hosted")]
-from reviewer_web.store import AdminStore
-anchor = AdminStore.set_anchor
-def set_anchor(self, *args, **kw):
-    anchor(self, *args, **kw)
-    with self.connection() as conn:
-        conn.execute("UPDATE reviewer SET imported_at = now() WHERE imported_at IS NULL")
-AdminStore.set_anchor = set_anchor
 # The preview's network: every round trip takes 0.4 s, as across the internet (on this machine it
 # takes a few milliseconds, which hides the races a reviewer meets).
 import time

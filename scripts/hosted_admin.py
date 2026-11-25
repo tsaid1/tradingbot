@@ -489,7 +489,7 @@ def cmd_sync_reviewers(args) -> int:
                  if shared.get(r.sign_in, 0) > 1 else ""))
     print(f"{len(rows)} reviewer row(s) written; none deleted")
     for alias in store.closed_rows():
-        print(f"{alias}: closed until import-log runs (no save is accepted before)")
+        print(f"{alias}: closed until import-log --cutover runs (no save is accepted before)")
     return 0
 
 
@@ -564,11 +564,27 @@ def own_anchor(store, lines: list[bytes], anchor: dict | None) -> None:
         raise refused("ANCHOR_NOT_OF_THIS_LOG")
 
 
+OWN_ALIAS = re.compile(r"^(REMOTE-[0-9]+|OWNER-REVIEWER)$")  # what sync-reviewers writes
+
+
 def strangers(events: list[dict], rows, listed) -> int:
     """HOSTED lines of reviewer rows that are not entries of the reviewers file (an invented
-    tester of a preview, a row of another folder): such a database is not this cutover's."""
-    logins = {r.alias for r in rows if not r.is_test and r.login not in listed}
-    return sum(e["origin"] == HOSTED and e["alias"] in logins for e in events)
+    tester of a preview, a row of another folder): such a database is not this cutover's. A
+    REVOKED row of the file's own kind (``REMOTE-n``, ``OWNER-REVIEWER``) is an offboarded
+    reviewer: their lines are theirs and come home like anyone's. Each other row is named with
+    its count and the remedy; returns the number of such lines."""
+    found = 0
+    for r in rows:
+        if r.is_test or r.login in listed or (r.revoked and OWN_ALIAS.match(r.alias)):
+            continue
+        n = sum(e["origin"] == HOSTED and e["alias"] == r.alias for e in events)
+        if n:
+            found += n
+            print(f"{r.alias}: {n} hosted line(s) of a row that is not an entry of the reviewers "
+                  "file: put its entry back (a reviewer who leaves is revoked; the entry stays)"
+                  + ("" if OWN_ALIAS.match(r.alias) else "; this row was not written from "
+                     "this file: start from an empty database"))
+    return found
 
 
 def anchored(lines: list[bytes], anchor: dict | None) -> None:
@@ -646,6 +662,14 @@ def cmd_import_log(args) -> int:
     listed = A.load_reviewers(base / "reviewers.toml").entries
     if not lines and not args.allow_empty_log:
         raise refused("EMPTY_LOCAL_LOG")  # a preview only: --allow-empty-log
+    if args.cutover:  # say where it writes before it writes, and never the wrong pair
+        demo, preview = local.manifest.get("product_commit") == "demo", store.is_preview()
+        print(f"cutover: {'demonstration' if demo else 'real'} bundle into a database "
+              f"{'marked preview' if preview else 'not marked preview'}")
+        if demo and not preview:
+            raise refused("CUTOVER_DEMO_BUNDLE_ON_A_REAL_DATABASE")
+        if preview and not demo:
+            raise refused("CUTOVER_REAL_BUNDLE_ON_A_PREVIEW_DATABASE")
     with store.exclusive():
         events, anchor = store.events(), store.anchor()
         if strangers(events, store.reviewers(), listed):
@@ -695,7 +719,8 @@ def cmd_import_log(args) -> int:
         folder = snapshot(Path(args.snapshots).expanduser() if args.snapshots
                           else base / SNAPSHOTS, data, head, log.count)
         store.insert_events(new)
-        store.stamp_imported(row.id for row in rows.values())  # open from now on
+        if args.cutover:  # the final import: only it opens the reviewer rows
+            store.stamp_imported(row.id for row in rows.values())
         if not hosted:  # until a reviewer has saved on the site, the anchor follows the log
             store.set_anchor(log.count, log.head, sha256(data), writer="IMPORT")
         anchor, events = store.anchor(), store.events()
@@ -994,6 +1019,7 @@ def cmd_verify(args) -> int:
     with store.connection():
         events, anchor = store.events(), store.anchor()
         logins = {r.login for r in store.reviewers() if not r.is_test}
+        closed = {r.login for r in store.reviewers() if r.alias in set(store.closed_rows())}
     problems = chain_problems(events, anchor)
     problems += [f"LINE_NOT_SPELLED_AS_ITS_ROW at {e['seq']}" for e in events
                  if e["origin"] != RETURN and S.annotator_login(e["line"]) != e["login_shown"]]
@@ -1019,9 +1045,14 @@ def cmd_verify(args) -> int:
         else:
             problems += [f"LEGACY_LINE_DIFFERS at {seq}" for seq, line in legacy.items()
                          if seq > len(lines) or lines[seq - 1] != line]
-            problems += [f"LEGACY_LINE_MISSING at {n}" for n, rec in enumerate(log.records, 1)
-                         if _login(rec) in logins and n not in legacy
-                         and _pulled(rec) not in hosted]
+            missing = [(n, rec) for n, rec in enumerate(log.records, 1)
+                       if _login(rec) in logins and n not in legacy
+                       and _pulled(rec) not in hosted]
+            # A row no import has considered yet: its lines come with the next import; nothing
+            # is damaged, but verify does not pass until then.
+            problems += [f"NOT_IMPORTED_YET at {n} (a row closed until import-log)"
+                         if _login(rec) in closed else f"LEGACY_LINE_MISSING at {n}"
+                         for n, rec in missing]
         print(f"snapshot {folders[-1].name}: {len(lines)} line(s); {len(legacy)} LEGACY line(s) "
               "compared with it")
     problems += published_problems(store, _base(args))
@@ -1123,7 +1154,12 @@ def write_reviews_on_the_site(base: Path, events: list[dict], rows, closed, *,
     number of logins."""
     path = base / A.REVIEWS_ON_THE_SITE_FILE
     held = V._read_private(path, "reviews-on-the-site marker")
-    was = json.loads(held) if held else {}
+    try:
+        was = json.loads(held) if held else {}
+        if not isinstance(was, dict) or not isinstance(was.get("logins", []), list):
+            raise ValueError
+    except ValueError:  # a marker no one can read refuses every reviewer save: written anew
+        was = {"cutover": True, "logins": []}
     cutover = cutover or bool(was.get("cutover"))
     writers = {e["alias"] for e in events if e["origin"] == HOSTED}
     logins = sorted({r.login_shown for r in rows if not r.is_test and (
@@ -1514,8 +1550,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--allow-empty-log", action="store_true",
                    help="import an EMPTY local log (a preview only)")
     p.add_argument("--cutover", action="store_true",
-                   help="the final import: from now on every imported reviewer reviews on the "
-                        "site, and the local workspace refuses their reviewer saves")
+                   help="the final import: it alone opens the reviewer rows on the site; from "
+                        "now on the local workspace refuses their reviewer saves")
     command("parity", cmd_parity, "compare the local log's state with the hosted store's"
             ).add_argument("--accept-unlisted-lines", **accept)
     command("export", cmd_export, "every event as JSONL").add_argument(

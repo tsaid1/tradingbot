@@ -111,7 +111,15 @@ def cutover(run, store, base) -> dict:
     run("sync-reviewers", "--demo")
     run("sync-reviewers", "--test-identity", "TEST-1", TESTER)
     run("import-log")
+    open_rows(store)
     return {r.alias: r for r in store.reviewers()}
+
+
+def open_rows(store) -> None:
+    """Open every reviewer row as ``import-log --cutover`` does, WITHOUT the folder's marker
+    that the cutover also writes: so that a test can still play the old site's local saves
+    beside the hosted ones (what the marker refuses after a real cutover)."""
+    store.stamp_imported(r.id for r in store.reviewers() if not r.is_test)
 
 
 def hosted_work(store, rows) -> None:
@@ -389,9 +397,9 @@ def test_sync_reviewers_reads_the_owner_s_file_and_never_deletes(run, store, bas
     assert out.splitlines() == [f"REMOTE-2: id 1, REVIEWER, FULL, scope 40, {bundle}",
                                 f"REMOTE-3: id 2, REVIEWER, FULL, scope 40, {bundle}",
                                 "2 reviewer row(s) written; none deleted",
-                                ("REMOTE-2: closed until import-log runs (no save is accepted "
+                                ("REMOTE-2: closed until import-log --cutover runs (no save is accepted "
                                  "before)"),
-                                ("REMOTE-3: closed until import-log runs (no save is accepted "
+                                ("REMOTE-3: closed until import-log --cutover runs (no save is accepted "
                                  "before)")]
     assert store.reviewer_by_login(ONE.login).session() == ONE
     assert "TEST_ALIAS_IS_TEST_N" in run("sync-reviewers", "--test-identity", "REMOTE-9", TESTER,
@@ -400,8 +408,8 @@ def test_sync_reviewers_reads_the_owner_s_file_and_never_deletes(run, store, bas
     assert out.splitlines() == [
         f"TEST-1: id 3, REVIEWER, FULL, scope 40, {bundle}, test identity",
         "1 reviewer row(s) written; none deleted",
-        "REMOTE-2: closed until import-log runs (no save is accepted before)",
-        "REMOTE-3: closed until import-log runs (no save is accepted before)"]
+        "REMOTE-2: closed until import-log --cutover runs (no save is accepted before)",
+        "REMOTE-3: closed until import-log --cutover runs (no save is accepted before)"]
     assert store.reviewer_by_login(TESTER).is_test is True
     # An entry that left the file keeps its row (revoke it); the file itself is only read.
     file.write_text(file.read_text().split("[[reviewer]]\nlogin = \"remote@")[0])
@@ -1123,6 +1131,7 @@ def test_a_test_identity_works_on_invented_forms_beside_the_reviewers_on_the_rea
         (demo / "bundle" / "media" / "chart-p01.png").read_bytes(), "image/png")
     # The cutover and the work: the reviewer on the real forms, the test identity on invented ones.
     assert "imported 7 new line(s)" in run("import-log")
+    open_rows(store)
     hosted_reveal(store, one, "i08")  # 1000001
     hosted_save(store, one, "i08", A.AFTER_REVEAL)  # 1000002
     hosted_save(store, tester, "i07", A.INDEPENDENT)  # 3000001: the test identity's stream
@@ -1410,6 +1419,7 @@ def test_a_test_identity_saves_in_a_stream_of_its_own_and_never_fixes_the_anchor
     assert "events: LEGACY 9, TEST 2; hosted chain on " in run("verify")
     out = run("parity")
     assert "TEST-1" not in out and out.splitlines()[-1].endswith("PASS, 2 reviewer(s)")
+    open_rows(store)
     # A reviewer's first save continues the anchored log, and only that fixes the anchor.
     [mine] = hosted_save(store, rows["REMOTE-2"], "i03", A.INDEPENDENT).records
     assert (mine["seq"], mine["prev_sha256"]) == (HOSTED_1, head)

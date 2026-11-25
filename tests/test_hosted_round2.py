@@ -10,7 +10,7 @@ import json
 import pytest
 from hosted_pg import hosted_reveal, hosted_save, reading_kw
 from hosted_web_site import dsn, store  # noqa: F401 - fixtures
-from test_hosted_admin import ONE, base, cli, half_way, local_save  # noqa: F401 - fixtures
+from test_hosted_admin import ONE, base, cli, half_way, local_save, open_rows  # noqa: F401
 from test_hosted_identities import OWNER_R, address_file, owner_cutover, run  # noqa: F401
 
 from tradingbot.runtime import adjudication as A
@@ -38,7 +38,7 @@ def test_q1_a_row_written_after_the_first_import_is_closed_until_import_log_cons
     from reviewer_web import forms as F
 
     owner_history(base)
-    run("init-db")
+    run("init-db", "--preview")  # a rehearsal on the demo folder
     run("publish-bundle", "--demo", base)
     # Without the owner's address file sync-reviewers fails: nothing is written.
     out = run("sync-reviewers", "--demo", code=2)
@@ -46,19 +46,19 @@ def test_q1_a_row_written_after_the_first_import_is_closed_until_import_log_cons
     assert store.reviewers() == []
     out = run("sync-reviewers", "--demo", "--without-owner")
     assert "OWNER-REVIEWER: left out on purpose" in out
-    assert "REMOTE-2: closed until import-log runs" in out
+    assert "REMOTE-2: closed until import-log --cutover runs" in out
     run("import-log", "--accept-unlisted-lines", "3")
     secret = address_file(tmp_path / "keys")
     out = run("sync-reviewers", "--demo", "--owner-address-file", secret)
-    assert "OWNER-REVIEWER: closed until import-log runs" in out
-    assert "REMOTE-2: closed" not in out  # considered by the import
+    assert "OWNER-REVIEWER: closed until import-log --cutover runs" in out
+    assert "REMOTE-2: closed until import-log --cutover" in out  # a plain import opens nothing
     owner = {r.alias: r for r in store.reviewers()}["OWNER-REVIEWER"]
     assert not store.is_open(owner)
     with pytest.raises(A.AdjudicationError, match="^NOT_IMPORTED$"):
         hosted_save(store, owner, "i07", A.INDEPENDENT)
     assert not [e for e in store.events() if e["alias"] == "OWNER-REVIEWER"]
-    # The next import brings the owner's history first; then the site serves it.
-    run("import-log")
+    # The cutover's import brings the owner's history first and opens the rows.
+    run("import-log", "--cutover")
     assert store.is_open(owner)
     bundle, session = store.bundle_for(owner), owner.session()
     assert F.step_state(bundle, session, store.records_of(owner), "i07") == F.DONE
@@ -106,6 +106,7 @@ def test_q2_a_local_line_already_imported_is_no_second_history(run, store, base)
     run("publish-bundle", "--demo", base)
     run("sync-reviewers", "--demo", "--without-owner")
     run("import-log")
+    open_rows(store)
     rows = {r.alias: r for r in store.reviewers()}
     hosted_save(store, rows["REMOTE-3"], "i08", A.INDEPENDENT)
     run("pull-to-local")
@@ -362,3 +363,175 @@ def test_m4_a_draft_keeps_only_the_names_of_the_form_and_a_bounded_interface_sta
     names = shown.names - {"_csrf", "_key"}
     assert {n for n in names if not n.startswith("ui.")} <= web.draft_names(
         site.bundle, site.bundle.items["i07"])
+
+
+# ------------------------------------------------------------------ re-check R2-1
+
+
+def test_r2_1_the_documented_order_opens_no_row_before_the_cutover(
+        run, store, dsn, base, tmp_path):  # noqa: F811
+    """R2-1 (probe ``test_q11_recheck::test_a1_documented_order_owner_opens_your_review_at_
+    step_3``), the docs followed word for word on a rehearsal: after step 2 (a plain import-log)
+    the owner still reviews locally and reveals i02; at step 3 the owner signs in and may choose
+    "Your review": it is "Not open yet", no page writes an event, a save is refused; the test
+    forms work. Step 6 (import-log --cutover) moves the anchor to the present head, opens the
+    rows, and the site then serves i02 as seen."""
+    from hosted_web_site import ORIGIN, SECRET
+    from reviewer_web import app as web
+    from reviewer_web import forms as F
+    from reviewer_web import mail
+    from reviewer_web.store import Store
+    from test_hosted_identities import ADDRESS
+
+    half_way(base)
+    secret = address_file(tmp_path / "keys")
+    run("init-db", "--preview")
+    run("publish-bundle", "--demo", base)
+    run("sync-reviewers", "--demo", "--owner-address-file", secret)  # step 1
+    run("import-log")  # step 2
+    assert "PASS" in run("parity") and "verify: PASS" in run("verify")
+    assert store.closed_rows() == ["REMOTE-2", "REMOTE-3", "OWNER-REVIEWER"]
+    local_save(base, OWNER_R, "i02", A.INDEPENDENT)  # the owner, locally, before step 4
+    A.mark_system_shown(base, A.load_bundle(base / "bundle", A.FULL), OWNER_R, "i02")
+    run("sync-reviewers", "--test-identity", "TEST-1", "--owner-address-file", secret)  # step 3
+    outbox = mail.Outbox()
+    app = web.create_app(Store(dsn), outbox, {"SESSION_SECRET": SECRET, "SITE_ENV": "test",
+                                              "SIGN_IN_FLOOR_SECONDS": 0})
+    head = {"Origin": ORIGIN, "Sec-Fetch-Site": "same-origin"}
+
+    def signed(which: str):
+        client = app.test_client()
+        client.post("/sign-in", data={"address": ADDRESS}, base_url=ORIGIN, headers=head)
+        code = outbox.sent[-1][2].split("code is ")[1][:6]
+        answer = client.post("/sign-in/verify", data={"address": ADDRESS, "code": code},
+                             base_url=ORIGIN, headers=head)
+        assert answer.headers["Location"] == "/sign-in/choose"
+        client.post("/sign-in/choose", data={"identity": which}, base_url=ORIGIN, headers=head)
+        return client
+
+    mine = signed("review")
+    for path in ("/", "/form/i02", "/form/i07", "/continue", "/sequence/seqA"):
+        page = mine.get(path, base_url=ORIGIN)
+        assert page.status_code == 503 and "Not open yet" in page.get_data(as_text=True), path
+    owner = {r.alias: r for r in store.reviewers()}["OWNER-REVIEWER"]
+    with pytest.raises(A.AdjudicationError, match="^NOT_IMPORTED$"):
+        hosted_save(store, owner, "i02", A.INDEPENDENT)
+    test = signed("test")
+    assert test.get("/form/i07", base_url=ORIGIN).status_code == 200
+    assert not [e for e in store.events() if e["origin"] == "HOSTED"]  # no line, no marker
+    out = run("import-log", "--cutover")  # step 6
+    assert "moved to the log's present head" in out and store.closed_rows() == []
+    bundle, session = store.bundle_for(owner), owner.session()
+    assert F.step_state(bundle, session, store.records_of(owner), "i02") == F.AFTER_REVEAL_DUE
+    with pytest.raises(A.AdjudicationError, match="^SYSTEM_READING_ALREADY_SEEN$"):
+        hosted_save(store, owner, "i02", A.INDEPENDENT)
+
+
+# ------------------------------------------------------------------ re-check R2-2
+
+
+def test_r2_2_an_offboarded_reviewer_s_row_stops_no_pull(run, store, base):  # noqa: F811
+    """R2-2 (probe ``test_q11_recheck::test_a2``): REMOTE-3 revoked and removed from the file;
+    its hosted lines made import-log and pull-to-local refuse for everybody. A revoked row's
+    lines now come home as anyone's; a row removed WITHOUT revoking is named with the remedy."""
+    half_way(base)
+    run("init-db")
+    run("publish-bundle", "--demo", base)
+    run("sync-reviewers", "--demo", "--without-owner")
+    run("import-log")
+    open_rows(store)
+    rows = {r.alias: r for r in store.reviewers()}
+    hosted_save(store, rows["REMOTE-3"], "i08", A.INDEPENDENT)
+    hosted_save(store, rows["REMOTE-2"], "i03", A.INDEPENDENT)
+    path = base / "reviewers.toml"
+    whole = path.read_text()
+    path.write_text("[[reviewer]]".join(b for b in whole.split("[[reviewer]]")
+                                        if rows["REMOTE-3"].login_shown not in b))
+    out = run("pull-to-local", code=2)  # removed without revoking: named, with the remedy
+    assert "REMOTE-3: 1 hosted line(s) of a row that is not an entry of the reviewers file: put " \
+        "its entry back" in out and out.endswith("refused: HOSTED_LINES_OF_ROWS_NOT_IN_THE_FILE\n")
+    run("revoke", "REMOTE-3")
+    out = run("pull-to-local")
+    assert "pulled 2 hosted line(s) into the local log: REMOTE-3 1, REMOTE-2 1" in out
+    assert "imported 0 new line(s)" in run("import-log")
+
+
+# ------------------------------------------------------------------ re-check R2-3
+
+
+def test_r2_3_the_cutover_says_where_it_writes_and_refuses_the_wrong_pair(
+        run, store, base, tmp_path):  # noqa: F811
+    """R2-3: a terminal that ran the rehearsal still names the invented folder or the preview.
+    import-log --cutover prints which bundle and which database it writes, and refuses a
+    demonstration bundle into a database not marked preview, and a real bundle into a preview."""
+    import json as _json
+
+    half_way(base)
+    run("init-db")
+    run("publish-bundle", "--demo", base)
+    run("sync-reviewers", "--demo", "--without-owner")
+    out = run("import-log", "--cutover", code=2)
+    assert "cutover: demonstration bundle into a database not marked preview" in out
+    assert out.endswith("refused: CUTOVER_DEMO_BUNDLE_ON_A_REAL_DATABASE\n")
+    assert store.anchor() is None and store.closed_rows() == ["REMOTE-2", "REMOTE-3"]
+    store.mark_preview()
+    manifest = base / "bundle" / "manifest.json"
+    data = _json.loads(manifest.read_text())
+    manifest.write_text(_json.dumps({**data, "product_commit": "0" * 12}, indent=1) + "\n")
+    out = run("import-log", "--cutover", code=2)  # a real bundle's log into a preview
+    assert "cutover: real bundle into a database marked preview" in out
+    assert out.endswith("refused: CUTOVER_REAL_BUNDLE_ON_A_PREVIEW_DATABASE\n")
+    manifest.write_text(_json.dumps(data, indent=1) + "\n")
+    out = run("import-log", "--cutover")
+    assert "cutover: demonstration bundle into a database marked preview" in out
+    assert store.closed_rows() == []
+
+
+# ------------------------------------------------------------------ re-check R2-4
+
+
+@pytest.mark.parametrize("logins", ['"reviewer@example.invalid"', '{"a": 1}', "7", "null"])
+def test_r2_4_a_marker_that_is_no_list_of_logins_refuses_every_reviewer_save(
+        base, logins):  # noqa: F811
+    """R2-4 (a) (probe ``test_q11_recheck::test_a3``): "logins" given as a string became a set of
+    characters and refused nobody. Anything but a list of logins refuses every reviewer save and
+    reveal; the approver decides as before; pull-to-local writes the file anew."""
+    from test_hosted_admin import OWNER
+
+    half_way(base)
+    path = base / A.REVIEWS_ON_THE_SITE_FILE
+    path.write_text('{"schema": "%s", "logins": %s}' % (A.REVIEWS_ON_THE_SITE_SCHEMA, logins))
+    path.chmod(0o600)
+    b = A.load_bundle(base / "bundle", A.FULL)
+    for save in (lambda: local_save(base, ONE, "i02", A.INDEPENDENT),
+                 lambda: A.mark_system_shown(base, b, ONE, "i05")):
+        with pytest.raises(A.AdjudicationError, match="^REVIEWS_ON_THE_SITE_MARKER_UNREADABLE$"):
+            save()
+    A.append_annotation(base, b, OWNER, item_id="i07", phase=A.APPROVAL, blind=False,
+                        reading={}, refers_to=3, outcome="ACCEPT")
+
+
+def test_r2_4_verify_names_the_lines_of_a_closed_row(run, store, base, tmp_path):  # noqa: F811
+    """R2-4 (b): the lines of a row no import has considered yet read as LEGACY_LINE_MISSING."""
+    owner_history(base)
+    run("init-db")
+    run("publish-bundle", "--demo", base)
+    run("sync-reviewers", "--demo", "--without-owner")
+    run("import-log", "--accept-unlisted-lines", "3")
+    run("sync-reviewers", "--demo", "--owner-address-file", address_file(tmp_path / "keys"))
+    out = run("verify", code=1)
+    assert "  NOT_IMPORTED_YET at 9 (a row closed until import-log)" in out
+    assert "LEGACY_LINE_MISSING" not in out
+    run("import-log")
+    assert "verify: PASS" in run("verify")
+
+
+def test_r2_4_pull_writes_an_unreadable_marker_anew(run, store, base, tmp_path):  # noqa: F811
+    from test_hosted_identities import owner_cutover
+
+    owner_cutover(run, store, base, tmp_path)
+    path = base / A.REVIEWS_ON_THE_SITE_FILE
+    path.write_text("{not json")
+    path.chmod(0o600)
+    run("pull-to-local")
+    assert isinstance(A.reviews_on_the_site(base), frozenset)
