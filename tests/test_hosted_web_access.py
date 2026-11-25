@@ -183,10 +183,14 @@ def test_every_response_carries_the_headers_and_nothing_is_kept_by_a_browser(sit
         assert "url(" not in text
 
 
-def test_the_public_folder_holds_the_stylesheet_and_the_script_and_nothing_else():
+def test_the_public_folder_holds_the_stylesheets_and_the_script_and_nothing_else():
     files = sorted(p.relative_to(HOSTED / "public").as_posix()
                    for p in (HOSTED / "public").rglob("*") if p.is_file())
-    assert files == ["static/app.css", "static/app.js"]
+    assert files == ["static/app.css", "static/app.js", "static/nav.css"]
+    # The structure of the dashboard and the sidebar sets no colour of its own (INTERFACE's
+    # tokens give every colour) and loads nothing from anywhere.
+    nav = (HOSTED / "public" / "static" / "nav.css").read_text()
+    assert not re.search(r"#[0-9a-fA-F]{3,8}\b|rgb|hsl|url\(|@import", nav)
     assert (HOSTED / ".python-version").read_text().strip() == "3.12"
     assert "from reviewer_web.app import app" in (HOSTED / "wsgi.py").read_text()
 

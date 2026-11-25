@@ -49,6 +49,7 @@ from tradingbot.runtime import adjudication_rubric as R
 
 from . import auth, mail
 from . import forms as F
+from . import progress as P
 
 STATIC = Path(__file__).resolve().parent.parent / "public" / "static"
 SITE_ENVS = ("production", "preview", "test")
@@ -90,6 +91,24 @@ MESSAGES = {
           "never stored twice."),
     503: "The site is not available.",
 }
+
+
+class Status(dict):
+    """The form's status for the templates (``progress.form_status``: ``code``, ``waiting_for``,
+    ``draft``, ``step``); printed as it is, it reads as the status sentence of the earlier page,
+    so a template written before the dashboard shows what it showed."""
+
+    def __init__(self, found: dict, text: str):
+        super().__init__(found)
+        self.text = text
+
+    def __str__(self) -> str:
+        return self.text
+
+    def __html__(self) -> str:
+        from markupsafe import escape
+
+        return str(escape(self.text))
 
 
 @dataclass(frozen=True)
@@ -495,13 +514,27 @@ def create_app(store, mailer, config: dict) -> Flask:
 
     # ------------------------------------------------------------- the workspace
 
+    def drafts_of(bundle) -> set[str]:
+        """The forms of this reviewer that hold a draft of their current phase (a draft changes
+        nothing but its own flag)."""
+        reader = getattr(store, "draft_items", None)
+        return reader(g.who.reviewer, bundle) if reader else set()
+
+    def navigation(bundle, records, item_id=None) -> dict:
+        """The sidebar's model (``progress.sidebar``) of this reviewer's own saves."""
+        return P.sidebar(bundle, g.who.session, records, item_id, drafts_of(bundle))
+
     @app.get("/")
     @reviewer_route
     def workspace():
         bundle = store.bundle_for(g.who.reviewer)
         records = store.records_of(g.who.reviewer)
-        return lambda: render_template("workspace.html",
-                                       **F.workspace(bundle, g.who.session, records))
+        drafts = drafts_of(bundle)
+        old = F.workspace(bundle, g.who.session, records)
+        dash = P.dashboard(bundle, g.who.session, records, drafts)
+        nav = P.sidebar(bundle, g.who.session, records, None, drafts)
+        return lambda: render_template("workspace.html", **old, dash=dash, nav=nav,
+                                       names=F.names(bundle, g.who.session))
 
     @app.get("/continue")
     @reviewer_route
@@ -510,16 +543,33 @@ def create_app(store, mailer, config: dict) -> Flask:
         step = F.next_step(bundle, g.who.session, store.records_of(g.who.reviewer))
         return redirect(f"/form/{step}" if step else "/", 303)
 
+    @app.get("/sequence/<sequence_id>")
+    @reviewer_route
+    def sequence(sequence_id):
+        """A sequence's Start or Continue: its next step by the resume rule restricted to it (a
+        returned form first). A sequence outside the reviewer's scope is a 404."""
+        bundle = store.bundle_for(g.who.reviewer)
+        step = P.sequence_next(bundle, g.who.session, store.records_of(g.who.reviewer),
+                               sequence_id[:128])
+        if step is False:
+            abort(404)
+        return redirect(f"/form/{step}" if step else "/", 303)
+
     @app.get("/guide")
     @reviewer_route
     def guide():
-        return render_template("guide.html", blocks=F.guide_blocks(R.render_guide_markdown()),
-                               how=R.HOW_TO_REVIEW)
+        bundle = store.bundle_for(g.who.reviewer)
+        nav = navigation(bundle, store.records_of(g.who.reviewer))
+        return lambda: render_template("guide.html", nav=nav,
+                                       blocks=F.guide_blocks(R.render_guide_markdown()),
+                                       how=R.HOW_TO_REVIEW)
 
     @app.get("/fields")
     @reviewer_route
     def fields():
-        return render_template("fields.html", **F.field_reference())
+        bundle = store.bundle_for(g.who.reviewer)
+        nav = navigation(bundle, store.records_of(g.who.reviewer))
+        return lambda: render_template("fields.html", nav=nav, **F.field_reference())
 
     # ------------------------------------------------------------- one form
 
@@ -581,7 +631,7 @@ def create_app(store, mailer, config: dict) -> Flask:
         return A.AFTER_REVEAL if state != F.REVEAL_PENDING and gate.marked else None
 
     def page(bundle, item, records, gate, problem, *, posted=None, refusal=None, saved=None,
-             status=200):
+             status=200, draft=None):
         """The form page as it stands now. ``posted`` is used only when it belongs to the form
         the page shows (the same phase)."""
         who, item_id = g.who, item["item_id"]
@@ -590,10 +640,15 @@ def create_app(store, mailer, config: dict) -> Flask:
         if posted is not None and posted.get("_phase") != phase:
             posted = None
         step = F.step_from(bundle, who.session, records, item)
+        drafts = drafts_of(bundle)
         return render_template(
             "form.html", item_id=item_id, bundle_id=bundle.bundle_id,
             names=F.names(bundle, who.session),
-            status=F.STATUS_TEXT[gate.state],
+            status=Status(P.form_status(bundle, who.session, records, item_id, drafts),
+                          F.STATUS_TEXT[gate.state]),
+            step=P.remaining_step(bundle, who.session, records, item_id, drafts),
+            nav=P.sidebar(bundle, who.session, records, item_id, drafts),
+            draft=draft,
             returned=gate.returned is not None and revealed,
             not_blind=revealed and gate.ind is None,
             evidence=F.evidence(bundle, item), header=F.form_header(bundle, item),

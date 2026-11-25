@@ -672,11 +672,11 @@ def test_resuming_in_a_new_session_lands_on_the_next_unfinished_step(site14):
     assert (state("s14a"), state("s14b")) == (F.REVEAL_PENDING, F.INDEPENDENT_DUE)
     assert resume() == "/form/s14b"
     home = site.browser().sign_in(FIRST).get("/").get_data(as_text=True)
-    assert "next step" in home and "independent reading saved" in home
+    assert "In progress" in home and "/sequence/scs14" in home  # the dashboard (FLOW)
     b.review("s14b", after=False)
     assert "Next step: on this same form, below." in b.shown.visible()
     assert (state("s14a"), state("s14b")) == (F.AFTER_REVEAL_DUE, F.AFTER_REVEAL_DUE)
-    assert "reading after the reveal due" in b.get("/").get_data(as_text=True)
+    assert "Awaiting your assessment" in b.get("/").get_data(as_text=True)
     # Both saved and revealed: the first form that is not done, in the state after the reveal,
     # with the independent answers intact.
     assert resume() == "/form/s14a"
@@ -726,13 +726,13 @@ def test_a_reading_the_approver_returned_is_shown_to_its_reviewer_only(site):  #
     assert shown.value("lv.n:0.role") == "HISTORICAL_FILL"
     # The workspace says so, and "continue" goes there before the first form never started.
     home = a.get("/").get_data(as_text=True)
-    assert "Returned to you" in home and "The approver returned 1 reading to you." in " ".join(
+    assert "Returned for changes" in home and "The approver returned 1 reading to you." in " ".join(
         home.split())
     assert a.get("/continue").headers["Location"] == "/form/i08"
-    assert "2 of 45" in home  # the counts are the reviewer's own records, as before
+    assert "1 of 45" in home  # the reviewer's own saves; a returned form is not complete
     # The other reviewer, who read the same form, sees nothing of it.
     for text in (b.open("i08").text, b.get("/").get_data(as_text=True)):
-        assert "RETURNED" not in text and "Returned to you" not in text and note not in text
+        assert "RETURNED" not in text and "Returned for changes" not in text and note not in text
     assert b.get("/continue").headers["Location"] == "/form/i07"
     assert returned not in site.records(SECOND) and returned in site.records(FIRST)
     from reviewer_web import forms as F
@@ -750,7 +750,7 @@ def test_a_reading_the_approver_returned_is_shown_to_its_reviewer_only(site):  #
     assert "Saved." in done.text and "RETURNED" not in done.text
     assert "SAVED. Your reading of this form after the reveal is record" in done.text
     home = a.get("/").get_data(as_text=True)
-    assert "Returned to you" not in home and "The approver returned" not in home
+    assert "Returned for changes" not in home and "The approver returned" not in home
     assert a.get("/continue").headers["Location"] == "/form/i01"
     newest = [r for r in site.records(FIRST) if r["phase"] == A.AFTER_REVEAL][-1]
     assert newest["seq"] > after["seq"] and newest["notes"] == "corrected after the return"
@@ -775,7 +775,7 @@ def test_a_return_the_approver_took_back_shows_nowhere_on_the_site(site):  # noq
                                      "role": A.APPROVER, "access": A.FULL}  # as the tool stores
     assert 2_000_000 < returned["seq"] < 3_000_000 and returned["seq"] % 2 == 0
     assert a.get("/continue").headers["Location"] == "/form/i08"
-    assert "Returned to you" in a.get("/").get_data(as_text=True)
+    assert "Returned for changes" in a.get("/").get_data(as_text=True)
 
     def state() -> str:
         return F.step_state(site.bundle, site.reviewers[FIRST].session(), site.records(FIRST),
@@ -784,7 +784,7 @@ def test_a_return_the_approver_took_back_shows_nowhere_on_the_site(site):  # noq
     def nothing_is_returned(*notes: str) -> None:
         home, shown = Shown(a.get("/")), a.open("i08")
         for page in (home, shown):
-            assert "Returned to you" not in page.text and "RETURNED" not in page.text
+            assert "Returned for changes" not in page.text and "RETURNED" not in page.text
             assert "The approver returned" not in page.text and "WITHDRAWN" not in page.text
             assert not [n for n in (*notes, "never stored") if n in page.plain]
         assert "SAVED. Your reading of this form after the reveal is record" in shown.text
