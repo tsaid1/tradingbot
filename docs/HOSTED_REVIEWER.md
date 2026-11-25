@@ -172,13 +172,22 @@ site's address as the invitations name it: the only absolute address the site ev
 page and no redirect uses it, so the site works under each of its host names. The route's
 answer is three counts (`sent`, `failed`, `left`); it never returns or logs an address.
 
+**The database.** The site connects with `SITE_DATABASE_URL` when that variable is set (and
+not empty), otherwise with `DATABASE_URL`. `SITE_DATABASE_URL` is for the connection of a
+restricted role that may read and append but does not own the tables (so it cannot switch off
+the rule that no event is changed or deleted), while the platform keeps managing `DATABASE_URL`
+for the owning role.
+
 **Environments** (`SITE_ENV`). `preview` and `test` serve only bundles flagged as demonstration
 data: they do not start on any other, stop answering if one is published, and refuse a reviewer
 whose bundle is not flagged. With none of the mail variables set they use synthetic mail: no
 message leaves, and the code-entry page shows the code in the demonstration band. Synthetic mail
 is therefore only for a preview that sits behind the platform's own login: whoever reaches it
 can sign in as a listed address, and the page shows a code only for a listed one. Production
-never uses it.
+never uses it. A deployment the platform itself does not call production (`VERCEL_ENV` set and
+not `production`) refuses to start as production (`PREVIEW_DEPLOYMENT_NEEDS_SITE_ENV`): a
+preview that inherited the production variables must say `SITE_ENV=preview`, and then serves
+invented data only.
 
 **Known limits.** The time a code request takes is padded to a floor, and an address that gets no
 code makes the same connection to the mail server as one that does (so a mail failure reads the

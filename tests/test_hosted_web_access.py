@@ -388,3 +388,61 @@ def test_a_reviewer_without_a_bundle_is_served_nothing(store, dsn):  # noqa: F81
     for path in ("/", "/continue", "/form/i07", "/guide", "/media/" + "0" * 64 + "/p01/x.png"):
         answer = client.get(path, base_url=ORIGIN)
         assert answer.status_code == 503 and b"The site is not available." in answer.get_data()
+
+
+def test_a_deployment_the_platform_does_not_call_production_never_starts_as_production(
+        tmp_path, store, dsn):  # noqa: F811
+    """The review's finding 3: a preview deployment that inherited the production variables
+    (the database, the secret, the mail) and no SITE_ENV started as production on the real
+    database."""
+    from hosted_pg import publish_as_real
+    from reviewer_web import app as web
+
+    site = Site(tmp_path, store, dsn)  # noqa: F811
+    real = publish_as_real(store, tmp_path / "demo")  # a stand-in for the real bundle, active
+    site.set_reviewer(FIRST, bundle_id=real.bundle_id)
+    env = {"DATABASE_URL": dsn, "SESSION_SECRET": SECRET, "SMTP_HOST": "smtp.example.invalid",
+           "SMTP_PORT": "465", "SMTP_USER": "u", "SMTP_PASSWORD": "p",
+           "MAIL_FROM": "site@example.invalid", "OPERATOR_TOKEN": "t" * 40,
+           "SITE_URL": "https://review.example.invalid"}
+    for platform in ("preview", "development", "staging"):
+        for site_env in ({}, {"SITE_ENV": ""}, {"SITE_ENV": "production"}):
+            with pytest.raises(RuntimeError, match="^PREVIEW_DEPLOYMENT_NEEDS_SITE_ENV$"):
+                web.from_environment({**env, **site_env, "VERCEL_ENV": platform})
+    # Said to be a preview, it serves invented data only: here a real bundle is active.
+    with pytest.raises(RuntimeError, match="^NOT_A_DEMO_BUNDLE$"):
+        web.from_environment({**env, "VERCEL_ENV": "preview", "SITE_ENV": "preview"})
+    # The production deployment, and a site that is not on the platform at all, start.
+    for platform in ({"VERCEL_ENV": "production"}, {"VERCEL_ENV": ""}, {}):
+        app = web.from_environment({**env, **platform})
+        page = app.test_client().get("/sign-in", base_url=ORIGIN)
+        assert page.status_code == 200 and b"Demonstration data" not in page.get_data()
+
+
+def test_the_site_connects_with_its_own_database_address_when_one_is_given(
+        tmp_path, store, dsn, monkeypatch):  # noqa: F811
+    """SITE_DATABASE_URL (the connection of a restricted role) comes before DATABASE_URL (the
+    owning role's, which the platform manages); an empty value counts as not set."""
+    from reviewer_web import app as web
+    from reviewer_web import store as S
+
+    Site(tmp_path, store, dsn)
+    used = []
+
+    class Recording(S.Store):
+        def __init__(self, address):
+            used.append(address)
+            super().__init__(dsn)  # the test's database, whatever address was asked for
+
+    monkeypatch.setattr(S, "Store", Recording)
+    env = {"SESSION_SECRET": SECRET, "SITE_ENV": "test"}
+    owner, site_role = "postgresql://owner@db.example.invalid/x", \
+        "postgresql://site@db.example.invalid/x"
+    web.from_environment({**env, "DATABASE_URL": owner, "SITE_DATABASE_URL": site_role})
+    web.from_environment({**env, "DATABASE_URL": owner, "SITE_DATABASE_URL": ""})
+    web.from_environment({**env, "DATABASE_URL": owner})
+    web.from_environment({**env, "SITE_DATABASE_URL": site_role})
+    assert used == [site_role, owner, owner, site_role]
+    for nothing in ({}, {"SITE_DATABASE_URL": ""}):
+        with pytest.raises(KeyError):
+            web.from_environment({**env, **nothing})

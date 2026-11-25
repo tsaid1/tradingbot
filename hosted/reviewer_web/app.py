@@ -19,8 +19,9 @@ is read and written inside it, it is committed, and only then is the page built 
 read. So a marker or a save is durable before any page says so.
 
 ``create_app(store, mailer, config)`` builds the application; ``app`` (module level, built on
-first use) is the one the platform serves, configured by the environment: ``DATABASE_URL``,
-``SESSION_SECRET``, ``SITE_ENV``, the five SMTP variables of ``mail``, and for the operator's
+first use) is the one the platform serves, configured by the environment: ``DATABASE_URL``
+(or ``SITE_DATABASE_URL``), ``SESSION_SECRET``, ``SITE_ENV``, the five SMTP variables of
+``mail``, and for the operator's
 queued invitations ``OPERATOR_TOKEN`` and ``SITE_URL`` (``from_environment``).
 """
 
@@ -588,14 +589,24 @@ def create_app(store, mailer, config: dict) -> Flask:
 def from_environment(env=os.environ) -> Flask:
     """The application the platform serves. Mail: all five SMTP variables, or none of them.
     With none, ``preview`` and ``test`` show the code on the page beside the demonstration data
-    (no mail leaves); ``production`` refuses to start."""
+    (no mail leaves); ``production`` refuses to start.
+
+    The platform names the kind of deployment itself (``VERCEL_ENV``). A deployment it does not
+    call production never starts as production, whatever variables it inherited: a preview of
+    any branch would otherwise serve, and write to, the real database.
+
+    The database is ``SITE_DATABASE_URL`` when that is set (the connection of a role that may
+    read and append but does not own the tables), else ``DATABASE_URL``."""
     from .store import Store
 
     site_env = env.get("SITE_ENV") or "production"
+    if site_env == "production" and (env.get("VERCEL_ENV") or "production") != "production":
+        raise RuntimeError("PREVIEW_DEPLOYMENT_NEEDS_SITE_ENV")
     with_mail = mail.configured(env)
     if with_mail is None or (not with_mail and site_env not in DEMO_ENVS):
         raise RuntimeError("MAIL_NOT_CONFIGURED")
-    return create_app(Store(env["DATABASE_URL"]), mail.Smtp(env) if with_mail else None,
+    database = env.get("SITE_DATABASE_URL") or env["DATABASE_URL"]
+    return create_app(Store(database), mail.Smtp(env) if with_mail else None,
                       {"SESSION_SECRET": env.get("SESSION_SECRET", ""), "SITE_ENV": site_env,
                        "OPERATOR_TOKEN": env.get("OPERATOR_TOKEN", ""),
                        "SITE_URL": env.get("SITE_URL", "")})
