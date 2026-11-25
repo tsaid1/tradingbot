@@ -127,7 +127,9 @@ independent reading (or the system's reading was already shown to them). The SYS
 of every form of the post are then stored and committed FIRST, and only a page that reads them
 back shows the system's reading; if they cannot be stored, nothing is shown. A reading after the
 reveal is refused without the markers, and the core refuses an independent reading once a marker
-or a reading exists. The site has no switch to turn blind-first off. What a blind form still tells
+or a reading exists. A form whose post was already revealed through another of its forms (a form
+that enters the scope later, when the scope is raised) therefore has no independent step: its
+page says so, and its reading is stored with `blind: false`. The site has no switch to turn blind-first off. What a blind form still tells
 about the system is what it tells today, by design: the number of forms of a post, whether a form
 is an instruction or label-only, and the market names and idea identifiers offered as choices.
 

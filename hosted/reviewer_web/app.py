@@ -476,6 +476,7 @@ def create_app(store, mailer, config: dict) -> Flask:
             names=F.names(bundle, who.session),
             status=F.STATUS_TEXT[gate.state],
             returned=gate.returned is not None and revealed,
+            not_blind=revealed and gate.ind is None,
             evidence=F.evidence(bundle, item), header=F.form_header(bundle, item),
             how=R.HOW_TO_REVIEW, verdict_help=R.VERDICT_HELP,
             overall=F.overall(bundle, item, records, who.session.login),

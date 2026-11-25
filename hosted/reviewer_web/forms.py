@@ -86,7 +86,7 @@ class Gate:
     ind: dict | None  # the latest independent reading
     after: dict | None  # the latest reading after the reveal
     waiting: tuple[str, ...]  # forms of the post still without an independent reading
-    seen: bool  # a marker, or a record that is not a rubric-2 independent reading
+    seen: bool  # a marker on ANY form of the post, or a record that is not a blind reading
     marked: bool  # the SYSTEM_SHOWN marker of this form and of every form of its post is stored
     returned: dict | None = None  # the approver's RETURN of ``after``, while it stands
 
@@ -117,7 +117,13 @@ def gate(bundle: A.Bundle, session: A.Session, item: dict, records: list[dict]) 
     siblings = A.post_siblings(bundle, item, session.scope)
     new = A.rubric2(records)
     waiting = tuple(s for s in siblings if not A._of(new, s, bid, A.INDEPENDENT, me))
-    seen = _latest(records, iid, bundle, A.SYSTEM_SHOWN, me) is not None or any(
+    # The system's reading of a post is shown for all its forms at once. So a form counts as
+    # seen when ANY form of its post carries this reviewer's marker: a form that enters the
+    # scope after its post was revealed (the scope was raised) can have no independent reading
+    # any more (the core refuses one), and goes straight to the reading after the reveal,
+    # stored as not blind.
+    post = [i for i, x in bundle.items.items() if x["post_ref"] == item["post_ref"]]
+    seen = any(A._of(records, s, bid, A.SYSTEM_SHOWN, me) for s in post) or any(
         r.get("rubric") != A.RUBRIC or r["phase"] != A.INDEPENDENT
         for r in A._of(records, iid, bid, login=me) if r["phase"] != A.SYSTEM_SHOWN)
     marked = all(A._of(records, s, bid, A.SYSTEM_SHOWN, me) for s in siblings)

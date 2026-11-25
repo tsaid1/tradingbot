@@ -77,6 +77,12 @@
       <p class="caption">Blind-first: record your own reading; the system's reading is revealed after
       you save it on every form of this post.</p>
       {% else %}
+      {% if not_blind %}
+      <p class="banner info" role="note">The system's reading of this post was already shown to you
+      (on another form of the post, or before this form was in your scope). So this form has no
+      independent step: your reading is recorded as given after seeing the system's, and nothing of
+      the system's reading has filled an answer.</p>
+      {% endif %}
       <p class="caption">Your reading beside the system's: correct an answer only when the system's
       reading points to evidence you missed; each verdict is on the system's value, pre-filled from
       the comparison and editable.</p>

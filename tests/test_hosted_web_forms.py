@@ -730,3 +730,60 @@ def test_publisher_text_is_shown_as_text_never_as_markup(tmp_path, store, dsn): 
     templates = Path(site.app.root_path) / "templates"
     assert not [p.name for p in templates.glob("*.html") if "|safe" in p.read_text().replace(
         " ", "") or "autoescape" in p.read_text() or "Markup" in p.read_text()]
+
+
+def test_a_form_that_enters_the_scope_after_its_post_was_revealed_can_be_completed(
+        tmp_path, store, dsn):  # noqa: F811
+    """The review's finding 5. Scope 2; the forms i07 and x01 (of another idea) share one post
+    and x01 is outside the scope. The reviewer finishes i07; the scope is raised. x01 offered
+    the independent form, which the core can no longer accept: a form nobody could complete."""
+    from reviewer_web import forms as F
+    from test_hosted_admin import extend
+
+    site = Site(tmp_path, store, dsn, mark=False, edit=lambda base: extend(base, 2))  # noqa: F811
+    b = site.browser().sign_in(FIRST)
+    assert b.get("/form/x01").status_code == 404  # outside the scope of 2
+    reading = {"component": "ACTION_RECORDED_HERE", **scenario_reading(site.bundle, "i07")[0]}
+    b.open("i07")
+    b.fill(reading)
+    assert "Saved." in b.save().text and "already shown to you" not in b.shown.text
+    assert "Saved." in b.save().text
+    assert [(r["item_id"], r["phase"], r["blind"]) for r in site.records(FIRST)] == [
+        ("i07", A.INDEPENDENT, True), ("i07", A.SYSTEM_SHOWN, False), ("i07", A.AFTER_REVEAL, True)]
+    site.set_reviewer(FIRST, scope_sequences=3)  # the scope is raised: x01 enters
+    session = site.reviewers[FIRST].session()
+
+    def state(item_id):
+        return F.step_state(site.bundle, session, site.records(FIRST), item_id)
+
+    # The post was shown: x01 is due after the reveal, by the function and on the page.
+    assert state("x01") == F.AFTER_REVEAL_DUE and state("i07") == F.DONE
+    b = site.browser().sign_in(FIRST)
+    shown = b.open("x01")
+    assert shown.value("_phase") == A.AFTER_REVEAL and "holds SHIPPED" in shown.text
+    assert "The system's reading of this post was already shown to you" in shown.plain
+    assert "reading after the reveal due" in shown.text
+    assert shown.value("component") == "" and "timing" not in shown.names  # nothing is filled
+    assert ("x01", A.SYSTEM_SHOWN) in [(r["item_id"], r["phase"]) for r in site.records(FIRST)]
+    # An independent reading is what the core refuses; the page never offers that form.
+    attempt = [(n, A.INDEPENDENT if n == "_phase" else v) for n, v in shown.data()]
+    refused = b.post("/form/x01/save", attempt)
+    assert refused.status_code == 422 and b"SYSTEM_READING_ALREADY_SEEN" in refused.get_data()
+    assert b'name="_phase" value="AFTER_REVEAL"' in refused.get_data()
+    # The reading is saved, as one given after seeing the system's.
+    b.open("x01")
+    b.fill(reading)
+    done = b.save()
+    assert "Saved." in done.text and "Not saved" not in done.text
+    rec = site.records(FIRST)[-1]
+    assert (rec["item_id"], rec["phase"], rec["blind"], rec["refers_to"]) == (
+        "x01", A.AFTER_REVEAL, False, None)
+    assert state("x01") == F.DONE
+    # "Continue" never leads to a form that cannot be saved: whatever it names is a form whose
+    # page offers the phase the core accepts.
+    step = F.next_step(site.bundle, session, site.records(FIRST))
+    assert step == "i08" and b.get("/continue").headers["Location"] == "/form/i08"
+    for item_id in F.scoped(site.bundle, session):
+        offered = site.browser().sign_in(FIRST).open(item_id).value("_phase")
+        assert offered == {F.INDEPENDENT_DUE: A.INDEPENDENT, F.REVEAL_PENDING: None}.get(
+            state(item_id), A.AFTER_REVEAL), item_id
