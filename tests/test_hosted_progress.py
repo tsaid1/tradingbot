@@ -7,11 +7,8 @@ data on a real Postgres."""
 
 from __future__ import annotations
 
-import json
-import re
 from pathlib import Path
 
-import hosted_pg
 import pytest
 from hosted_web_site import FIRST, SECOND, Site, dsn, site, store  # noqa: F401 - fixtures
 
@@ -160,87 +157,8 @@ def test_the_sidebar_expands_the_active_sequence_and_marks_the_current_form(site
     assert b.open("s14b").status == 200
 
 
-# ------------------------------------------------------------------ blind, byte for byte
-
-
-def other_reading(n: int):
-    """An edit of the demo bundle that changes the SYSTEM'S READING only: every item's read
-    instrument, ambiguities, market, holds and mapping proposals (both a price series and an
-    instrument), differently for each ``n``."""
-    def edit(base: Path) -> None:
-        first(base)
-        path = base / "bundle" / "items.jsonl"
-        rows = [json.loads(line) for line in path.read_text().splitlines()]
-        families = json.loads((base / "bundle" / "manifest.json").read_text())["families"]
-        for row in rows:
-            ai = row.get("ai") or {}
-            if "instrument_as_read" in ai:
-                ai["instrument_as_read"] = f"ZQV{n} instrument"
-            if "ambiguities" in ai:
-                ai["ambiguities"] = [f"ZQV{n}_AMBIGUITY"]
-            if "family" in ai and families:
-                ai["family"] = families[n % len(families)]
-            row["holds"] = {"SHIPPED": {"status": "HOLD", "reasons": [f"ZQV{n}_HOLD"]}}
-            row["mapping"] = {"reference_series": f"ZQV{n}-REF" if n else None,
-                              "proposed_execution_instrument": f"ZQV{n}-EXEC" if n else None,
-                              "basis_treatment": None, "approved": False}
-        path.write_text("".join(json.dumps(r, ensure_ascii=False, sort_keys=True) + "\n"
-                                for r in rows))
-        manifest = base / "bundle" / "manifest.json"
-        data = json.loads(manifest.read_text())
-        data["bundle_id"] = A.bundle_digest(base / "bundle")
-        manifest.write_text(json.dumps(data, indent=1) + "\n")
-    return edit
-
-
-def same(text: str) -> str:
-    """A response without what differs by design between two databases: the session's CSRF
-    token, a page's random key, the bundle id (the digest of the files, the system's reading
-    included) and the wall-clock time of a save."""
-    text = re.sub(r"[A-Za-z0-9_-]{16,64}\.[0-9a-f]{32}", "KEY", text)
-    text = re.sub(r"\b[0-9a-f]{64}\b", "HEX", text)
-    return re.sub(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?\+00:00|\b\d\d:\d\d\b", "TIME", text)
-
-
-def test_three_databases_that_differ_only_in_the_system_s_reading_look_the_same_blind(
-        tmp_path):
-    from flask import render_template
-    from reviewer_web import progress as P
-    from reviewer_web.store import AdminStore
-
-    seen = []
-    for n in range(3):
-        address = hosted_pg.fresh_database()
-        admin = AdminStore(address)
-        admin.init_schema()
-        s = Site(tmp_path / f"db{n}", admin, address, mark=False, edit=other_reading(n))
-        b = s.browser().sign_in(FIRST)
-        pages = [b.get("/").get_data(as_text=True)]
-        b.review("s14a", after=False)  # form 1 of 2 of the post: the post stays blind
-        b.review("i07", after=False)  # a post of one form: revealed, so AWAITING
-        for path in ("/", "/sequence/scs14", "/continue", "/form/s14a", "/form/s14b",
-                     "/guide", "/fields"):
-            got = b.get(path)
-            pages.append(f"{got.status_code} {got.headers.get('Location')} "
-                         + got.get_data(as_text=True))
-        row = s.reviewers[FIRST]
-        records = s.admin.records_of(row)
-        for item in ("s14a", "s14b", None):
-            nav = P.sidebar(s.bundle, row.session(), records, item)
-            with s.app.test_request_context():
-                pages.append(render_template("_sidebar.html", nav=nav))
-            pages.append(json.dumps(nav, sort_keys=True))
-        dash = P.dashboard(s.bundle, row.session(), records)
-        pages.append(json.dumps(dash, sort_keys=True))
-        pages.append(json.dumps(P.form_status(s.bundle, row.session(), records, "s14a")))
-        for text in pages:
-            assert "ZQV" not in text
-        seen.append([same(t) for t in pages])
-    assert seen[0] == seen[1] == seen[2]
-    assert "Awaiting your assessment" in seen[0][1] and "In progress" in seen[0][1]
-    # The market each row names is the one the reviewer read, once they saved a reading of it
-    # (their own answer, never the system's): the same in the three databases.
-    assert "You read: " not in seen[0][0] and "You read: <strong>" in seen[0][1]
+# Blind first, byte for byte, over the dashboard, the sidebar and every other surface: the
+# reviewer's three-database walk in tests/test_hosted_blind.py (round 2, M3).
 
 
 def test_the_form_page_carries_nav_status_and_step_after_an_independent_save(site14):
