@@ -35,7 +35,6 @@ import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from urllib.parse import urlsplit
 
 from flask import Flask, Response, abort, g, redirect, render_template, request
 
@@ -59,7 +58,7 @@ CSP = ("default-src 'self'; img-src 'self'; style-src 'self'; script-src 'self';
 HEADERS = {
     "Content-Security-Policy": CSP,
     "X-Content-Type-Options": "nosniff",
-    "Referrer-Policy": "no-referrer",
+    "Referrer-Policy": "same-origin",  # nothing to another site; our own forms keep their Origin
     "X-Frame-Options": "DENY",
     "X-Robots-Tag": "noindex, nofollow",
     "Cross-Origin-Opener-Policy": "same-origin",
@@ -98,7 +97,7 @@ def create_app(store, mailer, config: dict) -> Flask:
     mail (preview and test only: the code is shown on the page). ``config``:
     ``SESSION_SECRET`` (at least 32 characters), ``SITE_ENV`` (production | preview | test), and
     for tests and the development server ``CLOCK`` (a function returning the time),
-    ``SIGN_IN_FLOOR_SECONDS`` and ``ALLOW_HTTP`` (accept an ``http`` origin on loopback)."""
+    ``SIGN_IN_FLOOR_SECONDS``."""
     secret = config.get("SESSION_SECRET") or ""
     secret = secret.encode("utf-8") if isinstance(secret, str) else bytes(secret)
     site_env = config.get("SITE_ENV") or "production"
@@ -116,7 +115,6 @@ def create_app(store, mailer, config: dict) -> Flask:
         raise RuntimeError("MAIL_NOT_CONFIGURED")
     clock = config.get("CLOCK") or (lambda: datetime.now(UTC))
     floor = float(config.get("SIGN_IN_FLOOR_SECONDS", 2.0))
-    schemes = ("https", "http") if config.get("ALLOW_HTTP") else ("https",)
 
     app = Flask(__name__, static_folder=str(STATIC), static_url_path="/static")
     app.config.update(MAX_CONTENT_LENGTH=MAX_REQUEST_BYTES, MAX_FORM_MEMORY_SIZE=MAX_REQUEST_BYTES,
@@ -131,20 +129,24 @@ def create_app(store, mailer, config: dict) -> Flask:
         return render_template("message.html", message=MESSAGES[status], status=status,
                                who=None, csrf="", demo=demo_env), status
 
+    def scheme() -> str:
+        """The scheme the browser used: behind the platform's proxy that is what
+        ``X-Forwarded-Proto`` says, not the scheme of the hop that reaches the application."""
+        forwarded = request.headers.get("X-Forwarded-Proto", "").split(",")[0].strip().lower()
+        return forwarded if forwarded in ("https", "http") else request.scheme
+
     def same_origin() -> bool:
-        """A POST must come from a page of this site. ``Sec-Fetch-Site`` (which a page cannot
-        set) must say ``same-origin``; an ``Origin`` sent with it must be this site's, or
-        ``null``: under ``Referrer-Policy: no-referrer`` a browser sends ``Origin: null`` with a
-        form it submits to its own site. A browser too old to send ``Sec-Fetch-Site`` is
-        believed only on an ``Origin`` that is this site's."""
+        """A request that changes something must come from a page of this site. An ``Origin``,
+        when sent, must be this site's own (``null`` is not); ``Sec-Fetch-Site``, when sent,
+        must say ``same-origin``; a request with neither is refused. The site's own origin is
+        that of THIS request (its scheme and its ``Host``), so the same deployment answers
+        under each of its host names and never takes one for the other."""
         site, origin = request.headers.get("Sec-Fetch-Site"), request.headers.get("Origin")
-        ours = False
-        if origin not in (None, "null"):
-            parts = urlsplit(origin)
-            ours = parts.scheme in schemes and parts.netloc == request.host
-        if site is None:
-            return ours
-        return site == "same-origin" and (ours or origin in (None, "null"))
+        if origin is None and site is None:
+            return False
+        if origin is not None and origin != f"{scheme()}://{request.host}":
+            return False
+        return site is None or site == "same-origin"
 
     def network() -> str:
         """The caller's network address, for the limits only (the platform sets these headers)."""
@@ -212,7 +214,7 @@ def create_app(store, mailer, config: dict) -> Flask:
         # Nothing behind sign-in, and no sign-in page, may be kept by a browser or a proxy.
         served = request.endpoint == "static" and response.status_code in (200, 304)
         response.headers["Cache-Control"] = "no-cache" if served else "private, no-store"
-        if request.is_secure:
+        if scheme() == "https":
             response.headers["Strict-Transport-Security"] = "max-age=63072000"
         return response
 

@@ -28,7 +28,7 @@ HOSTED = Path(__file__).resolve().parents[1] / "hosted"
 PNG = b"\x89PNG\r\n\x1a\n"
 HEADERS = {
     "X-Content-Type-Options": "nosniff",
-    "Referrer-Policy": "no-referrer",
+    "Referrer-Policy": "same-origin",
     "X-Frame-Options": "DENY",
     "X-Robots-Tag": "noindex, nofollow",
 }

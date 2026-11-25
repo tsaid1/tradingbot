@@ -112,7 +112,7 @@ def main() -> None:
         print(f"\n--- a message for {to} (not sent) ---\n{text}", flush=True)
 
     application = web.create_app(store, mailer, {
-        "SESSION_SECRET": SECRET, "SITE_ENV": "test", "ALLOW_HTTP": True,
+        "SESSION_SECRET": SECRET, "SITE_ENV": "test",
         "SIGN_IN_FLOOR_SECONDS": 0})
     served = application
     alias = args.dev_auto_sign_in

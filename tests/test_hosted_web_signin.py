@@ -263,23 +263,26 @@ def test_a_post_needs_the_sessions_csrf_token_and_the_sites_own_origin(site):  #
         assert b.post("/form/i07/state", data).status_code == 403
     good = {"_csrf": csrf}
 
-    def sign_out(origin=None, fetch_site=None):
+    def sign_out(origin=None, fetch_site=None, **extra):
         headers = {k: v for k, v in (("Origin", origin), ("Sec-Fetch-Site", fetch_site)) if v}
-        return b.post("/sign-out", good, origin=None, headers=headers).status_code
+        return b.post("/sign-out", good, origin=None, headers={**headers, **extra}).status_code
 
     refused = [
         sign_out(),  # neither header
+        sign_out("null", "same-origin"),  # "null" is never the site's own origin
+        sign_out("null"),
         sign_out("https://elsewhere.example.invalid", "same-origin"),  # the two disagree
         sign_out("https://elsewhere.example.invalid", "cross-site"),
         sign_out("https://elsewhere.example.invalid"),
-        sign_out(ORIGIN.replace("https", "http"), "same-origin"),
+        sign_out(ORIGIN.replace("https", "http"), "same-origin"),  # another scheme
         sign_out(ORIGIN + ".example.invalid", "same-origin"),
+        sign_out(ORIGIN + ":8443", "same-origin"),  # another port
+        sign_out(ORIGIN + "/", "same-origin"),
         sign_out(fetch_site="cross-site"),
         sign_out(fetch_site="same-site"),
         sign_out(fetch_site="none"),
-        sign_out("null", "cross-site"),  # a sandboxed frame elsewhere
         sign_out(ORIGIN, "cross-site"),
-        sign_out("null"),  # an old browser: "null" proves nothing
+        sign_out(ORIGIN, "same-site"),
     ]
     assert refused == [403] * len(refused)
     assert signed_in(b) and not site.records(FIRST)
@@ -288,18 +291,73 @@ def test_a_post_needs_the_sessions_csrf_token_and_the_sites_own_origin(site):  #
     stranger = site.browser()
     assert ask(stranger, login_of(site), origin="https://elsewhere.example.invalid").status_code \
         == 403
+    assert ask(stranger, login_of(site), origin="null").status_code == 403
     assert ask(stranger, login_of(site), origin=None).status_code == 403
     assert enter(stranger, login_of(site), "123456", origin=None).status_code == 403
     assert len(site.outbox.sent) == sent
-    # What browsers do send from a page of the site passes: a form (under no-referrer the
-    # Origin is "null"), the form's script, a browser without Origin, an old one without
-    # Sec-Fetch-Site.
-    for origin, fetch_site in (("null", "same-origin"), (ORIGIN, "same-origin"),
-                               (None, "same-origin"), (ORIGIN, None)):
+    # What a browser sends from a page of the site passes: both headers, the Origin alone (an
+    # older browser), or Sec-Fetch-Site alone.
+    for origin, fetch_site in ((ORIGIN, "same-origin"), (ORIGIN, None), (None, "same-origin")):
         if not signed_in(b):
             b.sign_in(FIRST)
             good["_csrf"] = b.csrf()
         assert sign_out(origin, fetch_site) == 303
+
+
+def test_the_sites_own_origin_is_that_of_the_request_behind_a_proxy_and_under_two_names(
+        site):  # noqa: F811
+    """The platform's proxy reaches the application over plain http and says which scheme the
+    browser used; one deployment answers under two host names (its own and the platform's)."""
+    login, other = login_of(site), "review.other.example.invalid"
+
+    def post(path, data, host, origin, proto="https", client=None):
+        client = client or site.app.test_client()
+        return client.post(path, data=data, base_url=f"http://{host}", headers={
+            "Origin": origin, "Sec-Fetch-Site": "same-origin", "X-Forwarded-Proto": proto})
+
+    host = ORIGIN.removeprefix("https://")
+    # Behind the proxy: the browser's https origin is the site's own, the hop's http is not.
+    assert post("/sign-in", {"address": login}, host, ORIGIN).status_code == 200
+    assert post("/sign-in", {"address": login}, host, f"http://{host}").status_code == 403
+    assert post("/sign-in", {"address": login}, host, ORIGIN, proto="http").status_code == 403
+    assert post("/sign-in", {"address": login}, host, f"http://{host}", proto="http").status_code \
+        == 200  # a plain http site (the development server) is its own origin too
+    # Under the second name the site is its own origin there, and neither name passes for the
+    # other.
+    assert post("/sign-in", {"address": login}, other, f"https://{other}").status_code == 200
+    assert post("/sign-in", {"address": login}, other, ORIGIN).status_code == 403
+    assert post("/sign-in", {"address": login}, host, f"https://{other}").status_code == 403
+    # A whole visit under the second name: sign-in, the workspace, a form, a round trip, a
+    # save. No page and no redirect names a host: every address is relative.
+    site.sql("DELETE FROM rate_limit")
+    client = site.app.test_client()
+    post("/sign-in", {"address": login}, other, f"https://{other}", client=client)
+    answer = post("/sign-in/verify", {"address": login, "code": site.code()}, other,
+                  f"https://{other}", client=client)
+    assert answer.status_code == 303 and answer.headers["Location"] == "/"
+    assert "Strict-Transport-Security" in answer.headers
+    kw = {"base_url": f"http://{other}", "headers": {"X-Forwarded-Proto": "https"}}
+    home = client.get("/", **kw)
+    assert home.status_code == 200
+    csrf = re.search(r'name="_csrf" value="([0-9a-f]{64})"', home.get_data(as_text=True)).group(1)
+    assert client.get("/continue", **kw).headers["Location"] == "/form/i07"
+    page = client.get("/form/i02", **kw).get_data(as_text=True)
+    key = re.search(r'name="_key" value="([^"]+)"', page).group(1)
+    data = {"_csrf": csrf, "_phase": "INDEPENDENT", "_key": key, "_on": "post_label",
+            "post_label": "COMMENTARY", "confidence": "HIGH"}
+    state = post("/form/i02/state", data, other, f"https://{other}", client=client)
+    assert state.status_code == 200 and "Save independent reading" in state.get_data(as_text=True)
+    saved = post("/form/i02/save", data, other, f"https://{other}", client=client)
+    assert saved.status_code == 303 and saved.headers["Location"].startswith("/form/i02?saved=")
+    assert post("/form/i02/save", data, other, ORIGIN, client=client).status_code == 403
+    pages = [home, state, saved, client.get(saved.headers["Location"], **kw),
+             client.get("/guide", **kw), client.get("/fields", **kw)]
+    for response in pages:
+        text = response.get_data(as_text=True) + repr(sorted(response.headers.items()))
+        assert "example.invalid" not in text.replace(login, "") and "://" not in text
+    # The session of one name is not a session under the other (the cookie is the host's own).
+    assert site.app.test_client().get("/", base_url=ORIGIN).status_code == 303
+    assert [r["phase"] for r in site.records(FIRST)] == ["INDEPENDENT", "SYSTEM_SHOWN"]
 
 
 def test_no_response_and_no_log_line_carries_a_code_or_an_address(site, caplog):  # noqa: F811

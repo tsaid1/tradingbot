@@ -97,12 +97,15 @@ code only as HMAC-SHA256 under `SESSION_SECRET`, a session token only as SHA-256
 under a keyed hash of the address or the network address. No address, code or token is stored in
 these tables, written to a log, or put into a URL.
 
-**Every request.** A POST must come from a page of the site: `Sec-Fetch-Site` must say
-`same-origin`, and an `Origin` sent with it must be the site's own or `null` (under
-`Referrer-Policy: no-referrer` a browser sends `Origin: null` with a form it submits to its own
-site); a browser too old to send `Sec-Fetch-Site` is believed only on an `Origin` that is the
-site's, so its forms are refused (Chrome 76, Firefox 90 and Safari 16.4 or newer are needed).
-Once signed in, a POST must also carry the session's CSRF token. A route behind sign-in first establishes the reviewer, then that reviewer's own
+**Every request.** A request that changes something must come from a page of the site: an
+`Origin` header, when sent, must be the site's own (`null` is refused); `Sec-Fetch-Site`, when
+sent, must say `same-origin`; a request with neither is refused. The site's own origin is that
+of the request itself (the scheme the platform's proxy reports in `X-Forwarded-Proto`, and the
+`Host`), so one deployment answers under each of its host names, and no page or redirect holds
+an absolute address. The site sends `Referrer-Policy: same-origin`: nothing goes to another
+site, and a browser keeps the real `Origin` on a form it submits to the site. Once signed in, a
+POST must also carry the session's CSRF token. A route behind sign-in first establishes the
+reviewer, then that reviewer's own
 bundle (`Store.bundle_for`), then the item: a form or an image is found only inside that
 reviewer's scope of that bundle (`ordered(bundle, scope)`); every id from a URL is looked up,
 never used. Anything else is a 404 that is the same page for every reason. The store has no call
@@ -139,7 +142,7 @@ bundle, by a name that post lists, as PNG, JPEG, GIF or WEBP of at most 4 MB.
 
 **Responses.** `Cache-Control: private, no-store` on everything but the stylesheet and the
 script; a Content-Security-Policy of `default-src 'self'` (no inline script or style, no other
-origin, no framing); `X-Content-Type-Options: nosniff`; `Referrer-Policy: no-referrer`;
+origin, no framing); `X-Content-Type-Options: nosniff`; `Referrer-Policy: same-origin`;
 `X-Frame-Options: DENY`; `X-Robots-Tag: noindex, nofollow`; `robots.txt` disallows everything.
 The pages load one stylesheet and one script from the site itself (`hosted/public/static`, which
 holds nothing else) and nothing from anywhere else. Publisher text is always rendered as text.
