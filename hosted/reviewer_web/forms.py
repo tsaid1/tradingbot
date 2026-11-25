@@ -356,19 +356,25 @@ def _tag(text: str) -> str:
 
 class _Held:
     """The answer each control holds: what the page sent for a control it had, else what the
-    stored reading holds (``_peek``: a stored NOT_APPLICABLE counts as unanswered). A field that
-    is not asked holds nothing: its value is the form's (derived or NOT_APPLICABLE), as on the
-    independent form."""
+    stored reading holds (``_peek``). Only an ANSWER of the stored reading counts: a value the
+    form had derived there, or NOT_APPLICABLE, never answers a question that a correction now
+    asks. A field that is not asked holds nothing: its value is the form's (derived or
+    NOT_APPLICABLE), as on the independent form."""
 
-    def __init__(self, posted, defaults: dict, item: dict, details: list[dict]):
+    def __init__(self, posted, defaults: dict, item: dict, details: list[dict],
+                 ctx: R.FormContext):
         self.posted, self.defaults, self.details = posted, defaults, details
         self.fields = R.fields_for(item["kind"])
         self.table = item["kind"] != "LABEL_ONLY"
         self.on = set(posted.getlist("_on")) if posted is not None else set()
+        stored = R.applicability(defaults, ctx) if defaults else {}
+        self.answers = {f for f in self.fields if stored.get(f, R.Status(R.NA)).state == R.ASK}
 
     def _default(self, f: str):
         d = self.defaults.get(f, [] if f in R.LIST_FIELDS else "")
-        return "" if d == R.NOT_APPLICABLE else d
+        if f not in self.answers or d == R.NOT_APPLICABLE:
+            return [] if f in R.LIST_FIELDS else ""
+        return d
 
     def state(self, f: str) -> str | None:
         """Of a field with a typed value: VALUE, one of its sentinels, or None (unanswered)."""
@@ -474,7 +480,7 @@ def build(bundle: A.Bundle, item: dict, records: list[dict], session: A.Session,
     earlier = A.earlier_positions(records, bundle, item, session.login)
     ctx = A.form_context(bundle, item, revealed=revealed, earlier_positions=earlier)
     details = A.table_row_details(bundle, item)
-    held = _Held(posted, defaults, item, details)
+    held = _Held(posted, defaults, item, details, ctx)
     raw = held.settle(ctx)
     done = R.complete(raw, ctx)
     status = R.applicability(done, ctx)

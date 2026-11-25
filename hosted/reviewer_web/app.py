@@ -118,7 +118,9 @@ def create_app(store, mailer, config: dict) -> Flask:
     # ------------------------------------------------------------- every request, every response
 
     def refuse(status: int):
-        return render_template("message.html", message=MESSAGES[status], status=status), status
+        """The one page of a refusal: the same for everybody, whoever asks and whatever for."""
+        return render_template("message.html", message=MESSAGES[status], status=status,
+                               who=None, csrf=""), status
 
     def same_origin() -> bool:
         """A POST must come from a page of this site: ``Sec-Fetch-Site`` and ``Origin`` (one of
@@ -187,8 +189,8 @@ def create_app(store, mailer, config: dict) -> Flask:
         for name, value in HEADERS.items():
             response.headers[name] = value
         # Nothing behind sign-in, and no sign-in page, may be kept by a browser or a proxy.
-        response.headers["Cache-Control"] = "no-cache" if request.endpoint == "static" \
-            else "private, no-store"
+        served = request.endpoint == "static" and response.status_code in (200, 304)
+        response.headers["Cache-Control"] = "no-cache" if served else "private, no-store"
         if request.is_secure:
             response.headers["Strict-Transport-Security"] = "max-age=63072000"
         return response

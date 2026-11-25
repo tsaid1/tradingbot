@@ -173,6 +173,11 @@ class Shown:
         """What a browser submits for this form."""
         return [(f[0], f[1] or "") for f in self._form.fields if f[3]]
 
+    @property
+    def plain(self) -> str:
+        """The page's markup with its character references resolved (for texts with quotes)."""
+        return html.unescape(self.text)
+
     def can_save(self) -> bool:
         return self.has_form and "save" not in self._form.disabled
 
@@ -243,8 +248,10 @@ class Browser:
     # -- sign-in
 
     def sign_in(self, alias: str = FIRST):
-        """Ask for a code, read it from the outbox, enter it."""
+        """Ask for a code, read it from the outbox, enter it. (The hourly limits are the
+        subject of their own test: a test that signs in often starts each time without them.)"""
         login = self.site.reviewers[alias].login_shown
+        self.site.sql("DELETE FROM rate_limit")
         assert self.post("/sign-in", {"address": login}).status_code == 200
         code = self.site.code()
         response = self.post("/sign-in/verify", {"address": login, "code": code})
