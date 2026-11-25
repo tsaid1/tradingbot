@@ -253,6 +253,16 @@ python scripts/hosted_admin.py status
   `REMOTE-<n>`, n its place among those entries in file order (the alias the owner's other tools
   print). Only the REVIEWER entries get a row. The reviewers file is only ever read.
 
+### What the platform is told
+
+`hosted/vercel.json` names the framework (`flask`) and bounds a request at 60 seconds. It is not
+optional: a project that was not created from this folder has no framework setting, and without
+one the platform builds no function, serves `public/` only and answers 404 for every page of the
+app while reporting the deployment as ready. The entry is `hosted/wsgi.py` (`app`); the
+dependencies are `hosted/requirements.txt`; the Python version is `hosted/.python-version`; the
+static files are `hosted/public/static/`, served by the platform. A deployment is checked by
+requesting `/healthz` (200, `ok`) and `/sign-in`, never by its "ready" state alone.
+
 ### Commands
 
 | command | what it does |
