@@ -233,7 +233,7 @@ python scripts/hosted_admin.py status
 | `push-returns` | Stores the approver's standing local RETURN decisions for the reviewers whose readings they return. |
 | `status` | The two bundles and the anchor; per reviewer: bundle, scope, invited, first sign-in, first hosted save, revoked, the lines by origin and phase, and each queued message (kind, queued, sent, result). Test identities are only counted. |
 | `test-report ALIAS` | For a test identity only: its bundle, first sign-in, number of web sessions, each of its events (seq, time, phase, item id) and the state of every form that is not open. This is how a sign-in, a save and a resume on the production site are checked without touching a reviewer. |
-| `verify` | The hosted chain (every line against its hash, 1000001, 1000002, ... from the anchor) and the imported lines against the newest snapshot, in both directions. |
+| `verify` | The hosted chain (every line against its hash, 1000001, 1000002, ... from the anchor), the test identities' stream as a chain of its own, every line under a row spelled as the line, and the imported lines against the newest snapshot, in both directions. |
 
 ### Real reviewers and test identities in one database
 
@@ -337,22 +337,36 @@ of it: a later line supersedes, as in the local log.
   (`chain_anchor`). A line hashes the same as a local one (`vocab_recommend.encode_line`).
 * **RETURN**: the approver's local decision to return a reading, stored by `push-returns` for
   the reviewer it concerns (below). Outside the hosted chain; the site never writes one.
+* **TEST**: a line of a test identity, written by the site: a stream of its own (`seq` 3000001,
+  3000002, ..., chained among themselves from a fixed value). It never touches the reviewers'
+  chain or the anchor, whenever it is written, and is never imported, pulled or pushed; the
+  table refuses a TEST line of anyone else and any other line of a test identity.
+
+The **anchor** is the local log's state that the reviewers' hosted chain continues. Every
+`import-log` moves it to the log's present head, until the first HOSTED line of a reviewer
+exists: from then on it is fixed, and `import-log` says so (`anchor: ...: FIXED ...`).
 
 ### Cutover
 
-Rehearse steps 1 to 3 while the present site still serves: every command can be run again.
+Rehearse steps 1 to 3 while the present site still serves: every command can be run again, and
+no reviewer may sign in to the hosted site before step 8 (a reviewer's first save there fixes
+the anchor).
 
 1. `init-db`, `publish-bundle --check-only`, `publish-bundle`, `sync-reviewers`, `status`.
 2. `import-log`, then `parity` and `verify`: both PASS.
 3. `publish-bundle --demo DIR`, `sync-reviewers --test-identity TEST-1 LOGIN`: sign in as that
-   test identity, work through an invented form, and read `test-report TEST-1`.
+   test identity, work through an invented form, and read `test-report TEST-1`. This may be
+   done at any time, before the first import too: a test identity's lines are a stream of
+   their own and leave the anchor alone.
 4. **Pause the writers**: stop the present published site, so that no remote reviewer can save
    into the local log. Do not save locally yourself during the next steps.
 5. **Verify** the local log: `python scripts/adjudication_freeze.py verify`.
 6. **Snapshot and import**: `import-log`. It verifies chain and head again, writes
    `<adjudication dir>/hosted_snapshots/log-<lines>-<sha256 prefix>/` (folder 0700, files 0600:
    the log, its head file, the sha256 of the log's bytes), imports only the lines that are new
-   since the rehearsal, and moves the anchor to the log's present head.
+   since the rehearsal, and moves the anchor to the log's present head (it prints
+   `anchor: <lines> line(s), head <...>: moved to the log's present head`; if it prints FIXED
+   instead, a reviewer has already saved on the site: stop and decide with the owner).
 7. **Parity**: `parity` PASS, `verify` PASS. Compare the per-alias lines and form states that
    `import-log` printed, and each reviewer's next step, with what you expect.
 8. Open the hosted site to the reviewers.
@@ -360,7 +374,7 @@ Rehearse steps 1 to 3 while the present site still serves: every command can be 
 ```text
 local log: 8 line(s), head ba9b895aae2b, 10174 bytes, sha256 dcb3...4622
 snapshot: log-00000008-dcb320867b5390e1
-anchor: 8 line(s), head ba9b895aae2b
+anchor: 8 line(s), head ba9b895aae2b: moved to the log's present head
 imported 7 new line(s); 0 already imported
 REMOTE-1: lines 6 (6 new); forms 45: DONE 1, INDEPENDENT_SAVED 1, INDEPENDENT_SAVED+SHOWN 1, OPEN 42
   i07 DONE
@@ -373,8 +387,10 @@ the system's reading was already shown and the reading after the reveal is still
 
 `import-log` refuses, and changes nothing, when the lines it imported earlier are no longer the
 local log's (`IMPORTED_PREFIX_DIFFERS`), when the log fails verification
-(`ANNOTATION_LOG_FAILS_VERIFICATION`), and when a reviewer who has saved on the site has also
-saved locally since (`LOCAL_SAVE_AFTER_HOSTED_SAVES`: two histories; see Rollback).
+(`ANNOTATION_LOG_FAILS_VERIFICATION`), when a reviewer who has saved on the site has also
+saved locally since (`LOCAL_SAVE_AFTER_HOSTED_SAVES`: two histories; see Rollback), and when a
+reviewer saved on the site before any log was imported (`HOSTED_LINES_BEFORE_FIRST_IMPORT`: that
+chain continues no log; start from an empty database).
 
 ### Day to day: hosted saves in the local log
 
@@ -390,8 +406,10 @@ python scripts/adjudication_freeze.py verify
 chained append: the same record with its own time, `refers_to` pointing at the local line of the
 record it means, and `hosted = {"seq", "sha256"}` naming the hosted line. It can be run again
 (nothing is appended twice), never touches a line already there, and skips test identities. It
-refuses a folder whose log is not the one the site continues
-(`LOCAL_LOG_IS_NOT_THE_ANCHORED_LOG`) and a store that fails verification. Between pulls `parity`
+refuses a folder whose log does not hold the anchored head at the anchored line count
+(`LOCAL_LOG_IS_NOT_THE_ANCHORED_LOG`), any log but an empty one while nothing was imported
+(`NO_ANCHOR_IMPORT_LOG_FIRST`), and a store that fails verification; `push-returns` refuses
+the same. Between pulls `parity`
 says FAIL with `hosted lines not pulled: n`; after a pull it must PASS.
 
 ```text

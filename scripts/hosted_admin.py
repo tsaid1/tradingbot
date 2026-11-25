@@ -43,8 +43,8 @@ from tradingbot.runtime.vocab_review import PrivateDir, PrivatePathError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "hosted"))
 S = importlib.import_module("reviewer_web.store")  # the deployed layout: a top-level package
-HOSTED, LEGACY, RETURN, sha256 = S.HOSTED, S.LEGACY, S.RETURN, S.sha256
-HOSTED_BASE, RETURN_BASE = S.HOSTED_BASE, S.RETURN_BASE
+HOSTED, LEGACY, RETURN, TEST, sha256 = S.HOSTED, S.LEGACY, S.RETURN, S.TEST, S.sha256
+HOSTED_BASE, RETURN_BASE, TEST_BASE = S.HOSTED_BASE, S.RETURN_BASE, S.TEST_BASE
 
 URL_ENV, UNPOOLED_ENV = "HOSTED_DATABASE_URL", "HOSTED_DATABASE_URL_UNPOOLED"
 EXPORT_SCHEMA = "tradingbot.hosted.export/1"
@@ -352,6 +352,16 @@ def continues(lines: list[bytes], anchor: dict | None) -> bool:
     return count <= len(lines) and (sha256(lines[count - 1]) if count else V.GENESIS) == head
 
 
+def anchored(lines: list[bytes], anchor: dict | None) -> None:
+    """Refuse a folder whose log is not the log the hosted chain continues: it must hold the
+    anchored head at the anchored line count. Without an anchor (nothing imported yet) only an
+    empty log is that log."""
+    if anchor is None and lines:
+        raise refused("NO_ANCHOR_IMPORT_LOG_FIRST")
+    if not continues(lines, anchor):
+        raise refused("LOCAL_LOG_IS_NOT_THE_ANCHORED_LOG")
+
+
 def _spelled(rec: dict) -> str:
     """A record's ``annotator.login`` exactly as spelled ("" when it has none)."""
     login = (rec.get("annotator") or {}).get("login")
@@ -417,6 +427,10 @@ def cmd_import_log(args) -> int:
     with store.exclusive():
         events, anchor = store.events(), store.anchor()
         legacy = {e["seq"]: e["line"] for e in events if e["origin"] == LEGACY}
+        # The reviewers' hosted lines (a test identity's are a stream of their own: TEST).
+        hosted = {e["sha256"] for e in events if e["origin"] == HOSTED}
+        if hosted and anchor is None:  # a chain that continues no log: start from an empty database
+            raise refused("HOSTED_LINES_BEFORE_FIRST_IMPORT")
         if not continues(lines, anchor) or any(
                 seq > len(lines) or lines[seq - 1] != line for seq, line in legacy.items()):
             raise refused("IMPORTED_PREFIX_DIFFERS")
@@ -432,7 +446,6 @@ def cmd_import_log(args) -> int:
                                        "file" if row.alias in wrong else ""))
         if wrong:
             raise refused("LOGIN_SPELLED_OTHERWISE")
-        hosted = {e["sha256"] for e in events if e["origin"] == HOSTED}
         writers = {e["alias"] for e in events if e["origin"] == HOSTED}
         new = []
         for n, (line, rec) in enumerate(zip(lines, log.records, strict=True), 1):
@@ -449,15 +462,15 @@ def cmd_import_log(args) -> int:
         folder = snapshot(Path(args.snapshots).expanduser() if args.snapshots
                           else base / SNAPSHOTS, data, head, log.count)
         store.insert_events(new)
-        if not hosted:
+        if not hosted:  # until a reviewer has saved on the site, the anchor follows the log
             store.set_anchor(log.count, log.head, sha256(data))
         anchor, events = store.anchor(), store.events()
     print(f"local log: {log.count} line(s), head {log.head[:12]}, {len(data)} bytes, sha256 "
           f"{sha256(data)}")
     print(f"snapshot: {folder.name}")
-    print(f"anchor: {anchor['count']} line(s), head {anchor['head'][:12]}"
-          + (" (fixed: hosted lines continue it)" if hosted else "") if anchor
-          else "anchor: none (the hosted lines continue an empty log)")
+    print(f"anchor: {anchor['count']} line(s), head {anchor['head'][:12]}: "
+          + (f"FIXED, the reviewers' hosted lines continue it (the local log has {log.count} "
+             "line(s) now)" if hosted else "moved to the log's present head"))
     print(f"imported {len(new)} new line(s); {len(legacy)} already imported")
     for row in rows.values():
         mine = [json.loads(e["line"]) for e in events
@@ -614,19 +627,28 @@ def _record(line: bytes) -> dict:
 def chain_problems(events: list[dict], anchor: dict | None) -> list[str]:
     """Constant codes, each with a line's seq: every line against its row (hash, seq, previous
     hash, schema); the HOSTED lines as ONE chain that starts on the anchor's head and counts
-    1000001, 1000002, ...; and every RETURN as the return of a reading after the reveal that
-    the same reviewer has in the store (its seq, and its sha256 as the RETURN's previous hash)."""
+    1000001, 1000002, ...; the TEST lines (test identities, and only theirs) as a chain of their
+    own from TEST_GENESIS, 3000001, 3000002, ...; and every RETURN as the return of a reading
+    after the reveal that the same reviewer has in the store (its seq, and its sha256 as the
+    RETURN's previous hash)."""
     out = []
     rows = {e["seq"]: (e, _record(e["line"])) for e in events}
     prev, due = anchor["head"] if anchor else V.GENESIS, HOSTED_BASE + 1
+    test_prev, test_due = S.TEST_GENESIS, TEST_BASE + 1
     for e, rec in rows.values():
         if sha256(e["line"]) != e["sha256"] or (rec.get("seq"), rec.get("prev_sha256"), rec.get(
                 "schema")) != (e["seq"], e["prev_sha256"], A.ANNOTATION_SCHEMA):
             out.append(f"LINE_DIFFERS_FROM_ITS_ROW at {e['seq']}")
+        if (e["origin"] == TEST) != e["is_test"]:
+            out.append(f"LINE_NOT_IN_ITS_ROW_S_STREAM at {e['seq']}")
         if e["origin"] == HOSTED:
             if (e["seq"], e["prev_sha256"]) != (due, prev):
                 out.append(f"HOSTED_CHAIN_BROKEN at {e['seq']}")
             prev, due = e["sha256"], e["seq"] + 1
+        elif e["origin"] == TEST:
+            if (e["seq"], e["prev_sha256"]) != (test_due, test_prev):
+                out.append(f"TEST_CHAIN_BROKEN at {e['seq']}")
+            test_prev, test_due = e["sha256"], e["seq"] + 1
         elif e["origin"] == RETURN:
             local = rec.get("local") if isinstance(rec.get("local"), dict) else {}
             reviewed, reading = rows.get(rec.get("refers_to"), ({}, {}))
@@ -754,15 +776,14 @@ def cmd_pull_to_local(args) -> int:
     data, _head, log = read_log(base)
     with store.connection():
         events, anchor = store.events(), store.anchor()
-    if not continues(_lines(data), anchor):
-        raise refused("LOCAL_LOG_IS_NOT_THE_ANCHORED_LOG")
+    anchored(_lines(data), anchor)
     if chain_problems(events, anchor):
         raise refused("HOSTED_STORE_FAILS_VERIFICATION")
     held = {_pulled(r): r["seq"] for r in log.records if _pulled(r)}
     local: dict[int, int] = {}  # a hosted line's seq -> the seq of its copy in the local log
     pulled = []
     for e in events:
-        if e["origin"] != HOSTED or e["is_test"]:
+        if e["origin"] != HOSTED:  # the reviewers' chain only: never a TEST or RETURN line
             continue
         if e["sha256"] in held:
             local[e["seq"]] = held[e["sha256"]]
@@ -818,8 +839,7 @@ def cmd_push_returns(args) -> int:
                 if a is not None and A._outcome(a) == "RETURN"]
     with store.exclusive():
         events, anchor = store.events(), store.anchor()
-        if not continues(lines, anchor):
-            raise refused("LOCAL_LOG_IS_NOT_THE_ANCHORED_LOG")
+        anchored(lines, anchor)
         if chain_problems(events, anchor):
             raise refused("HOSTED_STORE_FAILS_VERIFICATION")
         rows = {r.login: r for r in store.reviewers()

@@ -40,6 +40,7 @@ FORBIDDEN = ("@", "example.invalid", "Reviewer Example", "Owner Example", "Zed M
              "starter long", "bond crowd", "crude", "postgresql", "COMMENTARY", "NOT_STATED",
              "CURRENT_MARKET", "Approver")
 HOSTED_1 = 1_000_001
+TEST_1 = 3_000_001  # the first line of the test identities' own stream
 
 
 @pytest.fixture(scope="module")
@@ -112,7 +113,8 @@ def cutover(run, store, base) -> dict:
 
 
 def hosted_work(store, rows) -> None:
-    """Saves made on the hosted site after the cutover (seven hosted lines)."""
+    """Saves made on the hosted site after the cutover: six lines of the reviewers' chain and
+    one of the test identity, in its own stream."""
     one, two = rows["REMOTE-2"], rows["REMOTE-3"]
     hosted_reveal(store, one, "i08")  # 1000001
     hosted_save(store, one, "i08", A.AFTER_REVEAL)  # 1000002, refers to the local line 4
@@ -120,7 +122,7 @@ def hosted_work(store, rows) -> None:
     hosted_reveal(store, one, "i03")  # 1000004
     hosted_save(store, one, "i03", A.AFTER_REVEAL)  # 1000005, refers to the hosted 1000003
     hosted_save(store, two, "i08", A.INDEPENDENT)  # 1000006
-    hosted_save(store, rows["TEST-1"], "i07", A.INDEPENDENT)  # 1000007: never pulled
+    hosted_save(store, rows["TEST-1"], "i07", A.INDEPENDENT)  # 3000001: never pulled
 
 
 def log_lines(base: Path) -> list[bytes]:
@@ -649,13 +651,19 @@ def test_verify_checks_the_chain_the_anchor_and_the_imported_lines(cli, run, sto
     rows = cutover(run, store, base)
     hosted_work(store, rows)
     out = run("verify")
-    assert "events: LEGACY 7, HOSTED 7; hosted chain on " in out and ": OK" in out
+    assert "events: LEGACY 7, HOSTED 6, TEST 1; hosted chain on " in out and ": OK" in out
     assert "7 LEGACY line(s) compared with it" in out and "verify: PASS" in out
     # A hosted line that does not continue the chain (stored by other means than the site).
     last = json.loads(store.events()[-3]["line"])  # the first reviewer's latest hosted line
     stray = V.encode_line({**last, "seq": HOSTED_1 + 9})
     store.insert_events([cli.S.EventLine(rows["REMOTE-2"].id, "HOSTED", stray)])
     assert f"  HOSTED_CHAIN_BROKEN at {HOSTED_1 + 9}" in run("verify", code=1)
+    # The test identities' stream is a chain of its own, checked apart.
+    mine = json.loads(store.events()[-1]["line"])
+    store.insert_events([cli.S.EventLine(rows["TEST-1"].id, "TEST", V.encode_line(
+        {**mine, "seq": TEST_1 + 4}))])
+    out = run("verify", code=1)
+    assert f"  TEST_CHAIN_BROKEN at {TEST_1 + 4}" in out and out.count("CHAIN_BROKEN") == 2
     # A snapshot that was edited, and none at all.
     [folder] = (base / "hosted_snapshots").iterdir()
     copy = folder / "annotations.jsonl"
@@ -676,7 +684,7 @@ def test_an_export_restored_into_an_empty_database_is_identical(cli, run, store,
     out = run("export", "--out", out_file)
     data = out_file.read_bytes()
     assert b"a" * 64 not in data and b"token" not in data  # events and the anchor, nothing else
-    assert f"exported 14 event(s): LEGACY 7, HOSTED 7; {len(data)} bytes, sha256 " \
+    assert f"exported 14 event(s): LEGACY 7, HOSTED 6, TEST 1; {len(data)} bytes, sha256 " \
            f"{V._sha(data)}" in out
     assert stat.S_IMODE(out_file.stat().st_mode) == 0o600
     assert run("export", "--out", out_file, code=2) == "refused: FileExistsError\n"
@@ -686,7 +694,7 @@ def test_an_export_restored_into_an_empty_database_is_identical(cli, run, store,
         ("REMOTE-2", "HOSTED", HOSTED_1), ("REMOTE-2", "HOSTED", HOSTED_1 + 1),
         ("REMOTE-2", "HOSTED", HOSTED_1 + 2), ("REMOTE-2", "HOSTED", HOSTED_1 + 3),
         ("REMOTE-2", "HOSTED", HOSTED_1 + 4), ("REMOTE-3", "HOSTED", HOSTED_1 + 5),
-        ("TEST-1", "HOSTED", HOSTED_1 + 6)]
+        ("TEST-1", "TEST", TEST_1)]
     assert [e["is_test"] for e in exported] == [False] * 13 + [True]  # a test row is marked
     assert [e["line"].encode() for e in exported[:7]] == [
         log_lines(base)[n - 1] for n in (1, 2, 3, 4, 5, 7, 8)]
@@ -706,7 +714,7 @@ def test_an_export_restored_into_an_empty_database_is_identical(cli, run, store,
         conn.execute("DELETE FROM reviewer WHERE alias = 'TEST-1'")
     run("sync-reviewers", "--test-identity", "TEST-1", TESTER)
     out = run("restore", "--in", out_file)
-    assert "restored 14 event(s): LEGACY 7, HOSTED 7; every hash and the hosted chain " \
+    assert "restored 14 event(s): LEGACY 7, HOSTED 6, TEST 1; every hash and the hosted chain " \
            f"verified; file sha256 {V._sha(data)}" in out
     assert restored.events() == events and restored.anchor() == anchor
     assert "verify: PASS" in run("verify")
@@ -721,7 +729,7 @@ def test_an_export_restored_into_an_empty_database_is_identical(cli, run, store,
     [nxt] = hosted_save(restored, restored.reviewer_by_login(TWO.login), "i08",
                         A.AFTER_REVEAL).records
     assert (nxt["seq"], nxt["prev_sha256"], nxt["refers_to"]) == (
-        HOSTED_1 + 7, events[-1]["sha256"], HOSTED_1 + 5)
+        HOSTED_1 + 6, events[-2]["sha256"], HOSTED_1 + 5)  # the reviewers' chain, not the test's
     assert "verify: PASS" in run("verify")
     run("pull-to-local")
     assert A.read_annotations(base).count == 8 + 7
@@ -1018,8 +1026,8 @@ def test_a_test_identity_works_on_invented_forms_beside_the_reviewers_on_the_rea
     assert "imported 7 new line(s)" in run("import-log")
     hosted_reveal(store, one, "i08")  # 1000001
     hosted_save(store, one, "i08", A.AFTER_REVEAL)  # 1000002
-    hosted_save(store, tester, "i07", A.INDEPENDENT)  # 1000003
-    hosted_reveal(store, tester, "i07")  # 1000004
+    hosted_save(store, tester, "i07", A.INDEPENDENT)  # 3000001: the test identity's stream
+    hosted_reveal(store, tester, "i07")  # 3000002
     assert [r["bundle_id"] for r in store.records_of(tester)] == [demo_id] * 2
     assert {r["bundle_id"] for r in store.records_of(one)} == {real_id}
     assert len(store.records_of(one)) == 8  # the imported six and the two hosted, no one else's
@@ -1033,8 +1041,8 @@ def test_a_test_identity_works_on_invented_forms_beside_the_reviewers_on_the_rea
                       "scope 40, first sign-in 2026-03-09T07:15:00+00:00, web sessions 1, "
                       "revoked -")
     assert out[1] == "events: 2"
-    assert re.fullmatch(rf"  {HOSTED_1 + 2} \d{{4}}-\S+ INDEPENDENT i07", out[2])
-    assert re.fullmatch(rf"  {HOSTED_1 + 3} \d{{4}}-\S+ SYSTEM_SHOWN i07", out[3])
+    assert re.fullmatch(rf"  {TEST_1} \d{{4}}-\S+ INDEPENDENT i07", out[2])
+    assert re.fullmatch(rf"  {TEST_1 + 1} \d{{4}}-\S+ SYSTEM_SHOWN i07", out[3])
     assert out[4:] == ["TEST-1: records 2; forms 45: INDEPENDENT_SAVED+SHOWN 1, OPEN 44",
                        "  i07 INDEPENDENT_SAVED+SHOWN"]
     assert run("test-report", "REMOTE-2", code=2) == "refused: NOT_A_TEST_IDENTITY\n"
@@ -1218,7 +1226,7 @@ def test_restore_follows_the_sign_in_not_the_alias(cli, run, store, base, monkey
     new = cli.S.AdminStore(os.environ[cli.URL_ENV])
     assert [(r.alias, r.login) for r in new.reviewers()] == [
         ("REMOTE-2", TWO.login), ("REMOTE-3", ONE.login), ("TEST-1", TESTER)]  # swapped
-    assert "restored 15 event(s): LEGACY 7, HOSTED 7, RETURN 1" in run(
+    assert "restored 15 event(s): LEGACY 7, HOSTED 6, RETURN 1, TEST 1" in run(
         "restore", "--in", tmp_path / "x" / "events.jsonl")
     for row in new.reviewers():  # each person has exactly their own history again
         assert new.records_of(row) == served[row.login]
@@ -1235,3 +1243,95 @@ def test_restore_follows_the_sign_in_not_the_alias(cli, run, store, base, monkey
     cli.S.AdminStore(os.environ[cli.URL_ENV]).upsert_reviewer("REMOTE-2", RESPELLED.login)
     assert run("restore", "--in", tmp_path / "x" / "events.jsonl", code=2) == \
         "refused: NO_ROW_FOR_A_LINE_S_SIGN_IN\n"
+
+
+# ------------------------------------------------------------------ the test identities' stream
+# (The independent review's finding 2.)
+
+
+def test_a_test_identity_saves_in_a_stream_of_its_own_and_never_fixes_the_anchor(
+        cli, run, store, base, tmp_path):
+    """Probes ``test_anchor_is_stuck_once_a_test_identity_saved`` and
+    ``test_no_anchor_when_a_hosted_line_comes_first``: a save of the test identity fixed the
+    anchor at the rehearsal's head, or (before the first import) left the store without one, and
+    ``pull-to-local`` then wrote into any folder's log."""
+    half_way(base)
+    run("init-db")
+    run("publish-bundle", "--demo", base)
+    run("sync-reviewers", "--demo")
+    run("sync-reviewers", "--test-identity", "TEST-1", TESTER)
+    rows = {r.alias: r for r in store.reviewers()}
+    # The owner signs in as the test identity and saves BEFORE anything is imported.
+    [first] = hosted_save(store, rows["TEST-1"], "i07", A.INDEPENDENT).records
+    assert (first["seq"], first["prev_sha256"]) == (TEST_1, cli.S.TEST_GENESIS)
+    assert "anchor: 8 line(s), head " in run("import-log")  # the rehearsal
+    [second] = hosted_reveal(store, rows["TEST-1"], "i07").records
+    local_save(base, TWO, "i07", A.AFTER_REVEAL)  # the legacy site is still serving
+    local_save(base, ONE, "i08", A.AFTER_REVEAL)
+    out = run("import-log")  # the cutover: the anchor is the log's state NOW
+    head = V._sha(log_lines(base)[-1])
+    assert f"anchor: 10 line(s), head {head[:12]}: moved to the log's present head" in out
+    assert (store.anchor()["count"], store.anchor()["head"]) == (10, head)
+    assert "events: LEGACY 9, TEST 2; hosted chain on " in run("verify")
+    out = run("parity")
+    assert "TEST-1" not in out and out.splitlines()[-1].endswith("PASS, 2 reviewer(s)")
+    # A reviewer's first save continues the anchored log, and only that fixes the anchor.
+    [mine] = hosted_save(store, rows["REMOTE-2"], "i03", A.INDEPENDENT).records
+    assert (mine["seq"], mine["prev_sha256"]) == (HOSTED_1, head)
+    [third] = hosted_save(store, rows["TEST-1"], "i08", A.INDEPENDENT).records
+    assert (second["seq"], third["seq"], third["prev_sha256"]) == (
+        TEST_1 + 1, TEST_1 + 2, V._sha(V.encode_line(second)))  # its own chain, uninterrupted
+    decide(base, "i07", 3, "ACCEPT")  # the local log goes on: line 11
+    assert (f"anchor: 10 line(s), head {head[:12]}: FIXED, the reviewers' hosted lines continue "
+            "it (the local log has 11 line(s) now)") in run("import-log")
+    # Another folder's log is not the anchored log, for the pull and for the returns.
+    other = write_demo(tmp_path / "other")
+    local_save(other, TWO, "i08", A.INDEPENDENT)
+    for command in ("pull-to-local", "push-returns"):
+        assert run(command, "--dir", other, code=2) == \
+            "refused: LOCAL_LOG_IS_NOT_THE_ANCHORED_LOG\n"
+    assert len(log_lines(other)) == 1
+    # Home comes the reviewer's line, never a test identity's; its stream verifies apart.
+    assert "pulled 1 hosted line(s) into the local log: REMOTE-2 1; 0 already held" in run(
+        "pull-to-local")
+    assert TESTER not in A.annotations_path(base).read_text()
+    assert "events: LEGACY 9, HOSTED 1, TEST 3; hosted chain on " in run("verify")
+    assert "PASS" in run("parity")
+    # Whoever inserts: a test identity's line is a TEST line, and no one else's is.
+    for row, origin in ((rows["TEST-1"], "HOSTED"), (rows["REMOTE-2"], "TEST")):
+        line = V.encode_line({**(third if row.is_test else mine), "seq": 1_999_000 if origin
+                              == "HOSTED" else 3_999_000})
+        with pytest.raises(A.AdjudicationError, match="^LINE_NOT_IN_ITS_ROW_S_STREAM$"):
+            store.insert_events([cli.S.EventLine(row.id, origin, line)])
+        import psycopg
+        with pytest.raises(psycopg.errors.RestrictViolation,
+                           match="EVENT_NOT_IN_ITS_REVIEWER_S_STREAM"), \
+                store.connection() as conn:
+            conn.execute(
+                "INSERT INTO event (seq, prev_sha256, sha256, line, reviewer_id, bundle_id,"
+                " item_id, phase, at, origin, batch) SELECT %s, prev_sha256, %s, %s, %s,"
+                " bundle_id, item_id, phase, at, %s, %s FROM event LIMIT 1",
+                (json.loads(line)["seq"], V._sha(line), line, row.id, origin,
+                 json.loads(line)["seq"]))
+
+
+def test_a_reviewer_s_hosted_line_before_any_import_is_never_built_upon(run, store, base,
+                                                                        tmp_path):
+    run("init-db")
+    run("publish-bundle", "--demo", base)
+    run("sync-reviewers", "--demo")
+    one = store.reviewer_by_login(ONE.login)
+    [line] = hosted_save(store, one, "i07", A.INDEPENDENT).records  # no log was ever imported
+    assert (line["seq"], line["prev_sha256"]) == (HOSTED_1, V.GENESIS) and store.anchor() is None
+    # A folder with a log: not the (empty) log this chain continues. Nothing is written.
+    other = write_demo(tmp_path / "other")
+    local_save(other, TWO, "i08", A.INDEPENDENT)
+    for command in ("pull-to-local", "push-returns"):
+        assert run(command, "--dir", other, code=2) == "refused: NO_ANCHOR_IMPORT_LOG_FIRST\n"
+    assert run("import-log", "--dir", other, code=2) == \
+        "refused: HOSTED_LINES_BEFORE_FIRST_IMPORT\n"
+    assert len(log_lines(other)) == 1 and len(store.events()) == 1 and store.anchor() is None
+    # An empty log IS that log (a preview's saves can be taken home).
+    assert "pulled 1 hosted line(s) into the local log: REMOTE-2 1; 0 already held" in run(
+        "pull-to-local")
+    assert A.read_annotations(base).records[0]["hosted"]["seq"] == HOSTED_1

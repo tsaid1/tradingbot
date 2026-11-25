@@ -69,6 +69,9 @@ CREATE TABLE IF NOT EXISTS media (
 -- each chained on the previous HOSTED line and the first on chain_anchor.snapshot_head_sha256.
 -- RETURN: an approver's local decision to return a reading, stored for its reviewer by the
 -- operator tool; outside the hosted chain (seq above 2000000), never written by the site.
+-- TEST: a line of a test identity, written by the site: a stream of its own (seq 3000001, ...,
+-- chained among themselves from a fixed value). It never touches the reviewers' chain or its
+-- anchor, and is never imported, pulled or pushed.
 CREATE TABLE IF NOT EXISTS event (
     id              BIGSERIAL PRIMARY KEY,
     seq             INT NOT NULL UNIQUE,
@@ -80,17 +83,37 @@ CREATE TABLE IF NOT EXISTS event (
     item_id         TEXT NOT NULL,
     phase           TEXT NOT NULL,
     at              TIMESTAMPTZ NOT NULL,
-    origin          TEXT NOT NULL CHECK (origin IN ('LEGACY', 'HOSTED', 'RETURN')),
+    origin          TEXT NOT NULL,
     idempotency_key TEXT,                           -- on the FIRST line of a save only
     batch           INT NOT NULL,                   -- seq of the first line of the same save
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (reviewer_id, idempotency_key),
-    CHECK (CASE origin WHEN 'LEGACY' THEN seq BETWEEN 1 AND 999999
-                       WHEN 'HOSTED' THEN seq BETWEEN 1000001 AND 1999999
-                       ELSE seq > 2000000 END),
-    CHECK (batch <= seq)
+    CONSTRAINT event_batch CHECK (batch <= seq)
 );
 CREATE INDEX IF NOT EXISTS event_by_reviewer ON event (reviewer_id, seq);
+-- The streams. Stated again at every init-db, so that a database made by an earlier version of
+-- this file gets the present rule (the three DROPs name that version's constraints).
+ALTER TABLE event DROP CONSTRAINT IF EXISTS event_origin_check;
+ALTER TABLE event DROP CONSTRAINT IF EXISTS event_check;
+ALTER TABLE event DROP CONSTRAINT IF EXISTS event_stream;
+ALTER TABLE event ADD CONSTRAINT event_stream CHECK (
+    CASE origin WHEN 'LEGACY' THEN seq BETWEEN 1 AND 999999
+                WHEN 'HOSTED' THEN seq BETWEEN 1000001 AND 1999999
+                WHEN 'RETURN' THEN seq BETWEEN 2000001 AND 2999999
+                WHEN 'TEST' THEN seq > 3000000
+                ELSE FALSE END);
+-- A test identity's lines are TEST lines and no one else's are: whoever inserts.
+CREATE OR REPLACE FUNCTION event_in_its_reviewer_s_stream() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF (NEW.origin = 'TEST') IS DISTINCT FROM
+            (SELECT is_test FROM reviewer WHERE id = NEW.reviewer_id) THEN
+        RAISE EXCEPTION 'EVENT_NOT_IN_ITS_REVIEWER_S_STREAM' USING ERRCODE = 'restrict_violation';
+    END IF;
+    RETURN NEW;
+END
+$$;
+CREATE OR REPLACE TRIGGER event_stream_of_its_reviewer BEFORE INSERT ON event
+    FOR EACH ROW EXECUTE FUNCTION event_in_its_reviewer_s_stream();
 
 -- No update or delete of an event, ever (a later line supersedes, as in the local log).
 CREATE OR REPLACE FUNCTION event_is_append_only() RETURNS trigger LANGUAGE plpgsql AS $$

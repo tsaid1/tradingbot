@@ -31,6 +31,11 @@ connection and commits with the block (one connection per request).
 #   supersedes it. It is outside the hosted chain: seq 2000000 + its local line's seq (after
 #   every record of the reviewer's own), ``prev_sha256`` the sha256 of the returned reading. The
 #   site never writes one; ``pull-to-local`` never copies one back.
+# * ``event.origin`` TEST: the lines of a test identity are a stream of their own (seq 3000000
+#   + n, chained among themselves from TEST_GENESIS). A test identity may save before the real
+#   log is imported: its lines never touch the reviewers' chain or its anchor, and no "is there
+#   a hosted line yet" decision sees them. The table refuses a TEST line of anyone else and any
+#   other line of a test identity.
 # * A parsed bundle is cached by (bundle_id, published_at), not bundle_id alone: a larger scope
 #   of the same local bundle is published under the same bundle_id and must replace the cache.
 # * ``append`` also refuses a record whose annotator is not the reviewer or whose bundle is not
@@ -68,7 +73,9 @@ SCHEMA_SQL = Path(__file__).with_name("schema.sql")
 LOCK_KEY = 7_203_001  # pg_advisory_xact_lock: one writer of ``event`` at a time
 HOSTED_BASE = 1_000_000  # a HOSTED line's seq is HOSTED_BASE + n (n = 1, 2, ...)
 RETURN_BASE = 2_000_000  # a RETURN line's seq is RETURN_BASE + the seq of its local line
-LEGACY, HOSTED, RETURN = "LEGACY", "HOSTED", "RETURN"
+TEST_BASE = 3_000_000  # a TEST line's seq is TEST_BASE + n: the test identities' own stream
+TEST_GENESIS = hashlib.sha256(b"tradingbot.hosted.test-stream/1").hexdigest()  # its first prev
+LEGACY, HOSTED, RETURN, TEST = "LEGACY", "HOSTED", "RETURN", "TEST"
 MAX_MEDIA_BYTES = 4 * 1024 * 1024
 MAIL_LOCK_KEY = 7_203_002  # pg_try_advisory_xact_lock: one sender of queued mail at a time
 MAIL_KINDS = ("INVITE_CONTINUE", "INVITE_START")
@@ -312,16 +319,20 @@ class Store:
         nothing and propagates. A known ``idempotency_key`` returns what that save stored, with
         ``duplicate=True``, and does not call ``make``. A revoked reviewer: REVOKED.
 
+        A reviewer's line continues the HOSTED chain (from the anchor on the local log); a test
+        identity's line continues the TEST stream, which never touches that chain.
+
         One writer at a time: the transaction first takes the advisory lock, and only then reads
         (READ COMMITTED: each statement sees what earlier writers committed)."""
         with self.connection() as conn:
             conn.execute("SELECT pg_advisory_xact_lock(%s)", (LOCK_KEY,))
-            allowed, bundle_id, anchor, last_seq, last_sha = conn.execute(
-                "SELECT (SELECT revoked_at IS NULL FROM reviewer WHERE id = %s), " + _THEIRS + ","
-                " (SELECT snapshot_head_sha256 FROM chain_anchor WHERE id = 1),"
-                " (SELECT max(seq) FROM event WHERE origin = 'HOSTED'),"
-                " (SELECT sha256 FROM event WHERE origin = 'HOSTED' ORDER BY seq DESC LIMIT 1)",
-                (reviewer.id, reviewer.id)).fetchone()
+            allowed, test, bundle_id, anchor, last_seq, last_sha = conn.execute(
+                "SELECT r.revoked_at IS NULL, r.is_test, " + _THEIRS + ","
+                " (SELECT snapshot_head_sha256 FROM chain_anchor WHERE id = 1), t.seq, t.sha256"
+                " FROM reviewer r LEFT JOIN LATERAL (SELECT e.seq, e.sha256 FROM event e"
+                " WHERE e.origin = CASE WHEN r.is_test THEN 'TEST' ELSE 'HOSTED' END"
+                " ORDER BY e.seq DESC LIMIT 1) t ON TRUE WHERE r.id = %s",
+                (reviewer.id, reviewer.id)).fetchone() or (None,) * 6
             if not allowed:
                 raise A.AdjudicationError("REVOKED")
             if bundle_id is None:
@@ -335,7 +346,10 @@ class Store:
                     return Appended([json.loads(bytes(r[0])) for r in mine if r[3] == first], True)
             made = make([json.loads(bytes(r[0])) for r in mine if r[1] == bundle_id])
             bodies = [made] if isinstance(made, dict) else list(made or [])
-            seq, prev = last_seq or HOSTED_BASE, last_sha or anchor or GENESIS
+            if test:
+                origin, seq, prev = TEST, last_seq or TEST_BASE, last_sha or TEST_GENESIS
+            else:
+                origin, seq, prev = HOSTED, last_seq or HOSTED_BASE, last_sha or anchor or GENESIS
             records, rows = [], []
             for body in bodies:
                 if (body.get("annotator") or {}).get("login") != reviewer.login_shown \
@@ -345,7 +359,7 @@ class Store:
                 rec = {**body, "schema": A.ANNOTATION_SCHEMA, "seq": seq, "prev_sha256": prev}
                 line = encode_line(rec)
                 rows.append(_event_row(EventLine(
-                    reviewer.id, HOSTED, line, None if records else idempotency_key,
+                    reviewer.id, origin, line, None if records else idempotency_key,
                     seq - len(records))))
                 prev = sha256(line)
                 records.append(rec)
@@ -587,11 +601,15 @@ class AdminStore(Store):
         """Store lines exactly as given (the import's LEGACY lines; a restore's lines of every
         origin), under the writers' lock. A reviewer's own line (every origin but RETURN) is
         refused unless its ``annotator.login`` is EXACTLY its row's ``login_shown``: under any
-        other spelling the site would not find it and the form would look open again."""
+        other spelling the site would not find it and the form would look open again. A test
+        identity's lines are TEST lines, and no one else's are."""
         with self.exclusive() as conn:
-            spelled = dict(conn.execute("SELECT id, login_shown FROM reviewer WHERE id = ANY(%s)",
-                                        ([e.reviewer_id for e in lines],)).fetchall())
-            if any(e.origin != RETURN and annotator_login(e.line) != spelled.get(e.reviewer_id)
+            rows = {r[0]: r[1:] for r in conn.execute(
+                "SELECT id, login_shown, is_test FROM reviewer WHERE id = ANY(%s)",
+                ([e.reviewer_id for e in lines],)).fetchall()}
+            if any((e.origin == TEST) != rows.get(e.reviewer_id, (None, None))[1] for e in lines):
+                raise A.AdjudicationError("LINE_NOT_IN_ITS_ROW_S_STREAM")
+            if any(e.origin != RETURN and annotator_login(e.line) != rows[e.reviewer_id][0]
                    for e in lines):
                 raise A.AdjudicationError("LINE_NOT_SPELLED_AS_ITS_ROW")
             if lines:
