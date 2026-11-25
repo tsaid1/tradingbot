@@ -165,6 +165,13 @@ def create_app(store, mailer, config: dict) -> Flask:
             return redirect("/", 303)
         return None
 
+    def reads_demo(reviewer) -> bool | None:
+        """Whether the reviewer's bundle is invented data; None: no bundle is assigned to them."""
+        try:
+            return store.is_demo(reviewer)
+        except A.AdjudicationError:
+            return None
+
     def admit():
         """Who is asking, or the refusal. Runs first in every reviewer route."""
         token = request.cookies.get(auth.COOKIE, "")
@@ -177,9 +184,8 @@ def create_app(store, mailer, config: dict) -> Flask:
                 request.form.get("_csrf", "").encode("utf-8"),
                 auth.csrf_token(secret, token).encode("utf-8")):
             return refuse(403)
-        try:
-            demo = store.is_demo(reviewer)
-        except A.AdjudicationError:
+        demo = reads_demo(reviewer)
+        if demo is None:
             return refuse(503)  # no bundle is assigned to this reviewer: nothing is served
         if demo_env and not (demo and store.bundle_is_demo()):
             return refuse(503)  # a preview serves nobody whose bundle is not invented
@@ -266,7 +272,7 @@ def create_app(store, mailer, config: dict) -> Flask:
         if synthetic and not store.bundle_is_demo():
             return refuse(503)  # a code is shown on a page only beside invented data
         asked = auth.request_code(store, secret, address, network(), clock())
-        if synthetic and asked.code is not None and not store.is_demo(asked.reviewer):
+        if synthetic and asked.code is not None and not reads_demo(asked.reviewer):
             auth.cancel_codes(store, asked.reviewer, clock())  # never for a real bundle's reader
             asked = auth.Asked(True)
         unsent = False
