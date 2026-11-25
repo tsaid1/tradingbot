@@ -1,8 +1,8 @@
 -- The hosted reviewer site's database (Postgres). Applied by `scripts/hosted_admin.py init-db`;
 -- every statement can be run again. Invented data only in examples; no content lives here.
 --
--- DATA's section: reviewers, the published bundle, its images, the append-only events and the
--- anchor on the local log. The web app's own tables follow in WEB's section at the end.
+-- DATA's section: reviewers, the published bundles, their images, the append-only events and
+-- the anchor on the local log. The web app's own tables follow in WEB's section at the end.
 
 CREATE TABLE IF NOT EXISTS reviewer (
     id               BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -32,7 +32,27 @@ CREATE TABLE IF NOT EXISTS bundle (
     published_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
     active           BOOLEAN NOT NULL DEFAULT FALSE
 );
-CREATE UNIQUE INDEX IF NOT EXISTS bundle_one_active ON bundle (active) WHERE active;
+-- Two bundles may be active at once: the real one, and an invented one for test identities.
+DROP INDEX IF EXISTS bundle_one_active;
+CREATE UNIQUE INDEX IF NOT EXISTS bundle_one_active_real ON bundle (active)
+    WHERE active AND NOT is_demo;
+CREATE UNIQUE INDEX IF NOT EXISTS bundle_one_active_demo ON bundle (active)
+    WHERE active AND is_demo;
+
+-- The ONE bundle a reviewer works on: forms, images and records of no other bundle are served
+-- to that reviewer. A test identity is bound to an invented bundle, the reviewers to the real
+-- one. Assigned by the operator tool; once assigned it is never NULL again.
+ALTER TABLE reviewer ADD COLUMN IF NOT EXISTS bundle_id TEXT REFERENCES bundle (bundle_id);
+CREATE OR REPLACE FUNCTION reviewer_keeps_a_bundle() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF OLD.bundle_id IS NOT NULL AND NEW.bundle_id IS NULL THEN
+        RAISE EXCEPTION 'REVIEWER_KEEPS_A_BUNDLE' USING ERRCODE = 'restrict_violation';
+    END IF;
+    RETURN NEW;
+END
+$$;
+CREATE OR REPLACE TRIGGER reviewer_bundle_stays_assigned BEFORE UPDATE ON reviewer
+    FOR EACH ROW EXECUTE FUNCTION reviewer_keeps_a_bundle();
 
 CREATE TABLE IF NOT EXISTS media (
     bundle_id    TEXT NOT NULL REFERENCES bundle (bundle_id) ON DELETE CASCADE,

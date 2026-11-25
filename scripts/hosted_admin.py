@@ -1,7 +1,7 @@
 """Operator, locally: the hosted reviewer site's database (docs/HOSTED_REVIEWER.md, "Operations").
 
     python scripts/hosted_admin.py init-db
-    python scripts/hosted_admin.py sync-reviewers [--test-identity ALIAS LOGIN]
+    python scripts/hosted_admin.py sync-reviewers [--demo | --test-identity ALIAS LOGIN]
     python scripts/hosted_admin.py revoke ALIAS
     python scripts/hosted_admin.py restore-access ALIAS
     python scripts/hosted_admin.py publish-bundle [--check-only] [--demo DIR]
@@ -12,6 +12,7 @@
     python scripts/hosted_admin.py pull-to-local
     python scripts/hosted_admin.py push-returns
     python scripts/hosted_admin.py status
+    python scripts/hosted_admin.py test-report ALIAS
     python scripts/hosted_admin.py verify [--snapshots DIR]
 
 The database is ``HOSTED_DATABASE_URL`` (``init-db`` prefers ``HOSTED_DATABASE_URL_UNPOOLED``);
@@ -51,8 +52,8 @@ BUNDLE_FILES = ("manifest.json", "sequences.jsonl", "items.jsonl", "posts.jsonl"
 TEST_ALIAS = re.compile(r"^TEST-[0-9]{1,3}$")
 APPROVER_SHOWN = "approver"  # all a reviewer learns of who returned a reading
 ENVELOPE = ("schema", "seq", "prev_sha256")
-EVENT_KEYS = ("alias", "origin", "seq", "prev_sha256", "sha256", "line", "idempotency_key",
-              "batch", "created_at")
+EVENT_KEYS = ("alias", "is_test", "origin", "seq", "prev_sha256", "sha256", "line",
+              "idempotency_key", "batch", "created_at")
 
 
 def refused(code: str) -> A.AdjudicationError:
@@ -233,13 +234,15 @@ def cmd_publish_bundle(args) -> int:
         return 0
     store = _store()
     with store.exclusive():
-        if any(r.scope_sequences > scope for r in store.reviewers()) \
-                and scope < len(full.sequences):
+        if scope < len(full.sequences) and any(
+                r.bundle_id == full.bundle_id and r.scope_sequences > scope
+                for r in store.reviewers()):
             raise refused("SCOPE_BELOW_A_REVIEWER")  # sync-reviewers first
         store.publish_bundle(*files, media, is_demo=bool(args.demo),
                              source_sequences=len(full.sequences), scope_sequences=scope)
     print(f"published and active: bundle {full.bundle_id[:12]}, "
-          f"{'demonstration data' if args.demo else 'not a demonstration'}")
+          + ("demonstration data (for test identities; the real bundle stays)" if args.demo
+             else "the real bundle (the demonstration bundle stays)"))
     return 0
 
 
@@ -259,21 +262,30 @@ def cmd_init_db(_args) -> int:
 
 def cmd_sync_reviewers(args) -> int:
     store = _store()
-    reviewers = A.load_reviewers(_base(args) / "reviewers.toml")
-    if args.test_identity and not TEST_ALIAS.match(args.test_identity[0]):
-        raise refused("TEST_ALIAS_IS_TEST_N")
-    with store.exclusive():
-        if not _scope_fits(store.published(), reviewers.scope_sequences):
-            raise refused("SCOPE_NOT_PUBLISHED")  # publish-bundle first
-        rows = store.sync_reviewers(reviewers)
-        if args.test_identity:
-            alias, login = args.test_identity
-            rows.append(store.upsert_reviewer(
-                alias, login, name=alias, scope_sequences=reviewers.scope_sequences,
-                access=A.FULL if reviewers.remote_full_context_authorized else A.RESTRICTED,
-                is_test=True))
+    if args.test_identity:  # a test identity works on the invented bundle, never the real one
+        alias, login = args.test_identity
+        if not TEST_ALIAS.match(alias):
+            raise refused("TEST_ALIAS_IS_TEST_N")
+        with store.exclusive():
+            demo = store.published(demo=True)
+            if demo is None:
+                raise refused("NO_DEMO_BUNDLE_PUBLISHED")  # publish-bundle --demo DIR first
+            rows = [store.upsert_reviewer(alias, login, name=alias, is_test=True,
+                                          scope_sequences=demo["scope_sequences"],
+                                          bundle_id=demo["bundle_id"])]
+    else:
+        reviewers = A.load_reviewers(_base(args) / "reviewers.toml")
+        with store.exclusive():
+            bundle = store.published(demo=args.demo)
+            if bundle is None:  # publish-bundle first
+                raise refused("NO_DEMO_BUNDLE_PUBLISHED" if args.demo
+                              else "NO_REAL_BUNDLE_PUBLISHED")
+            if not _scope_fits(bundle, reviewers.scope_sequences):
+                raise refused("SCOPE_NOT_PUBLISHED")  # publish-bundle first
+            rows = store.sync_reviewers(reviewers, bundle_id=bundle["bundle_id"])
     for r in rows:
-        print(f"{r.alias}: id {r.id}, {r.role}, {r.access}, scope {r.scope_sequences}"
+        print(f"{r.alias}: id {r.id}, {r.role}, {r.access}, scope {r.scope_sequences}, bundle "
+              f"{r.bundle_id[:12]}" + (" (demonstration data)" if args.demo or r.is_test else "")
               + (", test identity" if r.is_test else "") + (", REVOKED" if r.revoked else ""))
     print(f"{len(rows)} reviewer row(s) written; none deleted")
     return 0
@@ -423,63 +435,116 @@ def _bodies(records: list[dict]) -> list[dict]:
              "refers_to": place.get(r.get("refers_to"), r.get("refers_to"))} for r in records]
 
 
+def _web_steps():
+    """(next_step, step_state) of the web app's own ``reviewer_web.forms``, else None."""
+    try:
+        forms = importlib.import_module("reviewer_web.forms")
+        return forms.next_step, forms.step_state
+    except (ImportError, AttributeError):
+        return None
+
+
 def cmd_parity(args) -> int:
     base, store = _base(args), _store()
     _data, _head, log = read_log(base)
     local = A.load_bundle(base / "bundle", A.RESTRICTED)
     with store.connection():
-        served, events = store.active_bundle(), store.events()
-        theirs = {r.alias: (r, store.records_of(r)) for r in store.reviewers() if not r.is_test}
+        events = store.events()
+        theirs = {r.alias: (r, store.bundle_for(r), store.records_of(r))
+                  for r in store.reviewers() if not r.is_test}
     held = {_pulled(r) for r in log.records}
-    failed = served.bundle_id != local.bundle_id
-    print(f"bundle: local {local.bundle_id[:12]}, hosted {served.bundle_id[:12]}: "
-          f"{'DIFFERENT' if failed else 'the same'}")
-    for alias, (row, hosted) in theirs.items():
+    steps = _web_steps()
+    failed = steps is None
+    if steps is None:  # the web app's resume rule is part of what must agree
+        print("NEXT_STEP_FUNCTION_MISSING: reviewer_web.forms gives no next_step and step_state")
+    print(f"local bundle {local.bundle_id[:12]}")
+    for alias, (row, served, stored) in theirs.items():
+        session = row.session()
         mine = [r for r in log.records if _login(r) == row.login
                 and r.get("bundle_id") == local.bundle_id]
-        hosted = [r for r in hosted if _login(r) == row.login]  # the reviewer's own
-        a, b = states(local, mine, row.session()), states(served, hosted, row.session())
-        same = _bodies(mine) == _bodies(hosted)
+        hosted = [r for r in stored if _login(r) == row.login]  # the reviewer's own
+        a, b = states(local, mine, session), states(served, hosted, session)
+        same = _bodies(mine) == _bodies(hosted) and served.bundle_id == local.bundle_id
         differing = [i for i in dict.fromkeys([*a, *b]) if a.get(i) != b.get(i)]
         waiting = sum(e["alias"] == alias and e["origin"] == HOSTED and e["sha256"] not in held
                       for e in events)
-        resume = next(((i, s) for i, s in b.items() if s != "DONE"), ("-", "all DONE"))
-        print(f"{alias}: records local {len(mine)}, hosted {len(hosted)}: "
-              f"{'the same' if same else 'DIFFERENT'}; forms {len(b)}: {len(b) - len(differing)}"
-              f" equal, {len(differing)} different; hosted lines not pulled: {waiting}; "
-              f"resumes at {resume[0]} {resume[1]}")
+        print(f"{alias}: bundle {served.bundle_id[:12]}; records local {len(mine)}, hosted "
+              f"{len(hosted)}: {'the same' if same else 'DIFFERENT'}; forms {len(b)}: "
+              f"{len(b) - len(differing)} equal, {len(differing)} different; hosted lines not "
+              f"pulled: {waiting}")
         for item_id in differing:
             print(f"  {item_id}: local {a.get(item_id, '-')}, hosted {b.get(item_id, '-')}")
         failed = failed or not same or bool(differing)
+        if steps is None:
+            continue
+        # The next step as the site computes it: over what the local log holds for this
+        # reviewer (their lines and the approver's decisions) and over what the site serves.
+        at_home = [r for r in log.records if r.get("bundle_id") == local.bundle_id
+                   and (_login(r) == row.login or r.get("phase") == A.APPROVAL)]
+        resume = []
+        for bundle, records in ((local, at_home), (served, stored)):
+            item_id = steps[0](bundle, session, records)
+            resume.append((item_id or "-", steps[1](bundle, session, records, item_id)
+                           if item_id else "nothing due"))
+        print(f"  next step: local {' '.join(resume[0])}, hosted {' '.join(resume[1])}: "
+              f"{'the same' if resume[0] == resume[1] else 'DIFFERENT'}")
+        failed = failed or resume[0] != resume[1]
     print(f"parity of the local log and the hosted store: {'FAIL' if failed else 'PASS'}, "
           f"{len(theirs)} reviewer(s)")
     return int(failed)
 
 
+def _print_bundle(published: dict | None, kind: str) -> None:
+    if published is None:
+        print(f"{kind} bundle: none published")
+        return
+    print(f"{kind} bundle {published['bundle_id'][:12]}: published "
+          f"{_time(published['published_at'])}, scope {published['scope_sequences']} of "
+          f"{published['source_sequences']} sequence(s), {published['bytes']} bytes, "
+          f"{published['images']} image(s) {published['image_bytes']} bytes")
+
+
 def cmd_status(_args) -> int:
     store = _store()
     with store.connection():
-        published, anchor, events, rows = (store.published(), store.anchor(), store.events(),
-                                           store.status())
-    if published:
-        print(f"bundle {published['bundle_id'][:12]}: "
-              f"{'demonstration data' if published['is_demo'] else 'not a demonstration'}, "
-              f"published {_time(published['published_at'])}, scope "
-              f"{published['scope_sequences']} of {published['source_sequences']} sequence(s), "
-              f"{published['bytes']} bytes, {published['images']} image(s) "
-              f"{published['image_bytes']} bytes")
-    else:
-        print("bundle: none published")
+        real, demo = store.published(demo=False), store.published(demo=True)
+        anchor, events, rows = store.anchor(), store.events(), store.status()
+    _print_bundle(real, "real")
+    _print_bundle(demo, "demonstration")
     print(f"anchor: {anchor['count']} line(s), head {anchor['head'][:12]}, imported "
           f"{_time(anchor['imported_at'])}" if anchor else "anchor: none (no log imported)")
     for r in rows:
+        if r["is_test"]:
+            continue  # see test-report
         mine = [e for e in events if e["alias"] == r["alias"]]
-        print(f"{r['alias']}{' (test identity)' if r['is_test'] else ''}: scope "
+        print(f"{r['alias']}: bundle {(r['bundle_id'] or '-')[:12]}, scope "
               f"{r['scope_sequences']}, invited {_time(r['invited_at'])}, first sign-in "
               f"{_time(r['first_sign_in_at'])}, first hosted save {_time(r['first_hosted_at'])}, "
               f"revoked {_time(r['revoked_at'])}")
         for origin in dict.fromkeys(e["origin"] for e in mine):
             print(f"  {origin}: " + _counts(e["phase"] for e in mine if e["origin"] == origin))
+    print(f"test identities: {sum(r['is_test'] for r in rows)} (see test-report ALIAS)")
+    return 0
+
+
+def cmd_test_report(args) -> int:
+    """A test identity's sign-in, saves and resume point: how a production sign-in is checked."""
+    store = _store()
+    with store.connection():
+        row = next((r for r in store.reviewers() if r.alias == args.alias), None)
+        if row is None or not row.is_test:
+            raise refused("UNKNOWN_ALIAS" if row is None else "NOT_A_TEST_IDENTITY")
+        status = next(r for r in store.status() if r["alias"] == row.alias)
+        events = [e for e in store.events() if e["alias"] == row.alias]
+        bundle, records = store.bundle_for(row), store.records_of(row)
+    print(f"{row.alias} (test identity): bundle {bundle.bundle_id[:12]} (demonstration data), "
+          f"scope {row.scope_sequences}, first sign-in {_time(status['first_sign_in_at'])}, web "
+          f"sessions {'-' if status['sessions'] is None else status['sessions']}, revoked "
+          f"{_time(status['revoked_at'])}")
+    print(f"events: {len(events)}")
+    for e in events:
+        print(f"  {e['seq']} {_time(e['at'])} {e['phase']} {e['item_id']}")
+    _print_states(row.alias, f"records {len(records)}", states(bundle, records, row.session()))
     return 0
 
 
@@ -596,14 +661,16 @@ def cmd_restore(args) -> int:
     with store.exclusive():
         if store.events() or store.anchor():
             raise refused("DATABASE_NOT_EMPTY")
-        ids = {r.alias: r.id for r in store.reviewers()}
-        if not {e["alias"] for e in events} <= set(ids):
+        rows = {r.alias: r for r in store.reviewers()}
+        if not {e["alias"] for e in events} <= set(rows):
             raise refused("UNKNOWN_ALIAS")  # sync-reviewers first
+        if any(rows[e["alias"]].is_test != e["is_test"] for e in events):
+            raise refused("ALIAS_IS_NOT_THE_SAME_KIND")  # a test identity's lines stay a test's
         if anchor:
             store.set_anchor(anchor["count"], anchor["head"], anchor["file_sha256"],
                              anchor["imported_at"])
-        store.insert_events([S.EventLine(ids[e["alias"]], e["origin"], e["line"],
-                                       e["idempotency_key"], e["batch"], e["created_at"])
+        store.insert_events([S.EventLine(rows[e["alias"]].id, e["origin"], e["line"],
+                                         e["idempotency_key"], e["batch"], e["created_at"])
                              for e in events])
         stored = [{k: e[k] for k in EVENT_KEYS} for e in store.events()]
         if stored != events or store.anchor() != anchor:
@@ -684,14 +751,13 @@ def cmd_push_returns(args) -> int:
     standing = [a for a in (A.effective_approval(new, i, local) for i in local.items)
                 if a is not None and A._outcome(a) == "RETURN"]
     with store.exclusive():
-        events, anchor, published = store.events(), store.anchor(), store.published()
+        events, anchor = store.events(), store.anchor()
         if not continues(lines, anchor):
             raise refused("LOCAL_LOG_IS_NOT_THE_ANCHORED_LOG")
         if chain_problems(events, anchor):
             raise refused("HOSTED_STORE_FAILS_VERIFICATION")
-        if published is None or published["bundle_id"] != local.bundle_id:
-            raise refused("HOSTED_BUNDLE_IS_NOT_THE_LOCAL_ONE")
-        rows = {r.login: r for r in store.reviewers() if not r.is_test}
+        rows = {r.login: r for r in store.reviewers()
+                if not r.is_test and r.bundle_id == local.bundle_id}  # who is served that bundle
         by_seq = {e["seq"]: e for e in events}
         by_sha = {e["sha256"]: e for e in events}
         pushed, known, skipped, elsewhere = [], 0, 0, 0
@@ -720,7 +786,7 @@ def cmd_push_returns(args) -> int:
                            reviewed["seq"]))
         events = store.events()
     print(f"returns that stand in the local log: {len(standing)}; {elsewhere} of a reading that "
-          "was not made by a hosted reviewer")
+          "was not made by a hosted reviewer of this bundle")
     print(f"pushed {len(pushed)} new return(s): {_counts(p[0] for p in pushed)}; {known} already "
           f"stored; {skipped} skipped (the returned reading is not in the hosted store)")
     for alias, item_id, seq, reviewed_seq in pushed:
@@ -757,10 +823,13 @@ def main(argv: list[str] | None = None) -> int:
         return p
 
     command("init-db", cmd_init_db, "apply schema.sql (can be run again)")
-    command("sync-reviewers", cmd_sync_reviewers,
-            "the reviewers file's remote reviewers as REMOTE-<n> rows").add_argument(
-        "--test-identity", nargs=2, metavar=("ALIAS", "LOGIN"),
-        help="also a test row TEST-<n> for this sign-in (never pulled to the local log)")
+    p = command("sync-reviewers", cmd_sync_reviewers,
+                "the reviewers file's remote reviewers as REMOTE-<n> rows on the real bundle")
+    p.add_argument("--demo", action="store_true",
+                   help="bind them to the demonstration bundle instead (a preview database)")
+    p.add_argument("--test-identity", nargs=2, metavar=("ALIAS", "LOGIN"),
+                   help="instead: write the test row TEST-<n> for this sign-in, bound to the "
+                        "demonstration bundle")
     for name, text in (("revoke", "stop a reviewer's access at once"),
                        ("restore-access", "lift a revocation")):
         command(name, cmd_revoke, text).add_argument("alias")
@@ -780,7 +849,9 @@ def main(argv: list[str] | None = None) -> int:
             "append the hosted saves the local log does not hold yet")
     command("push-returns", cmd_push_returns,
             "store the approver's standing local returns for the reviewers they concern")
-    command("status", cmd_status, "per alias: times, counts by phase, revoked")
+    command("status", cmd_status, "the bundles, and per reviewer: times, counts by phase")
+    command("test-report", cmd_test_report,
+            "a test identity's sign-in, events and form states").add_argument("alias")
     command("verify", cmd_verify,
             "the hosted chain, and the imported lines against the snapshot").add_argument(
         "--snapshots", metavar="DIR", help=f"snapshot root (default: <dir>/{SNAPSHOTS})")

@@ -1,8 +1,9 @@
 """The functions the hosted reviewer site shares with the local workspace (``bundle_from_bytes``,
 ``build_annotation``, ``build_system_shown``, ``encode_line``) and its Postgres store
-(``hosted/reviewer_web/store.py``): reviewers, the published bundle and its images, one
-reviewer's own records, the single chained append (one writer, idempotent), and event rows that
-can never be updated or deleted. INVENTED demo data and a real embedded Postgres."""
+(``hosted/reviewer_web/store.py``): reviewers, each reviewer's own bundle and its images (a
+test identity on an invented bundle beside the reviewers on the real one), one reviewer's own
+records, the single chained append (one writer, idempotent), and event rows that can never be
+updated or deleted. INVENTED demo data and a real embedded Postgres."""
 
 from __future__ import annotations
 
@@ -21,6 +22,7 @@ from hosted_pg import (
     demo_reviewers,
     hosted_reveal,
     hosted_save,
+    publish_as_real,
     publish_demo,
     reading_kw,
     write_demo,
@@ -190,6 +192,7 @@ def test_a_connection_block_is_one_transaction(store, base):
 
 
 def test_reviewers_are_found_by_casefolded_login_and_a_revoked_one_says_so(store, base):
+    bundle = publish_demo(store, base)
     rows = demo_reviewers(store, base)
     assert sorted(rows) == ["REMOTE-2", "REMOTE-3"]  # REMOTE-1: the approver's '@' entry, no row
     row = store.reviewer_by_login("Reviewer@EXAMPLE.invalid")
@@ -198,7 +201,7 @@ def test_reviewers_are_found_by_casefolded_login_and_a_revoked_one_says_so(store
         "id": row.id, "alias": "REMOTE-2", "login": "reviewer@example.invalid",
         "login_shown": "reviewer@example.invalid", "name": "Reviewer Example",
         "role": A.REVIEWER, "access": A.FULL, "scope_sequences": 40, "is_test": False,
-        "revoked": False}
+        "revoked": False, "bundle_id": bundle.bundle_id}
     assert row.session() == A.Session("reviewer@example.invalid", "Reviewer Example", A.REVIEWER,
                                       A.FULL, True, 40)
     assert store.reviewer_by_login("mallory@example.invalid") is None
@@ -208,6 +211,7 @@ def test_reviewers_are_found_by_casefolded_login_and_a_revoked_one_says_so(store
     assert store.reviewer_by_id(row.id).revoked is True
     store.set_revoked("REMOTE-2", False)
     assert store.reviewer_by_id(row.id) == row
+    assert type(row)(*dataclasses.astuple(row)[:10]) == dataclasses.replace(row, bundle_id=None)
     with refused("UNKNOWN_ALIAS"):
         store.set_revoked("REMOTE-9", True)
 
@@ -237,31 +241,117 @@ def test_a_reviewer_row_is_one_person_and_follows_the_owner_s_file(store, base):
 # ------------------------------------------------------------------ the bundle and its images
 
 
-def test_the_active_bundle_is_the_local_one_validated_and_cached(store, base):
+def test_a_bundle_is_the_local_one_validated_and_parsed_once(store, base):
     with refused("NO_ACTIVE_BUNDLE"):
         store.active_bundle()
     publish_demo(store, base)
+    reviewer = demo_reviewers(store, base)["REMOTE-2"]
     local = A.load_bundle(base / "bundle", A.FULL)
-    served = store.active_bundle()
-    assert served == dataclasses.replace(local, root=None) and store.bundle_is_demo() is True
-    assert store.active_bundle() is served  # parsed once per process
+    served = store.bundle_for(reviewer)
+    assert served == dataclasses.replace(local, root=None) and store.is_demo(reviewer) is True
+    assert store.bundle_for(reviewer) is served is store.active_bundle()  # parsed once
+    assert store.bundle_is_demo() is True  # no real bundle is active: a preview database
     files, media = bundle_bytes(base)
     # A larger or smaller part of the same local bundle is published under the SAME bundle_id.
     fewer = b"".join(files[2].splitlines(keepends=True)[:-1])
-    store.publish_bundle(files[0], files[1], fewer, files[3], media, is_demo=False,
-                         source_sequences=7)
-    assert len(store.active_bundle().items) == len(served.items) - 1
-    assert store.bundle_is_demo() is False
-    other = json.dumps({**json.loads(files[0]), "bundle_id": "ab" * 32}).encode()
-    store.publish_bundle(other, *files[1:], media, is_demo=True, source_sequences=7)
-    assert store.active_bundle().bundle_id == "ab" * 32
+    store.publish_bundle(files[0], files[1], fewer, files[3], media, is_demo=True,
+                         source_sequences=7, scope_sequences=5)
+    assert len(store.bundle_for(reviewer).items) == len(served.items) - 1
     with store.connection() as conn:
-        assert conn.execute("SELECT bundle_id, source_sequences, scope_sequences FROM bundle"
-                            " WHERE active").fetchall() == [("ab" * 32, 7, 7)]
-        assert conn.execute("SELECT count(*) FROM bundle").fetchone() == (2,)
+        assert conn.execute("SELECT bundle_id, source_sequences, scope_sequences, active"
+                            " FROM bundle").fetchall() == [(local.bundle_id, 7, 5, True)]
 
 
-def test_an_image_is_served_only_for_a_post_of_the_active_bundle_that_lists_it(store, base):
+def test_a_real_and_a_demonstration_bundle_are_active_side_by_side(store, base):
+    import psycopg
+
+    demo = publish_demo(store, base)
+    real = publish_as_real(store, base)
+    assert (real.bundle_id, len(real.items)) == ("ab" * 32, len(demo.items) - 1)
+    # The first contract's names: the real bundle when there is one.
+    assert store.active_bundle().bundle_id == real.bundle_id and store.bundle_is_demo() is False
+    # Publishing one kind never deactivates the other; a new one replaces its own kind only.
+    publish_demo(store, base)
+    newer = publish_as_real(store, base, "cd" * 32)
+    with store.connection() as conn:
+        assert conn.execute("SELECT bundle_id, is_demo, active FROM bundle ORDER BY published_at"
+                            ).fetchall() == [(real.bundle_id, False, False),
+                                             (demo.bundle_id, True, True),
+                                             (newer.bundle_id, False, True)]
+    for kind, bundle_id in ((False, real.bundle_id), (True, real.bundle_id)):
+        with pytest.raises(psycopg.errors.UniqueViolation), store.connection() as conn:
+            conn.execute("UPDATE bundle SET active = TRUE, is_demo = %s WHERE bundle_id = %s",
+                         (kind, bundle_id))  # at most one active of each kind
+    assert {k: store.published(demo=k)["bundle_id"] for k in (False, True)} == {
+        False: newer.bundle_id, True: demo.bundle_id}
+
+
+def test_a_test_identity_and_a_reviewer_never_receive_each_other_s_bundle_or_records(
+        store, base):
+    import psycopg
+
+    demo = publish_demo(store, base)
+    real = publish_as_real(store, base)
+    reviewer = demo_reviewers(store, base)["REMOTE-2"]  # the real bundle, when one is active
+    tester = store.upsert_reviewer("TEST-1", "tester@example.invalid", name="TEST-1",
+                                   is_test=True)  # the demonstration bundle, whatever else is
+    assert (reviewer.bundle_id, tester.bundle_id) == (real.bundle_id, demo.bundle_id)
+    assert store.bundle_for(reviewer) == real and store.is_demo(reviewer) is False
+    assert store.bundle_for(tester) == demo and store.is_demo(tester) is True
+    last = list(demo.items)[-1]
+    assert last in store.bundle_for(tester).items and last not in store.bundle_for(
+        reviewer).items
+    # The same image name in both bundles, other bytes: each gets their own bundle's.
+    png = (base / "bundle" / "media" / "chart-p01.png").read_bytes()
+    assert store.media(tester, "p01", "chart-p01.png") == (png, "image/png")
+    assert store.media(reviewer, "p01", "chart-p01.png") == (png + b"real", "image/png")
+    assert store.media("p01", "chart-p01.png") == (png + b"real", "image/png")  # active_bundle
+    assert store.media(tester, "p02", "chart-p01.png") is None
+    with store.connection() as conn:  # an image only the real bundle has
+        conn.execute("UPDATE media SET name = 'only-real.png' WHERE bundle_id = %s",
+                     (real.bundle_id,))
+    assert store.media(tester, "p01", "only-real.png") is None
+    assert store.media(reviewer, "p01", "chart-p01.png") is None  # no such image there now
+    # Records: each sees only their own, of their own bundle; a record of the other bundle is
+    # refused, whoever builds it.
+    [mine] = hosted_save(store, reviewer, "i07", A.INDEPENDENT).records
+    [theirs] = hosted_save(store, tester, "i07", A.INDEPENDENT).records
+    assert (mine["bundle_id"], theirs["bundle_id"]) == (real.bundle_id, demo.bundle_id)
+    assert store.records_of(reviewer) == [mine] and store.records_of(tester) == [theirs]
+    for who, body in ((tester, {**theirs, "bundle_id": real.bundle_id, "item_id": "i08"}),
+                      (reviewer, {**mine, "bundle_id": demo.bundle_id, "item_id": "i08"})):
+        with refused("RECORD_NOT_OF_THIS_REVIEWER_AND_BUNDLE"):
+            store.append(who, lambda records, b=body: {
+                k: v for k, v in b.items() if k not in ("schema", "seq", "prev_sha256")})
+    # A test identity is bound to demonstration data only, at every level.
+    with refused("TEST_IDENTITY_NEEDS_A_DEMO_BUNDLE"):
+        store.upsert_reviewer("TEST-1", "tester@example.invalid", is_test=True,
+                              bundle_id=real.bundle_id)
+    with refused("UNKNOWN_BUNDLE"):
+        store.upsert_reviewer("TEST-1", "tester@example.invalid", is_test=True,
+                              bundle_id="ef" * 32)
+    files, media = bundle_bytes(base)
+    with refused("TEST_IDENTITIES_WORK_ON_THIS_BUNDLE"):  # the demo bundle published as real
+        store.publish_bundle(*files, media, is_demo=False, source_sequences=1)
+    with pytest.raises(psycopg.errors.RestrictViolation, match="REVIEWER_KEEPS_A_BUNDLE"), \
+            store.connection() as conn:
+        conn.execute("UPDATE reviewer SET bundle_id = NULL WHERE alias = 'TEST-1'")
+    with store.connection() as conn:  # even bound by hand to real content: served nothing
+        conn.execute("UPDATE reviewer SET bundle_id = %s WHERE alias = 'TEST-1'",
+                     (real.bundle_id,))
+    with refused("NO_BUNDLE_ASSIGNED"):
+        store.bundle_for(tester)
+    with refused("NO_BUNDLE_ASSIGNED"):
+        store.media(tester, "p01", "only-real.png")
+    with refused("NO_BUNDLE_ASSIGNED"):
+        store.append(tester, lambda records: pytest.fail("make was called"))
+    assert store.records_of(tester) == [] and store.records_of(reviewer) == [mine]
+    # A reviewer without a bundle yet (a row written before anything was published).
+    with refused("NO_BUNDLE_ASSIGNED"):
+        store.bundle_for(dataclasses.replace(reviewer, id=10_000))
+
+
+def test_an_image_is_served_only_for_a_post_of_the_reviewer_s_bundle_that_lists_it(store, base):
     files, media = bundle_bytes(base)
     png = media["chart-p01.png"]
     for given, code in (({}, "MEDIA_NOT_AS_LISTED"),
@@ -273,9 +363,11 @@ def test_an_image_is_served_only_for_a_post_of_the_active_bundle_that_lists_it(s
     with refused("NO_ACTIVE_BUNDLE"):  # a refused publication stored nothing
         store.media("p01", "chart-p01.png")
     publish_demo(store, base)
-    assert store.media("p01", "chart-p01.png") == (png, "image/png")
-    assert store.media("p02", "chart-p01.png") is None  # that post does not list it
-    assert store.media("p01", "other.png") is None and store.media("nope", "x.png") is None
+    reviewer = demo_reviewers(store, base)["REMOTE-2"]
+    assert store.media(reviewer, "p01", "chart-p01.png") == (png, "image/png")
+    assert store.media(reviewer, "p02", "chart-p01.png") is None  # that post does not list it
+    assert store.media(reviewer, "p01", "other.png") is None
+    assert store.media(reviewer, "nope", "x.png") is None
     with store.connection() as conn:
         assert conn.execute("SELECT name, post_ref, content_type, sha256 FROM media").fetchall() \
             == [("chart-p01.png", "p01", "image/png", sha(png))]
@@ -339,7 +431,7 @@ def test_the_first_hosted_line_continues_the_anchored_local_log(store, base):
 def test_a_save_of_several_lines_is_one_chained_batch_under_one_key(store, base):
     publish_demo(store, base)
     reviewer = demo_reviewers(store, base)["REMOTE-2"]
-    bundle, session = store.active_bundle(), reviewer.session()
+    bundle, session = store.bundle_for(reviewer), reviewer.session()
     calls = []
 
     def reveal(records):
@@ -406,8 +498,7 @@ def test_a_revoked_reviewer_cannot_append(store, base):
     assert len(hosted_reveal(store, store.reviewer_by_id(reviewer.id), "i07").records) == 1
 
 
-def test_records_of_gives_only_the_reviewer_s_own_of_the_active_bundle_legacy_first(
-        store, base):
+def test_records_of_gives_only_the_reviewer_s_own_of_their_bundle_legacy_first(store, base):
     bundle = publish_demo(store, base)
     rows = demo_reviewers(store, base)
     one, two = rows["REMOTE-2"], rows["REMOTE-3"]
@@ -440,10 +531,14 @@ def test_records_of_gives_only_the_reviewer_s_own_of_the_active_bundle_legacy_fi
     theirs = store.records_of(two)
     assert [(r["seq"], r["refers_to"]) for r in theirs] == [(2, None), (HOSTED_1, 2)]
     assert A.progress(bundle, mine, one.session()).status["i07"] == "DONE"
-    # Records of a bundle that is not the active one are not served.
+    # Another bundle is published: a reviewer stays on theirs until the operator moves them,
+    # and is then served the records of the new bundle only.
     files, media = bundle_bytes(base)
     other = json.dumps({**json.loads(files[0]), "bundle_id": "ab" * 32}).encode()
     store.publish_bundle(other, *files[1:], media, is_demo=True, source_sequences=1)
+    assert store.records_of(one) == mine and store.bundle_for(one).bundle_id == bundle.bundle_id
+    one = store.sync_reviewers(A.load_reviewers(base / "reviewers.toml"),
+                               bundle_id="ab" * 32)[0]
     assert store.records_of(one) == [] and len(store.events()) == 5
     assert hosted_save(store, one, "i07", A.INDEPENDENT).records[0]["bundle_id"] == "ab" * 32
 
