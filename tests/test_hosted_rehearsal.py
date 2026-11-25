@@ -45,7 +45,7 @@ def test_the_rehearsal_folder_goes_through_the_cutover_as_documented(
     out = run("sync-reviewers", "--demo")
     assert [line.split(":")[0] for line in out.splitlines() if ": id " in line] == [
         "REMOTE-1", "REMOTE-2", "OWNER-REVIEWER"]
-    assert "OWNER-REVIEWER: closed until import-log runs" in out
+    assert "OWNER-REVIEWER: closed until import-log --cutover runs" in out
     out = run("sync-reviewers", "--test-identity", "TEST-1")
     assert "its sign-in address opens 2 identities" in out
     out = run("import-log", "--cutover")

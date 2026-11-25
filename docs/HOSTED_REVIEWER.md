@@ -534,40 +534,57 @@ schema: `import-log` refuses an anchor it did not write from this folder's log.
 
 ### Cutover
 
-Rehearse steps 1 to 3 while the present site still serves: every command can be run again, and
-no reviewer may sign in to the hosted site before step 8 (a reviewer's first save there fixes
-the anchor).
+Steps 1 to 3 may run while the present site still serves, and be run again: no reviewer row
+is open on the site before step 6 (each shows "Not open yet", and the store refuses its lines:
+`NOT_IMPORTED`), so the owner may still review locally until step 4. **The site becomes usable
+for the reviewers, the owner's "Your review" included, at step 6**, and is announced at step 8.
 
-1. `init-db` (never `--preview` on production), `make-site-role --grants-only` (when the
+1. **The real folder and the production database, said explicitly** (a terminal that ran the
+   rehearsal still holds its folder and the preview's address):
+
+   ```bash
+   export PYTHONPATH="$PWD/src"
+   export TRADINGBOT_ADJUDICATION_DIR=<the REAL adjudication folder>
+   export HOSTED_DATABASE_URL='<the PRODUCTION address>'
+   export HOSTED_DATABASE_URL_UNPOOLED='<the PRODUCTION direct address>'
+   export HOSTED_OWNER_ADDRESS_FILE=~/hosted-keys/owner-address
+   ```
+
+   Then `init-db` (never `--preview` on production), `make-site-role --grants-only` (when the
    role exists: the new tables), `publish-bundle --check-only`, `publish-bundle`,
-   `sync-reviewers --owner-address-file FILE` (it fails without the file:
-   `NO_OWNER_ADDRESS_FILE`), `status`: three reviewer rows, two `REMOTE-n` and
-   `OWNER-REVIEWER`, each "closed until import-log runs", `anchor: none`, and no other row but
-   the test identity (otherwise start from an empty database).
-2. `import-log`, then `parity` and `verify`: both PASS.
-3. `publish-bundle --demo DIR`, `sync-reviewers --test-identity TEST-1 --owner-address-file
-   FILE` (the owner's address: after the code it asks "Your review" or "Test forms"): sign in as that
-   test identity, work through an invented form, and read `test-report TEST-1`. This may be
-   done at any time, before the first import too: a test identity's lines are a stream of
-   their own and leave the anchor alone.
+   `sync-reviewers` (it fails without the owner's address file: `NO_OWNER_ADDRESS_FILE`), and
+   `status`: compare its reviewer rows with the reviewers file (two `REMOTE-n` and
+   `OWNER-REVIEWER`, each "closed until import-log --cutover runs"), `anchor: none`, and no
+   other row but the test identity (otherwise start from an empty database).
+2. `import-log`, then `parity` and `verify`: both PASS. This import snapshots the log and moves
+   the anchor; it opens no row.
+3. `publish-bundle --demo DIR`, `sync-reviewers --test-identity TEST-1` (the owner's address,
+   from the same file). The owner signs in and, after the code, chooses **"Test forms
+   (invented data)"** ("Your review" says "Not open yet" until step 6), works through an
+   invented form; read `test-report TEST-1`. A test identity's lines are a stream of their own
+   and leave the anchor alone.
 4. **Pause the writers**: stop the present published site, so that no remote reviewer can save
-   into the local log. Do not save locally yourself during the next steps.
+   into the local log. The owner makes no reviewer save in the local workspace from here on.
 5. **Verify** the local log: `python scripts/adjudication_freeze.py verify`.
-6. **Snapshot and import**: `import-log --cutover` (the final one: from now on the local
-   workspace refuses reviewer saves of the imported reviewers, `REVIEWS_ON_THE_SITE`). It
-   verifies chain and head again, writes
+6. **Snapshot, import and open**: `import-log --cutover`. It prints first which bundle and
+   which database it writes (`cutover: real bundle into a database not marked preview`), and
+   refuses a demonstration bundle into an unmarked database
+   (`CUTOVER_DEMO_BUNDLE_ON_A_REAL_DATABASE`) and a real one into a preview
+   (`CUTOVER_REAL_BUNDLE_ON_A_PREVIEW_DATABASE`). It verifies chain and head again, writes
    `<adjudication dir>/hosted_snapshots/log-<lines>-<sha256 prefix>/` (folder 0700, files 0600:
    the log, its head file, the sha256 of the log's bytes), imports only the lines that are new
-   since the rehearsal, and moves the anchor to the log's present head (it prints
-   `anchor: <lines> line(s), head <...>: moved to the log's present head`; if it prints FIXED
-   instead, a reviewer has already saved on the site: stop and decide with the owner).
+   since step 2, moves the anchor to the log's present head (it must print
+   `anchor: <lines> line(s), head <...>: moved to the log's present head`; anything else:
+   stop), OPENS every reviewer row it considered, and marks them in the folder: from now on the
+   local workspace refuses their reviewer saves (`REVIEWS_ON_THE_SITE`). A row written later
+   stays closed until the next `import-log --cutover` has considered it.
 7. **Returns and parity**: `push-returns` (a return the approver decided before the cutover
    and that still stands reaches its reviewer only by this command; until it is run, `parity`
    fails on that form), then `parity` PASS and `verify` PASS. Compare the per-alias lines and
    form states that `import-log` printed, and each reviewer's next step, with what you expect;
    the last lines of `parity` (`<ALIAS>: completed n of m; next <form> <phase>`, one per
    identity, `OWNER-REVIEWER` among them) are what to report to the owner.
-8. Open the hosted site to the reviewers.
+8. Announce the hosted site to the reviewers (the invitations).
 
 ```text
 local log: 8 line(s), head ba9b895aae2b, 10174 bytes, sha256 dcb3...4622

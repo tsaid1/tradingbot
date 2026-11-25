@@ -489,7 +489,7 @@ def cmd_sync_reviewers(args) -> int:
                  if shared.get(r.sign_in, 0) > 1 else ""))
     print(f"{len(rows)} reviewer row(s) written; none deleted")
     for alias in store.closed_rows():
-        print(f"{alias}: closed until import-log runs (no save is accepted before)")
+        print(f"{alias}: closed until import-log --cutover runs (no save is accepted before)")
     return 0
 
 
@@ -695,7 +695,8 @@ def cmd_import_log(args) -> int:
         folder = snapshot(Path(args.snapshots).expanduser() if args.snapshots
                           else base / SNAPSHOTS, data, head, log.count)
         store.insert_events(new)
-        store.stamp_imported(row.id for row in rows.values())  # open from now on
+        if args.cutover:  # the final import: only it opens the reviewer rows
+            store.stamp_imported(row.id for row in rows.values())
         if not hosted:  # until a reviewer has saved on the site, the anchor follows the log
             store.set_anchor(log.count, log.head, sha256(data), writer="IMPORT")
         anchor, events = store.anchor(), store.events()
@@ -1514,8 +1515,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--allow-empty-log", action="store_true",
                    help="import an EMPTY local log (a preview only)")
     p.add_argument("--cutover", action="store_true",
-                   help="the final import: from now on every imported reviewer reviews on the "
-                        "site, and the local workspace refuses their reviewer saves")
+                   help="the final import: it alone opens the reviewer rows on the site; from "
+                        "now on the local workspace refuses their reviewer saves")
     command("parity", cmd_parity, "compare the local log's state with the hosted store's"
             ).add_argument("--accept-unlisted-lines", **accept)
     command("export", cmd_export, "every event as JSONL").add_argument(

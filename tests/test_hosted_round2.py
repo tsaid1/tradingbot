@@ -10,7 +10,7 @@ import json
 import pytest
 from hosted_pg import hosted_reveal, hosted_save, reading_kw
 from hosted_web_site import dsn, store  # noqa: F401 - fixtures
-from test_hosted_admin import ONE, base, cli, half_way, local_save  # noqa: F401 - fixtures
+from test_hosted_admin import ONE, base, cli, half_way, local_save, open_rows  # noqa: F401
 from test_hosted_identities import OWNER_R, address_file, owner_cutover, run  # noqa: F401
 
 from tradingbot.runtime import adjudication as A
@@ -38,7 +38,7 @@ def test_q1_a_row_written_after_the_first_import_is_closed_until_import_log_cons
     from reviewer_web import forms as F
 
     owner_history(base)
-    run("init-db")
+    run("init-db", "--preview")  # a rehearsal on the demo folder
     run("publish-bundle", "--demo", base)
     # Without the owner's address file sync-reviewers fails: nothing is written.
     out = run("sync-reviewers", "--demo", code=2)
@@ -46,19 +46,19 @@ def test_q1_a_row_written_after_the_first_import_is_closed_until_import_log_cons
     assert store.reviewers() == []
     out = run("sync-reviewers", "--demo", "--without-owner")
     assert "OWNER-REVIEWER: left out on purpose" in out
-    assert "REMOTE-2: closed until import-log runs" in out
+    assert "REMOTE-2: closed until import-log --cutover runs" in out
     run("import-log", "--accept-unlisted-lines", "3")
     secret = address_file(tmp_path / "keys")
     out = run("sync-reviewers", "--demo", "--owner-address-file", secret)
-    assert "OWNER-REVIEWER: closed until import-log runs" in out
-    assert "REMOTE-2: closed" not in out  # considered by the import
+    assert "OWNER-REVIEWER: closed until import-log --cutover runs" in out
+    assert "REMOTE-2: closed until import-log --cutover" in out  # a plain import opens nothing
     owner = {r.alias: r for r in store.reviewers()}["OWNER-REVIEWER"]
     assert not store.is_open(owner)
     with pytest.raises(A.AdjudicationError, match="^NOT_IMPORTED$"):
         hosted_save(store, owner, "i07", A.INDEPENDENT)
     assert not [e for e in store.events() if e["alias"] == "OWNER-REVIEWER"]
-    # The next import brings the owner's history first; then the site serves it.
-    run("import-log")
+    # The cutover's import brings the owner's history first and opens the rows.
+    run("import-log", "--cutover")
     assert store.is_open(owner)
     bundle, session = store.bundle_for(owner), owner.session()
     assert F.step_state(bundle, session, store.records_of(owner), "i07") == F.DONE
@@ -106,6 +106,7 @@ def test_q2_a_local_line_already_imported_is_no_second_history(run, store, base)
     run("publish-bundle", "--demo", base)
     run("sync-reviewers", "--demo", "--without-owner")
     run("import-log")
+    open_rows(store)
     rows = {r.alias: r for r in store.reviewers()}
     hosted_save(store, rows["REMOTE-3"], "i08", A.INDEPENDENT)
     run("pull-to-local")
@@ -362,3 +363,65 @@ def test_m4_a_draft_keeps_only_the_names_of_the_form_and_a_bounded_interface_sta
     names = shown.names - {"_csrf", "_key"}
     assert {n for n in names if not n.startswith("ui.")} <= web.draft_names(
         site.bundle, site.bundle.items["i07"])
+
+
+# ------------------------------------------------------------------ re-check R2-1
+
+
+def test_r2_1_the_documented_order_opens_no_row_before_the_cutover(
+        run, store, dsn, base, tmp_path):  # noqa: F811
+    """R2-1 (probe ``test_q11_recheck::test_a1_documented_order_owner_opens_your_review_at_
+    step_3``), the docs followed word for word on a rehearsal: after step 2 (a plain import-log)
+    the owner still reviews locally and reveals i02; at step 3 the owner signs in and may choose
+    "Your review": it is "Not open yet", no page writes an event, a save is refused; the test
+    forms work. Step 6 (import-log --cutover) moves the anchor to the present head, opens the
+    rows, and the site then serves i02 as seen."""
+    from hosted_web_site import ORIGIN, SECRET
+    from reviewer_web import app as web
+    from reviewer_web import forms as F
+    from reviewer_web import mail
+    from reviewer_web.store import Store
+    from test_hosted_identities import ADDRESS
+
+    half_way(base)
+    secret = address_file(tmp_path / "keys")
+    run("init-db", "--preview")
+    run("publish-bundle", "--demo", base)
+    run("sync-reviewers", "--demo", "--owner-address-file", secret)  # step 1
+    run("import-log")  # step 2
+    assert "PASS" in run("parity") and "verify: PASS" in run("verify")
+    assert store.closed_rows() == ["REMOTE-2", "REMOTE-3", "OWNER-REVIEWER"]
+    local_save(base, OWNER_R, "i02", A.INDEPENDENT)  # the owner, locally, before step 4
+    A.mark_system_shown(base, A.load_bundle(base / "bundle", A.FULL), OWNER_R, "i02")
+    run("sync-reviewers", "--test-identity", "TEST-1", "--owner-address-file", secret)  # step 3
+    outbox = mail.Outbox()
+    app = web.create_app(Store(dsn), outbox, {"SESSION_SECRET": SECRET, "SITE_ENV": "test",
+                                              "SIGN_IN_FLOOR_SECONDS": 0})
+    head = {"Origin": ORIGIN, "Sec-Fetch-Site": "same-origin"}
+
+    def signed(which: str):
+        client = app.test_client()
+        client.post("/sign-in", data={"address": ADDRESS}, base_url=ORIGIN, headers=head)
+        code = outbox.sent[-1][2].split("code is ")[1][:6]
+        answer = client.post("/sign-in/verify", data={"address": ADDRESS, "code": code},
+                             base_url=ORIGIN, headers=head)
+        assert answer.headers["Location"] == "/sign-in/choose"
+        client.post("/sign-in/choose", data={"identity": which}, base_url=ORIGIN, headers=head)
+        return client
+
+    mine = signed("review")
+    for path in ("/", "/form/i02", "/form/i07", "/continue", "/sequence/seqA"):
+        page = mine.get(path, base_url=ORIGIN)
+        assert page.status_code == 503 and "Not open yet" in page.get_data(as_text=True), path
+    owner = {r.alias: r for r in store.reviewers()}["OWNER-REVIEWER"]
+    with pytest.raises(A.AdjudicationError, match="^NOT_IMPORTED$"):
+        hosted_save(store, owner, "i02", A.INDEPENDENT)
+    test = signed("test")
+    assert test.get("/form/i07", base_url=ORIGIN).status_code == 200
+    assert not [e for e in store.events() if e["origin"] == "HOSTED"]  # no line, no marker
+    out = run("import-log", "--cutover")  # step 6
+    assert "moved to the log's present head" in out and store.closed_rows() == []
+    bundle, session = store.bundle_for(owner), owner.session()
+    assert F.step_state(bundle, session, store.records_of(owner), "i02") == F.AFTER_REVEAL_DUE
+    with pytest.raises(A.AdjudicationError, match="^SYSTEM_READING_ALREADY_SEEN$"):
+        hosted_save(store, owner, "i02", A.INDEPENDENT)
