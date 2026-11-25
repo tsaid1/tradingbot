@@ -275,9 +275,11 @@ an instrument; the tester's reading of s01 has been returned by the approver.
 PYTHONPATH=src .venv/bin/python scripts/hosted_dev_server.py --port 8612 --acceptance ACCEPT-1
 # sign in as acceptance.tester@example.invalid (the code is printed in the terminal)
 
-# on a preview database that holds invented bundles only (refused otherwise: NOT_A_DEMO_DATABASE)
+# on a database initialised as a preview, holding invented bundles only, no anchor of an
+# import and no reviewer row but ACCEPT-n ones (refused otherwise: NOT_A_PREVIEW_DATABASE,
+# NOT_A_DEMO_DATABASE, ANCHOR_EXISTS, OTHER_REVIEWER_ROWS); several testers may be seeded
 export HOSTED_DATABASE_URL='postgresql://...'
-PYTHONPATH=src python scripts/hosted_admin.py init-db
+PYTHONPATH=src python scripts/hosted_admin.py init-db --preview
 PYTHONPATH=src python scripts/hosted_acceptance_seed.py seed --alias ACCEPT-1 \
     --login acceptance.tester@example.invalid
 ```
@@ -500,16 +502,48 @@ role that is an administrator, may create roles or databases, inherits, cannot l
 anything or is a member of another role (`NOT_A_SITE_ROLE`); `--grants-only` refuses a role
 that does not exist (`NO_SITE_ROLE`).
 
+### Rehearsal (on a preview database, invented data)
+
+The whole cutover once, in its own order, on an invented folder shaped like the real one: two
+remote reviewers (the first has finished three forms and is half-way through a fourth, the
+second has nothing), the owner's local reviewer identity (two forms finished, form 1 of a
+two-form post saved), the local approver (one reading accepted, one returned).
+
+```bash
+export PYTHONPATH="$PWD/src"
+python scripts/hosted_rehearsal_folder.py ~/hosted-rehearsal      # prints the expected lines
+export TRADINGBOT_ADJUDICATION_DIR=~/hosted-rehearsal
+export HOSTED_OWNER_ADDRESS_FILE=~/hosted-keys/owner-address      # 0600, outside Dropbox
+export HOSTED_DATABASE_URL='postgresql://...'                     # the PREVIEW database
+python scripts/hosted_admin.py init-db --preview
+python scripts/hosted_admin.py make-site-role --grants-only
+python scripts/hosted_admin.py publish-bundle --demo ~/hosted-rehearsal
+python scripts/hosted_admin.py sync-reviewers --demo
+python scripts/hosted_admin.py sync-reviewers --test-identity TEST-1
+python scripts/hosted_admin.py status
+python scripts/hosted_admin.py import-log --cutover
+python scripts/hosted_admin.py push-returns
+python scripts/hosted_admin.py parity
+python scripts/hosted_admin.py verify
+```
+
+`parity` must end with PASS (without `--accept-unlisted-lines`) and print, among its last
+lines, exactly the three lines the folder script printed (`REMOTE-1: completed 3 of m; next
+s02a RETURNED`, ...). A preview that held an earlier rehearsal is started again from an empty
+schema: `import-log` refuses an anchor it did not write from this folder's log.
+
 ### Cutover
 
 Rehearse steps 1 to 3 while the present site still serves: every command can be run again, and
 no reviewer may sign in to the hosted site before step 8 (a reviewer's first save there fixes
 the anchor).
 
-1. `init-db`, `make-site-role --grants-only` (when the role exists: the new tables),
-   `publish-bundle --check-only`, `publish-bundle`,
-   `sync-reviewers --owner-address-file FILE`, `status` (three reviewer rows: two `REMOTE-n`
-   and `OWNER-REVIEWER`; nobody can save before the import: `NO_ANCHOR`).
+1. `init-db` (never `--preview` on production), `make-site-role --grants-only` (when the
+   role exists: the new tables), `publish-bundle --check-only`, `publish-bundle`,
+   `sync-reviewers --owner-address-file FILE` (it fails without the file:
+   `NO_OWNER_ADDRESS_FILE`), `status`: three reviewer rows, two `REMOTE-n` and
+   `OWNER-REVIEWER`, each "closed until import-log runs", `anchor: none`, and no other row but
+   the test identity (otherwise start from an empty database).
 2. `import-log`, then `parity` and `verify`: both PASS.
 3. `publish-bundle --demo DIR`, `sync-reviewers --test-identity TEST-1 --owner-address-file
    FILE` (the owner's address: after the code it asks "Your review" or "Test forms"): sign in as that
@@ -519,7 +553,9 @@ the anchor).
 4. **Pause the writers**: stop the present published site, so that no remote reviewer can save
    into the local log. Do not save locally yourself during the next steps.
 5. **Verify** the local log: `python scripts/adjudication_freeze.py verify`.
-6. **Snapshot and import**: `import-log`. It verifies chain and head again, writes
+6. **Snapshot and import**: `import-log --cutover` (the final one: from now on the local
+   workspace refuses reviewer saves of the imported reviewers, `REVIEWS_ON_THE_SITE`). It
+   verifies chain and head again, writes
    `<adjudication dir>/hosted_snapshots/log-<lines>-<sha256 prefix>/` (folder 0700, files 0600:
    the log, its head file, the sha256 of the log's bytes), imports only the lines that are new
    since the rehearsal, and moves the anchor to the log's present head (it prints
@@ -547,6 +583,19 @@ REMOTE-1: lines 6 (6 new); forms 45: DONE 1, INDEPENDENT_SAVED 1, INDEPENDENT_SA
 
 The states: OPEN; INDEPENDENT_SAVED; DONE (a reading after the reveal is saved); `+SHOWN` when
 the system's reading was already shown and the reading after the reveal is still due.
+
+Also refused, changing nothing: an empty local log (`EMPTY_LOCAL_LOG`; `--allow-empty-log`
+on a preview only), an anchor that no import or restore of this folder's log wrote
+(`ANCHOR_NOT_OF_THIS_LOG`), hosted lines of a row that is not an entry of the reviewers file
+(`HOSTED_LINES_OF_ROWS_NOT_IN_THE_FILE`), a local line for a row that already holds hosted lines
+(`LEGACY_AFTER_HOSTED_LINES`), and local reviewer lines no row holds unless
+`--accept-unlisted-lines N` names exactly their count (`UNLISTED_LOCAL_LINES`). A reviewer row is
+closed for saving (`NOT_IMPORTED`; the site says "Not open yet" and offers Sign out) until an
+import has considered it, whenever it was written. `sync-reviewers` prints
+`OWNER-REVIEWER: sign-in address CHANGED` (never the address) and, for a row with lines,
+refuses without `--address-changed` (`ADDRESS_CHANGED_NEEDS_THE_FLAG`); `--without-owner` leaves
+the owner's identity out on purpose; `--owner-entry N` refuses a remote reviewer's entry
+(`OWNER_ENTRY_IS_A_REMOTE_REVIEWER_S`).
 
 `import-log` refuses, and changes nothing, when the lines it imported earlier are no longer the
 local log's (`IMPORTED_PREFIX_DIFFERS`), when the log fails verification
