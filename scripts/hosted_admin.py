@@ -74,6 +74,8 @@ MANIFEST_KEYS = ("schema", "bundle_id", "families")
 STUB_TIME = "1970-01-01T00:00:00+00:00"  # of a post that is named by its id only
 TEST_ALIAS = re.compile(r"^TEST-[0-9]{1,3}$")
 APPROVER_SHOWN = "approver"  # all a reviewer learns of who returned a reading
+WITHDRAWN = "WITHDRAWN"  # the decision of a line that clears a pushed return (never RETURN)
+MAX_LOCAL_LINES = 499_999  # a RETURN-stream seq is 2000000 + twice a local line's seq (+ 1)
 ENVELOPE = ("schema", "seq", "prev_sha256")
 EVENT_KEYS = ("alias", "is_test", "origin", "seq", "prev_sha256", "sha256", "line",
               "idempotency_key", "batch", "created_at")
@@ -486,7 +488,7 @@ def cmd_import_log(args) -> int:
     base, store = _base(args), _store()
     data, head, log = read_log(base)
     lines = _lines(data)
-    if log.count >= HOSTED_BASE:
+    if log.count > MAX_LOCAL_LINES:
         raise refused("LOCAL_LOG_TOO_LONG")
     local = A.load_bundle(base / "bundle", A.RESTRICTED)
     listed = A.load_reviewers(base / "reviewers.toml").entries
@@ -718,8 +720,10 @@ def chain_problems(events: list[dict], anchor: dict | None) -> list[str]:
         elif e["origin"] == RETURN:
             local = rec.get("local") if isinstance(rec.get("local"), dict) else {}
             reviewed, reading = rows.get(rec.get("refers_to"), ({}, {}))
-            if (e["seq"] - RETURN_BASE, rec.get("phase"), rec.get("decision")) != (
-                    local.get("seq"), A.APPROVAL, "RETURN") or (
+            clears = rec.get("decision") == WITHDRAWN  # a clearing line: an odd seq, no notes
+            if (e["seq"] - RETURN_BASE, rec.get("phase"), rec.get("decision") in (
+                    "RETURN", WITHDRAWN), bool(clears and rec.get("notes"))) != (
+                    2 * local.get("seq", 0) + clears, A.APPROVAL, True, False) or (
                     reviewed.get("alias"), reviewed.get("sha256"), reading.get("phase")) != (
                     e["alias"], e["prev_sha256"], A.AFTER_REVEAL):
                 out.append(f"RETURN_DOES_NOT_NAME_ITS_READING at {e['seq']}")
@@ -883,30 +887,44 @@ def cmd_pull_to_local(args) -> int:
 # ------------------------------------------------------------------ the approver's returns
 
 
-def return_record(approval: dict, line_sha256: str, reviewed: dict) -> dict:
+def return_record(approval: dict, line_sha256: str, reviewed: dict, *,
+                  clears: int | None = None) -> dict:
     """The record the hosted store keeps of a local RETURN, for the reviewer whose reading it
     returns: an APPROVAL record of the log's shape, so that ``A.effective_approval`` and
     ``A._outcome`` read it as they read the local one. ``reviewed``: the hosted event of the
     returned reading. It carries the decision, the approver's notes and time, the hosted ``seq``
     of the returned reading (``refers_to``) and that reading's sha256 (``prev_sha256``: it is
     outside the hosted chain); of the approver only the role; and the local line it was made
-    from (``local``)."""
-    return {"schema": A.ANNOTATION_SCHEMA, "seq": RETURN_BASE + approval["seq"],
+    from (``local``). Its seq is 2000000 + twice the local line's seq, so the store's order is
+    the local log's.
+
+    With ``clears`` (the seq of a pushed return that no longer stands locally): the line that
+    clears it, made from the local approval that came after: the same shape WITHOUT content
+    (no notes, decision WITHDRAWN, which says nothing of what the approver decided), one seq
+    above that approval's place. It is then the latest approval of the item on the site, so
+    ``effective_approval`` no longer gives the return."""
+    return {"schema": A.ANNOTATION_SCHEMA,
+            "seq": RETURN_BASE + 2 * approval["seq"] + (clears is not None),
             "prev_sha256": reviewed["sha256"], "at": approval["at"],
             "bundle_id": approval["bundle_id"], "item_id": approval["item_id"],
             "annotator": {"login": APPROVER_SHOWN, "name": APPROVER_SHOWN.capitalize(),
                           "role": A.APPROVER, "access": A.FULL},
             "phase": A.APPROVAL, "blind": False, "reading": {}, "field_verdicts": {},
-            "flags": [], "confidence": "", "notes": approval.get("notes") or "",
-            "refers_to": reviewed["seq"], "decision": "RETURN", "rubric": A.RUBRIC,
+            "flags": [], "confidence": "",
+            "notes": "" if clears is not None else approval.get("notes") or "",
+            "refers_to": reviewed["seq"],
+            "decision": WITHDRAWN if clears is not None else "RETURN", "rubric": A.RUBRIC,
             "acknowledged_warnings": [],
-            "local": {"seq": approval["seq"], "sha256": line_sha256}}
+            "local": {"seq": approval["seq"], "sha256": line_sha256},
+            **({} if clears is None else {"clears": clears})}
 
 
 def cmd_push_returns(args) -> int:
     base, store = _base(args), _store()
     data, _head, log = read_log(base)
     lines = _lines(data)
+    if log.count > MAX_LOCAL_LINES:
+        raise refused("LOCAL_LOG_TOO_LONG")
     local = A.load_bundle(base / "bundle", A.RESTRICTED)
     new = A.rubric2(log.records)
     standing = [a for a in (A.effective_approval(new, i, local) for i in local.items)
@@ -918,8 +936,20 @@ def cmd_push_returns(args) -> int:
             raise refused("HOSTED_STORE_FAILS_VERIFICATION")
         rows = {r.login: r for r in store.reviewers()
                 if not r.is_test and r.bundle_id == local.bundle_id}  # who is served that bundle
+        ids = {r.alias: r.id for r in rows.values()}
         by_seq = {e["seq"]: e for e in events}
         by_sha = {e["sha256"]: e for e in events}
+
+        def push(row_id: int, record: dict) -> bool:
+            """Store the line unless the store holds it; True when it was stored now."""
+            line = V.encode_line(record)
+            held = by_seq.get(record["seq"])
+            if held is not None and held["sha256"] != sha256(line):
+                raise refused("PUSHED_RETURN_DIFFERS")
+            if held is None:
+                store.insert_events([S.EventLine(row_id, RETURN, line)])
+            return held is None
+
         pushed, known, skipped, elsewhere = [], 0, 0, 0
         for approval in standing:
             source = log.records[approval["refers_to"] - 1]  # the reading it returns
@@ -933,37 +963,48 @@ def cmd_push_returns(args) -> int:
                     LEGACY, HOSTED):
                 skipped += 1
                 continue
-            line = V.encode_line(return_record(approval, sha256(lines[approval["seq"] - 1]),
-                                               reviewed))
-            held = by_seq.get(RETURN_BASE + approval["seq"])
-            if held is not None and held["sha256"] != sha256(line):
-                raise refused("PUSHED_RETURN_DIFFERS")
-            if held is not None:
+            record = return_record(approval, sha256(lines[approval["seq"] - 1]), reviewed)
+            if push(row.id, record):
+                pushed.append((row.alias, approval["item_id"], record["seq"], reviewed["seq"]))
+            else:
                 known += 1
+        # A pushed return that no longer stands locally (the approver decided again on that
+        # reading, or another decision on the item came after) but still shows on the site: no
+        # line of the store can be taken back, so ONE clearing line follows it.
+        stands = {a["seq"] for a in standing}
+        cleared, stale = [], []
+        for e in [e for e in events if e["origin"] == RETURN and e["alias"] in ids]:
+            rec = json.loads(e["line"])
+            if rec.get("decision") != "RETURN" or rec["local"]["seq"] in stands:
                 continue
-            store.insert_events([S.EventLine(row.id, RETURN, line)])
-            pushed.append((row.alias, approval["item_id"], RETURN_BASE + approval["seq"],
-                           reviewed["seq"]))
-        events = store.events()
+            theirs = [r for r in (json.loads(x["line"]) for x in store.events()
+                                  if x["alias"] == e["alias"])
+                      if r["bundle_id"] == rec["bundle_id"]]
+            showing = A.effective_approval(A.rubric2(theirs), rec["item_id"], local)
+            if showing is None or showing["seq"] != e["seq"]:
+                continue  # the site no longer shows it (answered, or cleared before)
+            later = [r for r in new if r["phase"] == A.APPROVAL and r["seq"] > rec["local"]["seq"]
+                     and (r["item_id"], r["bundle_id"]) == (rec["item_id"], rec["bundle_id"])]
+            if not later:  # nothing to derive a clearing line from
+                stale.append((e["alias"], rec["item_id"], e["seq"]))
+                continue
+            record = return_record(later[-1], sha256(lines[later[-1]["seq"] - 1]),
+                                   by_seq[rec["refers_to"]], clears=e["seq"])
+            if push(ids[e["alias"]], record):
+                cleared.append((e["alias"], rec["item_id"], record["seq"], e["seq"]))
     print(f"returns that stand in the local log: {len(standing)}; {elsewhere} of a reading that "
           "was not made by a hosted reviewer of this bundle")
     print(f"pushed {len(pushed)} new return(s): {_counts(p[0] for p in pushed)}; {known} already "
           f"stored; {skipped} skipped (the returned reading is not in the hosted store)")
     for alias, item_id, seq, reviewed_seq in pushed:
         print(f"  {alias} {item_id}: return {seq} of the reading {reviewed_seq}")
-    # A pushed return that no longer stands locally (the approver decided again) but still shows
-    # on the site: no line of the store can be taken back; the reviewer's next save clears it.
-    stands = {a["seq"] for a in standing}
-    for e in events:
-        if e["origin"] != RETURN:
-            continue
-        rec = json.loads(e["line"])
-        theirs = [json.loads(x["line"]) for x in events if x["alias"] == e["alias"]
-                  and json.loads(x["line"])["bundle_id"] == rec["bundle_id"]]
-        shown = A.effective_approval(A.rubric2(theirs), rec["item_id"], local)
-        if rec["local"]["seq"] not in stands and shown is not None and shown["seq"] == e["seq"]:
-            print(f"  NO_LONGER_STANDS_LOCALLY {e['alias']} {rec['item_id']}: return {e['seq']} "
-                  "still shows on the site until that reviewer saves again")
+    print(f"cleared {len(cleared)} pushed return(s) that no longer stand locally: "
+          f"{_counts(c[0] for c in cleared)}")
+    for alias, item_id, seq, return_seq in cleared:
+        print(f"  {alias} {item_id}: line {seq} clears the return {return_seq}")
+    for alias, item_id, seq in stale:
+        print(f"  NO_LONGER_STANDS_LOCALLY {alias} {item_id}: return {seq} still shows on the "
+              "site until that reviewer saves again (no later local decision to clear it with)")
     return 0
 
 

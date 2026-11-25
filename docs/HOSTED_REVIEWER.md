@@ -453,9 +453,9 @@ field) and stores one RETURN event under that reviewer:
 * an APPROVAL record of the log's shape with `decision: "RETURN"`, the approver's notes and
   time, and `refers_to` the `seq` the returned reading has in the store; of the approver only
   the role (`annotator` is `approver` / `Approver`, never a sign-in or a name);
-* `seq` 2000000 + the seq of the local approval line (so the same decision is stored once),
-  `prev_sha256` the sha256 of the returned reading, `local = {"seq", "sha256"}` naming the local
-  line.
+* `seq` 2000000 + twice the seq of the local approval line (so the same decision is stored
+  once, in the local log's order), `prev_sha256` the sha256 of the returned reading,
+  `local = {"seq", "sha256"}` naming the local line.
 
 The site serves it to that reviewer only, after the reviewer's own records, and computes
 "returned" with the workspace's own functions (`effective_approval`, `_outcome`), so the form
@@ -468,7 +468,8 @@ again.
 ```text
 returns that stand in the local log: 2; 0 of a reading that was not made by a hosted reviewer
 pushed 1 new return(s): REMOTE-1 1; 1 already stored; 0 skipped (the returned reading is not in the hosted store)
-  REMOTE-1 i03: return 2000012 of the reading 1000003
+  REMOTE-1 i03: return 2000024 of the reading 1000003
+cleared 0 pushed return(s) that no longer stand locally: -
 ```
 
 It can be run again (nothing is stored twice). A RETURN of a reading the store does not hold
@@ -477,11 +478,21 @@ It can be run again (nothing is stored twice). A RETURN of a reading the store d
 seq and sha256; `export` and `restore` carry RETURN events like the others; `parity` compares the
 reviewers' own records only.
 
-One limit: no event can be taken back. If the approver decides again on the same reading
-(ACCEPT or AMEND after a RETURN) before the reviewer has answered, the site still shows the
-return until that reviewer saves again; `push-returns` then prints
-`NO_LONGER_STANDS_LOCALLY <alias> <item>`. The same holds for the return of one reviewer's
-reading once the approver's latest decision on that item concerns another reviewer's reading.
+No event can be taken back. When a pushed return no longer stands locally (the approver decided
+again on that reading, or the item's latest decision now concerns another reviewer's reading)
+and the site still shows it, `push-returns` stores ONE clearing line after it: the same shape
+without content (`decision: "WITHDRAWN"`, no notes: nothing of what the approver decided), made
+from the local decision that came after, at one seq above that decision's place. The site's
+`effective_approval` then no longer gives the return, the form stands as done, and nothing asks
+the reviewer for a save that would undo an acceptance. Stored once, like a return:
+
+```text
+cleared 1 pushed return(s) that no longer stand locally: REMOTE-1 1
+  REMOTE-1 i07: line 2000021 clears the return 2000018
+```
+
+Only when there is no later local decision to make the line from (the reading was superseded
+by a local save of the reviewer) it prints `NO_LONGER_STANDS_LOCALLY <alias> <item>` instead.
 
 ### Backup: export and restore
 

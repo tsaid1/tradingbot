@@ -28,9 +28,12 @@ connection and commits with the block (one connection per request).
 #   shape (decision RETURN, the approver's notes; of the approver only the role), ``refers_to``
 #   the seq the returned reading has HERE, so ``A.effective_approval`` / ``A._outcome`` give the
 #   site what they give the local workspace, and the reviewer's next reading after the reveal
-#   supersedes it. It is outside the hosted chain: seq 2000000 + its local line's seq (after
-#   every record of the reviewer's own), ``prev_sha256`` the sha256 of the returned reading. The
-#   site never writes one; ``pull-to-local`` never copies one back.
+#   supersedes it. It is outside the hosted chain: seq 2000000 + twice its local line's seq
+#   (after every record of the reviewer's own, in the local log's order), ``prev_sha256`` the
+#   sha256 of the returned reading. A return that no longer stands locally is followed by ONE
+#   clearing line of the same shape without content (decision WITHDRAWN, one seq above the place
+#   of the local decision that came after), so that ``effective_approval`` no longer gives the
+#   return. The site never writes either; ``pull-to-local`` never copies one back.
 # * ``event.origin`` TEST: the lines of a test identity are a stream of their own (seq 3000000
 #   + n, chained among themselves from TEST_GENESIS). A test identity may save before the real
 #   log is imported: its lines never touch the reviewers' chain or its anchor, and no "is there
@@ -72,7 +75,7 @@ from tradingbot.runtime.vocab_recommend import GENESIS, encode_line
 SCHEMA_SQL = Path(__file__).with_name("schema.sql")
 LOCK_KEY = 7_203_001  # pg_advisory_xact_lock: one writer of ``event`` at a time
 HOSTED_BASE = 1_000_000  # a HOSTED line's seq is HOSTED_BASE + n (n = 1, 2, ...)
-RETURN_BASE = 2_000_000  # a RETURN line's seq is RETURN_BASE + the seq of its local line
+RETURN_BASE = 2_000_000  # a RETURN line's seq: RETURN_BASE + twice its local line's seq (+ 1)
 TEST_BASE = 3_000_000  # a TEST line's seq is TEST_BASE + n: the test identities' own stream
 TEST_GENESIS = hashlib.sha256(b"tradingbot.hosted.test-stream/1").hexdigest()  # its first prev
 LEGACY, HOSTED, RETURN, TEST = "LEGACY", "HOSTED", "RETURN", "TEST"

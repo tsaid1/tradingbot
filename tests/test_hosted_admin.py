@@ -837,7 +837,13 @@ def test_status_gives_times_and_counts_by_phase_per_alias(run, store, base):
 
 # ------------------------------------------------------------------ the approver's returns
 
-RETURN_1 = 2_000_001
+
+
+def ret(line: int) -> int:
+    """The store's seq of the return made from that local line (its clearing line: one above)."""
+    return 2_000_000 + 2 * line
+
+
 NOTE = "The stop was raised in the post before this one."
 NEUTRAL = {"login": "approver", "name": "Approver", "role": A.APPROVER, "access": A.FULL}
 
@@ -887,11 +893,12 @@ def test_a_local_return_reaches_its_reviewer_and_a_corrected_save_supersedes_it(
          "reviewer of this bundle"),
         ("pushed 2 new return(s): REMOTE-2 2; 0 already stored; 0 skipped (the returned reading "
          "is not in the hosted store)"),
-        f"  REMOTE-2 i03: return {RETURN_1 + 11} of the reading {HOSTED_1 + 2}",
-        f"  REMOTE-2 i07: return {RETURN_1 + 12} of the reading 3"]
+        f"  REMOTE-2 i03: return {ret(12)} of the reading {HOSTED_1 + 2}",
+        f"  REMOTE-2 i07: return {ret(13)} of the reading 3",
+        "cleared 0 pushed return(s) that no longer stand locally: -"]
     # The site computes "returned" with the workspace's own functions, as the local log does.
     got = hosted_return(store, one, "i03")
-    assert got == {**local, "seq": RETURN_1 + 11, "refers_to": HOSTED_1 + 2, "annotator": NEUTRAL,
+    assert got == {**local, "seq": ret(12), "refers_to": HOSTED_1 + 2, "annotator": NEUTRAL,
                    "prev_sha256": got["prev_sha256"], "local": got["local"]}
     assert (got["decision"], got["notes"], got["at"]) == ("RETURN", NOTE, local["at"])
     log = A.read_annotations(base).records
@@ -902,12 +909,12 @@ def test_a_local_return_reaches_its_reviewer_and_a_corrected_save_supersedes_it(
     # store names the approver.
     mine = store.records_of(one)
     assert [r for r in mine if r["phase"] != A.APPROVAL] == before["REMOTE-2"]
-    assert [r["seq"] for r in mine][-2:] == [RETURN_1 + 11, RETURN_1 + 12]
+    assert [r["seq"] for r in mine][-2:] == [ret(12), ret(13)]
     assert store.records_of(two) == before["REMOTE-3"]
     assert store.records_of(rows["TEST-1"]) == before["TEST-1"] == []
     returns = [e for e in store.events() if e["origin"] == "RETURN"]
     assert [(e["seq"], e["alias"], e["phase"]) for e in returns] == [
-        (RETURN_1 + 11, "REMOTE-2", A.APPROVAL), (RETURN_1 + 12, "REMOTE-2", A.APPROVAL)]
+        (ret(12), "REMOTE-2", A.APPROVAL), (ret(13), "REMOTE-2", A.APPROVAL)]
     assert not any(word.encode() in e["line"] for e in returns
                    for word in (OWNER.login, OWNER.name, "owner"))
     assert got["prev_sha256"] == V._sha(V.encode_line(mine[-3]))  # the reading it returns
@@ -955,30 +962,67 @@ def test_a_return_of_a_reading_the_store_does_not_hold_is_counted_and_skipped(ru
     assert [e["origin"] for e in store.events()] == ["LEGACY"] * 7
     assert "imported 1 new line(s)" in run("import-log")
     out = run("push-returns")
-    assert f"  REMOTE-3 i07: return {RETURN_1 + 9} of the reading 9" in out
+    assert f"  REMOTE-3 i07: return {ret(10)} of the reading 9" in out
     assert hosted_return(store, rows["REMOTE-3"], "i07")["notes"] == NOTE
     assert hosted_return(store, rows["REMOTE-2"], "i07") is None  # the other reviewer's reading
     assert [r["phase"] for r in store.records_of(rows["REMOTE-2"])].count(A.APPROVAL) == 0
 
 
-def test_a_pushed_return_that_the_approver_took_back_is_reported(run, store, base):
+def test_a_return_the_approver_took_back_is_cleared_on_the_site(run, store, base):
+    """Probe ``test_stale_return_undoes_a_later_accept`` (finding 6): the approver returned a
+    reading, pushed it, then accepted that same reading; the site went on saying "Returned to
+    you", the reviewer saved again, and after the next pull the acceptance no longer counted."""
+    from reviewer_web import forms
+
     rows = cutover(run, store, base)
-    one = rows["REMOTE-2"]
+    one, two = rows["REMOTE-2"], rows["REMOTE-3"]
+
+    def site_state(row) -> str:
+        return forms.step_state(store.bundle_for(row), row.session(), store.records_of(row),
+                                "i07")
+
     decide(base, "i07", 3, "RETURN", NOTE)  # line 9
     assert "pushed 1 new return(s): REMOTE-2 1" in run("push-returns")
-    decide(base, "i07", 3, "ACCEPT")  # line 10: decided again, without a new reading
-    assert standing_return(A.read_annotations(base).records, store.bundle_for(one), ONE.login,
-                           "i07") is None
-    out = run("push-returns")  # no line of the store can be taken back: the operator is told
-    assert "returns that stand in the local log: 0;" in out
-    assert out.splitlines()[-1] == (f"  NO_LONGER_STANDS_LOCALLY REMOTE-2 i07: return "
-                                    f"{RETURN_1 + 8} still shows on the site until that reviewer "
-                                    "saves again")
-    assert hosted_return(store, one, "i07") is not None
-    hosted_reveal(store, one, "i07")
-    hosted_save(store, one, "i07", A.AFTER_REVEAL)  # the reviewer's next save clears it
-    assert hosted_return(store, one, "i07") is None
-    assert "NO_LONGER_STANDS_LOCALLY" not in run("push-returns")
+    assert site_state(one) == forms.RETURNED
+    accepted = decide(base, "i07", 3, "ACCEPT", "a note of the approver's own")  # line 10
+    out = run("push-returns")
+    assert out.splitlines()[-2:] == [
+        "cleared 1 pushed return(s) that no longer stand locally: REMOTE-2 1",
+        f"  REMOTE-2 i07: line {ret(10) + 1} clears the return {ret(9)}"]
+    # ONE line without content: nothing of what the approver decided, no note.
+    clear = store.records_of(one)[-1]
+    assert clear == {
+        "schema": A.ANNOTATION_SCHEMA, "seq": ret(10) + 1, "prev_sha256": clear["prev_sha256"],
+        "at": accepted["at"], "bundle_id": accepted["bundle_id"], "item_id": "i07",
+        "annotator": NEUTRAL, "phase": A.APPROVAL, "blind": False, "reading": {},
+        "field_verdicts": {}, "flags": [], "confidence": "", "notes": "", "refers_to": 3,
+        "decision": "WITHDRAWN", "rubric": A.RUBRIC, "acknowledged_warnings": [],
+        "local": {"seq": 10, "sha256": V._sha(log_lines(base)[9])}, "clears": ret(9)}
+    assert hosted_return(store, one, "i07") is None and site_state(one) == forms.DONE
+    events = store.events()
+    assert "cleared 0 pushed return(s)" in run("push-returns") and store.events() == events
+    assert "PASS" in run("verify") and "PASS" in run("parity")
+    # Nothing asks the reviewer to save again, so the acceptance stands.
+    assert "pulled 0 hosted line(s)" in run("pull-to-local")
+    b = A.load_bundle(base / "bundle", A.RESTRICTED)
+    records = A.read_annotations(base).records
+    assert A.effective_approval(A.rubric2(records), "i07", b)["decision"] == "ACCEPT"
+    assert next(r for r in A.resolve(records, b) if r["item_id"] == "i07")["status"] == "APPROVED"
+    # The store keeps the local order: a return of that reading AFTER the clearing line shows.
+    decide(base, "i07", 3, "RETURN", NOTE)  # line 11
+    assert f"  REMOTE-2 i07: return {ret(11)} of the reading 3" in run("push-returns")
+    assert hosted_return(store, one, "i07")["seq"] == ret(11) and site_state(one) == \
+        forms.RETURNED
+    # Superseded by a decision on ANOTHER reviewer's reading of the item: cleared too, and the
+    # other reviewer gets theirs (two lines made from one local line, two seqs).
+    local_save(base, TWO, "i07", A.AFTER_REVEAL)  # line 12
+    run("import-log")
+    decide(base, "i07", 12, "RETURN", NOTE)  # line 13
+    out = run("push-returns")
+    assert f"  REMOTE-3 i07: return {ret(13)} of the reading 12" in out
+    assert f"  REMOTE-2 i07: line {ret(13) + 1} clears the return {ret(11)}" in out
+    assert (site_state(one), site_state(two)) == (forms.DONE, forms.RETURNED)
+    assert "events: LEGACY 8, RETURN 5" in run("verify") and "PASS" in run("parity")
 
 
 def test_returns_survive_export_and_restore_and_verify_checks_what_they_name(
@@ -1003,15 +1047,20 @@ def test_returns_survive_export_and_restore_and_verify_checks_what_they_name(
     record = json.loads(events[-1]["line"])
     for n, (refers_to, prev) in enumerate(((5, events[4]["sha256"]), (1, events[0]["sha256"]),
                                            (3, "0" * 64)), 1):
-        stray = V.encode_line({**record, "seq": record["seq"] + n, "refers_to": refers_to,
+        stray = V.encode_line({**record, "seq": record["seq"] + 2 * n, "refers_to": refers_to,
                                "prev_sha256": prev,
                                "local": {**record["local"], "seq": record["local"]["seq"] + n}})
         restored.insert_events([cli.S.EventLine(one.id, "RETURN", stray)])
+    # ... or a seq that is not its local line's place, or a clearing line that carries a note.
+    for seq, extra in ((record["seq"] + 9, {}), (record["seq"] + 21, {
+            "decision": "WITHDRAWN", "notes": "a note", "local": {"seq": 19, "sha256": "0" * 64}})):
+        restored.insert_events([cli.S.EventLine(one.id, "RETURN", V.encode_line(
+            {**record, "seq": seq, **extra}))])
     out = run("verify", code=1)
     assert [x for x in out.splitlines() if x.startswith("  ")] == [
-        f"  RETURN_DOES_NOT_NAME_ITS_READING at {record['seq'] + n}" for n in (1, 2, 3)]
+        f"  RETURN_DOES_NOT_NAME_ITS_READING at {record['seq'] + n}" for n in (2, 4, 6, 9, 21)]
     # The site never writes a return, and a return is never in the hosted chain.
-    assert restored.records_of(one)[-1]["seq"] == record["seq"] + 3
+    assert restored.records_of(one)[-1]["seq"] == record["seq"] + 21
     [nxt] = hosted_reveal(restored, restored.reviewer_by_login(ONE.login), "i08").records
     assert (nxt["seq"], nxt["prev_sha256"]) == (HOSTED_1, restored.anchor()["head"])
     # Another folder's log is not the log this store continues.
