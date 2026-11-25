@@ -112,7 +112,7 @@ def create_app(store, mailer, config: dict) -> Flask:
     if synthetic and not demo:
         raise RuntimeError("MAIL_NOT_CONFIGURED")
     clock = config.get("CLOCK") or (lambda: datetime.now(UTC))
-    floor = float(config.get("SIGN_IN_FLOOR_SECONDS", 1.5))
+    floor = float(config.get("SIGN_IN_FLOOR_SECONDS", 2.0))
     schemes = ("https", "http") if config.get("ALLOW_HTTP") else ("https",)
 
     app = Flask(__name__, static_folder=str(STATIC), static_url_path="/static")
@@ -239,9 +239,14 @@ def create_app(store, mailer, config: dict) -> Flask:
 
     @app.post("/sign-in")
     def sign_in_code():
-        """Answers the same for every address, listed or not, and takes about as long. When
-        the mail server cannot be reached the page says so, for every address alike: an address
-        that gets no code asks the server too (``probe``), and sends nothing."""
+        """Answers the same for every address, listed or not, and takes about as long.
+
+        The page never carries the code (synthetic mail apart, which production never uses).
+        When the mail server cannot be reached the page says the code could not be sent, for
+        every address alike: an address that gets no code asks the server too (``probe``) and
+        sends nothing. A failure of the one message (which no unlisted address could meet) is
+        logged and not shown: showing it would say that the address is listed. Either way the
+        code that was not delivered is ended."""
         started = time.monotonic()
         address = request.form.get("address", "")[:auth.MAX_ADDRESS]
         if synthetic and not store.bundle_is_demo():
@@ -254,9 +259,15 @@ def create_app(store, mailer, config: dict) -> Flask:
                     mailer(asked.reviewer.login_shown, auth.SUBJECT, auth.mail_text(asked.code))
                 elif asked.allowed and hasattr(mailer, "probe"):
                     mailer.probe()
+            except mail.Unreachable as exc:
+                app.logger.error("MAIL_UNREACHABLE error=%s", str(exc)[:60])  # a class name
+                unsent = True
             except Exception as exc:  # noqa: BLE001 - whatever failed: a constant code, no detail
                 app.logger.error("MAIL_FAILED error=%s", type(exc).__name__)
-                unsent = True
+            else:
+                asked = asked._replace(code=None)  # delivered, or none was made: nothing to end
+            if asked.code is not None:
+                auth.cancel_codes(store, asked.reviewer, clock())
         time.sleep(max(0.0, floor - (time.monotonic() - started)))
         return render_template("sign_in_code.html", address=address, failed=False, unsent=unsent,
                                shown_code=asked.code if synthetic else None)
@@ -359,21 +370,30 @@ def create_app(store, mailer, config: dict) -> Flask:
                        notice=F.saved_notice(gate.ind, gate.after, gate.returned)
                        if after else None)
 
+    def phase_of(bundle, item, records, gate) -> str | None:
+        """The form the page of ``item`` shows, by ``forms.step_state`` (the one function that
+        says where a form stands): the independent form, no form while the post waits for
+        another form's reading, else the form after the reveal. That one needs the markers:
+        without them (they could not be stored) no form is shown."""
+        state = F.step_state(bundle, g.who.session, records, item["item_id"])
+        if state == F.INDEPENDENT_DUE:
+            return A.INDEPENDENT
+        return A.AFTER_REVEAL if state != F.REVEAL_PENDING and gate.marked else None
+
     def page(bundle, item, records, gate, problem, *, posted=None, refusal=None, saved=None,
              status=200):
         """The form page as it stands now. ``posted`` is used only when it belongs to the form
         the page shows (the same phase)."""
         who, item_id = g.who, item["item_id"]
-        revealed = gate.open and gate.marked
-        phase = A.AFTER_REVEAL if revealed else A.INDEPENDENT if (
-            gate.ind is None and not gate.open) else None
+        phase = phase_of(bundle, item, records, gate)
+        revealed = phase == A.AFTER_REVEAL
         if posted is not None and posted.get("_phase") != phase:
             posted = None
         step = F.step_from(bundle, who.session, records, item)
         return render_template(
             "form.html", item_id=item_id, bundle_id=bundle.bundle_id,
             names=F.names(bundle, who.session),
-            status=F.STATUS_TEXT[F.statuses(bundle, who.session, records)[item_id]],
+            status=F.STATUS_TEXT[gate.state],
             returned=gate.returned is not None and revealed,
             evidence=F.evidence(bundle, item), header=F.form_header(bundle, item),
             how=R.HOW_TO_REVIEW, verdict_help=R.VERDICT_HELP,
@@ -408,9 +428,7 @@ def create_app(store, mailer, config: dict) -> Flask:
         Saves nothing. A script asks for the form's body only; without one the whole page."""
         bundle, item = item_of(item_id)
         records, gate, problem = reveal(bundle, item)
-        revealed = gate.open and gate.marked
-        phase = A.AFTER_REVEAL if revealed else A.INDEPENDENT if (
-            gate.ind is None and not gate.open) else None
+        phase = phase_of(bundle, item, records, gate)
         if request.headers.get("X-Fragment") != "form":
             return lambda: page(bundle, item, records, gate, problem, posted=request.form)
         if phase is None or request.form.get("_phase") != phase:
@@ -438,7 +456,7 @@ def create_app(store, mailer, config: dict) -> Flask:
         def make(current):
             """Under the store's lock, with the reviewer's current records."""
             gate = F.gate(bundle, who.session, item, current)
-            if phase == A.AFTER_REVEAL and not (gate.open and gate.marked):
+            if phase == A.AFTER_REVEAL and phase_of(bundle, item, current, gate) != phase:
                 raise A.AdjudicationError("NOT_REVEALED")
             filled = build(bundle, item, current, gate, phase, request.form)
             if filled.invalid:

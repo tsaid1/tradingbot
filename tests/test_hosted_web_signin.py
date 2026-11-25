@@ -274,33 +274,20 @@ def test_no_response_and_no_log_line_carries_a_code_or_an_address(site, caplog):
                                       "/healthz", "/robots.txt", "/static/app.js")]
     seen.append(b.post("/sign-out", {"_csrf": b.csrf()}))
 
-    class Down:
-        """A mail server that cannot be reached, for a message and for the probe alike."""
+    def failing(_to, _subject, text):
+        raise RuntimeError(f"the server said no to {text}")  # an error may quote anything
 
-        def __call__(self, _to, _subject, text):
-            raise RuntimeError(f"the server said no to {text}")  # an error may quote anything
-
-        def probe(self):
-            raise OSError("no route to the mail server")
-
-    broken = web.create_app(site.store, Down(), site.config).test_client()
-
-    def ask_broken(address):
-        return broken.post("/sign-in", data={"address": address}, base_url=ORIGIN,
-                           headers={"Origin": ORIGIN})
-
-    listed, unlisted = ask_broken(login), ask_broken(NOBODY)
-    # The page says so calmly, and the same for a listed and an unlisted address.
-    assert listed.status_code == unlisted.status_code == 200
-    assert "The code could not be sent. Try again in a minute." in listed.get_data(as_text=True)
-    assert listed.get_data(as_text=True).replace(login, NOBODY) == unlisted.get_data(as_text=True)
-    assert "could not be sent" not in seen[0].get_data(as_text=True)
-    seen += [listed, unlisted]
+    broken = web.create_app(site.store, failing, site.config).test_client()
+    same = broken.post("/sign-in", data={"address": login}, base_url=ORIGIN,
+                       headers={"Origin": ORIGIN})
+    assert same.status_code == 200 and same.get_data(as_text=True) == seen[0].get_data(
+        as_text=True)  # a message that failed answers like one that went out
+    seen.append(same)
     [(newest,)] = site.sql("SELECT code_hmac FROM login_code ORDER BY id DESC LIMIT 1")
     logged = "\n".join(r.getMessage() for r in caplog.records)
-    assert "MAIL_FAILED error=RuntimeError" in logged and "MAIL_FAILED error=OSError" in logged
+    assert "MAIL_FAILED error=RuntimeError" in logged
     assert code not in logged and login.casefold() not in logged.casefold()
-    assert newest not in logged and "sign-in code is" not in logged and "no route" not in logged
+    assert newest not in logged and "sign-in code is" not in logged
     for response in seen:
         assert code not in response.get_data(as_text=True)
         assert code not in repr(sorted(response.headers.items()))
@@ -309,6 +296,94 @@ def test_no_response_and_no_log_line_carries_a_code_or_an_address(site, caplog):
     probes, sent = site.outbox.probes, len(site.outbox.sent)
     ask(site.browser(), NOBODY)
     assert site.outbox.probes == probes + 1 and len(site.outbox.sent) == sent
+
+
+def test_production_never_shows_its_own_code_whatever_happens_to_the_mail(
+        tmp_path, store, dsn, monkeypatch, caplog):  # noqa: F811
+    import smtplib
+
+    from reviewer_web import app as web
+    from reviewer_web import auth, mail
+
+    caplog.set_level(logging.DEBUG)
+    site = Site(tmp_path, store, dsn)  # noqa: F811
+    login, made = login_of(site), []
+    real = auth.secrets.randbelow
+
+    def recorded(n):
+        made.append(f"{real(n):06d}")
+        return int(made[-1])
+
+    monkeypatch.setattr(auth.secrets, "randbelow", recorded)
+
+    class Mailer:
+        """A mail server in one of its states: fine, unreachable, or failing this message."""
+
+        def __init__(self, at_connect=None, at_send=None):
+            self.at_connect, self.at_send, self.sent = at_connect, at_send, []
+
+        def __call__(self, to, _subject, text):
+            if self.at_connect:
+                raise mail.Unreachable(type(self.at_connect).__name__)
+            if self.at_send:
+                raise self.at_send
+            self.sent.append((to, text))
+
+        def probe(self):
+            if self.at_connect:
+                raise mail.Unreachable(type(self.at_connect).__name__)
+
+    def production(mailer):
+        return web.create_app(site.store, mailer, {**site.config, "SITE_ENV": "production"})
+
+    def ask_live(app, address):
+        site.sql("DELETE FROM rate_limit")
+        return app.test_client().post("/sign-in", data={"address": address}, base_url=ORIGIN,
+                                      headers={"Origin": ORIGIN})
+
+    def whole(response) -> str:
+        return response.get_data(as_text=True) + repr(sorted(response.headers.items()))
+
+    fine = production(Mailer())
+    neutral = ask_live(fine, NOBODY).get_data(as_text=True)
+    assert "a message with a six-digit code is on its way" in " ".join(neutral.split())
+    cases = [(Mailer(at_connect=TimeoutError("timed out")), True),
+             (Mailer(at_connect=ConnectionRefusedError()), True),
+             (Mailer(at_send=smtplib.SMTPDataError(451, b"try later 123456")), False),
+             (Mailer(at_send=TimeoutError("timed out")), False),
+             (Mailer(at_send=smtplib.SMTPRecipientsRefused({})), False),
+             (Mailer(), False)]
+    for mailer, says_so in cases:
+        app, before = production(mailer), len(made)
+        listed, unlisted = ask_live(app, login), ask_live(app, NOBODY)
+        assert len(made) == before + 1  # one code, for the listed address only
+        code = made[-1]
+        for response in (listed, unlisted):
+            assert response.status_code == 200
+            assert code not in whole(response)  # body and every header
+            assert "Set-Cookie" not in response.headers and "Location" not in response.headers
+            assert "Demonstration" not in response.get_data(as_text=True)
+            assert ("The code could not be sent. Try again in a minute." in response.get_data(
+                as_text=True)) is says_so
+        # The same page for a listed and an unlisted address, whatever happened to the mail;
+        assert listed.get_data(as_text=True).replace(login, NOBODY) == unlisted.get_data(
+            as_text=True)
+        # and without the sentence it is the page of a message that went out.
+        if not says_so:
+            assert unlisted.get_data(as_text=True) == neutral
+        # A code that was not delivered is ended: it cannot be tried afterwards.
+        delivered = bool(mailer.sent)
+        answer = app.test_client().post(
+            "/sign-in/verify", data={"address": login, "code": code}, base_url=ORIGIN,
+            headers={"Origin": ORIGIN})
+        assert answer.status_code == (303 if delivered else 401)
+        assert code not in whole(answer)
+        assert site.sql("SELECT count(*) FROM login_code WHERE used_at IS NULL") == [(0,)]
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert "MAIL_UNREACHABLE error=TimeoutError" in logged
+    assert "MAIL_FAILED error=SMTPDataError" in logged
+    assert not [code for code in made if code in logged] and login not in logged
+    assert "try later" not in logged
 
 
 def test_mail_goes_out_over_tls_by_the_port_and_carries_the_code_and_nothing_else(monkeypatch):
@@ -375,9 +450,18 @@ def test_mail_goes_out_over_tls_by_the_port_and_carries_the_code_and_nothing_els
 
     monkeypatch.setattr(smtplib, "SMTP", NoTls)
     calls.clear()
-    with pytest.raises(smtplib.SMTPNotSupportedError):
+    with pytest.raises(mail.Unreachable, match="^SMTPNotSupportedError$"):
         mail.send("reviewer@example.invalid", "s", "t", {**env, "SMTP_PORT": "587"})
     assert [c[0] for c in calls] == ["connect", "close"]  # no sign-in, no message in the clear
+
+    class Refused(Server):
+        def __init__(self, *a, **k):
+            raise ConnectionRefusedError("an-invented-key must not travel with the error")
+
+    monkeypatch.setattr(smtplib, "SMTP_SSL", Refused)
+    with pytest.raises(mail.Unreachable) as failure:
+        mail.Smtp(env).probe()
+    assert failure.value.args == ("ConnectionRefusedError",) and failure.value.__cause__ is None
     assert mail.configured(env) is True and mail.configured({}) is False
     assert mail.configured({**env, "SMTP_PASSWORD": ""}) is None
 

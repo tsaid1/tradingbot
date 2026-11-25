@@ -30,7 +30,7 @@
     <li class="{{ 'first' if loop.first else '' }} {{ 'next' if row.item_id == next else '' }}">
       <a href="/form/{{ row.item_id }}">{{ row.name }}</a>
       {% if row.form %}<span class="quiet-text">{{ row.form }}</span>{% endif %}
-      <span class="status status-{{ row.status | lower }}">{{ row.status_text }}</span>
+      <span class="status status-{{ row.status | lower | replace("_", "-") }}">{{ row.status_text }}</span>
       {% if row.item_id == next %}<span class="status status-next">next step</span>{% endif %}
     </li>
     {% endfor %}

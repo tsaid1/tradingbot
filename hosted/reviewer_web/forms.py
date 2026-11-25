@@ -43,9 +43,15 @@ PROPOSALS = {
         "The system proposed no execution instrument for this post, so no answer is asked."),
 }
 ANSWER_TEXT = {"YES": "Yes", "NO": "No", "UNSURE": "Unsure"}
+# Where one form stands for one reviewer (``step_state``), and how the workspace words it.
+INDEPENDENT_DUE = "INDEPENDENT_DUE"  # no reading yet: the independent form
+REVEAL_PENDING = "REVEAL_PENDING"  # independent reading saved; a form of the post still has none
+AFTER_REVEAL_DUE = "AFTER_REVEAL_DUE"  # the system's reading may be shown; the second save is due
 RETURNED = "RETURNED"  # the approver sent the reviewer's latest reading back
-STATUS_TEXT = {"OPEN": "open", "INDEPENDENT_SAVED": "independent reading saved", "DONE": "done",
-               RETURNED: "Returned to you"}
+DONE = "DONE"  # a reading after the reveal is saved
+STATUS_TEXT = {INDEPENDENT_DUE: "open", REVEAL_PENDING: "independent reading saved",
+               AFTER_REVEAL_DUE: "reading after the reveal due", RETURNED: "Returned to you",
+               DONE: "done"}
 # What a refusal of the core means for the reviewer, in a calm sentence (the code stays visible).
 REFUSALS = {
     "SYSTEM_READING_ALREADY_SEEN": (
@@ -89,6 +95,16 @@ class Gate:
         """The system's reading may be revealed (it is shown only once ``marked``)."""
         return not self.waiting or self.seen
 
+    @property
+    def state(self) -> str:
+        if self.returned is not None:
+            return RETURNED
+        if self.after is not None:
+            return DONE
+        if self.open:
+            return AFTER_REVEAL_DUE
+        return REVEAL_PENDING if self.ind is not None else INDEPENDENT_DUE
+
 
 def _latest(records, item_id, bundle, phase, login):
     found = [r for r in A._of(records, item_id, bundle.bundle_id, phase, login)
@@ -121,35 +137,44 @@ def returned(bundle: A.Bundle, item: dict, records: list[dict], after: dict | No
         "refers_to"] == after["seq"] else None
 
 
-def statuses(bundle: A.Bundle, session: A.Session, records: list[dict]) -> dict[str, str]:
-    """Per form of the scope: OPEN, INDEPENDENT_SAVED, DONE (``A.progress``, from the reviewer's
-    own records), or RETURNED when the approver sent the latest reading back."""
-    out = dict(A.progress(bundle, records, session).status)
-    for item_id, item in scoped(bundle, session).items():
-        if out[item_id] == "DONE" and gate(bundle, session, item, records).returned is not None:
-            out[item_id] = RETURNED
-    return out
+def step_state(bundle: A.Bundle, session: A.Session, records: list[dict], item_id: str) -> str:
+    """Where the form ``item_id`` of the reviewer's scope stands, from the stored records alone:
+    INDEPENDENT_DUE (the independent form), REVEAL_PENDING (saved; a form of the same post still
+    has no independent reading), AFTER_REVEAL_DUE (the form after the reveal), RETURNED (the
+    approver sent the latest reading back: the form after the reveal, to correct) or DONE.
+    Pure: the form's page shows exactly this state, and so does anything that checks a
+    reviewer's resume point without signing in as them."""
+    return gate(bundle, session, scoped(bundle, session)[item_id], records).state
+
+
+def states(bundle: A.Bundle, session: A.Session, records: list[dict]) -> dict[str, str]:
+    """``step_state`` of every form of the scope, in review order."""
+    return {item_id: gate(bundle, session, item, records).state
+            for item_id, item in scoped(bundle, session).items()}
+
+
+def _sibling(bundle, session, records, item) -> str:
+    """The form of ``item``'s post that still needs an independent reading (the first in review
+    order)."""
+    waiting = gate(bundle, session, item, records).waiting
+    return next((i for i in scoped(bundle, session) if i in waiting), waiting[0])
 
 
 def next_step(bundle: A.Bundle, session: A.Session, records: list[dict]) -> str | None:
-    """The resume rule. A reading the approver returned comes first (the approver is waiting):
-    the first returned form in review order. Otherwise the next unfinished step is the first
-    form in review order that is not DONE. When that form's independent reading is saved and the
-    system's reading cannot be revealed yet because a form of the same post still has none, the
-    step is that sibling."""
-    items = scoped(bundle, session)
-    status = statuses(bundle, session, records)
-    back = next((i for i in items if status[i] == RETURNED), None)
+    """The resume rule: the form "Continue" opens, or None when nothing is left. A reading the
+    approver returned comes first (the approver is waiting): the first RETURNED form in review
+    order. Otherwise the first form in review order that is not DONE; when that form is
+    REVEAL_PENDING (its independent reading is saved and a form of the same post still has
+    none), the step is that sibling. Pure: the stored records decide, nothing else."""
+    state = states(bundle, session, records)
+    back = next((i for i in state if state[i] == RETURNED), None)
     if back is not None:
         return back
-    for item_id, item in items.items():
-        if status[item_id] == "DONE":
-            continue
-        if status[item_id] == "INDEPENDENT_SAVED":
-            g = gate(bundle, session, item, records)
-            if not g.open:
-                return next((i for i in items if i in g.waiting), g.waiting[0])
-        return item_id
+    for item_id, item in scoped(bundle, session).items():
+        if state[item_id] == REVEAL_PENDING:
+            return _sibling(bundle, session, records, item)
+        if state[item_id] != DONE:
+            return item_id
     return None
 
 
@@ -157,12 +182,10 @@ def step_from(bundle: A.Bundle, session: A.Session, records: list[dict],
               item: dict) -> str | None:
     """The next step as one form's page names it: the form of the same post that still needs an
     independent reading, else this form while it is unfinished, else the resume rule."""
-    item_id = item["item_id"]
-    status = statuses(bundle, session, records)[item_id]
-    g = gate(bundle, session, item, records)
-    if status == "INDEPENDENT_SAVED" and not g.open:
-        return next((i for i in scoped(bundle, session) if i in g.waiting), g.waiting[0])
-    return item_id if status != "DONE" else next_step(bundle, session, records)
+    state = step_state(bundle, session, records, item["item_id"])
+    if state == REVEAL_PENDING:
+        return _sibling(bundle, session, records, item)
+    return item["item_id"] if state != DONE else next_step(bundle, session, records)
 
 
 def names(bundle: A.Bundle, session: A.Session) -> dict[str, str]:
@@ -177,7 +200,7 @@ def workspace(bundle: A.Bundle, session: A.Session, records: list[dict]) -> dict
     """The workspace page: progress, and every form of the scope in review order with its
     status. Names are those of the Streamlit selector ("<idea> <n>: <kind>")."""
     prog = A.progress(bundle, records, session)
-    status = statuses(bundle, session, records)
+    status = states(bundle, session, records)
     name = names(bundle, session)
     groups = []
     for sid, items in A.ordered(bundle, session.scope):
