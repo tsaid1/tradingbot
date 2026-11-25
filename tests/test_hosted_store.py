@@ -38,6 +38,17 @@ HOSTED_1 = 1_000_001
 dsn, store = hosted_pg.dsn, hosted_pg.store  # fixtures
 
 
+NOT_IMPORTED = "before_the_local_log_is_imported"  # the one test that keeps the anchor away
+
+
+@pytest.fixture(autouse=True)
+def imported(request):
+    """The store's tests work on a database whose local log is imported (here an empty one):
+    before that no reviewer's line may be stored (NO_ANCHOR; its own test says so)."""
+    if "store" in request.fixturenames and NOT_IMPORTED not in request.node.name:
+        request.getfixturevalue("store").set_anchor(0, GENESIS, sha(b""))
+
+
 @pytest.fixture
 def base(tmp_path) -> Path:
     return write_demo(tmp_path / "adjudication")
@@ -201,7 +212,8 @@ def test_reviewers_are_found_by_casefolded_login_and_a_revoked_one_says_so(store
         "id": row.id, "alias": "REMOTE-2", "login": "reviewer@example.invalid",
         "login_shown": "reviewer@example.invalid", "name": "Reviewer Example",
         "role": A.REVIEWER, "access": A.FULL, "scope_sequences": 40, "is_test": False,
-        "revoked": False, "bundle_id": bundle.bundle_id}
+        "revoked": False, "bundle_id": bundle.bundle_id,
+        "sign_in": "reviewer@example.invalid", "address": "reviewer@example.invalid"}
     assert row.session() == A.Session("reviewer@example.invalid", "Reviewer Example", A.REVIEWER,
                                       A.FULL, True, 40)
     assert store.reviewer_by_login("mallory@example.invalid") is None
@@ -211,7 +223,8 @@ def test_reviewers_are_found_by_casefolded_login_and_a_revoked_one_says_so(store
     assert store.reviewer_by_id(row.id).revoked is True
     store.set_revoked("REMOTE-2", False)
     assert store.reviewer_by_id(row.id) == row
-    assert type(row)(*dataclasses.astuple(row)[:10]) == dataclasses.replace(row, bundle_id=None)
+    assert type(row)(*dataclasses.astuple(row)[:10]) == dataclasses.replace(
+        row, bundle_id=None, sign_in=None, address=None)
     with refused("UNKNOWN_ALIAS"):
         store.set_revoked("REMOTE-9", True)
 
@@ -622,3 +635,24 @@ def test_the_same_idempotency_key_from_two_connections_stores_one_event(store, b
     assert inside.is_set() and sorted(r.duplicate for r in results) == [False, True]
     assert results[0].records == results[1].records and len(store.events()) == 1
     assert chain_is_whole(store.events())
+
+
+def test_no_reviewer_line_is_stored_before_the_local_log_is_imported(store, base):
+    """Re-check R1: a reviewer's save before the first ``import-log`` would continue no local
+    log, and no command could bring it home. The store refuses it (NO_ANCHOR) and stores
+    nothing; a test identity's stream needs no anchor and saves as before."""
+    bundle = publish_demo(store, base)
+    reviewer = demo_reviewers(store, base)["REMOTE-2"]
+    tester = store.upsert_reviewer("TEST-1", "tester@example.invalid", scope_sequences=40,
+                                   is_test=True, bundle_id=bundle.bundle_id)
+    assert store.anchor() is None
+    for save in (lambda: hosted_save(store, reviewer, "i07", A.INDEPENDENT),
+                 lambda: hosted_reveal(store, reviewer, "i07")):
+        with refused("NO_ANCHOR"):
+            save()
+    assert store.events() == [] and not store.is_open(reviewer) and store.is_open(tester)
+    [line] = hosted_save(store, tester, "i07", A.INDEPENDENT).records
+    assert line["seq"] == 3_000_001
+    store.set_anchor(0, GENESIS, sha(b""))
+    assert store.is_open(reviewer)
+    assert hosted_save(store, reviewer, "i07", A.INDEPENDENT).records[0]["seq"] == HOSTED_1

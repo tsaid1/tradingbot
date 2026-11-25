@@ -702,7 +702,7 @@ def test_resuming_in_a_new_session_lands_on_the_next_unfinished_step(site14):
     assert (state("s14a"), state("s14b")) == (F.REVEAL_PENDING, F.INDEPENDENT_DUE)
     assert resume() == "/form/s14b"
     home = site.browser().sign_in(FIRST).get("/").get_data(as_text=True)
-    assert "next step" in home and "In progress" in home
+    assert "In progress" in home and "/sequence/scs14" in home  # the dashboard (FLOW)
     b.review("s14b", after=False)
     assert "Your reading is saved. Review the system's answers." in b.shown.visible()
     assert (state("s14a"), state("s14b")) == (F.AFTER_REVEAL_DUE, F.AFTER_REVEAL_DUE)
@@ -761,7 +761,7 @@ def test_a_reading_the_approver_returned_is_shown_to_its_reviewer_only(site):  #
     assert "Returned for changes" in home and "The approver returned 1 reading to you." in " ".join(
         home.split())
     assert a.get("/continue").headers["Location"] == "/form/i08"
-    assert "2 of 45" in home  # the counts are the reviewer's own records, as before
+    assert "1 of 45" in home  # the reviewer's own saves; a returned form is not complete
     # The other reviewer, who read the same form, sees nothing of it.
     for text in (b.open("i08").text, b.get("/").get_data(as_text=True)):
         assert "RETURNED" not in text and "Returned for changes" not in text and note not in text

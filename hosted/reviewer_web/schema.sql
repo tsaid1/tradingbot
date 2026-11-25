@@ -54,6 +54,29 @@ $$;
 CREATE OR REPLACE TRIGGER reviewer_bundle_stays_assigned BEFORE UPDATE ON reviewer
     FOR EACH ROW EXECUTE FUNCTION reviewer_keeps_a_bundle();
 
+-- The address a sign-in code is mailed to is not the identity whose lines are written. ``login``
+-- (casefolded ``login_shown``) is the identity: what its records carry. ``sign_in`` (casefolded)
+-- and ``address`` (as given) are where its codes go. One address may have TWO identities, one of
+-- each kind: the owner's real reviewer identity and a test identity. A database made by an
+-- earlier version of this file gets its rows' own login as their address.
+ALTER TABLE reviewer ADD COLUMN IF NOT EXISTS sign_in TEXT;
+ALTER TABLE reviewer ADD COLUMN IF NOT EXISTS address TEXT;
+UPDATE reviewer SET sign_in = login, address = login_shown WHERE sign_in IS NULL OR address IS NULL;
+ALTER TABLE reviewer ALTER COLUMN sign_in SET NOT NULL;
+ALTER TABLE reviewer ALTER COLUMN address SET NOT NULL;
+-- A row written without an address (an older operator tool) has its login as its address.
+CREATE OR REPLACE FUNCTION reviewer_address_defaults() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    NEW.address := COALESCE(NEW.address, NEW.login_shown);
+    NEW.sign_in := COALESCE(NEW.sign_in, NEW.login);
+    RETURN NEW;
+END
+$$;
+CREATE OR REPLACE TRIGGER reviewer_address_by_default BEFORE INSERT ON reviewer
+    FOR EACH ROW EXECUTE FUNCTION reviewer_address_defaults();
+CREATE UNIQUE INDEX IF NOT EXISTS reviewer_one_of_each_kind_per_sign_in
+    ON reviewer (sign_in, is_test);
+
 CREATE TABLE IF NOT EXISTS media (
     bundle_id    TEXT NOT NULL REFERENCES bundle (bundle_id) ON DELETE CASCADE,
     name         TEXT NOT NULL,
@@ -108,6 +131,12 @@ BEGIN
     IF (NEW.origin = 'TEST') IS DISTINCT FROM
             (SELECT is_test FROM reviewer WHERE id = NEW.reviewer_id) THEN
         RAISE EXCEPTION 'EVENT_NOT_IN_ITS_REVIEWER_S_STREAM' USING ERRCODE = 'restrict_violation';
+    END IF;
+    -- The site writes HOSTED and TEST lines only. LEGACY and RETURN lines are the operator's,
+    -- who owns the table: a role that does not (the site's own) may not add one.
+    IF NEW.origin NOT IN ('HOSTED', 'TEST') AND NOT pg_has_role(
+            current_user, (SELECT relowner FROM pg_class WHERE oid = TG_RELID), 'USAGE') THEN
+        RAISE EXCEPTION 'EVENT_ORIGIN_IS_THE_OPERATOR_S' USING ERRCODE = 'insufficient_privilege';
     END IF;
     RETURN NEW;
 END
@@ -169,6 +198,32 @@ CREATE TABLE IF NOT EXISTS rate_limit (
     at     TIMESTAMPTZ NOT NULL
 );
 CREATE INDEX IF NOT EXISTS rate_limit_by_bucket ON rate_limit (bucket, at);
+
+-- A form's DRAFT: what the page last sent for one reviewer's form in one phase, kept by the
+-- applicability round trip and by a refused save, deleted in the transaction of the form's
+-- successful save. Never an event: never exported, pulled, counted or shown to anybody else; a
+-- draft of another phase than the form's current one is dropped when the form is opened.
+CREATE TABLE IF NOT EXISTS draft (
+    reviewer_id BIGINT NOT NULL REFERENCES reviewer (id) ON DELETE CASCADE,
+    bundle_id   TEXT NOT NULL,
+    item_id     TEXT NOT NULL,
+    phase       TEXT NOT NULL CHECK (phase IN ('INDEPENDENT', 'AFTER_REVEAL')),
+    fields      JSONB NOT NULL,                -- [[name, value], ...] as posted
+    saved_at    TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (reviewer_id, bundle_id, item_id)
+);
+
+-- After a right code for an address with two identities: the choice of the identity to open,
+-- bound to that verified code. Single use, five minutes, held by its browser in a cookie of its
+-- own; only the token's SHA-256 is stored. ``sign_in_key``: the address's key row (the lowest id
+-- of the rows of that address), under which its codes and counters are kept.
+CREATE TABLE IF NOT EXISTS sign_in_choice (
+    token_sha256 TEXT PRIMARY KEY CHECK (token_sha256 ~ '^[0-9a-f]{64}$'),
+    sign_in_key  BIGINT NOT NULL REFERENCES reviewer (id) ON DELETE CASCADE,
+    created_at   TIMESTAMPTZ NOT NULL,
+    expires_at   TIMESTAMPTZ NOT NULL,
+    used_at      TIMESTAMPTZ
+);
 
 -- Mail the operator asks the site to send (the mail password exists only where the site runs):
 -- one invitation per row. No address and no text is stored: the reviewer's row gives the address

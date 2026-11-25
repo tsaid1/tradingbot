@@ -1,0 +1,31 @@
+/* The dashboard and the sidebar: STRUCTURE only (grid, disclosure, spacing). Colours, type and
+   the status badges are INTERFACE's (app.css, DESIGN_UX section 4); every value below falls back
+   to a plain one when those tokens are absent, and nothing here sets a colour of its own. */
+
+.dashboard { display: grid; gap: var(--space-4, 1.5rem); }
+.dashboard__totals { display: flex; flex-wrap: wrap; gap: var(--space-3, 1rem); align-items: center; }
+.sequences { list-style: none; margin: 0; padding: 0; display: grid; gap: var(--space-3, 1rem); }
+.sequence { border: 1px solid var(--line, currentColor); border-radius: var(--radius, 6px); padding: var(--space-3, 1rem); }
+.sequence__head { display: grid; grid-template-columns: 1fr auto; gap: var(--space-2, 0.5rem) var(--space-3, 1rem); align-items: center; }
+.sequence__facts { display: flex; flex-wrap: wrap; gap: var(--space-2, 0.5rem) var(--space-3, 1rem); margin: 0; }
+.sequence__facts > div { display: flex; gap: var(--space-1, 0.25rem); }
+.sequence__facts dt, .sequence__facts dd { margin: 0; }
+.sequence details > summary { cursor: pointer; margin-top: var(--space-2, 0.5rem); }
+.posts, .forms-of-post { list-style: none; margin: 0; padding: 0; }
+.posts { display: grid; gap: var(--space-2, 0.5rem); margin-top: var(--space-2, 0.5rem); }
+.post-row { display: grid; gap: var(--space-1, 0.25rem); }
+.form-row { display: flex; flex-wrap: wrap; gap: var(--space-2, 0.5rem); align-items: baseline; padding: var(--space-1, 0.25rem) 0; }
+.form-row a { min-height: 44px; display: inline-flex; align-items: center; }
+
+.nav-panel > summary { cursor: pointer; padding: var(--space-2, 0.5rem) 0; min-height: 44px; }
+.nav-tree ol { list-style: none; margin: 0; padding: 0; }
+.nav-tree__sequence > details > summary { display: flex; flex-wrap: wrap; gap: var(--space-2, 0.5rem); align-items: center; cursor: pointer; padding: var(--space-2, 0.5rem) 0; min-height: 44px; }
+.nav-tree__posts { padding-left: var(--space-3, 1rem); }
+.nav-tree__form a { display: flex; flex-wrap: wrap; justify-content: space-between; gap: var(--space-1, 0.25rem) var(--space-2, 0.5rem); padding: var(--space-1, 0.25rem) var(--space-2, 0.5rem); min-height: 44px; align-items: center; border-radius: var(--radius, 6px); }
+.nav-tree__form a[aria-current="page"] { outline: 2px solid var(--accent, currentColor); outline-offset: -2px; font-weight: 600; }
+.nav-tree__form a:focus-visible, .nav-panel > summary:focus-visible, .nav-tree summary:focus-visible { outline: 3px solid var(--focus, currentColor); outline-offset: 2px; }
+
+@media (min-width: 64rem) {
+  .with-nav { display: grid; grid-template-columns: minmax(14rem, 20rem) 1fr; gap: var(--space-5, 2rem); align-items: start; }
+  .with-nav > .nav-panel { position: sticky; top: var(--space-3, 1rem); max-height: calc(100vh - 2rem); overflow: auto; }
+}

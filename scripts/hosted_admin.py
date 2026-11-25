@@ -17,6 +17,7 @@
     python scripts/hosted_admin.py test-report ALIAS
     python scripts/hosted_admin.py verify [--snapshots DIR]
     python scripts/hosted_admin.py make-site-role --out FILE [--role NAME]
+    python scripts/hosted_admin.py make-site-role --grants-only [--role NAME]
 
 The database is ``HOSTED_DATABASE_URL`` (``init-db`` prefers ``HOSTED_DATABASE_URL_UNPOOLED``);
 the adjudication folder is ``--dir`` or ``TRADINGBOT_ADJUDICATION_DIR``. Never deployed. It
@@ -56,6 +57,10 @@ HOSTED, LEGACY, RETURN, TEST, sha256 = S.HOSTED, S.LEGACY, S.RETURN, S.TEST, S.s
 HOSTED_BASE, RETURN_BASE, TEST_BASE = S.HOSTED_BASE, S.RETURN_BASE, S.TEST_BASE
 
 URL_ENV, UNPOOLED_ENV = "HOSTED_DATABASE_URL", "HOSTED_DATABASE_URL_UNPOOLED"
+OWNER_ADDRESS_ENV = "HOSTED_OWNER_ADDRESS_FILE"  # names the private file of the owner's address
+OWNER_REVIEWER = S.OWNER_REVIEWER
+REPO = Path(__file__).resolve().parents[1]
+SYNCED = ("dropbox", "cloudstorage", "icloud", "onedrive", "google drive", "mobile documents")
 EXPORT_SCHEMA = "tradingbot.hosted.export/1"
 SNAPSHOTS, LOG, WHAT = "hosted_snapshots", "annotations.jsonl", "annotation log"
 BUNDLE_FILES = ("manifest.json", "sequences.jsonl", "items.jsonl", "posts.jsonl")
@@ -93,7 +98,7 @@ EVENT_KEYS = ("alias", "is_test", "origin", "seq", "prev_sha256", "sha256", "lin
 SITE_ROLE = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
 SITE_READS = ("reviewer", "bundle", "media", "event", "chain_anchor", "mail_queue")
 SITE_INSERTS = ("event",)
-SITE_OWN = ("login_code", "web_session", "rate_limit")  # the sign-in tables: every row operation
+SITE_OWN = ("login_code", "web_session", "rate_limit", "sign_in_choice", "draft")  # the sign-in tables: every row operation
 SITE_SETS = {"reviewer": ("first_sign_in_at", "invited_at"),
              # a try is counted and its start noted BEFORE the mail server hears of it
              "mail_queue": ("attempts", "sending_at", "result", "sent_at")}
@@ -355,10 +360,59 @@ def cmd_init_db(_args) -> int:
     return 0
 
 
+def owner_entry(reviewers: A.Reviewers, place: int | None):
+    """The owner's own REVIEWER entry of the reviewers file: the one REVIEWER entry whose login
+    is a local identity (no ``@``), or with ``place`` the place-th REVIEWER entry in file order.
+    None when the file has no such entry. An APPROVER entry is never one: approval, return and
+    freeze have no hosted access."""
+    listed = [e for e in reviewers.entries.values() if e.role == A.REVIEWER]
+    if place is not None:
+        if not 1 <= place <= len(listed):
+            raise refused("NO_SUCH_REVIEWER_ENTRY")
+        return listed[place - 1]
+    local = [e for e in listed if "@" not in e.login]
+    if len(local) > 1:
+        raise refused("OWNER_REVIEWER_ENTRY_NOT_ONE")  # name it: --owner-entry N
+    return local[0] if local else None
+
+
+def owner_address(args, *, required: bool) -> str | None:
+    """The owner's sign-in address, from a private file (mode 0600) outside the repository and
+    outside any synchronised folder: ``--owner-address-file`` or the variable
+    HOSTED_OWNER_ADDRESS_FILE. Never printed; stored in the database only."""
+    name = getattr(args, "owner_address_file", None) or os.environ.get(OWNER_ADDRESS_ENV)
+    if not name:
+        if required:
+            raise refused("NO_OWNER_ADDRESS_FILE")
+        return None
+    path = Path(name).expanduser().absolute()
+    if path.resolve().is_relative_to(REPO.resolve()):
+        raise refused("OWNER_ADDRESS_FILE_INSIDE_THE_REPOSITORY")
+    if any(word in part.casefold() for part in path.resolve().parts for word in SYNCED):
+        raise refused("OWNER_ADDRESS_FILE_IN_A_SYNCHRONISED_FOLDER")
+    try:
+        data = V._read_private(path, "owner's address file")
+    except FileNotFoundError:
+        data = None  # not even its folder
+    if data is None:
+        raise refused("NO_OWNER_ADDRESS_FILE")
+    try:
+        address = data.decode("utf-8").strip()
+    except UnicodeDecodeError:
+        raise refused("OWNER_ADDRESS_FILE_NOT_AN_ADDRESS") from None
+    if AUTH.plausible(address) is None:
+        raise refused("OWNER_ADDRESS_FILE_NOT_AN_ADDRESS")
+    return address
+
+
 def cmd_sync_reviewers(args) -> int:
     store = _store()
     if args.test_identity:  # a test identity works on the invented bundle, never the real one
-        alias, login = args.test_identity
+        if len(args.test_identity) > 2:
+            raise refused("TEST_IDENTITY_IS_ALIAS_AND_ONE_ADDRESS")
+        alias, login = (*args.test_identity, None)[:2]
+        if login is None:  # the owner's own address, from the private file
+            login = owner_address(args, required=True)
         if not TEST_ALIAS.match(alias):
             raise refused("TEST_ALIAS_IS_TEST_N")
         with store.exclusive():
@@ -390,11 +444,31 @@ def cmd_sync_reviewers(args) -> int:
                       "lines under its spelling; put the earlier spelling back in the file")
             if respelled:
                 raise refused("LOGIN_SPELLING_HAS_RECORDS")
-            rows = store.sync_reviewers(reviewers, bundle_id=bundle["bundle_id"])
+            owner = owner_entry(reviewers, args.owner_entry)
+            address = owner_address(args, required=False)
+            rows = store.sync_reviewers(reviewers, bundle_id=bundle["bundle_id"],
+                                        skip=owner.login if owner else None)
+            held = next((r for r in store.reviewers() if r.alias == OWNER_REVIEWER), None)
+            if owner is not None and (address or held):
+                # The owner's REAL reviewer identity: its lines carry the local identity string
+                # exactly as the reviewers file spells it; its codes go to the private address.
+                rows.append(store.upsert_reviewer(
+                    OWNER_REVIEWER, owner.login, name=owner.name, role=A.REVIEWER,
+                    access=owner.access if reviewers.remote_full_context_authorized
+                    else A.RESTRICTED, scope_sequences=reviewers.scope_sequences,
+                    bundle_id=bundle["bundle_id"], address=address or held.address))
+            elif owner is not None:
+                print(f"{OWNER_REVIEWER}: not written: no sign-in address file (--owner-address-"
+                      f"file FILE or {OWNER_ADDRESS_ENV})")
+    shared = {}
+    for r in store.reviewers():
+        shared[r.sign_in] = shared.get(r.sign_in, 0) + 1
     for r in rows:
         print(f"{r.alias}: id {r.id}, {r.role}, {r.access}, scope {r.scope_sequences}, bundle "
               f"{r.bundle_id[:12]}" + (" (demonstration data)" if args.demo or r.is_test else "")
-              + (", test identity" if r.is_test else "") + (", REVOKED" if r.revoked else ""))
+              + (", test identity" if r.is_test else "") + (", REVOKED" if r.revoked else "")
+              + (f"; its sign-in address opens {shared[r.sign_in]} identities"
+                 if shared.get(r.sign_in, 0) > 1 else ""))
     print(f"{len(rows)} reviewer row(s) written; none deleted")
     return 0
 
@@ -424,8 +498,12 @@ def cmd_unlock(args) -> int:
         row = next((r for r in store.reviewers() if r.alias == args.alias), None)
         if row is None:
             raise refused("UNKNOWN_ALIAS")
-        cleared = AUTH.unlock(store, row.id)
-    print(f"{args.alias}: sign-in unlocked; {cleared} counted event(s) cleared")
+        key = AUTH.key_of(store, row)
+        shared = len(store.identities_at(row.sign_in))
+        cleared = AUTH.unlock(store, key)
+    print(f"{args.alias}: sign-in unlocked; {cleared} counted event(s) cleared"
+          + (f" (the counters belong to its sign-in address, which opens {shared} identities)"
+             if shared > 1 else ""))
     return 0
 
 
@@ -456,9 +534,10 @@ def continues(lines: list[bytes], anchor: dict | None) -> bool:
 
 def anchored(lines: list[bytes], anchor: dict | None) -> None:
     """Refuse a folder whose log is not the log the hosted chain continues: it must hold the
-    anchored head at the anchored line count. Without an anchor (nothing imported yet) only an
-    empty log is that log."""
-    if anchor is None and lines:
+    anchored head at the anchored line count. Without an anchor (nothing imported yet) only a
+    log that holds nothing but its own pulled copies of hosted lines is that log (an empty log,
+    or one a previous pull wrote)."""
+    if anchor is None and any(_pulled(_record(line)) is None for line in lines):
         raise refused("NO_ANCHOR_IMPORT_LOG_FIRST")
     if not continues(lines, anchor):
         raise refused("LOCAL_LOG_IS_NOT_THE_ANCHORED_LOG")
@@ -574,6 +653,7 @@ def cmd_import_log(args) -> int:
           + (f"FIXED, the reviewers' hosted lines continue it (the local log has {log.count} "
              "line(s) now)" if hosted else "moved to the log's present head"))
     print(f"imported {len(new)} new line(s); {len(legacy)} already imported")
+    print(_unlisted_line(unlisted(log.records, rows.values()), args.accept_unlisted_lines)[0])
     for row in rows.values():
         mine = [json.loads(e["line"]) for e in events
                 if e["alias"] == row.alias and e["origin"] != RETURN]
@@ -593,6 +673,30 @@ def _bodies(records: list[dict]) -> list[dict]:
     place = {r["seq"]: n for n, r in enumerate(records)}
     return [{**{k: v for k, v in r.items() if k not in (*ENVELOPE, "hosted")},
              "refers_to": place.get(r.get("refers_to"), r.get("refers_to"))} for r in records]
+
+
+def unlisted(records: list[dict], rows) -> list[str]:
+    """The spelling of every local line of a reviewer (role REVIEWER) that no reviewer row holds
+    under that exact spelling: a former reviewer no longer in the file, a sign-in spelled
+    otherwise, or the owner's reviewer identity before its row is written. Counted, never
+    printed."""
+    held = {row.login_shown for row in rows if not row.is_test}
+    return [_spelled(r) for r in records
+            if (r.get("annotator") or {}).get("role") == A.REVIEWER and _spelled(r) not in held]
+
+
+def _unlisted_line(found: list[str], accepted: int | None) -> tuple[str, bool]:
+    """(the line that says how many local reviewer lines no row holds, whether that fails)."""
+    n, who = len(found), len(set(found))
+    if accepted is not None and accepted == n:
+        return (f"local lines of reviewers that no row holds: {n}, of {who} sign-in "
+                f"spelling(s): accepted as named (--accept-unlisted-lines {accepted})"), False
+    if accepted is not None:
+        return (f"local lines of reviewers that no row holds: {n}, of {who} sign-in "
+                f"spelling(s): NOT the {accepted} named"), True
+    return (f"local lines of reviewers that no row holds: {n}, of {who} sign-in spelling(s)"
+            + (": give them a row, or accept exactly that many with --accept-unlisted-lines "
+               f"{n}" if n else "")), bool(n)
 
 
 def _web_steps():
@@ -618,13 +722,14 @@ def cmd_parity(args) -> int:
     if steps is None:  # the web app's resume rule is part of what must agree
         print("NEXT_STEP_FUNCTION_MISSING: reviewer_web.forms gives no next_step and step_state")
     print(f"local bundle {local.bundle_id[:12]}")
-    held_as = {row.login_shown for row, _served, _stored in theirs.values()}
-    strays = [_spelled(r) for r in log.records if "@" in _spelled(r) and (
-        r.get("annotator") or {}).get("role") == A.REVIEWER and _spelled(r) not in held_as]
-    if strays:  # a remote reviewer without a row, or lines under another spelling of a sign-in
-        print(f"local lines of remote reviewers that NO row holds under that spelling: "
-              f"{len(strays)}, of {len(set(strays))} sign-in spelling(s)")
-        failed = True
+    # A reviewer without a row, lines under another spelling of a sign-in: only a count the
+    # operator names explicitly is accepted (re-check R5).
+    strays = unlisted(log.records, [row for row, _served, _stored in theirs.values()])
+    if strays or args.accept_unlisted_lines is not None:
+        line, fails = _unlisted_line(strays, args.accept_unlisted_lines)
+        print(line)
+        failed = failed or fails
+    summary = []
     for alias, (row, served, stored) in theirs.items():
         session = row.session()
         mine = [r for r in log.records if _login(r) == row.login
@@ -656,6 +761,14 @@ def cmd_parity(args) -> int:
         print(f"  next step: local {' '.join(resume[0])}, hosted {' '.join(resume[1])}: "
               f"{'the same' if resume[0] == resume[1] else 'DIFFERENT'}")
         failed = failed or resume[0] != resume[1]
+        shown = [sum(r.get("phase") == A.SYSTEM_SHOWN for r in side) for side in (mine, hosted)]
+        print(f"  reveal history: local {shown[0]}, hosted {shown[1]} marker(s): "
+              f"{'the same' if shown[0] == shown[1] and same else 'DIFFERENT'}")
+        prog = A.progress(served, hosted, session)
+        summary.append(f"{alias}: completed {prog.done} of {prog.total}; next "
+                       f"{' '.join(resume[1])}"
+                       + ("" if same and resume[0] == resume[1] and not differing
+                          else " (DOES NOT AGREE with the local log)"))
         if served.bundle_id != local.bundle_id:
             continue
         # Where EVERY form stands as the site says it, on both sides: a return that is missing
@@ -669,6 +782,8 @@ def cmd_parity(args) -> int:
             print(f"  {item_id}: site state local {sides[0][item_id]}, hosted "
                   f"{sides[1][item_id]}")
         failed = failed or bool(apart)
+    for line in summary:  # one line per identity, for the report to the owner
+        print(line)
     print(f"parity of the local log and the hosted store: {'FAIL' if failed else 'PASS'}, "
           f"{len(theirs)} reviewer(s)")
     return int(failed)
@@ -690,8 +805,9 @@ def cmd_status(_args) -> int:
         real, demo = store.published(demo=False), store.published(demo=True)
         anchor, events, rows = store.anchor(), store.events(), store.status()
         mail = store.queued_mail()
-        locks = {r.alias: AUTH.locked_until(store, r.id, datetime.now(UTC))
+        locks = {r.alias: AUTH.locked_until(store, AUTH.key_of(store, r), datetime.now(UTC))
                  for r in store.reviewers()}
+        shared = {r.alias: len(store.identities_at(r.sign_in)) for r in store.reviewers()}
     _print_bundle(real, "real")
     _print_bundle(demo, "demonstration")
     print(f"anchor: {anchor['count']} line(s), head {anchor['head'][:12]}, imported "
@@ -703,7 +819,9 @@ def cmd_status(_args) -> int:
         print(f"{r['alias']}: bundle {(r['bundle_id'] or '-')[:12]}, scope "
               f"{r['scope_sequences']}, invited {_time(r['invited_at'])}, first sign-in "
               f"{_time(r['first_sign_in_at'])}, first hosted save {_time(r['first_hosted_at'])}, "
-              f"revoked {_time(r['revoked_at'])}")
+              f"revoked {_time(r['revoked_at'])}"
+              + (f", sign-in address shared by {shared[r['alias']]} identities"
+                 if shared[r["alias"]] > 1 else ""))
         for origin in dict.fromkeys(e["origin"] for e in mine):
             print(f"  {origin}: " + _counts(e["phase"] for e in mine if e["origin"] == origin))
         for m in (m for m in mail if m["alias"] == r["alias"]):
@@ -785,6 +903,35 @@ def chain_problems(events: list[dict], anchor: dict | None) -> list[str]:
     return out
 
 
+def published_problems(store, base: Path) -> list[str]:
+    """Re-check R6: what is stored of the published part, compared again with a fresh cut of the
+    local bundle at the stored scope: the sha256 of the four files and of every image, both
+    ways. The active bundle of this folder (real, else the demonstration one) is compared; a
+    real bundle of another folder is a problem. Counts only."""
+    local_id = A.load_bundle(base / "bundle", A.RESTRICTED).bundle_id
+    real, demo = store.published(demo=False), store.published(demo=True)
+    mine = next((p for p in (real, demo) if p and p["bundle_id"] == local_id), None)
+    if mine is None:
+        if real is not None:
+            print("published files: the active real bundle is not this folder's: NOT compared")
+            return ["PUBLISHED_BUNDLE_IS_NOT_THIS_FOLDER_S"]
+        print("published files: no active bundle is this folder's: not compared")
+        return []
+    _full, files, media = subset(base, mine["scope_sequences"])
+    stored_files, stored_media = store.published_files(local_id)
+    files_differ = sum(a != b for a, b in zip([sha256(f) for f in files], stored_files,
+                                              strict=False)) + abs(len(files) - len(stored_files))
+    names = set(media) | set(stored_media)
+    images_differ = sum(sha256(media[n]) != stored_media.get(n) if n in media else True
+                        for n in names)
+    print(f"published files of bundle {local_id[:12]} against a fresh cut of the local bundle: "
+          f"files {len(files) - files_differ} of {len(files)} equal, images "
+          f"{len(names) - images_differ} of {len(names)} equal: "
+          f"{'PASS' if not files_differ and not images_differ else 'FAIL'}")
+    return ["PUBLISHED_FILE_DIFFERS"] * bool(files_differ) + \
+        ["PUBLISHED_IMAGE_DIFFERS"] * bool(images_differ)
+
+
 def cmd_verify(args) -> int:
     store = _store()
     with store.connection():
@@ -820,6 +967,7 @@ def cmd_verify(args) -> int:
                          and _pulled(rec) not in hosted]
         print(f"snapshot {folders[-1].name}: {len(lines)} line(s); {len(legacy)} LEGACY line(s) "
               "compared with it")
+    problems += published_problems(store, _base(args))
     for problem in problems[:40]:
         print(f"  {problem}")
     print(f"verify: {'FAIL' if problems else 'PASS'}, {len(problems)} problem(s)")
@@ -902,14 +1050,23 @@ class _Held(Exception):
 
 def cmd_pull_to_local(args) -> int:
     base, store = _base(args), _store()
-    data, _head, _log = read_log(base)
+    data, _head, log = read_log(base)
     with store.connection():
         events, anchor = store.events(), store.anchor()
+        logins = {r.alias: r.login for r in store.reviewers() if not r.is_test}
     anchored(_lines(data), anchor)
     if chain_problems(events, anchor):
         raise refused("HOSTED_STORE_FAILS_VERIFICATION")
     hosted = [e for e in events if e["origin"] == HOSTED]  # never a TEST or RETURN line
     known = {e["sha256"] for e in hosted}
+    held_here = {_pulled(r) for r in log.records}
+    # A reviewer (the owner's reviewer identity too) who saved LOCALLY after the anchor while
+    # hosted saves of theirs are not home yet has two histories: nothing is appended.
+    since = anchor["count"] if anchor else 0
+    for alias, login in logins.items():
+        if any(e["alias"] == alias and e["sha256"] not in held_here for e in hosted) and any(
+                _login(r) == login and _pulled(r) is None for r in log.records[since:]):
+            raise refused("LOCAL_SAVE_AFTER_HOSTED_SAVES")
     pulled, held = [], 0
     for e in hosted:
         def make(v: V.Verification, e=e) -> dict:
@@ -1076,30 +1233,69 @@ def _site_url(url: str, role: str, password: str) -> str:
         netloc=f"{quote(role, safe='')}:{quote(password, safe='')}@{host}"))
 
 
+def scram_verifier(password: str, salt: bytes | None = None, iterations: int = 4096) -> str:
+    """The SCRAM-SHA-256 verifier PostgreSQL stores for ``password`` (RFC 5802, 7677), computed
+    HERE: the statement that sets the password carries this verifier, never the password, so a
+    server that logs statements keeps nothing that signs in. (The password is URL-safe ASCII,
+    which SASLprep leaves as it is.)"""
+    import base64
+    import hashlib
+    import hmac
+
+    salt = salt if salt is not None else secrets.token_bytes(16)
+    salted = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+    client = hmac.new(salted, b"Client Key", hashlib.sha256).digest()
+    server = hmac.new(salted, b"Server Key", hashlib.sha256).digest()
+
+    def b64(data: bytes) -> str:
+        return base64.b64encode(data).decode("ascii")
+
+    return (f"SCRAM-SHA-256${iterations}:{b64(salt)}${b64(hashlib.sha256(client).digest())}"
+            f":{b64(server)}")
+
+
+# What a site role must not have; checked, never re-stated: an operator who is not a superuser
+# may not name SUPERUSER, REPLICATION or BYPASSRLS in an ALTER ROLE at all, even to deny them.
+_ROLE_FACTS = ("SELECT r.rolsuper OR r.rolcreaterole OR r.rolcreatedb OR r.rolbypassrls"
+               " OR r.rolreplication OR r.rolinherit OR NOT r.rolcanlogin"
+               " OR r.rolname = current_user"
+               " OR EXISTS (SELECT 1 FROM pg_class c WHERE c.relowner = r.oid)"
+               " OR EXISTS (SELECT 1 FROM pg_namespace n WHERE n.nspowner = r.oid)"
+               " OR EXISTS (SELECT 1 FROM pg_auth_members m WHERE m.member = r.oid)"
+               " FROM pg_roles r WHERE r.rolname = %s")
+
+
 def cmd_make_site_role(args) -> int:
-    """Create the login role the SITE connects as, or give it a new password: the rights the
-    site's code uses and no other, no ownership. The new address goes to a file (mode 0600);
-    nothing secret is printed."""
+    """Create the login role the SITE connects as, give it a new password, or (``--grants-only``)
+    give an existing one exactly the present rights again without touching its password: the
+    rights the site's code uses and no other, no ownership. A new address goes to a file (mode
+    0600); nothing secret is printed, and the password never travels to the server (only its
+    SCRAM-SHA-256 verifier). It works for an operator that has CREATEROLE and is not a superuser
+    (the hosting provider's), and after the schema was dropped and made again."""
     url = os.environ.get(URL_ENV)
     if not SITE_ROLE.match(args.role):
         raise refused("BAD_ROLE_NAME")
     if not url:
         raise refused(f"SET_{URL_ENV}")
-    store, role, password = _store(unpooled=True), sql.Identifier(args.role), \
-        secrets.token_urlsafe(32)
+    if not args.grants_only and not args.out:
+        raise refused("OUT_FILE_NEEDED")  # or --grants-only
+    store, role = _store(unpooled=True), sql.Identifier(args.role)
     with store.exclusive() as conn:
-        found = conn.execute(
-            "SELECT r.rolsuper OR r.rolcreaterole OR r.rolcreatedb OR r.rolbypassrls"
-            " OR r.rolname = current_user"
-            " OR EXISTS (SELECT 1 FROM pg_class c WHERE c.relowner = r.oid)"
-            " OR EXISTS (SELECT 1 FROM pg_auth_members m WHERE m.member = r.oid)"
-            " FROM pg_roles r WHERE r.rolname = %s", (args.role,)).fetchone()
-        if found and found[0]:  # an administrator, an owner, or a member of another role
+        found = conn.execute(_ROLE_FACTS, (args.role,)).fetchone()
+        if found and found[0]:  # an administrator, an owner, a member of another role
             raise refused("NOT_A_SITE_ROLE")
-        conn.execute(sql.SQL(
-            "{} ROLE {} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION"
-            " NOBYPASSRLS PASSWORD {}").format(
-                sql.SQL("ALTER" if found else "CREATE"), role, sql.Literal(password)))
+        if args.grants_only and not found:
+            raise refused("NO_SITE_ROLE")  # make it first: make-site-role --out FILE
+        password = None
+        if not args.grants_only:
+            password = secrets.token_urlsafe(32)
+            verifier = sql.Literal(scram_verifier(password))
+            if found:  # only the password: what an operator without superuser may alter
+                conn.execute(sql.SQL("ALTER ROLE {} PASSWORD {}").format(role, verifier))
+            else:
+                conn.execute(sql.SQL(
+                    "CREATE ROLE {} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT"
+                    " NOREPLICATION NOBYPASSRLS PASSWORD {}").format(role, verifier))
         schema, database = (sql.Identifier(x) for x in conn.execute(
             "SELECT current_schema(), current_database()").fetchone())
         for statement in ("REVOKE ALL ON ALL TABLES IN SCHEMA {s} FROM {r}",
@@ -1130,14 +1326,18 @@ def cmd_make_site_role(args) -> int:
             grant("UPDATE, DELETE", table)
         for table, columns in SITE_SETS.items():
             grant("UPDATE", table, columns)
-        with PrivateDir(args.out, "site database address", create=True) as d:
-            d.create(d.name, (_site_url(url, args.role, password) + "\n").encode("utf-8"))
-    print(f"site role {args.role}: {'password changed' if found else 'created'}; it owns "
+        if password is not None:
+            with PrivateDir(args.out, "site database address", create=True) as d:
+                d.create(d.name, (_site_url(url, args.role, password) + "\n").encode("utf-8"))
+    done = "rights given again, password unchanged" if args.grants_only else (
+        "password changed" if found else "created")
+    print(f"site role {args.role}: {done}; it owns "
           f"nothing and may: read {', '.join(SITE_READS)}; add to {', '.join(SITE_INSERTS)}; "
           f"use {', '.join(SITE_OWN)}; set "
           + "; ".join(f"{t}.({', '.join(c)})" for t, c in SITE_SETS.items()))
-    print(f"its database address is in {Path(args.out).name} (mode 0600): the site's "
-          "DATABASE_URL. Nothing of it is printed.")
+    if password is not None:
+        print(f"its database address is in {Path(args.out).name} (mode 0600): the site's "
+              "SITE_DATABASE_URL. Nothing of it is printed.")
     return 0
 
 
@@ -1156,6 +1356,9 @@ def main(argv: list[str] | None = None) -> int:
         p.set_defaults(run=run)
         return p
 
+    accept = {"type": int, "metavar": "N", "dest": "accept_unlisted_lines",
+              "help": "accept exactly N local reviewer lines that no row holds (the number a "
+                      "run without it printed); any other number fails"}
     command("init-db", cmd_init_db, "apply schema.sql (can be run again)")
     p = command("sync-reviewers", cmd_sync_reviewers,
                 "the reviewers file's remote reviewers as REMOTE-<n> rows on the real bundle")
@@ -1163,9 +1366,16 @@ def main(argv: list[str] | None = None) -> int:
                    help="bind them to the demonstration bundle instead (a preview database)")
     p.add_argument("--force", action="store_true",
                    help="with --demo: although a real bundle is published in this database")
-    p.add_argument("--test-identity", nargs=2, metavar=("ALIAS", "LOGIN"),
-                   help="instead: write the test row TEST-<n> for this sign-in, bound to the "
+    p.add_argument("--test-identity", nargs="+", metavar="ALIAS [LOGIN]",
+                   help="instead: write the test row TEST-<n> for this sign-in (without LOGIN: "
+                        "the owner's address, from the address file), bound to the "
                         "demonstration bundle")
+    p.add_argument("--owner-address-file", metavar="FILE",
+                   help=f"the private file (0600) holding the owner's sign-in address (default: "
+                        f"{OWNER_ADDRESS_ENV})")
+    p.add_argument("--owner-entry", type=int, metavar="N",
+                   help="the owner's reviewer entry is the N-th REVIEWER entry of the file "
+                        "(default: the one REVIEWER entry without '@')")
     for name, text in (("revoke", "stop a reviewer's access at once"),
                        ("restore-access", "lift a revocation")):
         command(name, cmd_revoke, text).add_argument("alias")
@@ -1180,10 +1390,12 @@ def main(argv: list[str] | None = None) -> int:
                 "publish the part of the local bundle the scope needs, after a parity check")
     p.add_argument("--check-only", action="store_true", help="cut and check; upload nothing")
     p.add_argument("--demo", metavar="DIR", help="publish the invented demo folder DIR instead")
-    command("import-log", cmd_import_log,
-            "snapshot the local log and import the remote reviewers' lines").add_argument(
-        "--snapshots", metavar="DIR", help=f"snapshot root (default: <dir>/{SNAPSHOTS})")
-    command("parity", cmd_parity, "compare the local log's state with the hosted store's")
+    p = command("import-log", cmd_import_log,
+                "snapshot the local log and import the remote reviewers' lines")
+    p.add_argument("--snapshots", metavar="DIR", help=f"snapshot root (default: <dir>/{SNAPSHOTS})")
+    p.add_argument("--accept-unlisted-lines", **accept)
+    command("parity", cmd_parity, "compare the local log's state with the hosted store's"
+            ).add_argument("--accept-unlisted-lines", **accept)
     command("export", cmd_export, "every event as JSONL").add_argument(
         "--out", required=True, metavar="FILE")
     command("restore", cmd_restore, "load an export into an EMPTY database").add_argument(
@@ -1200,8 +1412,10 @@ def main(argv: list[str] | None = None) -> int:
         "--snapshots", metavar="DIR", help=f"snapshot root (default: <dir>/{SNAPSHOTS})")
     p = command("make-site-role", cmd_make_site_role,
                 "create the site's own database role (or change its password): no ownership")
-    p.add_argument("--out", required=True, metavar="FILE",
+    p.add_argument("--out", metavar="FILE",
                    help="where the new database address is written (mode 0600)")
+    p.add_argument("--grants-only", action="store_true",
+                   help="give the existing role the present rights again; its password stays")
     p.add_argument("--role", default="reviewer_site", help="the role's name")
     args = ap.parse_args(argv)
     try:

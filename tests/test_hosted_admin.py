@@ -7,6 +7,7 @@ and that no command prints an address, a name or a word of a post or a reading."
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import importlib.util
 import json
 import os
@@ -527,11 +528,15 @@ def test_parity_compares_records_states_and_the_site_s_next_step(run, store, bas
         (f"REMOTE-2: bundle {bundle}; records local 6, hosted 6: the same; forms 45: 45 equal, "
          "0 different; hosted lines not pulled: 0"),
         "  next step: local i08 AFTER_REVEAL_DUE, hosted i08 AFTER_REVEAL_DUE: the same",
+        "  reveal history: local 2, hosted 2 marker(s): the same",
         "  the site's state of each form: 45 equal, 0 different",
         (f"REMOTE-3: bundle {bundle}; records local 1, hosted 1: the same; forms 45: 45 equal, "
          "0 different; hosted lines not pulled: 0"),
         "  next step: local i07 AFTER_REVEAL_DUE, hosted i07 AFTER_REVEAL_DUE: the same",
+        "  reveal history: local 0, hosted 0 marker(s): the same",
         "  the site's state of each form: 45 equal, 0 different",
+        "REMOTE-2: completed 1 of 45; next i08 AFTER_REVEAL_DUE",
+        "REMOTE-3: completed 0 of 45; next i07 AFTER_REVEAL_DUE",
         "parity of the local log and the hosted store: PASS, 2 reviewer(s)"]  # no test identity
     # The next step is the web app's own function: without it there is no parity.
     with monkeypatch.context() as without:
@@ -1313,8 +1318,8 @@ def test_local_lines_spelled_otherwise_are_refused_and_parity_fails(cli, run, st
     local_save(base, ONE, "i08", A.INDEPENDENT)  # the file's spelling, beside the other
     assert "REMOTE-2: 2 spelling(s) of its sign-in" in run("import-log", code=2)
     out = run("parity", code=1)
-    assert ("local lines of remote reviewers that NO row holds under that spelling: 3, of 1 "
-            "sign-in spelling(s)") in out and out.splitlines()[-1].endswith("FAIL, 2 reviewer(s)")
+    assert ("local lines of reviewers that no row holds: 3, of 1 sign-in spelling(s)") in out \
+        and out.splitlines()[-1].endswith("FAIL, 2 reviewer(s)")
     # Whoever asks: no line is stored under a row spelled otherwise.
     row = store.reviewer_by_login(ONE.login)
     with pytest.raises(A.AdjudicationError, match="^LINE_NOT_SPELLED_AS_ITS_ROW$"):
@@ -1437,24 +1442,45 @@ def test_a_test_identity_saves_in_a_stream_of_its_own_and_never_fixes_the_anchor
 
 def test_a_reviewer_s_hosted_line_before_any_import_is_never_built_upon(run, store, base,
                                                                         tmp_path):
+    """Re-check R1 (probe ``test_r11::test_real_save_before_any_import_and_the_empty_log_case``):
+    a reviewer's saves before the first ``import-log`` left lines that ``pull-to-local``,
+    ``push-returns`` and ``import-log`` then refused for good. Now the store refuses such a
+    save (NO_ANCHOR; the site says calmly that the workspace is not open yet), and a database
+    that holds such lines anyway (made before this rule, or restored from one) can still bring
+    them home: a log that holds only its own pulled copies is the log they continue."""
+    from reviewer_web.store import EventLine
+
     run("init-db")
     run("publish-bundle", "--demo", base)
     run("sync-reviewers", "--demo")
     one = store.reviewer_by_login(ONE.login)
-    [line] = hosted_save(store, one, "i07", A.INDEPENDENT).records  # no log was ever imported
-    assert (line["seq"], line["prev_sha256"]) == (HOSTED_1, V.GENESIS) and store.anchor() is None
-    # A folder with a log: not the (empty) log this chain continues. Nothing is written.
+    with pytest.raises(A.AdjudicationError, match="^NO_ANCHOR$"):
+        hosted_save(store, one, "i07", A.INDEPENDENT)
+    assert store.events() == [] and store.anchor() is None
+    # Lines of the old rule: two saves of a reviewer before any import, one after a pull.
+    b = store.bundle_for(one)
+    body = A.build_annotation([], b, one.session(), **reading_kw(b, "i07", [], one.session(),
+                                                                 phase=A.INDEPENDENT))
+    first = {**body, "schema": A.ANNOTATION_SCHEMA, "seq": HOSTED_1, "prev_sha256": V.GENESIS}
+    store.insert_events([EventLine(one.id, "HOSTED", V.encode_line(first))])
+    # A folder with a log of its own: not the (empty) log this chain continues.
     other = write_demo(tmp_path / "other")
     local_save(other, TWO, "i08", A.INDEPENDENT)
     for command in ("pull-to-local", "push-returns"):
         assert run(command, "--dir", other, code=2) == "refused: NO_ANCHOR_IMPORT_LOG_FIRST\n"
-    assert run("import-log", "--dir", other, code=2) == \
-        "refused: HOSTED_LINES_BEFORE_FIRST_IMPORT\n"
-    assert len(log_lines(other)) == 1 and len(store.events()) == 1 and store.anchor() is None
-    # An empty log IS that log (a preview's saves can be taken home).
+    assert len(log_lines(other)) == 1 and store.anchor() is None
     assert "pulled 1 hosted line(s) into the local log: REMOTE-2 1; 0 already held" in run(
         "pull-to-local")
-    assert A.read_annotations(base).records[0]["hosted"]["seq"] == HOSTED_1
+    [marker] = A.build_system_shown([first], b, one.session(), "i07")
+    second = {**marker, "schema": A.ANNOTATION_SCHEMA, "seq": HOSTED_1 + 1,
+              "prev_sha256": hashlib.sha256(V.encode_line(first)).hexdigest()}
+    store.insert_events([EventLine(one.id, "HOSTED", V.encode_line(second))])
+    # The second pull: the log holds only its own pulled copy, so it is still that log.
+    assert "pulled 1 hosted line(s) into the local log: REMOTE-2 1; 1 already held" in run(
+        "pull-to-local")
+    assert [r["hosted"]["seq"] for r in A.read_annotations(base).records] == [
+        HOSTED_1, HOSTED_1 + 1]
+    assert "returns that stand in the local log: 0" in run("push-returns")
 
 
 def test_two_pulls_at_once_append_every_hosted_line_once(cli, run, store, base, monkeypatch,
@@ -1794,9 +1820,11 @@ def test_the_site_s_role_covers_every_write_of_the_sign_in_the_save_and_the_send
     reading, _form = scenario_reading(site.bundle, "i08")
     one.open("i08")
     one.fill(reading)
-    one.set({"confidence": "HIGH", "notes": "sent twice"})
+    one.set({"confidence": "HIGH", "notes": "sent twice", "ui.later": "timing"})
+    assert site.sql("SELECT item_id FROM draft") == [("i08",)]  # kept by the round trips
     answers = [one.post("/form/i08/save", one.shown.data()) for _ in range(2)]
     assert [a.status_code for a in answers] == [303, 303]
+    assert site.sql("SELECT count(*) FROM draft") == [(0,)]  # ended with the save
     assert {a.headers["Location"] for a in answers} == {"/form/i08?saved=1000004"}
     # The test identity, on the same site as the same role: a stream of its own.
     expiry = "SELECT expires_at FROM web_session WHERE reviewer_id = %s"
@@ -1912,7 +1940,10 @@ def test_a_test_identity_s_saves_through_the_site_are_a_stream_of_their_own(
     assert [e["prev_sha256"] for e in mine] == [TEST_GENESIS, mine[0]["sha256"],
                                                 mine[1]["sha256"]]
     key = next(v for n, v in data if n == "_key")
-    assert mine[0]["idempotency_key"] == web.save_key(key, [x for x in data if x[0] != "_csrf"])
+    # (the session's token and the interface state, ``ui.*``, are no part of what was saved)
+    assert mine[0]["idempotency_key"] == web.save_key(
+        key, [x for x in data if x[0] != "_csrf" and not x[0].startswith("ui.")])
+    assert any(x[0].startswith("ui.") for x in data)  # the page does post such fields
     assert [(e["origin"], e["seq"]) for e in events[FIRST]] == [
         ("HOSTED", 1_000_001 + n) for n in range(6)]
     assert [e["prev_sha256"] for e in events[FIRST]] == [
@@ -1931,7 +1962,9 @@ def test_a_test_identity_s_saves_through_the_site_are_a_stream_of_their_own(
     out = run("verify", code=1)  # both chains hold; all it misses is an imported log
     assert out.startswith("events: HOSTED 6, TEST 3; hosted chain on ") and \
         "CHAIN_BROKEN" not in out
-    assert out.splitlines()[1:] == ["  NO_SNAPSHOT", "verify: FAIL, 1 problem(s)"]
+    assert out.splitlines()[1:] == [
+        "published files: no active bundle is this folder's: not compared", "  NO_SNAPSHOT",
+        "verify: FAIL, 1 problem(s)"]
     out = run("status")
     assert "TEST-1" not in out and out.splitlines()[-1] == \
         "test identities: 1 (see test-report ALIAS)"
@@ -2002,3 +2035,178 @@ def test_every_page_of_the_site_is_the_same_on_the_published_part_as_on_the_whol
     assert due["/form/i07"] != done["/form/i07"] != blind["/form/i07"] != due["/form/i07"]
     assert b"SEQUENCE:scs01" in due["/form/i08"][2]  # the idea of a reference that left
     assert "REQUEST_FAILED" not in "\n".join(r.getMessage() for r in caplog.records)
+
+
+# ------------------------------------------------------------------ an operator who is no superuser
+
+
+def operator_database(name: str) -> tuple[str, str]:
+    """(the superuser's address, the operator's address) of a new database OWNED by a new login
+    role that has CREATEROLE and is NOT a superuser, as the hosting provider gives its operator.
+    The embedded server trusts every connection, so the role is used, not its password."""
+    import psycopg
+    from psycopg import sql
+    from psycopg.conninfo import conninfo_to_dict, make_conninfo
+
+    server = hosted_pg._server()
+    with psycopg.connect(server.get_uri(), autocommit=True) as conn:
+        conn.execute(sql.SQL("CREATE ROLE {} LOGIN CREATEROLE NOSUPERUSER PASSWORD 'op'").format(
+            sql.Identifier(f"op_{name}")))
+        conn.execute(sql.SQL("CREATE DATABASE {} OWNER {}").format(
+            sql.Identifier(name), sql.Identifier(f"op_{name}")))
+    admin = server.get_uri(name)
+    parts = conninfo_to_dict(admin)
+    return admin, make_conninfo(**{**parts, "user": f"op_{name}", "password": "op"})
+
+
+def test_make_site_role_works_for_an_operator_who_is_not_a_superuser(
+        cli, monkeypatch, capsys, base, tmp_path):
+    """Re-check R4 and the lead's preview database: an operator with CREATEROLE but no superuser
+    may not name SUPERUSER, REPLICATION or BYPASSRLS in an ALTER ROLE, so the second run failed
+    (InsufficientPrivilege). And the password travelled in clear inside the statement, and a new
+    grant meant a new password. Here the WHOLE tool runs as such an operator: init-db (twice),
+    the bundle and the reviewers, make-site-role a first and a second time and --grants-only,
+    after the schema was dropped and made again, and an export restored into a second such
+    database."""
+    import psycopg
+    from psycopg.conninfo import conninfo_to_dict
+
+    name = f"nosu{os.getpid()}"
+    admin, operator = operator_database(name)
+    monkeypatch.setenv(cli.URL_ENV, operator)
+    monkeypatch.delenv(cli.UNPOOLED_ENV, raising=False)
+    monkeypatch.setenv(A.DIR_ENV, str(base))
+    sent: list[str] = []
+    real_execute = psycopg.Connection.execute
+
+    def spy(self, query, params=None, **kw):
+        sent.append(query.as_string(self) if hasattr(query, "as_string") else str(query))
+        return real_execute(self, query, params, **kw)
+
+    monkeypatch.setattr(psycopg.Connection, "execute", spy)
+
+    def run(*argv, code=0) -> str:
+        capsys.readouterr()
+        got = cli.main([str(a) for a in argv])
+        printed = "".join(capsys.readouterr())
+        assert got == code, printed
+        return printed
+
+    with psycopg.connect(operator) as conn:
+        assert conn.execute("SELECT rolsuper FROM pg_roles WHERE rolname = current_user"
+                            ).fetchone() == (False,)
+    for _ in range(2):
+        run("init-db")
+    half_way(base)
+    run("publish-bundle", "--demo", base)
+    run("sync-reviewers", "--demo")
+    run("import-log")
+    role = f"site_{name}"
+
+    def stored_verifier() -> str:
+        with psycopg.connect(admin) as conn:
+            return conn.execute("SELECT rolpassword FROM pg_authid WHERE rolname = %s",
+                                (role,)).fetchone()[0]
+
+    def password_of(path: Path) -> str:
+        return conninfo_to_dict(path.read_text().strip())["password"]
+
+    assert "created" in run("make-site-role", "--role", role, "--out", tmp_path / "k" / "a1")
+    first = stored_verifier()
+    assert "password changed" in run("make-site-role", "--role", role, "--out",
+                                     tmp_path / "k" / "a2")
+    second = stored_verifier()
+    assert first != second and second.startswith("SCRAM-SHA-256$4096:")
+    for path, verifier in ((tmp_path / "k" / "a1", first), (tmp_path / "k" / "a2", second)):
+        salt = __import__("base64").b64decode(verifier.split("$")[1].split(":")[1])
+        assert cli.scram_verifier(password_of(path), salt) == verifier  # its own password's
+        assert not [q for q in sent if password_of(path) in q]  # never sent to the server
+    out = run("make-site-role", "--role", role, "--grants-only")
+    assert "rights given again, password unchanged" in out and stored_verifier() == second
+    assert not (tmp_path / "k" / "a3").exists()
+    # The site's role may read and add HOSTED lines; a LEGACY or a RETURN line is the operator's.
+    site = conninfo_to_dict(admin) | {"user": role}
+    with psycopg.connect(**site) as conn:
+        assert conn.execute("SELECT count(*) FROM event").fetchone()[0] > 0
+        line = conn.execute("SELECT line, reviewer_id FROM event ORDER BY seq LIMIT 1").fetchone()
+    rec = json.loads(bytes(line[0]))
+    for origin, seq in (("LEGACY", 400), ("RETURN", 2_000_999)):
+        moved = V.encode_line({**rec, "seq": seq})
+        with pytest.raises(psycopg.errors.InsufficientPrivilege), psycopg.connect(**site) as conn:
+            conn.execute(
+                "INSERT INTO event (seq, prev_sha256, sha256, line, reviewer_id, bundle_id,"
+                " item_id, phase, at, origin, batch) VALUES (%s, %s, %s, %s, %s, %s, %s, %s,"
+                " %s, %s, %s)", (seq, rec["prev_sha256"], hashlib.sha256(moved).hexdigest(),
+                                 moved, line[1], rec["bundle_id"], rec["item_id"], rec["phase"],
+                                 rec["at"], origin, seq))
+    # Export, and restore into a second database of such an operator.
+    (tmp_path / "x").mkdir(mode=0o700)
+    run("export", "--out", tmp_path / "x" / "events.jsonl")
+    _admin2, operator2 = operator_database(name + "b")
+    monkeypatch.setenv(cli.URL_ENV, operator2)
+    run("init-db")
+    run("publish-bundle", "--demo", base)
+    run("sync-reviewers", "--demo")
+    assert run("restore", "--in", tmp_path / "x" / "events.jsonl").startswith("restored ")
+    assert "verify: PASS" in run("verify")
+    monkeypatch.setenv(cli.URL_ENV, operator)
+    # The preview database is reset by dropping the schema and making it again.
+    with psycopg.connect(operator, autocommit=True) as conn:
+        conn.execute("DROP SCHEMA public CASCADE")
+        conn.execute("CREATE SCHEMA public")
+    run("init-db")
+    assert "rights given again" in run("make-site-role", "--role", role, "--grants-only")
+    assert "password changed" in run("make-site-role", "--role", role, "--out",
+                                     tmp_path / "k" / "a4")
+    # A refusal by the facts of the role, never by re-stating them.
+    assert run("make-site-role", "--role", f"op_{name}", "--grants-only", code=2) == \
+        "refused: NOT_A_SITE_ROLE\n"
+    assert run("make-site-role", "--role", "nobody_here", "--grants-only", code=2) == \
+        "refused: NO_SITE_ROLE\n"
+    assert run("make-site-role", "--role", role, code=2) == "refused: OUT_FILE_NEEDED\n"
+
+
+def test_local_lines_of_a_reviewer_without_a_row_are_accepted_only_by_their_count(
+        cli, run, store, base):
+    """Re-check R5 (probe ``test_r15::test_a_reviewer_of_the_local_log_without_a_row...``): a
+    former remote reviewer's line in the local log, nobody of that address in the file, made
+    ``parity`` fail for good, while the cutover needs PASS. Now ``import-log`` and ``parity``
+    print the count (no address), and ``parity`` accepts exactly the number the operator names
+    with ``--accept-unlisted-lines``; any other number fails."""
+    b = A.load_bundle(base / "bundle", A.FULL)
+    former = A.Session("former@example.invalid", "Former Example", A.REVIEWER, A.FULL, True, 40)
+    A.append_annotation(base, b, former, **reading_kw(b, "i07", [], former, phase=A.INDEPENDENT))
+    run("init-db")
+    run("publish-bundle", "--demo", base)
+    run("sync-reviewers", "--demo")
+    assert "local lines of reviewers that no row holds: 1, of 1 sign-in spelling(s): give them " \
+        "a row, or accept exactly that many with --accept-unlisted-lines 1" in run("import-log")
+    assert run("parity", code=1).splitlines()[-1].endswith("FAIL, 2 reviewer(s)")
+    for wrong in ("0", "2"):
+        out = run("parity", "--accept-unlisted-lines", wrong, code=1)
+        assert f"NOT the {wrong} named" in out
+    out = run("parity", "--accept-unlisted-lines", "1")
+    assert "1, of 1 sign-in spelling(s): accepted as named (--accept-unlisted-lines 1)" in out
+    assert out.splitlines()[-1].endswith("PASS, 2 reviewer(s)")
+
+
+def test_verify_compares_the_published_files_with_a_fresh_cut_of_the_local_bundle(
+        run, store, base, dsn):
+    """Re-check R6 (probe ``test_r15::test_nothing_compares_the_published_files...``): the stored
+    posts and images were changed with the owning role, and ``verify`` still said PASS."""
+    import psycopg
+
+    cutover(run, store, base)
+    out = run("verify")
+    assert "files 4 of 4 equal, images 1 of 1 equal: PASS" in out and "verify: PASS" in out
+    with psycopg.connect(dsn) as conn:  # the owning role, or anyone holding its address
+        conn.execute("UPDATE media SET bytes = bytes || 'x'")
+    out = run("verify", code=1)
+    assert "images 0 of 1 equal: FAIL" in out and "PUBLISHED_IMAGE_DIFFERS" in out
+    with psycopg.connect(dsn) as conn:
+        conn.execute("UPDATE bundle SET posts = convert_to(replace(convert_from(posts, 'UTF8'),"
+                     " 'a', 'e'), 'UTF8')")
+    out = run("verify", code=1)
+    assert "files 3 of 4 equal" in out and "PUBLISHED_FILE_DIFFERS" in out
+    run("publish-bundle", "--demo", base)  # published again: equal again
+    assert "verify: PASS" in run("verify")

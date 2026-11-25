@@ -17,15 +17,25 @@ six-digit code: it is valid for 10 minutes, works once and allows five tries; at
 are sent to an address in an hour. If you ask twice, the two newest codes both work. After ten
 wrong codes within 24 hours the sign-in of that address is locked for the rest of those 24
 hours: tell the person who invited you, who can unlock it. The page answers the same for every
-address, so it never says whether an address is invited. Signing in sets one cookie, which keeps
+address, so it never says whether an address is invited. When one address opens two
+workspaces (the owner's own review and the invented test forms), the page after the code asks
+which to open: "Your review" or "Test forms (invented data)"; to open the other, sign out and
+sign in again. Signing in sets one cookie, which keeps
 you signed in on that device for thirty days after your last visit, and for at most ninety days
 after signing in (then a new code is needed); "Sign out" ends it. On another device you sign in
 again. If your access is withdrawn, the site stops answering you at once.
 
-**The workspace.** It shows how many ideas and forms of your scope are done, and every form in
-review order with its status: open, independent reading saved (another form of the same post is
-still open), reading after the reveal due, done, or "Returned to you". "Continue" opens the next
-unfinished step (the rule is below). You may open any form of the list.
+**Your sequences** (the dashboard). One row per sequence of your scope, in review order (the
+posts of no sequence last): its idea, how many of its forms are complete out of how many, how
+many remain, and one button: **Start** while nothing of it is saved, **Continue** after that
+(it opens that sequence's next step by the rule below, a returned form first). A row opens to
+its posts, in time order, and each post's forms ("Form 1 of 2" when a post has two), each with
+its status: **Not started** (no reading saved; a kept draft is marked beside it), **In
+progress** (your reading is saved and another form of the same post must be completed before
+the system's answers are shown), **Awaiting your assessment**, **Complete**, or **Returned for
+changes**. Everything is counted from your own saved readings only. The same grouping is the
+sidebar of a form's page, with the sequence you are in open and the form you are on marked.
+"Continue" at the top opens the next unfinished step of all your work.
 
 **A form** has three parts: 1. the source evidence (the post, its images, and the earlier posts
 shown with it, oldest first), 2. your reading, 3. the system's reading.
@@ -63,7 +73,10 @@ action. An answer you saved is shown chosen again when you return.
 next step, and the form says above the confidence what is stored. Every save is a new record;
 nothing is overwritten, and the newest counts. A double click stores one record. If the
 connection drops while saving, reload the page or send it again: the same save is never stored
-twice. Answers you have not saved are lost when you leave the page.
+twice. Every time the form is brought up to date, and when a save is refused, what you have
+entered is kept as a DRAFT of that form ("Draft kept at HH:MM, not submitted"): it comes back
+when you open the form again, on any device, and it ends when the form is saved. A draft is not
+a submission: it changes no status, nobody else sees it, and it never reaches the approver.
 
 **Resuming.** Everything shown comes from what is stored, on any device. The next unfinished step
 is:
@@ -128,6 +141,28 @@ that returns another reviewer's records, so no page can show them; beside a revi
 records it hands over only the approver's RETURN of that reviewer's readings (of the approver
 the role alone, no name and no address) and the line without content that takes one back. A
 page shows a return only while it is the latest decision on the reviewer's latest reading.
+
+**The address and the identity.** The address a code is mailed to (`reviewer.sign_in`, as
+given in `reviewer.address`) is not the identity whose lines are written (`login_shown`, which
+the records carry). For a remote reviewer the two are the same address. For the owner's own
+reviewer identity, `OWNER-REVIEWER`, the identity is the local identity string exactly as the
+owner's reviewers file and the local log spell it, and the address comes from a private file
+(see "Operations"). One address may open at most one real identity and one test identity (a
+unique index). After a right code such an address chooses which to open: the choice is stored
+as `sign_in_choice` (only its token's SHA-256), bound to that verified code, used once, valid
+five minutes, held by the browser that entered the code in its own cookie `__Host-choice`; it
+can name only an identity of that address that may sign in, and anything else uses it up and
+opens nothing. A session belongs to one identity. The address's codes and counters are kept
+under its key row (the lowest id of its rows): the ten-wrong-codes lock, the hourly quota and
+`unlock ALIAS` (of either identity) act on the ADDRESS; `revoke ALIAS` ends that identity's
+sessions and the address's open codes and choices (the other identity of the address simply
+asks for a new code, and is then let in without a choice); the first sign-in is noted for the
+identity opened. No hosted identity can approve, return or freeze: the store writes no phase
+but a reviewer's own (`PHASE_NOT_WRITTEN_BY_THE_SITE`), and an APPROVER row cannot sign in.
+
+**Before the import.** Until the local log is imported (no anchor), a reviewer's identity is
+served one page ("Your workspace is not open yet ...") and the store refuses any of its lines
+(`NO_ANCHOR`): such a line would continue no local log. A test identity works as before.
 
 **A test identity beside the real reviewers.** A reviewer row flagged as a test identity reads a
 bundle of invented forms in the same database, while the real reviewers read the real one. Every
@@ -198,7 +233,10 @@ the mail server, and no transaction is open while the server is spoken to: a cal
 stopped between a send and its record can never send that message a second time.
 
 **The database.** The site connects with `SITE_DATABASE_URL` when that variable is set (and
-not empty), otherwise with `DATABASE_URL`. `SITE_DATABASE_URL` is for the connection of a
+not empty), otherwise with `DATABASE_URL`; production does not start without
+`SITE_DATABASE_URL` (`SITE_DATABASE_URL_MISSING`), and logs `SITE_ROLE_OWNS_EVENT` once at
+start-up when the role it connects as owns the tables. The insert trigger refuses a LEGACY or
+RETURN line from any role that does not own `event`. `SITE_DATABASE_URL` is for the connection of a
 restricted role that may read and append but does not own the tables (so it cannot switch off
 the rule that no event is changed or deleted), while the platform keeps managing `DATABASE_URL`
 for the owning role. `hosted_admin.py make-site-role` creates that role and writes its address
@@ -227,6 +265,22 @@ from copying what they are shown: confidentiality rests on the reviewer's undert
 starts an embedded Postgres with the invented demo bundle and two invented reviewers on
 `127.0.0.1:8600` and prints the one-time code in the terminal.
 
+**The browser acceptance** (invented data only). One sequence (`scs01`) of four posts: s01 with
+a chart, s05, s14 with two forms, s18; every form's system reading proposes a price series and
+an instrument; the tester's reading of s01 has been returned by the approver.
+
+```bash
+# on this machine
+PYTHONPATH=src .venv/bin/python scripts/hosted_dev_server.py --port 8612 --acceptance ACCEPT-1
+# sign in as acceptance.tester@example.invalid (the code is printed in the terminal)
+
+# on a preview database that holds invented bundles only (refused otherwise: NOT_A_DEMO_DATABASE)
+export HOSTED_DATABASE_URL='postgresql://...'
+PYTHONPATH=src python scripts/hosted_admin.py init-db
+PYTHONPATH=src python scripts/hosted_acceptance_seed.py seed --alias ACCEPT-1 \
+    --login acceptance.tester@example.invalid
+```
+
 ## Operations
 
 The operator tool is `scripts/hosted_admin.py`. It runs on the owner's Mac, is never deployed, and
@@ -252,6 +306,12 @@ python scripts/hosted_admin.py status
 * A reviewer is named by **alias**: an entry of `reviewers.toml` whose login contains `@` is
   `REMOTE-<n>`, n its place among those entries in file order (the alias the owner's other tools
   print). Only the REVIEWER entries get a row. The reviewers file is only ever read.
+* The owner's own reviewer identity is `OWNER-REVIEWER`: the one REVIEWER entry of the file
+  whose login has no `@` (or `--owner-entry N`, the N-th REVIEWER entry), with the sign-in
+  address read from a private file: `--owner-address-file FILE` or the variable
+  `HOSTED_OWNER_ADDRESS_FILE`. The file holds the address on one line, has mode 0600, and lies
+  outside the repository and outside any synchronised folder (Dropbox, iCloud, OneDrive, Google
+  Drive are refused). No command prints the address; it is stored in the database only.
 
 ### What the platform is told
 
@@ -269,22 +329,24 @@ requesting `/healthz` (200, `ok`) and `/sign-in`, never by its "ready" state alo
 | --- | --- |
 | `init-db` | Applies `hosted/reviewer_web/schema.sql`. Every statement can be run again. |
 | `sync-reviewers` | Writes the remote reviewers of `reviewers.toml` as rows, bound to the active REAL bundle: login, name, role, scope, and the access a remote session has by that file (FULL only while `remote_full_context_authorized = true`, else RESTRICTED, which the site does not serve). Never deletes: an entry that left the file keeps its row, so revoke it. Refused while no real bundle is published (`NO_REAL_BUNDLE_PUBLISHED`), when an alias would pass to another sign-in (`ALIAS_OR_LOGIN_HELD_BY_ANOTHER_ROW`), when the file spells differently (capitals included) a sign-in whose row already has lines (`LOGIN_SPELLING_HAS_RECORDS`, with the alias: put the earlier spelling back), or when the file's scope is larger than the published one (`SCOPE_NOT_PUBLISHED`: publish first). `--demo` binds them to the demonstration bundle instead (a preview database, tests); on a database that holds a real bundle that would move the reviewers from the real forms to the invented ones, so it is refused there (`REAL_BUNDLE_IS_PUBLISHED`) unless `--force` is given (run `sync-reviewers` without `--demo` to move them back). |
-| `sync-reviewers --test-identity TEST-1 LOGIN` | Instead: writes (or updates) the test identity `TEST-<n>` for that sign-in, bound to the active DEMONSTRATION bundle with that bundle's scope (`NO_DEMO_BUNDLE_PUBLISHED` while there is none). The reviewers file is not read. |
+| `sync-reviewers --owner-address-file FILE` | Also writes `OWNER-REVIEWER` (above); without the file an existing row keeps its address, and a missing row is reported as not written. An APPROVER entry never gets a row. |
+| `sync-reviewers --test-identity TEST-1 [LOGIN]` | Instead: writes (or updates) the test identity `TEST-<n>` for that sign-in (without LOGIN: the owner's address, from the address file), bound to the active DEMONSTRATION bundle with that bundle's scope (`NO_DEMO_BUNDLE_PUBLISHED` while there is none). The reviewers file is not read. |
 | `revoke ALIAS` | Sets `revoked_at` and deletes that reviewer's web sessions and sign-in codes not yet used. From that moment sign-in, every page and every save are refused; the records stay. |
 | `restore-access ALIAS` | Clears the revocation (the reviewer signs in again). |
-| `unlock ALIAS` | Clears a reviewer's sign-in counters: the wrong codes of the last 24 hours (ten lock the sign-in; `status` then shows `sign-in: locked until <time>`) and the hour's code requests for that address. |
+| `unlock ALIAS` | Clears the sign-in counters of the reviewer's ADDRESS (of both identities when it opens two): the wrong codes of the last 24 hours (ten lock the sign-in; `status` then shows `sign-in: locked until <time>`) and the hour's code requests. |
 | `invite ALIAS --kind continue\|start` | Queues one invitation for the SITE to send (the operator's machine holds no mail password): `continue` for a reviewer whose work moved here, `start` for a first access. Refused for a test identity (`TEST_IDENTITY_IS_NOT_INVITED`), a revoked reviewer (`REVOKED`), an unknown alias, and while a message of that kind already waits (`ALREADY_QUEUED`). |
 | `publish-bundle` | Verifies the local bundle (`BUNDLE_ID_MISMATCH` otherwise), cuts the part the scope needs, checks parity, uploads and marks it THE active real bundle. Refused unless `remote_full_context_authorized = true` (`REMOTE_FULL_CONTEXT_NOT_AUTHORIZED`): the posts leave the Mac only by the owner's switch. `--check-only` cuts and checks without a database. `--demo DIR` publishes the invented demo folder `DIR` instead, as THE active demonstration bundle (and refuses any other bundle: `NOT_A_DEMO_BUNDLE`). The two kinds are active side by side: publishing one never deactivates the other. |
-| `import-log` | Verifies the local log (chain and head), copies it and its head file into a snapshot folder, imports the remote reviewers' lines, records the anchor. Can be run again. |
-| `parity` | Compares, per reviewer, the local log with the hosted store: the reviewer's records, the state of every form in scope, and the NEXT STEP as the web app's own functions compute it (`reviewer_web.forms.next_step` and `step_state`), once over the local log and once over what the site serves. PASS only when all agree. |
+| `import-log [--accept-unlisted-lines N]` | Verifies the local log (chain and head), copies it and its head file into a snapshot folder, imports the lines of the reviewers who have a row (the remote reviewers and `OWNER-REVIEWER`; never the approver's), records the anchor, and prints how many local reviewer lines no row holds. Can be run again. |
+| `parity [--accept-unlisted-lines N]` | Compares, per reviewer, the local log with the hosted store: the reviewer's records, the reveal history (the SYSTEM_SHOWN markers), the state of every form in scope, and the NEXT STEP as the web app's own functions compute it (`reviewer_web.forms.next_step` and `step_state`), once over the local log and once over what the site serves; then one line per identity for the owner: `<ALIAS>: completed n of m; next <form> <phase>`. PASS only when all agree. Local lines of a reviewer that no row holds fail it unless their count is named exactly with `--accept-unlisted-lines N`. |
 | `export --out FILE` | Every event as JSONL (mode 0600, never over an existing file, never inside the repository): a header with the anchor, then per event its alias, origin, `seq`, hashes and exact line. |
 | `restore --in FILE` | Loads an export into an EMPTY database and verifies every hash and the hosted chain. |
-| `pull-to-local` | Appends the hosted saves the local log does not hold yet to the local log. |
+| `pull-to-local` | Appends the hosted saves the local log does not hold yet to the local log (`OWNER-REVIEWER`'s too; never a test identity's). Refused when an identity saved locally after the anchor while hosted saves of theirs are not home yet (`LOCAL_SAVE_AFTER_HOSTED_SAVES`). |
 | `push-returns` | Stores the approver's standing local RETURN decisions for the reviewers whose readings they return. |
 | `status` | The two bundles and the anchor; per reviewer: bundle, scope, invited, first sign-in, first hosted save, revoked, the lines by origin and phase, and each queued message (kind, queued, sent, result). Test identities are only counted. |
 | `test-report ALIAS` | For a test identity only: its bundle, first sign-in, number of web sessions, each of its events (seq, time, phase, item id) and the state of every form that is not open. This is how a sign-in, a save and a resume on the production site are checked without touching a reviewer. |
 | `make-site-role --out FILE` | Creates the database role the SITE connects as (default name `reviewer_site`), or gives it a new password, and writes its database address (the given address with user and password replaced) to FILE, mode 0600, never over an existing file. Nothing secret is printed. See "The site's own database role". |
-| `verify` | The hosted chain (every line against its hash, 1000001, 1000002, ... from the anchor), the test identities' stream as a chain of its own, every line under a row spelled as the line, and the imported lines against the newest snapshot, in both directions. |
+| `make-site-role --grants-only` | Gives the existing role exactly the present rights again (a new table such as `draft`), its password unchanged. |
+| `verify` | The hosted chain (every line against its hash, 1000001, 1000002, ... from the anchor), the test identities' stream as a chain of its own, every line under a row spelled as the line, the imported lines against the newest snapshot, in both directions, and the stored publication of this folder's bundle against a fresh cut of it (the four files and every image by sha256). |
 
 ### Real reviewers and test identities in one database
 
@@ -314,8 +376,8 @@ python scripts/hosted_admin.py test-report TEST-1
 ```text
 TEST-1 (test identity): bundle 5bee31e4acb2 (demonstration data), scope 40, first sign-in 2026-03-09T07:15:00+00:00, web sessions 1, revoked -
 events: 2
-  1000004 2026-03-09T07:21:10+00:00 INDEPENDENT i07
-  1000005 2026-03-09T07:21:40+00:00 SYSTEM_SHOWN i07
+  3000001 2026-03-09T07:21:10+00:00 INDEPENDENT i07
+  3000002 2026-03-09T07:21:40+00:00 SYSTEM_SHOWN i07
 TEST-1: records 2; forms 45: INDEPENDENT_SAVED+SHOWN 1, OPEN 44
   i07 INDEPENDENT_SAVED+SHOWN
 ```
@@ -411,8 +473,9 @@ The operator tool connects as that role; the SITE must not. `make-site-role` cre
 login role that owns nothing and has exactly the rights the site's code uses:
 
 * read `reviewer`, `bundle`, `media`, `event`, `chain_anchor`, `mail_queue`;
-* add rows to `event` (never change or delete one);
-* every row operation on the sign-in tables `login_code`, `web_session`, `rate_limit`;
+* add rows to `event` (never change or delete one; a LEGACY or RETURN line is refused to it);
+* every row operation on the sign-in tables `login_code`, `web_session`, `rate_limit`,
+  `sign_in_choice`, and on the drafts `draft`;
 * set `reviewer.first_sign_in_at` and `reviewer.invited_at`, and `mail_queue.attempts`,
   `sending_at`, `result`, `sent_at`; no other column of either table.
 
@@ -420,12 +483,18 @@ login role that owns nothing and has exactly the rights the site's code uses:
 python scripts/hosted_admin.py make-site-role --out ~/hosted-keys/site-address-1
 ```
 
-Give the content of that file to the site as its `DATABASE_URL` (the pooled address, if
-`HOSTED_DATABASE_URL` is the pooled one), and keep `HOSTED_DATABASE_URL` (the owner's role) on
-the Mac only. Run it again with another `--out` to change the password. It runs after
-`init-db` (the tables must exist), over the direct connection when
-`HOSTED_DATABASE_URL_UNPOOLED` is set. It refuses a role that is an administrator, owns
-anything or is a member of another role (`NOT_A_SITE_ROLE`).
+Give the content of that file to the site as its `SITE_DATABASE_URL` (with the host of the
+pooled address, if the site should use the pool), and keep `HOSTED_DATABASE_URL` (the owner's
+role) on the Mac only; the platform may keep managing `DATABASE_URL`, which the site then does
+not use. Run it again with another `--out` to change the password, and with `--grants-only`
+after an `init-db` that added a table (the password stays). The password never travels to the
+server: the statement carries its SCRAM-SHA-256 verifier, computed on the Mac. It works for an
+operator that has CREATEROLE and is not a superuser (a second run alters only the password),
+and after the schema was dropped and made again. It runs after `init-db` (the tables must
+exist), over the direct connection when `HOSTED_DATABASE_URL_UNPOOLED` is set. It refuses a
+role that is an administrator, may create roles or databases, inherits, cannot log in, owns
+anything or is a member of another role (`NOT_A_SITE_ROLE`); `--grants-only` refuses a role
+that does not exist (`NO_SITE_ROLE`).
 
 ### Cutover
 
@@ -433,9 +502,13 @@ Rehearse steps 1 to 3 while the present site still serves: every command can be 
 no reviewer may sign in to the hosted site before step 8 (a reviewer's first save there fixes
 the anchor).
 
-1. `init-db`, `publish-bundle --check-only`, `publish-bundle`, `sync-reviewers`, `status`.
+1. `init-db`, `make-site-role --grants-only` (when the role exists: the new tables),
+   `publish-bundle --check-only`, `publish-bundle`,
+   `sync-reviewers --owner-address-file FILE`, `status` (three reviewer rows: two `REMOTE-n`
+   and `OWNER-REVIEWER`; nobody can save before the import: `NO_ANCHOR`).
 2. `import-log`, then `parity` and `verify`: both PASS.
-3. `publish-bundle --demo DIR`, `sync-reviewers --test-identity TEST-1 LOGIN`: sign in as that
+3. `publish-bundle --demo DIR`, `sync-reviewers --test-identity TEST-1 --owner-address-file
+   FILE` (the owner's address: after the code it asks "Your review" or "Test forms"): sign in as that
    test identity, work through an invented form, and read `test-report TEST-1`. This may be
    done at any time, before the first import too: a test identity's lines are a stream of
    their own and leave the anchor alone.
@@ -451,7 +524,9 @@ the anchor).
 7. **Returns and parity**: `push-returns` (a return the approver decided before the cutover
    and that still stands reaches its reviewer only by this command; until it is run, `parity`
    fails on that form), then `parity` PASS and `verify` PASS. Compare the per-alias lines and
-   form states that `import-log` printed, and each reviewer's next step, with what you expect.
+   form states that `import-log` printed, and each reviewer's next step, with what you expect;
+   the last lines of `parity` (`<ALIAS>: completed n of m; next <form> <phase>`, one per
+   identity, `OWNER-REVIEWER` among them) are what to report to the owner.
 8. Open the hosted site to the reviewers.
 
 ```text
@@ -459,6 +534,7 @@ local log: 8 line(s), head ba9b895aae2b, 10174 bytes, sha256 dcb3...4622
 snapshot: log-00000008-dcb320867b5390e1
 anchor: 8 line(s), head ba9b895aae2b: moved to the log's present head
 imported 7 new line(s); 0 already imported
+local lines of reviewers that no row holds: 0, of 0 sign-in spelling(s)
 REMOTE-1: lines 6 (6 new); forms 45: DONE 1, INDEPENDENT_SAVED 1, INDEPENDENT_SAVED+SHOWN 1, OPEN 42
   i07 DONE
   i08 INDEPENDENT_SAVED
@@ -478,7 +554,10 @@ chain continues no log; start from an empty database).
 ### Day to day: hosted saves in the local log
 
 Approval, freeze and scoring read the local log, and nothing in them knows of the site: a
-freeze taken without a pull simply lacks the hosted saves. Before them, always:
+freeze taken without a pull simply lacks the hosted saves. The owner now reviews on the site
+(`OWNER-REVIEWER`) and approves locally: a reviewer save of the owner's in the local workspace
+after the cutover makes two histories, and `pull-to-local` and `import-log` refuse until it is
+resolved (`LOCAL_SAVE_AFTER_HOSTED_SAVES`). Before approval, freeze or scoring, always:
 
 ```bash
 python scripts/hosted_admin.py pull-to-local
@@ -503,6 +582,8 @@ local bundle 5bee31e4acb2
 REMOTE-1: bundle 5bee31e4acb2; records local 6, hosted 8: DIFFERENT; forms 45: 44 equal, 1 different; hosted lines not pulled: 2
   i08: local INDEPENDENT_SAVED, hosted DONE
   next step: local i08 AFTER_REVEAL_DUE, hosted i01 AFTER_REVEAL_DUE: DIFFERENT
+  reveal history: local 2, hosted 3 marker(s): DIFFERENT
+REMOTE-1: completed 2 of 45; next i01 AFTER_REVEAL_DUE (DOES NOT AGREE with the local log)
 parity of the local log and the hosted store: FAIL, 1 reviewer(s)
 ```
 
@@ -599,11 +680,15 @@ the same chain.
 
 ### Rollback to the present site
 
-1. Stop the hosted site, or `revoke` each alias.
+1. Stop the hosted site, or `revoke` each alias (`OWNER-REVIEWER` too; a test identity may
+   stay).
 2. `pull-to-local`, then `parity` PASS and `adjudication_freeze.py verify` OK: the local log now
    holds every hosted save.
 3. Start the present site again. The reviewers go on from the pulled state: a local reading
-   after the reveal refers to a pulled independent reading like to any other line.
+   after the reveal refers to a pulled independent reading like to any other line. The owner
+   reviews locally again under the same local identity, whose pulled lines are its own.
+   Drafts stay in the database and are never pulled: an answer kept only as a draft is not
+   carried back.
 
 To go back to the hosted site after reviewers have saved locally again, start from an EMPTY
 database (`init-db`, `publish-bundle`, `sync-reviewers`, `import-log`): the whole local log,

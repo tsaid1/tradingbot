@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block title %}Choose what to open{% endblock %}
+{% block main %}
+<section class="page">
+  <h1>What would you like to open?</h1>
+  <p>This address opens two separate workspaces. Choose one; to open the other later, sign out
+  and sign in again.</p>
+  <form method="post" action="/sign-in/choose" class="choose-identity">
+    {% for value, label in options %}
+    <p><button type="submit" name="identity" value="{{ value }}"
+      class="button {{ 'button--primary primary' if loop.first else 'button--quiet quiet' }}">{{ label }}</button></p>
+    {% endfor %}
+  </form>
+</section>
+{% endblock %}

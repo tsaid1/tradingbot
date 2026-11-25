@@ -1,7 +1,7 @@
 """Look at the hosted reviewer site on INVENTED data, on this machine. Never deployed.
 
     PYTHONPATH=src .venv/bin/python scripts/hosted_dev_server.py [--port 8600]
-        [--dev-auto-sign-in REMOTE-2] [--dev-seed s14a --dev-seed s14b]
+        [--dev-auto-sign-in REMOTE-2] [--dev-seed s14a --dev-seed s14b] [--acceptance ACCEPT-1]
 
 Starts an embedded Postgres (``pgserver``) in a temporary folder, applies the schema, publishes
 the invented demo bundle (``scripts/adjudication_demo_bundle.py``) flagged as demonstration data
@@ -17,6 +17,10 @@ request but those to ``/sign-in`` is served as that reviewer, without a cookie. 
 has no such switch, and this script lives outside ``hosted/`` (the folder that is deployed). ``--dev-seed ITEM`` stores that reviewer's independent reading of a scenario
 item of the demo (its expected answers) before serving, so the page after the reveal can be seen
 at once: seed every form of a post (``s14a`` and ``s14b`` are the two forms of one post).
+``--acceptance ALIAS`` serves the browser acceptance's invented data instead
+(``scripts/hosted_acceptance_seed.py``): one sequence of four posts, a chart, a post with two
+forms, and the reading of s01 of the invented reviewer ALIAS (sign-in
+``acceptance.tester@example.invalid``) returned by the approver.
 """
 
 from __future__ import annotations
@@ -90,6 +94,7 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8600)
     parser.add_argument("--dev-auto-sign-in", metavar="ALIAS")
     parser.add_argument("--dev-seed", metavar="ITEM", action="append", default=[])
+    parser.add_argument("--acceptance", metavar="ALIAS")
     args = parser.parse_args()
 
     import pgserver
@@ -106,7 +111,21 @@ def main() -> None:
     dsn = server.get_uri()
     admin = AdminStore(dsn)
     admin.init_schema()
-    reviewers = publish(admin, _demo_module().write_demo(work / "demo"))
+    if args.acceptance:
+        spec = importlib.util.spec_from_file_location(
+            "hosted_acceptance_seed_dev", REPO / "scripts" / "hosted_acceptance_seed.py")
+        seeding = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(seeding)
+        seeding.seed(admin, seeding.write(work / "acceptance"), args.acceptance)
+        reviewers = {r.alias: r for r in admin.reviewers()}
+    else:
+        reviewers = publish(admin, _demo_module().write_demo(work / "demo"))
+        # An empty local log, imported: the invented reviewers may save.
+        from reviewer_web.store import sha256
+
+        from tradingbot.runtime.vocab_recommend import GENESIS
+
+        admin.set_anchor(0, GENESIS, sha256(b""))
     store = Store(dsn)
 
     def mailer(to: str, _subject: str, text: str) -> None:

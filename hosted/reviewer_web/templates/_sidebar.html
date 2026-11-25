@@ -1,0 +1,39 @@
+{# The sidebar (FLOW): the dashboard's model, the active sequence expanded, the current form
+   marked. Works without a script (<details>), by keyboard, on a phone (one disclosure).
+   Nothing in it depends on the system's reading. #}
+{% if nav %}
+<details class="nav-panel" open>
+  <summary class="nav-panel__toggle">Your sequences</summary>
+  <nav class="nav-tree" aria-label="Your sequences">
+    <ol class="nav-tree__sequences">
+      {% for row in nav.sequences %}
+      <li class="nav-tree__sequence">
+        <details{% if row.id == nav.active %} open{% endif %}>
+          <summary>
+            <span class="nav-tree__label">{{ row.label }}</span>
+            <span class="count">{{ row.done }} of {{ row.total }}</span>
+            <span class="status status--{{ row.status | lower | replace('_', '-') | replace('awaiting-assessment', 'awaiting') }}">{{ row.status_text }}</span>
+          </summary>
+          <ol class="nav-tree__posts">
+            {% for post in row.posts %}
+            <li class="nav-tree__post">
+              <ol class="nav-tree__forms">
+                {% for f in post.forms %}
+                <li class="nav-tree__form">
+                  <a href="/form/{{ f.item_id }}"{% if f.current %} aria-current="page"{% endif %}>
+                    <span class="nav-tree__name">{{ f.item_id }}{% if f.n > 1 %} · Form {{ f.k }} of {{ f.n }}{% endif %}</span>
+                    <span class="status status--{{ f.status | lower | replace('_', '-') | replace('awaiting-assessment', 'awaiting') }}">{{ f.status_text }}</span>
+                  </a>
+                </li>
+                {% endfor %}
+              </ol>
+            </li>
+            {% endfor %}
+          </ol>
+        </details>
+      </li>
+      {% endfor %}
+    </ol>
+  </nav>
+</details>
+{% endif %}
