@@ -539,8 +539,7 @@ def cmd_test_report(args) -> int:
         bundle, records = store.bundle_for(row), store.records_of(row)
     print(f"{row.alias} (test identity): bundle {bundle.bundle_id[:12]} (demonstration data), "
           f"scope {row.scope_sequences}, first sign-in {_time(status['first_sign_in_at'])}, web "
-          f"sessions {'-' if status['sessions'] is None else status['sessions']}, revoked "
-          f"{_time(status['revoked_at'])}")
+          f"sessions {status['sessions']}, revoked {_time(status['revoked_at'])}")
     print(f"events: {len(events)}")
     for e in events:
         print(f"  {e['seq']} {_time(e['at'])} {e['phase']} {e['item_id']}")

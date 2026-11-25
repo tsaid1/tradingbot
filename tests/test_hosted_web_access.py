@@ -10,7 +10,7 @@ import re
 from pathlib import Path
 
 import pytest
-from hosted_pg import bundle_bytes, write_demo
+from hosted_pg import bundle_bytes
 from hosted_web_site import (  # noqa: F401 - fixtures
     FIRST,
     ORIGIN,
@@ -239,7 +239,7 @@ def test_preview_and_test_show_invented_data_only_and_say_so(tmp_path, store, ds
     assert "Demonstration data" in site.browser().get("/sign-in").get_data(as_text=True)
     # The same content published WITHOUT the flag: the site answers no content route any more,
     # and an application for preview or test refuses to start on it.
-    files, media = bundle_bytes(write_demo(tmp_path / "again"))
+    files, media = bundle_bytes(tmp_path / "demo")  # the site's own bundle: its reviewers' bundle
     store.publish_bundle(*files, media, is_demo=False, source_sequences=1)
     for path in ("/", "/form/i07", "/guide", f"/media/{site.bundle.bundle_id}/p01/chart-p01.png"):
         answer = b.get(path)

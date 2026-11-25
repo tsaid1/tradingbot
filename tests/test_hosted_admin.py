@@ -11,6 +11,7 @@ import json
 import os
 import re
 import stat
+import sys
 from pathlib import Path
 
 import hosted_pg
@@ -99,11 +100,13 @@ def half_way(base: Path) -> None:
 
 
 def cutover(run, store, base) -> dict:
-    """The cutover on the demo data; returns the reviewer rows by alias (TEST-1 included)."""
+    """The cutover on the demo data, as on a preview database (the remote reviewers work on the
+    demonstration bundle); returns the reviewer rows by alias (TEST-1 included)."""
     half_way(base)
     run("init-db")
-    run("sync-reviewers", "--test-identity", "TEST-1", TESTER)
     run("publish-bundle", "--demo", base)
+    run("sync-reviewers", "--demo")
+    run("sync-reviewers", "--test-identity", "TEST-1", TESTER)
     run("import-log")
     return {r.alias: r for r in store.reviewers()}
 
@@ -181,15 +184,17 @@ def test_publish_bundle_uploads_only_what_the_scope_needs_and_proves_parity(run,
     assert [f["item_id"] for f in A.post_forms(full, full.items["i07"])] == ["i07", "x01"]
     out = run("publish-bundle", "--demo", base, "--check-only")
     assert "parity with the full bundle: PASS, 8 item(s) in scope, 0 difference(s)" in out
-    assert "checked only: nothing uploaded" in out and store.published() is None
+    assert "checked only: nothing uploaded" in out and store.published(demo=True) is None
     out = run("publish-bundle", "--demo", base)
     assert (f"bundle {full.bundle_id[:12]}: scope 2 of 33 sequence(s); items 8 shown, 1 kept for "
             "form numbering, 37 left out; posts 10 of 41; images 1,") in out
     assert "parity with the full bundle: PASS" in out and "published and active" in out
     part = store.active_bundle()
     assert part.bundle_id == full.bundle_id and store.bundle_is_demo() is True
-    assert {k: store.published()[k] for k in ("source_sequences", "scope_sequences", "images")} \
-        == {"source_sequences": 33, "scope_sequences": 2, "images": 1}
+    assert {k: store.published(demo=True)[k]
+            for k in ("source_sequences", "scope_sequences", "images")} == {
+        "source_sequences": 33, "scope_sequences": 2, "images": 1}
+    assert store.published(demo=False) is None
     # The items the scope offers, the second form of a post they share, and nothing else.
     assert [i["item_id"] for _s, items in A.ordered(part, 2) for i in items] == IN_SCOPE
     assert set(part.items) == {*IN_SCOPE, "x01"}
@@ -287,7 +292,7 @@ def test_a_wrong_part_fails_parity_and_is_not_uploaded(cli, run, store, base, mo
         full, wrong({2: keep_the_reference}), media))
     out = run("publish-bundle", "--demo", base, code=1)
     assert "parity with the full bundle: FAIL, 8 item(s) in scope, 1 difference(s)" in out
-    assert "differs: system_reading of i08" in out and store.published() is None
+    assert "differs: system_reading of i08" in out and store.published(demo=True) is None
 
 
 def test_publish_bundle_refuses_real_content_without_the_owner_s_switch(run, store, base,
@@ -297,9 +302,10 @@ def test_publish_bundle_refuses_real_content_without_the_owner_s_switch(run, sto
     reseal(closed, product_commit="abc1234")  # not the demo script's bundle any more
     assert "NOT_A_DEMO_BUNDLE" in run("publish-bundle", "--demo", closed, code=2)
     assert "REMOTE_FULL_CONTEXT_NOT_AUTHORIZED" in run("publish-bundle", "--dir", closed, code=2)
-    assert store.published() is None
+    assert store.published(demo=False) is None and store.published(demo=True) is None
     reseal(base, product_commit="abc1234")
     assert "published and active" in run("publish-bundle") and store.bundle_is_demo() is False
+    assert store.published(demo=False)["bundle_id"] == A.bundle_digest(base / "bundle")
     (base / "bundle" / "items.jsonl").write_text("")  # the files no longer match the bundle_id
     assert "BUNDLE_ID_MISMATCH" in run("publish-bundle", code=2)
 
@@ -307,19 +313,19 @@ def test_publish_bundle_refuses_real_content_without_the_owner_s_switch(run, sto
 def test_the_published_scope_and_the_reviewers_scope_stay_consistent(run, store, base):
     extend(base, 2)
     run("publish-bundle", "--demo", base)
-    assert "REMOTE-2: id 1, REVIEWER, FULL, scope 2" in run("sync-reviewers")
+    assert "REMOTE-2: id 1, REVIEWER, FULL, scope 2, bundle " in run("sync-reviewers", "--demo")
     path = base / "reviewers.toml"
     path.write_text(path.read_text().replace("scope_sequences = 2", "scope_sequences = 3"))
-    assert "SCOPE_NOT_PUBLISHED" in run("sync-reviewers", code=2)  # publish the larger part first
+    assert "SCOPE_NOT_PUBLISHED" in run("sync-reviewers", "--demo", code=2)  # publish first
     assert {r.scope_sequences for r in store.reviewers()} == {2}
     run("publish-bundle", "--demo", base)
-    assert "scope 3" in run("sync-reviewers")
+    assert "scope 3" in run("sync-reviewers", "--demo")
     path.write_text(path.read_text().replace("scope_sequences = 3", "scope_sequences = 1"))
     assert "SCOPE_BELOW_A_REVIEWER" in run("publish-bundle", "--demo", base, code=2)
-    assert store.published()["scope_sequences"] == 3
-    run("sync-reviewers")  # lowering the reviewers first is always possible
+    assert store.published(demo=True)["scope_sequences"] == 3
+    run("sync-reviewers", "--demo")  # lowering the reviewers first is always possible
     run("publish-bundle", "--demo", base)
-    assert store.published()["scope_sequences"] == 1
+    assert store.published(demo=True)["scope_sequences"] == 1
 
 
 # ------------------------------------------------------------------ reviewers
@@ -332,50 +338,65 @@ def test_sync_reviewers_reads_the_owner_s_file_and_never_deletes(run, store, bas
     assert re.fullmatch(r"schema applied: \d+ table\(s\): [a-z_, ]+\n", out)
     assert {"bundle", "chain_anchor", "event", "media", "reviewer"} <= set(
         out.strip().split(": ")[2].split(", "))
-    out = run("sync-reviewers")
-    assert out.splitlines() == ["REMOTE-2: id 1, REVIEWER, FULL, scope 40",
-                                "REMOTE-3: id 2, REVIEWER, FULL, scope 40",
+    # A reviewer is bound to a bundle: nothing can be synced before one is published.
+    assert run("sync-reviewers", code=2) == "refused: NO_REAL_BUNDLE_PUBLISHED\n"
+    assert run("sync-reviewers", "--demo", code=2) == "refused: NO_DEMO_BUNDLE_PUBLISHED\n"
+    assert run("sync-reviewers", "--test-identity", "TEST-1", TESTER, code=2) == \
+        "refused: NO_DEMO_BUNDLE_PUBLISHED\n"
+    run("publish-bundle", "--demo", base)
+    assert run("sync-reviewers", code=2) == "refused: NO_REAL_BUNDLE_PUBLISHED\n"
+    bundle = f"bundle {A.bundle_digest(base / 'bundle')[:12]} (demonstration data)"
+    out = run("sync-reviewers", "--demo")
+    assert out.splitlines() == [f"REMOTE-2: id 1, REVIEWER, FULL, scope 40, {bundle}",
+                                f"REMOTE-3: id 2, REVIEWER, FULL, scope 40, {bundle}",
                                 "2 reviewer row(s) written; none deleted"]
     assert store.reviewer_by_login(ONE.login).session() == ONE
     assert "TEST_ALIAS_IS_TEST_N" in run("sync-reviewers", "--test-identity", "REMOTE-9", TESTER,
                                          code=2)
     out = run("sync-reviewers", "--test-identity", "TEST-1", TESTER)
-    assert "TEST-1: id 3, REVIEWER, FULL, scope 40, test identity" in out
+    assert out.splitlines() == [
+        f"TEST-1: id 3, REVIEWER, FULL, scope 40, {bundle}, test identity",
+        "1 reviewer row(s) written; none deleted"]
     assert store.reviewer_by_login(TESTER).is_test is True
     # An entry that left the file keeps its row (revoke it); the file itself is only read.
     file.write_text(file.read_text().split("[[reviewer]]\nlogin = \"remote@")[0])
-    assert run("sync-reviewers").splitlines()[-1] == "1 reviewer row(s) written; none deleted"
+    assert run("sync-reviewers", "--demo").splitlines()[-1] == \
+        "1 reviewer row(s) written; none deleted"
     assert [r.alias for r in store.reviewers()] == ["REMOTE-2", "REMOTE-3", "TEST-1"]
     file.write_bytes(before[0])
     os.utime(file, ns=(before[1], before[1]))
-    for command in (["sync-reviewers"], ["publish-bundle", "--demo", base], ["import-log"],
-                    ["parity"], ["status"]):
+    for command in (["sync-reviewers", "--demo"], ["publish-bundle", "--demo", base],
+                    ["import-log"], ["parity"], ["status"], ["push-returns"]):
         run(*command)
     assert (file.read_bytes(), file.stat().st_mtime_ns) == before
 
 
 def web_sessions(store, *sessions: tuple[str, int]) -> None:
-    """Rows (token letter, reviewer id) in the web app's ``web_session`` table: made here as the
-    web app's part of ``schema.sql`` defines it when this tree does not hold that part yet."""
+    """Rows (token letter, reviewer id) in the web app's ``web_session`` table."""
     with store.connection() as conn:
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS web_session (token_sha256 TEXT PRIMARY KEY,"
-            " reviewer_id BIGINT NOT NULL REFERENCES reviewer (id) ON DELETE CASCADE,"
-            " created_at TIMESTAMPTZ NOT NULL, last_seen_at TIMESTAMPTZ NOT NULL,"
-            " expires_at TIMESTAMPTZ NOT NULL)")
         for letter, reviewer_id in sessions:
-            conn.execute("INSERT INTO web_session VALUES (%s, %s, now(), now(), now())",
+            conn.execute("INSERT INTO web_session (token_sha256, reviewer_id, created_at,"
+                         " last_seen_at, expires_at) VALUES (%s, %s, now(), now(), now())",
                          (letter * 64, reviewer_id))
 
 
 def test_revoke_stops_access_at_once_and_restore_access_lifts_it(run, store, base):
-    run("sync-reviewers")
+    run("publish-bundle", "--demo", base)
+    run("sync-reviewers", "--demo")
     web_sessions(store, ("a", 1), ("b", 1), ("c", 2))
+    with store.connection() as conn:  # sign-in codes: one used, the others still open
+        for letter, reviewer_id, used in (("d", 1, None), ("e", 1, "now"), ("f", 2, None)):
+            conn.execute("INSERT INTO login_code (reviewer_id, code_hmac, created_at,"
+                         " expires_at, used_at) VALUES (%s, %s, now(), now(), %s::timestamptz)",
+                         (reviewer_id, letter * 64, used))
     assert run("revoke", "REMOTE-2") == "REMOTE-2: REVOKED; 2 web session(s) deleted\n"
     assert store.reviewer_by_login(ONE.login).revoked is True
-    assert "REMOTE-2: id 1, REVIEWER, FULL, scope 40, REVOKED" in run("sync-reviewers")
+    assert re.search(r"REMOTE-2: id 1, REVIEWER, FULL, scope 40, .*, REVOKED\n",
+                     run("sync-reviewers", "--demo"))
     with store.connection() as conn:
         assert conn.execute("SELECT token_sha256 FROM web_session").fetchall() == [("c" * 64,)]
+        assert conn.execute("SELECT left(code_hmac, 1) FROM login_code ORDER BY 1"
+                            ).fetchall() == [("e",), ("f",)]  # the open code went too
     assert "revoked 2" in run("status").replace("revoked -", "")
     assert run("restore-access", "REMOTE-2") == \
         "REMOTE-2: access restored; 0 web session(s) deleted\n"
@@ -401,8 +422,8 @@ def test_the_database_address_comes_from_the_environment_and_is_never_printed(
 
 def test_import_log_is_verbatim_verifiable_and_idempotent(run, store, base):
     half_way(base)
-    run("sync-reviewers")
     run("publish-bundle", "--demo", base)
+    run("sync-reviewers", "--demo")
     log = A.annotations_path(base)
     data, lines = log.read_bytes(), log_lines(base)
     out = run("import-log")
@@ -448,27 +469,63 @@ def test_import_log_is_verbatim_verifiable_and_idempotent(run, store, base):
     assert [e["seq"] for e in store.events()] == [1, 2, 3, 4, 5, 7, 8, 9]
     assert (store.anchor()["count"], store.anchor()["head"]) == (10, V._sha(log_lines(base)[-1]))
     assert len(list((base / "hosted_snapshots").iterdir())) == 2
-    assert "PASS" in run("parity") and "PASS" in run("verify")
+    # The approver's return is not on the site yet: the reviewer's next step differs there.
+    assert "  next step: local i07 RETURNED, hosted i08 AFTER_REVEAL_DUE: DIFFERENT" in run(
+        "parity", code=1)
+    run("push-returns")
+    assert "  next step: local i07 RETURNED, hosted i07 RETURNED: the same" in run("parity")
+    assert "PASS" in run("verify")
 
 
-def test_parity_names_each_reviewer_s_resume_point_and_fails_on_a_difference(run, store, base):
+def test_parity_compares_records_states_and_the_site_s_next_step(run, store, base,
+                                                                monkeypatch):
     rows = cutover(run, store, base)
-    out = run("parity")
-    assert "bundle: local " in out and ": the same" in out
-    assert ("REMOTE-2: records local 6, hosted 6: the same; forms 45: 45 equal, 0 different; "
-            "hosted lines not pulled: 0; resumes at i08 INDEPENDENT_SAVED") in out
-    assert "REMOTE-3: records local 1, hosted 1: the same" in out
-    assert "resumes at i07 INDEPENDENT_SAVED" in out and "TEST-1" not in out
+    bundle = store.active_bundle().bundle_id[:12]
+    assert run("parity").splitlines() == [
+        f"local bundle {bundle}",
+        (f"REMOTE-2: bundle {bundle}; records local 6, hosted 6: the same; forms 45: 45 equal, "
+         "0 different; hosted lines not pulled: 0"),
+        "  next step: local i08 AFTER_REVEAL_DUE, hosted i08 AFTER_REVEAL_DUE: the same",
+        (f"REMOTE-3: bundle {bundle}; records local 1, hosted 1: the same; forms 45: 45 equal, "
+         "0 different; hosted lines not pulled: 0"),
+        "  next step: local i07 AFTER_REVEAL_DUE, hosted i07 AFTER_REVEAL_DUE: the same",
+        "parity of the local log and the hosted store: PASS, 2 reviewer(s)"]  # no test identity
+    # The next step is the web app's own function: without it there is no parity.
+    with monkeypatch.context() as without:
+        without.setitem(sys.modules, "reviewer_web.forms", None)
+        out = run("parity", code=1)
+    assert out.startswith("NEXT_STEP_FUNCTION_MISSING") and "next step" not in out
+    assert out.splitlines()[-1].endswith("FAIL, 2 reviewer(s)")
+    # The site is ahead of the local log until the next pull.
     hosted_reveal(store, rows["REMOTE-2"], "i08")
     hosted_save(store, rows["REMOTE-2"], "i08", A.AFTER_REVEAL)
-    out = run("parity", code=1)  # the site is ahead of the local log until the next pull
-    assert ("REMOTE-2: records local 6, hosted 8: DIFFERENT; forms 45: 44 equal, 1 different; "
-            "hosted lines not pulled: 2; resumes at i01 INDEPENDENT_SAVED+SHOWN") in out
+    out = run("parity", code=1)
+    assert (f"REMOTE-2: bundle {bundle}; records local 6, hosted 8: DIFFERENT; forms 45: 44 "
+            "equal, 1 different; hosted lines not pulled: 2") in out
     assert "  i08: local INDEPENDENT_SAVED, hosted DONE" in out
+    assert "  next step: local i08 AFTER_REVEAL_DUE, hosted i01 AFTER_REVEAL_DUE: DIFFERENT" in out
     assert out.splitlines()[-1] == \
         "parity of the local log and the hosted store: FAIL, 2 reviewer(s)"
     run("pull-to-local")
-    assert "resumes at i01 INDEPENDENT_SAVED+SHOWN" in run("parity")
+    assert "  next step: local i01 AFTER_REVEAL_DUE, hosted i01 AFTER_REVEAL_DUE: the same" in run(
+        "parity")
+
+
+def test_one_extra_local_line_makes_parity_fail(run, store, base):
+    cutover(run, store, base)
+    assert "PASS" in run("parity")
+    A.mark_system_shown(base, A.load_bundle(base / "bundle", A.FULL), TWO, "i08")
+    out = run("parity", code=1)  # one marker the site does not hold: no form changes its step
+    assert "REMOTE-3: bundle " in out and "records local 2, hosted 1: DIFFERENT; forms 45: 44 " \
+        "equal, 1 different" in out
+    assert "  i08: local OPEN+SHOWN, hosted OPEN" in out
+    assert "  next step: local i07 AFTER_REVEAL_DUE, hosted i07 AFTER_REVEAL_DUE: the same" in out
+    assert "REMOTE-2: bundle " in out and "records local 6, hosted 6: the same" in out
+    local_save(base, ONE, "i08", A.AFTER_REVEAL)  # and one reading: the next step moves too
+    out = run("parity", code=1)
+    assert "  next step: local i01 AFTER_REVEAL_DUE, hosted i08 AFTER_REVEAL_DUE: DIFFERENT" in out
+    assert "imported 2 new line(s)" in run("import-log")  # no hosted save yet: both come over
+    assert "PASS" in run("parity")
 
 
 def test_import_log_refuses_a_log_that_is_not_the_imported_one(run, store, base, tmp_path):
@@ -608,9 +665,11 @@ def test_an_export_restored_into_an_empty_database_is_identical(cli, run, store,
                                                                 monkeypatch, tmp_path):
     rows = cutover(run, store, base)
     hosted_work(store, rows)
+    web_sessions(store, ("a", rows["REMOTE-2"].id), ("b", rows["TEST-1"].id))
     out_file = tmp_path / "exports" / "events.jsonl"
     out = run("export", "--out", out_file)
     data = out_file.read_bytes()
+    assert b"a" * 64 not in data and b"token" not in data  # events and the anchor, nothing else
     assert f"exported 14 event(s): LEGACY 7, HOSTED 7; {len(data)} bytes, sha256 " \
            f"{V._sha(data)}" in out
     assert stat.S_IMODE(out_file.stat().st_mode) == 0o600
@@ -622,6 +681,7 @@ def test_an_export_restored_into_an_empty_database_is_identical(cli, run, store,
         ("REMOTE-2", "HOSTED", HOSTED_1 + 2), ("REMOTE-2", "HOSTED", HOSTED_1 + 3),
         ("REMOTE-2", "HOSTED", HOSTED_1 + 4), ("REMOTE-3", "HOSTED", HOSTED_1 + 5),
         ("TEST-1", "HOSTED", HOSTED_1 + 6)]
+    assert [e["is_test"] for e in exported] == [False] * 13 + [True]  # a test row is marked
     assert [e["line"].encode() for e in exported[:7]] == [
         log_lines(base)[n - 1] for n in (1, 2, 3, 4, 5, 7, 8)]
     assert run("restore", "--in", out_file, code=2) == "refused: DATABASE_NOT_EMPTY\n"
@@ -631,18 +691,27 @@ def test_an_export_restored_into_an_empty_database_is_identical(cli, run, store,
     monkeypatch.setenv(cli.URL_ENV, empty)
     run("init-db")
     assert run("restore", "--in", out_file, code=2) == "refused: UNKNOWN_ALIAS\n"
+    run("publish-bundle", "--demo", base)
+    run("sync-reviewers", "--demo")
+    restored = cli.S.AdminStore(empty)
+    restored.upsert_reviewer("TEST-1", TESTER)  # the alias of a test identity, as a reviewer
+    assert run("restore", "--in", out_file, code=2) == "refused: ALIAS_IS_NOT_THE_SAME_KIND\n"
+    with restored.connection() as conn:
+        conn.execute("DELETE FROM reviewer WHERE alias = 'TEST-1'")
     run("sync-reviewers", "--test-identity", "TEST-1", TESTER)
     out = run("restore", "--in", out_file)
     assert "restored 14 event(s): LEGACY 7, HOSTED 7; every hash and the hosted chain " \
            f"verified; file sha256 {V._sha(data)}" in out
-    restored = cli.S.AdminStore(empty)
     assert restored.events() == events and restored.anchor() == anchor
     assert "verify: PASS" in run("verify")
     again = tmp_path / "exports" / "again.jsonl"
     run("export", "--out", again)
     assert again.read_bytes().splitlines()[1:] == data.splitlines()[1:]
+    # Sign-in codes and web sessions are never exported or restored: everyone signs in again.
+    with restored.connection() as conn:
+        assert conn.execute("SELECT (SELECT count(*) FROM web_session),"
+                            " (SELECT count(*) FROM login_code)").fetchone() == (0, 0)
     # The restored site goes on where the other stopped: the next line continues the chain.
-    run("publish-bundle", "--demo", base)
     [nxt] = hosted_save(restored, restored.reviewer_by_login(TWO.login), "i08",
                         A.AFTER_REVEAL).records
     assert (nxt["seq"], nxt["prev_sha256"], nxt["refers_to"]) == (
@@ -661,6 +730,8 @@ def test_restore_refuses_an_export_that_fails_verification(cli, run, store, base
     empty = hosted_pg.fresh_database()
     monkeypatch.setenv(cli.URL_ENV, empty)
     run("init-db")
+    run("publish-bundle", "--demo", base)
+    run("sync-reviewers", "--demo")
     run("sync-reviewers", "--test-identity", "TEST-1", TESTER)
 
     def restore(name: str, lines: list[str]) -> str:
@@ -690,8 +761,9 @@ def test_restore_refuses_an_export_that_fails_verification(cli, run, store, base
 
 
 def test_status_gives_times_and_counts_by_phase_per_alias(run, store, base):
-    assert run("status").splitlines() == ["bundle: none published",
-                                          "anchor: none (no log imported)"]
+    assert run("status").splitlines() == [
+        "real bundle: none published", "demonstration bundle: none published",
+        "anchor: none (no log imported)", "test identities: 0 (see test-report ALIAS)"]
     rows = cutover(run, store, base)
     hosted_work(store, rows)
     with store.connection() as conn:  # what the web app records at the first sign-in
@@ -699,20 +771,21 @@ def test_status_gives_times_and_counts_by_phase_per_alias(run, store, base):
                      " first_sign_in_at = '2026-03-09T07:15:00Z' WHERE alias = 'REMOTE-2'")
     run("revoke", "REMOTE-3")
     out = run("status").splitlines()
-    assert re.match(r"bundle [0-9a-f]{12}: demonstration data, published \d{4}-\d\d-\d\dT",
-                    out[0])
-    assert "scope 40 of 33 sequence(s)" in out[0] and "1 image(s)" in out[0]
-    assert out[1].startswith("anchor: 8 line(s), head ")
+    bundle = store.active_bundle().bundle_id[:12]
+    assert out[0] == "real bundle: none published"
+    assert re.match(rf"demonstration bundle {bundle}: published \d{{4}}-\d\d-\d\dT\S+, scope 40 "
+                    r"of 33 sequence\(s\), \d+ bytes, 1 image\(s\) \d+ bytes$", out[1])
+    assert out[2].startswith("anchor: 8 line(s), head ")
     first = json.loads(store.events()[7]["line"])["at"][:19]
-    assert out[2] == ("REMOTE-2: scope 40, invited 2026-03-08T09:00:00+00:00, first sign-in "
-                      f"2026-03-09T07:15:00+00:00, first hosted save {first}+00:00, revoked -")
-    assert out[3:5] == ["  LEGACY: INDEPENDENT 3, SYSTEM_SHOWN 2, AFTER_REVEAL 1",
+    assert out[3] == (f"REMOTE-2: bundle {bundle}, scope 40, invited 2026-03-08T09:00:00+00:00, "
+                      "first sign-in 2026-03-09T07:15:00+00:00, first hosted save "
+                      f"{first}+00:00, revoked -")
+    assert out[4:6] == ["  LEGACY: INDEPENDENT 3, SYSTEM_SHOWN 2, AFTER_REVEAL 1",
                         "  HOSTED: SYSTEM_SHOWN 2, AFTER_REVEAL 2, INDEPENDENT 1"]
-    assert re.fullmatch(r"REMOTE-3: scope 40, invited -, first sign-in -, first hosted save "
-                        r"\d{4}-\S+, revoked \d{4}-\S+", out[5])
-    assert out[6:8] == ["  LEGACY: INDEPENDENT 1", "  HOSTED: INDEPENDENT 1"]
-    assert out[8].startswith("TEST-1 (test identity): scope 40,")
-    assert out[9:] == ["  HOSTED: INDEPENDENT 1"]
+    assert re.fullmatch(rf"REMOTE-3: bundle {bundle}, scope 40, invited -, first sign-in -, "
+                        r"first hosted save \d{4}-\S+, revoked \d{4}-\S+", out[6])
+    assert out[7:] == ["  LEGACY: INDEPENDENT 1", "  HOSTED: INDEPENDENT 1",
+                       "test identities: 1 (see test-report ALIAS)"]  # none of its lines here
 
 
 # ------------------------------------------------------------------ the approver's returns
@@ -734,7 +807,7 @@ def standing_return(records: list[dict], bundle: A.Bundle, login: str, item_id: 
 
 
 def hosted_return(store, row, item_id: str):
-    return standing_return(store.records_of(row), store.active_bundle(), row.login_shown,
+    return standing_return(store.records_of(row), store.bundle_for(row), row.login_shown,
                            item_id)
 
 
@@ -759,10 +832,12 @@ def test_a_local_return_reaches_its_reviewer_and_a_corrected_save_supersedes_it(
     assert "pushed 0 new return(s): -; 0 already stored; 0 skipped" in run("push-returns")
     local = decide(base, "i03", 11, "RETURN", NOTE)  # line 12
     decide(base, "i07", 3, "RETURN", "Look at the entry again.")  # line 13, of the local line 3
+    assert "  next step: local i07 RETURNED, hosted i08 AFTER_REVEAL_DUE: DIFFERENT" in run(
+        "parity", code=1)  # the approver is waiting, and the site does not say so yet
     out = run("push-returns")
     assert NOTE not in out and out.splitlines() == [
         ("returns that stand in the local log: 2; 0 of a reading that was not made by a hosted "
-         "reviewer"),
+         "reviewer of this bundle"),
         ("pushed 2 new return(s): REMOTE-2 2; 0 already stored; 0 skipped (the returned reading "
          "is not in the hosted store)"),
         f"  REMOTE-2 i03: return {RETURN_1 + 11} of the reading {HOSTED_1 + 2}",
@@ -796,7 +871,8 @@ def test_a_local_return_reaches_its_reviewer_and_a_corrected_save_supersedes_it(
     assert "pushed 0 new return(s): -; 2 already stored; 0 skipped" in run("push-returns")
     assert store.events() == events
     assert "events: LEGACY 7, HOSTED 3, RETURN 2" in run("verify")
-    assert "PASS" in run("parity") and "  RETURN: APPROVAL 2" in run("status")
+    assert "  next step: local i07 RETURNED, hosted i07 RETURNED: the same" in run("parity")
+    assert "  RETURN: APPROVAL 2" in run("status")
     # The reviewer saves a corrected reading on the site: it chains on normally, and the return
     # no longer stands (the other one still does).
     [fixed] = hosted_save(store, one, "i03", A.AFTER_REVEAL, confidence="MEDIUM").records
@@ -844,7 +920,7 @@ def test_a_pushed_return_that_the_approver_took_back_is_reported(run, store, bas
     decide(base, "i07", 3, "RETURN", NOTE)  # line 9
     assert "pushed 1 new return(s): REMOTE-2 1" in run("push-returns")
     decide(base, "i07", 3, "ACCEPT")  # line 10: decided again, without a new reading
-    assert standing_return(A.read_annotations(base).records, store.active_bundle(), ONE.login,
+    assert standing_return(A.read_annotations(base).records, store.bundle_for(one), ONE.login,
                            "i07") is None
     out = run("push-returns")  # no line of the store can be taken back: the operator is told
     assert "returns that stand in the local log: 0;" in out
@@ -866,15 +942,14 @@ def test_returns_survive_export_and_restore_and_verify_checks_what_they_name(
     run("push-returns")
     run("export", "--out", tmp_path / "x" / "events.jsonl")
     events = store.events()
-    original = monkeypatch.setenv(cli.URL_ENV, hosted_pg.fresh_database())
-    assert original is None
+    monkeypatch.setenv(cli.URL_ENV, hosted_pg.fresh_database())
     run("init-db")
-    run("sync-reviewers", "--test-identity", "TEST-1", TESTER)
+    run("publish-bundle", "--demo", base)
+    run("sync-reviewers", "--demo")
     assert "restored 8 event(s): LEGACY 7, RETURN 1" in run(
         "restore", "--in", tmp_path / "x" / "events.jsonl")
     restored = cli.S.AdminStore(os.environ[cli.URL_ENV])
     assert restored.events() == events
-    run("publish-bundle", "--demo", base)
     assert hosted_return(restored, restored.reviewer_by_login(ONE.login), "i07")["notes"] == NOTE
     assert "verify: PASS" in run("verify")
     # A return that names a reading of another reviewer, or no reading after the reveal.
@@ -895,3 +970,89 @@ def test_returns_survive_export_and_restore_and_verify_checks_what_they_name(
     # Another folder's log is not the log this store continues.
     assert run("push-returns", "--dir", write_demo(tmp_path / "other"), code=2) == \
         "refused: LOCAL_LOG_IS_NOT_THE_ANCHORED_LOG\n"
+
+
+# ------------------------------------------------------------------ a test identity in production
+
+
+def test_a_test_identity_works_on_invented_forms_beside_the_reviewers_on_the_real_bundle(
+        run, store, base, tmp_path):
+    # ``base`` stands in for the real folder (other content than the demo script writes, and
+    # not flagged as its bundle); ``demo`` is the invented folder for test identities.
+    demo = write_demo(tmp_path / "demo")
+    edit(base / "bundle" / "posts.jsonl",
+         lambda rows: rows["p09"].update(text="Back on Wednesday, after the holiday."))
+    chart = base / "bundle" / "media" / "chart-p01.png"
+    chart.write_bytes(chart.read_bytes() + b"another invented chart")
+    reseal(base, product_commit="abc1234")
+    real_id, demo_id = (A.bundle_digest(d / "bundle") for d in (base, demo))
+    half_way(base)
+    run("init-db")
+    assert "the real bundle (the demonstration bundle stays)" in run("publish-bundle")
+    assert "demonstration data (for test identities; the real bundle stays)" in run(
+        "publish-bundle", "--demo", demo)
+    assert f"REMOTE-2: id 1, REVIEWER, FULL, scope 40, bundle {real_id[:12]}\n" in run(
+        "sync-reviewers")
+    assert run("sync-reviewers", "--test-identity", "TEST-1", TESTER).startswith(
+        f"TEST-1: id 3, REVIEWER, FULL, scope 40, bundle {demo_id[:12]} (demonstration data), "
+        "test identity\n")
+    rows = {r.alias: r for r in store.reviewers()}
+    one, tester = rows["REMOTE-2"], rows["TEST-1"]
+    assert real_id != demo_id and [r.bundle_id for r in rows.values()] == [
+        real_id, real_id, demo_id]
+    # Each is served their own bundle: forms, posts, images.
+    assert (store.bundle_for(one).bundle_id, store.is_demo(one)) == (real_id, False)
+    assert (store.bundle_for(tester).bundle_id, store.is_demo(tester)) == (demo_id, True)
+    assert store.bundle_for(one).posts["p09"]["text"] != store.bundle_for(
+        tester).posts["p09"]["text"]
+    assert store.media(one, "p01", "chart-p01.png") == (chart.read_bytes(), "image/png")
+    assert store.media(tester, "p01", "chart-p01.png") == (
+        (demo / "bundle" / "media" / "chart-p01.png").read_bytes(), "image/png")
+    # The cutover and the work: the reviewer on the real forms, the test identity on invented ones.
+    assert "imported 7 new line(s)" in run("import-log")
+    hosted_reveal(store, one, "i08")  # 1000001
+    hosted_save(store, one, "i08", A.AFTER_REVEAL)  # 1000002
+    hosted_save(store, tester, "i07", A.INDEPENDENT)  # 1000003
+    hosted_reveal(store, tester, "i07")  # 1000004
+    assert [r["bundle_id"] for r in store.records_of(tester)] == [demo_id] * 2
+    assert {r["bundle_id"] for r in store.records_of(one)} == {real_id}
+    assert len(store.records_of(one)) == 8  # the imported six and the two hosted, no one else's
+    # The report of the test identity: sign-in, sessions, events, form states. Never an address.
+    web_sessions(store, ("a", tester.id), ("b", one.id))
+    with store.connection() as conn:
+        conn.execute("UPDATE reviewer SET first_sign_in_at = '2026-03-09T07:15:00Z'"
+                     " WHERE alias = 'TEST-1'")
+    out = run("test-report", "TEST-1").splitlines()
+    assert out[0] == (f"TEST-1 (test identity): bundle {demo_id[:12]} (demonstration data), "
+                      "scope 40, first sign-in 2026-03-09T07:15:00+00:00, web sessions 1, "
+                      "revoked -")
+    assert out[1] == "events: 2"
+    assert re.fullmatch(rf"  {HOSTED_1 + 2} \d{{4}}-\S+ INDEPENDENT i07", out[2])
+    assert re.fullmatch(rf"  {HOSTED_1 + 3} \d{{4}}-\S+ SYSTEM_SHOWN i07", out[3])
+    assert out[4:] == ["TEST-1: records 2; forms 45: INDEPENDENT_SAVED+SHOWN 1, OPEN 44",
+                       "  i07 INDEPENDENT_SAVED+SHOWN"]
+    assert run("test-report", "REMOTE-2", code=2) == "refused: NOT_A_TEST_IDENTITY\n"
+    assert run("test-report", "TEST-9", code=2) == "refused: UNKNOWN_ALIAS\n"
+    # The reviewers' commands leave the test identity alone: its events are never pulled.
+    out = run("parity", code=1)
+    assert "TEST-1" not in out and "hosted lines not pulled: 2" in out
+    assert "pulled 2 hosted line(s) into the local log: REMOTE-2 2; 0 already held" in run(
+        "pull-to-local")
+    text = A.annotations_path(base).read_text()
+    assert TESTER not in text and demo_id not in text
+    out = run("parity")
+    assert "TEST-1" not in out and out.splitlines()[-1].endswith("PASS, 2 reviewer(s)")
+    out = run("status")
+    assert out.startswith(f"real bundle {real_id[:12]}: published ")
+    assert f"\ndemonstration bundle {demo_id[:12]}: published " in out
+    assert out.count("TEST-1") == 0 and out.splitlines()[-1] == \
+        "test identities: 1 (see test-report ALIAS)"
+    assert "PASS" in run("verify") and "imported 0 new line(s)" in run("import-log")
+    # Nothing moves a test identity onto real content, and publishing again keeps both bundles.
+    with pytest.raises(A.AdjudicationError, match="TEST_IDENTITY_NEEDS_A_DEMO_BUNDLE"):
+        store.upsert_reviewer("TEST-1", TESTER, is_test=True, bundle_id=real_id)
+    run("publish-bundle", "--demo", demo)
+    run("publish-bundle")
+    assert (store.published(demo=False)["bundle_id"], store.published(demo=True)["bundle_id"]) \
+        == (real_id, demo_id)
+    assert store.bundle_for(tester).bundle_id == demo_id

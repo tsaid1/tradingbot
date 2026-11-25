@@ -201,18 +201,58 @@ python scripts/hosted_admin.py status
 | command | what it does |
 | --- | --- |
 | `init-db` | Applies `hosted/reviewer_web/schema.sql`. Every statement can be run again. |
-| `sync-reviewers` | Writes the remote reviewers of `reviewers.toml` as rows: login, name, role, scope, and the access a remote session has by that file (FULL only while `remote_full_context_authorized = true`, else RESTRICTED, which the site does not serve). Never deletes: an entry that left the file keeps its row, so revoke it. Refused when an alias would pass to another sign-in (`ALIAS_OR_LOGIN_HELD_BY_ANOTHER_ROW`) or the file's scope is larger than the published one (`SCOPE_NOT_PUBLISHED`: publish first). `--test-identity TEST-1 LOGIN` also writes a test row: it works like a reviewer, and its saves are never pulled into the local log. |
-| `revoke ALIAS` | Sets `revoked_at` and deletes that reviewer's web sessions. From that moment sign-in, every page and every save are refused; the records stay. |
+| `sync-reviewers` | Writes the remote reviewers of `reviewers.toml` as rows, bound to the active REAL bundle: login, name, role, scope, and the access a remote session has by that file (FULL only while `remote_full_context_authorized = true`, else RESTRICTED, which the site does not serve). Never deletes: an entry that left the file keeps its row, so revoke it. Refused while no real bundle is published (`NO_REAL_BUNDLE_PUBLISHED`), when an alias would pass to another sign-in (`ALIAS_OR_LOGIN_HELD_BY_ANOTHER_ROW`) or the file's scope is larger than the published one (`SCOPE_NOT_PUBLISHED`: publish first). `--demo` binds them to the demonstration bundle instead (a preview database, tests). |
+| `sync-reviewers --test-identity TEST-1 LOGIN` | Instead: writes (or updates) the test identity `TEST-<n>` for that sign-in, bound to the active DEMONSTRATION bundle with that bundle's scope (`NO_DEMO_BUNDLE_PUBLISHED` while there is none). The reviewers file is not read. |
+| `revoke ALIAS` | Sets `revoked_at` and deletes that reviewer's web sessions and sign-in codes not yet used. From that moment sign-in, every page and every save are refused; the records stay. |
 | `restore-access ALIAS` | Clears the revocation (the reviewer signs in again). |
-| `publish-bundle` | Verifies the local bundle (`BUNDLE_ID_MISMATCH` otherwise), cuts the part the scope needs, checks parity, uploads and marks it active. Refused unless `remote_full_context_authorized = true` (`REMOTE_FULL_CONTEXT_NOT_AUTHORIZED`): the posts leave the Mac only by the owner's switch. `--check-only` cuts and checks without a database. `--demo DIR` publishes the invented demo folder `DIR` instead, flagged as demonstration data (and refuses any other bundle: `NOT_A_DEMO_BUNDLE`). |
+| `publish-bundle` | Verifies the local bundle (`BUNDLE_ID_MISMATCH` otherwise), cuts the part the scope needs, checks parity, uploads and marks it THE active real bundle. Refused unless `remote_full_context_authorized = true` (`REMOTE_FULL_CONTEXT_NOT_AUTHORIZED`): the posts leave the Mac only by the owner's switch. `--check-only` cuts and checks without a database. `--demo DIR` publishes the invented demo folder `DIR` instead, as THE active demonstration bundle (and refuses any other bundle: `NOT_A_DEMO_BUNDLE`). The two kinds are active side by side: publishing one never deactivates the other. |
 | `import-log` | Verifies the local log (chain and head), copies it and its head file into a snapshot folder, imports the remote reviewers' lines, records the anchor. Can be run again. |
-| `parity` | Compares, per alias, the local log with the hosted store: the reviewer's records and the state of every form in scope. PASS or FAIL, and where each reviewer resumes. |
+| `parity` | Compares, per reviewer, the local log with the hosted store: the reviewer's records, the state of every form in scope, and the NEXT STEP as the web app's own functions compute it (`reviewer_web.forms.next_step` and `step_state`), once over the local log and once over what the site serves. PASS only when all agree. |
 | `export --out FILE` | Every event as JSONL (mode 0600, never over an existing file, never inside the repository): a header with the anchor, then per event its alias, origin, `seq`, hashes and exact line. |
 | `restore --in FILE` | Loads an export into an EMPTY database and verifies every hash and the hosted chain. |
 | `pull-to-local` | Appends the hosted saves the local log does not hold yet to the local log. |
 | `push-returns` | Stores the approver's standing local RETURN decisions for the reviewers whose readings they return. |
-| `status` | The published bundle and the anchor; per alias: scope, invited, first sign-in, first hosted save, revoked, and the lines by origin and phase. |
+| `status` | The two bundles and the anchor; per reviewer: bundle, scope, invited, first sign-in, first hosted save, revoked, and the lines by origin and phase. Test identities are only counted. |
+| `test-report ALIAS` | For a test identity only: its bundle, first sign-in, number of web sessions, each of its events (seq, time, phase, item id) and the state of every form that is not open. This is how a sign-in, a save and a resume on the production site are checked without touching a reviewer. |
 | `verify` | The hosted chain (every line against its hash, 1000001, 1000002, ... from the anchor) and the imported lines against the newest snapshot, in both directions. |
+
+### Real reviewers and test identities in one database
+
+Every reviewer row is bound to ONE bundle (`reviewer.bundle_id`), and the site serves a reviewer
+nothing else: forms, images, records and saves are of that bundle only. Two bundles are active
+side by side, at most one of each kind:
+
+* the **real** bundle (`publish-bundle`), on which the reviewers of `reviewers.toml` work
+  (`sync-reviewers`);
+* the **demonstration** bundle (`publish-bundle --demo DIR`, invented data), on which a test
+  identity works (`sync-reviewers --test-identity TEST-1 LOGIN`).
+
+A test identity is served a bundle only while that bundle is flagged as demonstration data: the
+tool refuses to bind one to the real bundle (`TEST_IDENTITY_NEEDS_A_DEMO_BUNDLE`), the store
+refuses to publish as real a bundle a test identity works on, and every query of the site checks
+the flag again. `import-log`, `parity`, `pull-to-local`, `push-returns` and `status` act on the
+reviewers only; a test identity's events stay in the store (`export` and `restore` keep them,
+marked `is_test`) and never reach the local log.
+
+```bash
+python scripts/hosted_admin.py publish-bundle --demo ~/adjudication-demo
+python scripts/hosted_admin.py sync-reviewers --test-identity TEST-1 LOGIN
+# ... sign in as that identity on the site, save a form, sign in again ...
+python scripts/hosted_admin.py test-report TEST-1
+```
+
+```text
+TEST-1 (test identity): bundle 5bee31e4acb2 (demonstration data), scope 40, first sign-in 2026-03-09T07:15:00+00:00, web sessions 1, revoked -
+events: 2
+  1000004 2026-03-09T07:21:10+00:00 INDEPENDENT i07
+  1000005 2026-03-09T07:21:40+00:00 SYSTEM_SHOWN i07
+TEST-1: records 2; forms 45: INDEPENDENT_SAVED+SHOWN 1, OPEN 44
+  i07 INDEPENDENT_SAVED+SHOWN
+```
+
+A new real bundle (another `bundle_id`) does not move anyone by itself: after `publish-bundle`,
+`sync-reviewers` binds the reviewers to it, and they are then served the records of that bundle
+only.
 
 ### What is published
 
@@ -267,8 +307,8 @@ Rehearse steps 1 to 3 while the present site still serves: every command can be 
 
 1. `init-db`, `publish-bundle --check-only`, `publish-bundle`, `sync-reviewers`, `status`.
 2. `import-log`, then `parity` and `verify`: both PASS.
-3. Sign in as a test identity (`sync-reviewers --test-identity TEST-1 LOGIN`) and work through a
-   form.
+3. `publish-bundle --demo DIR`, `sync-reviewers --test-identity TEST-1 LOGIN`: sign in as that
+   test identity, work through an invented form, and read `test-report TEST-1`.
 4. **Pause the writers**: stop the present published site, so that no remote reviewer can save
    into the local log. Do not save locally yourself during the next steps.
 5. **Verify** the local log: `python scripts/adjudication_freeze.py verify`.
@@ -277,7 +317,7 @@ Rehearse steps 1 to 3 while the present site still serves: every command can be 
    the log, its head file, the sha256 of the log's bytes), imports only the lines that are new
    since the rehearsal, and moves the anchor to the log's present head.
 7. **Parity**: `parity` PASS, `verify` PASS. Compare the per-alias lines and form states that
-   `import-log` printed with what you expect.
+   `import-log` printed, and each reviewer's next step, with what you expect.
 8. Open the hosted site to the reviewers.
 
 ```text
@@ -316,6 +356,20 @@ record it means, and `hosted = {"seq", "sha256"}` naming the hosted line. It can
 refuses a folder whose log is not the one the site continues
 (`LOCAL_LOG_IS_NOT_THE_ANCHORED_LOG`) and a store that fails verification. Between pulls `parity`
 says FAIL with `hosted lines not pulled: n`; after a pull it must PASS.
+
+```text
+local bundle 5bee31e4acb2
+REMOTE-1: bundle 5bee31e4acb2; records local 6, hosted 8: DIFFERENT; forms 45: 44 equal, 1 different; hosted lines not pulled: 2
+  i08: local INDEPENDENT_SAVED, hosted DONE
+  next step: local i08 AFTER_REVEAL_DUE, hosted i01 AFTER_REVEAL_DUE: DIFFERENT
+parity of the local log and the hosted store: FAIL, 1 reviewer(s)
+```
+
+The next step is the form the site's "Continue" opens and where it stands (INDEPENDENT_DUE,
+REVEAL_PENDING, AFTER_REVEAL_DUE, RETURNED). On the local side it is computed over the
+reviewer's lines and the approver's decisions of the local log; so a RETURN that was decided
+locally and not pushed yet also shows as a difference, until `push-returns`. Without the web
+app's functions the command prints `NEXT_STEP_FUNCTION_MISSING` and fails.
 
 ### Returned readings
 
@@ -372,11 +426,17 @@ python scripts/hosted_admin.py export --out ~/hosted-backups/events-1.jsonl
 ```
 
 An export holds every reading and the sign-ins inside its lines: keep it like the adjudication
-folder. To restore into a new, EMPTY database: `init-db`, `sync-reviewers` (the same reviewers
-file gives the same aliases), `restore --in FILE`, `publish-bundle`, `verify`. Refused:
-`DATABASE_NOT_EMPTY`, `UNKNOWN_ALIAS` (sync first), `EXPORT_UNREADABLE`,
-`EXPORT_FAILS_VERIFICATION` (a line that does not match its hash, a gap in the hosted chain, an
-anchor the first hosted line does not name). The restored site continues the same chain.
+folder. It holds the events (each with its alias and whether that is a test identity) and the
+anchor, and nothing else: sign-in codes, web sessions and rate limits are never exported or
+restored, so after a restore everyone signs in again; bundles and reviewer rows are written
+again by their own commands. To restore into a new database: `init-db`, `publish-bundle` (and
+`publish-bundle --demo DIR`), `sync-reviewers` (the same reviewers file gives the same aliases;
+the test identities again by `--test-identity`), `restore --in FILE`, `verify`. "Empty" means no
+event and no anchor. Refused: `DATABASE_NOT_EMPTY`, `UNKNOWN_ALIAS` (sync first),
+`ALIAS_IS_NOT_THE_SAME_KIND` (a test identity's lines under a reviewer's alias, or the reverse),
+`EXPORT_UNREADABLE`, `EXPORT_FAILS_VERIFICATION` (a line that does not match its hash, a gap in
+the hosted chain, an anchor the first hosted line does not name). The restored site continues
+the same chain.
 
 ### Rollback to the present site
 
@@ -387,11 +447,12 @@ anchor the first hosted line does not name). The restored site continues the sam
    after the reveal refers to a pulled independent reading like to any other line.
 
 To go back to the hosted site after reviewers have saved locally again, start from an EMPTY
-database (`init-db`, `sync-reviewers`, `publish-bundle`, `import-log`): the whole local log,
+database (`init-db`, `publish-bundle`, `sync-reviewers`, `import-log`): the whole local log,
 pulled copies included, is then imported as the reviewers' local lines.
 
 ### Revoking a reviewer
 
 `revoke REMOTE-2` takes effect at once: the site checks the row on every request and every save,
-and the reviewer's sessions are deleted. Nothing of the reviewer's work is removed.
+and the reviewer's sessions and open sign-in codes are deleted. Nothing of the reviewer's work is
+removed.
 `restore-access REMOTE-2` lifts it. Removing the entry from `reviewers.toml` does not revoke.
