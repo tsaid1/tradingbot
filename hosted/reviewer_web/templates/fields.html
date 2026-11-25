@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block title %}Field reference{% endblock %}
+{% block main %}
+<article class="page prose">
+  <h1>Field reference</h1>
+  <p>Answer states: "" unanswered; NOT_STATED the publisher did not state it; CANNOT_DETERMINE it
+  probably exists but the evidence does not settle it (needs an ambiguity or a flag);
+  NOT_APPLICABLE set by the form when a field does not apply.</p>
+  <h2>Which fields apply</h2>
+  <pre class="plain scroll">{{ applicability }}</pre>
+  {% for group in groups %}
+  <h2>{{ group.code }}. {{ group.title }}</h2>
+  {% for f in group.fields %}
+  <h3>{{ f.question }} <code class="fname">[{{ f.name }}]</code></h3>
+  <p>{{ f.tooltip }}</p>
+  {% if f.applies %}<p>Applies: {{ f.applies }}.</p>{% endif %}
+  {% if f.set_by_form %}<p>Set by the form: {{ f.set_by_form }}.</p>{% endif %}
+  <dl class="meanings">
+    {% for code, meaning in f["values"] %}<div><dt>{{ code }}</dt><dd>{{ meaning }}</dd></div>{% endfor %}
+  </dl>
+  {% for e in f.examples %}<p class="quiet-text">Invented example: {{ e }}</p>{% endfor %}
+  {% endfor %}
+  {% endfor %}
+  <h2>What Save refuses</h2>
+  <dl class="meanings">
+    {% for code, meaning in blocking %}<div><dt>{{ code }}</dt><dd>{{ meaning }}</dd></div>{% endfor %}
+  </dl>
+  <h2>Warnings (saving needs the tick "I have checked these")</h2>
+  <dl class="meanings">
+    {% for code, meaning in warnings %}<div><dt>{{ code }}</dt><dd>{{ meaning }}</dd></div>{% endfor %}
+  </dl>
+</article>
+{% endblock %}

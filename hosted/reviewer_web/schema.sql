@@ -115,3 +115,33 @@ CREATE TABLE IF NOT EXISTS chain_anchor (
 -- ---------------------------------------------------------------------------------------------
 -- WEB's section (sign-in codes, sessions, rate limits) starts below this line.
 -- ---------------------------------------------------------------------------------------------
+-- Sign-in codes, sessions and rate limits of the web app (hosted/reviewer_web/auth.py).
+-- No address, code or token is stored: a code as HMAC-SHA256 under the server's secret, a session
+-- token as SHA-256, a limit bucket as a keyed hash. Every statement can be run again.
+
+CREATE TABLE IF NOT EXISTS login_code (
+    id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    reviewer_id BIGINT NOT NULL REFERENCES reviewer (id) ON DELETE CASCADE,
+    code_hmac   TEXT NOT NULL CHECK (code_hmac ~ '^[0-9a-f]{64}$'),
+    created_at  TIMESTAMPTZ NOT NULL,
+    expires_at  TIMESTAMPTZ NOT NULL,          -- ten minutes after created_at
+    attempts    INT NOT NULL DEFAULT 0,        -- every try, right or wrong; at most five
+    used_at     TIMESTAMPTZ                    -- set by the sign-in, or by a newer code
+);
+CREATE INDEX IF NOT EXISTS login_code_by_reviewer ON login_code (reviewer_id, id);
+
+CREATE TABLE IF NOT EXISTS web_session (
+    token_sha256 TEXT PRIMARY KEY CHECK (token_sha256 ~ '^[0-9a-f]{64}$'),
+    reviewer_id  BIGINT NOT NULL REFERENCES reviewer (id) ON DELETE CASCADE,
+    created_at   TIMESTAMPTZ NOT NULL,
+    last_seen_at TIMESTAMPTZ NOT NULL,
+    expires_at   TIMESTAMPTZ NOT NULL          -- thirty days after last_seen_at (sliding)
+);
+CREATE INDEX IF NOT EXISTS web_session_by_reviewer ON web_session (reviewer_id);
+
+CREATE TABLE IF NOT EXISTS rate_limit (
+    id     BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    bucket TEXT NOT NULL,                      -- 'to:', 'net:' or 'try:' and a keyed hash
+    at     TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS rate_limit_by_bucket ON rate_limit (bucket, at);

@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block title %}Reviewer guide{% endblock %}
+{% block main %}
+<article class="page prose">
+  {% for kind, text in blocks %}
+  {% if kind == "title" %}<h1>{{ text }}</h1>
+  {% elif kind == "heading" %}<h2>{{ text }}</h2>
+  {% else %}<p>{{ text }}</p>{% endif %}
+  {% endfor %}
+  <h2>How to review</h2>
+  {% for line in how %}<p>{{ line }}</p>{% endfor %}
+</article>
+{% endblock %}
