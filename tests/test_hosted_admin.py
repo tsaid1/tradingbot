@@ -389,10 +389,10 @@ def test_sync_reviewers_reads_the_owner_s_file_and_never_deletes(run, store, bas
     assert out.splitlines() == [f"REMOTE-2: id 1, REVIEWER, FULL, scope 40, {bundle}",
                                 f"REMOTE-3: id 2, REVIEWER, FULL, scope 40, {bundle}",
                                 "2 reviewer row(s) written; none deleted",
-                                "REMOTE-2: closed until import-log runs (no save is accepted "
-                                "before)",
-                                "REMOTE-3: closed until import-log runs (no save is accepted "
-                                "before)"]
+                                ("REMOTE-2: closed until import-log runs (no save is accepted "
+                                 "before)"),
+                                ("REMOTE-3: closed until import-log runs (no save is accepted "
+                                 "before)")]
     assert store.reviewer_by_login(ONE.login).session() == ONE
     assert "TEST_ALIAS_IS_TEST_N" in run("sync-reviewers", "--test-identity", "REMOTE-9", TESTER,
                                          code=2)

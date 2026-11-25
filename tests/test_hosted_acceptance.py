@@ -103,3 +103,24 @@ def test_the_command_prints_ids_and_counts_only(seeding, dsn, monkeypatch, capsy
     assert out.startswith("ACCEPT-2: bundle ") and "@" not in out and "returned: s01a" in out
     assert seeding.main(["seed", "--alias", "ACCEPT-2"]) == 2
     assert capsys.readouterr().err == "refused: ALREADY_SEEDED\n"
+
+
+def test_several_testers_are_seeded_on_one_preview(seeding, store, tmp_path):  # noqa: F811
+    """Each seeded tester's returned reading has its own RETURN line (a second seed failed on
+    the preview with a duplicate seq); and each form of the sequence shows every earlier post
+    of it (post 3 closes the long that post 2 added to)."""
+    from reviewer_web import forms as F
+
+    store.mark_preview()
+    for alias in ("ACCEPT-1", "ACCEPT-2"):
+        seeding.seed(store, seeding.write(tmp_path / alias), alias)
+    returns = [(e["alias"], e["seq"]) for e in store.events() if e["origin"] == "RETURN"]
+    assert [a for a, _seq in returns] == ["ACCEPT-1", "ACCEPT-2"] and len(set(returns)) == 2
+    for row in store.reviewers():
+        records = store.records_of(row)
+        assert F.step_state(store.bundle_for(row), row.session(), records, "s01a") == F.RETURNED
+    bundle = store.bundle_for(store.reviewers()[0])
+    for item in ("s01a", "s05a", "s14a", "s14b", "s18a"):
+        post = bundle.items[item]["post_ref"]
+        assert bundle.items[item]["context_refs"] == list(
+            seeding.POSTS[:seeding.POSTS.index(post)]), item

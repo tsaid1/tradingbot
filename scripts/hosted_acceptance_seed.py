@@ -72,6 +72,9 @@ def write(directory: Path) -> Path:
     for item in items:
         if item["post_ref"] in POSTS:
             item["sequence_id"] = SEQUENCE
+            # Every earlier post of the sequence is shown with a form (post 3 closes the long
+            # that post 2 added to).
+            item["context_refs"] = list(POSTS[:POSTS.index(item["post_ref"])])
     moved = {f"sc{p}" for p in POSTS} - {SEQUENCE}
     order = 1
     kept = []
@@ -152,7 +155,13 @@ def _save(store, reviewer, item_id: str, *, after: bool) -> dict:
     return store.append(reviewer, make).records[-1]
 
 
-def seed(admin, base: Path, alias: str, login: str = LOGIN) -> dict:
+def login_of(alias: str) -> str:
+    """The invented sign-in of a tester: ACCEPT-1's is LOGIN, ACCEPT-n's carries n."""
+    n = alias.rsplit("-", 1)[-1]
+    return LOGIN if n == "1" else LOGIN.replace("@", f"-{n}@")
+
+
+def seed(admin, base: Path, alias: str, login: str | None = None) -> dict:
     """Publish the acceptance folder as the active demonstration bundle and put ``alias`` into
     the acceptance state. Refused on a database that holds a bundle that is not invented."""
     from reviewer_web.store import EventLine, sha256
@@ -180,7 +189,7 @@ def seed(admin, base: Path, alias: str, login: str = LOGIN) -> dict:
     with admin.connection():
         bundle = admin.publish_bundle(*files, media, is_demo=True,
                                       source_sequences=len(files[1].splitlines()))
-        row = admin.upsert_reviewer(alias, login, name="Acceptance Tester", scope_sequences=40,
+        row = admin.upsert_reviewer(alias, login or login_of(alias), name="Acceptance Tester", scope_sequences=40,
                                     bundle_id=bundle.bundle_id)
         if any(e["alias"] == alias for e in admin.events()):
             raise A.AdjudicationError("ALREADY_SEEDED")
@@ -193,8 +202,12 @@ def seed(admin, base: Path, alias: str, login: str = LOGIN) -> dict:
     reading = _save(admin, row, RETURNED, after=True)
     tool = _module("hosted_admin_acceptance", REPO / "scripts" / "hosted_admin.py")
     reviewed = next(e for e in admin.events() if e["seq"] == reading["seq"])
-    approval = {"seq": 1, "at": reading["at"], "bundle_id": bundle.bundle_id,
-                "item_id": RETURNED, "notes": NOTE}
+    # Each tester's return has its own place in the RETURN stream (as the approver's own line
+    # of an invented local log would): after every return already stored.
+    held = [json.loads(e["line"])["local"]["seq"] for e in admin.events()
+            if e["origin"] == "RETURN"]
+    approval = {"seq": max(held, default=0) + 1, "at": reading["at"],
+                "bundle_id": bundle.bundle_id, "item_id": RETURNED, "notes": NOTE}
     record = tool.return_record(approval, "0" * 64, reviewed)
     admin.insert_events([EventLine(row.id, "RETURN", encode_line(record))])
     return {"alias": alias, "bundle": bundle.bundle_id, "sequence": SEQUENCE,
@@ -208,7 +221,8 @@ def main(argv=None) -> int:
     sub.add_parser("write").add_argument("dir")
     p = sub.add_parser("seed")
     p.add_argument("--alias", required=True)
-    p.add_argument("--login", default=LOGIN)
+    p.add_argument("--login", help="default: acceptance.tester@example.invalid for ACCEPT-1, "
+                                   "acceptance.tester-<n>@example.invalid for ACCEPT-n")
     args = ap.parse_args(argv)
     if args.command == "write":
         base = write(Path(args.dir).expanduser())
