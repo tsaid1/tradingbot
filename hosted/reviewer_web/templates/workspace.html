@@ -1,71 +1,74 @@
 {% extends "base.html" %}
-{% block title %}Your sequences{% endblock %}
+{% from "_icons.html" import icon, status_badge %}
+{% block title %}Your review{% endblock %}
+{% block sidebar %}{% endblock %}
+{% block main_class %} class="wide"{% endblock %}
 {% block main %}
-<link rel="stylesheet" href="/static/nav.css">
-{# The dashboard (FLOW): one row per assigned sequence, from the reviewer's own confirmed saves.
-   Nothing on it depends on the system's reading. Works without a script (<details>). #}
-<section class="page dashboard">
-  <h1>Your sequences</h1>
-  <p class="quiet-text">Signed in as {{ who.session.name or "reviewer" }}. Your scope: {{ ideas }}
-  idea{{ "" if ideas == 1 else "s" }}, {{ forms }} form{{ "" if forms == 1 else "s" }}, in review
-  order.</p>
-  <div class="dashboard__totals">
-    <p class="metric"><span class="metric-value count">{{ dash.totals.sequences_done }} of {{ dash.totals.sequences }}</span>
-      <span class="metric-label">sequences complete</span></p>
-    <p class="metric"><span class="metric-value count">{{ dash.totals.done }} of {{ dash.totals.total }}</span>
-      <span class="metric-label">forms complete</span></p>
-    {% if dash.next %}
-    <p class="metric-action"><a class="button button--primary primary" href="/continue">Continue</a>
-      <span class="quiet-text">where you left off: {{ next_name }}</span></p>
-    {% else %}
-    <p class="banner banner--ok success" role="status">Review complete. Every form assigned to you is done.</p>
-    {% endif %}
+{#- The dashboard: one row per assigned sequence, from the reviewer's own confirmed saves
+    (progress.dashboard). Nothing on it depends on the system's reading: the market shown is the
+    one the reviewer read, once they saved a reading. Works without a script (<details>). -#}
+{%- set t = dash.totals -%}
+<section class="dashboard">
+  <h1>Your review</h1>
+  <div class="dash-top">
+    <div class="dash-top__done">
+      <p class="dash-big"><span class="count">{{ t.done }} of {{ t.total }}</span> forms complete</p>
+      <p class="quiet-text"><span class="count">{{ t.sequences_done }} of {{ t.sequences }}</span> sequences complete · <span class="count">{{ t.remaining }}</span> form{{ "" if t.remaining == 1 else "s" }} left</p>
+    </div>
+    <div class="dash-top__returned">
+      {% if t.returned %}
+      <p class="dash-flag dash-flag--attention">{{ icon("returned") }}<span><strong>{{ t.returned }} reading{{ "" if t.returned == 1 else "s" }} returned for changes.</strong> {{ "It opens" if t.returned == 1 else "The first opens" }} first.</span></p>
+      {% else %}
+      <p class="dash-flag">{{ icon("ok") }}<span>Nothing has been returned to you.</span></p>
+      {% endif %}
+      {% if t.attention %}
+      <p class="dash-flag dash-flag--attention">{{ icon("awaiting") }}<span>{{ t.attention }} form{{ "" if t.attention == 1 else "s" }} awaiting your assessment.</span></p>
+      {% endif %}
+    </div>
+    <div class="dash-top__next">
+      {% if dash.next %}
+      <a class="button button--primary dash-next" href="/continue">{{ dash.next_text }}{{ icon("go") }}</a>
+      {% else %}
+      <p class="dash-flag dash-flag--ok" role="status">{{ icon("ok") }}<span>Review complete. Every form assigned to you is done.</span></p>
+      {% endif %}
+    </div>
   </div>
-  {% if dash.totals.returned %}
-  <p class="banner banner--attention warning" role="status">The approver returned {{ dash.totals.returned }}
-  reading{{ "" if dash.totals.returned == 1 else "s" }} to you. "Continue" opens {{ "it" if dash.totals.returned == 1 else "the first" }}:
-  correct the reading and save it again.</p>
-  {% endif %}
-  <ol class="sequences">
+
+  <h2 class="dash-h2">Sequences <span class="quiet-text">in review order</span></h2>
+  <div class="seq-head" aria-hidden="true"><span>Sequence</span><span>Market</span><span>Done</span><span>Status</span><span></span></div>
+  <ol class="seq-list">
     {% for row in dash.sequences %}
-    <li class="sequence card" id="sequence-{{ row.id | ident }}">
-      <div class="sequence__head">
-        <h2 class="sequence__label">{{ row.label }}</h2>
-        {% if row.button %}
-        <a class="button {{ 'button--primary primary' if row.next_item == dash.next else 'button--quiet' }}"
-           href="/sequence/{{ row.id }}">{{ row.button_text }}<span class="visually-hidden"> {{ row.label }}</span></a>
-        {% endif %}
-        <dl class="sequence__facts">
-          <div><dt>Status</dt><dd><span class="status status--{{ row.status | lower | replace('_', '-') }}">{{ row.status_text }}</span></dd></div>
-          <div><dt>Completed</dt><dd><span class="count">{{ row.done }} of {{ row.total }}</span></dd></div>
-          <div><dt>Remaining</dt><dd><span class="count">{{ row.remaining }}</span></dd></div>
-          {% if row.returned %}<div><dt>Returned for changes</dt><dd><span class="count">{{ row.returned }}</span></dd></div>{% endif %}
-          {% if row.attention %}<div><dt>Awaiting your assessment</dt><dd><span class="count">{{ row.attention }}</span></dd></div>{% endif %}
-        </dl>
-      </div>
+    <li class="seq" id="sequence-{{ row.id | ident }}">
       <details>
-        <summary>Posts and forms</summary>
-        <ol class="posts">
+        <summary class="seq__row">
+          <span class="seq__title"><strong>{{ row.title }}</strong>{% if row.number %} <span class="quiet-text seq__id">{{ row.id }}</span>{% endif %}</span>
+          <span class="seq__read">{% if row.read %}You read: <strong>{{ row.read }}</strong>{% else %}<span class="quiet-text">No reading saved yet</span>{% endif %}</span>
+          <span class="seq__done"><span class="count">{{ row.done }} of {{ row.total }}</span> <span class="quiet-text">· {{ row.remaining }} left</span></span>
+          <span class="seq__status">{{ status_badge(row.status, row.status_text) }}
+            {%- if row.returned %} <span class="seq__flag">{{ icon("returned") }}{{ row.returned }} returned</span>{% endif %}
+            {%- if row.attention %} <span class="seq__flag">{{ icon("awaiting") }}{{ row.attention }} to assess</span>{% endif %}</span>
+        </summary>
+        <ol class="seq__forms">
           {% for post in row.posts %}
-          <li class="post-row">
-            <span class="quiet-text">Post of {{ post.when[:10] }} at {{ post.when[11:16] }}</span>
-            <ol class="forms-of-post">
-              {% for f in post.forms %}
-              <li class="form-row">
-                <a href="/form/{{ f.item_id }}">{{ names[f.item_id] }}</a>
-                {% if f.n > 1 %}<span class="quiet-text">Form {{ f.k }} of {{ f.n }}</span>{% endif %}
-                {% set code = f.status | lower | replace('_', '-') %}
-                <span class="status status--{{ 'awaiting' if code == 'awaiting-assessment' else code }}">{{ f.status_text }}</span>
-                {% if f.draft %}<span class="quiet-text">Draft kept, not submitted</span>{% endif %}
-              </li>
-              {% endfor %}
-            </ol>
+          {% for f in post.forms %}
+          <li>
+            <a href="/form/{{ f.item_id }}"><span>Post {{ post.number }} · {{ post.when_text }}{% if f.n > 1 %} · Form {{ f.k }} of {{ f.n }}{% endif %}</span></a>
+            {{ status_badge(f.status, f.status_text) }}
+            {% if f.draft %}<span class="seq__draft">{{ icon("edit") }}Draft kept, not submitted</span>{% endif %}
           </li>
+          {% endfor %}
           {% endfor %}
         </ol>
       </details>
+      {% if row.button %}
+      <a class="button {{ 'button--primary' if row.next_item == dash.next else 'button--quiet' }} seq__go" href="/sequence/{{ row.id }}">{{ row.button_text }}<span class="visually-hidden"> {{ row.title }}</span></a>
+      {% else %}
+      <span class="seq__go seq__go--done">{{ icon("complete") }}Done</span>
+      {% endif %}
     </li>
     {% endfor %}
   </ol>
+  <p class="quiet-text">Signed in as {{ who.session.name or "reviewer" }}. Your scope: {{ ideas }}
+  idea{{ "" if ideas == 1 else "s" }}, {{ forms }} form{{ "" if forms == 1 else "s" }}, in review order.</p>
 </section>
 {% endblock %}

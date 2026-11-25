@@ -151,7 +151,9 @@ def test_the_sidebar_expands_the_active_sequence_and_marks_the_current_form(site
         html = render_template("_sidebar.html", nav=nav)
     assert html.count('aria-current="page"') == 1
     assert '<a href="/form/s14b" aria-current="page">' in html
-    assert html.count(" open>") == 2  # the panel and the active sequence only
+    # The active sequence only: the panel itself opens on a wide screen (the script), and stays
+    # one line above the page on a phone.
+    assert html.count(" open>") == 1
     assert "Form 2 of 2" in html and "<script" not in html
     # The form page carries the model as ``nav``, ``status`` and ``step``.
     b = site14.browser().sign_in(FIRST)
@@ -236,6 +238,9 @@ def test_three_databases_that_differ_only_in_the_system_s_reading_look_the_same_
         seen.append([same(t) for t in pages])
     assert seen[0] == seen[1] == seen[2]
     assert "Awaiting your assessment" in seen[0][1] and "In progress" in seen[0][1]
+    # The market each row names is the one the reviewer read, once they saved a reading of it
+    # (their own answer, never the system's): the same in the three databases.
+    assert "You read: " not in seen[0][0] and "You read: <strong>" in seen[0][1]
 
 
 def test_the_form_page_carries_nav_status_and_step_after_an_independent_save(site14):

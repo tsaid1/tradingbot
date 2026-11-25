@@ -76,7 +76,7 @@ def test_the_form_stores_what_the_streamlit_form_stores(site):  # noqa: F811
     assert "The system's answers stay hidden until you save your own reading" in shown.visible()
     assert "holds SHIPPED" not in shown.text and "system-value" not in shown.text
     assert "Short Zed Metals around 412" in shown.text and "Post you're reviewing" in shown.plain
-    assert "Form 1 of" not in shown.text  # one form for this post: no form count shown
+    assert "Form 1 of 1" not in shown.text  # one form for this post: no form count shown
     reading = valid(site.bundle, "i07", entry_exactness="EXACT",
                     levels=[("CURRENT_MARKET", "EXACT"), ("STOP", "EXACT")])
     b.fill(reading)
@@ -696,7 +696,8 @@ def test_resuming_in_a_new_session_lands_on_the_next_unfinished_step(site14):
     assert (state("s14a"), state("s14b")) == (F.INDEPENDENT_DUE, F.INDEPENDENT_DUE)
     b = site.browser().sign_in(FIRST)
     b.review("s14a", after=False)
-    assert "Your reading is saved. Complete form 2 of 2 for this post next." in b.shown.visible()
+    assert ("Your reading is saved. Another form of this post must be completed before the "
+            "system's answers are shown: form 2 of 2.") in b.shown.visible()
     assert 'href="/form/s14b">Go to form 2 of 2' in b.shown.text
     # Form 1 is saved, the post is not revealed: the step is the sibling without a reading.
     assert (state("s14a"), state("s14b")) == (F.REVEAL_PENDING, F.INDEPENDENT_DUE)
@@ -718,15 +719,15 @@ def test_resuming_in_a_new_session_lands_on_the_next_unfinished_step(site14):
         assert shown.value(name) == value, name
     assert shown.value("confidence") == "" and SYSTEM_MARKS["s14a"]["reference"] in shown.text
     fresh.set({"reference_series_right": "YES", "execution_instrument_right": "YES"})
-    saved = fresh.save().visible()
-    assert "Review complete. Continue to the next form." in saved
-    assert "Continue to the next form: scs14 2: instruction" in saved
+    saved = fresh.save()
+    assert "Review complete. Continue to the next form." in saved.visible()
+    assert 'href="/form/s14b">Continue to the next form' in saved.text  # by ``step``
     assert (state("s14a"), state("s14b")) == (F.DONE, F.AFTER_REVEAL_DUE)
     assert resume() == "/form/s14b"
     fresh.open("s14b")
     fresh.set({"reference_series_right": "YES", "execution_instrument_right": "YES"})
     done = fresh.save()
-    assert "Continue to the next form: seqB 1: instruction" in done.visible()  # the next idea
+    assert 'href="/form/i07">Continue to the next form' in done.text  # the next idea
     assert resume() == "/form/i07"
     page = fresh.get("/").get_data(as_text=True)
     assert "1 of 33" in page and "2 of 45" in page  # ideas completed, forms done
@@ -758,7 +759,7 @@ def test_a_reading_the_approver_returned_is_shown_to_its_reviewer_only(site):  #
     assert shown.value("lv.n:0.role") == "HISTORICAL_FILL"
     # The workspace says so, and "continue" goes there before the first form never started.
     home = a.get("/").get_data(as_text=True)
-    assert "Returned for changes" in home and "The approver returned 1 reading to you." in " ".join(
+    assert "Returned for changes" in home and "1 reading returned for changes." in " ".join(
         home.split())
     assert a.get("/continue").headers["Location"] == "/form/i08"
     assert "1 of 45" in home  # the reviewer's own saves; a returned form is not complete
