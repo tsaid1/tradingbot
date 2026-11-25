@@ -5,6 +5,151 @@ The remote reviewers' part of the adjudication workspace
 (`hosted/reviewer_web/`) on one Postgres database. The owner's own review, approval, freeze and
 scoring stay local and unchanged. Every example below is invented.
 
+## For reviewers
+
+The site holds the same work as the adjudication workspace: you read a post with its earlier
+posts and images, record your own reading, then see the system's reading and give your verdicts.
+Nothing you save places, changes or approves a trade, a rule or a mapping. The reviewer guide and
+the field reference are pages of the site ("Reviewer guide", "Field reference").
+
+**Signing in.** Enter the address you were invited with. A message from "Trade review" brings a
+six-digit code: it is valid for 10 minutes, works once and allows five tries; at most five codes
+are sent to an address in an hour. The page answers the same for every address, so it never says
+whether an address is invited. Signing in sets one cookie, which keeps you signed in on that
+device for thirty days after your last visit; "Sign out" ends it. On another device you sign in
+again. If your access is withdrawn, the site stops answering you at once.
+
+**The workspace.** It shows how many ideas and forms of your scope are done, and every form in
+review order with its status: open, independent reading saved, done, or "Returned to you".
+"Continue" opens the next unfinished step (the rule is below). You may open any form of the list.
+
+**A form** has three parts: 1. the source evidence (the post, its images, and the earlier posts
+shown with it, oldest first), 2. your reading, 3. the system's reading.
+
+1. *Independent reading.* Answer the fields. Which fields are asked depends on your answers: when
+   you change one, the form is brought up to date by the server (without scripts in the browser,
+   press "Refresh the form"). Above the Save button the page lists what Save still needs: the
+   unanswered fields, each refusal with its code and field, and the warnings, which need the tick
+   "I have checked these". Then "Save independent reading".
+2. *The reveal.* The system's reading appears once EVERY form of the same post has your
+   independent reading (a post may have two forms). From then on an independent reading of that
+   post can no longer be saved.
+3. *Reading after the reveal.* Your answers stand beside the system's. Under each compared field
+   is the system's value and your verdict on it (CONFIRM, CORRECT or UNSURE), pre-filled from the
+   comparison and editable. Change your own answer only for evidence you missed. Flags, confidence
+   and notes are given anew at every save. Then "Save reading after reveal".
+
+**The two questions after the reveal.** They stand in two blocks of their own, each showing what
+the system proposes with your answer beside it (below it on a phone):
+
+* "System's reference price series: ..." with "Is this the price series used for the numbers in
+  the post?" The reference series is the price series the system reads the post's numbers
+  against. Answer Yes when the post's numbers are quoted in that series, No when they are quoted
+  in another one (a fund's price against a futures price, for example), Unsure when you cannot
+  tell. It is a check of a fact of the post.
+* "System's proposed execution instrument: ..." with "Would using this instrument faithfully
+  follow the publisher's trade idea?" This is your opinion on a proposal. It approves nothing:
+  approving a mapping is the owner's separate decision.
+
+Neither has an answer until you choose one, and Save waits for both. When no answer is asked the
+block says why: the system proposed nothing for this post, or your reading records no trading
+action. An answer you saved is shown chosen again when you return.
+
+**Saving.** A save is confirmed at the top of the page ("Saved ... stored as record n") with the
+next step, and the form says above the confidence what is stored. Every save is a new record;
+nothing is overwritten, and the newest counts. A double click stores one record. If the
+connection drops while saving, reload the page or send it again: the same save is never stored
+twice. Answers you have not saved are lost when you leave the page.
+
+**Resuming.** Everything shown comes from what is stored, on any device. The next unfinished step
+is:
+
+1. a reading the approver returned to you, if there is one (the first in review order);
+2. otherwise the first form in review order that is not done;
+3. when that form's independent reading is saved but another form of the same post has none yet,
+   that other form;
+4. a form whose independent reading is saved and whose post is revealed opens in the state after
+   the reveal, with your independent answers in it.
+
+**A returned reading.** When the approver returns your reading of a form, the workspace marks it
+"Returned to you" and the form opens again with your latest answers. The notice above the
+confidence says "RETURNED by the approver" and gives the approver's note. Correct the answers,
+give flags, confidence and notes, and save: the corrected reading replaces the returned one.
+
+## Security model
+
+**Who gets in.** Only a listed reviewer who is not revoked, with the role REVIEWER and FULL
+access, can sign in or stay signed in; this is checked on every request, so a revoked reviewer's
+sessions stop working at once. A one-time code is six digits, valid ten minutes, single use, five
+tries, compared in constant time; a new code replaces the earlier ones. Limits per hour: five
+codes per address, twenty code requests and thirty tries per network address. A session is a
+256-bit random token in the cookie `__Host-session` (Secure, HttpOnly, SameSite=Lax, Path=/),
+valid thirty days after the last use.
+
+**What is stored for sign-in** (`login_code`, `web_session`, `rate_limit` in `schema.sql`): a
+code only as HMAC-SHA256 under `SESSION_SECRET`, a session token only as SHA-256, a limit counter
+under a keyed hash of the address or the network address. No address, code or token is stored in
+these tables, written to a log, or put into a URL.
+
+**Every request.** A POST must come from a page of the site (`Origin` and `Sec-Fetch-Site`; at
+least one must be sent and every one sent must agree) and, once signed in, carry the session's
+CSRF token. A route behind sign-in first establishes the reviewer, then the item: a form or an
+image is found only inside that reviewer's scope (`ordered(bundle, scope)`); every id from a URL
+is looked up, never used. Anything else is a 404 that is the same page for every reason. The
+store has no call that returns another reviewer's records, so no page can show them; beside a
+reviewer's own records it hands over only the approver's RETURN of that reviewer's readings.
+
+**Blind-first.** Before the reveal a response holds nothing of the system: not its reading of any
+field, not its price rows or levels, not the holds, not the mapping (reference series, proposed
+instrument, basis, approval), in the page, its attributes, the form fragment or a header. The
+reveal is the existing per-post gate: every form of the post within the scope has the reviewer's
+independent reading (or the system's reading was already shown to them). The SYSTEM_SHOWN markers
+of every form of the post are then stored and committed FIRST, and only a page that reads them
+back shows the system's reading; if they cannot be stored, nothing is shown. A reading after the
+reveal is refused without the markers, and the core refuses an independent reading once a marker
+or a reading exists. The site has no switch to turn blind-first off. What a blind form still tells
+about the system is what it tells today, by design: the number of forms of a post, whether a form
+is an instruction or label-only, and the market names and idea identifiers offered as choices.
+
+**Saving.** One connection and one transaction per request; the page is built after the commit.
+The server validates every save with the rubric (`build_annotation` through `Store.append`,
+under the store's lock, against the reviewer's current records); the browser decides nothing. A
+save carries a key made for that rendering of the form: the same key again stores nothing and
+shows the saved state.
+
+**Images** are served only for the post of a form in the reviewer's scope, of the active bundle,
+by a name that post lists, as PNG, JPEG, GIF or WEBP of at most 4 MB.
+
+**Responses.** `Cache-Control: private, no-store` on everything but the stylesheet and the
+script; a Content-Security-Policy of `default-src 'self'` (no inline script or style, no other
+origin, no framing); `X-Content-Type-Options: nosniff`; `Referrer-Policy: no-referrer`;
+`X-Frame-Options: DENY`; `X-Robots-Tag: noindex, nofollow`; `robots.txt` disallows everything.
+The pages load one stylesheet and one script from the site itself (`hosted/public/static`, which
+holds nothing else) and nothing from anywhere else. Publisher text is always rendered as text.
+`/healthz` touches neither the database nor a session. A failure shows a constant sentence; a log
+line carries a constant code, the route's name and an exception's class, never post text, a
+reading, an address or a code.
+
+**Environments** (`SITE_ENV`). `production` needs the five mail variables (`SMTP_HOST`,
+`SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `MAIL_FROM`) or does not start; port 465 is TLS from
+the first byte, any other port STARTTLS. The message holds the site's name, the code and its
+validity, and no link. `preview` and `test` serve only a bundle flagged as demonstration data
+(they do not start on any other, and stop answering if one is published) and show a
+"Demonstration data" band on every page. With none of the mail variables set they use synthetic
+mail: no message leaves, and the code-entry page shows the code in that band. Synthetic mail is
+therefore only for a preview that sits behind the platform's own login: whoever reaches it can
+sign in as a listed address, and the page shows a code only for a listed one.
+
+**Known limits.** The time a code request takes is padded to a floor, and an address that gets no
+code makes the same connection to the mail server as one that does (so a mail failure reads the
+same for both); a sending time far above the floor could still be told apart. The limits per
+network address rely on the platform's forwarding headers. Nothing prevents a signed-in reviewer
+from copying what they are shown: confidentiality rests on the reviewer's undertaking, as today.
+
+**Looking at the site locally.** `PYTHONPATH=src python hosted/dev_server.py` (never deployed)
+starts an embedded Postgres with the invented demo bundle and two invented reviewers on
+`127.0.0.1:8600` and prints the one-time code in the terminal.
+
 ## Operations
 
 The operator tool is `scripts/hosted_admin.py`. It runs on the owner's Mac, is never deployed, and
