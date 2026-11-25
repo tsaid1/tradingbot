@@ -5,6 +5,7 @@
     python scripts/hosted_admin.py revoke ALIAS
     python scripts/hosted_admin.py restore-access ALIAS
     python scripts/hosted_admin.py invite ALIAS --kind continue|start
+    python scripts/hosted_admin.py unlock ALIAS
     python scripts/hosted_admin.py publish-bundle [--check-only] [--demo DIR]
     python scripts/hosted_admin.py import-log [--snapshots DIR]
     python scripts/hosted_admin.py parity
@@ -43,6 +44,7 @@ from tradingbot.runtime.vocab_review import PrivateDir, PrivatePathError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "hosted"))
 S = importlib.import_module("reviewer_web.store")  # the deployed layout: a top-level package
+AUTH = importlib.import_module("reviewer_web.auth")  # the sign-in counters (invite, unlock)
 HOSTED, LEGACY, RETURN, sha256 = S.HOSTED, S.LEGACY, S.RETURN, S.sha256
 HOSTED_BASE, RETURN_BASE = S.HOSTED_BASE, S.RETURN_BASE
 
@@ -317,6 +319,19 @@ def cmd_invite(args) -> int:
     return 0
 
 
+def cmd_unlock(args) -> int:
+    """Clear a reviewer's sign-in counters: the wrong codes of the day (ten lock the sign-in for
+    24 hours) and the hour's code requests."""
+    store = _store()
+    with store.connection():
+        row = next((r for r in store.reviewers() if r.alias == args.alias), None)
+        if row is None:
+            raise refused("UNKNOWN_ALIAS")
+        cleared = AUTH.unlock(store, row.id)
+    print(f"{args.alias}: sign-in unlocked; {cleared} counted event(s) cleared")
+    return 0
+
+
 # ------------------------------------------------------------------ the local log
 
 
@@ -528,6 +543,8 @@ def cmd_status(_args) -> int:
         real, demo = store.published(demo=False), store.published(demo=True)
         anchor, events, rows = store.anchor(), store.events(), store.status()
         mail = store.queued_mail()
+        locks = {r.alias: AUTH.locked_until(store, r.id, datetime.now(UTC))
+                 for r in store.reviewers()}
     _print_bundle(real, "real")
     _print_bundle(demo, "demonstration")
     print(f"anchor: {anchor['count']} line(s), head {anchor['head'][:12]}, imported "
@@ -545,6 +562,8 @@ def cmd_status(_args) -> int:
         for m in (m for m in mail if m["alias"] == r["alias"]):
             print(f"  mail {m['kind']}: queued {_time(m['queued_at'])}, sent "
                   f"{_time(m['sent_at'])}, result {m['result'] or '-'}")
+        if locks[r["alias"]]:  # ten wrong codes within 24 hours
+            print(f"  sign-in: locked until {_time(locks[r['alias']])} (unlock lifts it)")
     print(f"test identities: {sum(r['is_test'] for r in rows)} (see test-report ALIAS)")
     return 0
 
@@ -854,6 +873,9 @@ def main(argv: list[str] | None = None) -> int:
     for name, text in (("revoke", "stop a reviewer's access at once"),
                        ("restore-access", "lift a revocation")):
         command(name, cmd_revoke, text).add_argument("alias")
+    command("unlock", cmd_unlock,
+            "clear a reviewer's sign-in counters (wrong codes, code requests)").add_argument(
+        "alias")
     p = command("invite", cmd_invite, "queue an invitation for the site to send")
     p.add_argument("alias")
     p.add_argument("--kind", required=True, choices=("continue", "start"),

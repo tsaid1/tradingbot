@@ -14,7 +14,9 @@ the field reference are pages of the site ("Reviewer guide", "Field reference").
 
 **Signing in.** Enter the address you were invited with. A message from "Trade review" brings a
 six-digit code: it is valid for 10 minutes, works once and allows five tries; at most five codes
-are sent to an address in an hour. The page answers the same for every address, so it never says
+are sent to an address in an hour. If you ask twice, the two newest codes both work. After ten
+wrong codes within 24 hours the sign-in of that address is locked for the rest of those 24
+hours: tell the person who invited you, who can unlock it. The page answers the same for every address, so it never says
 whether an address is invited. Signing in sets one cookie, which keeps you signed in on that
 device for thirty days after your last visit; "Sign out" ends it. On another device you sign in
 again. If your access is withdrawn, the site stops answering you at once.
@@ -87,8 +89,17 @@ give flags, confidence and notes, and save: the corrected reading replaces the r
 **Who gets in.** Only a listed reviewer who is not revoked, with the role REVIEWER and FULL
 access, can sign in or stay signed in; this is checked on every request, so a revoked reviewer's
 sessions stop working at once. A one-time code is six digits, valid ten minutes, single use, five
-tries, compared in constant time; a new code replaces the earlier ones. Limits per hour: five
-codes per address, twenty code requests and thirty tries per network address. A session is a
+tries, compared in constant time. The newest two codes of a reviewer are valid at once, so a
+request by somebody else does not end the code a reviewer was just sent; using one ends both.
+Limits per hour: five codes per address, twenty code requests and thirty tries per network
+address. Per day: ten wrong codes for an address lock its sign-in (no code is accepted or sent)
+until 24 hours after the tenth-newest wrong code; the site logs
+`SIGN_IN_TRIES_EXHAUSTED alias=<ALIAS>` once, `status` shows `sign-in: locked until <time>`, and
+`hosted_admin.py unlock ALIAS` clears that counter and the hour's code requests of the address.
+Every request is counted against its network address first; an address that is not shaped like
+one (empty, too long, a control character) is never looked up and never makes the site contact
+the mail server; entering a code takes the same least time and one database connection, whoever
+asks. A session is a
 256-bit random token in the cookie `__Host-session` (Secure, HttpOnly, SameSite=Lax, Path=/),
 valid thirty days after the last use.
 
@@ -234,6 +245,7 @@ python scripts/hosted_admin.py status
 | `sync-reviewers --test-identity TEST-1 LOGIN` | Instead: writes (or updates) the test identity `TEST-<n>` for that sign-in, bound to the active DEMONSTRATION bundle with that bundle's scope (`NO_DEMO_BUNDLE_PUBLISHED` while there is none). The reviewers file is not read. |
 | `revoke ALIAS` | Sets `revoked_at` and deletes that reviewer's web sessions and sign-in codes not yet used. From that moment sign-in, every page and every save are refused; the records stay. |
 | `restore-access ALIAS` | Clears the revocation (the reviewer signs in again). |
+| `unlock ALIAS` | Clears a reviewer's sign-in counters: the wrong codes of the last 24 hours (ten lock the sign-in; `status` then shows `sign-in: locked until <time>`) and the hour's code requests for that address. |
 | `invite ALIAS --kind continue\|start` | Queues one invitation for the SITE to send (the operator's machine holds no mail password): `continue` for a reviewer whose work moved here, `start` for a first access. Refused for a test identity (`TEST_IDENTITY_IS_NOT_INVITED`), a revoked reviewer (`REVOKED`), an unknown alias, and while a message of that kind already waits (`ALREADY_QUEUED`). |
 | `publish-bundle` | Verifies the local bundle (`BUNDLE_ID_MISMATCH` otherwise), cuts the part the scope needs, checks parity, uploads and marks it THE active real bundle. Refused unless `remote_full_context_authorized = true` (`REMOTE_FULL_CONTEXT_NOT_AUTHORIZED`): the posts leave the Mac only by the owner's switch. `--check-only` cuts and checks without a database. `--demo DIR` publishes the invented demo folder `DIR` instead, as THE active demonstration bundle (and refuses any other bundle: `NOT_A_DEMO_BUNDLE`). The two kinds are active side by side: publishing one never deactivates the other. |
 | `import-log` | Verifies the local log (chain and head), copies it and its head file into a snapshot folder, imports the remote reviewers' lines, records the anchor. Can be run again. |

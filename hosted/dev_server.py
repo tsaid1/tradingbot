@@ -125,7 +125,8 @@ def main() -> None:
     if alias:
         now = datetime.now(UTC)
         asked = auth.request_code(store, SECRET.encode(), reviewer.login, "dev", now)
-        token = auth.verify_code(store, SECRET.encode(), reviewer.login, asked.code, "dev", now)
+        token = auth.verify_code(store, SECRET.encode(), reviewer.login, asked.code, "dev",
+                                 now).token
 
         def served(environ, start_response):
             if not environ.get("PATH_INFO", "").startswith("/sign-in"):

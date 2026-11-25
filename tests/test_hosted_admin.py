@@ -1110,3 +1110,29 @@ def test_invite_queues_a_message_for_the_site_to_send_and_status_says_how_it_wen
     out = tmp_path / "export.jsonl"
     run("export", "--out", out)
     assert "INVITE" not in out.read_text() and "mail" not in out.read_text()
+
+
+def test_unlock_clears_a_reviewers_sign_in_counters_and_status_shows_a_lock(run, store, base):
+    """Ten wrong codes within 24 hours lock an address's sign-in (tests/test_hosted_web_signin.py);
+    the operator sees it in ``status`` and lifts it with ``unlock``."""
+    run("publish-bundle", "--demo", base)
+    run("sync-reviewers", "--demo")
+    one = store.reviewer_by_login(ONE.login)
+    assert "sign-in: locked" not in run("status")
+    with store.connection() as conn:  # what the site records: nine wrong codes, then the tenth
+        for n in range(9):
+            conn.execute("INSERT INTO rate_limit (bucket, at) VALUES (%s, now() - %s * interval"
+                         " '1 minute')", (f"wrong:r{one.id}", 30 - n))
+        conn.execute("INSERT INTO rate_limit (bucket, at) VALUES (%s, now())", (f"to:r{one.id}",))
+    assert "sign-in: locked" not in run("status")  # nine: not locked
+    with store.connection() as conn:
+        conn.execute("INSERT INTO rate_limit (bucket, at) VALUES (%s, now())",
+                     (f"wrong:r{one.id}",))
+    out = run("status")
+    assert re.search(r"REMOTE-2: [^\n]*\n(  [^\n]*\n)*  sign-in: locked until \d{4}-\d\d-\d\dT\S+ "
+                     r"\(unlock lifts it\)\n", out)
+    assert "sign-in: locked" not in out.split("REMOTE-3:")[1]
+    assert run("unlock", "REMOTE-2") == "REMOTE-2: sign-in unlocked; 11 counted event(s) cleared\n"
+    assert "sign-in: locked" not in run("status")
+    assert run("unlock", "REMOTE-2") == "REMOTE-2: sign-in unlocked; 0 counted event(s) cleared\n"
+    assert run("unlock", "REMOTE-9", code=2) == "refused: UNKNOWN_ALIAS\n"

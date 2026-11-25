@@ -136,13 +136,169 @@ def test_a_wrong_an_expired_a_used_and_a_replaced_code_are_refused(site):  # noq
     code = site.code()
     site.clock.forward(minutes=10, seconds=1)
     assert enter(late, login2, code).status_code == 401 and not signed_in(late)
-    # A new code replaces the earlier one.
-    ask(late, login2)
-    first = site.code()
-    ask(late, login2)
-    second = site.code()
-    assert enter(late, login2, first).status_code == 401 or first == second
-    assert enter(late, login2, second).status_code == 303 and signed_in(late)
+    # The newest two codes are valid; a third request ends the oldest; using one ends both.
+    codes = []
+    for _ in range(3):
+        ask(late, login2)
+        codes.append(site.code())
+    assert len(set(codes)) == 3, "three random codes happened to collide: run again"
+    assert enter(late, login2, codes[0]).status_code == 401
+    assert enter(late, login2, codes[1]).status_code == 303 and signed_in(late)
+    assert enter(site.browser(), login2, codes[2]).status_code == 401  # ended with the other
+
+
+def test_somebody_elses_request_does_not_end_a_delivered_code(site):  # noqa: F811
+    """The review's finding 4, the lock-out: a stranger's request for a reviewer's address ended
+    the code the reviewer had just been sent."""
+    from reviewer_web import auth
+
+    login = login_of(site)
+    reviewer, stranger = site.browser(), site.browser()
+    elsewhere = {"X-Real-Ip": "203.0.113.9"}
+    ask(reviewer, login)
+    code = site.code()
+    ask(stranger, login.upper(), headers=elsewhere)
+    assert enter(reviewer, login, code).status_code == 303 and signed_in(reviewer)
+    # The hour's five requests per address are still counted, whoever makes them: the stranger
+    # can use them up. The operator clears the counter (hosted_admin.py unlock).
+    site.sql("DELETE FROM rate_limit")
+    for _ in range(5):
+        ask(stranger, login, headers=elsewhere)
+    sent = len(site.outbox.sent)
+    again = site.browser()
+    ask(again, login)
+    assert len(site.outbox.sent) == sent
+    assert auth.unlock(site.store, site.reviewers[FIRST].id) == 5
+    ask(again, login)
+    assert len(site.outbox.sent) == sent + 1
+    assert enter(again, login, site.code()).status_code == 303
+
+
+def test_ten_wrong_codes_in_a_day_lock_the_address_and_the_log_says_so_once(
+        site, caplog):  # noqa: F811
+    """The review's finding 4, the guessing: 25 guesses an hour per address, for ever, and
+    nothing recorded. Now ten wrong codes in 24 hours end it for the rest of the window."""
+    from reviewer_web import auth
+
+    caplog.set_level(logging.DEBUG)
+    login, row = login_of(site), site.reviewers[FIRST]
+    b = site.browser()
+
+    def exhausted() -> list[str]:
+        return [r.getMessage() for r in caplog.records if "EXHAUSTED" in r.getMessage()]
+
+    # A wrong code while no code is valid is no guess at one: it is not counted.
+    assert enter(b, login, "000000").status_code == 401
+    assert auth.locked_until(site.store, row.id, site.clock()) is None
+    wrong_tries = 0
+    for _hour in range(3):  # the reviewer's probe: one computer, hour after hour
+        for _ in range(5):
+            sent = len(site.outbox.sent)
+            ask(b, login)
+            if len(site.outbox.sent) == sent:
+                continue
+            for n in range(1, 7):
+                assert enter(b, login, f"{(int(site.code()) + n) % 10 ** 6:06d}").status_code == 401
+        wrong_tries = site.sql("SELECT count(*) FROM rate_limit WHERE bucket = %s",
+                               f"wrong:r{row.id}")[0][0]
+        site.clock.forward(minutes=61)
+    assert wrong_tries == 10  # not 75: after the tenth nothing more was compared or sent
+    assert exhausted() == [f"SIGN_IN_TRIES_EXHAUSTED alias={FIRST}"]  # once, the alias only
+    assert login not in "\n".join(r.getMessage() for r in caplog.records)
+    assert len(site.outbox.sent) == 2  # two codes went out before the lock, none after
+    # Locked: no code is sent and none is accepted, not even the right one.
+    until = auth.locked_until(site.store, row.id, site.clock())
+    assert until is not None and until > site.clock()
+    site.sql("DELETE FROM rate_limit WHERE bucket LIKE 'to:%%' OR bucket LIKE 'net:%%'")
+    page = ask(b, login)
+    assert len(site.outbox.sent) == 2
+    assert page.get_data(as_text=True).replace(login, NOBODY) == ask(
+        site.browser(), NOBODY).get_data(as_text=True)  # and the page says nothing of it
+    site.sql("UPDATE login_code SET used_at = NULL, expires_at = %s, attempts = 0 WHERE id = "
+             "(SELECT max(id) FROM login_code)", site.clock() + auth.CODE_VALID)
+    assert enter(b, login, site.code()).status_code == 401 and not signed_in(b)
+    assert exhausted() == [f"SIGN_IN_TRIES_EXHAUSTED alias={FIRST}"]
+    # The other reviewer is not affected.
+    other = site.browser().sign_in(SECOND)
+    assert signed_in(other)
+    # The window passes: the sign-in opens again by itself.
+    site.clock.now = until + auth.HOUR
+    assert auth.locked_until(site.store, row.id, site.clock()) is None
+    site.sql("DELETE FROM rate_limit WHERE bucket LIKE 'to:%%' OR bucket LIKE 'net:%%'")
+    ask(b, login)
+    assert len(site.outbox.sent) == 4 and enter(b, login, site.code()).status_code == 303
+    # Or the operator unlocks it.
+    for n in range(10):
+        site.sql("INSERT INTO rate_limit (bucket, at) VALUES (%s, %s)", f"wrong:r{row.id}",
+                 site.clock())
+    assert auth.locked_until(site.store, row.id, site.clock()) is not None
+    assert auth.unlock(site.store, row.id) >= 10
+    assert auth.locked_until(site.store, row.id, site.clock()) is None
+
+
+def test_what_is_not_an_address_costs_one_count_and_never_reaches_the_mail_server(
+        site):  # noqa: F811
+    """The review's finding 11: an empty or over-long address was answered before any limit and
+    still made the site sign in to the mail server; a NUL character was a 500."""
+    b = site.browser()
+    normal = ask(site.browser(), NOBODY, headers={"X-Real-Ip": "203.0.113.1"})
+    site.sql("DELETE FROM rate_limit")
+    probes, sent = site.outbox.probes, len(site.outbox.sent)
+    odd = ["", "   ", "ß" * 300, "x" * 400 + "@example.invalid", "no-at-sign", "a@b@c",
+           "two words@example.invalid", "a\x00b@example.invalid", "\x7f@example.invalid",
+           "tab\there@example.invalid", "@example.invalid", "someone@", "a\u202eb@example.invalid"]
+    for address in odd:
+        page = ask(b, address)
+        assert page.status_code == 200, repr(address)
+        # the neutral page, with nothing of what was typed in it
+        assert page.get_data(as_text=True) == normal.get_data(as_text=True).replace(
+            f'value="{NOBODY}"', 'value=""'), repr(address)
+        refused = enter(b, address, "123456")
+        assert refused.status_code == 401 and 'name="address" value=""' in refused.get_data(
+            as_text=True)
+    for code in ("12\x0034", "\x00" * 6, "１２３４５６", "12345\n6", "-12345", "1e5000"):
+        assert enter(b, login_of(site), code).status_code == 401, repr(code)
+    assert site.outbox.probes == probes and len(site.outbox.sent) == sent
+    # Every one of them was counted against the network address it came from, and only there.
+    buckets = [row[0][:4] for row in site.sql("SELECT bucket FROM rate_limit")]
+    assert buckets.count("net:") == len(odd) and set(buckets) == {"net:", "try:"}
+    # So such requests run into the network's hourly limit like any others.
+    for _ in range(30):
+        ask(b, "")
+    assert site.sql("SELECT count(*) FROM rate_limit WHERE bucket LIKE 'net:%%'") == [(20,)]
+    ask(b, login_of(site))
+    assert len(site.outbox.sent) == sent and site.outbox.probes == probes
+
+
+def test_entering_a_code_costs_the_same_whoever_asks(site, monkeypatch):  # noqa: F811
+    """The review's finding 11: /sign-in/verify had no least time and opened one more database
+    connection for a listed address than for an unlisted one."""
+    import psycopg
+    from reviewer_web import app as web
+
+    opened, slept = [], []
+    connect = psycopg.connect
+    monkeypatch.setattr(psycopg, "connect", lambda *a, **k: opened.append(1) or connect(*a, **k))
+    monkeypatch.setattr(web.time, "sleep", slept.append)
+    app = web.create_app(site.store, site.outbox, {**site.config, "SIGN_IN_FLOOR_SECONDS": 30})
+    counts = {}
+    for who, address in (("listed", login_of(site)), ("unlisted", NOBODY), ("odd", "nobody")):
+        b = site.browser(app)
+        for step in ("ask", "000000", "abcdef"):
+            opened.clear()
+            slept.clear()
+            if step == "ask":
+                ask(b, address)
+            else:
+                enter(b, address, step)
+            counts[who, step] = len(opened)
+            assert len(slept) == 1 and 29 < slept[0] <= 30, (who, step)  # the same least time
+    assert set(counts.values()) == {1}, counts  # one connection, whoever asks and whatever for
+    # The right code too waits out the floor.
+    b = site.browser(app)
+    ask(b, login_of(site))
+    slept.clear()
+    assert enter(b, login_of(site), site.code()).status_code == 303 and len(slept) == 1
 
 
 def test_a_code_allows_five_tries(site):  # noqa: F811
@@ -183,9 +339,11 @@ def test_codes_and_tries_are_limited_per_hour(site):  # noqa: F811
     assert enter(b, login_of(site, SECOND), code, headers=there).status_code == 401
     assert enter(b, login_of(site, SECOND), code,
                  headers={"X-Real-Ip": "203.0.113.9"}).status_code == 303
-    # The limit rows hold keyed hashes only.
+    # The limit rows hold keyed hashes or a reviewer's row number, never an address.
     buckets = [row[0] for row in site.sql("SELECT bucket FROM rate_limit")]
-    assert buckets and all(re.fullmatch(r"(to|net|try):[0-9a-f]{64}", x) for x in buckets)
+    assert buckets and all(re.fullmatch(r"(to|net|try):[0-9a-f]{64}|(to|wrong):r\d+", x)
+                           for x in buckets)
+    assert {x.split(":")[0] for x in buckets} == {"net", "to", "try"}
 
 
 def test_a_revoked_reviewer_cannot_sign_in_and_an_existing_session_dies_at_once(site):  # noqa: F811

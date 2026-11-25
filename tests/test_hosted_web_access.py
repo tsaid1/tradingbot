@@ -207,6 +207,23 @@ def test_the_health_page_and_the_static_files_touch_neither_the_store_nor_a_sess
     assert b.get("/healthz", headers={"Cookie": "__Host-session=anything"}).status_code == 200
 
 
+def test_what_the_http_layer_declines_is_not_a_failure(site, caplog):  # noqa: F811
+    """The review's finding 11: a range of a static file that cannot be satisfied was a 500."""
+    caplog.set_level(logging.DEBUG)
+    b = site.browser().sign_in(FIRST)
+    answer = b.get("/static/app.css", headers={"Range": "bytes=999999-"})
+    assert answer.status_code == 416 and b"could not be read" in answer.get_data()
+    assert answer.headers["Cache-Control"] == "private, no-store"
+    part = b.get("/static/app.css", headers={"Range": "bytes=0-9"})
+    assert part.status_code == 206 and len(part.get_data()) == 10
+    for path, method, status in (("/form/i07/", "GET", 404), ("/sign-out", "GET", 405),
+                                 ("/form/i07/save", "GET", 405), ("/form/i07", "OPTIONS", 200),
+                                 ("/static/", "GET", 404), ("/form/i07", "TRACE", 405),
+                                 ("/static/%2e%2e/reviewer_web/schema.sql", "GET", 404)):
+        assert b.client.open(path, method=method, base_url=ORIGIN).status_code == status, path
+    assert not [r for r in caplog.records if "REQUEST_FAILED" in r.getMessage()]
+
+
 def test_a_failure_shows_no_detail_and_logs_a_code_only(site, monkeypatch, caplog):  # noqa: F811
     caplog.set_level(logging.DEBUG)
     b = site.browser().sign_in(FIRST)

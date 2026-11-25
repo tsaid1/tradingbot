@@ -39,6 +39,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from flask import Flask, Response, abort, g, jsonify, redirect, render_template, request
+from werkzeug.exceptions import HTTPException
+from werkzeug.routing import RoutingException
 
 from tradingbot.runtime import adjudication as A
 from tradingbot.runtime import adjudication_rubric as R
@@ -164,6 +166,12 @@ def create_app(store, mailer, config: dict) -> Flask:
             return False
         return site is None or site == "same-origin"
 
+    def typed_address() -> str:
+        """The address a sign-in form sent, for the page's own form again; nothing at all when
+        it is not shaped like an address (a control character never reaches a page or a query)."""
+        address = request.form.get("address", "")[:auth.MAX_ADDRESS]
+        return address if auth.plausible(address) else ""
+
     def network() -> str:
         """The caller's network address, for the limits only (the platform sets these headers)."""
         forwarded = request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
@@ -243,6 +251,15 @@ def create_app(store, mailer, config: dict) -> Flask:
 
     for status in (400, 403, 404, 405, 413):
         app.register_error_handler(status, lambda _exc, status=status: refuse(status))
+
+    @app.errorhandler(HTTPException)
+    def declined(exc):
+        """Any other answer of the HTTP layer itself (a range of a static file that cannot be
+        satisfied, for one) keeps its status and gets the plain page: it is not a failure."""
+        if isinstance(exc, RoutingException) or exc.code is None:
+            return exc
+        return render_template("message.html", message=MESSAGES[400], status=exc.code,
+                               who=None, csrf="", demo=demo_env), exc.code
 
     @app.errorhandler(Exception)
     def failed(exc):
@@ -326,12 +343,12 @@ def create_app(store, mailer, config: dict) -> Flask:
         logged and not shown: showing it would say that the address is listed. Either way the
         code that was not delivered is ended."""
         started = time.monotonic()
-        address = request.form.get("address", "")[:auth.MAX_ADDRESS]
+        address = typed_address()
         if synthetic and not store.bundle_is_demo():
             return refuse(503)  # a code is shown on a page only beside invented data
         asked = auth.request_code(store, secret, address, network(), clock())
         if synthetic and asked.code is not None and not reads_demo(asked.reviewer):
-            auth.cancel_codes(store, asked.reviewer, clock())  # never for a real bundle's reader
+            auth.cancel_code(store, asked.code_id, clock())  # never for a real bundle's reader
             asked = auth.Asked(True)
         unsent = False
         if not synthetic:
@@ -348,16 +365,21 @@ def create_app(store, mailer, config: dict) -> Flask:
             else:
                 asked = asked._replace(code=None)  # delivered, or none was made: nothing to end
             if asked.code is not None:
-                auth.cancel_codes(store, asked.reviewer, clock())
+                auth.cancel_code(store, asked.code_id, clock())
         time.sleep(max(0.0, floor - (time.monotonic() - started)))
         return render_template("sign_in_code.html", address=address, failed=False, unsent=unsent,
                                shown_code=asked.code if synthetic else None)
 
     @app.post("/sign-in/verify")
     def sign_in_verify():
-        address = request.form.get("address", "")[:auth.MAX_ADDRESS]
-        token = auth.verify_code(store, secret, address, request.form.get("code", "")[:32],
-                                 network(), clock())
+        """One refusal for every reason, after the same least time as a request for a code."""
+        started = time.monotonic()
+        address = typed_address()
+        token, exhausted = auth.verify_code(
+            store, secret, address, request.form.get("code", "")[:32], network(), clock())
+        if exhausted:  # the tenth wrong code of the day for this reviewer: the operator sees it
+            app.logger.warning("SIGN_IN_TRIES_EXHAUSTED alias=%s", exhausted)
+        time.sleep(max(0.0, floor - (time.monotonic() - started)))
         if token is None:
             return render_template("sign_in_code.html", address=address, failed=True,
                                    unsent=False, shown_code=None), 401
