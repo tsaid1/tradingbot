@@ -329,7 +329,7 @@ def owner_cutover(run, store, base, tmp_path) -> dict:  # noqa: F811
                         outcome="ACCEPT")  # 12: the approver's line never leaves the Mac
     local_save(base, OWNER_R, "i08", A.INDEPENDENT)  # 13
     secret = address_file(tmp_path / "keys")
-    run("init-db")
+    run("init-db", "--preview")  # a rehearsal on the invented folder
     run("publish-bundle", "--demo", base)
     run("sync-reviewers", "--demo", "--owner-address-file", secret)
     run("sync-reviewers", "--test-identity", "TEST-1", "--owner-address-file", secret)

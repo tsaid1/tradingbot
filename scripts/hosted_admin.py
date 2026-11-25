@@ -662,6 +662,14 @@ def cmd_import_log(args) -> int:
     listed = A.load_reviewers(base / "reviewers.toml").entries
     if not lines and not args.allow_empty_log:
         raise refused("EMPTY_LOCAL_LOG")  # a preview only: --allow-empty-log
+    if args.cutover:  # say where it writes before it writes, and never the wrong pair
+        demo, preview = local.manifest.get("product_commit") == "demo", store.is_preview()
+        print(f"cutover: {'demonstration' if demo else 'real'} bundle into a database "
+              f"{'marked preview' if preview else 'not marked preview'}")
+        if demo and not preview:
+            raise refused("CUTOVER_DEMO_BUNDLE_ON_A_REAL_DATABASE")
+        if preview and not demo:
+            raise refused("CUTOVER_REAL_BUNDLE_ON_A_PREVIEW_DATABASE")
     with store.exclusive():
         events, anchor = store.events(), store.anchor()
         if strangers(events, store.reviewers(), listed):

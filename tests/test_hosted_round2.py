@@ -454,3 +454,34 @@ def test_r2_2_an_offboarded_reviewer_s_row_stops_no_pull(run, store, base):  # n
     out = run("pull-to-local")
     assert "pulled 2 hosted line(s) into the local log: REMOTE-3 1, REMOTE-2 1" in out
     assert "imported 0 new line(s)" in run("import-log")
+
+
+# ------------------------------------------------------------------ re-check R2-3
+
+
+def test_r2_3_the_cutover_says_where_it_writes_and_refuses_the_wrong_pair(
+        run, store, base, tmp_path):  # noqa: F811
+    """R2-3: a terminal that ran the rehearsal still names the invented folder or the preview.
+    import-log --cutover prints which bundle and which database it writes, and refuses a
+    demonstration bundle into a database not marked preview, and a real bundle into a preview."""
+    import json as _json
+
+    half_way(base)
+    run("init-db")
+    run("publish-bundle", "--demo", base)
+    run("sync-reviewers", "--demo", "--without-owner")
+    out = run("import-log", "--cutover", code=2)
+    assert "cutover: demonstration bundle into a database not marked preview" in out
+    assert out.endswith("refused: CUTOVER_DEMO_BUNDLE_ON_A_REAL_DATABASE\n")
+    assert store.anchor() is None and store.closed_rows() == ["REMOTE-2", "REMOTE-3"]
+    store.mark_preview()
+    manifest = base / "bundle" / "manifest.json"
+    data = _json.loads(manifest.read_text())
+    manifest.write_text(_json.dumps({**data, "product_commit": "0" * 12}, indent=1) + "\n")
+    out = run("import-log", "--cutover", code=2)  # a real bundle's log into a preview
+    assert "cutover: real bundle into a database marked preview" in out
+    assert out.endswith("refused: CUTOVER_REAL_BUNDLE_ON_A_PREVIEW_DATABASE\n")
+    manifest.write_text(_json.dumps(data, indent=1) + "\n")
+    out = run("import-log", "--cutover")
+    assert "cutover: demonstration bundle into a database marked preview" in out
+    assert store.closed_rows() == []
