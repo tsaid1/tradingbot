@@ -8,7 +8,8 @@
 .with-nav__main { min-width: 0; }
 @media (min-width: 80rem) {
   .with-nav { grid-template-columns: 15.5rem minmax(0, 1fr); gap: var(--space-5); align-items: start; }
-  .with-nav > .nav-panel { position: sticky; top: 3rem; max-height: calc(100vh - 7.5rem);
+  /* It ends above the bar: the window less the band, the bar and the margins. */
+  .with-nav > .nav-panel { position: sticky; top: 0.75rem; max-height: calc(100dvh - 2.5rem - 4.5rem - 1.5rem);
     overflow-y: auto; overscroll-behavior: contain; }
 }
 
@@ -25,7 +26,7 @@
 .nav-tree { padding: 0 var(--space-2) var(--space-2); }
 .nav-tree ol { list-style: none; margin: 0; padding: 0; }
 .nav-tree__home { margin: 0 0 var(--space-2); padding: 0 var(--space-1); }
-.nav-tree__sequence > details > summary { display: grid; grid-template-columns: minmax(0, 1fr) auto auto;
+.nav-tree__sequence > details > summary { display: grid; grid-template-columns: minmax(0, 1fr) auto auto auto;
   align-items: center; gap: var(--space-2); min-height: 2.5rem; padding: var(--space-1) var(--space-2);
   cursor: pointer; list-style: none; }
 .nav-tree__sequence > details > summary::-webkit-details-marker { display: none; }
@@ -33,7 +34,7 @@
 .nav-tree__forms { padding: 0 0 var(--space-2) var(--space-3) !important; }
 .nav-tree__form a { display: grid; grid-template-columns: minmax(0, 1fr); gap: 0;
   padding: var(--space-1) var(--space-2); min-height: 2.75rem; align-content: center; }
-.nav-tree__state { display: inline-flex; align-items: center; gap: 0.3em; }
+.nav-tree__state, .nav-tree__draft, .nav-tree__draft-mark { display: inline-flex; align-items: center; gap: 0.3em; }
 
 /* ------------------------------------------------------------ the dashboard */
 

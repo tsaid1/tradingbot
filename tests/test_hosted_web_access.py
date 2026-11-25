@@ -44,7 +44,7 @@ def test_a_reviewer_reaches_only_the_forms_of_their_scope(site):  # noqa: F811
     a, b = site.browser().sign_in(FIRST), site.browser().sign_in(SECOND)
     home = a.get("/").get_data(as_text=True)
     assert re.findall(r'href="/form/([^"]+)"', home) == ["i07", "i08"]
-    assert "1 idea, 2 forms" in " ".join(home.split())
+    assert "1 sequence, 2 forms in all" in " ".join(home.split())
     assert a.get("/form/i07").status_code == 200
     data = {"_csrf": a.csrf(), "_phase": A.INDEPENDENT, "_key": "k" * 24, "confidence": "HIGH"}
     for item in ("i01", "s14a", "i09"):

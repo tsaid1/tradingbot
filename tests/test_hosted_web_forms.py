@@ -113,8 +113,14 @@ def test_the_form_stores_what_the_streamlit_form_stores(site):  # noqa: F811
         *A.compared_fields(site.bundle, item, rec["reading"]), "levels"}
     assert "Your assessment is saved (record" in b.shown.text
     assert "Review complete. Continue to the next form." in b.shown.text
-    # The next save needs a confidence again: listed, not shown as an error before a submission.
-    assert "Choose how confident you are." in b.shown.visible() and 'id="problems"' not in b.shown.text
+    # A complete form owes nothing: no "points still open" before the reviewer changes anything.
+    assert "Choose how confident you are." not in b.shown.visible()
+    assert 'id="problems"' not in b.shown.text
+    again = b.open("i07")
+    assert "This form is complete: your reading and your assessment are saved." in again.plain
+    assert "still open before you can submit" not in again.visible()
+    changed = b.set({"notes": "a correction"})
+    assert "Choose how confident you are." in changed.visible()  # once it is edited
 
 
 def test_fields_appear_and_go_with_the_answers_by_a_round_trip_to_the_server(site):  # noqa: F811

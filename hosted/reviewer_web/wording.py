@@ -23,6 +23,7 @@ from tradingbot.runtime import adjudication_rubric as R
 
 NOT_ANSWERED = "I haven't answered yet"
 POST_SILENT = "The post doesn't say"
+POSTS_SILENT = "The posts shown don't say"  # NOT_STATED where the earlier posts shown count too
 UNSETTLED = "The evidence conflicts or doesn't settle it"
 DOES_NOT_APPLY = "This question doesn't apply"
 VALUE = "VALUE"  # the page's own code for "a value is typed" (forms.VALUE)
@@ -253,7 +254,7 @@ OPTIONS: dict[str, dict[str, str]] = {
              "UNRESOLVED": UNSETTLED},
     "exactness": {"EXACT": "Exactly", "APPROXIMATE": "Approximately"},
     "contract_month": {"FRONT": "The front (nearest) month", "NEXT": "The next month",
-                       "NAMED": "A month the post names", R.NOT_STATED: POST_SILENT},
+                       "NAMED": "A month the post names", R.NOT_STATED: POSTS_SILENT},
 }
 # The further actions reuse the questions' own option words.
 ADDITIONAL = {"timing": ("When", "timing"), "action": ("What", "action"),
@@ -270,6 +271,41 @@ VALUE_CHOICE = {
     "amendment_from": ("It gives the old value", "The old value"),
 }
 SENTINEL = {R.NOT_STATED: POST_SILENT, R.CANNOT_DETERMINE: UNSETTLED}
+# Where the rubric lets the earlier posts shown answer, "doesn't say" is about all of them.
+SILENT_IN_POSTS_SHOWN = ("position_last_stop", "amendment_from", "contract_month")
+
+
+def sentinel(f: str, code: str) -> str:
+    if code == R.NOT_STATED and f in SILENT_IN_POSTS_SHOWN:
+        return POSTS_SILENT
+    return SENTINEL[code]
+
+
+# The two proposals after the reveal: what each thing is, and a stored code in words.
+PROPOSAL_IS = {
+    "reference_series_right": ("The price series the system would compare the post's prices "
+                               "with. The system records only this name for it."),
+    "execution_instrument_right": "The instrument the system would trade to follow this idea.",
+}
+INSTRUMENT_WORDS = {"FUT": "futures contract", "FUTURES": "futures contract",
+                    "ETF": "exchange-traded fund", "CFD": "CFD", "SPOT": "spot market",
+                    "OPT": "options", "OPTIONS": "options", "STK": "shares", "STOCK": "shares"}
+
+
+def proposal_words(f: str, value: str) -> str:
+    """A proposed value in words: "FUT" is "A futures contract"; "TLT ETF" is "TLT, an
+    exchange-traded fund". A name the site does not know stays as written."""
+    parts = str(value).split()
+    if f != "execution_instrument_right" or not parts:
+        return str(value)
+    known = [INSTRUMENT_WORDS.get(p.upper()) for p in parts]
+    if len(parts) == 1 and known[0]:
+        return ("A " if known[0][0] not in "aeiouAEIOU" or known[0] == "CFD" else "An ") \
+            + known[0]
+    if len(parts) == 2 and known[1] and not known[0]:
+        art = "an" if known[1][0] in "aeiou" else "a"
+        return f"{parts[0]}, {art} {known[1]}"
+    return str(value)
 
 VERDICT_QUESTION = "Is the system's answer right?"
 VERDICTS = {"CONFIRM": "Yes, the system is right",
@@ -330,6 +366,31 @@ REASONS = {
     "not a price of this action": "Not a price of this action.",
 }
 SET_BY_FORM = "Set by the form from your answers"
+# Which answer each value the form sets comes from ("set by the form from ...").
+DERIVED_FROM = {
+    "component": "because this post has one form",
+    "post_label": "from when the action happens",
+    "announcement": "from when the action happens",
+    "follower_implication": "from when it happens, whether this is the first report, and the "
+                            "action",
+    "action": "because there is no action: commentary only",
+    "effect": "from the action and the position before it (or because this post repeats an "
+              "earlier report)",
+    "entry_role": "because the post gives no entry number",
+    "stop_price": "from the new value of the change",
+    "amendment_from": "from the latest stop before this action",
+}
+
+
+def set_by_form(f: str) -> str:
+    return "set by the form " + DERIVED_FROM.get(f, "from your answers")
+
+
+# What belongs on each form of a post with several forms (the rubric's own rule; nothing of
+# what the system read).
+FORMS_RULE = ("A post with several actions has one form per action, in the order the actions "
+              "first appear in the post: the first action on form 1, the second on form 2. A "
+              "form left over records no action.")
 
 # ------------------------------------------------------------------ what blocks a submission
 
@@ -470,6 +531,10 @@ SAVED_READING_OTHER_FORM_DETAIL = ("The system's answers are shown once every fo
 SAVED_REVIEW_COMPLETE = "Review complete. Continue to the next form."
 SAVED_ALL_DONE = "Review complete. Every form in your list is done."
 SAVED_RECEIPT = "Saved. Record {seq}, {day} at {hhmm} UTC."
+REVIEW_COMPLETE_HERE = "Review complete. Your assessment of this form is saved."
+COMPLETE_AGAIN = "This form is complete: your reading and your assessment are saved."
+COMPLETE_AGAIN_DETAIL = ("Nothing more is needed here. Save again only to correct your "
+                         "assessment: the newest one counts.")
 NEXT_ACTION = {"review": "Review the system's answers", "other": "Go to form {k} of {n}",
                "next": "Continue to the next form", "home": "Back to the dashboard"}
 
@@ -579,7 +644,9 @@ def option(f: str, code: str) -> str:
     if f == "post_label" and code not in OPTIONS[f]:
         return code
     if f in VALUE_CHOICE:
-        return SENTINEL.get(code, code)
+        return sentinel(f, code) if code in SENTINEL else code
+    if code == R.NOT_STATED and f in SILENT_IN_POSTS_SHOWN:
+        return POSTS_SILENT
     return OPTIONS.get(f, {}).get(code, code)
 
 
@@ -593,7 +660,7 @@ def shown(f: str, value) -> str:
     if value in ("", R.NOT_APPLICABLE):
         return option(f, value)
     if f in VALUE_CHOICE or f not in OPTIONS and f != "family":
-        return SENTINEL.get(value, value)
+        return sentinel(f, value) if value in SENTINEL else value
     words = option(f, value)
     return humane(words) if words == value and f != "family" else words
 
@@ -681,7 +748,7 @@ def wording_table_markdown() -> str:
             lines.append(f"| | | {cell(VALUE_CHOICE[f][0])}: a box \"{cell(VALUE_CHOICE[f][1])}\" "
                          f"| the typed value | value given |")
             for c in R.VALUE_SENTINELS[f]:
-                lines.append(f"| | | {cell(SENTINEL[c])} | `{c}` | "
+                lines.append(f"| | | {cell(sentinel(f, c))} | `{c}` | "
                              f"{'not stated' if c == R.NOT_STATED else 'cannot determine'} |")
             continue
         before = dict(_before_options(f))

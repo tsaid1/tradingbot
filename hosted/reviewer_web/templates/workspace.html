@@ -36,17 +36,21 @@
 
   <h2 class="dash-h2">Sequences <span class="quiet-text">in review order</span></h2>
   <div class="seq-head" aria-hidden="true"><span>Sequence</span><span>Market</span><span>Done</span><span>Status</span><span></span></div>
+  {%- set grouped = dash.sequences | selectattr("number") | list -%}
+  {%- set loose = dash.sequences | rejectattr("number") | list -%}
+  {%- macro rows(list) -%}
   <ol class="seq-list">
-    {% for row in dash.sequences %}
+    {% for row in list %}
     <li class="seq" id="sequence-{{ row.id | ident }}">
       <details>
         <summary class="seq__row">
           <span class="seq__title"><strong>{{ row.title }}</strong>{% if row.number %} <span class="quiet-text seq__id">{{ row.id }}</span>{% endif %}</span>
-          <span class="seq__read">{% if row.read %}You read: <strong>{{ row.read }}</strong>{% else %}<span class="quiet-text">No reading saved yet</span>{% endif %}</span>
+          <span class="seq__read">{% if row.read %}You read: <strong>{{ row.read }}</strong>{% elif row.drafts %}<span class="quiet-text">Draft kept, no reading submitted yet</span>{% else %}<span class="quiet-text">No reading saved yet</span>{% endif %}</span>
           <span class="seq__done"><span class="count">{{ row.done }} of {{ row.total }}</span> <span class="quiet-text">· {{ row.remaining }} left</span></span>
           <span class="seq__status">{{ status_badge(row.status, row.status_text) }}
             {%- if row.returned %} <span class="seq__flag">{{ icon("returned") }}{{ row.returned }} returned</span>{% endif %}
-            {%- if row.attention %} <span class="seq__flag">{{ icon("awaiting") }}{{ row.attention }} to assess</span>{% endif %}</span>
+            {%- if row.attention %} <span class="seq__flag">{{ icon("awaiting") }}{{ row.attention }} to assess</span>{% endif %}
+            {%- if row.drafts %} <span class="seq__draft">{{ icon("edit") }}Draft kept, not submitted</span>{% endif %}</span>
         </summary>
         <ol class="seq__forms">
           {% for post in row.posts %}
@@ -68,7 +72,16 @@
     </li>
     {% endfor %}
   </ol>
-  <p class="quiet-text">Signed in as {{ who.session.name or "reviewer" }}. Your scope: {{ ideas }}
-  idea{{ "" if ideas == 1 else "s" }}, {{ forms }} form{{ "" if forms == 1 else "s" }}, in review order.</p>
+  {%- endmacro -%}
+  {{ rows(grouped) }}
+  {% if loose %}
+  <h2 class="dash-h2">Single posts outside any sequence</h2>
+  <p class="quiet-text">Posts that belong to no trade idea of the list, sampled so that the review
+  also covers them. Review them like the others.</p>
+  {{ rows(loose) }}
+  {% endif %}
+  <p class="quiet-text">Signed in as {{ who.session.name or "reviewer" }}. Your list:
+  {{ grouped | length }} sequence{{ "" if grouped | length == 1 else "s" }}{% if loose %} and the single posts{% endif %},
+  {{ forms }} form{{ "" if forms == 1 else "s" }} in all, in review order.</p>
 </section>
 {% endblock %}

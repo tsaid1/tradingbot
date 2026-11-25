@@ -204,7 +204,8 @@
   <div class="question proposal pair{{ ' is-later' if p.anchor in later else '' }}{{ ' has-error' if tried and form.errors.get(p.anchor) else '' }}" id="{{ p.anchor }}" data-q>
     <div class="pair-system">
       <p class="pair-head">{{ p.title }}</p>
-      <p class="proposal-value">{{ p.value or "Nothing proposed" }}</p>
+      <p class="proposal-value">{{ p.words or "Nothing proposed" }}{% if p.value and p.words != p.value %} <span class="proposal-code">stored as {{ p.value }}</span>{% endif %}</p>
+      <p class="note">{{ p.is }}</p>
       {% if p.mine %}<p class="note">{{ p.mine[0] }}: <strong>{{ p.mine[1] }}</strong>.</p>{% endif %}
     </div>
     <div class="pair-mine">
@@ -250,7 +251,7 @@
       <p class="field-label">{{ e.question }}</p>
       {{ errors(e.anchor) }}
       {% if e.state == "DERIVED" %}
-      <p class="derived">{{ e.derived }} <span class="note">({{ w.SET_BY_FORM | lower }})</span></p>
+      <p class="derived">{{ e.derived }} <span class="note">({{ e.derived_from }})</span></p>
       {% if e.sentence %}<p class="note">{{ e.sentence }}</p>{% endif %}
       {% else %}
       <p class="note">{{ e.note }}</p>
@@ -376,7 +377,7 @@
     </div>
   </div>
   {% endif %}
-  {% if form.problems and not tried %}
+  {% if form.problems and not tried and (form.edited or not form.stored.assessment) %}
   <div class="todo card">
     <p class="todo-title"><span class="count">{{ form.problems | map(attribute="anchor") | unique | list | length }}</span> {{ "point is" if (form.problems | map(attribute="anchor") | unique | list | length) == 1 else "points are" }} still open before you can submit</p>
     <ul class="problem-list">
