@@ -1,59 +1,85 @@
 /* The hosted reviewer site. One file, no external font, image or import. Light and dark follow the
-   reader's system. Three kinds of thing are kept visibly apart on a form: the reviewer's own answer
-   (plain), the system's value with its verdict (a ruled inset), and the two questions about the
-   system's proposals (their own tinted block). Holds no private material. */
+   reader's system. Holds no private material.
+
+   THE VISUAL VOCABULARY (DECIDED 40). Every colour has one meaning on every page, and is never the
+   only signal: each use is paired with words or an inline SVG icon (templates/_icons.html).
+     --surface-earlier   neutral: the earlier posts shown with a post
+     --accent            the post under review and the question being answered
+     --ok                a save the server confirmed
+     --attention         something that needs the reviewer: a mark "For later", an awaited step,
+                         a returned reading, edits not yet kept
+     --error             a blocking problem: a refused submission, the field to correct
+   Contrast (WCAG 2.1, computed for both themes): text and quiet text at least 6.1:1 on every
+   surface; each status colour at least 5.6:1 on its own surface and on --surface; control
+   borders at least 4:1; the focus ring at least 4.4:1 on every surface. */
 
 :root {
   color-scheme: light dark;
-  --bg: #f6f5f1;
+  --bg: #f5f4f0;
   --surface: #ffffff;
-  --sunk: #efede7;
+  --surface-earlier: #f0eee9;
   --text: #1b1a17;
-  --muted: #58554e;
-  --line: #d6d2c8;
-  --accent: #1d55b3;
+  --text-quiet: #57534b;
+  --line: #d9d5cc;
+  --line-strong: #7c776d;
+  --accent: #1f56b5;
+  --accent-surface: #eaf1fd;
   --accent-text: #ffffff;
-  --focus: #b3400b;
-  --system: #6a4bb5;
-  --system-bg: #f3effb;
-  --proposal: #0b6b62;
-  --proposal-bg: #e6f3f1;
-  --ok: #24693a;
-  --ok-bg: #e7f3ea;
-  --info: #1d55b3;
-  --info-bg: #e8eefa;
-  --warn: #8a5a00;
-  --warn-bg: #fbf1d5;
-  --bad: #a3231c;
-  --bad-bg: #fbe8e6;
+  --ok: #1d6b3a;
+  --ok-surface: #e7f4eb;
+  --attention: #8a5200;
+  --attention-surface: #fcf2dc;
+  --error: #b02a20;
+  --error-surface: #fcebe9;
+  --focus: #c2410c;
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-5: 1.5rem;
+  --space-6: 2.25rem;
+  --radius: 8px;
+  --radius-small: 5px;
+  --shadow: 0 1px 2px rgb(27 26 23 / 0.06), 0 4px 14px rgb(27 26 23 / 0.07);
   --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
   --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
   --control: 21rem;
+  /* Earlier names, kept so that a page written before this vocabulary still reads right. */
+  --sunk: var(--surface-earlier);
+  --muted: var(--text-quiet);
+  --ok-bg: var(--ok-surface);
+  --info: var(--accent);
+  --info-bg: var(--accent-surface);
+  --warn: var(--attention);
+  --warn-bg: var(--attention-surface);
+  --bad: var(--error);
+  --bad-bg: var(--error-surface);
+  --system: var(--text);
+  --system-bg: var(--surface-earlier);
+  --proposal: var(--accent);
+  --proposal-bg: var(--accent-surface);
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: #141518;
+    --bg: #131417;
     --surface: #1c1e22;
-    --sunk: #24272c;
-    --text: #e9e6df;
-    --muted: #aba79e;
-    --line: #3b3f47;
-    --accent: #8fb6ff;
-    --accent-text: #0d1b33;
-    --focus: #ffb37a;
-    --system: #c1a8ff;
-    --system-bg: #26213a;
-    --proposal: #6fd3c6;
-    --proposal-bg: #14302d;
-    --ok: #86d39a;
-    --ok-bg: #18301f;
-    --info: #8fb6ff;
-    --info-bg: #182640;
-    --warn: #f0c466;
-    --warn-bg: #33290f;
-    --bad: #ff9d94;
-    --bad-bg: #3a1a17;
+    --surface-earlier: #23262b;
+    --text: #ebe8e1;
+    --text-quiet: #aeaaa1;
+    --line: #3a3e46;
+    --line-strong: #8c8f97;
+    --accent: #8db4ff;
+    --accent-surface: #1b2a45;
+    --accent-text: #0b1730;
+    --ok: #7fd398;
+    --ok-surface: #16301f;
+    --attention: #f2c162;
+    --attention-surface: #33290f;
+    --error: #ff9a90;
+    --error-surface: #3b1916;
+    --focus: #ff9f5a;
+    --shadow: 0 1px 2px rgb(0 0 0 / 0.4), 0 6px 18px rgb(0 0 0 / 0.35);
   }
 }
 
@@ -72,6 +98,7 @@ a { color: var(--accent); text-underline-offset: 0.15em; }
 a:hover { text-decoration-thickness: 2px; }
 
 :focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; border-radius: 2px; }
+::selection { background: var(--accent-surface); color: var(--text); }
 
 h1 { font-size: 1.6rem; line-height: 1.25; margin: 0 0 0.75rem; }
 h2 { font-size: 1.25rem; line-height: 1.3; margin: 0 0 0.75rem; }
@@ -161,24 +188,67 @@ button:disabled { border-color: var(--line); background: var(--sunk); color: var
 .stack label { font-weight: 600; }
 .stack.again { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem 1.25rem; }
 
-/* ------------------------------------------------------------ banners and status */
 
-.banner { padding: 0.7rem 0.9rem; border-radius: 6px; border-left: 5px solid var(--info);
-  background: var(--info-bg); margin: 0 0 1rem; overflow-wrap: anywhere; }
+/* ------------------------------------------------------------ the vocabulary's components */
+
+.icon { width: 1.1em; height: 1.1em; flex: none; vertical-align: -0.18em; }
+
+.card { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius);
+  padding: var(--space-4); min-width: 0; }
+
+.count { font-variant-numeric: tabular-nums; font-weight: 700; }
+
+.button { display: inline-flex; align-items: center; justify-content: center; gap: var(--space-2); }
+.button--primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
+.button--quiet { border-color: var(--line-strong); color: var(--text); background: var(--surface);
+  font-weight: 500; }
+
+.status { display: inline-flex; align-items: center; gap: 0.35em; padding: 0.1rem 0.6rem;
+  border-radius: 999px; border: 1px solid var(--line-strong); background: var(--surface);
+  color: var(--text-quiet); font-size: 0.85rem; font-weight: 600; line-height: 1.5;
+  white-space: nowrap; }
+.status--not-started { color: var(--text-quiet); border-color: var(--line-strong);
+  background: var(--surface); }
+.status--in-progress { color: var(--accent); border-color: var(--accent);
+  background: var(--accent-surface); }
+.status--awaiting { color: var(--attention); border-color: var(--attention);
+  background: var(--attention-surface); }
+.status--complete { color: var(--ok); border-color: var(--ok); background: var(--ok-surface); }
+.status--returned { color: var(--attention); border-color: var(--attention);
+  background: var(--attention-surface); }
+
+.banner { display: flex; gap: var(--space-3); align-items: flex-start; padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--line-strong); border-radius: var(--radius); background: var(--surface);
+  margin: 0 0 var(--space-4); overflow-wrap: anywhere; }
+.banner > .icon { width: 1.35rem; height: 1.35rem; margin-top: 0.1rem; }
+.banner-body { min-width: 0; flex: 1; }
+.banner-body > :last-child { margin-bottom: 0; }
+.banner-title { font-weight: 700; margin: 0 0 var(--space-1); }
+.banner--ok { border-color: var(--ok); background: var(--ok-surface); }
+.banner--ok > .icon, .banner--ok .banner-title { color: var(--ok); }
+.banner--attention { border-color: var(--attention); background: var(--attention-surface); }
+.banner--attention > .icon, .banner--attention .banner-title { color: var(--attention); }
+.banner--error { border-color: var(--error); background: var(--error-surface); }
+.banner--error > .icon, .banner--error .banner-title { color: var(--error); }
+.banner--accent { border-color: var(--accent); background: var(--accent-surface); }
+.banner--accent > .icon, .banner--accent .banner-title { color: var(--accent); }
+
+/* ------------------------------------------------------------ banners and status (earlier names) */
+
+.banner { display: block; }
+.banner:has(> .icon) { display: flex; }
 .banner p:last-child { margin-bottom: 0; }
-.banner.success { border-color: var(--ok); background: var(--ok-bg); }
-.banner.error { border-color: var(--bad); background: var(--bad-bg); }
-.banner.warning { border-color: var(--warn); background: var(--warn-bg); }
+.banner.info { border-color: var(--accent); background: var(--accent-surface); }
+.banner.success { border-color: var(--ok); background: var(--ok-surface); }
+.banner.error { border-color: var(--error); background: var(--error-surface); }
+.banner.warning { border-color: var(--attention); background: var(--attention-surface); }
 
-.status { display: inline-block; padding: 0.05rem 0.55rem; border-radius: 999px;
-  border: 1px solid var(--line); background: var(--sunk); font-size: 0.85rem; }
-.status-done { border-color: var(--ok); color: var(--ok); background: var(--ok-bg); }
-.status-reveal-pending, .status-after-reveal-due { border-color: var(--info); color: var(--info);
-  background: var(--info-bg); }
-.status-returned { border-color: var(--warn); color: var(--warn); background: var(--warn-bg);
-  font-weight: 600; }
-.status-next { border-color: var(--focus); color: var(--focus); background: transparent;
-  font-weight: 600; }
+.status-done { border-color: var(--ok); color: var(--ok); background: var(--ok-surface); }
+.status-reveal-pending { border-color: var(--accent); color: var(--accent);
+  background: var(--accent-surface); }
+.status-after-reveal-due, .status-returned { border-color: var(--attention);
+  color: var(--attention); background: var(--attention-surface); }
+.status-next { border-color: var(--accent); color: var(--accent); background: transparent; }
 
 /* ------------------------------------------------------------ the workspace */
 
