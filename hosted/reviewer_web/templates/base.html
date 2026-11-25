@@ -7,6 +7,7 @@
 <meta name="referrer" content="same-origin">
 <title>{% block title %}Sign in{% endblock %} · {{ site_name }}</title>
 <link rel="stylesheet" href="/static/app.css">
+<link rel="stylesheet" href="/static/nav.css">
 <script src="/static/app.js" defer></script>
 </head>
 <body>
@@ -31,7 +32,19 @@
   {% endif %}
 </header>
 <main id="main"{% block main_class %}{% endblock %}>
+{#- With the sidebar (``nav``): a page in two parts, the sequences beside the page's own
+    content. A page that IS the overview (the dashboard) empties the block ``sidebar``. -#}
+{%- set sidebar_html %}{% block sidebar %}{% include "_sidebar.html" %}{% endblock %}{% endset -%}
+{% if sidebar_html | trim %}
+<div class="with-nav">
+{{ sidebar_html }}
+<div class="with-nav__main">
 {% block main %}{% endblock %}
+</div>
+</div>
+{% else %}
+{{ self.main() }}
+{% endif %}
 </main>
 </body>
 </html>

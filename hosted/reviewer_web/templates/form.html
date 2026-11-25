@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% from "_icons.html" import icon, status_badge %}
 {% set w = evidence.w %}
-{% block title %}{{ names[item_id] }}{% endblock %}
+{% block title %}{{ nav.place if nav is defined and nav and nav.place else names[item_id] }}{% endblock %}
 {% block main_class %} class="wide"{% endblock %}
 {% block main %}
 {#- The page's state, in words and colour: progress's code when the route gives it (``status``
@@ -16,15 +16,15 @@
 {%- set multi = evidence.forms | length > 1 -%}
 <div class="form-top">
   <p class="crumbs"><a href="/">Dashboard</a> <span aria-hidden="true">/</span>
-    <strong>{{ names[item_id] }}</strong>
-    {% if multi %}<span class="quiet-text">{{ header }}</span>{% endif %}</p>
+    <strong>{{ nav.place if nav is defined and nav and nav.place else names[item_id] }}</strong>
+    {% if multi and not (nav is defined and nav and nav.place) %}<span class="quiet-text">{{ header }}</span>{% endif %}</p>
   <div class="form-status">
     {{ status_badge(status_code, w.STATUS[status_code]) }}
     {% if form %}
     {%- set kept = draft.saved_at if draft is defined and draft else none -%}
     <p class="save-state{{ ' save-state--draft' if kept else '' }}" id="save-state" role="status"
-       data-editing="{{ w.STATE_EDITING }}">
-      {% if kept %}{{ icon("edit") }}<span>{{ w.state_draft(kept.strftime("%H:%M") if kept.strftime is defined else kept[11:16]) }}</span>
+       data-editing="{{ w.STATE_EDITING }}" data-draft="{{ w.state_draft('{time}') }}">
+      {% if kept %}{{ icon("edit") }}<span>{{ w.state_draft(w.hhmm(kept)) }}</span>
       {% elif phase == "AFTER_REVEAL" and form.stored.assessment and not returned %}{{ icon("ok") }}<span>Assessment: {{ w.state_submitted(form.stored.assessment) }}</span>
       {% else %}{{ icon("not-started") }}<span>{{ "Assessment: not submitted yet" if phase == "AFTER_REVEAL" else w.STATE_UNSUBMITTED }}</span>{% endif %}
     </p>
@@ -36,37 +36,34 @@
 </div>
 
 {% if saved %}
-{#- After a confirmed save: the stage, and the next action (DECIDED 40 section 4). -#}
+{#- After a confirmed save: the stage, and the next action (DECIDED 40 section 4), from ``step``
+    (progress.remaining_step); without it, from what the page itself knows. -#}
 {%- set other = (evidence.forms | rejectattr("current") | selectattr("item_id", "in", waiting) | first) if waiting else none -%}
 {%- set code = step.code if step is defined and step else "" -%}
+{%- if not code -%}
+{%- set code = ("COMPLETE_OTHER_FORM" if other else "ASSESS_SYSTEM_ANSWERS" if form and form.phase == "AFTER_REVEAL" else "") if saved.phase == "INDEPENDENT" else ("NEXT_FORM" if next_step and next_step != item_id else "ALL_DONE" if not next_step else "") -%}
+{%- endif -%}
+{%- set target = (step.item_id if step is defined and step and step.item_id else other.item_id if other else next_step) -%}
 <div class="banner banner--ok saved-banner" role="status" id="saved" tabindex="-1">
   {{ icon("ok") }}
   <div class="banner-body">
-    {% if saved.phase == "INDEPENDENT" %}
-    {% if code == "COMPLETE_OTHER_FORM" or (not code and other) %}
-    {%- set k = step.k if code else other.k -%}{%- set n = step.n if code else other.n -%}
-    {%- set target = step.item_id if code else other.item_id -%}
-    <p class="banner-title">{{ w.SAVED_READING_OTHER_FORM.format(k=k, n=n) }}.</p>
-    <p>{{ w.SAVED_READING_OTHER_FORM_DETAIL }} {{ w.FORM_OF_POST.format(k=this_form.k, n=this_form.n) if this_form else "" }} is saved.</p>
+    {% if code == "COMPLETE_OTHER_FORM" %}
+    {%- set k = step.k if step is defined and step and step.k else other.k -%}{%- set n = step.n if step is defined and step and step.n else other.n -%}
+    <p class="banner-title">{{ w.STEP_TEXT.COMPLETE_OTHER_FORM.format(k=k, n=n) }}</p>
     <p class="banner-actions"><a class="button button--primary" href="/form/{{ target }}">{{ w.NEXT_ACTION.other.format(k=k, n=n) }}{{ icon("go") }}</a></p>
-    {% elif form and form.phase == "AFTER_REVEAL" %}
-    <p class="banner-title">{{ w.SAVED_READING_REVIEW }}.</p>
+    {% elif code == "ASSESS_SYSTEM_ANSWERS" %}
+    <p class="banner-title">{{ w.STEP_TEXT.ASSESS_SYSTEM_ANSWERS }}</p>
     <p>They stand beside your answers below, each with the question it needs.</p>
-    <p class="banner-actions"><a class="button button--primary" href="/form/{{ item_id }}#reading-form" data-go="g-A">{{ w.NEXT_ACTION.review }}{{ icon("go") }}</a></p>
-    {% else %}
-    <p class="banner-title">Your reading is saved.</p>
-    {% endif %}
-    {% else %}
-    {% if next_step and next_step != item_id %}
-    <p class="banner-title">{{ w.SAVED_REVIEW_COMPLETE }}</p>
-    <p class="banner-actions"><a class="button button--primary" href="/form/{{ next_step }}">{{ w.NEXT_ACTION.next }}: {{ names[next_step] }}{{ icon("go") }}</a>
+    <p class="banner-actions"><a class="button button--primary" href="/form/{{ item_id }}#sec-A" data-go="sec-A">{{ w.NEXT_ACTION.review }}{{ icon("go") }}</a></p>
+    {% elif code == "NEXT_FORM" and target and target != item_id %}
+    <p class="banner-title">{{ w.STEP_TEXT.NEXT_FORM }}</p>
+    <p class="banner-actions"><a class="button button--primary" href="/form/{{ target }}">{{ w.NEXT_ACTION.next }}{{ icon("go") }}</a>
       <a class="button button--quiet" href="/">{{ w.NEXT_ACTION.home }}</a></p>
-    {% elif next_step == item_id %}
-    <p class="banner-title">Your assessment is saved.</p>
-    {% else %}
-    <p class="banner-title">{{ w.SAVED_ALL_DONE }}</p>
+    {% elif code == "ALL_DONE" %}
+    <p class="banner-title">{{ w.STEP_TEXT.ALL_DONE }}</p>
     <p class="banner-actions"><a class="button button--quiet" href="/">{{ w.NEXT_ACTION.home }}</a></p>
-    {% endif %}
+    {% else %}
+    <p class="banner-title">{{ "Your reading is saved." if saved.phase == "INDEPENDENT" else "Your assessment is saved." }}</p>
     {% endif %}
     <p class="receipt">Saved. Your {{ "own reading" if saved.phase == "INDEPENDENT" else "assessment" }} is stored as record {{ saved.seq }} ({{ w.day_time(saved.at) }}).</p>
   </div>

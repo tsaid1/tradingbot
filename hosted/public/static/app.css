@@ -494,10 +494,61 @@ pre.plain { white-space: pre-wrap; background: var(--surface-earlier); padding: 
   border-radius: var(--radius-small); margin: var(--space-2) 0; }
 .plain { margin: var(--space-1) 0; overflow-wrap: anywhere; }
 
-/* The persistent "View post" button, on the right. */
-.dock { position: fixed; right: var(--space-4); bottom: var(--space-4); z-index: 6; }
-.dock-button { box-shadow: var(--shadow); min-height: 3rem; border-radius: 999px; padding: 0.55rem 1.2rem; }
+/* The persistent "View post" button: a slim bar along the bottom. The page keeps room for it,
+   and a control scrolled into view or focused stops above it: it never covers one. */
+.dock { position: fixed; left: 0; right: 0; bottom: 0; z-index: 6; display: flex; justify-content: flex-end;
+  align-items: center; gap: var(--space-3); padding: var(--space-2) var(--space-4);
+  background: var(--surface); border-top: 1px solid var(--line-strong); box-shadow: var(--shadow); }
+.dock-button { min-height: 2.75rem; padding: 0.4rem 1.1rem; }
 .dock-button.is-back { background: var(--surface); color: var(--accent); border-color: var(--accent); }
+html:has(.dock) { scroll-padding-bottom: 5rem; }
+body:has(.dock) main { padding-bottom: 6rem; }
+.js .post-back { display: none; }
+.js .post-back.is-shown { display: block; }
+
+/* The sidebar's colours (structure: nav.css). */
+.nav-panel { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); }
+.nav-panel > summary { font-weight: 700; }
+.nav-panel > summary .icon { color: var(--accent); }
+.nav-panel__where { font-weight: 600; font-size: 0.86rem; color: var(--accent); }
+.nav-tree__home { font-size: 0.88rem; }
+.nav-tree__sequence > details > summary { border-radius: var(--radius-small); font-size: 0.92rem; }
+.nav-tree__sequence > details > summary:hover, .nav-tree__form a:hover { background: var(--surface-earlier); }
+.nav-tree__sequence.is-active > details > summary { font-weight: 700; }
+.nav-tree__read { font-size: 0.8rem; color: var(--text-quiet); font-weight: 500; }
+.nav-tree__count { font-size: 0.82rem; color: var(--text-quiet); }
+.nav-tree__form a { color: var(--text); text-decoration: none; border-radius: var(--radius-small);
+  border-left: 3px solid transparent; font-size: 0.9rem; }
+.nav-tree__form a[aria-current="page"] { background: var(--accent-surface); border-left-color: var(--accent);
+  font-weight: 700; }
+.nav-tree__status-text { font-size: 0.8rem; font-weight: 500; }
+.nav-tree__state.status--not-started { color: var(--text-quiet); }
+.nav-tree__state.status--in-progress { color: var(--accent); }
+.nav-tree__state.status--awaiting, .nav-tree__state.status--returned { color: var(--attention); }
+.nav-tree__state.status--complete { color: var(--ok); }
+
+/* The dashboard's colours (structure: nav.css). */
+.dashboard h1 { margin: 0; }
+.dash-top { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); }
+.dash-big { font-size: 1.35rem; font-weight: 700; }
+.dash-flag { color: var(--text-quiet); font-weight: 500; }
+.dash-flag .icon { margin-top: 0.2rem; color: var(--ok); }
+.dash-flag--attention { color: var(--attention); font-weight: 600; }
+.dash-flag--attention .icon { color: var(--attention); }
+.dash-flag--ok { color: var(--ok); font-weight: 600; }
+.dash-next { min-height: 3rem; font-size: 1.02rem; }
+.dash-h2 { margin: var(--space-3) 0 0; font-size: 1.15rem; }
+.seq-head { font-size: 0.8rem; font-weight: 700; color: var(--text-quiet); text-transform: uppercase;
+  letter-spacing: 0.05em; }
+.seq-list { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); }
+.seq + .seq { border-top: 1px solid var(--line); }
+.seq__id { font-size: 0.82rem; font-family: var(--mono); }
+.seq__flag { color: var(--attention); font-weight: 600; font-size: 0.88rem; }
+.seq__draft { color: var(--attention); font-size: 0.88rem; font-weight: 600; }
+.seq__go--done { color: var(--ok); font-weight: 600; display: inline-flex; gap: 0.3em; align-items: center; }
+.seq__row:hover { color: var(--text); }
+.seq details[open] > .seq__row { border-bottom: 1px solid var(--line); }
+.choose .button { min-height: 3rem; }
 
 table.ref { border-collapse: collapse; width: 100%; font-size: 0.92rem; margin: var(--space-2) 0 var(--space-3); }
 table.ref th, table.ref td { text-align: left; vertical-align: top; padding: var(--space-1) var(--space-2);
@@ -513,7 +564,6 @@ table.ref th { color: var(--text-quiet); font-weight: 600; }
   .question { margin-left: calc(-1 * var(--space-2)); margin-right: calc(-1 * var(--space-2));
     padding: var(--space-2); }
   .post-form { margin-left: 0; }
-  .dock { right: var(--space-3); bottom: var(--space-3); }
 }
 
 @media (prefers-reduced-motion: reduce) {

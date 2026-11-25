@@ -427,6 +427,9 @@ REFUSALS = {
                                          "judgment."),
     "BLOCKED": "",
     "REVOKED": "This access has been withdrawn.",
+    "NO_ANCHOR": ("Nothing was stored: the site is not yet open for saving your review. You "
+                  "don't need to do anything now. Try again later, and if this keeps happening, "
+                  "tell the person who invited you."),
 }
 REFUSAL_OTHER = "The server could not accept these answers. Check them and submit again."
 
@@ -469,6 +472,61 @@ SAVED_ALL_DONE = "Review complete. Every form in your list is done."
 SAVED_RECEIPT = "Saved. Record {seq}, {day} at {hhmm} UTC."
 NEXT_ACTION = {"review": "Review the system's answers", "other": "Go to form {k} of {n}",
                "next": "Continue to the next form", "home": "Back to the dashboard"}
+
+# The dashboard and the sidebar.
+SEQUENCE = "Sequence {n}"
+NO_SEQUENCE = "Posts of no sequence"
+YOU_READ = "You read"
+
+
+def hhmm(at) -> str:
+    """HH:MM (UTC) of a stored time: a datetime or its ISO text."""
+    from datetime import UTC, datetime
+    if isinstance(at, datetime):
+        return f"{(at.astimezone(UTC) if at.tzinfo else at):%H:%M}"
+    try:
+        return f"{datetime.fromisoformat(str(at)).astimezone(UTC):%H:%M}"
+    except ValueError:
+        return str(at)[11:16]
+
+
+def post_time(at: str) -> str:
+    """"3 Mar 2026, 10:15 UTC" for a post's time."""
+    from datetime import datetime
+    try:
+        moment = datetime.fromisoformat(str(at))
+    except ValueError:
+        return str(at)
+    return f"{moment.day} {moment:%b %Y}, {moment:%H:%M} UTC"
+
+
+def form_label(post: int, k: int, n: int) -> str:
+    """"Post 2 · Form 1 of 2" (the form count only when the post has more than one)."""
+    return f"Post {post}" + (f" · Form {k} of {n}" if n > 1 else "")
+
+
+def place(sequence: str, post: int, k: int, n: int) -> str:
+    return f"{sequence}, post {post}" + (f", form {k} of {n}" if n > 1 else "")
+
+
+def next_button(code: str, where: str) -> str:
+    """The one primary button of the dashboard: what it opens, in plain words."""
+    verb = {"RETURNED": "Correct the returned reading", "AWAITING_ASSESSMENT":
+            "Assess the system's answers", "NOT_STARTED": "Start"}.get(code, "Continue")
+    return f"{verb}: {where}" if where else verb
+
+
+# What remains after a save (progress.remaining_step's codes), in the owner's words.
+STEP_TEXT = {
+    "SAVE_YOUR_READING": "Save your own reading of this form.",
+    "COMPLETE_OTHER_FORM": ("Your reading is saved. Another form of this post must be completed "
+                            "before the system's answers are shown: form {k} of {n}."),
+    "ASSESS_SYSTEM_ANSWERS": "Your reading is saved. Review the system's answers.",
+    "CORRECT_RETURNED": ("This reading was returned for changes. Correct it and save the "
+                         "assessment again."),
+    "NEXT_FORM": "Review complete. Continue to the next form.",
+    "ALL_DONE": "Review complete. Every form assigned to you is done.",
+}
 
 # Form statuses (progress's codes; FLOW's model, these words).
 STATUS = {"NOT_STARTED": "Not started", "IN_PROGRESS": "In progress",
