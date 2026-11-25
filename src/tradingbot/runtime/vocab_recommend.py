@@ -433,6 +433,13 @@ def repair_head(log_path: str | Path, schema: str, what: str, *, confirm: bool =
     return out
 
 
+def encode_line(rec: dict) -> bytes:
+    """One record as the bytes of its log line (without the newline): the exact serialisation
+    every chained line is hashed in, wherever it is stored."""
+    return json.dumps(rec, ensure_ascii=False, sort_keys=True,
+                      separators=(",", ":")).encode("utf-8")
+
+
 def append_chained(log_path: str | Path, what: str, schema: str, make) -> dict:
     """Append ONE line to a chained log under an exclusive lock: ``make(verification)`` returns
     the record (without ``schema``, ``seq``, ``prev_sha256``) or raises to write nothing. Refused
@@ -450,8 +457,7 @@ def append_chained(log_path: str | Path, what: str, schema: str, make) -> dict:
             if not v.ok:
                 raise RecommendationError("LOG_FAILS_VERIFICATION")
             rec = {**make(v), "schema": schema, "seq": v.count + 1, "prev_sha256": v.head}
-            line = json.dumps(rec, ensure_ascii=False, sort_keys=True,
-                              separators=(",", ":")).encode("utf-8")
+            line = encode_line(rec)
             os.write(fd, line + b"\n")
             os.fsync(fd)
             # Still under the lock. A crash between the two writes leaves a head that fails
