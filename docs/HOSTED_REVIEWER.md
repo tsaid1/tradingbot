@@ -601,6 +601,26 @@ reviewer's lines and the approver's decisions of the local log; so a RETURN that
 locally and not pushed yet also shows as a difference, until `push-returns`. Without the web
 app's functions the command prints `NEXT_STEP_FUNCTION_MISSING` and fails.
 
+### Two histories
+
+A reviewer has two histories when they saved in the local workspace after the anchor while
+hosted saves of theirs are not pulled yet. The final `import-log --cutover` prevents it at the
+source: it writes `reviews_on_the_site.json` into the adjudication folder (mode 0600: the logins,
+as the log spells them, of every imported reviewer, `OWNER-REVIEWER` among them; nothing else),
+which `pull-to-local` keeps current (every row with hosted lines is added), and the local
+workspace then refuses a REVIEWER save or marker of those logins (`Not saved
+(REVIEWS_ON_THE_SITE).`). The approver's decisions are not touched, and `pull-to-local` appends
+its copies as before. A folder without the file behaves as before. To let someone review locally
+again (Rollback), delete the file after `revoke`.
+
+If it happened anyway (a folder without the file), `pull-to-local` pulls everybody else, names
+the identity (`<ALIAS>: NOT pulled: n hosted line(s) ... LOCAL_SAVE_AFTER_HOSTED_SAVES`) and
+exits 1; `import-log` refuses. No command merges two histories, and no line can be taken back:
+the identity's hosted lines stay in the store and on the site, its local lines are what
+approval reads. Decide with the owner which history counts; the one way that keeps the hosted
+saves is a new database (`init-db`, `publish-bundle`, `sync-reviewers`, `import-log`) after the
+local lines of that identity were superseded by a rollback of that identity to the local site.
+
 ### Returned readings
 
 The approver decides locally. A RETURN reaches the reviewer through the operator:

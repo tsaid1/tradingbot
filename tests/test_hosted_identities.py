@@ -400,7 +400,7 @@ def test_a_local_reviewer_save_of_the_owner_after_hosted_saves_is_refused(
     hosted_reveal(store, owner, "i08")  # a hosted line of the owner's, not pulled yet
     local_save(base, OWNER_R, "i01", A.INDEPENDENT)  # and a local save by habit
     assert run("import-log", code=2).endswith("refused: LOCAL_SAVE_AFTER_HOSTED_SAVES\n")
-    assert run("pull-to-local", code=2) == "refused: LOCAL_SAVE_AFTER_HOSTED_SAVES\n"
+    assert "OWNER-REVIEWER: NOT pulled: 1 hosted line(s)" in run("pull-to-local", code=1)
     assert len(A.read_annotations(base).records) == 14  # nothing appended
 
 

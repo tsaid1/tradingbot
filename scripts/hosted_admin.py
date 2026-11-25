@@ -655,6 +655,8 @@ def cmd_import_log(args) -> int:
         if not hosted:  # until a reviewer has saved on the site, the anchor follows the log
             store.set_anchor(log.count, log.head, sha256(data))
         anchor, events = store.anchor(), store.events()
+        on_site = write_reviews_on_the_site(base, events, store.reviewers(),
+                                            set(store.closed_rows()), cutover=args.cutover)
     print(f"local log: {log.count} line(s), head {log.head[:12]}, {len(data)} bytes, sha256 "
           f"{sha256(data)}")
     print(f"snapshot: {folder.name}")
@@ -662,6 +664,8 @@ def cmd_import_log(args) -> int:
           + (f"FIXED, the reviewers' hosted lines continue it (the local log has {log.count} "
              "line(s) now)" if hosted else "moved to the log's present head"))
     print(f"imported {len(new)} new line(s); {len(legacy)} already imported")
+    print(f"reviewers who review on the site, marked in the adjudication folder: {on_site}"
+          + (" (cutover: every imported reviewer)" if args.cutover else ""))
     print(_unlisted_line(unlisted(log.records, rows.values()), args.accept_unlisted_lines)[0])
     for row in rows.values():
         mine = [json.loads(e["line"]) for e in events
@@ -1065,6 +1069,29 @@ class _Held(Exception):
     """The local log already holds this hosted line."""
 
 
+def write_reviews_on_the_site(base: Path, events: list[dict], rows, closed, *,
+                              cutover: bool) -> int:
+    """The marker the local workspace reads (``adjudication.REVIEWS_ON_THE_SITE_FILE``): the
+    logins, as the log spells them, of the reviewers who review on the site, so that a REVIEWER
+    save of theirs in the local workspace is refused (REVIEWS_ON_THE_SITE). Those are the rows
+    with HOSTED lines, and once the cutover was declared (``import-log --cutover``, remembered in
+    the file) every reviewer row an import has opened. Nothing else is in it. Returns the
+    number of logins."""
+    path = base / A.REVIEWS_ON_THE_SITE_FILE
+    held = V._read_private(path, "reviews-on-the-site marker")
+    was = json.loads(held) if held else {}
+    cutover = cutover or bool(was.get("cutover"))
+    writers = {e["alias"] for e in events if e["origin"] == HOSTED}
+    logins = sorted({r.login_shown for r in rows if not r.is_test and (
+        r.alias in writers or (cutover and r.alias not in closed))} | set(was.get("logins") or ()))
+    data = (json.dumps({"schema": A.REVIEWS_ON_THE_SITE_SCHEMA, "cutover": cutover,
+                        "logins": logins}, ensure_ascii=False, sort_keys=True) + "\n").encode()
+    if held != data:
+        with PrivateDir(path, "reviews-on-the-site marker", create=True) as d:
+            d.write_atomic(data)
+    return len(logins)
+
+
 def cmd_pull_to_local(args) -> int:
     base, store = _base(args), _store()
     data, _head, log = read_log(base)
@@ -1077,13 +1104,19 @@ def cmd_pull_to_local(args) -> int:
     hosted = [e for e in events if e["origin"] == HOSTED]  # never a TEST or RETURN line
     known = {e["sha256"] for e in hosted}
     held_here = {_pulled(r) for r in log.records}
+    imported = {e["seq"] for e in events if e["origin"] == LEGACY}
     # A reviewer (the owner's reviewer identity too) who saved LOCALLY after the anchor while
-    # hosted saves of theirs are not home yet has two histories: nothing is appended.
+    # hosted saves of theirs are not home yet has two histories: THAT identity's lines are not
+    # appended (everybody else's are). A local line the store already holds as LEGACY (imported
+    # beyond the anchor before the reviewer saved on the site) is one history, not two.
     since = anchor["count"] if anchor else 0
+    blocked = {}
     for alias, login in logins.items():
-        if any(e["alias"] == alias and e["sha256"] not in held_here for e in hosted) and any(
-                _login(r) == login and _pulled(r) is None for r in log.records[since:]):
-            raise refused("LOCAL_SAVE_AFTER_HOSTED_SAVES")
+        waiting = sum(e["alias"] == alias and e["sha256"] not in held_here for e in hosted)
+        if waiting and any(_login(r) == login and _pulled(r) is None and n not in imported
+                           for n, r in enumerate(log.records[since:], since + 1)):
+            blocked[alias] = waiting
+    hosted = [e for e in hosted if e["alias"] not in blocked]
     pulled, held = [], 0
     for e in hosted:
         def make(v: V.Verification, e=e) -> dict:
@@ -1108,9 +1141,17 @@ def cmd_pull_to_local(args) -> int:
     after = A.read_annotations(base)
     print(f"pulled {len(pulled)} hosted line(s) into the local log: {_counts(pulled)}; "
           f"{held} already held")
+    for alias, waiting in blocked.items():
+        print(f"{alias}: NOT pulled: {waiting} hosted line(s); this identity also saved in the "
+              "local workspace after the anchor (LOCAL_SAVE_AFTER_HOSTED_SAVES): two histories, "
+              "see \"Two histories\" in docs/HOSTED_REVIEWER.md")
     print(f"annotation log: {'OK' if after.ok else 'FAILS ' + str(after.problem)}, "
           f"{after.count} line(s), head {after.head[:12]}")
-    return 0 if after.ok else 1
+    with store.connection():
+        on_site = write_reviews_on_the_site(base, store.events(), store.reviewers(),
+                                            set(store.closed_rows()), cutover=False)
+    print(f"reviewers who review on the site, marked in the adjudication folder: {on_site}")
+    return 0 if after.ok and not blocked else 1
 
 
 # ------------------------------------------------------------------ the approver's returns
@@ -1416,6 +1457,9 @@ def main(argv: list[str] | None = None) -> int:
                 "snapshot the local log and import the remote reviewers' lines")
     p.add_argument("--snapshots", metavar="DIR", help=f"snapshot root (default: <dir>/{SNAPSHOTS})")
     p.add_argument("--accept-unlisted-lines", **accept)
+    p.add_argument("--cutover", action="store_true",
+                   help="the final import: from now on every imported reviewer reviews on the "
+                        "site, and the local workspace refuses their reviewer saves")
     command("parity", cmd_parity, "compare the local log's state with the hosted store's"
             ).add_argument("--accept-unlisted-lines", **accept)
     command("export", cmd_export, "every event as JSONL").add_argument(

@@ -657,6 +657,10 @@ def test_hosted_saves_come_home_into_a_log_the_local_code_accepts(run, store, ba
     # resume (a local reading after the reveal that refers to a pulled independent one).
     A.append_annotation(base, b, OWNER, item_id="i08", phase=A.APPROVAL, blind=False,
                         reading={}, refers_to=10, outcome="ACCEPT")
+    # A reviewer who saved on the site is refused locally until the rollback removes the mark.
+    with pytest.raises(A.AdjudicationError, match="^REVIEWS_ON_THE_SITE$"):
+        local_save(base, TWO, "i08", A.AFTER_REVEAL)
+    (base / A.REVIEWS_ON_THE_SITE_FILE).unlink()
     later = local_save(base, TWO, "i08", A.AFTER_REVEAL)
     assert (later["seq"], later["refers_to"], later["blind"]) == (17, 14, True)
     assert FREEZE.main(["verify", "--dir", str(base)]) == 0
