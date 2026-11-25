@@ -469,7 +469,8 @@ def test_a_deployment_the_platform_does_not_call_production_never_starts_as_prod
     site = Site(tmp_path, store, dsn)  # noqa: F811
     real = publish_as_real(store, tmp_path / "demo")  # a stand-in for the real bundle, active
     site.set_reviewer(FIRST, bundle_id=real.bundle_id)
-    env = {"DATABASE_URL": dsn, "SESSION_SECRET": SECRET, "SMTP_HOST": "smtp.example.invalid",
+    env = {"DATABASE_URL": dsn, "SITE_DATABASE_URL": dsn, "SESSION_SECRET": SECRET,
+           "SMTP_HOST": "smtp.example.invalid",
            "SMTP_PORT": "465", "SMTP_USER": "u", "SMTP_PASSWORD": "p",
            "MAIL_FROM": "site@example.invalid", "OPERATOR_TOKEN": "t" * 40,
            "SITE_URL": "https://review.example.invalid"}
@@ -485,6 +486,27 @@ def test_a_deployment_the_platform_does_not_call_production_never_starts_as_prod
         app = web.from_environment({**env, **platform})
         page = app.test_client().get("/sign-in", base_url=ORIGIN)
         assert page.status_code == 200 and b"Demonstration data" not in page.get_data()
+
+
+def test_production_runs_as_the_site_s_own_role_or_does_not_start(tmp_path, store, dsn, caplog):
+    """Re-check R4 (probe ``test_r13``): nothing made the site use its restricted role. Now
+    production refuses to start without SITE_DATABASE_URL, and logs one constant line at
+    start-up when the role it connects as owns the tables."""
+    import logging
+
+    from reviewer_web import app as web
+
+    Site(tmp_path, store, dsn)
+    env = {"DATABASE_URL": dsn, "SESSION_SECRET": SECRET, "SMTP_HOST": "smtp.example.invalid",
+           "SMTP_PORT": "465", "SMTP_USER": "u", "SMTP_PASSWORD": "p",
+           "MAIL_FROM": "site@example.invalid"}
+    for missing in ({}, {"SITE_DATABASE_URL": ""}):
+        with pytest.raises(RuntimeError, match="^SITE_DATABASE_URL_MISSING$"):
+            web.from_environment({**env, **missing})
+    caplog.set_level(logging.INFO)
+    web.from_environment({**env, "SITE_DATABASE_URL": dsn})  # here: the owning role
+    owned = [r.getMessage() for r in caplog.records if "SITE_ROLE_OWNS_EVENT" in r.getMessage()]
+    assert len(owned) == 1 and dsn not in owned[0]
 
 
 def test_the_site_connects_with_its_own_database_address_when_one_is_given(

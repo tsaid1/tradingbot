@@ -827,7 +827,8 @@ def test_synthetic_mail_shows_the_code_only_in_a_preview_of_invented_data(tmp_pa
     page = post(live, "/sign-in", {"address": login}).get_data(as_text=True)
     assert len(site.outbox.sent) == 1 and site.code() not in page
     assert "Demonstration" not in page and "your code is" not in page
-    assert isinstance(web.from_environment({**env, **smtp, "SITE_ENV": "production"}), web.Flask)
+    assert isinstance(web.from_environment({**env, **smtp, "SITE_ENV": "production",
+                                            "SITE_DATABASE_URL": dsn}), web.Flask)
     # A preview whose bundle is not flagged as demonstration data: no code is made or shown,
     # and such a preview does not start.
     app = web.from_environment({**env, "SITE_ENV": "preview"})

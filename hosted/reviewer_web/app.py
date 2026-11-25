@@ -167,6 +167,15 @@ def create_app(store, mailer, config: dict) -> Flask:
     floor = float(config.get("SIGN_IN_FLOOR_SECONDS", 2.0))
 
     app = Flask(__name__, static_folder=str(STATIC), static_url_path="/static")
+    if site_env == "production":
+        # Re-check R4: the site connects as its own restricted role, which owns nothing. When it
+        # is the owning role instead, one constant line says so at start-up.
+        try:
+            if store.role_owns_events():
+                app.logger.error("SITE_ROLE_OWNS_EVENT: the site connects as the role that owns "
+                                 "the tables; give it SITE_DATABASE_URL (make-site-role)")
+        except Exception as exc:  # noqa: BLE001 - a start-up check, never a reason not to start
+            app.logger.error("SITE_ROLE_NOT_CHECKED error=%s", type(exc).__name__)
     app.config.update(MAX_CONTENT_LENGTH=MAX_REQUEST_BYTES, MAX_FORM_MEMORY_SIZE=MAX_REQUEST_BYTES,
                       MAX_FORM_PARTS=5000)
     app.jinja_env.filters["ident"] = lambda s: re.sub(r"[^A-Za-z0-9_-]", "-", str(s))
@@ -714,7 +723,8 @@ def from_environment(env=os.environ) -> Flask:
     any branch would otherwise serve, and write to, the real database.
 
     The database is ``SITE_DATABASE_URL`` when that is set (the connection of a role that may
-    read and append but does not own the tables), else ``DATABASE_URL``."""
+    read and append but does not own the tables), else ``DATABASE_URL``; production does not
+    start without ``SITE_DATABASE_URL`` (SITE_DATABASE_URL_MISSING)."""
     from .store import Store
 
     site_env = env.get("SITE_ENV") or "production"
@@ -723,6 +733,8 @@ def from_environment(env=os.environ) -> Flask:
     with_mail = mail.configured(env)
     if with_mail is None or (not with_mail and site_env not in DEMO_ENVS):
         raise RuntimeError("MAIL_NOT_CONFIGURED")
+    if site_env == "production" and not env.get("SITE_DATABASE_URL"):
+        raise RuntimeError("SITE_DATABASE_URL_MISSING")  # production runs as the site's own role
     database = env.get("SITE_DATABASE_URL") or env["DATABASE_URL"]
     return create_app(Store(database), mail.Smtp(env) if with_mail else None,
                       {"SESSION_SECRET": env.get("SESSION_SECRET", ""), "SITE_ENV": site_env,

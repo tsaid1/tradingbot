@@ -17,6 +17,7 @@
     python scripts/hosted_admin.py test-report ALIAS
     python scripts/hosted_admin.py verify [--snapshots DIR]
     python scripts/hosted_admin.py make-site-role --out FILE [--role NAME]
+    python scripts/hosted_admin.py make-site-role --grants-only [--role NAME]
 
 The database is ``HOSTED_DATABASE_URL`` (``init-db`` prefers ``HOSTED_DATABASE_URL_UNPOOLED``);
 the adjudication folder is ``--dir`` or ``TRADINGBOT_ADJUDICATION_DIR``. Never deployed. It
@@ -1177,30 +1178,69 @@ def _site_url(url: str, role: str, password: str) -> str:
         netloc=f"{quote(role, safe='')}:{quote(password, safe='')}@{host}"))
 
 
+def scram_verifier(password: str, salt: bytes | None = None, iterations: int = 4096) -> str:
+    """The SCRAM-SHA-256 verifier PostgreSQL stores for ``password`` (RFC 5802, 7677), computed
+    HERE: the statement that sets the password carries this verifier, never the password, so a
+    server that logs statements keeps nothing that signs in. (The password is URL-safe ASCII,
+    which SASLprep leaves as it is.)"""
+    import base64
+    import hashlib
+    import hmac
+
+    salt = salt if salt is not None else secrets.token_bytes(16)
+    salted = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+    client = hmac.new(salted, b"Client Key", hashlib.sha256).digest()
+    server = hmac.new(salted, b"Server Key", hashlib.sha256).digest()
+
+    def b64(data: bytes) -> str:
+        return base64.b64encode(data).decode("ascii")
+
+    return (f"SCRAM-SHA-256${iterations}:{b64(salt)}${b64(hashlib.sha256(client).digest())}"
+            f":{b64(server)}")
+
+
+# What a site role must not have; checked, never re-stated: an operator who is not a superuser
+# may not name SUPERUSER, REPLICATION or BYPASSRLS in an ALTER ROLE at all, even to deny them.
+_ROLE_FACTS = ("SELECT r.rolsuper OR r.rolcreaterole OR r.rolcreatedb OR r.rolbypassrls"
+               " OR r.rolreplication OR r.rolinherit OR NOT r.rolcanlogin"
+               " OR r.rolname = current_user"
+               " OR EXISTS (SELECT 1 FROM pg_class c WHERE c.relowner = r.oid)"
+               " OR EXISTS (SELECT 1 FROM pg_namespace n WHERE n.nspowner = r.oid)"
+               " OR EXISTS (SELECT 1 FROM pg_auth_members m WHERE m.member = r.oid)"
+               " FROM pg_roles r WHERE r.rolname = %s")
+
+
 def cmd_make_site_role(args) -> int:
-    """Create the login role the SITE connects as, or give it a new password: the rights the
-    site's code uses and no other, no ownership. The new address goes to a file (mode 0600);
-    nothing secret is printed."""
+    """Create the login role the SITE connects as, give it a new password, or (``--grants-only``)
+    give an existing one exactly the present rights again without touching its password: the
+    rights the site's code uses and no other, no ownership. A new address goes to a file (mode
+    0600); nothing secret is printed, and the password never travels to the server (only its
+    SCRAM-SHA-256 verifier). It works for an operator that has CREATEROLE and is not a superuser
+    (the hosting provider's), and after the schema was dropped and made again."""
     url = os.environ.get(URL_ENV)
     if not SITE_ROLE.match(args.role):
         raise refused("BAD_ROLE_NAME")
     if not url:
         raise refused(f"SET_{URL_ENV}")
-    store, role, password = _store(unpooled=True), sql.Identifier(args.role), \
-        secrets.token_urlsafe(32)
+    if not args.grants_only and not args.out:
+        raise refused("OUT_FILE_NEEDED")  # or --grants-only
+    store, role = _store(unpooled=True), sql.Identifier(args.role)
     with store.exclusive() as conn:
-        found = conn.execute(
-            "SELECT r.rolsuper OR r.rolcreaterole OR r.rolcreatedb OR r.rolbypassrls"
-            " OR r.rolname = current_user"
-            " OR EXISTS (SELECT 1 FROM pg_class c WHERE c.relowner = r.oid)"
-            " OR EXISTS (SELECT 1 FROM pg_auth_members m WHERE m.member = r.oid)"
-            " FROM pg_roles r WHERE r.rolname = %s", (args.role,)).fetchone()
-        if found and found[0]:  # an administrator, an owner, or a member of another role
+        found = conn.execute(_ROLE_FACTS, (args.role,)).fetchone()
+        if found and found[0]:  # an administrator, an owner, a member of another role
             raise refused("NOT_A_SITE_ROLE")
-        conn.execute(sql.SQL(
-            "{} ROLE {} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION"
-            " NOBYPASSRLS PASSWORD {}").format(
-                sql.SQL("ALTER" if found else "CREATE"), role, sql.Literal(password)))
+        if args.grants_only and not found:
+            raise refused("NO_SITE_ROLE")  # make it first: make-site-role --out FILE
+        password = None
+        if not args.grants_only:
+            password = secrets.token_urlsafe(32)
+            verifier = sql.Literal(scram_verifier(password))
+            if found:  # only the password: what an operator without superuser may alter
+                conn.execute(sql.SQL("ALTER ROLE {} PASSWORD {}").format(role, verifier))
+            else:
+                conn.execute(sql.SQL(
+                    "CREATE ROLE {} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT"
+                    " NOREPLICATION NOBYPASSRLS PASSWORD {}").format(role, verifier))
         schema, database = (sql.Identifier(x) for x in conn.execute(
             "SELECT current_schema(), current_database()").fetchone())
         for statement in ("REVOKE ALL ON ALL TABLES IN SCHEMA {s} FROM {r}",
@@ -1231,14 +1271,18 @@ def cmd_make_site_role(args) -> int:
             grant("UPDATE, DELETE", table)
         for table, columns in SITE_SETS.items():
             grant("UPDATE", table, columns)
-        with PrivateDir(args.out, "site database address", create=True) as d:
-            d.create(d.name, (_site_url(url, args.role, password) + "\n").encode("utf-8"))
-    print(f"site role {args.role}: {'password changed' if found else 'created'}; it owns "
+        if password is not None:
+            with PrivateDir(args.out, "site database address", create=True) as d:
+                d.create(d.name, (_site_url(url, args.role, password) + "\n").encode("utf-8"))
+    done = "rights given again, password unchanged" if args.grants_only else (
+        "password changed" if found else "created")
+    print(f"site role {args.role}: {done}; it owns "
           f"nothing and may: read {', '.join(SITE_READS)}; add to {', '.join(SITE_INSERTS)}; "
           f"use {', '.join(SITE_OWN)}; set "
           + "; ".join(f"{t}.({', '.join(c)})" for t, c in SITE_SETS.items()))
-    print(f"its database address is in {Path(args.out).name} (mode 0600): the site's "
-          "DATABASE_URL. Nothing of it is printed.")
+    if password is not None:
+        print(f"its database address is in {Path(args.out).name} (mode 0600): the site's "
+              "SITE_DATABASE_URL. Nothing of it is printed.")
     return 0
 
 
@@ -1308,8 +1352,10 @@ def main(argv: list[str] | None = None) -> int:
         "--snapshots", metavar="DIR", help=f"snapshot root (default: <dir>/{SNAPSHOTS})")
     p = command("make-site-role", cmd_make_site_role,
                 "create the site's own database role (or change its password): no ownership")
-    p.add_argument("--out", required=True, metavar="FILE",
+    p.add_argument("--out", metavar="FILE",
                    help="where the new database address is written (mode 0600)")
+    p.add_argument("--grants-only", action="store_true",
+                   help="give the existing role the present rights again; its password stays")
     p.add_argument("--role", default="reviewer_site", help="the role's name")
     args = ap.parse_args(argv)
     try:

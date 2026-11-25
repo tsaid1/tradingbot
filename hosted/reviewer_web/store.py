@@ -216,6 +216,14 @@ class Store:
                                 (sign_in.casefold(),)).fetchall()
         return [ReviewerRow(*row) for row in rows]
 
+    def role_owns_events(self) -> bool:
+        """Whether the role this store connects as owns ``event`` (or has its rights): such a
+        role could switch off the rule that no event is changed. The site must not be it."""
+        with self.connection() as conn:
+            row = conn.execute("SELECT pg_has_role(current_user, c.relowner, 'USAGE')"
+                               " FROM pg_class c WHERE c.oid = to_regclass('event')").fetchone()
+        return bool(row and row[0])
+
     def is_open(self, reviewer: ReviewerRow) -> bool:
         """Whether this identity may work here: a test identity always; a reviewer once the
         local log is imported (the anchor exists), so that every hosted line continues it."""

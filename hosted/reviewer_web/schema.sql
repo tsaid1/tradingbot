@@ -132,6 +132,12 @@ BEGIN
             (SELECT is_test FROM reviewer WHERE id = NEW.reviewer_id) THEN
         RAISE EXCEPTION 'EVENT_NOT_IN_ITS_REVIEWER_S_STREAM' USING ERRCODE = 'restrict_violation';
     END IF;
+    -- The site writes HOSTED and TEST lines only. LEGACY and RETURN lines are the operator's,
+    -- who owns the table: a role that does not (the site's own) may not add one.
+    IF NEW.origin NOT IN ('HOSTED', 'TEST') AND NOT pg_has_role(
+            current_user, (SELECT relowner FROM pg_class WHERE oid = TG_RELID), 'USAGE') THEN
+        RAISE EXCEPTION 'EVENT_ORIGIN_IS_THE_OPERATOR_S' USING ERRCODE = 'insufficient_privilege';
+    END IF;
     RETURN NEW;
 END
 $$;

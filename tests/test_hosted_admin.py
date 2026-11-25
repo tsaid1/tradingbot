@@ -2028,3 +2028,132 @@ def test_every_page_of_the_site_is_the_same_on_the_published_part_as_on_the_whol
     assert due["/form/i07"] != done["/form/i07"] != blind["/form/i07"] != due["/form/i07"]
     assert b"SEQUENCE:scs01" in due["/form/i08"][2]  # the idea of a reference that left
     assert "REQUEST_FAILED" not in "\n".join(r.getMessage() for r in caplog.records)
+
+
+# ------------------------------------------------------------------ an operator who is no superuser
+
+
+def operator_database(name: str) -> tuple[str, str]:
+    """(the superuser's address, the operator's address) of a new database OWNED by a new login
+    role that has CREATEROLE and is NOT a superuser, as the hosting provider gives its operator.
+    The embedded server trusts every connection, so the role is used, not its password."""
+    import psycopg
+    from psycopg import sql
+    from psycopg.conninfo import conninfo_to_dict, make_conninfo
+
+    server = hosted_pg._server()
+    with psycopg.connect(server.get_uri(), autocommit=True) as conn:
+        conn.execute(sql.SQL("CREATE ROLE {} LOGIN CREATEROLE NOSUPERUSER PASSWORD 'op'").format(
+            sql.Identifier(f"op_{name}")))
+        conn.execute(sql.SQL("CREATE DATABASE {} OWNER {}").format(
+            sql.Identifier(name), sql.Identifier(f"op_{name}")))
+    admin = server.get_uri(name)
+    parts = conninfo_to_dict(admin)
+    return admin, make_conninfo(**{**parts, "user": f"op_{name}", "password": "op"})
+
+
+def test_make_site_role_works_for_an_operator_who_is_not_a_superuser(
+        cli, monkeypatch, capsys, base, tmp_path):
+    """Re-check R4 and the lead's preview database: an operator with CREATEROLE but no superuser
+    may not name SUPERUSER, REPLICATION or BYPASSRLS in an ALTER ROLE, so the second run failed
+    (InsufficientPrivilege). And the password travelled in clear inside the statement, and a new
+    grant meant a new password. Here the WHOLE tool runs as such an operator: init-db (twice),
+    the bundle and the reviewers, make-site-role a first and a second time and --grants-only,
+    after the schema was dropped and made again, and an export restored into a second such
+    database."""
+    import psycopg
+    from psycopg.conninfo import conninfo_to_dict
+
+    name = f"nosu{os.getpid()}"
+    admin, operator = operator_database(name)
+    monkeypatch.setenv(cli.URL_ENV, operator)
+    monkeypatch.delenv(cli.UNPOOLED_ENV, raising=False)
+    monkeypatch.setenv(A.DIR_ENV, str(base))
+    sent: list[str] = []
+    real_execute = psycopg.Connection.execute
+
+    def spy(self, query, params=None, **kw):
+        sent.append(query.as_string(self) if hasattr(query, "as_string") else str(query))
+        return real_execute(self, query, params, **kw)
+
+    monkeypatch.setattr(psycopg.Connection, "execute", spy)
+
+    def run(*argv, code=0) -> str:
+        capsys.readouterr()
+        got = cli.main([str(a) for a in argv])
+        printed = "".join(capsys.readouterr())
+        assert got == code, printed
+        return printed
+
+    with psycopg.connect(operator) as conn:
+        assert conn.execute("SELECT rolsuper FROM pg_roles WHERE rolname = current_user"
+                            ).fetchone() == (False,)
+    for _ in range(2):
+        run("init-db")
+    half_way(base)
+    run("publish-bundle", "--demo", base)
+    run("sync-reviewers", "--demo")
+    run("import-log")
+    role = f"site_{name}"
+
+    def stored_verifier() -> str:
+        with psycopg.connect(admin) as conn:
+            return conn.execute("SELECT rolpassword FROM pg_authid WHERE rolname = %s",
+                                (role,)).fetchone()[0]
+
+    def password_of(path: Path) -> str:
+        return conninfo_to_dict(path.read_text().strip())["password"]
+
+    assert "created" in run("make-site-role", "--role", role, "--out", tmp_path / "k" / "a1")
+    first = stored_verifier()
+    assert "password changed" in run("make-site-role", "--role", role, "--out",
+                                     tmp_path / "k" / "a2")
+    second = stored_verifier()
+    assert first != second and second.startswith("SCRAM-SHA-256$4096:")
+    for path, verifier in ((tmp_path / "k" / "a1", first), (tmp_path / "k" / "a2", second)):
+        salt = __import__("base64").b64decode(verifier.split("$")[1].split(":")[1])
+        assert cli.scram_verifier(password_of(path), salt) == verifier  # its own password's
+        assert not [q for q in sent if password_of(path) in q]  # never sent to the server
+    out = run("make-site-role", "--role", role, "--grants-only")
+    assert "rights given again, password unchanged" in out and stored_verifier() == second
+    assert not (tmp_path / "k" / "a3").exists()
+    # The site's role may read and add HOSTED lines; a LEGACY or a RETURN line is the operator's.
+    site = conninfo_to_dict(admin) | {"user": role}
+    with psycopg.connect(**site) as conn:
+        assert conn.execute("SELECT count(*) FROM event").fetchone()[0] > 0
+        line = conn.execute("SELECT line, reviewer_id FROM event ORDER BY seq LIMIT 1").fetchone()
+    rec = json.loads(bytes(line[0]))
+    for origin, seq in (("LEGACY", 400), ("RETURN", 2_000_999)):
+        moved = V.encode_line({**rec, "seq": seq})
+        with pytest.raises(psycopg.errors.InsufficientPrivilege), psycopg.connect(**site) as conn:
+            conn.execute(
+                "INSERT INTO event (seq, prev_sha256, sha256, line, reviewer_id, bundle_id,"
+                " item_id, phase, at, origin, batch) VALUES (%s, %s, %s, %s, %s, %s, %s, %s,"
+                " %s, %s, %s)", (seq, rec["prev_sha256"], hashlib.sha256(moved).hexdigest(),
+                                 moved, line[1], rec["bundle_id"], rec["item_id"], rec["phase"],
+                                 rec["at"], origin, seq))
+    # Export, and restore into a second database of such an operator.
+    (tmp_path / "x").mkdir(mode=0o700)
+    run("export", "--out", tmp_path / "x" / "events.jsonl")
+    _admin2, operator2 = operator_database(name + "b")
+    monkeypatch.setenv(cli.URL_ENV, operator2)
+    run("init-db")
+    run("publish-bundle", "--demo", base)
+    run("sync-reviewers", "--demo")
+    assert run("restore", "--in", tmp_path / "x" / "events.jsonl").startswith("restored ")
+    assert "verify: PASS" in run("verify")
+    monkeypatch.setenv(cli.URL_ENV, operator)
+    # The preview database is reset by dropping the schema and making it again.
+    with psycopg.connect(operator, autocommit=True) as conn:
+        conn.execute("DROP SCHEMA public CASCADE")
+        conn.execute("CREATE SCHEMA public")
+    run("init-db")
+    assert "rights given again" in run("make-site-role", "--role", role, "--grants-only")
+    assert "password changed" in run("make-site-role", "--role", role, "--out",
+                                     tmp_path / "k" / "a4")
+    # A refusal by the facts of the role, never by re-stating them.
+    assert run("make-site-role", "--role", f"op_{name}", "--grants-only", code=2) == \
+        "refused: NOT_A_SITE_ROLE\n"
+    assert run("make-site-role", "--role", "nobody_here", "--grants-only", code=2) == \
+        "refused: NO_SITE_ROLE\n"
+    assert run("make-site-role", "--role", role, code=2) == "refused: OUT_FILE_NEEDED\n"
