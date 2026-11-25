@@ -11,15 +11,15 @@
 <script src="/static/app.js" defer></script>
 </head>
 <body>
-{#- Everything scrolls in one region; a page's bottom bar (block ``dock``) sits below it, never
-    over it, so it can cover nothing. -#}
-<div class="page-scroll" id="page-scroll">
+{#- On a page with a bottom bar (block ``dock``) the page scrolls in one region between the
+    demonstration band and the bar: neither can cover anything. -#}
 {% if demo %}
 <div class="demo-band" role="note">
   <p>Demonstration data: every post, price and reading on this site is invented.</p>
   {% block band %}{% endblock %}
 </div>
 {% endif %}
+<div class="page-scroll" id="page-scroll">
 <header class="site">
   <a class="brand" href="/">{{ site_name }}</a>
   {% if who %}

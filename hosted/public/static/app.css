@@ -124,6 +124,7 @@ code, .mono, .fname, pre { font-family: var(--mono); font-size: 0.92em; }
 }
 /* A jump inside a page lands below the band. */
 [id] { scroll-margin-top: 4.5rem; }
+body:has(> .dock) .page-scroll [id] { scroll-margin-top: 0; }
 .demo-band .demo-code { margin-top: 0.2rem; color: var(--text); font-size: 1.1rem; }
 .demo-band .demo-code strong { font-family: var(--mono); font-size: 1.3em; letter-spacing: 0.15em; }
 
@@ -282,6 +283,10 @@ button:disabled { border-color: var(--line); background: var(--sunk); color: var
 .save-state { display: inline-flex; align-items: center; gap: 0.35em; margin: 0; font-size: 0.9rem;
   color: var(--text-quiet); font-weight: 600; }
 .save-state--draft, .save-state.is-editing { color: var(--attention); }
+.ss-icon { display: inline-flex; }
+.save-state .ss-icon--draft { display: none; }
+.save-state--draft .ss-icon--draft, .save-state.is-editing .ss-icon--draft { display: inline-flex; }
+.save-state--draft .ss-icon--state, .save-state.is-editing .ss-icon--state { display: none; }
 .save-state--ok { color: var(--ok); }
 
 .work { display: grid; gap: var(--space-5); grid-template-columns: minmax(0, 1fr); }
@@ -291,7 +296,7 @@ button:disabled { border-color: var(--line); background: var(--sunk); color: var
 .form-header { font-weight: 700; color: var(--accent); margin: 0 0 var(--space-3); }
 @media (min-width: 70rem) {
   .work { grid-template-columns: minmax(22rem, 5fr) minmax(0, 8fr); align-items: start; }
-  .evidence { position: sticky; top: 3rem; max-height: calc(100dvh - 9rem);
+  .evidence { position: sticky; top: 0.75rem; max-height: calc(100dvh - 8.5rem);
     overflow-y: auto; padding-right: var(--space-1); overscroll-behavior: contain; }
 }
 
@@ -429,7 +434,9 @@ select, input[type="text"] { border-color: var(--line-strong); }
 
 /* The two proposals: the proposed value, then the question it needs. */
 .proposal .pair-system { background: var(--surface); border: 1.5px solid var(--line-strong); }
-.proposal-value { margin: 0 0 var(--space-2); font-family: var(--mono); font-size: 1.15rem; font-weight: 700;
+.proposal-code { font-family: var(--mono); font-size: 0.8rem; font-weight: 500; color: var(--text-quiet);
+  margin-left: var(--space-2); }
+.proposal-value { margin: 0 0 var(--space-2); font-size: 1.15rem; font-weight: 700;
   overflow-wrap: anywhere; }
 .segmented { display: flex; flex-wrap: wrap; gap: var(--space-2); margin-top: var(--space-1); }
 .segmented input.seg { position: absolute; opacity: 0; width: 1px; height: 1px; margin: 0; }
@@ -496,8 +503,16 @@ pre.plain { white-space: pre-wrap; background: var(--surface-earlier); padding: 
 
 /* The persistent "View post" button: a slim bar along the bottom. The page keeps room for it,
    and a control scrolled into view or focused stops above it: it never covers one. */
-body:has(> .dock) { height: 100vh; height: 100dvh; display: flex; flex-direction: column; overflow: hidden; }
-body:has(> .dock) > .page-scroll { flex: 1 1 auto; min-height: 0; overflow-y: auto; }
+html:has(body > .dock) { height: 100%; overflow: hidden; overscroll-behavior: none; }
+body:has(> .dock) { height: 100vh; height: 100dvh; display: flex; flex-direction: column; overflow: hidden;
+  overscroll-behavior: none; }
+/* The scroller holds everything it shows, hidden helpers too (position: relative), so the
+   document is never taller than the window; a control brought into view stops below the band
+   and above the bar. */
+body:has(> .dock) > .page-scroll { flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden;
+  position: relative; overscroll-behavior: contain; -webkit-overflow-scrolling: touch;
+  scroll-padding-top: 0.75rem; scroll-padding-bottom: 0.75rem; }
+body:has(> .dock) > .demo-band { position: static; flex: none; }
 .dock { flex: none; z-index: 6; display: flex; justify-content: flex-end;
   align-items: center; gap: var(--space-3); padding: var(--space-2) var(--space-4);
   background: var(--surface); border-top: 1px solid var(--line-strong); box-shadow: var(--shadow); }
@@ -522,6 +537,7 @@ body:has(> .dock) > .page-scroll { flex: 1 1 auto; min-height: 0; overflow-y: au
 .nav-tree__form a[aria-current="page"] { background: var(--accent-surface); border-left-color: var(--accent);
   font-weight: 700; }
 .nav-tree__status-text { font-size: 0.8rem; font-weight: 500; }
+.nav-tree__draft, .nav-tree__draft-mark { color: var(--attention); font-size: 0.8rem; font-weight: 600; }
 .nav-tree__state.status--not-started { color: var(--text-quiet); }
 .nav-tree__state.status--in-progress { color: var(--accent); }
 .nav-tree__state.status--awaiting, .nav-tree__state.status--returned { color: var(--attention); }

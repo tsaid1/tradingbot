@@ -152,6 +152,8 @@ def _rows(view: _View, current: str | None) -> list[dict]:
         for i in ids:
             posts.setdefault(view.items[i]["post_ref"], []).append(i)
         nxt = view.next_in(ids)
+        begun = status != NOT_STARTED or any(i in view.drafts for i in ids)
+        start_or_continue = "CONTINUE" if begun else "START"
         ordered_posts = sorted(posts.items(), key=lambda p: (
             view.bundle.posts[p[0]]["published_at"], p[0]))
         out.append({
@@ -162,9 +164,11 @@ def _rows(view: _View, current: str | None) -> list[dict]:
             "status_text": TEXT[status], "done": done, "total": len(ids),
             "remaining": len(ids) - done, "returned": codes.count(RETURNED),
             "attention": codes.count(AWAITING_ASSESSMENT), "next_item": nxt,
-            "button": None if nxt is None else "START" if status == NOT_STARTED else "CONTINUE",
-            "button_text": None if nxt is None else TEXT["START" if status == NOT_STARTED
-                                                         else "CONTINUE"],
+            # A kept draft is work begun: its button continues (the status stays what the
+            # confirmed saves make it; the draft is a second fact beside it).
+            "drafts": sum(i in view.drafts for i in ids),
+            "button": None if nxt is None else start_or_continue,
+            "button_text": None if nxt is None else TEXT[start_or_continue],
             "active": current in ids,
             "posts": [{"post_ref": ref, "when": view.bundle.posts[ref]["published_at"],
                        "number": p, "when_text": W.post_time(view.bundle.posts[ref][
@@ -185,8 +189,14 @@ def _named(rows: list[dict], item_id: str | None) -> dict:
             for f in post["forms"]:
                 if f["item_id"] == item_id:
                     return {"place": W.place(row["title"], post["number"], f["k"], f["n"]),
-                            "code": f["status"]}
-    return {"place": "", "code": ""}
+                            "code": f["status"], "draft": f["draft"]}
+    return {"place": "", "code": "", "draft": False}
+
+
+def _places(rows: list[dict]) -> dict[str, str]:
+    """Every form's place in words, by item ("Sequence 1, post 2"): never its id."""
+    return {f["item_id"]: W.place(row["title"], post["number"], f["k"], f["n"])
+            for row in rows for post in row["posts"] for f in post["forms"]}
 
 
 def dashboard(bundle: A.Bundle, session: A.Session, records: list[dict], drafts=()) -> dict:
@@ -201,7 +211,9 @@ def dashboard(bundle: A.Bundle, session: A.Session, records: list[dict], drafts=
     nxt = F.next_step(bundle, session, records)
     named = _named(rows, nxt)
     return {"sequences": rows, "next": nxt, "next_place": named["place"],
-            "next_text": W.next_button(named["code"], named["place"]) if nxt else "",
+            "next_text": W.next_button("IN_PROGRESS" if named["draft"] else named["code"],
+                                       named["place"]) if nxt else "",
+            "places": _places(rows),
             "totals": {
         "done": codes.count(COMPLETE), "total": len(codes),
         "remaining": len(codes) - codes.count(COMPLETE), "returned": codes.count(RETURNED),
@@ -224,7 +236,7 @@ def sidebar(bundle: A.Bundle, session: A.Session, records: list[dict], item_id: 
                     form["current"] = False
     active = next((r["id"] for r in rows if r["active"]), None)
     return {"sequences": rows, "active": active, "current": current,
-            "place": _named(rows, current)["place"] if current else ""}
+            "place": _named(rows, current)["place"] if current else "", "places": _places(rows)}
 
 
 def sequence_next(bundle: A.Bundle, session: A.Session, records: list[dict],

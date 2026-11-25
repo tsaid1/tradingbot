@@ -186,7 +186,10 @@ def test_no_two_options_of_one_question_share_their_words():
         assert W.NOT_ANSWERED not in options.values() and W.DOES_NOT_APPLY not in \
             options.values(), f  # states, never options
         if R.NOT_STATED in options:
-            assert options[R.NOT_STATED] == W.POST_SILENT, f
+            # "doesn't say" is about this post, or about all the posts shown where the rubric
+            # lets the earlier posts answer (the position before, its stop, the month).
+            assert options[R.NOT_STATED] == (W.POSTS_SILENT if f in W.SILENT_IN_POSTS_SHOWN
+                                             else W.POST_SILENT), f
         if R.CANNOT_DETERMINE in options:
             assert options[R.CANNOT_DETERMINE] == W.UNSETTLED, f
 

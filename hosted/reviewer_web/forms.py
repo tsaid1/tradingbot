@@ -543,6 +543,7 @@ class Form:
     save_title: str = ""
     save_hint: str = ""
     tried: bool = False  # a submission was refused: the corrections are shown at each question
+    edited: bool = False  # the page holds answers the reviewer sent (a round trip, a draft)
     summary: str = ""
     # Interface state (posted fields ``ui.*``): kept through round trips, never stored.
     later: list[tuple[str, str]] = field(default_factory=list)  # (anchor, question) For later
@@ -625,7 +626,7 @@ def build(bundle: A.Bundle, item: dict, records: list[dict], session: A.Session,
             choice, box = W.VALUE_CHOICE[f]
             return {"type": "value", "name": f, "state_name": f"s.{f}", "typed": state == VALUE,
                     "value": value if state == VALUE else "", "maxlength": A.MAX_TEXT,
-                    "box": box, "options": [(s, choice if s == VALUE else W.SENTINEL[s],
+                    "box": box, "options": [(s, choice if s == VALUE else W.sentinel(f, s),
                                              s == state)
                                             for s in (VALUE, *R.VALUE_SENTINELS[f])]}
         if f == "ambiguities":
@@ -664,6 +665,7 @@ def build(bundle: A.Bundle, item: dict, records: list[dict], session: A.Session,
             order.append((e["anchor"], answered(f)))
         elif s.state == R.DERIVED:
             e["derived"] = W.shown(f, s.value) if s.value not in ("", None) else UNANSWERED_TEXT
+            e["derived_from"] = W.set_by_form(f)
             if f == "follower_implication":
                 e["sentence"] = R.FOLLOWER_SENTENCE + (
                     " Inferred from context: not counted as something to act on."
@@ -695,6 +697,7 @@ def build(bundle: A.Bundle, item: dict, records: list[dict], session: A.Session,
         for f, (key, title, (mine, said), none) in PROPOSALS.items():
             s, value = status.get(f, R.Status(R.NA)), item["mapping"].get(key) or ""
             e = {"name": f, "anchor": f"field-{ident(f)}", "title": title, "value": str(value),
+                 "words": W.proposal_words(f, str(value)), "is": W.PROPOSAL_IS[f],
                  "question": W.question(f), "help": W.HELP.get(f, ""),
                  "asked": s.state == R.ASK}
             anchors[f] = e["anchor"]
@@ -853,6 +856,7 @@ def build(bundle: A.Bundle, item: dict, records: list[dict], session: A.Session,
                               + W.WARNINGS_TICK + "”.", "answer": True,
                               "label": W.WARNINGS_TITLE})
     form.may_save = not checks.blocking and len(form.ack) == len(checks.warnings)
+    form.problems = _one_per_question(form.problems)
     answers = len({p["anchor"] for p in form.problems if p["answer"]})
     corrections = len({p["anchor"] for p in form.problems if not p["answer"]} -
                       {p["anchor"] for p in form.problems if p["answer"]})
@@ -862,6 +866,21 @@ def build(bundle: A.Bundle, item: dict, records: list[dict], session: A.Session,
         if p["message"] not in form.errors[p["anchor"]]:
             form.errors[p["anchor"]].append(p["message"])
     return form
+
+
+def _one_per_question(problems: list[dict]) -> list[dict]:
+    """One entry per question (per element to go to): its messages together, counted once,
+    and an answer to give when any of them asks for one. The count equals the list."""
+    out: dict[str, dict] = {}
+    for p in problems:
+        if p["anchor"] not in out:
+            out[p["anchor"]] = dict(p)
+            continue
+        q = out[p["anchor"]]
+        if p["message"] not in q["message"]:
+            q["message"] = q["message"] + " " + p["message"]
+        q["answer"] = q["answer"] or p["answer"]
+    return list(out.values())
 
 
 def _problem(form: Form, code: str, f: str, raw: dict, details: list[dict],
@@ -909,6 +928,7 @@ def _interface(form: Form, posted, anchors: dict[str, str], order: list) -> None
     last = posted.get("ui.last", "") if posted is not None else ""
     form.last = last if last in known else ""
     form.tried = bool(posted is not None and posted.get("ui.tried") == "1")
+    form.edited = posted is not None
     ids = [a for a, _ in order]
     start = ids.index(form.last) + 1 if form.last in ids else 0
     todo = [a for a, ok in order[start:] if not ok] or [a for a, ok in order if not ok]

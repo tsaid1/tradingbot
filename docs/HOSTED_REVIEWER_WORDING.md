@@ -89,7 +89,7 @@ The four states, worded the same way everywhere:
 | | | The evidence conflicts or doesn't settle it | `CANNOT_DETERMINE` | CANNOT_DETERMINE: the posts shown do not settle it |
 | `position_last_stop` | Just before this action, what was the latest stop the publisher had given? | | | BEFORE this action, what was the last stop communicated? |
 | | | A stop was given: a box "The stop" | the typed value | value given |
-| | | The post doesn't say | `NOT_STATED` | not stated |
+| | | The posts shown don't say | `NOT_STATED` | not stated |
 | | | The evidence conflicts or doesn't settle it | `CANNOT_DETERMINE` | cannot determine |
 | `effect` | What happened to the size or protection of the position? | | | How does this action change the position BEFORE this action? |
 | | | Opened from nothing | `OPENS` | OPENS: flat to a position |
@@ -130,7 +130,7 @@ The four states, worded the same way everywhere:
 | | | The evidence conflicts or doesn't settle it | `CANNOT_DETERMINE` | cannot determine |
 | `amendment_from` | What value does it replace? | | | Which value does it replace? |
 | | | It gives the old value: a box "The old value" | the typed value | value given |
-| | | The post doesn't say | `NOT_STATED` | not stated |
+| | | The posts shown don't say | `NOT_STATED` | not stated |
 | | | The evidence conflicts or doesn't settle it | `CANNOT_DETERMINE` | cannot determine |
 | `idea` | Which trade idea does this action belong to? | | | Which idea does this action belong to? |
 | | | A new idea, starting here | `NEW_IDEA` | NEW_IDEA: this action starts one (normally an OPEN from flat) |
@@ -189,7 +189,7 @@ The four states, worded the same way everywhere:
 | | | The front (nearest) month | `FRONT` | FRONT: front, nearest or spot month |
 | | | The next month | `NEXT` | NEXT: next or second month |
 | | | A month the post names | `NAMED` | NAMED: a named month or contract code (type it in month_named) |
-| | | The post doesn't say | `NOT_STATED` | NOT_STATED: nothing in the material identifies the month |
+| | | The posts shown don't say | `NOT_STATED` | NOT_STATED: nothing in the material identifies the month |
 | `month_named` | Which month or contract code is named? | | | Which month or code is named? |
 
 ## Judgments of the system's answers (after the reveal)

@@ -16,6 +16,7 @@
         <details{% if row.id == nav.active %} open{% endif %}>
           <summary>
             <span class="nav-tree__label">{{ row.title }}{% if row.read %}<span class="nav-tree__read">{{ row.read }}</span>{% endif %}</span>
+            {% if row.drafts %}<span class="nav-tree__draft-mark">{{ icon("edit", "Draft kept, not submitted") }}</span>{% endif %}
             <span class="nav-tree__count count">{{ row.done }}/{{ row.total }}<span class="visually-hidden"> complete</span></span>
             <span class="nav-tree__state status--{{ kinds[row.status] }}">{{ icon(kinds[row.status]) }}<span class="visually-hidden">{{ row.status_text }}</span></span>
           </summary>
@@ -26,6 +27,7 @@
               <a href="/form/{{ f.item_id }}"{% if f.current %} aria-current="page"{% endif %}>
                 <span class="nav-tree__name">{{ f.label }}</span>
                 <span class="nav-tree__state status--{{ kinds[f.status] }}">{{ icon(kinds[f.status]) }}<span class="nav-tree__status-text">{{ f.status_text }}</span></span>
+                {% if f.draft %}<span class="nav-tree__draft">{{ icon("edit") }}Draft kept, not submitted</span>{% endif %}
               </a>
             </li>
             {% endfor %}
