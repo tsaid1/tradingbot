@@ -493,7 +493,8 @@ def test_a_deployment_the_platform_does_not_call_production_never_starts_as_prod
         assert page.status_code == 200 and b"Demonstration data" not in page.get_data()
 
 
-def test_production_runs_as_the_site_s_own_role_or_does_not_start(tmp_path, store, dsn, caplog):
+def test_production_runs_as_the_site_s_own_role_or_does_not_start(
+        tmp_path, store, dsn, caplog):  # noqa: F811
     """Re-check R4 (probe ``test_r13``): nothing made the site use its restricted role. Now
     production refuses to start without SITE_DATABASE_URL, and logs one constant line at
     start-up when the role it connects as owns the tables."""

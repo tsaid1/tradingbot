@@ -14,7 +14,7 @@ import re
 from pathlib import Path
 
 import pytest
-from hosted_pg import REPO, hosted_reveal, hosted_save, reading_kw
+from hosted_pg import REPO, hosted_reveal, hosted_save
 from hosted_web_site import FIRST, ORIGIN, Site, dsn, store  # noqa: F401 - fixtures
 from test_hosted_admin import (  # noqa: F401 - fixtures
     FORBIDDEN,
@@ -36,7 +36,7 @@ QUIET = (*FORBIDDEN, LOCAL_ID, LOCAL_ID.casefold(), "Owner Reviewer Example", "O
          "owner.mail")
 
 
-def owner_entry(base: Path) -> Path:
+def owner_entry(base: Path) -> Path:  # noqa: F811
     """The invented reviewers file with the owner's own REVIEWER entry (a local identity, no
     ``@``) beside the approver and the two remote reviewers."""
     path = base / "reviewers.toml"
@@ -277,7 +277,7 @@ def test_sync_reviewers_writes_the_owner_s_reviewer_identity_from_the_private_ad
     assert "OWNER-REVIEWER" not in {r.alias for r in store.reviewers()}
     secret = address_file(tmp_path / "keys")
     out = run("sync-reviewers", "--demo", "--owner-address-file", secret)
-    assert re.search(r"^OWNER-REVIEWER: id \d+, REVIEWER, FULL, scope 40, bundle ", out, re.M)
+    assert re.search(r"^OWNER-REVIEWER: id \d+, REVIEWER, FULL, scope 40, bundle ", out, re.MULTILINE)
     owner = {r.alias: r for r in store.reviewers()}["OWNER-REVIEWER"]
     assert (owner.login_shown, owner.address, owner.role) == (LOCAL_ID, ADDRESS, A.REVIEWER)
     # The test identity on the same address: from the same file, nobody types it.
@@ -313,7 +313,7 @@ def test_sync_reviewers_writes_the_owner_s_reviewer_identity_from_the_private_ad
     assert caught.value.code == "ADDRESS_HELD_BY_ANOTHER_IDENTITY"
 
 
-def owner_cutover(run, store, base, tmp_path) -> dict:
+def owner_cutover(run, store, base, tmp_path) -> dict:  # noqa: F811
     """The legacy log half way, with the owner's own reviewer history in it (an independent
     reading, the reveal and the reading after it of i07, and an independent reading of i08) and
     the approver's acceptance of that reading; then the cutover with the owner's identity and a
