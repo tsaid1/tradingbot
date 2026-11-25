@@ -6,6 +6,7 @@ that nothing else contains (``SYSTEM_MARKS``)."""
 
 from __future__ import annotations
 
+import html
 import json
 import threading
 from pathlib import Path
@@ -26,12 +27,20 @@ from hosted_web_site import (  # noqa: F401 - fixtures
     store,
     wanted,
 )
+from reviewer_web import wording as W
 
 from tradingbot.runtime import adjudication as A
 from tradingbot.runtime import adjudication_rubric as R
 
 NA = R.NOT_APPLICABLE
 FRAGMENT = {"X-Fragment": "form"}
+
+
+def part(text: str, name: str) -> str:
+    """The page's markup of one question: from its element to the next question."""
+    start = text.index(f'id="field-{name}"')
+    end = text.find("data-q", text.index(">", start))
+    return text[start:end if end > 0 else None]
 
 
 def phases(site, alias=FIRST, item=None) -> list[str]:  # noqa: F811
@@ -64,9 +73,10 @@ def test_the_form_stores_what_the_streamlit_form_stores(site):  # noqa: F811
 
     b = site.browser().sign_in(FIRST)
     shown = b.open("i07")
-    assert "Hidden until you save an independent reading" in shown.text
+    assert "The system's answers stay hidden until you save your own reading" in shown.visible()
     assert "holds SHIPPED" not in shown.text and "system-value" not in shown.text
-    assert "Short Zed Metals around 412" in shown.text and "Form 1 of 1 for this post" in shown.text
+    assert "Short Zed Metals around 412" in shown.text and "Post you're reviewing" in shown.plain
+    assert "Form 1 of" not in shown.text  # one form for this post: no form count shown
     reading = valid(site.bundle, "i07", entry_exactness="EXACT",
                     levels=[("CURRENT_MARKET", "EXACT"), ("STOP", "EXACT")])
     b.fill(reading)
@@ -89,7 +99,8 @@ def test_the_form_stores_what_the_streamlit_form_stores(site):  # noqa: F811
     assert "holds SHIPPED: HOLD" in saved.text and "Saved." in saved.text
     assert saved.value("side") == "SHORT" and saved.value("v.side") == "CONFIRM"
     assert saved.value("confidence") == "" and saved.value("notes") == ""  # given anew
-    assert f"SAVED. Your independent reading of this form is record {ind['seq']}" in saved.text
+    assert f"Your own reading is saved (record {ind['seq']}," in saved.text
+    assert "Your reading is saved. Review the system&#39;s answers." in saved.text
     b.save()
     rec = site.records(FIRST)[-1]
     assert (rec["phase"], rec["blind"], rec["refers_to"]) == (A.AFTER_REVEAL, True, ind["seq"])
@@ -100,9 +111,10 @@ def test_the_form_stores_what_the_streamlit_form_stores(site):  # noqa: F811
     assert rec["reading"]["reference_series_right"] == NA  # this item has no proposal
     assert set(rec["field_verdicts"]) == {
         *A.compared_fields(site.bundle, item, rec["reading"]), "levels"}
-    assert "SAVED. Your reading of this form after the reveal is record" in b.shown.text
-    assert "The next save needs CONFIDENCE (confidence): confidence is required" in b.shown.text
-    assert "Save refuses" not in b.shown.text
+    assert "Your assessment is saved (record" in b.shown.text
+    assert "Review complete. Continue to the next form." in b.shown.text
+    # The next save needs a confidence again: listed, not shown as an error before a submission.
+    assert "Choose how confident you are." in b.shown.visible() and 'id="problems"' not in b.shown.text
 
 
 def test_fields_appear_and_go_with_the_answers_by_a_round_trip_to_the_server(site):  # noqa: F811
@@ -110,9 +122,9 @@ def test_fields_appear_and_go_with_the_answers_by_a_round_trip_to_the_server(sit
     shown = b.open("i07")
     assert {"timing", "action", "explicit"} <= shown.names
     assert not {"family", "s.entry_price", "effect", "lv.n:0.role"} & shown.names
-    assert "Not yet: choose the action first." in shown.text
+    assert "Answer what the publisher is doing first." in shown.text
     shown = b.set({"timing": "CURRENT"})
-    assert "ACTIONABLE" in shown.text and "(set by the form)" in shown.text  # the derived label
+    assert "A trade made now" in shown.text and "(set by the form" in shown.text  # derived
     shown = b.set({"action": "OPEN"})
     assert {"family", "s.entry_price", "effect", "lv.n:0.role", "s.stop_price"} <= shown.names
     assert "entry_price" not in shown.names  # the value box comes with "value given"
@@ -128,20 +140,19 @@ def test_fields_appear_and_go_with_the_answers_by_a_round_trip_to_the_server(sit
     # An answer that makes fields not apply takes their controls, and their values, away.
     shown = b.set({"action": "CLOSE"})
     assert not {"s.entry_price", "entry_price", "entry_role", "s.stop_price"} & shown.names
-    assert "Does not apply: the entry applies to OPEN and ADD." in shown.text
-    assert "does not apply (the stop and targets do not apply to CLOSE)." not in shown.text
+    assert "Only for opening or adding to a position." in shown.text
+    assert shown.text.count("Not asked when the whole position is closed.") == 1  # one section
     shown = b.set({"action": "OPEN"})
     assert shown.value("s.entry_price") == ""  # asked again: unanswered, nothing remembered
     shown = b.set({"timing": "COMMENTARY"})
-    assert "action" not in shown.names and "Does not apply: the post states no trading action." \
-        in shown.text
+    assert "action" not in shown.names and "The post states no trading action." in shown.text
     assert not site.records(FIRST)  # a round trip saves nothing
     # A script asks for the form's body only.
     data = b.shown.data()
     part = b.post("/form/i07/state", data, headers=FRAGMENT)
     text = part.get_data(as_text=True)
     assert part.status_code == 200 and part.headers["X-Fragment"] == "form"
-    assert "<html" not in text and 'name="_key"' in text and "Source evidence" not in text
+    assert "<html" not in text and 'name="_key"' in text and "Post you&#39;re reviewing" not in text
     # No rule lives in the script: it names no field, option or code of the rubric.
     script = (Path(site.app.static_folder) / "app.js").read_text()
     words = {f.name for f in R.RUBRIC} | {c for f in R.RUBRIC for c, _ in f.values} \
@@ -157,32 +168,40 @@ def test_save_lists_what_it_refuses_by_field_and_warnings_need_the_tick(site):  
     b.fill(valid(site.bundle, "i07", stop_price=R.NOT_STATED,
                  levels=[("CURRENT_MARKET", "APPROXIMATE"), ("STOP", "EXACT")]))
     shown = b.shown
-    assert not shown.can_save()
-    for code, where in (("TABLE_STOP", "stop_price"), ("CONFIDENCE", "confidence")):
-        assert f"Save refuses {code} ({where}): {R.BLOCKING_CODES[code]}" in shown.visible()
-    refused = b.press_save()  # pressed all the same (a page without scripts, a stale page)
-    assert refused.status == 422 and "Not saved (BLOCKED:TABLE_STOP,CONFIDENCE)" in refused.text
+    assert not shown.can_save() and 'id="problems"' not in shown.text
+    for code in ("TABLE_STOP", "CONFIDENCE"):
+        assert W.BLOCKING[code] in shown.plain
+    refused = b.press_save()  # Save is never disabled: the server checks and keeps every answer
+    assert refused.status == 422
+    assert ("Your form hasn't been submitted. One question needs an answer and one answer needs "
+            "a correction.") in refused.plain
+    assert refused.plain.count(W.GO_TO_QUESTION) == 2
+    assert 'formaction="/form/i07/state#field-stop_price" data-go="field-stop_price"' in refused.text
+    assert 'formaction="/form/i07/state#field-confidence"' in refused.text
+    # The correction stands at the question, tied to its controls.
+    assert 'id="err-field-confidence"' in refused.text
+    assert 'aria-invalid="true" aria-describedby="err-field-confidence"' in refused.text
     assert refused.value("s.stop_price") == R.NOT_STATED  # the answers are still in the page
+    assert refused.value("ui.tried") == "1"  # the corrections stay shown through round trips
     assert not site.records(FIRST)
     shown = b.set({"s.stop_price": "VALUE", "confidence": "HIGH"})
     shown = b.set({"stop_price": "four twenty"})
-    assert "Not a valid value (BAD_PRICE:stop_price)." in shown.text and not shown.can_save()
+    assert "This can&#39;t be stored as a price" in shown.text and not shown.can_save()
+    assert 'id="err-field-stop_price"' in shown.text
     shown = b.set({"stop_price": "420", "family": ""})
-    assert "Required, unanswered: family" in shown.text
-    assert f"Save refuses REQUIRED_UNANSWERED (family): {R.BLOCKING_CODES['REQUIRED_UNANSWERED']}" \
-        in shown.visible()
+    assert "Your form hasn&#39;t been submitted. One question needs an answer." in shown.text
+    assert 'id="err-field-family"' in shown.text and W.ANSWER_NEEDED in shown.plain
     shown = b.set({"family": "OTHER"})
-    assert shown.can_save() and "Save refuses" not in shown.text
+    assert shown.can_save() and "Everything that was missing is answered now." in shown.text
 
     # A warning: the reading is saved only with the tick, and the tick is stored.
     b.open("i03")
     b.fill(valid(site.bundle, "i03", idea="NEW_IDEA"))
     shown = b.set({"confidence": "HIGH"})
-    warning = f"Please check: NEW_IDEA_NOT_OPEN: {R.WARNING_CODES['NEW_IDEA_NOT_OPEN']}"
-    assert warning in shown.visible() and "I have checked these" in shown.text
+    assert W.WARNINGS["NEW_IDEA_NOT_OPEN"] in shown.plain and "I have checked these" in shown.text
     assert not shown.can_save() and shown.value("ack") == []
     refused = b.press_save()
-    assert refused.status == 422 and "Not saved (WARNINGS_NOT_ACKNOWLEDGED)" in refused.text
+    assert refused.status == 422 and W.REFUSALS["WARNINGS_NOT_ACKNOWLEDGED"] in refused.plain
     assert not site.records(FIRST)
     shown = b.set({"ack": "NEW_IDEA_NOT_OPEN"})
     assert shown.can_save() and shown.value("ack") == ["NEW_IDEA_NOT_OPEN"]
@@ -190,6 +209,7 @@ def test_save_lists_what_it_refuses_by_field_and_warnings_need_the_tick(site):  
     shown = b.set({"s.stop_price": "VALUE"})
     shown = b.set({"stop_price": "99"})
     assert "STOP_SIDE" in shown.text and shown.value("ack") == [] and not shown.can_save()
+    assert W.WARNINGS["STOP_SIDE"] in shown.plain
     shown = b.set({"s.stop_price": R.NOT_STATED})
     assert shown.value("ack") == [] and "STOP_SIDE" not in shown.text
     b.set({"ack": "NEW_IDEA_NOT_OPEN"})
@@ -201,11 +221,11 @@ def test_save_lists_what_it_refuses_by_field_and_warnings_need_the_tick(site):  
 def test_a_label_only_form_asks_for_the_label_and_the_actions(site):  # noqa: F811
     b = site.browser().sign_in(FIRST)
     shown = b.open("i02")
-    assert "Label-only form: the label of the whole post" in shown.text
+    assert "One form for the whole post" in shown.text
     assert {"post_label", "ambiguities", "flags", "confidence", "notes"} <= shown.names
     assert not {"timing", "action", "aa.n", "lv.n:0.role"} & shown.names
     shown = b.set({"post_label": "ACTIONABLE", "confidence": "LOW"})
-    assert "aa.n" in shown.names and "ADDITIONAL_ACTION_REQUIRED" in shown.text
+    assert "aa.n" in shown.names and W.BLOCKING["ADDITIONAL_ACTION_REQUIRED"] in shown.plain
     shown = b.set({"aa.n": "1"})
     b.set({"aa.0.timing": "CURRENT", "aa.0.action": "REDUCE", "aa.0.family": "TLT",
            "aa.0.side": "LONG"})
@@ -232,7 +252,7 @@ def test_nothing_of_the_system_leaves_the_server_before_every_form_of_the_post_i
     b.review("s14a", after=False)  # form 1 of 2 saved; form 2 not
     seen += [b.shown.text, b.open("s14a").text, b.open("s14b").text,
              b.get("/").get_data(as_text=True)]
-    assert "Still without an independent reading" in seen[3] and "/form/s14b" in seen[3]
+    assert "Complete form 2 of 2 for this post next." in seen[3] and "/form/s14b" in seen[3]
     b.open("s14b")
     seen.append(b.set({"component": "ACTION_RECORDED_HERE", "timing": "CURRENT"}).text)
     seen.append(b.post("/form/s14b/state", b.shown.data(), headers=FRAGMENT).get_data(
@@ -246,7 +266,7 @@ def test_nothing_of_the_system_leaves_the_server_before_every_form_of_the_post_i
         answer = b.post(f"/form/{item}/save", hostile)
         assert answer.status_code == 422
         seen.append(answer.get_data(as_text=True))
-        assert "Not saved (NOT_REVEALED)" in seen[-1]
+        assert W.REFUSALS["NOT_REVEALED"] in html.unescape(seen[-1])
         seen.append(b.post(f"/form/{item}/state", hostile, headers=FRAGMENT).get_data(
             as_text=True))
     assert phases(site) == [A.INDEPENDENT]
@@ -299,9 +319,9 @@ def test_nothing_of_the_system_is_shown_when_the_marker_cannot_be_stored(
     monkeypatch.setattr(A, "build_system_shown", refused)
     b.review("s14b", after=False)
     for text in (b.shown.text, b.open("s14a").text, b.open("s14b").text):
-        assert "The system's reading cannot be shown (LOG_FAILS_VERIFICATION)" in text
+        assert "The system's answers can't be shown right now." in html.unescape(text)
         assert not [w for w in SYSTEM_WORDS if w in text]
-        assert "Your independent reading of this form is saved." in text
+        assert "Your own reading. Saved. Record" in text  # the stored reading, in words
     assert not b.shown.has_form and phases(site) == [A.INDEPENDENT, A.INDEPENDENT]
     # The store failing (not the core) shows nothing either.
     append = site.store.append
@@ -314,7 +334,8 @@ def test_nothing_of_the_system_is_shown_when_the_marker_cannot_be_stored(
     monkeypatch.setattr(A, "build_system_shown", real)
     monkeypatch.setattr(site.store, "append", broken)
     text = b.open("s14b").text
-    assert "The system's reading cannot be shown (OSError)" in text and "went away" not in text
+    assert "The system's answers can't be shown right now." in html.unescape(text)
+    assert "OSError" not in text and "went away" not in text
     assert not [w for w in SYSTEM_WORDS if w in text]
     monkeypatch.setattr(site.store, "append", append)
     assert SYSTEM_MARKS["s14b"]["reference"] in b.open("s14b").text  # stored now, so shown
@@ -334,9 +355,10 @@ def test_an_independent_reading_cannot_be_saved_once_the_system_was_shown(site):
     again = [(n, site.page_key(FIRST, "i07") if n == "_key" else v) for n, v in independent]
     answer = b.post("/form/i07/save", again)
     text = answer.get_data(as_text=True)
-    assert answer.status_code == 422 and "Not saved (SYSTEM_READING_ALREADY_SEEN)" in text
-    assert "An independent reading can no longer be saved for this form" in text
-    assert "Save reading after reveal" in text  # the page shows where the form stands now
+    assert answer.status_code == 422 and W.REFUSALS["SYSTEM_READING_ALREADY_SEEN"] in \
+        html.unescape(text)
+    assert "Your own reading can no longer be saved for this form" in html.unescape(text)
+    assert "Save assessment" in text  # the page shows where the form stands now
     assert site.records(FIRST) == before
     assert b.post("/form/i07/state", again, headers=FRAGMENT).status_code == 409
     # A form whose system reading was seen before any reading (a marker from the local site):
@@ -347,8 +369,8 @@ def test_an_independent_reading_cannot_be_saved_once_the_system_was_shown(site):
     assert shown.value("timing") == ""  # nothing of the system fills an answer
     attempt = [(n, A.INDEPENDENT if n == "_phase" else v) for n, v in shown.data()]
     refused = b.post("/form/i08/save", attempt)
-    assert refused.status_code == 422 and "SYSTEM_READING_ALREADY_SEEN" in refused.get_data(
-        as_text=True)
+    assert refused.status_code == 422 and W.REFUSALS["SYSTEM_READING_ALREADY_SEEN"] in html.unescape(refused.get_data(
+        as_text=True))
     reading, _form = scenario_reading(site.bundle, "i08")
     b.fill(reading)
     assert "Saved." in b.save().text
@@ -364,42 +386,47 @@ def test_the_two_questions_after_the_reveal_stand_beside_the_systems_proposals(s
     b = site.browser().sign_in(FIRST)
     b.open("s14a")
     blind = b.fill({"component": "ACTION_RECORDED_HERE", "timing": "CURRENT", "action": "CLOSE"})
-    assert "Does not apply: asked only after the system's reading is revealed." in blind.plain
-    assert "System's reference price series" not in blind.plain
+    assert W.SECTIONS["H"] not in blind.plain  # nothing of the proposals before the reveal
+    assert "The system's price series" not in blind.plain
     assert not set(R.MAPPING_FIELDS) & blind.names
     b.review("s14a", after=False)
     b.review("s14b", after=False)
     shown = b.open("s14a")
     marks, text = SYSTEM_MARKS["s14a"], shown.plain
     # Each proposal, then its question, then its own input: in that order, in its own block.
-    order = ["System's reference price series", marks["reference"],
-             "Is this the price series used for the numbers in the post?",
-             'name="reference_series_right"', "System's proposed execution instrument",
+    order = ["The system's price series for this post", marks["reference"],
+             "Is this the price series the post uses?",
+             'name="reference_series_right"', "The instrument the system would trade",
              marks["execution"],
-             "Would using this instrument faithfully follow the publisher",
+             "Would trading this instrument follow the idea in the post?",
              'name="execution_instrument_right"']
     places = [text.index(part) for part in order]
     assert places == sorted(places)
     for name in R.MAPPING_FIELDS:
-        assert f'<div class="proposal" id="field-{name}">' in text
+        assert f'proposal pair" id="field-{name}" data-q>' in text
         assert shown._form.options[name] == ["YES", "NO", "UNSURE"]
         assert shown.value(name) == ""  # unanswered until the reviewer chooses
-    assert text.count("not answered yet") == 2
-    for label in (">Yes<", ">No<", ">Unsure<"):
-        assert text.count(label) == 2
+        assert W.NOT_ANSWERED in part(text, name)
+    # The reviewer's own answer stands beside the proposal it helps to judge.
+    assert "You answered that the quoted prices refer to" in part(text, "reference_series_right")
+    for name in R.MAPPING_FIELDS:
+        for label in (">Yes<", ">No<", ">Unsure<"):
+            assert part(text, name).count(label) == 1
     # Save waits for both answers; the server refuses a save sent without them.
     shown = b.set({"confidence": "HIGH"})
     assert not shown.can_save()
     for name in R.MAPPING_FIELDS:
-        assert f"REQUIRED_UNANSWERED ({name})" in shown.text
+        assert f'data-go="field-{name}"' in shown.text
     refused = b.press_save()
-    assert refused.status == 422 and "BLOCKED:REQUIRED_UNANSWERED" in refused.text
+    assert refused.status == 422 and "Two questions need an answer." in refused.text
     assert A.AFTER_REVEAL not in phases(site)
     shown = b.set({"reference_series_right": "NO"})
-    assert not shown.can_save() and shown.text.count("not answered yet") == 1
-    assert "REQUIRED_UNANSWERED (reference_series_right)" not in shown.text
+    assert not shown.can_save() and W.NOT_ANSWERED not in part(shown.plain,
+                                                               "reference_series_right")
+    assert 'data-go="field-reference_series_right"' not in shown.text
     shown = b.set({"execution_instrument_right": "UNSURE"})
-    assert shown.can_save() and "not answered yet" not in shown.text
+    assert shown.can_save() and W.NOT_ANSWERED not in part(shown.plain,
+                                                           "execution_instrument_right")
     assert "Saved." in b.press_save().text
     rec = site.records(FIRST)[-1]
     assert (rec["reading"]["reference_series_right"],
@@ -409,19 +436,19 @@ def test_the_two_questions_after_the_reveal_stand_beside_the_systems_proposals(s
     again = site.browser().sign_in(FIRST).open("s14a")
     assert again.value("reference_series_right") == "NO"
     assert again.value("execution_instrument_right") == "UNSURE"
-    assert "not answered yet" not in again.text
+    assert W.NOT_ANSWERED not in part(again.plain, "reference_series_right")
 
 
 def test_no_answer_is_asked_without_a_proposal_or_when_the_reading_has_no_action(site):  # noqa: F811
     b = site.browser().sign_in(FIRST)
     b.review("i07", after=False)  # the demo's i07: the system proposed nothing
     shown = b.shown
-    assert "The system proposed no reference price series for this post, so no answer is " \
-        "asked." in shown.plain
-    assert "The system proposed no execution instrument for this post, so no answer is " \
-        "asked." in shown.plain
-    assert shown.text.count("none proposed") == 2 and not set(R.MAPPING_FIELDS) & shown.names
-    assert shown.can_save() is False and "REQUIRED_UNANSWERED (reference" not in shown.text
+    assert "The system proposed no price series for this post, so there is nothing to " \
+        "judge." in shown.plain
+    assert "The system proposed no instrument for this post, so there is nothing to " \
+        "judge." in shown.plain
+    assert shown.text.count("Nothing proposed") == 2 and not set(R.MAPPING_FIELDS) & shown.names
+    assert shown.can_save() is False and 'data-go="field-reference' not in shown.text
     b.save()
     rec = site.records(FIRST)[-1]
     assert rec["reading"]["reference_series_right"] == NA
@@ -433,14 +460,15 @@ def test_no_answer_is_asked_without_a_proposal_or_when_the_reading_has_no_action
     assert set(R.MAPPING_FIELDS) <= shown.names
     shown = b.set({"timing": "COMMENTARY"})
     assert not set(R.MAPPING_FIELDS) & shown.names
-    assert shown.text.count("No answer is asked: the post states no trading action.") == 2
+    assert shown.text.count("Nothing to judge: the post states no trading action.") == 2
     assert SYSTEM_MARKS["s14b"]["reference"] in shown.text  # the proposal is still shown
     shown = b.set({"timing": "CURRENT"})  # asked again: the saved answers stand again
     assert shown.value("action") == "OPEN" and set(R.MAPPING_FIELDS) <= shown.names
     shown = b.set({"action": ""})
-    assert shown.text.count("No answer is asked yet: choose the action first.") == 2
+    assert shown.text.count("Nothing to judge yet: answer what the publisher is doing first.") \
+        == 2
     shown = b.set({"component": "NO_SEPARATE_ACTION"})
-    assert shown.text.count("No answer is asked: this form records no separate action.") == 2
+    assert shown.text.count("Nothing to judge: this form records no separate action.") == 2
     shown = b.set({"confidence": "HIGH"})
     assert shown.can_save()
     b.press_save()
@@ -457,7 +485,7 @@ def test_a_correction_after_the_reveal_derives_again_and_a_verdict_follows_its_a
     b.review("i07", after=False)
     shown = b.shown
     assert shown.value("v.side") == "CONFIRM" and shown.value("v.entry_role") == "CONFIRM"
-    assert "verdict: NOT_APPLICABLE (does not apply to your reading)" in shown.text
+    assert W.VERDICT_FIXED in shown.plain
     # An edited verdict stays while its answer stays, and starts again when the answer changes.
     shown = b.set({"v.side": "UNSURE"})
     shown = b.set({"notes": "looked at the chart again"})
@@ -564,8 +592,9 @@ def test_the_same_page_posted_with_other_answers_is_another_save(site):  # noqa:
     # Another save: checked as one. An independent reading exists, so the core refuses it; the
     # page says "Not saved", never "Saved".
     text = second.get_data(as_text=True)
-    assert second.status_code == 422 and "Not saved (SYSTEM_READING_ALREADY_SEEN)" in text
-    assert "<strong>Saved.</strong>" not in text
+    assert second.status_code == 422 and W.REFUSALS["SYSTEM_READING_ALREADY_SEEN"] in \
+        html.unescape(text)
+    assert "Saved." not in text
     assert [(r["confidence"], r["notes"]) for r in site.records(FIRST, markers=False)] == [
         ("HIGH", "first body")]
     # The first POST again, unchanged, is still the same save.
@@ -667,16 +696,17 @@ def test_resuming_in_a_new_session_lands_on_the_next_unfinished_step(site14):
     assert (state("s14a"), state("s14b")) == (F.INDEPENDENT_DUE, F.INDEPENDENT_DUE)
     b = site.browser().sign_in(FIRST)
     b.review("s14a", after=False)
-    assert "Next step:" in b.shown.text and "continue with s14b" in b.shown.visible()
+    assert "Your reading is saved. Complete form 2 of 2 for this post next." in b.shown.visible()
+    assert 'href="/form/s14b">Go to form 2 of 2' in b.shown.text
     # Form 1 is saved, the post is not revealed: the step is the sibling without a reading.
     assert (state("s14a"), state("s14b")) == (F.REVEAL_PENDING, F.INDEPENDENT_DUE)
     assert resume() == "/form/s14b"
     home = site.browser().sign_in(FIRST).get("/").get_data(as_text=True)
-    assert "next step" in home and "independent reading saved" in home
+    assert "next step" in home and "In progress" in home
     b.review("s14b", after=False)
-    assert "Next step: on this same form, below." in b.shown.visible()
+    assert "Your reading is saved. Review the system's answers." in b.shown.visible()
     assert (state("s14a"), state("s14b")) == (F.AFTER_REVEAL_DUE, F.AFTER_REVEAL_DUE)
-    assert "reading after the reveal due" in b.get("/").get_data(as_text=True)
+    assert "Awaiting your assessment" in b.get("/").get_data(as_text=True)
     # Both saved and revealed: the first form that is not done, in the state after the reveal,
     # with the independent answers intact.
     assert resume() == "/form/s14a"
@@ -688,13 +718,15 @@ def test_resuming_in_a_new_session_lands_on_the_next_unfinished_step(site14):
         assert shown.value(name) == value, name
     assert shown.value("confidence") == "" and SYSTEM_MARKS["s14a"]["reference"] in shown.text
     fresh.set({"reference_series_right": "YES", "execution_instrument_right": "YES"})
-    assert "continue with s14b" in fresh.save().visible()
+    saved = fresh.save().visible()
+    assert "Review complete. Continue to the next form." in saved
+    assert "Continue to the next form: scs14 2: instruction" in saved
     assert (state("s14a"), state("s14b")) == (F.DONE, F.AFTER_REVEAL_DUE)
     assert resume() == "/form/s14b"
     fresh.open("s14b")
     fresh.set({"reference_series_right": "YES", "execution_instrument_right": "YES"})
     done = fresh.save()
-    assert "continue with i07" in done.visible()  # the post is done: on to the next idea
+    assert "Continue to the next form: seqB 1: instruction" in done.visible()  # the next idea
     assert resume() == "/form/i07"
     page = fresh.get("/").get_data(as_text=True)
     assert "1 of 33" in page and "2 of 45" in page  # ideas completed, forms done
@@ -717,22 +749,22 @@ def test_a_reading_the_approver_returned_is_shown_to_its_reviewer_only(site):  #
         "access": A.FULL})
     shown = a.open("i08")
     after = [r for r in site.records(FIRST) if r["phase"] == A.AFTER_REVEAL][-1]
-    assert f"SAVED, and RETURNED by the approver. Your reading of this form after the reveal " \
-        f"is record {after['seq']}" in shown.text
-    assert "The approver returned this reading." in shown.text and note in shown.visible()
+    assert f"The approver returned your assessment (record {after['seq']}," in shown.text
+    assert "The approver returned this reading for changes." in shown.text
+    assert note in shown.visible()
     assert "owner@example.invalid" not in shown.text and "Owner Example" not in shown.text
     # The form is open again with the reviewer's latest answers.
     assert shown.value("_phase") == A.AFTER_REVEAL and shown.value("action") == "CLOSE"
     assert shown.value("lv.n:0.role") == "HISTORICAL_FILL"
     # The workspace says so, and "continue" goes there before the first form never started.
     home = a.get("/").get_data(as_text=True)
-    assert "Returned to you" in home and "The approver returned 1 reading to you." in " ".join(
+    assert "Returned for changes" in home and "The approver returned 1 reading to you." in " ".join(
         home.split())
     assert a.get("/continue").headers["Location"] == "/form/i08"
     assert "2 of 45" in home  # the counts are the reviewer's own records, as before
     # The other reviewer, who read the same form, sees nothing of it.
     for text in (b.open("i08").text, b.get("/").get_data(as_text=True)):
-        assert "RETURNED" not in text and "Returned to you" not in text and note not in text
+        assert "RETURNED" not in text and "Returned for changes" not in text and note not in text
     assert b.get("/continue").headers["Location"] == "/form/i07"
     assert returned not in site.records(SECOND) and returned in site.records(FIRST)
     from reviewer_web import forms as F
@@ -748,9 +780,9 @@ def test_a_reading_the_approver_returned_is_shown_to_its_reviewer_only(site):  #
     a.set({"lv.n:0.exactness": "APPROXIMATE"})
     done = a.save(confidence="MEDIUM", notes="corrected after the return")
     assert "Saved." in done.text and "RETURNED" not in done.text
-    assert "SAVED. Your reading of this form after the reveal is record" in done.text
+    assert "Your assessment is saved (record" in done.text
     home = a.get("/").get_data(as_text=True)
-    assert "Returned to you" not in home and "The approver returned" not in home
+    assert "Returned for changes" not in home and "The approver returned" not in home
     assert a.get("/continue").headers["Location"] == "/form/i01"
     newest = [r for r in site.records(FIRST) if r["phase"] == A.AFTER_REVEAL][-1]
     assert newest["seq"] > after["seq"] and newest["notes"] == "corrected after the return"
@@ -775,7 +807,7 @@ def test_a_return_the_approver_took_back_shows_nowhere_on_the_site(site):  # noq
                                      "role": A.APPROVER, "access": A.FULL}  # as the tool stores
     assert 2_000_000 < returned["seq"] < 3_000_000 and returned["seq"] % 2 == 0
     assert a.get("/continue").headers["Location"] == "/form/i08"
-    assert "Returned to you" in a.get("/").get_data(as_text=True)
+    assert "Returned for changes" in a.get("/").get_data(as_text=True)
 
     def state() -> str:
         return F.step_state(site.bundle, site.reviewers[FIRST].session(), site.records(FIRST),
@@ -784,10 +816,10 @@ def test_a_return_the_approver_took_back_shows_nowhere_on_the_site(site):  # noq
     def nothing_is_returned(*notes: str) -> None:
         home, shown = Shown(a.get("/")), a.open("i08")
         for page in (home, shown):
-            assert "Returned to you" not in page.text and "RETURNED" not in page.text
+            assert "Returned for changes" not in page.text and "RETURNED" not in page.text
             assert "The approver returned" not in page.text and "WITHDRAWN" not in page.text
             assert not [n for n in (*notes, "never stored") if n in page.plain]
-        assert "SAVED. Your reading of this form after the reveal is record" in shown.text
+        assert "Your assessment is saved (record" in shown.text
         assert "2 of 45" in home.text and state() == F.DONE
         assert a.get("/continue").headers["Location"] == "/form/i01"
 
@@ -811,7 +843,7 @@ def test_a_return_the_approver_took_back_shows_nowhere_on_the_site(site):  # noq
     assert again["seq"] > cleared["seq"] and state() == F.RETURNED
     assert a.get("/continue").headers["Location"] == "/form/i08"
     shown = a.open("i08")
-    assert "The approver returned this reading." in shown.text
+    assert "The approver returned this reading for changes." in shown.text
     assert "Once more: row 1." in shown.visible() and note not in shown.visible()
     # and the reviewer's corrected save ends it, with all three lines among the records.
     a.set({"lv.n:0.exactness": "APPROXIMATE"})
@@ -886,14 +918,15 @@ def test_a_form_that_enters_the_scope_after_its_post_was_revealed_can_be_complet
     b = site.browser().sign_in(FIRST)
     shown = b.open("x01")
     assert shown.value("_phase") == A.AFTER_REVEAL and "holds SHIPPED" in shown.text
-    assert "The system's reading of this post was already shown to you" in shown.plain
-    assert "reading after the reveal due" in shown.text
+    assert "The system's answers for this post were already shown to you" in shown.visible()
+    assert "Awaiting your assessment" in shown.text
     assert shown.value("component") == "" and "timing" not in shown.names  # nothing is filled
     assert ("x01", A.SYSTEM_SHOWN) in [(r["item_id"], r["phase"]) for r in site.records(FIRST)]
     # An independent reading is what the core refuses; the page never offers that form.
     attempt = [(n, A.INDEPENDENT if n == "_phase" else v) for n, v in shown.data()]
     refused = b.post("/form/x01/save", attempt)
-    assert refused.status_code == 422 and b"SYSTEM_READING_ALREADY_SEEN" in refused.get_data()
+    assert refused.status_code == 422 and W.REFUSALS["SYSTEM_READING_ALREADY_SEEN"] in \
+        html.unescape(refused.get_data(as_text=True))
     assert b'name="_phase" value="AFTER_REVEAL"' in refused.get_data()
     # The reading is saved, as one given after seeing the system's.
     b.open("x01")
@@ -947,7 +980,7 @@ def test_a_save_carries_the_rows_spelling_of_the_sign_in_however_it_was_typed(si
     again = sign_in(spelled.upper())
     assert "1 of 45" in again.get("/").get_data(as_text=True)
     assert again.get("/continue").headers["Location"] == "/form/i08"
-    assert "SAVED. Your reading of this form after the reveal is record" in again.open("i07").text
+    assert "Your assessment is saved (record" in again.open("i07").text
     again.review("i08")
     assert {r["annotator"]["login"] for r in site.records(FIRST)} == {spelled}
     # From now on the row keeps that spelling: its lines are found by it.

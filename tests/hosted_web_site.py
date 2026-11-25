@@ -199,7 +199,9 @@ class Shown:
         return html.unescape(self.text)
 
     def can_save(self) -> bool:
-        return self.has_form and "save" not in self._form.disabled
+        """The form holds a reading Save accepts (nothing open before submitting). The Save
+        button itself is never disabled: a refused submission lists what to correct."""
+        return self.has_form and 'data-ready="1"' in self.text
 
     def visible(self) -> str:
         """The text of the page without its tags (enough for ``in`` checks)."""
