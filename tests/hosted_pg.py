@@ -31,6 +31,15 @@ _spec = importlib.util.spec_from_file_location(
 DEMO = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(DEMO)
 NEEDS = 'the hosted store needs a real Postgres: uv pip install pgserver "psycopg[binary]"'
+SITE_NEEDS = ("the hosted site's tests need its packages and an embedded Postgres: pip install -r "
+              "hosted/requirements.txt pgserver (the CI job hosted-tests installs them)")
+
+
+def require_the_site() -> None:
+    """Skip the importing test module, at collection, when the site's packages are missing
+    (the core CI job installs none of them): one reason for every hosted web test module."""
+    for name in ("flask", "werkzeug", "psycopg", "pgserver"):
+        pytest.importorskip(name, reason=SITE_NEEDS)
 BUNDLE_FILES = ("manifest.json", "sequences.jsonl", "items.jsonl", "posts.jsonl")
 _names = (f"t{n}" for n in itertools.count(1))
 
