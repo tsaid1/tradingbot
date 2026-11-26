@@ -306,3 +306,17 @@ def test_blind_responses_are_the_same_bytes_whatever_the_system_read(tmp_path, s
                 a.splitlines(True), other.splitlines(True), n=0))[:12])))
         for word in (*SYSTEM_WORDS, "ZQOTHER"):
             assert word not in a, (k, word)
+
+
+def test_the_reference_and_the_guide_use_the_forms_words(site):  # noqa: F811
+    """The Field reference and the Reviewer guide say what the form says: the two proposal
+    judgments in the form's own help, and none of the vocabulary the form gave up."""
+    b = site.browser().sign_in(FIRST)
+    pages = {p: html.unescape(re.sub(r"<[^>]+>", " ", b.get(p).get_data(as_text=True)))
+             for p in ("/fields", "/guide")}
+    for path, text in pages.items():
+        for old in ("source fact", "mapping", "greyed", "tooltip", "stored as",
+                    "Posts of no sequence"):
+            assert old.lower() not in text.lower(), (path, old)
+    for f in R.MAPPING_FIELDS:
+        assert W.HELP[f] in " ".join(pages["/fields"].split())

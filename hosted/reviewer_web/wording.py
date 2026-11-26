@@ -920,9 +920,34 @@ _PLAIN_FIELDS = ("timing", "action", "announcement", "post_label", "follower_imp
                  "explicit")
 
 
+# What the Field reference says of a question whose help the form words itself: the SAME
+# entries as the form (so the two cannot drift apart).
+REFERENCE_ABOUT = {
+    "reference_series_right": (PROPOSAL_IS["reference_series_right"] + " "
+                               + HELP["reference_series_right"]),
+    "execution_instrument_right": (PROPOSAL_IS["execution_instrument_right"] + " "
+                                   + HELP["execution_instrument_right"]),
+}
+REFERENCE_APPLIES = {
+    "reference_series_right": "after your reading is saved, when the system proposes a price "
+                              "series",
+    "execution_instrument_right": "after your reading is saved, when the system proposes an "
+                                  "instrument",
+}
+# Phrases of the rubric's texts the site no longer uses, in its own words.
+_PHRASES = (("A source fact, not a trading decision.", "A fact about the post, not a trading "
+             "decision."),
+            ("stored as one plain line", "kept as one plain line"),
+            ("the system's mapping", "the system's proposal"),
+            ("approving a mapping", "approving a proposal"))
+
+
 def plain(text: str) -> str:
     """A text of the rubric with its codes and field names in the form's own words."""
     import re
+
+    for old, new in _PHRASES:
+        text = text.replace(old, new)
 
     words: dict[str, str] = {}
     for f in reversed(_PLAIN_FIELDS):
