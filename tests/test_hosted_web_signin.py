@@ -108,8 +108,11 @@ def test_the_answer_is_the_same_for_every_address_and_an_unlisted_one_gets_no_ma
     assert len(site.outbox.sent) == 1 and site.outbox.sent[0][0] == login_of(site)
     assert one.status_code == two.status_code == 200
     assert one.get_data(as_text=True).replace(login_of(site), NOBODY) == two.get_data(as_text=True)
-    assert dict(one.headers) == {**dict(two.headers), "Content-Length": one.headers[
-        "Content-Length"]}
+    def masked(r) -> dict:  # each answer names its own browser by a random value (the repeat)
+        return {**dict(r.headers), "Content-Length": "N", "Set-Cookie": re.sub(
+            r"__Host-signin=[^;]+", "__Host-signin=B", r.headers["Set-Cookie"])}
+
+    assert masked(one) == masked(two)
     assert site.sql("SELECT count(*) FROM login_code") == [(1,)]
     # Entering a code: the same refusal for an unlisted address as for a wrong code.
     refused, wrong_code = enter(unlisted, NOBODY, "123456"), enter(
@@ -678,7 +681,10 @@ def test_production_never_shows_its_own_code_whatever_happens_to_the_mail(
         for response in (listed, unlisted):
             assert response.status_code == 200
             assert code not in whole(response)  # body and every header
-            assert "Set-Cookie" not in response.headers and "Location" not in response.headers
+            # The only cookie: the code request's browser (a random value; the repeat).
+            assert response.headers.getlist("Set-Cookie")[0].startswith("__Host-signin=")
+            assert len(response.headers.getlist("Set-Cookie")) == 1
+            assert "Location" not in response.headers
             assert "Demonstration" not in response.get_data(as_text=True)
             assert ("The code could not be sent. Try again in a minute." in response.get_data(
                 as_text=True)) is says_so

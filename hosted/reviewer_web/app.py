@@ -68,6 +68,7 @@ DEMO_ENVS = ("preview", "test")  # these show invented data only
 PUBLIC = ("healthz", "robots", "favicon", "static")  # no session, no database
 SIGN_IN = ("sign_in", "sign_in_code", "sign_in_verify", "choose_identity", "chosen_identity")
 CHOICE_SECONDS = int(auth.CHOICE_VALID.total_seconds())
+BROWSER_SECONDS = int(auth.BROWSER_VALID.total_seconds())
 UI_PREFIX = "ui."  # posted interface state: kept in a draft, never validated, never an event
 MAX_UI_FIELDS = 64  # of one draft
 # The phase whose draft a form in this state may hold.
@@ -442,9 +443,15 @@ def create_app(store, mailer, config: dict) -> Flask:
 
     # ------------------------------------------------------------- sign-in and sign-out
 
+    def end_browser(response):
+        """The code request's browser cookie ends at sign-in and at "Use another address"."""
+        response.delete_cookie(auth.BROWSER_COOKIE, secure=True, httponly=True, samesite="Lax",
+                               path="/")
+        return response
+
     @app.get("/sign-in")
     def sign_in():
-        return render_template("sign_in.html")
+        return end_browser(make_response(render_template("sign_in.html")))
 
     @app.post("/sign-in")
     def sign_in_code():
@@ -460,7 +467,10 @@ def create_app(store, mailer, config: dict) -> Flask:
         address = typed_address()
         if synthetic and not store.bundle_is_demo():
             return refuse(503)  # a code is shown on a page only beside invented data
-        asked = auth.request_code(store, secret, address, network(), clock())
+        # Every answer names its browser (a random value; only its SHA-256 is kept, with the
+        # code if one was made): its own repeat of a successful sign-in is recognised by it.
+        browser = secrets.token_urlsafe(32)
+        asked = auth.request_code(store, secret, address, network(), clock(), browser)
         if synthetic and asked.code is not None and not all(
                 reads_demo(r) for r in asked.identities):
             auth.cancel_code(store, asked.code_id, clock())  # never for a real bundle's reader
@@ -482,21 +492,32 @@ def create_app(store, mailer, config: dict) -> Flask:
             if asked.code is not None:
                 auth.cancel_code(store, asked.code_id, clock())
         time.sleep(max(0.0, floor - (time.monotonic() - started)))
-        return render_template("sign_in_code.html", address=address, failed=False, unsent=unsent,
-                               shown_code=asked.code if synthetic else None)
+        response = make_response(render_template(
+            "sign_in_code.html", address=address, failed=False, unsent=unsent,
+            shown_code=asked.code if synthetic else None))
+        response.set_cookie(auth.BROWSER_COOKIE, browser, max_age=BROWSER_SECONDS, secure=True,
+                            httponly=True, samesite="Lax", path="/")
+        return response
 
     @app.post("/sign-in/verify")
     def sign_in_verify():
-        """One refusal for every reason, after the same least time as a request for a code."""
+        """One refusal for every reason, after the same least time as a request for a code. A
+        browser that has signed in already (``guard``: it holds a session) or holds the choice
+        of its identity is sent on, nothing counted; and the browser of a code request may
+        repeat, for a minute, the sign-in its right code made (``auth.verify_code``)."""
         started = time.monotonic()
         address = typed_address()
+        if auth.choices(store, request.cookies.get(auth.CHOICE_COOKIE, ""), clock()):
+            time.sleep(max(0.0, floor - (time.monotonic() - started)))
+            return redirect("/sign-in/choose", 303)  # the choice it holds is still to be made
         token, exhausted, choice = auth.verify_code(
-            store, secret, address, request.form.get("code", "")[:32], network(), clock())
+            store, secret, address, request.form.get("code", "")[:32], network(), clock(),
+            request.cookies.get(auth.BROWSER_COOKIE, ""))
         if exhausted:  # the tenth wrong code of the day for this address: the operator sees it
             app.logger.warning("SIGN_IN_TRIES_EXHAUSTED alias=%s", exhausted)
         time.sleep(max(0.0, floor - (time.monotonic() - started)))
         if choice is not None:  # an address with two identities: which one to open
-            response = redirect("/sign-in/choose", 303)
+            response = end_browser(redirect("/sign-in/choose", 303))
             response.set_cookie(auth.CHOICE_COOKIE, choice, max_age=CHOICE_SECONDS, secure=True,
                                 httponly=True, samesite="Lax", path="/")
             return response
@@ -505,7 +526,7 @@ def create_app(store, mailer, config: dict) -> Flask:
                                    unsent=False, shown_code=None), 401
         response = redirect("/", 303)
         session_cookie(response, token, SESSION_SECONDS)
-        return response
+        return end_browser(response)
 
     def end_choice(response):
         response.delete_cookie(auth.CHOICE_COOKIE, secure=True, httponly=True, samesite="Lax",

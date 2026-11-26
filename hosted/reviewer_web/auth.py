@@ -46,6 +46,9 @@ from .mail import SITE_NAME
 
 COOKIE = "__Host-session"
 CHOICE_COOKIE = "__Host-choice"
+BROWSER_COOKIE = "__Host-signin"  # set with a code request; names that request's browser
+BROWSER_VALID = timedelta(minutes=11)  # the cookie's life: the code's ten minutes and a little
+REPEAT_WINDOW = timedelta(seconds=60)  # a used code may be repeated by its own browser this long
 CHOICE_VALID = timedelta(minutes=5)
 REAL, TEST = "review", "test"  # what a choice names: the address's real identity, or its test one
 CODE_VALID = timedelta(minutes=10)
@@ -184,7 +187,8 @@ def unlock(store, reviewer_id: int) -> int:
         return cur.rowcount
 
 
-def request_code(store, secret: bytes, address: str, network: str, now: datetime) -> Asked:
+def request_code(store, secret: bytes, address: str, network: str, now: datetime,
+                 browser: str = "") -> Asked:
     """A code is stored only for a reviewer who may sign in, within the limits and not locked;
     for everything else there is none. The caller answers the same either way. One connection,
     whoever asks: the request is counted against its network address first, then the address's
@@ -212,9 +216,10 @@ def request_code(store, secret: bytes, address: str, network: str, now: datetime
         cur.execute("UPDATE login_code SET used_at = %s WHERE reviewer_id = %s AND used_at IS NULL"
                     " AND id NOT IN (SELECT id FROM login_code WHERE reviewer_id = %s"
                     " ORDER BY id DESC LIMIT %s)", (now, key.id, key.id, LIVE_CODES - 1))
-        cur.execute("INSERT INTO login_code (reviewer_id, code_hmac, created_at, expires_at) "
-                    "VALUES (%s, %s, %s, %s) RETURNING id",
-                    (key.id, _mac(secret, "code", str(key.id), code), now, now + CODE_VALID))
+        cur.execute("INSERT INTO login_code (reviewer_id, code_hmac, created_at, expires_at,"
+                    " browser_sha256) VALUES (%s, %s, %s, %s, %s) RETURNING id",
+                    (key.id, _mac(secret, "code", str(key.id), code), now, now + CODE_VALID,
+                     _sha(browser) if browser else None))
         return Asked(True, found.open[0], code, cur.fetchone()[0], found.open)
 
 
@@ -227,7 +232,7 @@ def cancel_code(store, code_id: int, now: datetime) -> None:
 
 
 def verify_code(store, secret: bytes, address: str, code: str, network: str,
-                now: datetime) -> Verified:
+                now: datetime, browser: str = "") -> Verified:
     """A new session's token, or none. One refusal for every reason: not an address, not
     listed, revoked, locked, no code, a wrong, expired or used code, too many tries. One
     connection, whoever asks. A wrong code that was compared with a valid one counts toward the
@@ -255,28 +260,73 @@ def verify_code(store, secret: bytes, address: str, code: str, network: str,
         right = [hmac.compare_digest(stored, entered) for _id, stored in valid]  # each one
         if not any(right):
             if not valid:
-                return Verified()  # nothing it could have been: not a guess at a code
+                # A code that signed in a moment ago: its own browser may repeat that sign-in
+                # (the first answer was dropped); any wrong code here is counted as any other.
+                return _repeat(cur, store, secret, found, code, browser, now) or Verified()
             cur.execute("INSERT INTO rate_limit (bucket, at) VALUES (%s, %s)",
                         (f"wrong:r{key.id}", now))
             exhausted = len(_wrong_codes(cur, key.id, now)) == WRONG_CODES_PER_DAY
             return Verified(None, "+".join(r.alias for r in found.open) if exhausted else None)
         cur.execute("UPDATE login_code SET used_at = %s WHERE reviewer_id = %s "
                     "AND used_at IS NULL", (now, key.id))  # using one ends both
-        token = secrets.token_urlsafe(32)  # 256 bits
-        if len(found.open) > 1:  # which identity to open: chosen next (only after this right code)
-            cur.execute("DELETE FROM sign_in_choice WHERE expires_at < %s", (now - DAY,))
-            cur.execute("INSERT INTO sign_in_choice (token_sha256, sign_in_key, created_at,"
-                        " expires_at) VALUES (%s, %s, %s, %s)",
-                        (_sha(token), key.id, now, now + CHOICE_VALID))
-            return Verified(choice=token)
-        _open_session(cur, store, token, found.open[0].id, now)
+        used = next(i for (i, _stored), ok in zip(valid, right, strict=True) if ok)
+        # The repeat belongs to the browser of THIS verify, and only when it is the browser
+        # that asked for the code: otherwise nobody may ever repeat this code.
+        cur.execute("UPDATE login_code SET signed_in_at = %s, browser_sha256 = CASE WHEN"
+                    " browser_sha256 = %s THEN browser_sha256 END WHERE id = %s",
+                    (now, _sha(browser) if browser else "-", used))
+        return _signed_in(cur, store, found, used, now)
+
+
+def _signed_in(cur, store, found: Address, code_id: int, now: datetime) -> Verified:
+    """A new session (or, for an address with two identities, a new choice) made by this code.
+    The sessions one code made all stay live until one of them is used (``session_reviewer``
+    then ends the others): whichever answer the browser kept, it works."""
+    token = secrets.token_urlsafe(32)  # 256 bits
+    if len(found.open) > 1:  # which identity to open: chosen next (only after this right code)
+        cur.execute("DELETE FROM sign_in_choice WHERE expires_at < %s", (now - DAY,))
+        cur.execute("INSERT INTO sign_in_choice (token_sha256, sign_in_key, created_at,"
+                    " expires_at) VALUES (%s, %s, %s, %s)",
+                    (_sha(token), found.key.id, now, now + CHOICE_VALID))
+        return Verified(choice=token)
+    _open_session(cur, store, token, found.open[0].id, now, from_code=code_id)
     return Verified(token)
 
 
-def _open_session(cur, store, token: str, reviewer_id: int, now: datetime) -> None:
+def _repeat(cur, store, secret: bytes, found: Address, code: str, browser: str,
+            now: datetime) -> Verified | None:
+    """While the address's newest code signed in no more than REPEAT_WINDOW ago: a WRONG code
+    is an ordinary wrong code (counted against the address; the per-network tries were counted
+    before) and ends the repeat of that code for good. The RIGHT code (the same constant-time
+    comparison) signs in again only when the browser carries the cookie recorded at the
+    first success, which is there only when that success came from the browser that asked
+    for the code, and every identity of the address is open. Anything else: None (the same
+    refusal as before). Nothing earlier is ended here."""
+    cur.execute("SELECT id, code_hmac, browser_sha256 FROM login_code WHERE reviewer_id = %s"
+                " AND id = (SELECT max(id) FROM login_code WHERE reviewer_id = %s)"
+                " AND signed_in_at > %s FOR UPDATE",
+                (found.key.id, found.key.id, now - REPEAT_WINDOW))
+    row = cur.fetchone()
+    if row is None:
+        return None
+    entered = _mac(secret, "code", str(found.key.id), code)
+    if not hmac.compare_digest(row[1], entered):
+        cur.execute("UPDATE login_code SET browser_sha256 = NULL WHERE id = %s", (row[0],))
+        cur.execute("INSERT INTO rate_limit (bucket, at) VALUES (%s, %s)",
+                    (f"wrong:r{found.key.id}", now))
+        exhausted = len(_wrong_codes(cur, found.key.id, now)) == WRONG_CODES_PER_DAY
+        return Verified(None, "+".join(r.alias for r in found.open) if exhausted else None)
+    if not browser or len(browser) > 128 or row[2] is None or not hmac.compare_digest(
+            row[2], _sha(browser)) or not all(store.is_open(r) for r in found.open):
+        return None
+    return _signed_in(cur, store, found, row[0], now)
+
+
+def _open_session(cur, store, token: str, reviewer_id: int, now: datetime, *,
+                  from_code: int | None = None) -> None:
     cur.execute("INSERT INTO web_session (token_sha256, reviewer_id, created_at, "
-                "last_seen_at, expires_at) VALUES (%s, %s, %s, %s, %s)",
-                (_sha(token), reviewer_id, now, now, now + SESSION_VALID))
+                "last_seen_at, expires_at, from_code) VALUES (%s, %s, %s, %s, %s, %s)",
+                (_sha(token), reviewer_id, now, now, now + SESSION_VALID, from_code))
     store.note_first_sign_in(reviewer_id)  # in the same transaction as the session
 
 
@@ -292,6 +342,8 @@ def _choice_key(cur, token: str, now: datetime) -> int | None:
 def choices(store, token: str, now: datetime) -> tuple | None:
     """The identities a pending choice may open, in order (the real one first), or None: no such
     choice, used, expired, or fewer than two identities left that may sign in."""
+    if not token:
+        return None  # no choice cookie: nothing to look up
     with store.connection() as conn:
         key = _choice_key(conn.cursor(row_factory=tuple_row), token, now)
         if key is None:
@@ -318,6 +370,9 @@ def choose(store, token: str, which: str, now: datetime) -> str | None:
         chosen = [r for r in address_of(store, key.sign_in).open if kind(r) == which]
         if len(chosen) != 1:
             return None
+        # The other choices a repeat of the same sign-in made end with this one.
+        cur.execute("DELETE FROM sign_in_choice WHERE sign_in_key = %s AND used_at IS NULL",
+                    (row[0],))
         session = secrets.token_urlsafe(32)
         _open_session(cur, store, session, chosen[0].id, now)
     return session
@@ -340,11 +395,16 @@ def session_reviewer(store, token: str, now: datetime) -> Signed | None:
     seconds = None
     with store.connection() as conn:
         cur = conn.cursor(row_factory=tuple_row)
-        cur.execute("SELECT reviewer_id, last_seen_at, expires_at, created_at FROM web_session "
-                    "WHERE token_sha256 = %s", (_sha(token),))
+        cur.execute("SELECT reviewer_id, last_seen_at, expires_at, created_at, from_code"
+                    " FROM web_session WHERE token_sha256 = %s", (_sha(token),))
         row = cur.fetchone()
         if row is None or row[2] <= now or row[3] + SESSION_LIMIT <= now:
             return None
+        if row[4] is not None:  # the first use of a session a code made: its others end
+            cur.execute("DELETE FROM web_session WHERE from_code = %s AND token_sha256 <> %s",
+                        (row[4], _sha(token)))
+            cur.execute("UPDATE web_session SET from_code = NULL WHERE token_sha256 = %s",
+                        (_sha(token),))
         if now - row[1] >= SESSION_REFRESH:
             expires = min(now + SESSION_VALID, row[3] + SESSION_LIMIT)
             cur.execute("UPDATE web_session SET last_seen_at = %s, expires_at = %s "

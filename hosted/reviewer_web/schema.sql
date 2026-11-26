@@ -200,6 +200,14 @@ CREATE TABLE IF NOT EXISTS login_code (
     used_at     TIMESTAMPTZ                    -- set by the sign-in, or by a newer code
 );
 CREATE INDEX IF NOT EXISTS login_code_by_reviewer ON login_code (reviewer_id, id);
+-- The browser of a code's first successful sign-in may repeat it for a minute (a second press of
+-- "Sign in" whose first answer it dropped): the SHA-256 of the cookie the code request was
+-- answered with, kept at that sign-in only when the signing-in browser carried it (else NULL:
+-- no repeat), and cleared by a wrong code in the minute; when this code signed in. The column
+-- delivered_sha256 is no longer written (sessions of one code end at the first use of one).
+ALTER TABLE login_code ADD COLUMN IF NOT EXISTS browser_sha256 TEXT;
+ALTER TABLE login_code ADD COLUMN IF NOT EXISTS signed_in_at TIMESTAMPTZ;
+ALTER TABLE login_code ADD COLUMN IF NOT EXISTS delivered_sha256 TEXT;
 
 CREATE TABLE IF NOT EXISTS web_session (
     token_sha256 TEXT PRIMARY KEY CHECK (token_sha256 ~ '^[0-9a-f]{64}$'),
@@ -210,6 +218,9 @@ CREATE TABLE IF NOT EXISTS web_session (
                                                -- never later than ninety days after created_at
 );
 CREATE INDEX IF NOT EXISTS web_session_by_reviewer ON web_session (reviewer_id);
+-- The code that made a session: every session one code made stays live until one of them is
+-- used; that first use ends the others (the browser kept one answer, whichever it was).
+ALTER TABLE web_session ADD COLUMN IF NOT EXISTS from_code BIGINT;
 
 CREATE TABLE IF NOT EXISTS rate_limit (
     id     BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
