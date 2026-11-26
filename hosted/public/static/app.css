@@ -11,7 +11,8 @@
      --error             a blocking problem: a refused submission, the field to correct
    Contrast (WCAG 2.1, computed for both themes): text and quiet text at least 6.1:1 on every
    surface; each status colour at least 5.6:1 on its own surface and on --surface; control
-   borders at least 4:1; the focus ring at least 4.4:1 on every surface. */
+   borders at least 4:1; the focus ring two rings (dark accent outside, light inside), the
+   outer one at least 9:1 on every surface and the pair visible on the blue buttons. */
 
 :root {
   color-scheme: light dark;
@@ -31,7 +32,8 @@
   --attention-surface: #fcf2dc;
   --error: #b02a20;
   --error-surface: #fcebe9;
-  --focus: #c2410c;
+  --focus: #0a2f73;         /* the focus ring: dark accent outside, */
+  --focus-inner: #ffffff;   /* light inside, so it shows on white, grey and blue alike */
   --space-1: 0.25rem;
   --space-2: 0.5rem;
   --space-3: 0.75rem;
@@ -78,7 +80,8 @@
     --attention-surface: #33290f;
     --error: #ff9a90;
     --error-surface: #3b1916;
-    --focus: #ff9f5a;
+    --focus: #c9dbff;
+    --focus-inner: #0b1730;
     --shadow: 0 1px 2px rgb(0 0 0 / 0.4), 0 6px 18px rgb(0 0 0 / 0.35);
   }
 }
@@ -97,7 +100,8 @@ body {
 a { color: var(--accent); text-underline-offset: 0.15em; }
 a:hover { text-decoration-thickness: 2px; }
 
-:focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; border-radius: 2px; }
+:focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; border-radius: 2px;
+  box-shadow: 0 0 0 2px var(--focus-inner); }
 ::selection { background: var(--accent-surface); color: var(--text); }
 
 h1 { font-size: 1.6rem; line-height: 1.25; margin: 0 0 0.75rem; }
@@ -327,7 +331,8 @@ button:disabled { border-color: var(--line); background: var(--sunk); color: var
 .post-body { padding: var(--space-3) var(--space-4) var(--space-4); }
 .post--current .post-text { font-size: 1.08rem; }
 .post--current:focus { outline: none; }
-.post--current:focus-visible { outline: 3px solid var(--focus); outline-offset: 3px; }
+.post--current:focus-visible { outline: 3px solid var(--focus); outline-offset: 3px;
+  box-shadow: 0 0 0 3px var(--focus-inner); }
 figure { margin: var(--space-3) 0 0; }
 figure img { display: block; width: 100%; max-width: 100%; height: auto; border: 1px solid var(--line);
   border-radius: var(--radius-small); background: var(--surface-earlier); }
@@ -388,7 +393,8 @@ details.help p { margin: var(--space-1) 0 var(--space-1); padding: var(--space-2
 .later-toggle:has(input:checked) { color: var(--attention); border-color: var(--attention);
   background: var(--attention-surface); }
 .later-toggle:has(input:checked) .icon { fill: currentColor; }
-.later-toggle:has(input:focus-visible) { outline: 3px solid var(--focus); outline-offset: 2px; }
+.later-toggle:has(input:focus-visible) { outline: 3px solid var(--focus); outline-offset: 2px;
+  box-shadow: 0 0 0 2px var(--focus-inner); }
 
 .options { display: grid; gap: var(--space-1); }
 .options label, .checks label, .warns label, label.tick {
@@ -445,7 +451,8 @@ select, input[type="text"] { border-color: var(--line-strong); }
   color: var(--text); border: 1.5px solid var(--line-strong); border-radius: var(--radius-small); }
 .segmented input.seg:checked + label { background: var(--accent); border-color: var(--accent);
   color: var(--accent-text); }
-.segmented input.seg:focus-visible + label { outline: 3px solid var(--focus); outline-offset: 2px; }
+.segmented input.seg:focus-visible + label { outline: 3px solid var(--focus); outline-offset: 2px;
+  box-shadow: 0 0 0 2px var(--focus-inner); }
 
 /* The numbers of the post. */
 .rows-plain { margin: 0 0 var(--space-2); padding: 0; list-style: none; }

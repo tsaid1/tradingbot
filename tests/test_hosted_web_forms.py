@@ -760,7 +760,7 @@ def test_a_reading_the_approver_returned_is_shown_to_its_reviewer_only(site):  #
     # The header tells the same story as the notice (the phone acceptance's P3).
     assert "was returned for changes" in shown.text and "Assessment: not submitted yet" \
         not in shown.text
-    assert "The approver returned this reading for changes." in shown.text
+    assert "The approver returned your assessment for changes." in shown.text
     assert note in shown.visible()
     assert "owner@example.invalid" not in shown.text and "Owner Example" not in shown.text
     # The form is open again with the reviewer's latest answers.
@@ -853,7 +853,7 @@ def test_a_return_the_approver_took_back_shows_nowhere_on_the_site(site):  # noq
     assert again["seq"] > cleared["seq"] and state() == F.RETURNED
     assert a.get("/continue").headers["Location"] == "/form/i08"
     shown = a.open("i08")
-    assert "The approver returned this reading for changes." in shown.text
+    assert "The approver returned your assessment for changes." in shown.text
     assert "Once more: row 1." in shown.visible() and note not in shown.visible()
     # and the reviewer's corrected save ends it, with all three lines among the records.
     a.set({"lv.n:0.exactness": "APPROXIMATE"})
