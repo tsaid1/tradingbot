@@ -36,6 +36,7 @@ from tradingbot.runtime.vocab_recommend import (  # noqa: F401 - re-exported for
     _read_private,
     append_chained,
     clean_text,
+    encode_line,
     request_identity,
     server_problem,
     verify_log,
@@ -132,7 +133,7 @@ class AdjudicationError(ValueError):
 
 @dataclass
 class Bundle:
-    root: Path
+    root: Path | None  # None: built from bytes (``bundle_from_bytes``), not from a folder
     access: str
     bundle_id: str
     manifest: dict
@@ -410,14 +411,9 @@ def check_folders(base: str | Path, *, media: bool) -> str | None:
     return synced_folder_class(base / "annotations.jsonl")
 
 
-def load_bundle(path: str | Path, access: str) -> Bundle:
-    """The bundle, validated. RESTRICTED reads ``manifest.json``, ``sequences.jsonl`` and
-    ``items.jsonl`` only: ``posts.jsonl`` and ``media/`` are never opened."""
-    if access not in (FULL, RESTRICTED):
-        raise AdjudicationError("UNKNOWN_ACCESS")
-    root = check_private_path(Path(path).expanduser() / "manifest.json", "bundle").parent
+def _manifest(data: bytes) -> dict:
     try:
-        manifest = json.loads(_read(root, "manifest.json"))
+        manifest = json.loads(data)
     except ValueError:
         raise AdjudicationError("NOT_JSON:manifest") from None
     if not isinstance(manifest, dict) or manifest.get("schema") != BUNDLE_SCHEMA:
@@ -425,56 +421,66 @@ def load_bundle(path: str | Path, access: str) -> Bundle:
     bundle_id = manifest.get("bundle_id")
     if not (isinstance(bundle_id, str) and re.fullmatch(r"[0-9a-f]{64}", bundle_id)):
         raise AdjudicationError("BAD_BUNDLE_ID")
-    if access == FULL and bundle_digest(root) != bundle_id:
-        raise AdjudicationError("BUNDLE_ID_MISMATCH")
+    return manifest
+
+
+def bundle_from_bytes(manifest: bytes, sequences: bytes, items: bytes, posts: bytes | None, *,
+                      access: str) -> Bundle:
+    """The bundle of the four files' bytes, validated: everything ``load_bundle`` checks but the
+    private-path guards and the ``bundle_id`` digest, which belong to the folder (``root`` is
+    None). RESTRICTED never looks at ``posts``."""
+    if access not in (FULL, RESTRICTED):
+        raise AdjudicationError("UNKNOWN_ACCESS")
+    manifest = _manifest(manifest)
     families = manifest.get("families")
     if not (isinstance(families, list) and all(isinstance(f, str) and _FAMILY_RE.match(f)
                                                for f in families)):
         raise AdjudicationError("UNKNOWN_VALUE:families")
     families = [f for f in dict.fromkeys(families) if f not in FAMILY_EXTRA]
-    sequences = {}
-    for raw in _lines(_read(root, "sequences.jsonl"), "sequences"):
+    by_id = {}
+    for raw in _lines(sequences, "sequences"):
         sid = _id(raw.get("sequence_id"), "sequence_id")
         refs, order = raw.get("post_refs"), raw.get("review_order")
-        if sid in sequences or not isinstance(refs, list) or isinstance(order, bool) \
+        if sid in by_id or not isinstance(refs, list) or isinstance(order, bool) \
                 or not isinstance(order, int):
             raise AdjudicationError("BAD_SEQUENCE")
-        sequences[sid] = {"sequence_id": sid, "set": _closed(raw.get("set"), SETS, "set"),
-                          "post_refs": [_id(r, "post_refs") for r in refs],
-                          "review_order": order}
-    if sorted(s["review_order"] for s in sequences.values()) != list(
-            range(1, len(sequences) + 1)):
+        by_id[sid] = {"sequence_id": sid, "set": _closed(raw.get("set"), SETS, "set"),
+                      "post_refs": [_id(r, "post_refs") for r in refs],
+                      "review_order": order}
+    if sorted(s["review_order"] for s in by_id.values()) != list(range(1, len(by_id) + 1)):
         raise AdjudicationError("BAD_REVIEW_ORDER")
-    items: dict[str, dict] = {}
-    for raw in _lines(_read(root, "items.jsonl"), "items"):
-        item = _item(raw, sequences, families)
-        if item["item_id"] in items:
+    found: dict[str, dict] = {}
+    for raw in _lines(items, "items"):
+        item = _item(raw, by_id, families)
+        if item["item_id"] in found:
             raise AdjudicationError("DUPLICATE_ITEM")
-        items[item["item_id"]] = item
-    bundle = Bundle(root, access, bundle_id, manifest,
-                    sorted(sequences.values(), key=lambda s: s["review_order"]), items,
+        found[item["item_id"]] = item
+    bundle = Bundle(None, access, manifest["bundle_id"], manifest,
+                    sorted(by_id.values(), key=lambda s: s["review_order"]), found,
                     families + list(FAMILY_EXTRA))
     if access == FULL:
-        posts = {}
-        for raw in _lines(_read(root, "posts.jsonl"), "posts"):
+        if posts is None:
+            raise AdjudicationError("MISSING:posts.jsonl")
+        by_ref = {}
+        for raw in _lines(posts, "posts"):
             p = _post(raw)
-            posts[p["post_ref"]] = p
-        wanted = {r for s in sequences.values() for r in s["post_refs"]} | {
-            r for i in items.values() for r in [i["post_ref"], *i["context_refs"]]} | {
-            p[k] for p in posts.values() for k in ("reply_to", "quotes") if p[k]}
-        if not wanted <= set(posts):
+            by_ref[p["post_ref"]] = p
+        wanted = {r for s in by_id.values() for r in s["post_refs"]} | {
+            r for i in found.values() for r in [i["post_ref"], *i["context_refs"]]} | {
+            p[k] for p in by_ref.values() for k in ("reply_to", "quotes") if p[k]}
+        if not wanted <= set(by_ref):
             raise AdjudicationError("UNKNOWN_POST_REF")
-        if any(lv["n"] is not None and lv["n"] >= len(posts[i["post_ref"]]["numbers"])
-               for i in items.values() for lv in i["levels"]):
+        if any(lv["n"] is not None and lv["n"] >= len(by_ref[i["post_ref"]]["numbers"])
+               for i in found.values() for lv in i["levels"]):
             raise AdjudicationError("LEVEL_NOT_IN_NUMBERS")
-        bundle.posts = posts
+        bundle.posts = by_ref
     else:
         allowed = set(families) | set(INSTRUMENT_WORDS)
 
         def shown(v: str) -> bool:
             return bool(_NUMBER.match(v)) or v in allowed
 
-        for item in items.values():
+        for item in found.values():
             withheld = [f for f in FREE_TEXT_FIELDS if item["ai"][f] and not shown(item["ai"][f])]
             withheld += [f"mapping.{f}" for f in FREE_TEXT_MAPPING
                          if item["mapping"][f] and not shown(item["mapping"][f])]
@@ -484,6 +490,23 @@ def load_bundle(path: str | Path, access: str) -> Bundle:
                 else:
                     item["ai"][f] = ""
             item["withheld"] = withheld
+    return bundle
+
+
+def load_bundle(path: str | Path, access: str) -> Bundle:
+    """The bundle, validated. RESTRICTED reads ``manifest.json``, ``sequences.jsonl`` and
+    ``items.jsonl`` only: ``posts.jsonl`` and ``media/`` are never opened."""
+    if access not in (FULL, RESTRICTED):
+        raise AdjudicationError("UNKNOWN_ACCESS")
+    root = check_private_path(Path(path).expanduser() / "manifest.json", "bundle").parent
+    manifest = _read(root, "manifest.json")
+    bundle_id = _manifest(manifest)["bundle_id"]  # the manifest's own faults first, as ever
+    if access == FULL and bundle_digest(root) != bundle_id:
+        raise AdjudicationError("BUNDLE_ID_MISMATCH")
+    bundle = bundle_from_bytes(
+        manifest, _read(root, "sequences.jsonl"), _read(root, "items.jsonl"),
+        _read(root, "posts.jsonl") if access == FULL else None, access=access)
+    bundle.root = root
     return bundle
 
 
@@ -995,15 +1018,13 @@ def _check_verdicts(bundle: Bundle, item: dict, done: dict, verdicts: dict, ctx)
         raise AdjudicationError("VERDICT_FOR_EVERY_COMPARED_FIELD")
 
 
-def append_annotation(base: str | Path, bundle: Bundle, session: Session, *, item_id: str,
-                      phase: str, blind: bool, reading: dict, field_verdicts: dict | None = None,
-                      flags=(), confidence: str = "", notes: str = "",
-                      refers_to: int | None = None, outcome: str | None = None,
-                      acknowledged_warnings=(), now: datetime | None = None) -> dict:
-    """Append ONE annotation record (the app's only write), validated against the bundle, the
-    session's role, the rubric (every blocking check of Save, the acknowledged warnings; for an
-    AMEND, on the merged reading) and the records already in the log (under the log's lock).
-    Every record carries ``rubric: 2`` and ``acknowledged_warnings``."""
+def _annotation(bundle: Bundle, session: Session, item_id: str, phase: str, blind: bool,
+                reading: dict, field_verdicts: dict | None, flags, confidence: str, notes: str,
+                refers_to: int | None, outcome: str | None, acknowledged_warnings,
+                now: datetime | None):
+    """The checks of an annotation that need no record; returns ``make(records) -> record``,
+    which runs the checks against the records already stored and builds the record (without
+    ``schema``, ``seq``, ``prev_sha256``)."""
     item = bundle.items.get(item_id)
     if item is None:
         raise AdjudicationError("UNKNOWN_ITEM")
@@ -1042,8 +1063,8 @@ def append_annotation(base: str | Path, bundle: Bundle, session: Session, *, ite
         if phase == AFTER_REVEAL and outcome:
             raise AdjudicationError("VERDICT_FOR_EVERY_COMPARED_FIELD")
 
-    def make(v: Verification) -> dict:
-        recs, me = v.records, session.login
+    def make(recs: list[dict]) -> dict:
+        me = session.login
         new = rubric2(recs)
         stored = reading
         siblings = post_siblings(bundle, item, session.scope)
@@ -1097,8 +1118,68 @@ def append_annotation(base: str | Path, bundle: Bundle, session: Session, *, ite
                 "notes": notes, "refers_to": refers_to, "decision": outcome, "rubric": RUBRIC,
                 "acknowledged_warnings": ack}
 
+    return make
+
+
+def build_annotation(records: list[dict], bundle: Bundle, session: Session, *, item_id: str,
+                     phase: str, blind: bool, reading: dict,
+                     field_verdicts: dict | None = None, flags=(), confidence: str = "",
+                     notes: str = "", refers_to: int | None = None, outcome: str | None = None,
+                     acknowledged_warnings=(), now: datetime | None = None) -> dict:
+    """ONE annotation record, validated against the bundle, the session's role, the rubric (every
+    blocking check of Save, the acknowledged warnings; for an AMEND, on the merged reading) and
+    ``records`` (what the log already holds): exactly what ``append_annotation`` writes, without
+    ``schema``, ``seq`` and ``prev_sha256``, refused with the same codes. Pure: a caller that
+    stores it must pass the records it read under its own lock. Every record carries
+    ``rubric: 2`` and ``acknowledged_warnings``."""
+    return _annotation(bundle, session, item_id, phase, blind, reading, field_verdicts, flags,
+                       confidence, notes, refers_to, outcome, acknowledged_warnings, now)(records)
+
+
+# Written by the hosted site's operator tool (``hosted_admin.py import-log`` and
+# ``pull-to-local``) into the adjudication folder: the logins, as the log spells them, that
+# review on the hosted site. Their REVIEWER saves here would start a second history of the same
+# reviewer, so they are refused (REVIEWS_ON_THE_SITE). A folder without it: as before.
+REVIEWS_ON_THE_SITE_FILE = "reviews_on_the_site.json"
+REVIEWS_ON_THE_SITE_SCHEMA = "tradingbot.hosted.reviews-on-the-site/1"
+
+
+def reviews_on_the_site(base: str | Path) -> frozenset[str]:
+    """The logins (exact spelling) that review on the hosted site; empty without the file."""
+    data = _read_private(Path(base).expanduser() / REVIEWS_ON_THE_SITE_FILE,
+                         "reviews-on-the-site marker")
+    if data is None:
+        return frozenset()
     try:
-        return append_chained(annotations_path(base), "annotation log", ANNOTATION_SCHEMA, make)
+        raw = json.loads(data)
+        logins = raw["logins"]
+        if raw.get("schema") != REVIEWS_ON_THE_SITE_SCHEMA or not isinstance(logins, list) \
+                or not all(isinstance(x, str) for x in logins):
+            raise ValueError
+    except (ValueError, KeyError, TypeError):
+        raise AdjudicationError("REVIEWS_ON_THE_SITE_MARKER_UNREADABLE") from None
+    return frozenset(logins)
+
+
+def _not_on_the_site(base: str | Path, session: Session) -> None:
+    if session.role == REVIEWER and session.login in reviews_on_the_site(base):
+        raise AdjudicationError("REVIEWS_ON_THE_SITE")
+
+
+def append_annotation(base: str | Path, bundle: Bundle, session: Session, *, item_id: str,
+                      phase: str, blind: bool, reading: dict, field_verdicts: dict | None = None,
+                      flags=(), confidence: str = "", notes: str = "",
+                      refers_to: int | None = None, outcome: str | None = None,
+                      acknowledged_warnings=(), now: datetime | None = None) -> dict:
+    """Append ONE annotation record (the app's only write): ``build_annotation`` against the
+    records already in the log, under the log's lock. What needs no record is checked before
+    the log is opened."""
+    make = _annotation(bundle, session, item_id, phase, blind, reading, field_verdicts, flags,
+                       confidence, notes, refers_to, outcome, acknowledged_warnings, now)
+    _not_on_the_site(base, session)  # a reviewer who reviews on the hosted site: not here
+    try:
+        return append_chained(annotations_path(base), "annotation log", ANNOTATION_SCHEMA,
+                              lambda v: make(v.records))
     except RecommendationError as exc:
         raise AdjudicationError(exc.code) from None
 
@@ -1106,29 +1187,45 @@ def append_annotation(base: str | Path, bundle: Bundle, session: Session, *, ite
 # ------------------------------------------------------------------ ground truth
 
 
+def build_system_shown(records: list[dict], bundle: Bundle, session: Session, item_id: str,
+                       now: datetime | None = None) -> list[dict]:
+    """The SYSTEM_SHOWN markers ``records`` still lacks before the system's reading of
+    ``item_id`` may be served to this reviewer: one (without ``schema``, ``seq``,
+    ``prev_sha256``) for EVERY item of the same post within the scope (blind-first holds per
+    post). Empty when all exist, and for an approver (who writes no reading)."""
+    if session.role != REVIEWER or item_id not in bundle.items:
+        return []
+    at = (now or datetime.now(UTC)).astimezone(UTC).isoformat()
+    return [{"at": at, "bundle_id": bundle.bundle_id, "item_id": sid,
+             "annotator": {"login": session.login, "name": session.name,
+                           "role": session.role, "access": session.access},
+             "phase": SYSTEM_SHOWN, "blind": False, "reading": {}, "field_verdicts": {},
+             "flags": [], "confidence": "", "notes": "", "refers_to": None,
+             "decision": None, "rubric": RUBRIC, "acknowledged_warnings": []}
+            for sid in post_siblings(bundle, bundle.items[item_id], session.scope)
+            if not _of(records, sid, bundle.bundle_id, SYSTEM_SHOWN, session.login)]
+
+
 def mark_system_shown(base: str | Path, bundle: Bundle, session: Session, item_id: str) -> None:
     """Record, BEFORE the system's reading of ``item_id`` is served to a reviewer, that it was
     (once per login and item), for EVERY item of the same post within the scope: blind-first
     holds per post. Raises when it cannot be recorded: the caller then does not show it.
-    Approvers write no reading, so they need no marker."""
+    Approvers write no reading, so they need no marker. One line per append: the first marker
+    ``build_system_shown`` still finds missing, until none is."""
+    def make(v: Verification) -> dict:
+        missing = build_system_shown(v.records, bundle, session, item_id)
+        if not missing:
+            raise _AlreadyMarked
+        return missing[0]
+
     if session.role != REVIEWER or item_id not in bundle.items:
         return
-    for sid in post_siblings(bundle, bundle.items[item_id], session.scope):
-        def make(v: Verification, sid=sid) -> dict:
-            if _of(v.records, sid, bundle.bundle_id, SYSTEM_SHOWN, session.login):
-                raise _AlreadyMarked
-            return {"at": datetime.now(UTC).isoformat(), "bundle_id": bundle.bundle_id,
-                    "item_id": sid,
-                    "annotator": {"login": session.login, "name": session.name,
-                                  "role": session.role, "access": session.access},
-                    "phase": SYSTEM_SHOWN, "blind": False, "reading": {}, "field_verdicts": {},
-                    "flags": [], "confidence": "", "notes": "", "refers_to": None,
-                    "decision": None, "rubric": RUBRIC, "acknowledged_warnings": []}
-
+    _not_on_the_site(base, session)
+    while True:
         try:
             append_chained(annotations_path(base), "annotation log", ANNOTATION_SCHEMA, make)
         except _AlreadyMarked:
-            continue
+            return
         except RecommendationError as exc:
             raise AdjudicationError(exc.code) from None
 

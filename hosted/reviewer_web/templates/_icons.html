@@ -1,0 +1,46 @@
+{#- The site's icons: inline SVG drawn here, one stroke weight, no icon font, no file, no request.
+    An icon always stands beside words that say the same thing, so it is hidden from assistive
+    technology unless a label is given. Usage: {% from "_icons.html" import icon %} {{ icon("ok") }}
+    Names: ok, attention, error, info, not-started, in-progress, awaiting, complete, returned,
+    later, post, back, go, edit. -#}
+{%- macro icon(name, label="") -%}
+<svg class="icon icon--{{ name }}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"{% if label %} role="img" aria-label="{{ label }}"{% else %} aria-hidden="true" focusable="false"{% endif %}>
+{%- if name in ("ok", "complete") -%}
+<circle cx="12" cy="12" r="9"/><path d="m8 12.5 2.7 2.7 5.8-5.7"/>
+{%- elif name == "attention" -%}
+<path d="M12 3.8 21.2 20H2.8z"/><path d="M12 10v4.4"/><path d="M12 17.3v.2"/>
+{%- elif name == "error" -%}
+<circle cx="12" cy="12" r="9"/><path d="m9 9 6 6m0-6-6 6"/>
+{%- elif name == "info" -%}
+<circle cx="12" cy="12" r="9"/><path d="M12 11v5.5"/><path d="M12 7.8v.2"/>
+{%- elif name == "not-started" -%}
+<circle cx="12" cy="12" r="8.5" stroke-dasharray="2.6 3"/>
+{%- elif name == "in-progress" -%}
+<circle cx="12" cy="12" r="8.5"/><path d="M12 3.5a8.5 8.5 0 0 1 0 17z" fill="currentColor"/>
+{%- elif name == "awaiting" -%}
+<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.2 2"/>
+{%- elif name == "returned" -%}
+<path d="M9 14 4.5 9.5 9 5"/><path d="M4.5 9.5H15a5 5 0 0 1 0 10h-3"/>
+{%- elif name == "later" -%}
+<path d="M6.5 3.5h11v17L12 16.4l-5.5 4.1z"/>
+{%- elif name == "post" -%}
+<rect x="4" y="3.5" width="16" height="17" rx="2"/><path d="M8 8.5h8M8 12h8M8 15.5h5"/>
+{%- elif name == "back" -%}
+<path d="M9 10 4 15l5 5"/><path d="M4 15h11a5 5 0 0 0 5-5V4"/>
+{%- elif name == "go" -%}
+<path d="M5 12h14"/><path d="m13 6 6 6-6 6"/>
+{%- elif name == "edit" -%}
+<path d="M4 20h4L19 9l-4-4L4 16z"/>
+{%- endif -%}
+</svg>
+{%- endmacro -%}
+
+{#- A form's or a sequence's status as one badge: words, icon and colour together. ``code`` is one
+    of progress's codes (NOT_STARTED, IN_PROGRESS, AWAITING_ASSESSMENT, COMPLETE, RETURNED);
+    ``text`` the words shown (``wording.STATUS[code]``). -#}
+{%- macro status_badge(code, text) -%}
+{%- set kind = {"NOT_STARTED": "not-started", "IN_PROGRESS": "in-progress",
+                "AWAITING_ASSESSMENT": "awaiting", "COMPLETE": "complete",
+                "RETURNED": "returned"}.get(code, "not-started") -%}
+<span class="status status--{{ kind }}">{{ icon(kind) }}{{ text }}</span>
+{%- endmacro -%}

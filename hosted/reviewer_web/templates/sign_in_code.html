@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block title %}Enter your code{% endblock %}
+{% block band %}
+  {% if shown_code %}
+  <p class="demo-code">Demonstration: your code is <strong>{{ shown_code }}</strong>; no email was sent.</p>
+  {% elif synthetic %}
+  <p class="demo-code">Demonstration: no email is sent from this site.</p>
+  {% endif %}
+{% endblock %}
+{% block main %}
+<section class="narrow">
+  <h1>Enter your code</h1>
+  {% if unsent %}
+  <p class="banner error" role="alert">The code could not be sent. Try again in a minute.</p>
+  {% elif failed %}
+  <p class="banner error" role="alert">That code was not accepted. A code is six digits, works
+  once and for ten minutes, and allows five tries. Check the newest message, or ask for a new
+  code.</p>
+  {% elif synthetic %}
+  <p class="banner info" role="status">If that address is invited, its six-digit code stands in
+  the demonstration band at the top of this page. It is valid for ten minutes.</p>
+  {% else %}
+  <p class="banner info" role="status">If that address is invited, a message with a six-digit
+  code is on its way to it. It is valid for ten minutes.</p>
+  {% endif %}
+  <p class="quiet-text">At most five codes an hour are sent to one address. If no code arrives,
+  wait and ask again, or write to the person who invited you.</p>
+  <form method="post" action="/sign-in/verify" class="stack" data-once>
+    <input type="hidden" name="address" value="{{ address }}">
+    <label for="code">One-time code</label>
+    <input type="text" id="code" name="code" class="code" inputmode="numeric"
+           autocomplete="one-time-code" pattern="[0-9 ]*" maxlength="12" required autofocus>
+    <button type="submit" class="primary" data-busy="Checking the code…">Sign in</button>
+  </form>
+  <form method="post" action="/sign-in" class="stack again" data-once>
+    <input type="hidden" name="address" value="{{ address }}">
+    <button type="submit" class="quiet" data-busy="Sending a new code…">Send a new code</button>
+    <a href="/sign-in">Use another address</a>
+  </form>
+</section>
+{% endblock %}

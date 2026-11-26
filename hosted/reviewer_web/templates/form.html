@@ -1,0 +1,264 @@
+{% extends "base.html" %}
+{% from "_icons.html" import icon, status_badge %}
+{% set w = evidence.w %}
+{% block title %}{{ nav.place if nav is defined and nav and nav.place else names[item_id] }}{% endblock %}
+{% block main_class %} class="wide"{% endblock %}
+{% block skip %}{% if form %}<a class="skip-link" href="/form/{{ item_id }}#form-start" data-skip>Skip to the form</a>{% endif %}{% endblock %}
+{% block main %}
+{#- The page's state, in words and colour: progress's code when the route gives it (``status``
+    as a mapping), else the page's own text of forms.STATUS_TEXT. -#}
+{%- if status is mapping -%}
+{%- set status_code = status.shown or status.code -%}
+{%- else -%}
+{%- set status_code = (w.STATUS | dictsort | selectattr(1, "equalto", status) | map(attribute=0) | first) or "NOT_STARTED" -%}
+{%- endif -%}
+{%- set phase = form.phase if form else "" -%}
+{%- set places = nav.places if nav is defined and nav and nav.places else {} -%}
+{%- set this_form = evidence.forms | selectattr("current") | first -%}
+{%- set multi = evidence.forms | length > 1 -%}
+<div class="form-top">
+  <p class="crumbs"><a href="/">Dashboard</a> <span aria-hidden="true">/</span>
+    <strong>{{ nav.place if nav is defined and nav and nav.place else names[item_id] }}</strong>
+    {% if multi and not (nav is defined and nav and nav.place) %}<span class="quiet-text">{{ header }}</span>{% endif %}</p>
+  <div class="form-status">
+    {#- A draft kept during this visit makes the form In progress: the script shows the second
+        badge then (a draft and "Not started" never stand together). -#}
+    <span class="badge-now">{{ status_badge(status_code, w.STATUS[status_code]) }}</span>
+    {% if status_code == "NOT_STARTED" %}<span class="badge-if-draft" hidden>{{ status_badge("IN_PROGRESS", w.STATUS["IN_PROGRESS"]) }}</span>{% endif %}
+    {% if form %}
+    {%- set kept = draft.saved_at if draft is defined and draft else none -%}
+    <p class="save-state{{ ' save-state--draft' if kept else (' save-state--returned' if returned and form.stored.assessment else '') }}" id="save-state" role="status"
+       data-editing="{{ w.STATE_EDITING }}" data-draft="{{ w.state_draft('{time}') }}">
+      {#- The icon of each state; the script switches the state (class) and the words. -#}
+      <span class="ss-icon ss-icon--draft">{{ icon("edit") }}</span>
+      {%- if kept %}<span>{{ w.state_draft(w.hhmm(kept)) }}</span>
+      {% elif returned and form.stored.assessment %}<span class="ss-icon ss-icon--state">{{ icon("returned") }}</span><span>{{ w.ASSESSMENT_RETURNED.format(hhmm=form.stored.assessment) }}</span>
+      {% elif phase == "AFTER_REVEAL" and form.stored.assessment and not returned %}<span class="ss-icon ss-icon--state">{{ icon("ok") }}</span><span>Assessment: {{ w.state_submitted(form.stored.assessment) }}</span>
+      {% else %}<span class="ss-icon ss-icon--state">{{ icon("not-started") }}</span><span>{{ "Assessment: not submitted yet" if phase == "AFTER_REVEAL" else w.STATE_UNSUBMITTED }}</span>{% endif %}
+    </p>
+    {% if phase == "AFTER_REVEAL" and form.stored.reading %}
+    <p class="save-state save-state--ok">{{ icon("ok") }}<span>Your own reading: {{ w.state_submitted(form.stored.reading) }}</span></p>
+    {% endif %}
+    {% endif %}
+  </div>
+</div>
+
+{% if saved %}
+{#- After a confirmed save: the stage, and the next action (DECIDED 40 section 4), from ``step``
+    (progress.remaining_step); without it, from what the page itself knows. -#}
+{%- set other = (evidence.forms | rejectattr("current") | selectattr("item_id", "in", waiting) | first) if waiting else none -%}
+{%- set code = step.code if step is defined and step else "" -%}
+{%- if not code -%}
+{%- set code = ("COMPLETE_OTHER_FORM" if other else "ASSESS_SYSTEM_ANSWERS" if form and form.phase == "AFTER_REVEAL" else "") if saved.phase == "INDEPENDENT" else ("NEXT_FORM" if next_step and next_step != item_id else "ALL_DONE" if not next_step else "") -%}
+{%- endif -%}
+{%- set target = (step.item_id if step is defined and step and step.item_id else other.item_id if other else next_step) -%}
+<div class="banner banner--ok saved-banner" role="status" id="saved" tabindex="-1">
+  {{ icon("ok") }}
+  <div class="banner-body">
+    {% if code == "COMPLETE_OTHER_FORM" %}
+    {%- set k = step.k if step is defined and step and step.k else other.k -%}{%- set n = step.n if step is defined and step and step.n else other.n -%}
+    <p class="banner-title">{{ w.STEP_TEXT.COMPLETE_OTHER_FORM.format(k=k, n=n) }}</p>
+    <p class="banner-actions"><a class="button button--primary" href="/form/{{ target }}">{{ w.NEXT_ACTION.other.format(k=k, n=n) }}{{ icon("go") }}</a></p>
+    {% elif code == "ASSESS_SYSTEM_ANSWERS" %}
+    <p class="banner-title">{{ w.STEP_TEXT.ASSESS_SYSTEM_ANSWERS }}</p>
+    <p>They stand beside your answers below, each with the question it needs.</p>
+    <p class="banner-actions"><a class="button button--primary" href="/form/{{ item_id }}#sec-A" data-go="sec-A">{{ w.NEXT_ACTION.review }}{{ icon("go") }}</a></p>
+    {% elif code == "NEXT_FORM" and target and target != item_id %}
+    <p class="banner-title">{{ w.STEP_TEXT.NEXT_FORM }}</p>
+    <p class="banner-actions"><a class="button button--primary" href="/form/{{ target }}">{{ w.NEXT_ACTION.next }}{{ icon("go") }}</a>
+      <a class="button button--quiet" href="/">{{ w.NEXT_ACTION.home }}</a></p>
+    {% elif code == "ALL_DONE" %}
+    <p class="banner-title">{{ w.STEP_TEXT.ALL_DONE }}</p>
+    <p class="banner-actions"><a class="button button--quiet" href="/">{{ w.NEXT_ACTION.home }}</a></p>
+    {% elif saved.phase == "INDEPENDENT" %}
+    <p class="banner-title">{{ w.STEP_TEXT.ASSESS_SYSTEM_ANSWERS }}</p>
+    {% else %}
+    <p class="banner-title">{{ w.REVIEW_COMPLETE_HERE }}</p>
+    <p class="banner-actions"><a class="button button--quiet" href="/">{{ w.NEXT_ACTION.home }}</a></p>
+    {% endif %}
+    <p class="receipt">Saved. Your {{ "own reading" if saved.phase == "INDEPENDENT" else "assessment" }} is stored as record {{ saved.seq }} ({{ w.day_time(saved.at) }}).</p>
+  </div>
+</div>
+{% endif %}
+{% if form and not saved and not form.edited and status_code == "COMPLETE" %}
+<div class="banner banner--ok" role="status">
+  {{ icon("complete") }}
+  <div class="banner-body">
+    <p class="banner-title">{{ w.COMPLETE_AGAIN }}</p>
+    <p>{{ w.COMPLETE_AGAIN_DETAIL }}</p>
+  </div>
+</div>
+{% endif %}
+{% if refusal and not refusal.startswith("BLOCKED") %}
+<div class="banner banner--error" role="alert" id="refused">
+  {{ icon("error") }}
+  <div class="banner-body">
+    <p class="banner-title">{{ w.SUMMARY_NOT_SUBMITTED }}</p>
+    <p>{{ refusal_text or w.REFUSAL_OTHER }}</p>
+    {% if form %}<p>Every answer you gave is still on the page.</p>{% endif %}
+  </div>
+</div>
+{% endif %}
+{% if problem %}
+<div class="banner banner--error" role="alert">
+  {{ icon("error") }}
+  <div class="banner-body">
+    <p class="banner-title">The system's answers can't be shown right now.</p>
+    <p>It could not be recorded that they were shown, so nothing of them is on this page. Reload
+    the page to try again.</p>
+  </div>
+</div>
+{% endif %}
+{% if returned %}
+<div class="banner banner--attention" role="status">
+  {{ icon("returned") }}
+  <div class="banner-body">
+    <p class="banner-title">The approver returned your assessment for changes.</p>
+    <p>The approver's note and what to do stand <a href="#notice">directly above the confidence</a>:
+    correct your answers and save the assessment again.</p>
+  </div>
+</div>
+{% endif %}
+
+<div class="work">
+  <section class="evidence" id="evidence" aria-labelledby="h-evidence">
+    <h2 id="h-evidence" class="visually-hidden">The posts</h2>
+    {% for p in evidence.context %}
+    <article class="post post--earlier" aria-labelledby="post-{{ p.ref | ident }}">
+      <header class="post-head">
+        <h3 class="post-label" id="post-{{ p.ref | ident }}">{{ p.label }}</h3>
+        <p class="post-meta"><time datetime="{{ p.at }}">{{ p.when }}</time></p>
+      </header>
+      <p class="post-text">{{ p.text }}</p>
+    </article>
+    {% endfor %}
+    <article class="post post--current" id="post-under-review" tabindex="-1" aria-labelledby="h-post">
+      <header class="post-banner">
+        {{ icon("post") }}
+        <h3 id="h-post">{{ w.POST_UNDER_REVIEW }}</h3>
+        {% if multi and this_form %}<span class="post-form">{{ w.FORM_OF_POST.format(k=this_form.k, n=this_form.n) }}</span>{% endif %}
+      </header>
+      <div class="post-body">
+        <p class="post-meta"><time datetime="{{ evidence.post.at }}">{{ evidence.post.when }}</time>
+          {%- if evidence.post.revision and evidence.post.revision != 1 %} · revision {{ evidence.post.revision }}{% endif %}
+          {%- for kind, ref in evidence.post.links %} · {{ "a reply" if kind == "reply_to" else "quotes a post" }}{% endfor %}</p>
+        <p class="post-text">{{ evidence.post.text }}</p>
+        {% for name in evidence.post.media %}
+        {#- Loaded at once. The frame keeps its place and says "Loading…" under the image until
+            the image covers it; if it fails, the script says so and offers to try again. -#}
+        <figure class="media" data-media>
+          <div class="media__frame">
+            <p class="media__state" aria-live="polite"><span class="media__loading">Loading image {{ loop.index }} of {{ loop.length }}…</span><span class="media__failed">Image {{ loop.index }} of {{ loop.length }} could not be loaded. <button type="button" class="button button--quiet media__retry">Try again</button></span></p>
+            <img src="/media/{{ bundle_id }}/{{ evidence.post.ref }}/{{ name }}" alt="Chart or image attached to the post you're reviewing ({{ loop.index }} of {{ loop.length }})" decoding="async" fetchpriority="high">
+          </div>
+          <figcaption>Attached to this post · image {{ loop.index }} of {{ loop.length }}</figcaption>
+        </figure>
+        {% endfor %}
+        {% if form %}
+        <p class="post-back"><button type="submit" form="reading-form" class="button button--quiet back-to-question" formaction="/form/{{ item_id }}/state#{{ form.last or form.next_anchor }}" data-back>{{ icon("back") }}{{ w.BACK_TO_QUESTION }}</button></p>
+        {% endif %}
+      </div>
+    </article>
+  </section>
+
+  <div class="answers">
+    <section class="reading" aria-labelledby="h-reading">
+      <h2 id="h-reading">{{ "Your assessment" if phase == "AFTER_REVEAL" else "Your reading" }}</h2>
+      {% if multi and this_form %}<p class="form-header">{{ w.FORM_OF_POST.format(k=this_form.k, n=this_form.n) }}</p>
+      <p class="caption forms-rule">{{ w.FORMS_RULE }}</p>
+      {% elif not evidence.forms %}<p class="form-header">{{ header }}</p>{% endif %}
+      <details class="how">
+        <summary>How to review</summary>
+        <ol>{% for line in w.HOW_TO_REVIEW %}<li>{{ line }}</li>{% endfor %}</ol>
+      </details>
+      {% if overall %}<p class="plain">{{ overall }}</p>{% endif %}
+
+      {% if form %}
+      {% if form.phase == "INDEPENDENT" %}
+      <p class="caption">Answer from the posts alone. The system's answers stay hidden until you
+      save your own reading of every form of this post.</p>
+      {% else %}
+      {% if not_blind %}
+      <div class="banner banner--accent" role="note">
+        {{ icon("info") }}
+        <div class="banner-body"><p>The system's answers for this post were already shown to you
+        (on another form of the post, or before this form was in your list). So this form has no
+        separate first step: your reading is recorded as given after seeing the system's, and
+        nothing of the system's answers has filled one of yours.</p></div>
+      </div>
+      {% endif %}
+      <p class="caption">Each of the system's answers stands beside yours with one question: is it
+      right? Correct your own answer only when the system points to evidence you missed.</p>
+      <details class="how"><summary>What a judgment means</summary><p>{{ w.VERDICT_HELP }}</p></details>
+      {% endif %}
+      <form id="reading-form" method="post" action="/form/{{ item_id }}/save#problems"
+            data-state="/form/{{ item_id }}/state" autocomplete="off" novalidate>
+        <input type="hidden" name="_csrf" value="{{ csrf }}">
+        <input type="hidden" name="_phase" value="{{ form.phase }}">
+        <button type="submit" class="visually-hidden" tabindex="-1" formaction="/form/{{ item_id }}/state">Refresh the form</button>
+        <div id="form-body">
+{% include "_form_body.html" %}
+        </div>
+      </form>
+      {% elif described %}
+      {% if not saved %}
+      {%- set other = evidence.forms | rejectattr("current") | selectattr("item_id", "in", waiting) | first -%}
+      <div class="banner banner--accent">
+        {{ icon("in-progress") }}
+        <div class="banner-body">
+          <p class="banner-title">Your reading of this form is saved.{% if other %} Complete form {{ other.k }} of {{ other.n }} for this post next.{% endif %}</p>
+          <p>The system's answers are shown once every form of this post has your own reading.</p>
+          {% if waiting %}
+          <p class="banner-actions">{% for o in waiting %}<a class="button button--primary" href="/form/{{ o }}">{% set f = evidence.forms | selectattr("item_id", "equalto", o) | first %}{{ "Go to form " ~ f.k ~ " of " ~ f.n if f else "Go to " ~ places.get(o, "the next form") }}{{ icon("go") }}</a> {% endfor %}</p>
+          {% endif %}
+        </div>
+      </div>
+      {% endif %}
+      <h3>{{ described.head }}</h3>
+      <dl class="answers-list saved-reading">
+        {% for name, value in described.rows %}<div><dt>{{ name }}</dt><dd>{{ value }}</dd></div>{% endfor %}
+      </dl>
+      {% endif %}
+    </section>
+
+    {% if system %}
+    <section class="system card" aria-labelledby="h-system">
+      <details>
+        <summary><h2 id="h-system">Everything the system read for this form</h2></summary>
+        <dl class="answers-list system-reading">
+          {% for name, value in system.fields %}<div><dt>{{ name }}</dt><dd>{{ value }}</dd></div>{% endfor %}
+        </dl>
+        <details class="technical">
+          <summary>Technical detail, as the system recorded it</summary>
+          {% if system.levels %}<pre class="plain">{{ system.levels | join("\n") }}</pre>{% endif %}
+          {% if system.unread %}<p class="plain">Numbers the system didn't read: {% for n in system.unread %}number {{ n }}{{ ", " if not loop.last else "" }}{% endfor %}</p>{% endif %}
+          {% if system.holds %}<pre class="plain">{{ system.holds | join("\n") }}</pre>{% endif %}
+          {% if system.mapping %}
+          <dl class="answers-list">
+            {% for name, value in system.mapping %}<div><dt>proposed {{ name }}</dt><dd>{{ value }}</dd></div>{% endfor %}
+          </dl>
+          {% endif %}
+        </details>
+      </details>
+    </section>
+    {% endif %}
+
+    <p class="after">
+      {% if next_step and next_step != item_id %}<a class="button button--quiet" href="/form/{{ next_step }}">Next: {{ places.get(next_step, "the next form") }}{{ icon("go") }}</a>{% endif %}
+      <a href="/">Back to the dashboard</a>
+    </p>
+  </div>
+</div>
+
+{% endblock %}
+{% block dock %}
+{#- The persistent "View post" button. Without a script it posts the form as it stands and the
+    page opens at the post; with one it moves there in place and becomes "Back to my question". -#}
+<div class="dock" id="dock">
+  {% if form %}
+  <button type="submit" form="reading-form" class="button button--primary dock-button" id="view-post" formaction="/form/{{ item_id }}/state#post-under-review" data-view="{{ w.VIEW_POST }}" data-back-text="{{ w.BACK_TO_QUESTION }}">{{ icon("post") }}<span>{{ w.VIEW_POST }}</span></button>
+  {% else %}
+  <a class="button button--primary dock-button" id="view-post" href="/form/{{ item_id }}#post-under-review">{{ icon("post") }}<span>{{ w.VIEW_POST }}</span></a>
+  {% endif %}
+</div>
+{% endblock %}

@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% from "_icons.html" import icon %}
+{%- set heads = {400: "This request could not be read", 403: "This request was refused",
+                 404: "Not found", 405: "Not found", 413: "This request is too large",
+                 500: "The page could not be completed", 503: "Not open yet"} -%}
+{% block title %}{{ heads.get(status, "A message") }}{% endblock %}
+{% block main %}
+<section class="narrow message">
+  <h1>{{ icon("info" if status == 503 else "attention") }} {{ heads.get(status, "A message") }}</h1>
+  <p>{{ message }}</p>
+  <p class="quiet-text">Code {{ status }}.</p>
+  <p><a href="/">Back to the site</a></p>
+</section>
+{% endblock %}

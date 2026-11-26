@@ -56,7 +56,7 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
-from tradingbot.runtime.config import ConfigError
+from tradingbot.runtime.errors import ConfigError
 
 # The mapping module (and through it execution and the validator) is imported only when a function
 # needs it: the reviewer page (``vocab_recommend``) imports this module's path guards and group

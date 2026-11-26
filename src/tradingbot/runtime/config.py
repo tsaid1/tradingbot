@@ -21,13 +21,10 @@ from pydantic import Field, ValidationError
 
 from tradingbot.models import MockPolicy, StrictModel
 from tradingbot.risk.policy import RiskConfigError, RiskPolicy
+from tradingbot.runtime.errors import ConfigError
 
 DEFAULT_CONFIG_PATH = Path("~/.config/tradingbot/runtime.toml")
 ACCEPTED_MODES = ("mock", "shadow")
-
-
-class ConfigError(ValueError):
-    """The configuration is missing, malformed, or asks for something this build refuses."""
 
 
 class PathsConfig(StrictModel):

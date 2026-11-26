@@ -1,0 +1,85 @@
+/* The dashboard and the sidebar: STRUCTURE only (grid, disclosure, spacing). Colours, type and
+   the status badges are in app.css (the tokens of DESIGN_UX section 4); nothing here sets a
+   colour of its own. */
+
+/* ------------------------------------------------------------ the page with the sidebar */
+
+.with-nav { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--space-3); }
+.with-nav__main { min-width: 0; }
+@media (min-width: 80rem) {
+  .with-nav { grid-template-columns: 15.5rem minmax(0, 1fr); gap: var(--space-5); align-items: start; }
+  /* It ends above the bar: the window less the band, the bar and the margins. */
+  .with-nav > .nav-panel { position: sticky; top: 0.75rem; max-height: calc(100dvh - 2.5rem - 4.5rem - 1.5rem);
+    overflow-y: auto; overscroll-behavior: contain; }
+}
+
+/* ------------------------------------------------------------ the sidebar */
+
+.nav-panel { min-width: 0; }
+.nav-panel > summary { display: flex; align-items: center; gap: var(--space-2); flex-wrap: wrap;
+  min-height: 2.75rem; padding: var(--space-2) var(--space-3); cursor: pointer; list-style: none; }
+.nav-panel > summary::-webkit-details-marker { display: none; }
+.nav-panel__where { flex-basis: 100%; }
+@media (max-width: 79.99rem) {
+  .nav-panel__where { display: none; } /* the page's own heading names the place */
+}
+.nav-tree { padding: 0 var(--space-2) var(--space-2); }
+.nav-tree ol { list-style: none; margin: 0; padding: 0; }
+.nav-tree__home { margin: 0 0 var(--space-2); padding: 0 var(--space-1); }
+.nav-tree__sequence > details > summary { display: grid; grid-template-columns: minmax(0, 1fr) auto auto auto;
+  align-items: center; gap: var(--space-2); min-height: 2.5rem; padding: var(--space-1) var(--space-2);
+  cursor: pointer; list-style: none; }
+.nav-tree__sequence > details > summary::-webkit-details-marker { display: none; }
+.nav-tree__label { display: grid; min-width: 0; }
+.nav-tree__forms { padding: 0 0 var(--space-2) var(--space-3) !important; }
+.nav-tree__form a { display: grid; grid-template-columns: minmax(0, 1fr); gap: 0;
+  padding: var(--space-1) var(--space-2); min-height: 2.75rem; align-content: center; }
+.nav-tree__state, .nav-tree__draft, .nav-tree__draft-mark { display: inline-flex; align-items: center; gap: 0.3em; }
+
+/* ------------------------------------------------------------ the dashboard */
+
+.dashboard { display: grid; gap: var(--space-4); max-width: 72rem; margin: 0 auto; }
+.dash-top { display: grid; gap: var(--space-3) var(--space-5); grid-template-columns: minmax(0, 1fr);
+  padding: var(--space-4); align-items: center; }
+@media (min-width: 56rem) {
+  .dash-top { grid-template-columns: minmax(0, 1fr) minmax(0, 1.3fr) auto; }
+}
+.dash-top p { margin: 0; }
+.dash-flag { display: flex; gap: var(--space-2); align-items: flex-start; }
+.dash-flag + .dash-flag { margin-top: var(--space-1); }
+.seq-head, .seq__row { display: grid; align-items: center; gap: var(--space-1) var(--space-3);
+  grid-template-columns: minmax(0, 1fr); }
+@media (min-width: 56rem) {
+  .seq-head, .seq__row { grid-template-columns: 12rem minmax(0, 1fr) 8.5rem minmax(14rem, 1.2fr); }
+}
+.seq-head { padding: 0 var(--space-3); }
+@media (max-width: 55.99rem) { .seq-head { display: none; } }
+.seq-list { list-style: none; margin: 0; padding: 0; }
+.seq { display: grid; grid-template-columns: minmax(0, 1fr) 7.5rem; align-items: start;
+  gap: 0 var(--space-3); padding: var(--space-2) var(--space-3); }
+.seq > details { min-width: 0; }
+.seq__row { cursor: pointer; list-style: none; min-height: 2.75rem; padding: var(--space-1) 0; }
+.seq__row::-webkit-details-marker { display: none; }
+.seq__status { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-1) var(--space-2); }
+.seq__flag, .seq__draft { display: inline-flex; align-items: center; gap: 0.3em; }
+.seq__go { justify-self: end; margin-top: var(--space-1); }
+.seq__go.button { min-width: 7rem; }
+.seq__forms { list-style: none; margin: var(--space-2) 0 var(--space-2); padding: 0; display: grid; }
+.seq__forms li { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-1) var(--space-3);
+  padding: var(--space-1) 0; }
+.seq__forms a { min-height: 2.75rem; display: inline-flex; align-items: center; }
+@media (max-width: 55.99rem) {
+  /* A phone: two short lines per sequence, the button beside them. */
+  .seq { grid-template-columns: minmax(0, 1fr) auto; padding: var(--space-2) var(--space-3); }
+  .seq__row { grid-template-columns: minmax(0, 1fr) auto; gap: 0.1rem var(--space-2); }
+  .seq__read { grid-column: 1 / -1; grid-row: 2; }
+  .seq__status { grid-column: 1 / -1; grid-row: 3; }
+  .seq__go.button { min-width: 0; padding: 0.4rem 0.9rem; }
+  .seq__read:has(> .quiet-text:only-child) { display: none; }
+}
+
+/* ------------------------------------------------------------ choosing an identity */
+
+.choose-identity { display: grid; gap: var(--space-4); margin-top: var(--space-4); }
+.choose__option p { margin: var(--space-1) 0 0; }
+.choose__option .button { width: 100%; }

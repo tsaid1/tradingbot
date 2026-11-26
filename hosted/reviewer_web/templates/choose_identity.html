@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %}Choose what to open{% endblock %}
+{% block main %}
+{#- After the code, for an address with two identities: one clear choice per button, a sentence
+    on what each is. The words follow ``value`` (the route's own label stands in for an unknown
+    one). Nothing of one identity is visible in the other. -#}
+{%- set words = {"review": ("Your review", "Your own readings of the real posts. What you save here is your review."),
+                 "test": ("Test forms (invented data)", "Practice forms on invented posts. Nothing saved there touches your review.")} -%}
+<section class="narrow choose">
+  <h1>What would you like to open?</h1>
+  <p>This address has two separate workspaces. To switch later, sign out and sign in again.</p>
+  <form method="post" action="/sign-in/choose" class="choose-identity" data-once>
+    {% for value, label in options %}
+    {%- set w = words.get(value, (label, "")) -%}
+    <div class="choose__option">
+      <button type="submit" name="identity" value="{{ value }}" data-busy="Opening…" aria-describedby="choose-{{ value | ident }}"
+        class="button {{ 'button--primary' if loop.first else 'button--quiet' }}">{{ w[0] }}</button>
+      {% if w[1] %}<p class="quiet-text" id="choose-{{ value | ident }}">{{ w[1] }}</p>{% endif %}
+    </div>
+    {% endfor %}
+  </form>
+</section>
+{% endblock %}

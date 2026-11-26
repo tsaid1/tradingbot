@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+{% block title %}Field reference{% endblock %}
+{% block main %}
+<article class="page prose">
+  <h1>Field reference</h1>
+  <p>Each question as the form asks it, the name of the field it fills, and what every option
+  stores. The form shows only the questions; this page is for checking what an answer means.</p>
+  <dl class="answers-list">
+    <div><dt>{{ w.NOT_ANSWERED }}</dt><dd>Nothing chosen yet: a state, never an option (kept as an empty value).</dd></div>
+    <div><dt>{{ w.POST_SILENT }}</dt><dd><code>NOT_STATED</code>: the publisher did not state it.</dd></div>
+    <div><dt>{{ w.UNSETTLED }}</dt><dd><code>CANNOT_DETERMINE</code> (and <code>UNKNOWN</code>, <code>UNCERTAIN</code>, <code>UNRESOLVED</code> where a question has those): it probably exists, but the evidence shown conflicts or does not settle it. It needs a reason: something ticked as unclear, or a flag.</dd></div>
+    <div><dt>{{ w.DOES_NOT_APPLY }}</dt><dd><code>NOT_APPLICABLE</code>: set by the form when a question does not apply; never chosen.</dd></div>
+  </dl>
+  <h2 id="apply-title">Which questions apply</h2>
+  <p class="quiet-text">By what the publisher does in the action. On a phone, slide the table sideways.</p>
+  <div class="table-scroll" role="region" aria-labelledby="apply-title" tabindex="0">
+  <table class="ref apply">
+    <thead><tr>{% for h in apply_head %}<th scope="col">{{ h }}</th>{% endfor %}</tr></thead>
+    <tbody>{% for name, cells in apply_rows %}<tr><th scope="row">{{ name }}</th>{% for c in cells %}<td>{{ c }}</td>{% endfor %}</tr>{% endfor %}</tbody>
+  </table>
+  </div>
+  {% for group in groups %}
+  <h2>{{ group.title }}</h2>
+  {% for f in group.fields %}
+  <h3>{{ f.asked }} <code class="fname">{{ f.field.name }}</code></h3>
+  <p>{{ f.about }}</p>
+  {% if f.applies %}<p>Asked: {{ f.applies }}.</p>{% endif %}
+  {% if f.set_by_form %}<p>Set by the form: {{ f.set_by_form }}.</p>{% endif %}
+  <table class="ref">
+    <thead><tr><th scope="col">Option as shown</th><th scope="col">Stored value</th><th scope="col">Meaning</th></tr></thead>
+    <tbody>
+    {% for shown, code, meaning in f.options %}<tr><td>{{ shown or "(typed)" }}</td><td><code>{{ code }}</code></td><td>{{ meaning }}</td></tr>{% endfor %}
+    </tbody>
+  </table>
+  {% for e in f.examples %}<p class="quiet-text">Invented example: {{ e }}</p>{% endfor %}
+  {% endfor %}
+  {% endfor %}
+  <h2>What stops a submission</h2>
+  <table class="ref">
+    <thead><tr><th scope="col">Message as shown</th><th scope="col">Code</th><th scope="col">The rule</th></tr></thead>
+    <tbody>{% for code, shown, meaning in blocking %}<tr><td>{{ shown }}</td><td><code>{{ code }}</code></td><td>{{ meaning }}</td></tr>{% endfor %}</tbody>
+  </table>
+  <h2>Points to check (submitting needs the tick “{{ w.WARNINGS_TICK }}”)</h2>
+  <table class="ref">
+    <thead><tr><th scope="col">Message as shown</th><th scope="col">Code</th><th scope="col">The rule</th></tr></thead>
+    <tbody>{% for code, shown, meaning in warnings %}<tr><td>{{ shown }}</td><td><code>{{ code }}</code></td><td>{{ meaning }}</td></tr>{% endfor %}</tbody>
+  </table>
+</article>
+{% endblock %}
