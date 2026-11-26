@@ -302,6 +302,13 @@ PYTHONPATH=src python scripts/hosted_acceptance_seed.py seed --alias ACCEPT-1 \
     --login acceptance.tester@example.invalid
 ```
 
+**Running the hosted tests.** They need the site's packages and an embedded Postgres:
+`python -m pip install -e '.[dev]' -r hosted/requirements.txt 'pgserver==0.1.4'`, then
+`python -m pytest tests/test_hosted_*.py` (the CI job `hosted-tests` does exactly this). Without
+those packages (the core CI job installs `.[dev]` only) every hosted module skips at collection
+with one reason, so the core suite runs to the end. The two checks under `tests/browser/` need
+Chrome and are run by hand; no job collects them.
+
 ## Operations
 
 The operator tool is `scripts/hosted_admin.py`. It runs on the owner's Mac, is never deployed, and

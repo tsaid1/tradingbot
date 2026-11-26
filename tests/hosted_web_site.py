@@ -26,6 +26,10 @@ from html.parser import HTMLParser
 from pathlib import Path
 
 import pytest
+from hosted_pg import require_the_site
+
+require_the_site()  # before any import of the site's packages: else the module is skipped
+
 from hosted_pg import (  # noqa: F401 - fixtures
     bundle_bytes,
     demo_reviewers,
