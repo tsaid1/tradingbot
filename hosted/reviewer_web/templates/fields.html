@@ -6,7 +6,7 @@
   <p>Each question as the form asks it, the name of the field it fills, and what every option
   stores. The form shows only the questions; this page is for checking what an answer means.</p>
   <dl class="answers-list">
-    <div><dt>{{ w.NOT_ANSWERED }}</dt><dd>Nothing chosen yet: a state, never an option (stored as an empty value).</dd></div>
+    <div><dt>{{ w.NOT_ANSWERED }}</dt><dd>Nothing chosen yet: a state, never an option (kept as an empty value).</dd></div>
     <div><dt>{{ w.POST_SILENT }}</dt><dd><code>NOT_STATED</code>: the publisher did not state it.</dd></div>
     <div><dt>{{ w.UNSETTLED }}</dt><dd><code>CANNOT_DETERMINE</code> (and <code>UNKNOWN</code>, <code>UNCERTAIN</code>, <code>UNRESOLVED</code> where a question has those): it probably exists, but the evidence shown conflicts or does not settle it. It needs a reason: something ticked as unclear, or a flag.</dd></div>
     <div><dt>{{ w.DOES_NOT_APPLY }}</dt><dd><code>NOT_APPLICABLE</code>: set by the form when a question does not apply; never chosen.</dd></div>

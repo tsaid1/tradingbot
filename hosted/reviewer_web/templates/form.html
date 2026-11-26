@@ -235,7 +235,7 @@
           {% if system.holds %}<pre class="plain">{{ system.holds | join("\n") }}</pre>{% endif %}
           {% if system.mapping %}
           <dl class="answers-list">
-            {% for name, value in system.mapping %}<div><dt>mapping {{ name }}</dt><dd>{{ value }}</dd></div>{% endfor %}
+            {% for name, value in system.mapping %}<div><dt>proposed {{ name }}</dt><dd>{{ value }}</dd></div>{% endfor %}
           </dl>
           {% endif %}
         </details>

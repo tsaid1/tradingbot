@@ -981,7 +981,8 @@ def field_reference() -> dict:
     groups = [{"code": code, "title": W.SECTIONS[code], "before": title,
                "fields": [{"field": f, "asked": W.question(f.name, R.LABEL_ONLY)
                            if f.name in W.QUESTIONS else f.question,
-                           "about": W.plain(f.tooltip), "applies": W.plain(f.applies),
+                           "about": W.REFERENCE_ABOUT.get(f.name) or W.plain(f.tooltip),
+                           "applies": W.REFERENCE_APPLIES.get(f.name) or W.plain(f.applies),
                            "set_by_form": W.plain(f.set_by_form),
                            "examples": [W.plain(e) for e in f.examples],
                            "options": [(W.shown(f.name, c) if not c.startswith("<") else "",
