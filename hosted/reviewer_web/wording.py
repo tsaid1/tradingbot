@@ -83,8 +83,8 @@ QUESTIONS = {
     "notes": "Notes",
     "role": "What is this number?",
     "exactness": "How exactly is it given?",
-    "contract_month": "For which futures month is this number?",
-    "month_named": "Which month does the post name? (type it)",
+    "contract_month": "Does the post tie this number to a futures month?",
+    "month_named": "Type the month or contract code exactly as the post writes it",
 }
 
 # One short example or hint, behind a disclosure ("Example"): reachable by keyboard and touch.
@@ -136,10 +136,9 @@ HELP = {
     "notes": "Refer to a number by its row (“number 2”); don't paste the post.",
     "role": "“Crude bounced from 70 last week. Our stop goes to 70.”: the first 70 is a chart "
             "level, the second a stop.",
-    "contract_month": "For futures: the nearest month, the one after it, or a month the post "
-                      "names (you type which one next). Only from what the posts show, never "
-                      "from the post's date or the price level.",
-    "month_named": "Type the month as the post names it, such as DEC or Z6.",
+    "contract_month": "Only from what the posts show, never from the post's date or the price "
+                      "level. If the post names the month, a box opens to type it.",
+    "month_named": "For example DEC or Z6.",
 }
 
 # ------------------------------------------------------------------ options
@@ -255,8 +254,10 @@ OPTIONS: dict[str, dict[str, str]] = {
              "CHART_LEVEL": "A chart level (support, resistance, a prior high or low)",
              "UNRESOLVED": UNSETTLED},
     "exactness": {"EXACT": "Exactly", "APPROXIMATE": "Approximately"},
-    "contract_month": {"FRONT": "The front (nearest) month", "NEXT": "The next month",
-                       "NAMED": "A month the post names", R.NOT_STATED: POSTS_SILENT},
+    "contract_month": {"FRONT": "Yes, the nearest (front) month",
+                       "NEXT": "Yes, the month after it",
+                       "NAMED": "Yes, a month the post names",
+                       R.NOT_STATED: POSTS_SILENT},
 }
 # The further actions reuse the questions' own option words.
 ADDITIONAL = {"timing": ("When", "timing"), "action": ("What", "action"),

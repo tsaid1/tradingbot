@@ -185,12 +185,12 @@ The four states, worded the same way everywhere:
 | `exactness` | How exactly is it given? | | | How is this number expressed? |
 | | | Exactly | `EXACT` | EXACT: a precise figure with no hedge (a round number without a hedge is EXACT) |
 | | | Approximately | `APPROXIMATE` | APPROXIMATE: hedged (around, about, near, roughly, area, zone, ~), an end of a range, or rounded shorthand (4.5k) |
-| `contract_month` | For which futures month is this number? | | | Which contract month is this number quoted for? |
-| | | The front (nearest) month | `FRONT` | FRONT: front, nearest or spot month |
-| | | The next month | `NEXT` | NEXT: next or second month |
-| | | A month the post names | `NAMED` | NAMED: a named month or contract code (type it in month_named) |
+| `contract_month` | Does the post tie this number to a futures month? | | | Which contract month is this number quoted for? |
+| | | Yes, the nearest (front) month | `FRONT` | FRONT: front, nearest or spot month |
+| | | Yes, the month after it | `NEXT` | NEXT: next or second month |
+| | | Yes, a month the post names | `NAMED` | NAMED: a named month or contract code (type it in month_named) |
 | | | The posts shown don't say | `NOT_STATED` | NOT_STATED: nothing in the material identifies the month |
-| `month_named` | Which month does the post name? (type it) | | | Which month or code is named? |
+| `month_named` | Type the month or contract code exactly as the post writes it | | | Which month or code is named? |
 
 ## Judgments of the system's answers (after the reveal)
 
