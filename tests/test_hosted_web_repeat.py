@@ -35,6 +35,12 @@ def sessions(site) -> list:  # noqa: F811
     return site.sql("SELECT reviewer_id FROM web_session")
 
 
+def live(site, token) -> bool:  # noqa: F811
+    client = site.app.test_client()
+    client.set_cookie("__Host-session", token, domain="reviewer.example.invalid")
+    return client.get("/", base_url=ORIGIN).status_code == 200
+
+
 def token_of(answer) -> str | None:
     found = re.search(r"__Host-session=([^;]+)", ",".join(answer.headers.getlist("Set-Cookie")))
     return found and found.group(1)
@@ -50,36 +56,41 @@ def test_a_second_press_signs_in_and_leaves_one_live_session(site):  # noqa: F81
                   {"address": login, "code": code}, browser)
     assert [r.status_code for r in (first, second)] == [303, 303]
     assert first.headers["Location"] == second.headers["Location"] == "/"
-    assert token_of(first) != token_of(second) and len(sessions(site)) == 1
+    assert token_of(first) != token_of(second) and len(sessions(site)) == 2  # until one is used
     assert site.sql("SELECT first_sign_in_at FROM reviewer WHERE alias = %s", FIRST) == stamped
     assert site.sql("SELECT count(*) FROM rate_limit WHERE bucket LIKE 'wrong:%%'") == [(0,)]
-    # The answer the browser kept works; the one it dropped was ended.
-    kept, dropped = site.app.test_client(), site.app.test_client()
-    kept.set_cookie("__Host-session", token_of(second), domain="reviewer.example.invalid")
-    dropped.set_cookie("__Host-session", token_of(first), domain="reviewer.example.invalid")
-    assert kept.get("/", base_url=ORIGIN).status_code == 200
-    assert dropped.get("/", base_url=ORIGIN).status_code == 303
+    # The answer the browser kept works, and its first use ends the one it dropped.
+    assert live(site, token_of(second)) and not live(site, token_of(first))
+    assert len(sessions(site)) == 1
     # The sign-in ends the code request's cookie.
     assert f"{BROWSER}=;" in ",".join(second.headers.getlist("Set-Cookie"))
 
 
-def test_two_presses_at_once_give_one_live_session(site):  # noqa: F811
+def test_two_presses_at_once_give_one_live_session_whichever_answer_is_kept(site):  # noqa: F811
+    """Two presses in parallel (two threads): both answered as signed in; both sessions stay live
+    until one is used, and its first use ends the other. Run twice, keeping the one answer and
+    then the other: whichever the browser keeps, it works and one live session results."""
     login = site.reviewers[FIRST].login_shown
-    code, browser = ask(site, login)
-    answers, start = [], threading.Barrier(2, timeout=30)
+    for keep in (0, 1):
+        site.sql("DELETE FROM web_session")
+        code, browser = ask(site, login)
+        answers, start = [], threading.Barrier(2, timeout=30)
 
-    def press():
-        client = site.app.test_client(use_cookies=False)
-        start.wait()
-        answers.append(post(client, "/sign-in/verify", {"address": login, "code": code}, browser))
+        def press(code=code, browser=browser, start=start, answers=answers):
+            client = site.app.test_client(use_cookies=False)
+            start.wait()
+            answers.append(post(client, "/sign-in/verify", {"address": login, "code": code},
+                                browser))
 
-    threads = [threading.Thread(target=press) for _ in range(2)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-    assert sorted(r.status_code for r in answers) == [303, 303]
-    assert len(sessions(site)) == 1
+        threads = [threading.Thread(target=press) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert sorted(r.status_code for r in answers) == [303, 303]
+        assert len(sessions(site)) == 2
+        assert live(site, token_of(answers[keep])) and not live(site, token_of(answers[1 - keep]))
+        assert len(sessions(site)) == 1
     assert site.sql("SELECT count(*) FROM reviewer WHERE first_sign_in_at IS NOT NULL") == [(1,)]
 
 
@@ -142,14 +153,15 @@ def test_a_signed_in_browser_or_a_pending_choice_is_sent_on_and_nothing_counted(
     fresh = site.app.test_client(use_cookies=False)
     repeat = post(fresh, "/sign-in/verify", {"address": ADDRESS, "code": code}, browser)
     assert repeat.headers["Location"] == "/sign-in/choose"
-    assert site.sql("SELECT count(*) FROM sign_in_choice WHERE used_at IS NULL") == [(1,)]
-    assert client.get("/sign-in/choose", base_url=ORIGIN).headers.get("Location") == "/sign-in"
+    assert site.sql("SELECT count(*) FROM sign_in_choice WHERE used_at IS NULL") == [(2,)]
     choice = re.search(r"__Host-choice=([^;]+)", ",".join(
         repeat.headers.getlist("Set-Cookie"))).group(1)
     chooser = site.app.test_client()
     chooser.set_cookie("__Host-choice", choice, domain="reviewer.example.invalid")
     assert chooser.post("/sign-in/choose", data={"identity": "test"}, base_url=ORIGIN,
                         headers=HEAD).headers["Location"] == "/"
+    # Using one choice ended the other.
+    assert client.get("/sign-in/choose", base_url=ORIGIN).headers.get("Location") == "/sign-in"
     # Signed in now: a verify from that browser is sent to the site, nothing counted.
     late = chooser.post("/sign-in/verify", data={"address": ADDRESS, "code": "123456"},
                         base_url=ORIGIN, headers=HEAD)
@@ -180,3 +192,64 @@ def test_the_refused_page_is_the_same_for_listed_and_unlisted_and_the_floor_hold
     assert [p.status_code for p in pages] == [401, 401]
     texts = [p.get_data(as_text=True) for p in pages]
     assert texts[0].replace(login, "X") == texts[1].replace("nobody.here@example.invalid", "X")
+
+
+# ------------------------------------------------------------------ S1: who may repeat
+
+
+def wrongs(site) -> int:  # noqa: F811
+    return site.sql("SELECT count(*) FROM rate_limit WHERE bucket LIKE 'wrong:%%'")[0][0]
+
+
+def test_the_one_who_asked_for_the_code_cannot_take_over_the_session_of_who_used_it(site):  # noqa: F811
+    """S1 (probe ``test_takeover_by_the_one_who_asked_for_the_code``): an attacker asks for a
+    code for the victim's address and keeps that request's cookie; the victim signs in with the
+    mailed code in their own browser. The attacker's guesses in the window are ordinary wrong
+    codes (counted, and the tenth locks the address), and the right code with the attacker's
+    cookie is refused: the victim's session stays."""
+    victim = site.reviewers[FIRST].login_shown
+    code, attacker = ask(site, victim)
+    signed = post(site.app.test_client(use_cookies=False), "/sign-in/verify",
+                  {"address": victim, "code": code})  # the victim's own browser: no cookie
+    assert signed.status_code == 303 and live(site, token_of(signed))
+    for n in range(9):
+        wrong = f"{(int(code) + 1 + n) % 10 ** 6:06d}"
+        site.sql("DELETE FROM rate_limit WHERE bucket LIKE 'try:%%'")  # many network addresses
+        assert post(site.app.test_client(use_cookies=False), "/sign-in/verify",
+                    {"address": victim, "code": wrong}, attacker).status_code == 401
+    assert wrongs(site) == 9
+    hit = post(site.app.test_client(use_cookies=False), "/sign-in/verify",
+               {"address": victim, "code": code}, attacker)
+    assert hit.status_code == 401 and token_of(hit) is None
+    assert live(site, token_of(signed))
+    site.sql("DELETE FROM rate_limit WHERE bucket LIKE 'try:%%'")
+    post(site.app.test_client(use_cookies=False), "/sign-in/verify",
+         {"address": victim, "code": f"{(int(code) + 50) % 10 ** 6:06d}"}, attacker)
+    from reviewer_web import auth
+
+    assert wrongs(site) == 10 and auth.locked_until(
+        site.store, site.reviewers[FIRST].id, site.clock()) is not None
+
+
+def test_a_first_sign_in_without_the_cookie_can_never_be_repeated(site):  # noqa: F811
+    login = site.reviewers[FIRST].login_shown
+    code, browser = ask(site, login)
+    assert post(site.app.test_client(use_cookies=False), "/sign-in/verify",
+                {"address": login, "code": code}).status_code == 303  # without the cookie
+    again = post(site.app.test_client(use_cookies=False), "/sign-in/verify",
+                 {"address": login, "code": code}, browser)  # then with the request's cookie
+    assert again.status_code == 401 and len(sessions(site)) == 1
+
+
+def test_a_wrong_code_in_the_window_ends_the_repeat(site):  # noqa: F811
+    login = site.reviewers[FIRST].login_shown
+    code, browser = ask(site, login)
+    assert post(site.app.test_client(use_cookies=False), "/sign-in/verify",
+                {"address": login, "code": code}, browser).status_code == 303
+    wrong = f"{(int(code) + 1) % 10 ** 6:06d}"
+    assert post(site.app.test_client(use_cookies=False), "/sign-in/verify",
+                {"address": login, "code": wrong}, browser).status_code == 401
+    assert wrongs(site) == 1
+    assert post(site.app.test_client(use_cookies=False), "/sign-in/verify",
+                {"address": login, "code": code}, browser).status_code == 401
+    assert len(sessions(site)) == 1
